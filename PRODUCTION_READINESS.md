@@ -25,17 +25,17 @@ target SHA and as-of UTC) whenever the blocker set changes.
 <!-- launch-readiness:begin -->
 ```json
 {
-  "verdict": "FAIL",
+  "verdict": "UNKNOWN",
   "policy_version": "2",
   "classification_version": "launch-blocker-v2",
   "launch_tier": "ga",
   "private_blockers_redacted_count": 0,
   "counts_by_severity": {
-    "critical": 1,
-    "high": 6,
+    "critical": 0,
+    "high": 0,
     "medium": 0
   },
-  "notes": "Reviewed snapshot only. Target SHA and as-of UTC come from the workflow's evaluated record; they are deliberately not asserted here."
+  "notes": "Reviewed snapshot only. The configured launch-blocker/launch-exempted/severity:* labels are not yet defined in repository metadata, so the labeled inventory is unavailable and the verdict is UNKNOWN with zero counts by construction — this is NOT evidence of a clean blocker set. Refresh to the computed FAIL once a maintainer provisions and backfills the label vocabulary. Target SHA and as-of UTC come from the workflow's evaluated record; they are deliberately not asserted here."
 }
 ```
 <!-- launch-readiness:end -->
@@ -46,11 +46,15 @@ which requires a computed `PASS` for the exact released commit. Only a computed
 `PASS` whose snapshot agrees exits zero: `FAIL` and `UNKNOWN` are both non-zero,
 so this check stays red while real launch blockers are open — that is the honest
 signal, not a defect. `UNKNOWN` covers a missing token, an API/rate-limit/
-pagination/schema failure, an issue without exactly one severity label, a live
-severity label that contradicts the tracked contract, and missing/malformed/
-stale/future private-advisory input. Private advisories contribute a redacted
-count only; setup and maintenance are described in
-[`docs/launch-readiness.md`](docs/launch-readiness.md).
+pagination/schema failure, a configured blocker/exemption/severity label that is
+absent from or renamed in repository metadata, an open `tracked_blockers` entry
+that never received the `launch-blocker` label, an issue without exactly one
+severity label, a live severity label that contradicts the tracked contract, and
+missing/malformed/stale/future private-advisory input. The label vocabulary is
+proven to exist before any issue listing is trusted, so an empty
+`labels=launch-blocker` result can never be mistaken for a clean inventory.
+Private advisories contribute a redacted count only; setup and maintenance are
+described in [`docs/launch-readiness.md`](docs/launch-readiness.md).
 
 <!-- launch-readiness:historical -->
 

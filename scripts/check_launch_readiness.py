@@ -50,6 +50,16 @@ PER_PAGE = 100
 SEVERITIES = ("critical", "high", "medium")
 VERDICTS = ("PASS", "FAIL", "UNKNOWN")
 
+# An empty `labels=launch-blocker` listing and a label that does not exist are
+# the same HTTP response, so the label vocabulary is proven from repository
+# metadata before any issue listing is trusted. These codes keep the three
+# outcomes distinguishable in the UNKNOWN reason: a missing/renamed definition
+# (`label_inventory`), a tracked blocker that was never classified into the
+# labeled inventory (`label_drift`), and an ordinary transport/permission
+# failure (`api` / `denied` / `rate_limit`).
+LABEL_INVENTORY_CODE = "label_inventory"
+LABEL_DRIFT_CODE = "label_drift"
+
 # Repository security advisories are a distinct GitHub permission. The Actions
 # `security-events` scope does NOT grant it, so the workflow token gets 403.
 ADVISORY_STATES = ("triage", "draft", "published", "closed", "withdrawn")
@@ -290,20 +300,26 @@ def validate_policy(policy: dict[str, Any]) -> None:
         raise GateError("schema", "repository must be owner/name")
 
     labels = require_dict(policy.get("labels"), "labels")
+    seen_labels: set[str] = set()
     for key in ("launch_blocker", "launch_exempted"):
         label = require_str(labels.get(key), f"labels.{key}")
         if not LABEL_RE.fullmatch(label):
             raise GateError("schema", f"labels.{key} malformed")
+        if label in seen_labels:
+            raise GateError("schema", "configured label names must be distinct")
+        seen_labels.add(label)
     severity_labels = require_dict(labels.get("severity"), "labels.severity")
     if set(severity_labels) != set(SEVERITIES):
         raise GateError("schema", "labels.severity must cover exactly the severities")
-    seen_labels: set[str] = set()
     for sev in SEVERITIES:
         label = require_str(severity_labels.get(sev), f"labels.severity.{sev}")
         if not LABEL_RE.fullmatch(label):
             raise GateError("schema", f"labels.severity.{sev} malformed")
         if label in seen_labels:
-            raise GateError("schema", "labels.severity entries must be distinct")
+            # One repository label may not serve two policy roles: the
+            # existence proof below would then pass while the vocabulary is
+            # ambiguous.
+            raise GateError("schema", "configured label names must be distinct")
         seen_labels.add(label)
 
     tiers = require_dict(policy.get("tiers"), "tiers")
@@ -840,6 +856,83 @@ def fetch_timeline_prs(
     return [n for n in open_prs if n not in merged_prs], merged_prs
 
 
+def configured_policy_labels(policy: dict[str, Any]) -> list[str]:
+    """Every repository label the policy depends on, in a deterministic order."""
+
+    labels = policy["labels"]
+    names = [labels["launch_blocker"], labels["launch_exempted"]]
+    names.extend(labels["severity"][sev] for sev in SEVERITIES)
+    return names
+
+
+def fetch_repository_label(
+    repo: str,
+    name: str,
+    token: str | None,
+    *,
+    opener: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Read one label definition from repository metadata."""
+
+    url = f"{API_ORIGIN}repos/{repo}/labels/{urllib.parse.quote(name, safe='')}"
+    payload, _headers = http_get_json(url, token, opener=opener)
+    if not isinstance(payload, dict):
+        raise GateError("schema", "repository label payload is not an object")
+    return payload
+
+
+def verify_repository_labels(
+    repo: str,
+    policy: dict[str, Any],
+    token: str | None,
+    *,
+    opener: Callable[..., Any] | None = None,
+    label_fetcher: Callable[..., dict[str, Any]] | None = None,
+) -> list[str]:
+    """Prove every configured blocker/exemption/severity label exists.
+
+    The Issues API answers `labels=launch-blocker` with an empty list both when
+    the label exists and matches nothing and when the label does not exist at
+    all, so an empty labeled inventory is only meaningful once the vocabulary
+    itself has been independently established. A missing definition, a renamed
+    definition (GitHub resolves label lookups case-insensitively, so the
+    returned name is compared exactly), or a malformed payload is
+    `label_inventory` — never a clean empty set. Transport, permission, and
+    rate-limit failures keep their own codes so an unreachable API is never
+    reported as an absent label.
+
+    Only the checked-in configured names are echoed; nothing from the response
+    body reaches the record.
+    """
+
+    fetch = label_fetcher or fetch_repository_label
+    verified: list[str] = []
+    for name in configured_policy_labels(policy):
+        try:
+            payload = fetch(repo, name, token, opener=opener)
+        except GateError as exc:
+            if exc.code == "api" and exc.message == "HTTP 404":
+                raise GateError(
+                    LABEL_INVENTORY_CODE,
+                    f"configured label {name} is not defined in repository metadata",
+                ) from exc
+            raise
+        if not isinstance(payload, dict):
+            raise GateError("schema", "repository label payload is not an object")
+        live_name = payload.get("name")
+        if not isinstance(live_name, str) or not LABEL_RE.fullmatch(live_name):
+            raise GateError(
+                "schema", f"repository label payload for {name} is malformed"
+            )
+        if live_name != name:
+            raise GateError(
+                LABEL_INVENTORY_CODE,
+                f"configured label {name} resolves to a differently named repository label",
+            )
+        verified.append(name)
+    return verified
+
+
 def fetch_labeled_blocker_issues(
     repo: str,
     policy: dict[str, Any],
@@ -1101,6 +1194,7 @@ def evaluate_live(
     issue_fetcher: Callable[..., dict[str, Any]] | None = None,
     timeline_fetcher: Callable[..., tuple[list[int], list[int]]] | None = None,
     labeled_fetcher: Callable[..., list[dict[str, Any]]] | None = None,
+    label_fetcher: Callable[..., dict[str, Any]] | None = None,
     advisory_fetcher: Callable[..., list[Any]] | None = None,
 ) -> Evaluation:
     """Evaluate the live launch state at the injected instant `now`.
@@ -1134,7 +1228,16 @@ def evaluate_live(
     timeline_fetch = timeline_fetcher or fetch_timeline_prs
     labeled_fetch = labeled_fetcher or fetch_labeled_blocker_issues
 
+    blocker_label = policy["labels"]["launch_blocker"]
+
     try:
+        # Establish the label vocabulary from repository metadata BEFORE any
+        # issue listing. Until this succeeds an empty labeled inventory carries
+        # no information at all, so it may not be accepted as a clean set.
+        verify_repository_labels(
+            repo, policy, token, opener=opener, label_fetcher=label_fetcher
+        )
+
         tracked_severity = {
             int(entry["issue"]): str(entry["severity"])
             for entry in policy["tracked_blockers"]
@@ -1150,12 +1253,19 @@ def evaluate_live(
                 tracked_severity=severity,
                 source="tracked",
             )
+            if record.state == "open" and blocker_label not in record.labels:
+                # Defense in depth must not become a private inventory: an open
+                # tracked blocker that was never classified into the labeled
+                # inventory is unreconciled drift, not a silently covered case.
+                raise GateError(
+                    LABEL_DRIFT_CODE,
+                    f"tracked blocker #{number} is open without the {blocker_label} label",
+                )
             record.linked_open_prs, record.linked_merged_prs = timeline_fetch(
                 repo, number, token, opener=opener
             )
             by_number[number] = record
 
-        blocker_label = policy["labels"]["launch_blocker"]
         for payload in labeled_fetch(repo, policy, token, opener=opener):
             if not isinstance(payload, dict):
                 raise GateError("schema", "issues page entry is not an object")
@@ -1518,6 +1628,37 @@ def _fresh_env(count: str = "0") -> dict[str, str]:
     return {FALLBACK_COUNT_VAR: count, FALLBACK_AS_OF_VAR: FRESH_AS_OF}
 
 
+def _label_fetcher(
+    defined: set[str] | None = None,
+    *,
+    renamed: dict[str, str] | None = None,
+    payloads: dict[str, Any] | None = None,
+    asked: list[str] | None = None,
+):
+    """Fixture repository-label endpoint.
+
+    `defined=None` means the whole configured vocabulary exists; pass an
+    explicit set to model a deleted definition, `renamed` to model a label the
+    lookup resolves to under a different name, and `payloads` to model a
+    malformed body.
+    """
+
+    known = set(configured_policy_labels(_base_policy())) if defined is None else defined
+
+    def _fetch(repo: str, name: str, token: str | None, opener=None):  # noqa: ARG001
+        if asked is not None:
+            asked.append(name)
+        if payloads is not None and name in payloads:
+            return payloads[name]
+        if renamed is not None and name in renamed:
+            return {"name": renamed[name]}
+        if name not in known:
+            raise GateError("api", "HTTP 404")
+        return {"name": name, "id": 1, "color": "ededed"}
+
+    return _fetch
+
+
 def _issue_fetcher(payloads: dict[int, dict[str, Any]]):
     def _fetch(repo: str, number: int, token: str | None, opener=None):  # noqa: ARG001
         if number not in payloads:
@@ -1547,6 +1688,7 @@ def _evaluate(
     advisories: list[Any] | None = None,
     issue_fetcher=None,
     labeled_fetcher=None,
+    label_fetcher=None,
     advisory_fetcher=None,
     token: str | None = "issues-token",
 ) -> Evaluation:
@@ -1561,6 +1703,7 @@ def _evaluate(
         issue_fetcher=issue_fetcher or _issue_fetcher(issues or {}),
         timeline_fetcher=_timeline_fetcher(timelines or {}),
         labeled_fetcher=labeled_fetcher or (lambda *a, **k: list(labeled or [])),
+        label_fetcher=label_fetcher or _label_fetcher(),
         advisory_fetcher=advisory_fetcher or (lambda *a, **k: list(advisories or [])),
     )
 
@@ -1638,6 +1781,18 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
             lambda p: p["labels"]["severity"].pop("medium"),
         ),
         (
+            "duplicate severity label names",
+            lambda p: p["labels"]["severity"].__setitem__("medium", "severity:high"),
+        ),
+        (
+            "blocker label reused as a severity label",
+            lambda p: p["labels"]["severity"].__setitem__("medium", "launch-blocker"),
+        ),
+        (
+            "exemption label equal to the blocker label",
+            lambda p: p["labels"].__setitem__("launch_exempted", "launch-blocker"),
+        ),
+        (
             "never_emit incomplete",
             lambda p: p["private_advisories"].__setitem__("never_emit_fields", ["summary"]),
         ),
@@ -1711,6 +1866,182 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     )
     check("active exemption marked", active[0]["expired"] is False)
 
+    # ---- label inventory boundary ------------------------------------------
+    # An empty `labels=launch-blocker` listing is indistinguishable from a label
+    # that does not exist, so every configured name must be proven present in
+    # repository metadata before an empty inventory may be accepted.
+    all_labels = set(configured_policy_labels(_base_policy()))
+    check(
+        "configured vocabulary is the five policy labels",
+        configured_policy_labels(_base_policy())
+        == [
+            "launch-blocker",
+            "launch-exempted",
+            "severity:critical",
+            "severity:high",
+            "severity:medium",
+        ],
+        str(configured_policy_labels(_base_policy())),
+    )
+
+    asked: list[str] = []
+    verified = verify_repository_labels(
+        "ferrum-edge/ferrum-edge",
+        _base_policy(),
+        "tok",
+        label_fetcher=_label_fetcher(asked=asked),
+    )
+    check("every configured label is verified", set(verified) == all_labels, str(verified))
+    check("every configured label is queried", set(asked) == all_labels, str(asked))
+
+    # Each individual definition is load-bearing: deleting any one is UNKNOWN.
+    for missing in sorted(all_labels):
+        ev = _evaluate(
+            _base_policy(), label_fetcher=_label_fetcher(all_labels - {missing})
+        )
+        check(
+            f"absent label {missing} is UNKNOWN",
+            unknown_because(ev, f"configured label {missing} is not defined"),
+            str(ev.unknown_reasons),
+        )
+        check(
+            f"absent label {missing} is not a clean PASS",
+            ev.verdict == "UNKNOWN" and ev.counts_by_severity == {s: 0 for s in SEVERITIES},
+            ev.verdict,
+        )
+
+    # A rename (including a case-only rename, which GitHub's case-insensitive
+    # label lookup would otherwise resolve happily) is UNKNOWN, not a clean set.
+    for renamed_from, renamed_to in (
+        ("launch-blocker", "launch-blocker-v2"),
+        ("launch-blocker", "Launch-Blocker"),
+        ("severity:high", "severity-high"),
+        ("launch-exempted", "launch-exempt"),
+    ):
+        ev = _evaluate(
+            _base_policy(),
+            label_fetcher=_label_fetcher(renamed={renamed_from: renamed_to}),
+        )
+        check(
+            f"renamed label {renamed_from}->{renamed_to} is UNKNOWN",
+            unknown_because(ev, f"configured label {renamed_from} resolves to a"),
+            str(ev.unknown_reasons),
+        )
+
+    # A malformed label payload fails closed as a schema error.
+    for name, bad_payload in (
+        ("non-object", "not-an-object"),
+        ("missing name", {"id": 7}),
+        ("non-string name", {"name": 7}),
+        ("malformed name", {"name": "not a label!"}),
+    ):
+        ev = _evaluate(
+            _base_policy(),
+            label_fetcher=_label_fetcher(payloads={"launch-blocker": bad_payload}),
+        )
+        check(
+            f"malformed label payload ({name}) is UNKNOWN",
+            unknown_because(ev, "repository label payload"),
+            str(ev.unknown_reasons),
+        )
+
+    # An API/permission failure on the label endpoint stays distinct from an
+    # absent definition: an unreachable API is never reported as a missing label.
+    for code, message, needle in (
+        ("api", "HTTP 500", "HTTP 500"),
+        ("denied", "HTTP 403", "HTTP 403"),
+        ("rate_limit", "HTTP 429", "HTTP 429"),
+    ):
+
+        def failing_labels(*a, _code=code, _message=message, **k):  # noqa: ARG001
+            raise GateError(_code, _message)
+
+        ev = _evaluate(_base_policy(), label_fetcher=failing_labels)
+        check(
+            f"label endpoint {message} is UNKNOWN",
+            unknown_because(ev, needle),
+            str(ev.unknown_reasons),
+        )
+        check(
+            f"label endpoint {message} is not reported as an absent label",
+            not any("is not defined" in r for r in ev.unknown_reasons),
+            str(ev.unknown_reasons),
+        )
+
+    # Existing-but-empty is the one case that may be accepted, and only after
+    # the vocabulary has been proven.
+    empty_inventory_calls: list[int] = []
+
+    def empty_labeled(*a, **k):  # noqa: ARG001
+        empty_inventory_calls.append(1)
+        return []
+
+    ev = _evaluate(_base_policy(), labeled_fetcher=empty_labeled)
+    check("existing but empty label inventory passes", ev.verdict == "PASS", ev.verdict)
+    check("empty inventory was actually queried", empty_inventory_calls == [1])
+
+    # ...and label verification runs BEFORE issue discovery, so a missing
+    # definition never even reaches the issue listing.
+    unreached: list[int] = []
+
+    def must_not_run(*a, **k):  # noqa: ARG001
+        unreached.append(1)
+        return []
+
+    ev = _evaluate(
+        _base_policy(),
+        labeled_fetcher=must_not_run,
+        label_fetcher=_label_fetcher(all_labels - {"launch-blocker"}),
+    )
+    check(
+        "missing definition short-circuits issue discovery",
+        ev.verdict == "UNKNOWN" and unreached == [],
+        str(unreached),
+    )
+
+    # A newly filed labeled blocker is discovered without editing
+    # tracked_blockers, and is additive to the tracked inventory.
+    policy = _tracked(_base_policy(), 1200, "critical")
+    ev = _evaluate(
+        policy,
+        issues={1200: _issue(1200, labels=["launch-blocker", "severity:critical"])},
+        labeled=[
+            _issue(1200, labels=["launch-blocker", "severity:critical"]),
+            _issue(1201, labels=["launch-blocker", "severity:medium"]),
+        ],
+    )
+    check("untracked labeled blocker fails the gate", ev.verdict == "FAIL", ev.verdict)
+    check(
+        "untracked labeled blocker is counted",
+        ev.counts_by_severity == {"critical": 1, "high": 0, "medium": 1},
+        str(ev.counts_by_severity),
+    )
+    check(
+        "untracked labeled blocker is attributed to the label source",
+        [i["source"] for i in ev.blocking_issues] == ["tracked+label", "label"],
+        str([i["source"] for i in ev.blocking_issues]),
+    )
+
+    # tracked_blockers stays defense in depth, but may not become a private
+    # inventory: an open tracked blocker missing the label is unreconciled.
+    policy = _tracked(_base_policy(), 1210, "high")
+    ev = _evaluate(policy, issues={1210: _issue(1210, labels=["severity:high"])})
+    check(
+        "unlabeled open tracked blocker is UNKNOWN",
+        unknown_because(ev, "#1210 is open without the launch-blocker label"),
+        str(ev.unknown_reasons),
+    )
+    policy = _tracked(_base_policy(), 1211, "high")
+    ev = _evaluate(
+        policy,
+        issues={1211: _issue(1211, state="closed", state_reason="completed")},
+    )
+    check(
+        "closed tracked blocker needs no label backfill",
+        ev.verdict == "PASS",
+        str(ev.unknown_reasons),
+    )
+
     # ---- severity discovery ------------------------------------------------
     labeled_missing_severity = [_issue(1100, labels=["launch-blocker"])]
     ev = _evaluate(_base_policy(), labeled=labeled_missing_severity)
@@ -1727,6 +2058,18 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     check(
         "ambiguous severity is UNKNOWN",
         unknown_because(ev, "more than one severity label"),
+        str(ev.unknown_reasons),
+    )
+
+    # A severity-shaped label that is not the configured vocabulary is not a
+    # severity: it leaves the blocker with zero severities, which is UNKNOWN.
+    ev = _evaluate(
+        _base_policy(),
+        labeled=[_issue(1103, labels=["launch-blocker", "severity:low"])],
+    )
+    check(
+        "unconfigured severity label is UNKNOWN",
+        unknown_because(ev, "without exactly one severity label"),
         str(ev.unknown_reasons),
     )
 
@@ -1758,8 +2101,11 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     )
 
     policy = _tracked(_base_policy(), 2003, "high")
-    ev = _evaluate(policy, issues={2003: _issue(2003)})
-    check("tracked severity used when unlabeled", ev.counts_by_severity["high"] == 1)
+    ev = _evaluate(policy, issues={2003: _issue(2003, labels=["launch-blocker"])})
+    check(
+        "tracked severity used without a severity label",
+        ev.counts_by_severity["high"] == 1,
+    )
 
     policy = _tracked(_base_policy(), 2004, "high")
     ev = _evaluate(
@@ -1776,20 +2122,20 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     # ---- tiers -------------------------------------------------------------
     for sev in SEVERITIES:
         policy = _tracked(_base_policy(), 2100, sev)
-        ev = _evaluate(policy, issues={2100: _issue(2100)})
+        ev = _evaluate(policy, issues={2100: _issue(2100, labels=["launch-blocker"])})
         check(f"ga blocks {sev}", ev.verdict == "FAIL", ev.verdict)
 
     policy = _tracked(_base_policy(), 2101, "medium")
-    ev = _evaluate(policy, launch_tier="experimental", issues={2101: _issue(2101)})
+    ev = _evaluate(policy, launch_tier="experimental", issues={2101: _issue(2101, labels=["launch-blocker"])})
     check("experimental ignores medium", ev.verdict == "PASS", ev.verdict)
     policy = _tracked(_base_policy(), 2102, "high")
-    ev = _evaluate(policy, launch_tier="beta", issues={2102: _issue(2102)})
+    ev = _evaluate(policy, launch_tier="beta", issues={2102: _issue(2102, labels=["launch-blocker"])})
     check("beta blocks high", ev.verdict == "FAIL", ev.verdict)
 
     # ---- issue state machine ----------------------------------------------
     policy = _tracked(_base_policy(), 3001, "high")
     ev = _evaluate(
-        policy, issues={3001: _issue(3001)}, timelines={3001: ([555], [])}
+        policy, issues={3001: _issue(3001, labels=["launch-blocker"])}, timelines={3001: ([555], [])}
     )
     check("open PR does not clear", ev.verdict == "FAIL", ev.verdict)
     check(
@@ -1799,7 +2145,7 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     )
 
     ev = _evaluate(
-        policy, issues={3001: _issue(3001)}, timelines={3001: ([], [556])}
+        policy, issues={3001: _issue(3001, labels=["launch-blocker"])}, timelines={3001: ([], [556])}
     )
     check(
         "merged awaiting close blocks",
@@ -1846,7 +2192,7 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     valid_exemption = validate_exemptions(
         {"exemptions_version": "1", "exemptions": [exemption()]}, FIXED_NOW
     )
-    ev = _evaluate(policy, exemptions=valid_exemption, issues={5001: _issue(5001)})
+    ev = _evaluate(policy, exemptions=valid_exemption, issues={5001: _issue(5001, labels=["launch-blocker"])})
     check("active exemption clears", ev.verdict == "PASS", ev.verdict)
     check("exemption reported", len(ev.exempted_issues) == 1)
 
@@ -1857,12 +2203,12 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
         },
         FIXED_NOW,
     )
-    ev = _evaluate(policy, exemptions=stale_exemption, issues={5001: _issue(5001)})
+    ev = _evaluate(policy, exemptions=stale_exemption, issues={5001: _issue(5001, labels=["launch-blocker"])})
     check("expired exemption blocks", ev.verdict == "FAIL", ev.verdict)
 
     ev = _evaluate(
         policy,
-        issues={5001: _issue(5001, labels=["launch-exempted"])},
+        issues={5001: _issue(5001, labels=["launch-blocker", "launch-exempted"])},
     )
     check(
         "bare exempt label is UNKNOWN",
@@ -1872,10 +2218,10 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
 
     # ---- deterministic clock ----------------------------------------------
     policy = _tracked(_base_policy(), 6001, "high")
-    first = _evaluate(policy, issues={6001: _issue(6001)}, now=FIXED_NOW)
+    first = _evaluate(policy, issues={6001: _issue(6001, labels=["launch-blocker"])}, now=FIXED_NOW)
     second = _evaluate(
         policy,
-        issues={6001: _issue(6001)},
+        issues={6001: _issue(6001, labels=["launch-blocker"])},
         now=OTHER_NOW,
         env={FALLBACK_COUNT_VAR: "0", FALLBACK_AS_OF_VAR: format_utc(OTHER_NOW)},
     )
@@ -2195,7 +2541,7 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
             check(f"claim rejects {name}", True)
 
     policy = _tracked(_base_policy(), 8001, "critical")
-    failing = _evaluate(policy, issues={8001: _issue(8001)})
+    failing = _evaluate(policy, issues={8001: _issue(8001, labels=["launch-blocker"])})
     passing = _evaluate(_base_policy())
     unknown = _evaluate(_base_policy(), env={})
 
