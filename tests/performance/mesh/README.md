@@ -25,6 +25,7 @@ cargo bench --bench slice_apply -- "workloads/1000"
 ./run.sh             # all benches
 ./run.sh authz_match # one bench
 ./run.sh ip_restriction # large IP-policy lookup bench
+./run.sh unix_backend_pool # sidecar-ingress Unix dial vs. pooled checkout (#3731)
 ./run.sh --skip-build authz_match  # reuse prior build artefacts
 ```
 
@@ -36,6 +37,7 @@ cargo bench --bench slice_apply -- "workloads/1000"
 | `ip_restriction` | One or four `ip_restriction` instances evaluating a 10,000-rule miss or final-interval match | Guards the allocation-free indexed lookup promised by issue #2322 across supported multiple-instance composition. |
 | `slice_apply` | `MeshSlice::from_gateway_config(&GatewayConfig, MeshSliceRequest)` over N workloads | Slice build cost dominates the latency budget when an xDS / native CP pushes a fresh slice; this is the cold-path that runs under the ArcSwap apply. |
 | `xds_translation` | `xds::translator::translate_mesh_slice_to_snapshot(&MeshSlice)` over N workloads | Control-plane translation cost shared by every connected DP; the snapshot cache dedupes by content fingerprint downstream of this call. |
+| `unix_backend_pool` | `UnixBackendConnectionPool::checkout_h1` with and without check-in | Issue #3731. Prices one sidecar-ingress Unix dial — path admission, `connect(2)`, inode re-check, peer-UID check, HTTP/1.1 handshake, one spawned driver task — against a pooled keep-alive checkout. Also prints physical connections, pool hits/misses, and the backend's accept count, which are the FD / task / accept side of the same comparison. Unix-only; no budget gate. |
 
 Most benches parameterise over input size: typically `[10, 100, 1_000, 10_000]`
 for in-process traversals and `[100, 1_000, 5_000]` for slice / translation

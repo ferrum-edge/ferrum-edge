@@ -89,6 +89,10 @@ pub enum MeshUpdateRejectReason {
     WorkloadScopeMismatch,
     /// The subscription pinned a waypoint the slice does not echo.
     WaypointScopeMismatch,
+    /// Slice `ext_authz_providers` failed structural validation, or a CUSTOM
+    /// policy binds a provider that is not declared (issue #3235 admission
+    /// parity with every other MeshSubscribe content gate).
+    InvalidExtAuthzContent,
 }
 
 impl MeshUpdateRejectReason {
@@ -105,6 +109,7 @@ impl MeshUpdateRejectReason {
             Self::NamespaceMismatch => "namespace_mismatch",
             Self::WorkloadScopeMismatch => "workload_scope_mismatch",
             Self::WaypointScopeMismatch => "waypoint_scope_mismatch",
+            Self::InvalidExtAuthzContent => "invalid_ext_authz_content",
         }
     }
 
@@ -116,12 +121,12 @@ impl MeshUpdateRejectReason {
     /// else it sends can be trusted either, so the native client drops it and
     /// lets multi-CP failover move to the next control plane. A **content**
     /// failure (unparseable JSON, envelope/slice version disagreement, a stray
-    /// heartbeat-marked frame) is per-frame: drop the frame, keep the last-good
-    /// slice, and stay connected so a corrected broadcast still converges. A
-    /// malformed *revision* is stream-terminal despite being carried inside
-    /// content: it compromises the ordering domain itself, so failover must
-    /// leave that control plane just like a stale revision does.
-    /// Neither outcome ever mutates runtime state.
+    /// heartbeat-marked frame, malformed/unbound ext-authz content) is
+    /// per-frame: drop the frame, keep the last-good slice, and stay connected
+    /// so a corrected broadcast still converges. A malformed *revision* is
+    /// stream-terminal despite being carried inside content: it compromises the
+    /// ordering domain itself, so failover must leave that control plane just
+    /// like a stale revision does. Neither outcome ever mutates runtime state.
     ///
     /// The one-shot remote-discovery fetch ignores this split and fails the
     /// whole poll on any rejection, preserving last-good endpoints.
@@ -137,7 +142,8 @@ impl MeshUpdateRejectReason {
             Self::UnexpectedHeartbeat
             | Self::InvalidSliceJson
             | Self::EnvelopeVersionMismatch
-            | Self::EnvelopeRevisionMismatch => false,
+            | Self::EnvelopeRevisionMismatch
+            | Self::InvalidExtAuthzContent => false,
         }
     }
 }
@@ -383,6 +389,30 @@ pub fn validate_mesh_config_update(
             render_revision(slice_revision)
         );
         return rejected(consumer, Reason::EnvelopeRevisionMismatch, detail);
+    }
+
+    // Narrow ext-authz admission: provider structure + CUSTOM binding only.
+    // Without this, `NativeMeshConfigConsumer::apply_update` would
+    // provisionally install malformed/unbound providers into
+    // `MeshRuntimeState` and only discover the failure later during plugin
+    // preparation — after the frame had already passed every other
+    // MeshSubscribe content gate. Reuse the shared validators so native,
+    // remote-discovery, and MeshConfig boundaries stay at parity. A refusal
+    // here is per-frame content failure: last-good state is untouched.
+    {
+        let mut errors = Vec::new();
+        crate::modes::mesh::config::validate_mesh_ext_authz_binding(
+            &slice.mesh_policies,
+            &slice.ext_authz_providers,
+            &mut errors,
+        );
+        if let Some(error) = errors.into_iter().next() {
+            let detail = format!(
+                "slice ext-authz content refused: {}",
+                diagnostic_value(&error)
+            );
+            return rejected(consumer, Reason::InvalidExtAuthzContent, detail);
+        }
     }
 
     Ok(slice)

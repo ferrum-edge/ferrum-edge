@@ -524,6 +524,40 @@ fn authorization_policy_status(
                     }
                 });
                 (true, "NoOp", message, Some(detail))
+            } else if action == "CUSTOM" {
+                // Issue #3235. A CUSTOM policy is only ever accepted with a
+                // bound provider (translation refuses it otherwise), so the
+                // status states which provider now decides matching requests
+                // and how a provider failure resolves — operators cannot see
+                // either from the resource alone.
+                let rule_count = object
+                    .spec
+                    .get("rules")
+                    .and_then(Value::as_array)
+                    .map(|rules| rules.len())
+                    .unwrap_or(0);
+                let provider = object
+                    .spec
+                    .get("provider")
+                    .and_then(|provider| provider.get("name"))
+                    .and_then(Value::as_str)
+                    .map(crate::modes::mesh::config::sanitize_mesh_ext_authz_diagnostic)
+                    .unwrap_or_default();
+                let message = format!(
+                    "Ferrum accepted this CUSTOM AuthorizationPolicy ({rule_count} rule(s)); \
+                     matching HTTP requests are delegated to meshConfig.extensionProviders \
+                     '{provider}'. A provider timeout, transport error, or malformed response \
+                     denies unless the provider sets failOpen. Matching non-HTTP (TCP/UDP) \
+                     traffic is denied: an external check cannot be performed on it."
+                );
+                let detail = json!({
+                    "translation": {
+                        "action": action,
+                        "rules_translated": rule_count,
+                        "custom_provider": provider,
+                    }
+                });
+                (true, "Accepted", message, Some(detail))
             } else {
                 let rule_count = object
                     .spec
@@ -1590,6 +1624,43 @@ fn classify_sidecar_ingress_entries(spec: &Value) -> (usize, Vec<&'static str>) 
                 "unrecognized or unsupported ingress protocol (not HTTP/stream-modeled)",
             );
             continue;
+        }
+        // Issue #3266: validate `bind` with the same parse as resolve() so a
+        // custom address is never reported modeled while the runtime would
+        // refuse it.
+        let bind = entry.get("bind").and_then(Value::as_str);
+        match crate::modes::mesh::config::parse_ingress_bind(bind) {
+            Ok(crate::modes::mesh::config::IngressBind::Dedicated(_))
+                if endpoint.starts_with("unix://") =>
+            {
+                push_unique(
+                    &mut deferred,
+                    "dedicated bind cannot own a TCP listener for a unix defaultEndpoint",
+                );
+                continue;
+            }
+            Ok(_) => {}
+            Err(crate::modes::mesh::config::IngressListenerUnsupported::UnixBindUnsupported) => {
+                push_unique(
+                    &mut deferred,
+                    "bind must not be a unix socket (Istio ingress listeners reject UDS binds)",
+                );
+                continue;
+            }
+            Err(crate::modes::mesh::config::IngressListenerUnsupported::BindNotRepresentable) => {
+                push_unique(
+                    &mut deferred,
+                    "bind must be omitted, unspecified (0.0.0.0/::), or loopback for dedicated ownership",
+                );
+                continue;
+            }
+            Err(_) => {
+                push_unique(
+                    &mut deferred,
+                    "bind must be a bare IPv4/IPv6 address (not host:port or hostname)",
+                );
+                continue;
+            }
         }
         // A `unix://` endpoint IS modeled (Unix-stream backend) as long as its
         // path passes the same SYNTACTIC admission rules
@@ -3777,6 +3848,64 @@ mod tests {
         assert!(
             deferred.is_empty(),
             "a fully supported ingress listener is not deferred, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn sidecar_dedicated_loopback_bind_is_modeled() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "ingress-bind",
+            json!({
+                "ingress": [{
+                    "port": { "number": 9080, "protocol": "TCP" },
+                    "bind": "127.0.0.1",
+                    "defaultEndpoint": "127.0.0.1:8080"
+                }]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options_ingress_enforced());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(detail["translation"]["ingress_modeled"].as_u64(), Some(1));
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred.is_empty(),
+            "dedicated loopback bind must be modeled, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn sidecar_unsupported_bind_is_deferred_field_specifically() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "ingress-bad-bind",
+            json!({
+                "ingress": [{
+                    "port": { "number": 9080, "protocol": "TCP" },
+                    "bind": "10.0.0.5",
+                    "defaultEndpoint": "127.0.0.1:8080"
+                }]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options_ingress_enforced());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(detail["translation"]["ingress_modeled"].as_u64(), Some(0));
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred.iter().any(|d| d.contains("bind must be omitted")),
+            "non-loopback bind must be field-specifically deferred, got {deferred:?}"
         );
     }
 

@@ -32,10 +32,10 @@ target SHA and as-of UTC) whenever the blocker set changes.
   "private_blockers_redacted_count": 0,
   "counts_by_severity": {
     "critical": 1,
-    "high": 6,
-    "medium": 0
+    "high": 9,
+    "medium": 14
   },
-  "notes": "Reviewed snapshot only. Target SHA and as-of UTC come from the workflow's evaluated record; they are deliberately not asserted here."
+  "notes": "Reviewed post-merge snapshot for PR #3806. The five configured label definitions exist and every open severity-classified launch blocker is backfilled with launch-blocker plus exactly one severity label. The 2026-08-12 live inventory is critical 2 / high 9 / medium 14 while #3801 remains open; this snapshot projects its completed closure via PR #3806, leaving critical 1 / high 9 / medium 14. #3332 is not launch-classified. Target SHA and as-of UTC come from the workflow's evaluated record; they are deliberately not asserted here."
 }
 ```
 <!-- launch-readiness:end -->
@@ -46,11 +46,17 @@ which requires a computed `PASS` for the exact released commit. Only a computed
 `PASS` whose snapshot agrees exits zero: `FAIL` and `UNKNOWN` are both non-zero,
 so this check stays red while real launch blockers are open — that is the honest
 signal, not a defect. `UNKNOWN` covers a missing token, an API/rate-limit/
-pagination/schema failure, an issue without exactly one severity label, a live
-severity label that contradicts the tracked contract, and missing/malformed/
-stale/future private-advisory input. Private advisories contribute a redacted
-count only; setup and maintenance are described in
-[`docs/launch-readiness.md`](docs/launch-readiness.md).
+pagination/schema failure, a configured blocker/exemption/severity label that is
+absent from or renamed in repository metadata, an open `tracked_blockers` entry
+that never received the `launch-blocker` label, an issue without exactly one
+severity label, a live severity label that contradicts the tracked contract, and
+missing/malformed/stale/future private-advisory input. The label vocabulary is
+proven to exist before any issue listing is trusted, and open issues are
+selected by the verified immutable blocker-label id rather than a name filter,
+so a missing or transiently renamed label can never be mistaken for a clean
+inventory.
+Private advisories contribute a redacted count only; setup and maintenance are
+described in [`docs/launch-readiness.md`](docs/launch-readiness.md).
 
 <!-- launch-readiness:historical -->
 

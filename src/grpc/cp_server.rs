@@ -2719,9 +2719,16 @@ mod tests {
             "only the subscriber's own listener classification may cross the CP boundary"
         );
         let serialized = serde_json::to_string(&filtered).expect("serialize filtered snapshot");
+        let wire: serde_json::Value =
+            serde_json::from_str(&serialized).expect("deserialize filtered snapshot wire form");
+        assert_eq!(
+            wire["http_tls_listen_ports"],
+            serde_json::json!([["ns-a", 8443]]),
+            "the wire classification must contain only the subscriber's own listener"
+        );
         assert!(
-            !serialized.contains("ns-b") && !serialized.contains("9443"),
-            "no foreign namespace or listener port may appear on the wire: {serialized}"
+            !serialized.contains("\"ns-b\""),
+            "no foreign namespace may appear on the wire: {serialized}"
         );
     }
 

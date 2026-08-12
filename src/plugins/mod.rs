@@ -10606,7 +10606,9 @@ pub fn create_plugin_with_http_client_and_config_id(
         "adaptive_concurrency" => Ok(Some(Arc::new(
             adaptive_concurrency::AdaptiveConcurrency::new(config, http_client.clone())?,
         ))),
-        "mesh_authz" => Ok(Some(Arc::new(mesh::authz::MeshAuthz::new(config)?))),
+        "mesh_authz" => Ok(Some(Arc::new(
+            mesh::authz::MeshAuthz::new_with_http_client(config, Some(http_client.clone()))?,
+        ))),
         "opa" => Ok(Some(Arc::new(opa::Opa::new(config, http_client.clone())?))),
         "mesh_outbound_registry" => Ok(Some(Arc::new(
             mesh::outbound_registry::OutboundRegistry::new(config)?,

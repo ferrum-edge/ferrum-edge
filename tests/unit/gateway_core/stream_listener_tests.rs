@@ -11,6 +11,7 @@ use ferrum_edge::config::types::{
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::load_balancer::LoadBalancerCache;
+use ferrum_edge::modes::mesh::config::MeshConfig;
 use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::proxy::client_ip::TrustedProxies;
 use ferrum_edge::proxy::stream_listener::{StreamListenerDegradation, StreamListenerManager};
@@ -2163,4 +2164,85 @@ impl rustls::server::ResolvesServerCert for NoopCertResolver {
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
         None
     }
+}
+
+fn config_with_sidecar_bind(proxy: Proxy, port: u16, bind: IpAddr) -> GatewayConfig {
+    let mut mesh = MeshConfig::default();
+    mesh.sidecar_ingress_bind_overrides.insert(port, bind);
+    GatewayConfig {
+        proxies: vec![proxy],
+        mesh: Some(Box::new(mesh)),
+        ..empty_config()
+    }
+}
+
+/// A dedicated Sidecar ingress bind-address change must register as listener
+/// drift and rebind — port/scheme alone are not enough restart identity.
+#[tokio::test]
+async fn test_reconcile_restarts_on_dedicated_bind_address_change() {
+    let port = ephemeral_port().await;
+    let first: IpAddr = "127.0.0.1".parse().expect("ip");
+    let second: IpAddr = "127.0.0.2".parse().expect("ip");
+    let proxy = create_stream_proxy("tcp-bind-rebind", BackendScheme::Tcp, port);
+    let config = config_with_sidecar_bind(proxy.clone(), port, first);
+    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
+    let manager = create_manager_with_config_arc(config_arc.clone(), &config);
+
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "initial dedicated-bind listener should start: {failures:?}"
+    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("initial dedicated-bind listener should bind");
+    assert_eq!(
+        manager.active_binds().await,
+        vec![(
+            format!(
+                "{}|tcp-bind-rebind",
+                ferrum_edge::config::types::default_namespace()
+            ),
+            first
+        )]
+    );
+
+    // Prove the old address is reachable before the rebind.
+    tokio::net::TcpStream::connect((first, port))
+        .await
+        .expect("pre-rebind connect to first bind must succeed");
+
+    config_arc.store(Arc::new(config_with_sidecar_bind(proxy, port, second)));
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "bind-address restart should wait for the old socket before probing: {failures:?}"
+    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("rebound dedicated-bind listener should bind");
+    assert_eq!(
+        manager.active_binds().await,
+        vec![(
+            format!(
+                "{}|tcp-bind-rebind",
+                ferrum_edge::config::types::default_namespace()
+            ),
+            second
+        )],
+        "bind-address drift must rebind the live stream listener"
+    );
+
+    // Old ownership must be gone; new ownership must accept.
+    assert!(
+        tokio::net::TcpStream::connect((first, port)).await.is_err(),
+        "old dedicated bind must not keep accepting after rebind"
+    );
+    tokio::net::TcpStream::connect((second, port))
+        .await
+        .expect("new dedicated bind must accept after rebind");
+
+    manager.shutdown_all().await;
 }

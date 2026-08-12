@@ -423,6 +423,15 @@ pub struct MeshSlice {
     pub declared_ingress_http_ports: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mesh_policies: Vec<MeshPolicy>,
+    /// Admitted mesh-wide external authorization providers (issue #3235).
+    ///
+    /// Carried on every slice that retains at least one `PolicyAction::Custom`
+    /// rule, so the data plane can bind `spec.provider.name` without a second
+    /// lookup surface. The set is authored ONLY from the Istio root namespace,
+    /// so narrowing never has to consider tenant namespaces — a workload can
+    /// only ever reach a provider the mesh operator declared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ext_authz_providers: Vec<crate::modes::mesh::config::MeshExtAuthzProvider>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peer_authentications: Vec<PeerAuthentication>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -752,6 +761,14 @@ impl MeshSlice {
             // single-listener pass-through.
             && self.declared_ingress_http_ports == other.declared_ingress_http_ports
             && self.mesh_policies == other.mesh_policies
+            // The ext-authz provider set decides whether a CUSTOM policy binds
+            // at all, and it flips independently of `mesh_policies` (an
+            // operator editing only `meshConfig.extensionProviders` leaves
+            // every policy byte-identical). Omitting it from slice equality
+            // would let MeshSubscribe/update dedupe suppress the frame, so the
+            // DP would keep calling a retired provider — or keep denying a
+            // CUSTOM policy whose provider was just repaired.
+            && self.ext_authz_providers == other.ext_authz_providers
             && self.peer_authentications == other.peer_authentications
             && self.service_entries == other.service_entries
             && self.request_authentications == other.request_authentications
@@ -1793,6 +1810,30 @@ impl MeshSlice {
         // happens once per slice; the alternative (reordering field
         // initialization) is fragile across future struct changes.
         let request_namespace = request.namespace;
+        // Issue #3235: carry ONLY the ext-authz providers the retained CUSTOM
+        // policies actually bind. The declared set is mesh-wide root-namespace
+        // configuration, so narrowing it to the referenced names keeps an
+        // unrelated tenant's provider endpoint (and any operator-authored
+        // check headers on it) off this workload's slice entirely. A CUSTOM
+        // policy whose provider is absent here DENIES at runtime — the
+        // narrowing is a projection of what the policy set already named, so
+        // it can never remove a provider a retained policy needs.
+        let ext_authz_providers: Vec<crate::modes::mesh::config::MeshExtAuthzProvider> = {
+            let referenced: BTreeSet<&str> = mesh_policies
+                .iter()
+                .flat_map(|policy| policy.rules.iter())
+                .filter_map(|rule| rule.action.custom_provider())
+                .collect();
+            if referenced.is_empty() {
+                Vec::new()
+            } else {
+                mesh.ext_authz_providers
+                    .iter()
+                    .filter(|provider| referenced.contains(provider.name.as_str()))
+                    .cloned()
+                    .collect()
+            }
+        };
         let waypoint_gateway_class = request.waypoint_name.as_deref().and_then(|name| {
             mesh.waypoint_bindings
                 .iter()
@@ -1828,6 +1869,7 @@ impl MeshSlice {
             sidecar_ingress_declared,
             declared_ingress_http_ports,
             mesh_policies,
+            ext_authz_providers,
             peer_authentications,
             service_entries,
             request_authentications,
@@ -4621,6 +4663,7 @@ mod tests {
             sidecar_ingress_declared: false,
             declared_ingress_http_ports: 0,
             mesh_policies: vec![make_policy("p1", "ns", PolicyScope::MeshWide)],
+            ext_authz_providers: Vec::new(),
             peer_authentications: vec![make_peer_auth("pa1", "ns", None)],
             service_entries: vec![make_service_entry("se1", "ns", vec!["*".into()])],
             destination_rules: Vec::new(),

@@ -569,8 +569,12 @@ runtime tool staging, the release publication workflow, the live fixture, and
 related docs. When relevant, the job builds the lib and functional test binaries
 (without running them as the invoking user), preflights `unshare` /
 `iptables` / `ip6tables` / TPROXY primitives, then runs
-`tests/k8s/ambient_host_udp_live/run.sh` as root with
-`FERRUM_LIVE_TESTS_REQUIRED=1`. The fixture exercises the production
+`tests/k8s/ambient_host_udp_live/run.sh` as root inside an explicit hosted
+disposable outer network + private mount namespace (`unshare --mount --net`,
+#3804) with a fresh read-only sysfs view tied to the owned network namespace and
+`FERRUM_LIVE_TESTS_REQUIRED=1`. The runner itself also creates a structurally
+proven disposable outer netns for every ordinary root execution so ad-hoc runs
+share the same ownership boundary. The fixture exercises the production
 `ProxyHostUdpBackend` path: multi-veth dual-stack TPROXY delivery, original
 destination recovery, ingress-ifindex attribution, transparent replies,
 restart/cleanup ownership, and explicit negative cases. Skips under required

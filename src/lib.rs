@@ -2804,6 +2804,211 @@ pub mod _test_support {
         crate::proxy::websocket_backend_tls_sni_unsupported(proxy)
     }
 
+    /// Drive the Unix backend pool's HTTP/1.1 check-in with a hook that runs
+    /// BETWEEN the two halves of its withdrawal fence (issue #3731).
+    ///
+    /// `between_fence_reads` runs after the pre-insert generation read and
+    /// before the insert, which is the one interleaving that defeats a
+    /// single-shot fence: a check-in that observed a live generation, then a
+    /// publication that bumps the generation and completes its retirement pass,
+    /// then the insert. Production `checkin_h1` is this same function with an
+    /// empty closure, so a test through here exercises the production path
+    /// rather than a parallel one.
+    #[cfg(unix)]
+    pub fn checkin_unix_h1_with_publication_between(
+        pool: &crate::proxy::unix_backend_pool::UnixBackendConnectionPool,
+        checkout: crate::proxy::unix_backend_pool::UnixH1Checkout,
+        between_fence_reads: impl FnOnce(),
+    ) {
+        pool.checkin_h1_fenced(checkout, between_fence_reads, || {});
+    }
+
+    /// Drive the same production check-in with a hook that runs AFTER the
+    /// insert and after its shard guard is released, but BEFORE the fence's
+    /// post-insert cleanup (issue #3764).
+    ///
+    /// That is the visibility window a two-read fence cannot close on its own:
+    /// the entry is in the idle map, still stamped with the superseded
+    /// generation, and a concurrent checkout could otherwise pop it and adopt
+    /// it under the caller's own generation.
+    #[cfg(unix)]
+    pub fn checkin_unix_h1_with_checkout_after_insert(
+        pool: &crate::proxy::unix_backend_pool::UnixBackendConnectionPool,
+        checkout: crate::proxy::unix_backend_pool::UnixH1Checkout,
+        between_fence_reads: impl FnOnce(),
+        after_insert: impl FnOnce(),
+    ) {
+        pool.checkin_h1_fenced(checkout, between_fence_reads, after_insert);
+    }
+
+    /// Drive the production h2c checkout with hooks around the point where the
+    /// shared carrier enters the map: `before_publish` runs after the live-set
+    /// read and before the insert (the h2c twin of `checkin_h1_fenced`'s
+    /// `between_fence_reads`, so a publication can land in the one window that
+    /// still lets a superseded carrier reach the shared map), and
+    /// `after_publish` observes the resulting window in which that carrier is
+    /// visible but must not be handed out — the h2c half of the H1 fence
+    /// regression (issue #3764).
+    #[cfg(unix)]
+    pub async fn checkout_unix_h2c_with_publication_hooks(
+        pool: &crate::proxy::unix_backend_pool::UnixBackendConnectionPool,
+        proxy: &crate::config::types::Proxy,
+        socket_path: &str,
+        connect_timeout_ms: u64,
+        allowed_roots: &[String],
+        allowed_uids: &[u32],
+        publish_seams: (impl FnOnce(), impl FnOnce()),
+    ) -> Result<
+        crate::proxy::mesh_mtls_pool::MeshMtlsSender,
+        crate::proxy::unix_backend::UnixBackendError,
+    > {
+        pool.checkout_h2c_fenced(
+            proxy,
+            socket_path,
+            connect_timeout_ms,
+            allowed_roots,
+            allowed_uids,
+            publish_seams,
+        )
+        .await
+    }
+
+    /// Drive the production HTTP/1.1 checkout with a hook awaited AFTER the
+    /// client handshake and BEFORE the connection's driver is registered with
+    /// the pool's shutdown tracker (issue #3764).
+    ///
+    /// That is the one interleaving the shutdown boundary must survive: a
+    /// checkout that passed the pool's closed-latch gate while the pool was
+    /// still open, and reaches registration after a concurrent
+    /// `shutdown_drain` latched it. Production `checkout_h1` is this same
+    /// function with a ready future.
+    #[cfg(unix)]
+    pub async fn checkout_unix_h1_with_registration_seam<F, Fut>(
+        pool: &crate::proxy::unix_backend_pool::UnixBackendConnectionPool,
+        proxy: &crate::config::types::Proxy,
+        socket_path: &str,
+        connect_timeout_ms: u64,
+        allowed_roots: &[String],
+        allowed_uids: &[u32],
+        before_register: F,
+    ) -> Result<
+        crate::proxy::unix_backend_pool::UnixH1Checkout,
+        crate::proxy::unix_backend::UnixBackendError,
+    >
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        pool.checkout_h1_seamed(
+            proxy,
+            socket_path,
+            connect_timeout_ms,
+            allowed_roots,
+            allowed_uids,
+            before_register,
+        )
+        .await
+    }
+
+    /// The h2c half of [`checkout_unix_h1_with_registration_seam`]: the same
+    /// pre-registration hook on the shared-carrier cold path, so both wire
+    /// protocols prove the shutdown latch/registration race rather than one
+    /// standing in for the other.
+    #[cfg(unix)]
+    pub async fn checkout_unix_h2c_with_registration_seam<F, Fut>(
+        pool: &crate::proxy::unix_backend_pool::UnixBackendConnectionPool,
+        proxy: &crate::config::types::Proxy,
+        socket_path: &str,
+        connect_timeout_ms: u64,
+        allowed_roots: &[String],
+        allowed_uids: &[u32],
+        before_register: F,
+    ) -> Result<
+        crate::proxy::mesh_mtls_pool::MeshMtlsSender,
+        crate::proxy::unix_backend::UnixBackendError,
+    >
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        pool.checkout_h2c_with_registration_seam(
+            proxy,
+            socket_path,
+            connect_timeout_ms,
+            allowed_roots,
+            allowed_uids,
+            before_register,
+        )
+        .await
+    }
+
+    /// Drive the production Unix-pool shutdown drain with a hook awaited AFTER
+    /// both shutdown latches are set — the driver tracker's registration latch
+    /// and the pool's checkout/check-in latch — and BEFORE any pooled carrier
+    /// is retired or any driver is drained (issue #3764).
+    ///
+    /// That interval is the one a racing establishment used to be able to
+    /// register inside. Production `shutdown_drain` is this same function with a
+    /// ready future.
+    #[cfg(unix)]
+    pub async fn shutdown_unix_pool_with_latch_seam<F, Fut>(
+        pool: &crate::proxy::unix_backend_pool::UnixBackendConnectionPool,
+        driver_budget: std::time::Duration,
+        reap_budget: std::time::Duration,
+        after_latch: F,
+    ) where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        pool.shutdown_drain_seamed(
+            driver_budget,
+            reap_budget,
+            || std::future::ready(()),
+            after_latch,
+        )
+        .await;
+    }
+
+    /// Drive the same production shutdown drain with a hook awaited BETWEEN the
+    /// two shutdown latches: after the driver tracker's registration latch is
+    /// closed under its map lock, and BEFORE the pool's `shutting_down` store is
+    /// published (issue #3764).
+    ///
+    /// This is the only point that can distinguish the required ordering from
+    /// its reverse. Inside this hook a registration must already be refused
+    /// while `shutdown_latch_published()` still reads false; under a pool-first
+    /// order the same point would find the pool latched and the tracker still
+    /// adopting drivers. Production `shutdown_drain` passes a ready future here.
+    #[cfg(unix)]
+    pub async fn shutdown_unix_pool_with_inter_latch_seam<B, BFut>(
+        pool: &crate::proxy::unix_backend_pool::UnixBackendConnectionPool,
+        driver_budget: std::time::Duration,
+        reap_budget: std::time::Duration,
+        between_latches: B,
+    ) where
+        B: FnOnce() -> BFut,
+        BFut: std::future::Future<Output = ()>,
+    {
+        pool.shutdown_drain_seamed(driver_budget, reap_budget, between_latches, || {
+            std::future::ready(())
+        })
+        .await;
+    }
+
+    /// Ask the PRODUCTION shared-h2c selector whether it would hand a pooled
+    /// carrier to a request for this identity right now. Read-only; never
+    /// dials.
+    #[cfg(unix)]
+    pub fn unix_pool_shared_h2c_selector_yields_carrier(
+        pool: &crate::proxy::unix_backend_pool::UnixBackendConnectionPool,
+        proxy: &crate::config::types::Proxy,
+        socket_path: &str,
+        allowed_roots: &[String],
+        allowed_uids: &[u32],
+    ) -> bool {
+        pool.shared_h2c_selector_yields_carrier(proxy, socket_path, allowed_roots, allowed_uids)
+    }
+
     pub use crate::proxy::tcp_proxy::{
         StreamCopyResult, StreamIoSide, relay_failure_is_client_facing,
     };

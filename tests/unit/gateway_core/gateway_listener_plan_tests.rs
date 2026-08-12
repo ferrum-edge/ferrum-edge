@@ -10,12 +10,14 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use chrono::Utc;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
+use ferrum_edge::modes::mesh::config::MeshConfig;
 use ferrum_edge::proxy::gateway_listener::{
-    GatewayListenerClass, GatewayListenerFailureReason, GatewayListenerPlan,
-    GatewayListenerProtocolFailure,
+    DesiredGatewayListener, GatewayListenerClass, GatewayListenerFailureReason,
+    GatewayListenerPlan, GatewayListenerProtocolFailure,
 };
 
 const PORT: u16 = 9000;
+const DEFAULT_BIND: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
 
 fn http_proxy(id: &str, port: u16) -> Proxy {
     let proxy: Proxy = serde_json::from_value(serde_json::json!({
@@ -105,7 +107,27 @@ fn plan_for(proxies: Vec<Proxy>) -> GatewayListenerPlan {
         ..GatewayConfig::default()
     };
     config.resolve_dispatch_kind();
-    GatewayListenerPlan::from_config(&config, &HashSet::new(), &BTreeMap::new(), false)
+    GatewayListenerPlan::from_config(
+        &config,
+        &HashSet::new(),
+        &BTreeMap::new(),
+        DEFAULT_BIND,
+        false,
+    )
+}
+
+fn plan_with_frontends(
+    mut config: GatewayConfig,
+    existing_frontends: BTreeMap<u16, GatewayListenerClass>,
+) -> GatewayListenerPlan {
+    config.resolve_dispatch_kind();
+    GatewayListenerPlan::from_config(
+        &config,
+        &HashSet::new(),
+        &existing_frontends,
+        DEFAULT_BIND,
+        false,
+    )
 }
 
 fn tls_plan_for(proxies: Vec<Proxy>, http3_enabled: bool) -> GatewayListenerPlan {
@@ -117,7 +139,13 @@ fn tls_plan_for(proxies: Vec<Proxy>, http3_enabled: bool) -> GatewayListenerPlan
     config
         .http_tls_listen_ports
         .insert((ferrum_edge::config::types::default_namespace(), PORT));
-    GatewayListenerPlan::from_config(&config, &HashSet::new(), &BTreeMap::new(), http3_enabled)
+    GatewayListenerPlan::from_config(
+        &config,
+        &HashSet::new(),
+        &BTreeMap::new(),
+        DEFAULT_BIND,
+        http3_enabled,
+    )
 }
 
 #[test]
@@ -128,8 +156,8 @@ fn http_and_udp_stream_may_share_numeric_port() {
     ]);
 
     assert_eq!(
-        plan.ports.get(&PORT),
-        Some(&GatewayListenerClass::Plaintext)
+        plan.ports.get(&PORT).map(|d| d.class),
+        Some(GatewayListenerClass::Plaintext)
     );
     assert!(
         !plan.refused.contains_key(&PORT),
@@ -151,8 +179,8 @@ fn http_and_dtls_stream_may_share_numeric_port() {
     ]);
 
     assert_eq!(
-        plan.ports.get(&PORT),
-        Some(&GatewayListenerClass::Plaintext)
+        plan.ports.get(&PORT).map(|d| d.class),
+        Some(GatewayListenerClass::Plaintext)
     );
     assert!(
         !plan.refused.contains_key(&PORT),
@@ -172,7 +200,10 @@ fn http3_and_udp_stream_refuses_quic_only() {
         true,
     );
 
-    assert_eq!(plan.ports.get(&PORT), Some(&GatewayListenerClass::Tls));
+    assert_eq!(
+        plan.ports.get(&PORT).map(|desired| desired.class),
+        Some(GatewayListenerClass::Tls)
+    );
     assert!(
         !plan.refused.contains_key(&PORT),
         "UDP must not refuse the TCP half: {:?}",
@@ -203,7 +234,10 @@ fn http3_and_dtls_stream_refuses_quic_only() {
         true,
     );
 
-    assert_eq!(plan.ports.get(&PORT), Some(&GatewayListenerClass::Tls));
+    assert_eq!(
+        plan.ports.get(&PORT).map(|desired| desired.class),
+        Some(GatewayListenerClass::Tls)
+    );
     assert!(
         !plan.refused.contains_key(&PORT),
         "DTLS must not refuse the TCP half: {:?}",
@@ -225,7 +259,10 @@ fn https_and_udp_stream_may_share_numeric_port_when_http3_is_disabled() {
         false,
     );
 
-    assert_eq!(plan.ports.get(&PORT), Some(&GatewayListenerClass::Tls));
+    assert_eq!(
+        plan.ports.get(&PORT).map(|d| d.class),
+        Some(GatewayListenerClass::Tls)
+    );
     assert!(
         !plan.refused.contains_key(&PORT),
         "disabled HTTP/3 owns no UDP socket: {:?}",
@@ -303,7 +340,13 @@ fn process_global_same_class_frontend_is_already_served_with_udp_present() {
     let mut existing = BTreeMap::new();
     existing.insert(PORT, GatewayListenerClass::Tls);
 
-    let plan = GatewayListenerPlan::from_config(&config, &HashSet::new(), &existing, true);
+    let plan = GatewayListenerPlan::from_config(
+        &config,
+        &HashSet::new(),
+        &existing,
+        DEFAULT_BIND,
+        true,
+    );
 
     assert!(
         plan.ports.is_empty(),
@@ -340,9 +383,105 @@ fn quic_udp_collision_is_numeric_port_not_address_family() {
         ],
         true,
     );
-    assert_eq!(plan.ports.get(&PORT), Some(&GatewayListenerClass::Tls));
+    assert_eq!(
+        plan.ports.get(&PORT).map(|desired| desired.class),
+        Some(GatewayListenerClass::Tls)
+    );
     assert_eq!(
         plan.quic_refused.get(&PORT),
         Some(&GatewayListenerProtocolFailure::UdpStreamCollision)
+    );
+}
+
+#[test]
+fn dedicated_sidecar_bind_is_carried_in_desired_identity() {
+    let loopback: IpAddr = "127.0.0.1".parse().expect("ip");
+    let mut mesh = MeshConfig::default();
+    mesh.sidecar_ingress_bind_overrides.insert(PORT, loopback);
+    let config = GatewayConfig {
+        proxies: vec![http_proxy("http-gw", PORT)],
+        mesh: Some(Box::new(mesh)),
+        ..GatewayConfig::default()
+    };
+    let plan = plan_with_frontends(config, BTreeMap::new());
+    assert_eq!(
+        plan.ports.get(&PORT),
+        Some(&DesiredGatewayListener {
+            class: GatewayListenerClass::Plaintext,
+            bind_addr: loopback,
+            mesh_direction: Some(ferrum_edge::modes::mesh::MeshTrafficDirection::Inbound),
+        })
+    );
+}
+
+#[test]
+fn dedicated_sidecar_tls_bind_is_refused_with_a_bounded_reason() {
+    let loopback: IpAddr = "127.0.0.1".parse().expect("ip");
+    let mut mesh = MeshConfig::default();
+    mesh.sidecar_ingress_bind_overrides.insert(PORT, loopback);
+    let mut config = GatewayConfig {
+        proxies: vec![http_proxy("https-gw", PORT)],
+        mesh: Some(Box::new(mesh)),
+        ..GatewayConfig::default()
+    };
+    config
+        .http_tls_listen_ports
+        .insert((ferrum_edge::config::types::default_namespace(), PORT));
+
+    let plan = plan_with_frontends(config, BTreeMap::new());
+    assert!(!plan.ports.contains_key(&PORT));
+    let refusal = plan.refused.get(&PORT).expect("refusal");
+    assert_eq!(
+        refusal.reason,
+        GatewayListenerFailureReason::DedicatedBindTlsUnsupported
+    );
+    assert!(refusal.message.contains("plaintext HTTP-family"));
+}
+
+#[test]
+fn same_class_process_global_frontend_is_already_served_without_dedicated_bind() {
+    let config = GatewayConfig {
+        proxies: vec![http_proxy("http-gw", PORT)],
+        ..GatewayConfig::default()
+    };
+    let mut existing = BTreeMap::new();
+    existing.insert(PORT, GatewayListenerClass::Plaintext);
+    let plan = plan_with_frontends(config, existing);
+    assert_eq!(
+        plan.already_served.get(&PORT),
+        Some(&GatewayListenerClass::Plaintext)
+    );
+    assert!(!plan.ports.contains_key(&PORT));
+    assert!(!plan.refused.contains_key(&PORT));
+}
+
+#[test]
+fn dedicated_bind_cannot_be_absorbed_by_process_global_same_class_frontend() {
+    let loopback: IpAddr = "127.0.0.1".parse().expect("ip");
+    let mut mesh = MeshConfig::default();
+    mesh.sidecar_ingress_bind_overrides.insert(PORT, loopback);
+    let config = GatewayConfig {
+        proxies: vec![http_proxy("http-gw", PORT)],
+        mesh: Some(Box::new(mesh)),
+        ..GatewayConfig::default()
+    };
+    let mut existing = BTreeMap::new();
+    existing.insert(PORT, GatewayListenerClass::Plaintext);
+    let plan = plan_with_frontends(config, existing);
+    assert!(
+        !plan.already_served.contains_key(&PORT),
+        "dedicated bind must not widen onto the global frontend: {:?}",
+        plan.already_served
+    );
+    assert!(!plan.ports.contains_key(&PORT));
+    let reason = plan.refused.get(&PORT).expect("refusal");
+    assert_eq!(
+        reason.reason,
+        GatewayListenerFailureReason::DedicatedBindConflict
+    );
+    assert!(
+        reason.message.contains("dedicated Sidecar ingress bind"),
+        "refusal must name dedicated-bind isolation: {}",
+        reason.message
     );
 }

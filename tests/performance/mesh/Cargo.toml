@@ -19,6 +19,12 @@ ferrum-edge = { path = "../../.." }
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["plotters", "html_reports"] }
 serde_json = "1"
+# SYNC: keep aligned with the root Cargo.toml. `unix_backend_pool` drives the
+# production Unix connection pool, which is async and binds real Unix-domain
+# sockets, so the bench needs a runtime and a temp dir.
+chrono = { version = "0.4", features = ["serde"] }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
 
 # Standalone manifests do not inherit the root crate's patch table. Keep these
 # overrides synchronized with the root Cargo.toml so the benchmark builds the
@@ -57,6 +63,10 @@ harness = false
 
 [[bench]]
 name = "ai_semantic_cache_cleanup"
+harness = false
+
+[[bench]]
+name = "unix_backend_pool"
 harness = false
 
 [profile.dev]

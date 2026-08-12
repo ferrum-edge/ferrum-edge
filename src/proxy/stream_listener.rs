@@ -89,6 +89,10 @@ struct ListenerHandle {
     shutdown_tx: watch::Sender<bool>,
     join_handle: JoinHandle<()>,
     listen_port: u16,
+    /// Exact OS bind address this listener was started with. Part of restart
+    /// identity so a dedicated Sidecar ingress bind change retires the old
+    /// socket instead of leaving it running indefinitely.
+    bind_addr: IpAddr,
     scheme: BackendScheme,
     frontend_tls: bool,
     passthrough: bool,
@@ -779,6 +783,11 @@ struct DesiredStreamListener {
     /// produced it.
     identity: NamespacedResourceId,
     port: u16,
+    /// Exact OS bind address derived from the reconcile's `current_config`
+    /// (dedicated Sidecar ingress override or the manager default). Carried
+    /// through preflight and task startup so spawn never reloads config for
+    /// the bind after desired-state construction.
+    bind_addr: IpAddr,
     scheme: BackendScheme,
     frontend_tls: bool,
     passthrough: bool,
@@ -1819,6 +1828,7 @@ impl StreamListenerManager {
                 DesiredStreamListener {
                     identity: identity.clone(),
                     port: entry.port,
+                    bind_addr: self.resolve_bind_addr(&current_config, entry.port),
                     scheme: entry.scheme,
                     frontend_tls: entry.frontend_tls,
                     passthrough: entry.passthrough,
@@ -1841,6 +1851,7 @@ impl StreamListenerManager {
                     DesiredStreamListener {
                         identity: representative.clone(),
                         port: entry.port,
+                        bind_addr: self.resolve_bind_addr(&current_config, entry.port),
                         scheme: entry.scheme,
                         frontend_tls: entry.frontend_tls,
                         passthrough: entry.passthrough,
@@ -1861,6 +1872,7 @@ impl StreamListenerManager {
                     DesiredStreamListener {
                         identity: representative.clone(),
                         port: entry.port,
+                        bind_addr: self.resolve_bind_addr(&current_config, entry.port),
                         scheme: entry.scheme,
                         frontend_tls: entry.frontend_tls,
                         passthrough: false,
@@ -1927,6 +1939,7 @@ impl StreamListenerManager {
             let Some(DesiredStreamListener {
                 identity,
                 port,
+                bind_addr,
                 scheme,
                 frontend_tls,
                 passthrough,
@@ -1943,6 +1956,7 @@ impl StreamListenerManager {
             // (e.g. a port move with broken TLS material must still release
             // the old port).
             let identity_changed = handle.listen_port != *port
+                || handle.bind_addr != *bind_addr
                 || handle.scheme != *scheme
                 || handle.frontend_tls != *frontend_tls
                 || handle.passthrough != *passthrough
@@ -2052,6 +2066,7 @@ impl StreamListenerManager {
             let DesiredStreamListener {
                 identity,
                 port,
+                bind_addr,
                 scheme,
                 frontend_tls,
                 passthrough,
@@ -2131,8 +2146,10 @@ impl StreamListenerManager {
             // Pre-check port availability before spawning the listener task.
             // This catches EADDRINUSE early with a clear error rather than having
             // the spawned task fail silently in the background.
-            let bind_addr = self.bind_addr;
+            // Use the bind carried on the desired listener — never reload config
+            // for the address after desired-state construction.
             let port_val = *port;
+            let bind_addr = *bind_addr;
             let probe_addr = std::net::SocketAddr::new(bind_addr, port_val);
             let probe_result = if scheme.is_udp() {
                 tokio::net::UdpSocket::bind(probe_addr).await.map(drop)
@@ -2517,6 +2534,7 @@ impl StreamListenerManager {
                     shutdown_tx,
                     join_handle,
                     listen_port: *port,
+                    bind_addr,
                     scheme: *scheme,
                     frontend_tls: *frontend_tls,
                     passthrough: *passthrough,
@@ -2671,6 +2689,28 @@ impl StreamListenerManager {
     pub fn active_backend_session_estimate(&self) -> u64 {
         let entries = self.stream_backend_metrics.load();
         active_backend_session_estimate_from_entries(&entries)
+    }
+
+    /// `(listener_key, bind_addr)` pairs currently owned by this manager.
+    #[allow(dead_code)] // Test / introspection surface.
+    pub async fn active_binds(&self) -> Vec<(String, IpAddr)> {
+        let listeners = self.listeners.lock().await;
+        let mut out: Vec<_> = listeners
+            .iter()
+            .map(|(key, handle)| (key.clone(), handle.bind_addr))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Resolve the OS bind address for `port` from the reconcile generation's
+    /// config (dedicated Sidecar ingress override or the manager default).
+    fn resolve_bind_addr(&self, config: &GatewayConfig, port: u16) -> IpAddr {
+        config
+            .mesh
+            .as_ref()
+            .and_then(|mesh| mesh.sidecar_ingress_bind_override(port))
+            .unwrap_or(self.bind_addr)
     }
 
     /// Wait until all currently configured stream listeners have successfully

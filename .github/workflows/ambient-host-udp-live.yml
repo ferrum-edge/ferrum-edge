@@ -249,7 +249,23 @@ jobs:
           FERRUM_HOST_UDP_LIB_TEST_BIN: ${{ steps.build_test_bin.outputs.lib_test_bin }}
           FERRUM_HOST_UDP_FUNCTIONAL_TEST_BIN: ${{ steps.build_test_bin.outputs.functional_test_bin }}
           FERRUM_HOST_UDP_LIVE_RESULTS: ${{ github.workspace }}/target/ambient-host-udp-live
-        run: sudo -E tests/k8s/ambient_host_udp_live/run.sh
+        run: |
+          set -euo pipefail
+          # Explicit hosted disposable outer network-namespace boundary (#3804).
+          # Composes with PR #3800: the trusted relevance / `changes` job above
+          # is untouched; only this live execution step is wrapped. run.sh also
+          # creates its own proven disposable outer netns for every ordinary
+          # root execution (including ad-hoc), so isolation does not depend on
+          # a forgeable environment flag.
+          sudo -E unshare --net -- bash -c '
+            set -euo pipefail
+            ip link set lo up
+            if [[ -w /proc/sys/net/ipv6/conf/all/disable_ipv6 ]]; then
+              printf 0 > /proc/sys/net/ipv6/conf/all/disable_ipv6 || true
+            fi
+            ip -6 link set lo up 2>/dev/null || true
+            exec "$1"
+          ' bash tests/k8s/ambient_host_udp_live/run.sh
 
       - name: Upload bounded diagnostics
         if: always()

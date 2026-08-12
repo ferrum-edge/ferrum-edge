@@ -1903,6 +1903,32 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_mesh_ext_authz_check_failures_total",
+    "type": "counter",
+    "help": "Failed CUSTOM external authorization checks by how the failure was resolved.",
+    "labels": [
+      "disposition",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_ext_authz_checks_total",
+    "type": "counter",
+    "help": "Istio AuthorizationPolicy CUSTOM external authorization check outcomes.",
+    "labels": [
+      "outcome",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_mesh_federation_bundle_age_seconds",
     "type": "gauge",
     "help": "Age of the cached federated trust bundle, in seconds.",

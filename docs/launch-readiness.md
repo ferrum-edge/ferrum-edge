@@ -11,6 +11,7 @@ in `PRODUCTION_READINESS.md`.
 |-------|------|
 | [`docs/launch-blocker-policy.json`](launch-blocker-policy.json) | Machine-readable blocker contract: labels, tiers, state machine, tracked inventory, private-advisory redaction rules and freshness ceiling |
 | [`docs/launch-exemptions.json`](launch-exemptions.json) | Structured, expiring exemptions (owner, approver, rationale, compensating control, expiry) |
+| Live repository labels API | Existence proof for every configured blocker/exemption/severity label, checked before any issue listing is trusted |
 | Live GitHub issues API (paginated) | Open/closed state, `state_reason`, labels, linked in-flight PRs |
 | Live repository security-advisories API (paginated) | Private/draft blockers as a **redacted count only**, when a dedicated advisory token is available |
 | Repository Actions variables `LAUNCH_PRIVATE_BLOCKER_COUNT` / `LAUNCH_PRIVATE_ADVISORY_AS_OF` | Externally maintained redacted count and audit timestamp used when no advisory token is available |
@@ -26,17 +27,83 @@ policy file defines only the freshness ceiling; a count or an as-of value inside
 it is rejected by schema validation precisely because a pull request could edit
 it.
 
+## The label vocabulary
+
+The policy names five repository labels — `launch-blocker`, `launch-exempted`,
+and `severity:{critical,high,medium}` — and they are the authoritative
+classifier. Free-form issue titles and bodies are **never** parsed as
+classification input.
+
+The Issues API answers `labels=launch-blocker` with an empty list in two very
+different situations: the label exists and no issue carries it, and the label
+does not exist at all. It can also transiently return an empty set when a label
+is renamed away and back during the request. Treating those cases as clean is
+fail-open. The checker therefore calls
+`GET /repos/{owner}/{repo}/labels/{name}` before and after discovery, requires an
+exact case-sensitive name plus a stable unique id, and walks the unfiltered
+all-state issue inventory. Blockers are selected by the verified immutable id;
+every in-page id/name pair must still agree. GitHub resolves label lookups
+case-insensitively, so a case-only rename is caught rather than accepted, while
+the identity fences catch deletion/recreation and rename-roundtrip races.
+
+- Missing definition ⇒ `UNKNOWN` (`label_inventory:configured label … is not
+  defined in repository metadata`).
+- Renamed definition ⇒ `UNKNOWN` (`label_inventory:… resolves to a differently
+  named repository label`).
+- Malformed label payload ⇒ `UNKNOWN` (`schema:…`).
+- Denial, rate limit, or transport failure ⇒ `UNKNOWN` under its own
+  `denied` / `rate_limit` / `api` code, never reported as an absent label.
+- Label proven present and the inventory is empty ⇒ that empty set is real and
+  may contribute to `PASS`.
+
+Only the checked-in configured label names are echoed into the reason; nothing
+from the API response body reaches the record.
+
+Two policy roles may not share one repository label: `validate_policy` rejects a
+policy whose blocker, exemption, and severity names are not pairwise distinct,
+because a shared name would satisfy the existence proof while leaving the
+vocabulary ambiguous.
+
+Provisioning and backfilling these labels is repository-settings work performed
+outside this tree by a maintainer. The production vocabulary was provisioned and
+the open severity-classified launch inventory was backfilled on 2026-08-11.
+Deleting or renaming any definition returns the gate to `UNKNOWN`, which is the
+correct fail-closed answer — not a `PASS`.
+
 ## Classification
 
-1. **Label discovery:** the whole `launch-blocker` label set is walked with
-   pagination. Pull-request nodes are excluded. Each remaining issue must carry
-   exactly one configured `severity:{critical,high,medium}` label; zero, several,
-   or malformed severity is `UNKNOWN`, never a silent omission.
+1. **Label discovery:** after the vocabulary is proven to exist, the whole
+   all-state issue inventory is walked with pagination. The immutable
+   blocker-label id selects the authoritative set. Pull-request nodes are
+   excluded. Each remaining issue must carry exactly one configured
+   `severity:{critical,high,medium}` label; zero, several, or an unconfigured
+   severity-shaped label is `UNKNOWN`, never a silent omission. A newly filed
+   blocker with one valid severity is discovered without editing the policy.
+   Closed issues are included because `duplicate`, `not_planned`, and a missing
+   close reason remain blocking until the issue is completed or explicitly
+   exempted; an `open`-only walk would silently drop them.
+   Because this walk is unfiltered, its size tracks the whole repository history
+   rather than the blocker set, so it reads against its own page and body
+   ceilings (`MAX_INVENTORY_PAGES`, `MAX_INVENTORY_RESPONSE_BYTES`) instead of
+   the shared defaults, which ordinary repository growth would otherwise turn
+   into a permanent `pagination` or size-cap `UNKNOWN`. Both ceilings still fail
+   closed: an exhausted bound is `UNKNOWN`, never a truncated inventory.
 2. **Tracked inventory:** `tracked_blockers` in the policy is an explicit,
-   CODEOWNERS-reviewed list evaluated even before labels are applied. The tracked
-   severity is the contract: a live severity label that disagrees with it is a
-   schema mismatch (`UNKNOWN`), never a downgrade or a silent replacement. A
-   matching label is accepted; an absent label uses the tracked severity.
+   CODEOWNERS-reviewed list, kept as defense in depth against a labeling
+   mistake. It is never the only functioning inventory: the labeled walk above
+   always runs, and an unavailable label vocabulary is `UNKNOWN` rather than
+   being masked by the tracked list. The tracked severity is the contract: a
+   live severity label that disagrees with it is a schema mismatch (`UNKNOWN`),
+   never a downgrade or a silent replacement. Every open tracked blocker must
+   carry the blocker label and exactly one matching severity label; the tracked
+   severity never substitutes for missing live classification.
+   Drift between the two sources is detected rather than tolerated: an **open**
+   tracked blocker that does not carry the `launch-blocker` label is `UNKNOWN`
+   (`label_drift:tracked blocker #N is open without the launch-blocker label`),
+   so an entry can never sit in a private list outside the labeled inventory. A
+   tracked entry that is already closed needs no label backfill. Entries are
+   added to `tracked_blockers` in the same reviewed change that files the
+   blocker, and are removed only after the issue is closed as completed.
 3. **States:**
    - `open` — blocking
    - `in_flight` — open issue with open implementation PR(s); still blocking
@@ -58,7 +125,7 @@ it.
 |---------|---------|------|
 | `PASS` | No blocking public issues and zero redacted private blockers for the tier | 0 (only when the checked-in snapshot agrees) |
 | `FAIL` | At least one blocking public issue or redacted private blocker | non-zero |
-| `UNKNOWN` | Missing token, API/rate-limit/pagination/schema/staleness failure | non-zero |
+| `UNKNOWN` | Missing token, absent/renamed label definition, tracked-vs-labeled drift, API/rate-limit/pagination/schema/staleness failure | non-zero |
 
 Only a computed `PASS` can make the hosted job green. A checked-in `FAIL`
 snapshot that agrees with a computed `FAIL` is still a non-zero exit: while real

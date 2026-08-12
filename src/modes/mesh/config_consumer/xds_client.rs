@@ -15,7 +15,7 @@ use super::common::{
 };
 use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret};
 use crate::modes::mesh::config::{
-    AppProtocol, MeshDestinationRule, MeshRuntimeOverlay, MeshService, PolicyAction, PolicyScope,
+    AppProtocol, MeshDestinationRule, MeshRuntimeOverlay, MeshService, PolicyScope,
     PolicyTargetAttachment, ServicePort,
 };
 use crate::modes::mesh::revision::MeshRevisionRejection;
@@ -1454,7 +1454,7 @@ fn reverse_translate(
         }
     }
 
-    Ok(MeshSlice {
+    let slice = MeshSlice {
         node_id: config.node_id.clone(),
         namespace: config.namespace.clone(),
         // Issue #2469: the mesh root namespace rides its own carrier so a
@@ -1567,6 +1567,12 @@ fn reverse_translate(
         // GAP-1a: authorization policies recovered from the MeshPolicies
         // carrier. Without this the xDS mesh had NO authz (implicit allow-all).
         mesh_policies: recovered.mesh_policies,
+        // Issue #3235: ext-authz providers recovered from the ExtAuthzProviders
+        // carrier, already re-validated at the ACK boundary. Without this an
+        // xDS-built slice would carry CUSTOM policies with no provider to bind,
+        // which the runtime denies — the carrier is what keeps xDS and native
+        // materialization at parity.
+        ext_authz_providers: recovered.ext_authz_providers,
         // Gate the CORS carrier exactly like the legacy DR carrier above is
         // gated to the workload namespace: an ECDS carrier is raw producer
         // input that never passed this DP's slice admission, so the
@@ -1625,7 +1631,52 @@ fn reverse_translate(
         // GAP-3E: merged RTDS layers. Empty when no Runtime resources have
         // shipped on this stream.
         runtime_overlay,
-    })
+    };
+    // Issue #3235: the ACK boundary validates the provider carrier in
+    // ISOLATION, which cannot see a cross-carrier incoherence — a
+    // MeshPolicies carrier retaining CUSTOM policies while the
+    // ExtAuthzProviders carrier was withdrawn, or advanced to a set whose
+    // names no longer match, is structurally valid on each side and only
+    // becomes visible once the two are recovered together. Installing such a
+    // generation would replace a working last-good slice with one that denies
+    // every delegated decision at request time, so the COMPLETE binding is
+    // proved here, before the slice is returned: an incoherent recovery is an
+    // error, which NACKs and retains last-good.
+    validate_recovered_ext_authz_binding(&slice)?;
+    Ok(slice)
+}
+
+/// Prove every recovered `PolicyAction::Custom` rule binds a provider the
+/// recovered provider set actually carries.
+///
+/// Diagnostics are field/name-shaped and bounded by
+/// `sanitize_mesh_ext_authz_diagnostic`; a carrier-supplied value is never
+/// echoed unbounded.
+fn validate_recovered_ext_authz_binding(
+    slice: &crate::modes::mesh::slice::MeshSlice,
+) -> Result<(), String> {
+    use crate::modes::mesh::config::sanitize_mesh_ext_authz_diagnostic;
+
+    for policy in &slice.mesh_policies {
+        for rule in &policy.rules {
+            let Some(provider) = rule.action.custom_provider() else {
+                continue;
+            };
+            if !slice
+                .ext_authz_providers
+                .iter()
+                .any(|candidate| candidate.name == provider)
+            {
+                return Err(format!(
+                    "xDS mesh slice recovery: AuthorizationPolicy '{}' in namespace '{}' uses action CUSTOM with external authorization provider '{}', which the recovered ExtAuthzProviders carrier does not declare",
+                    sanitize_mesh_ext_authz_diagnostic(&policy.name),
+                    sanitize_mesh_ext_authz_diagnostic(&policy.namespace),
+                    sanitize_mesh_ext_authz_diagnostic(provider)
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the recovered slice's effective labels for this DP.
@@ -1721,6 +1772,7 @@ struct RecoveredSliceCarriers {
     node_waypoint_capture_destinations: Vec<crate::modes::mesh::config::Workload>,
     node_waypoint_capture_peer_authentications: Vec<crate::modes::mesh::config::PeerAuthentication>,
     mesh_policies: Vec<crate::modes::mesh::config::MeshPolicy>,
+    ext_authz_providers: Vec<crate::modes::mesh::config::MeshExtAuthzProvider>,
     virtual_service_cors_policies: Vec<crate::modes::mesh::config::MeshVirtualServiceCorsPolicy>,
     peer_authentications: Vec<crate::modes::mesh::config::PeerAuthentication>,
     request_authentications: Vec<crate::modes::mesh::config::MeshRequestAuthentication>,
@@ -1769,10 +1821,7 @@ fn validate_waypoint_gateway_class_carrier(
                         matches!(attachment, PolicyTargetAttachment::GatewayClass { .. })
                     })
         );
-        let enforces = policy
-            .rules
-            .iter()
-            .any(|rule| matches!(rule.action, PolicyAction::Allow | PolicyAction::Deny));
+        let enforces = policy.rules.iter().any(|rule| rule.action.is_enforcing());
         targets_gateway_class && enforces
     });
 
@@ -1932,6 +1981,22 @@ fn validate_recognized_mesh_slice_carrier(
                 namespace,
                 &mut errors,
             );
+        }
+        // Issue #3235: an ext-authz provider names where an authorization
+        // decision is delegated to, including the transport it is dialed over.
+        // A carrier is raw producer input that never passed this DP's
+        // admission, so the full fail-closed structural contract
+        // (bounded cardinality, unique names, TLS-or-loopback transport,
+        // bounded timeout/status/headers/body) is re-checked here rather than
+        // trusted. The diagnostic is provider-name-shaped and bounded by
+        // `sanitize_mesh_ext_authz_diagnostic`; it never echoes a header value
+        // or an unbounded endpoint string.
+        MeshSliceCarrier::ExtAuthzProviders(providers) => {
+            if let Err(error) =
+                crate::modes::mesh::config::validate_mesh_ext_authz_providers(providers)
+            {
+                errors.push(format!("xDS ext-authz provider carrier: {error}"));
+            }
         }
         _ => return Ok(()),
     }
@@ -2170,6 +2235,7 @@ fn apply_recovered_carrier(
             recovered.virtual_service_l4_upstreams = value
         }
         MeshSliceCarrier::MeshPolicies(value) => recovered.mesh_policies = value,
+        MeshSliceCarrier::ExtAuthzProviders(value) => recovered.ext_authz_providers = value,
         MeshSliceCarrier::VirtualServiceCorsPolicies(value) => {
             recovered.virtual_service_cors_policies = value
         }
@@ -4884,6 +4950,125 @@ mod tests {
         )
     }
 
+    // ── Issue #3235: CUSTOM policy ↔ ext-authz provider cross-carrier binding ──
+    //
+    // The ACK boundary validates the provider carrier in ISOLATION and cannot
+    // see an incoherent PAIR. These pin the post-recovery binding proof, which
+    // is the only place a withdrawn or renamed provider beside retained CUSTOM
+    // policies can be caught before the slice replaces last-good.
+
+    fn ext_authz_provider_json(name: &str) -> String {
+        format!(
+            r#"{{"name":"{name}","service":"127.0.0.1","port":9000,"timeout_ms":250,"status_on_error":403}}"#
+        )
+    }
+
+    fn ext_authz_providers_carrier_resource(providers_json: &str) -> proto::Any {
+        use crate::xds::carrier::{
+            FERRUM_ECDS_EXT_AUTHZ_PROVIDERS_TYPE_URL, carrier_resource_name_for_type_url,
+        };
+        let name = carrier_resource_name_for_type_url(FERRUM_ECDS_EXT_AUTHZ_PROVIDERS_TYPE_URL)
+            .expect("ext-authz provider carrier has a reserved resource name");
+        typed_extension_resource(
+            name,
+            FERRUM_ECDS_EXT_AUTHZ_PROVIDERS_TYPE_URL,
+            providers_json.as_bytes().to_vec(),
+        )
+    }
+
+    fn custom_policy_carrier_resource(provider: &str) -> proto::Any {
+        use crate::xds::carrier::{
+            FERRUM_ECDS_MESH_POLICIES_TYPE_URL, carrier_resource_name_for_type_url,
+        };
+        let name = carrier_resource_name_for_type_url(FERRUM_ECDS_MESH_POLICIES_TYPE_URL)
+            .expect("mesh-policy carrier has a reserved resource name");
+        let policies = format!(
+            r#"[{{"name":"delegate-admin","namespace":"default","scope":{{"kind":"mesh_wide"}},"rules":[{{"action":{{"custom":{{"provider":"{provider}"}}}}}}]}}]"#
+        );
+        typed_extension_resource(
+            name,
+            FERRUM_ECDS_MESH_POLICIES_TYPE_URL,
+            policies.as_bytes().to_vec(),
+        )
+    }
+
+    #[test]
+    fn reverse_translation_recovers_a_coherent_custom_policy_and_provider_pair() {
+        let mut accumulator = primed_accumulator();
+        accumulator
+            .apply_sotw_response(
+                ECDS_TYPE_URL,
+                &[
+                    custom_policy_carrier_resource("sample-ext-authz"),
+                    ext_authz_providers_carrier_resource(&format!(
+                        "[{}]",
+                        ext_authz_provider_json("sample-ext-authz")
+                    )),
+                ],
+                "v1",
+            )
+            .expect("coherent carriers apply");
+        let slice = accumulator
+            .try_build_mesh_slice(&test_config())
+            .expect("a coherent recovery builds a slice")
+            .expect("required versions are coherent");
+        assert_eq!(slice.mesh_policies.len(), 1);
+        assert_eq!(
+            slice
+                .ext_authz_providers
+                .iter()
+                .map(|provider| provider.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sample-ext-authz"]
+        );
+    }
+
+    #[test]
+    fn reverse_translation_rejects_custom_policies_with_no_provider_carrier() {
+        // The provider carrier was withdrawn (or never emitted) while the
+        // MeshPolicies carrier still retains CUSTOM policies. Each carrier is
+        // structurally valid on its own, so only the cross-field proof catches
+        // it — and installing this generation would deny every delegated
+        // decision at request time.
+        let mut accumulator = primed_accumulator();
+        accumulator
+            .apply_sotw_response(
+                ECDS_TYPE_URL,
+                &[custom_policy_carrier_resource("sample-ext-authz")],
+                "v1",
+            )
+            .expect("carriers apply at the ACK boundary");
+        let error = accumulator
+            .try_build_mesh_slice(&test_config())
+            .expect_err("an incoherent recovery must NACK and retain last-good");
+        assert!(
+            error.contains("sample-ext-authz") && error.contains("does not declare"),
+            "the diagnostic must name the unbound provider: {error}"
+        );
+    }
+
+    #[test]
+    fn reverse_translation_rejects_a_provider_carrier_whose_names_no_longer_match() {
+        let mut accumulator = primed_accumulator();
+        accumulator
+            .apply_sotw_response(
+                ECDS_TYPE_URL,
+                &[
+                    custom_policy_carrier_resource("sample-ext-authz"),
+                    ext_authz_providers_carrier_resource(&format!(
+                        "[{}]",
+                        ext_authz_provider_json("renamed-ext-authz")
+                    )),
+                ],
+                "v1",
+            )
+            .expect("carriers apply at the ACK boundary");
+        let error = accumulator
+            .try_build_mesh_slice(&test_config())
+            .expect_err("a name mismatch is as incoherent as a withdrawal");
+        assert!(error.contains("sample-ext-authz"), "got: {error}");
+    }
+
     fn root_namespace_carrier_resource(namespace: &str) -> proto::Any {
         use crate::xds::carrier::{
             FERRUM_ECDS_ISTIO_ROOT_NAMESPACE_TYPE_URL, carrier_resource_name_for_type_url,
@@ -5221,6 +5406,7 @@ mod tests {
                 endpoint_unix_h2c: false,
                 owner_namespace: "default".to_string(),
                 owner_service: "api".to_string(),
+                bind: None,
             }],
             sidecar_ingress_declared: true,
             // F6 §6.2 (codex round-4 P2): the DECLARED HTTP-family ingress port

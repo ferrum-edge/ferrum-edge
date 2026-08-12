@@ -338,6 +338,10 @@ impl ServeHandles {
             )
             .await;
         }
+        // Release backend transport pools that hold kernel objects (issue
+        // #3731): after the bounded in-flight drain, no further request may be
+        // served, so idle sidecar-ingress Unix carriers must not outlive it.
+        self.proxy_state.drain_transport_pools_for_shutdown().await;
         let mut background_handles = self.background_handles;
         background_handles.extend(self.proxy_state.health_checker.take_active_check_handles());
         join_background_handles(background_handles, self.background_drain_timeout).await;

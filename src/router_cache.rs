@@ -137,13 +137,24 @@ struct PortScopedProxy {
     proxy: Arc<Proxy>,
     listen_port: Option<u16>,
     listen_port_tls: bool,
+    /// Dedicated Sidecar ingress `bind` routes own an exclusive OS listener
+    /// (issue #3266). They must never ride the single-listener Service remap
+    /// onto another frontend — that would beat the port-agnostic capture
+    /// sibling on `:15006` / process-global binds, then fail the bind-route
+    /// exact-port gate and 502 mesh peers. Capture stays port-agnostic.
+    allow_service_remap: bool,
 }
 
 impl PortScopedProxy {
     /// Rank this candidate against the request frontend. See
     /// [`port_match_priority`].
     fn match_priority(&self, ctx: HttpPortMatchContext) -> Option<u8> {
-        port_match_priority(self.listen_port, self.listen_port_tls, ctx)
+        port_match_priority(
+            self.listen_port,
+            self.listen_port_tls,
+            self.allow_service_remap,
+            ctx,
+        )
     }
 
     fn new(proxy: Arc<Proxy>, tls_listen_ports: &BTreeSet<(String, u16)>) -> Self {
@@ -157,10 +168,13 @@ impl PortScopedProxy {
             // build time (once per config publication), not the request path.
             tls_listen_ports.contains(&(proxy.namespace.clone(), port))
         });
+        let allow_service_remap =
+            !crate::modes::mesh::is_mesh_ingress_bind_route_id(proxy.id.as_str());
         Self {
             proxy,
             listen_port,
             listen_port_tls,
+            allow_service_remap,
         }
     }
 }
@@ -173,6 +187,7 @@ impl PortScopedProxy {
 fn port_match_priority(
     listen_port: Option<u16>,
     listen_port_tls: bool,
+    allow_service_remap: bool,
     ctx: HttpPortMatchContext<'_>,
 ) -> Option<u8> {
     let Some(port) = listen_port else {
@@ -192,7 +207,12 @@ fn port_match_priority(
     if ctx.frontend_port == Some(port) {
         return Some(0);
     }
-    // Single-listener protocol remap (Service-fronted topology).
+    // Single-listener protocol remap (Service-fronted topology). Dedicated
+    // Sidecar ingress binds are excluded: exclusive OS ownership must not
+    // widen onto `:15006` / process-global frontends (#3266).
+    if !allow_service_remap {
+        return None;
+    }
     let single_for_class = if ctx.frontend_is_tls {
         ctx.single_tls_listen_port
     } else {
@@ -416,7 +436,9 @@ pub(crate) struct HostRouteTable {
 /// replaces pending with a decided refusal set only after reconciling that same
 /// config generation. The decided set includes both pre-bind admission
 /// refusals and OS bind failures so neither can expose a listener-scoped route
-/// through Service-fronted remapping.
+/// through Service-fronted remapping. This also preserves the dedicated
+/// Sidecar-ingress boundary: a failed loopback bind cannot widen onto the
+/// process-global frontend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GatewayListenerAdmission {
     pending: bool,
@@ -3037,10 +3059,16 @@ impl RouterCache {
         // exactly one listen port of that class, so a remapped request can only
         // ever have meant one listener. Classified per proxy from its own
         // `(namespace, listen_port)` entry, never from the bare port number.
+        // Dedicated Sidecar ingress `bind` routes are excluded: a lone
+        // loopback bind must not arm Service remap (issue #3266) — that would
+        // steal `:15006` / process-global matches from the capture sibling.
         let mut nontls_ports: BTreeSet<u16> = BTreeSet::new();
         let mut tls_ports: BTreeSet<u16> = BTreeSet::new();
         for proxy in &config.proxies {
             if proxy.dispatch_kind.is_stream() {
+                continue;
+            }
+            if crate::modes::mesh::is_mesh_ingress_bind_route_id(proxy.id.as_str()) {
                 continue;
             }
             let Some(port) = proxy.listen_port else {
@@ -5842,6 +5870,7 @@ mod tests {
                         endpoint_unix_h2c: false,
                         owner_namespace: "default".to_string(),
                         owner_service: "reviews".to_string(),
+                        bind: None,
                     },
                     ResolvedIngressListener {
                         port: 8443,
@@ -5852,6 +5881,7 @@ mod tests {
                         endpoint_unix_h2c: false,
                         owner_namespace: "default".to_string(),
                         owner_service: "reviews".to_string(),
+                        bind: None,
                     },
                 ],
                 ..MeshConfig::default()
@@ -5922,6 +5952,7 @@ mod tests {
                     endpoint_unix_h2c: false,
                     owner_namespace: "default".to_string(),
                     owner_service: "reviews".to_string(),
+                    bind: None,
                 }],
                 ..MeshConfig::default()
             })),
@@ -6021,6 +6052,7 @@ mod tests {
                     endpoint_unix_h2c: false,
                     owner_namespace: "default".to_string(),
                     owner_service: "reviews".to_string(),
+                    bind: None,
                 }],
                 // Operator declared TWO HTTP-family ingress ports; only one
                 // resolved. The declared count must drive the router.

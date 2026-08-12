@@ -3123,6 +3123,7 @@ paths:
                           - mesh_telemetry
                           - mesh_proxy_configs
                           - extension_configs
+                          - ext_authz_providers
                         properties:
                           workloads: { type: integer, minimum: 0 }
                           services: { type: integer, minimum: 0 }
@@ -3135,6 +3136,7 @@ paths:
                           mesh_telemetry: { type: integer, minimum: 0 }
                           mesh_proxy_configs: { type: integer, minimum: 0 }
                           extension_configs: { type: integer, minimum: 0 }
+                          ext_authz_providers: { type: integer, minimum: 0 }
                       fingerprint:
                         type: string
                         pattern: "^sha256-[0-9a-f]{64}$"
@@ -3402,6 +3404,7 @@ paths:
                         mesh_telemetry: 2
                         mesh_proxy_configs: 1
                         extension_configs: 0
+                        ext_authz_providers: 1
                       fingerprint: "sha256-9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
                       source_protocol: native
                       source_cp_url: "grpcs://cp-primary.mesh.svc.cluster.local:50051"
@@ -3455,6 +3458,7 @@ paths:
                         mesh_telemetry: 0
                         mesh_proxy_configs: 0
                         extension_configs: 0
+                        ext_authz_providers: 0
                       source_protocol: native
                       source_cp_url: "grpcs://cp-primary.mesh.svc.cluster.local:50051"
                     revision:
@@ -12997,6 +13001,23 @@ components:
         pool_handshakes_total: { type: object, additionalProperties: { type: integer, format: uint64 } }
         pool_evictions_total: { type: object, additionalProperties: { type: integer, format: uint64 } }
         pool_failures_total: { type: object, additionalProperties: { type: integer, format: uint64 } }
+        unix_backend_pool:
+          type: object
+          description: >-
+            Sidecar-ingress Unix-domain backend connection pool accounting. Fixed
+            cardinality: one object for the whole pool, never per target. Counters
+            are monotonic; the three connection fields are gauges.
+          properties:
+            hits: { type: integer, format: uint64, description: "Checkouts served by an already-admitted pooled carrier" }
+            misses: { type: integer, format: uint64, description: "Checkouts that had to establish a new physical connection" }
+            physical_connects: { type: integer, format: uint64, description: "Physical connections established" }
+            identity_retirements: { type: integer, format: uint64, description: "Carriers retired by socket replacement or config withdrawal" }
+            setup_failures: { type: integer, format: uint64, description: "Connect or protocol-handshake failures" }
+            checkout_failures: { type: integer, format: uint64, description: "Gateway-side checkout refusals: path admission, the per-target Unix ingress connection bound, and the shutdown latch" }
+            idle_h1_connections: { type: integer, format: uint64, description: "Idle HTTP/1.1 carriers currently pooled" }
+            active_h2c_connections: { type: integer, format: uint64, description: "Shared h2c carriers currently pooled" }
+            open_physical_connections: { type: integer, format: uint64, description: "Physical connections currently open, including checked-out carriers" }
+            withdrawal_fenced_checkins: { type: integer, format: uint64, description: "Carriers the publication fence refused to re-pool" }
         tcp_rst_observed:
           type: object
           properties:

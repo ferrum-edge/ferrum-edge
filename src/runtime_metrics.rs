@@ -41,6 +41,8 @@ pub enum PoolKind {
     Hbone,
     /// Sidecar egress SVID-mTLS HTTP/2 pool (`mesh_mtls_pool`).
     MeshMtls,
+    /// Sidecar ingress Unix-domain HTTP/1.1 + h2c pool (`unix_backend_pool`).
+    UnixBackend,
 }
 
 impl PoolKind {
@@ -52,6 +54,7 @@ impl PoolKind {
             Self::Grpc => "grpc",
             Self::Hbone => "hbone",
             Self::MeshMtls => "mesh_mtls",
+            Self::UnixBackend => "unix_backend",
         }
     }
 }
@@ -647,6 +650,10 @@ pub struct ConnectionsSnapshot {
     pub pool_handshakes_total: BTreeMap<&'static str, u64>,
     pub pool_evictions_total: BTreeMap<&'static str, u64>,
     pub pool_failures_total: BTreeMap<&'static str, u64>,
+    /// Sidecar-ingress Unix backend pool counters and connection gauges
+    /// (issue #3731). Bounded and fixed-cardinality: one object for the whole
+    /// pool, never one per target.
+    pub unix_backend_pool: crate::proxy::unix_backend_pool::UnixPoolStats,
     pub tcp_rst_observed: TcpRstSnapshot,
 }
 
@@ -864,6 +871,13 @@ fn build_connections_snapshot(
         pool_handshakes_total: pool_map(&metrics.pool_handshakes_total),
         pool_evictions_total: pool_map(&metrics.pool_evictions_total),
         pool_failures_total: pool_map(&metrics.pool_failures_total),
+        // Sidecar-ingress Unix pool accounting (issue #3731). Read straight off
+        // the pool's own atomics — fixed cardinality, no per-target labels, and
+        // O(1): the gauges are maintained at each insert/removal and at each
+        // connection-driver spawn/completion, so nothing is scanned here.
+        unix_backend_pool: proxy_state
+            .map(|ps| ps.unix_backend_pool.stats())
+            .unwrap_or_default(),
         tcp_rst_observed: tcp_rst_snapshot(metrics),
     }
 }

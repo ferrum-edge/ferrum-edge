@@ -442,13 +442,684 @@ pub(crate) fn is_zero_usize(value: &usize) -> bool {
     *value == 0
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// Istio `AuthorizationPolicy.spec.action`.
+///
+/// Deliberately NOT `Copy`: [`PolicyAction::Custom`] carries the external
+/// authorization provider name it delegates to, so the action and its binding
+/// can never be separated by a partial clone. Evaluation helpers therefore
+/// take `&PolicyAction`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyAction {
     #[default]
     Allow,
     Deny,
     Audit,
+    /// Istio `action: CUSTOM` — delegate the decision to the named
+    /// `meshConfig.extensionProviders` entry.
+    ///
+    /// `provider` is the `spec.provider.name` value, resolved at translation
+    /// time against the root-namespace provider registry. Runtime consumers
+    /// MUST re-resolve it against the live generation's
+    /// [`MeshExtAuthzProvider`] set and DENY when it does not bind — a CUSTOM
+    /// policy that cannot reach its provider is never allowed to fall through
+    /// to the ALLOW/DENY tiers.
+    Custom {
+        provider: String,
+    },
+}
+
+impl PolicyAction {
+    /// Whether this action participates in the allow/deny outcome.
+    ///
+    /// `Audit` is non-enforcing (it only records metadata); everything else,
+    /// including `Custom`, can change whether a request is served.
+    #[inline]
+    pub fn is_enforcing(&self) -> bool {
+        !matches!(self, PolicyAction::Audit)
+    }
+
+    /// The external authorization provider this action delegates to, if any.
+    #[inline]
+    pub fn custom_provider(&self) -> Option<&str> {
+        match self {
+            PolicyAction::Custom { provider } => Some(provider.as_str()),
+            _ => None,
+        }
+    }
+}
+
+// ── External authorization providers (meshConfig.extensionProviders) ──────
+
+/// Upper bound on admitted ext-auth providers carried on one mesh generation.
+pub const MAX_MESH_EXT_AUTHZ_PROVIDERS: usize = 16;
+/// DNS-1123 subdomain ceiling for a provider name / service host.
+pub const MAX_MESH_EXT_AUTHZ_NAME_LEN: usize = 253;
+/// Upper bound on entries in any single provider header list.
+pub const MAX_MESH_EXT_AUTHZ_HEADER_RULES: usize = 32;
+/// Upper bound on a forwarded/returned header name.
+pub const MAX_MESH_EXT_AUTHZ_HEADER_NAME_LEN: usize = 128;
+/// Upper bound on an operator-declared additional header VALUE.
+pub const MAX_MESH_EXT_AUTHZ_HEADER_VALUE_LEN: usize = 1024;
+/// Upper bound on the provider check `pathPrefix`.
+pub const MAX_MESH_EXT_AUTHZ_PATH_PREFIX_LEN: usize = 256;
+/// Default provider check timeout when `timeout` is omitted.
+pub const MESH_EXT_AUTHZ_DEFAULT_TIMEOUT_MS: u64 = 1_000;
+/// Hard ceiling on a provider check timeout.
+pub const MESH_EXT_AUTHZ_MAX_TIMEOUT_MS: u64 = 30_000;
+/// Hard ceiling on the number of provider response bytes Ferrum will read.
+pub const MESH_EXT_AUTHZ_MAX_RESPONSE_BYTES: usize = 64 * 1024;
+/// Hard ceiling on `includeRequestBodyInCheck.maxRequestBytes`.
+pub const MESH_EXT_AUTHZ_MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+/// Hard ceiling on concurrent in-flight provider checks per gateway process.
+pub const MESH_EXT_AUTHZ_MAX_CONCURRENT_CALLS: usize = 512;
+/// Default concurrent in-flight provider checks per gateway process.
+pub const MESH_EXT_AUTHZ_DEFAULT_CONCURRENT_CALLS: usize = 128;
+
+/// One admitted Istio `meshConfig.extensionProviders[]` external authorization
+/// provider.
+///
+/// Only the `envoyExtAuthzHttp` shape is representable: Ferrum performs the
+/// check as a bounded HTTP request. `envoyExtAuthzGrpc` and every other
+/// provider variant are refused at admission with a field-specific diagnostic
+/// rather than silently downgraded — an accepted-but-inert CUSTOM policy is a
+/// fail-open authorization gap.
+///
+/// Every field here is already validated and bounded; the runtime precomputes
+/// its client state from this value at config publication and performs no
+/// per-request parsing or formatting of provider identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshExtAuthzProvider {
+    /// `extensionProviders[].name` — the value an `AuthorizationPolicy`
+    /// `spec.provider.name` must equal.
+    pub name: String,
+    /// Resolved check endpoint host (the provider's `service`).
+    pub service: String,
+    /// Resolved check endpoint port.
+    pub port: u16,
+    /// Whether the check is dialed over TLS. Non-loopback providers must set
+    /// this (or be reached over authenticated mesh transport); see
+    /// [`MeshExtAuthzProvider::validate`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tls: bool,
+    /// Istio `pathPrefix`: prefix prepended to the original request path when
+    /// building the check request. Always starts with `/` when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
+    /// Bounded check timeout in milliseconds.
+    pub timeout_ms: u64,
+    /// Istio `failOpen`. Default `false`: a timeout, transport error, or
+    /// malformed response DENIES.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fail_open: bool,
+    /// Istio `statusOnError` — the client-visible status when the check could
+    /// not be completed and `fail_open` is false.
+    pub status_on_error: u16,
+    /// Istio `includeRequestHeadersInCheck` — exact, lowercase request header
+    /// names copied into the check request. Credentials (`authorization`,
+    /// `cookie`) reach the provider only by being named here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include_request_headers_in_check: Vec<String>,
+    /// Istio `includeAdditionalHeadersInCheck` — fixed operator-authored
+    /// headers added to the check request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include_additional_headers_in_check: Vec<MeshExtAuthzHeader>,
+    /// Istio `includeRequestBodyInCheck`. `None` means the check carries no
+    /// request body at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_request_body_in_check: Option<MeshExtAuthzBodyCheck>,
+    /// Istio `headersToUpstreamOnAllow` — provider response headers copied
+    /// onto the backend-bound request when the check allows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers_to_upstream_on_allow: Vec<String>,
+    /// Istio `headersToDownstreamOnDeny` — provider response headers copied
+    /// onto the client-visible denial.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers_to_downstream_on_deny: Vec<String>,
+    /// Istio `headersToDownstreamOnAllow` — provider response headers copied
+    /// onto the client-visible response when the check allows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers_to_downstream_on_allow: Vec<String>,
+}
+
+/// A fixed operator-authored header added to every check request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshExtAuthzHeader {
+    pub name: String,
+    pub value: String,
+}
+
+/// Istio `includeRequestBodyInCheck`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshExtAuthzBodyCheck {
+    /// Maximum number of request body bytes forwarded to the provider.
+    pub max_request_bytes: usize,
+    /// Istio's `allowPartialMessage`. Ferrum refuses `true` at every admission
+    /// boundary: an oversize body is an unconditional client-facing `413`
+    /// before the check runs and is never subject to `failOpen`. Kept on the
+    /// typed model so a hostile/`true` carrier is still deserialized and
+    /// rejected with a field-shaped diagnostic rather than silently dropped.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_partial_message: bool,
+}
+
+/// Hop-by-hop / framing / routing / mesh-identity header names that may never
+/// be forwarded to a provider nor written back from one.
+///
+/// Names are compared after ASCII-lowercasing. `x-ferrum-` prefixed names are
+/// reserved gateway assertions and are refused by prefix, not by exact name.
+const MESH_EXT_AUTHZ_RESERVED_HEADERS: &[&str] = &[
+    "connection",
+    "content-length",
+    "expect",
+    "host",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    // Mesh identity / original-destination signals: rewriting these would let
+    // a provider re-target or re-identify the request.
+    "baggage",
+];
+
+/// Additional names refused for MUTATION (upstream/downstream write-back) but
+/// permitted for read-only inclusion in the check request when the operator
+/// names them explicitly.
+const MESH_EXT_AUTHZ_UNMUTABLE_HEADERS: &[&str] = &["forwarded", "proxy-authorization"];
+
+fn mesh_ext_authz_header_name_is_wellformed(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_MESH_EXT_AUTHZ_HEADER_NAME_LEN
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn mesh_ext_authz_header_is_reserved(lowercase: &str) -> bool {
+    MESH_EXT_AUTHZ_RESERVED_HEADERS.contains(&lowercase)
+        || lowercase.starts_with("x-ferrum-")
+        || lowercase.starts_with("x-forwarded-")
+}
+
+/// Validate a header name that will be COPIED FROM the client request INTO the
+/// provider check request.
+pub fn validate_mesh_ext_authz_forwarded_header(name: &str) -> Result<String, String> {
+    if !mesh_ext_authz_header_name_is_wellformed(name) {
+        return Err(format!(
+            "'{}' is not a valid HTTP header name (RFC 9110 token, at most {MAX_MESH_EXT_AUTHZ_HEADER_NAME_LEN} bytes)",
+            sanitize_mesh_ext_authz_diagnostic(name)
+        ));
+    }
+    let lowercase = name.to_ascii_lowercase();
+    if mesh_ext_authz_header_is_reserved(&lowercase) {
+        return Err(format!(
+            "'{lowercase}' is a hop-by-hop, framing, routing, or gateway-reserved header and cannot be forwarded to an external authorization provider"
+        ));
+    }
+    Ok(lowercase)
+}
+
+/// Validate a header name the provider is allowed to WRITE onto the upstream
+/// request or the client-visible response.
+pub fn validate_mesh_ext_authz_mutable_header(name: &str) -> Result<String, String> {
+    let lowercase = validate_mesh_ext_authz_forwarded_header(name)?;
+    if MESH_EXT_AUTHZ_UNMUTABLE_HEADERS.contains(&lowercase.as_str()) {
+        return Err(format!(
+            "'{lowercase}' controls request provenance or proxy authentication and cannot be mutated by an external authorization provider"
+        ));
+    }
+    Ok(lowercase)
+}
+
+/// Reduce an operator-supplied token to a bounded, control-character-free form
+/// for diagnostics. Provider configuration can embed credentials, so nothing
+/// longer than a short prefix is ever echoed.
+pub fn sanitize_mesh_ext_authz_diagnostic(value: &str) -> String {
+    let mut out: String = value
+        .chars()
+        .take(48)
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect();
+    if value.chars().count() > 48 {
+        out.push('…');
+    }
+    out
+}
+
+/// Validate an `extensionProviders[].service` value as a REAL bare URL host.
+///
+/// The value is concatenated into a URL authority at config publication, so
+/// anything that can change which URL component the remainder lands in has to
+/// be refused HERE, at generation admission — not deferred to a per-request
+/// parse failure that would turn every delegated decision into a fail-closed
+/// denial (or, with `failOpen`, into a silent allow).
+///
+/// Accepted shapes are exactly: a DNS name (RFC 1123 labels, optional trailing
+/// dot), an IPv4 literal, or an IPv6 literal (bracketed or bare). Everything
+/// else — userinfo (`@`), an embedded port (`:` outside an IPv6 literal), a
+/// path/query/fragment (`/`, `?`, `#`), a backslash, percent-encoding, a
+/// bracket imbalance, or the namespace-qualified Istio `namespace/hostname`
+/// syntax — is rejected with a field-shaped diagnostic.
+///
+/// Namespace-qualified `[namespace/]hostname` is DELIBERATELY unsupported:
+/// Ferrum dials the provider directly rather than resolving it through the
+/// mesh's own service registry, so the namespace qualifier has no meaning here
+/// and silently dropping it would dial a different service than the operator
+/// named. Declare the fully qualified host instead.
+pub fn validate_mesh_ext_authz_service_host(service: &str) -> Result<(), String> {
+    if service.is_empty() || service.len() > MAX_MESH_EXT_AUTHZ_NAME_LEN {
+        return Err(format!(
+            "service must be non-empty and at most {MAX_MESH_EXT_AUTHZ_NAME_LEN} bytes"
+        ));
+    }
+    if service.trim() != service {
+        return Err("service must not have surrounding whitespace".to_string());
+    }
+    if service.contains('/') {
+        return Err(
+            "service must be a bare host; namespace-qualified '<namespace>/<hostname>' syntax is \
+             not supported (declare the fully qualified hostname instead)"
+                .to_string(),
+        );
+    }
+    if service.bytes().any(|byte| {
+        byte.is_ascii_whitespace()
+            || byte.is_ascii_control()
+            || !byte.is_ascii()
+            || matches!(
+                byte,
+                b'@' | b'?' | b'#' | b'\\' | b'%' | b'"' | b'\'' | b'<' | b'>'
+            )
+    }) {
+        return Err(
+            "service must be a bare host with no userinfo, query, fragment, escape, or path \
+             component"
+                .to_string(),
+        );
+    }
+    // IPv6 literal, bracketed or bare.
+    if let Some(inner) = service.strip_prefix('[') {
+        let Some(inner) = inner.strip_suffix(']') else {
+            return Err("service IPv6 literal must be fully bracketed".to_string());
+        };
+        return match inner.parse::<std::net::Ipv6Addr>() {
+            Ok(_) => Ok(()),
+            Err(_) => Err("service IPv6 literal is not a valid address".to_string()),
+        };
+    }
+    if service.contains(']') {
+        return Err("service must not contain an unmatched ']'".to_string());
+    }
+    if service.contains(':') {
+        return match service.parse::<std::net::Ipv6Addr>() {
+            Ok(_) => Ok(()),
+            Err(_) => Err(
+                "service must not carry a port or ':' separator; declare the port in \
+                 extensionProviders[].port"
+                    .to_string(),
+            ),
+        };
+    }
+    if service.parse::<std::net::Ipv4Addr>().is_ok() {
+        return Ok(());
+    }
+    // DNS name: RFC 1123 labels, one optional trailing dot.
+    let name = service.strip_suffix('.').unwrap_or(service);
+    if name.is_empty() {
+        return Err("service must be a valid DNS name".to_string());
+    }
+    for label in name.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err("service DNS labels must be 1-63 characters".to_string());
+        }
+        if !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(
+                "service DNS labels may contain only letters, digits, and hyphens".to_string(),
+            );
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err("service DNS labels must not start or end with '-'".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Validate an `extensionProviders[].pathPrefix` as a REAL URL path prefix.
+///
+/// The prefix is concatenated ahead of the request path, so a value carrying
+/// `?`, `#`, `\`, percent-encoding, a dot segment, or a leading `//` could be
+/// reinterpreted by the URL parser — silently sending the check to a path or
+/// component the operator did not name.
+pub fn validate_mesh_ext_authz_path_prefix(prefix: &str) -> Result<(), String> {
+    if !prefix.starts_with('/') {
+        return Err("pathPrefix must start with '/'".to_string());
+    }
+    if prefix.len() > MAX_MESH_EXT_AUTHZ_PATH_PREFIX_LEN {
+        return Err(format!(
+            "pathPrefix must be at most {MAX_MESH_EXT_AUTHZ_PATH_PREFIX_LEN} bytes"
+        ));
+    }
+    if prefix.starts_with("//") {
+        return Err(
+            "pathPrefix must not start with '//': a protocol-relative prefix re-targets the \
+             check at a different authority"
+                .to_string(),
+        );
+    }
+    if prefix.bytes().any(|byte| {
+        byte.is_ascii_control()
+            || byte.is_ascii_whitespace()
+            || !byte.is_ascii()
+            || matches!(byte, b'?' | b'#' | b'\\' | b'%')
+    }) {
+        return Err(
+            "pathPrefix must be printable ASCII with no '?', '#', '\\', or percent-encoding \
+             (those can change how the URL parser interprets the path)"
+                .to_string(),
+        );
+    }
+    if prefix
+        .split('/')
+        .any(|segment| matches!(segment, "." | ".."))
+    {
+        return Err("pathPrefix must not contain a '.' or '..' segment".to_string());
+    }
+    Ok(())
+}
+
+/// Whether a host is a loopback literal, for which plaintext provider
+/// transport is permitted.
+pub fn mesh_ext_authz_host_is_loopback(host: &str) -> bool {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback(),
+        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback(),
+        Err(_) => false,
+    }
+}
+
+impl MeshExtAuthzProvider {
+    /// Fail-closed structural validation applied at EVERY boundary that can
+    /// introduce a provider: the Kubernetes translator, the native/file mesh
+    /// source, and the xDS carrier reverse-translation.
+    ///
+    /// Returns a field-shaped diagnostic that never echoes an unbounded
+    /// operator value.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.name.trim().is_empty() || self.name.len() > MAX_MESH_EXT_AUTHZ_NAME_LEN {
+            return Err(format!(
+                "extensionProviders[].name must be non-empty and at most {MAX_MESH_EXT_AUTHZ_NAME_LEN} bytes"
+            ));
+        }
+        if self.name.trim() != self.name {
+            return Err("extensionProviders[].name must not have surrounding whitespace".into());
+        }
+        validate_mesh_ext_authz_service_host(&self.service).map_err(|error| {
+            format!(
+                "extensionProviders '{}' {error}",
+                sanitize_mesh_ext_authz_diagnostic(&self.name)
+            )
+        })?;
+        if self.port == 0 {
+            return Err(format!(
+                "extensionProviders '{}' port must be between 1 and 65535",
+                sanitize_mesh_ext_authz_diagnostic(&self.name)
+            ));
+        }
+        if !self.tls && !mesh_ext_authz_host_is_loopback(&self.service) {
+            return Err(format!(
+                "extensionProviders '{}' must set an https scheme for a non-loopback external authorization service; plaintext ext-authz would expose the check (and any forwarded credential) to the network",
+                sanitize_mesh_ext_authz_diagnostic(&self.name)
+            ));
+        }
+        if self.timeout_ms == 0 || self.timeout_ms > MESH_EXT_AUTHZ_MAX_TIMEOUT_MS {
+            return Err(format!(
+                "extensionProviders '{}' timeout must be between 1ms and {MESH_EXT_AUTHZ_MAX_TIMEOUT_MS}ms",
+                sanitize_mesh_ext_authz_diagnostic(&self.name)
+            ));
+        }
+        if !(400..=599).contains(&self.status_on_error) {
+            return Err(format!(
+                "extensionProviders '{}' statusOnError must be a 4xx or 5xx status",
+                sanitize_mesh_ext_authz_diagnostic(&self.name)
+            ));
+        }
+        if let Some(prefix) = self.path_prefix.as_deref() {
+            validate_mesh_ext_authz_path_prefix(prefix).map_err(|error| {
+                format!(
+                    "extensionProviders '{}' {error}",
+                    sanitize_mesh_ext_authz_diagnostic(&self.name)
+                )
+            })?;
+        }
+        Self::validate_header_list(
+            &self.name,
+            "includeRequestHeadersInCheck",
+            &self.include_request_headers_in_check,
+            validate_mesh_ext_authz_forwarded_header,
+        )?;
+        // Provider-driven mutation of the BACKEND request or of a SUCCESSFUL
+        // response is refused at admission rather than partially implemented.
+        // Ferrum's ext-authz check runs in the `authorize` phase, before route
+        // dispatch and before every request/response transformer, so a header
+        // written there would be re-ordered against operator-authored rules
+        // differently on each ingress path — a protocol-dependent mutation of
+        // an authenticated request is exactly the class of gap this feature
+        // must not introduce. Refusing is visible and fixable; silently
+        // dropping the field would let an operator believe a token-exchange
+        // contract is in force when it is not.
+        if !self.headers_to_upstream_on_allow.is_empty() {
+            return Err(format!(
+                "extensionProviders '{}' headersToUpstreamOnAllow is not supported: Ferrum does not let an external authorization provider mutate the backend-visible request",
+                sanitize_mesh_ext_authz_diagnostic(&self.name)
+            ));
+        }
+        if !self.headers_to_downstream_on_allow.is_empty() {
+            return Err(format!(
+                "extensionProviders '{}' headersToDownstreamOnAllow is not supported: Ferrum does not let an external authorization provider mutate an allowed response",
+                sanitize_mesh_ext_authz_diagnostic(&self.name)
+            ));
+        }
+        // `headersToDownstreamOnDeny` IS supported: those headers land only on
+        // the gateway-authored denial this plugin itself produces, so there is
+        // no ordering ambiguity and no authenticated request to alter.
+        Self::validate_header_list(
+            &self.name,
+            "headersToDownstreamOnDeny",
+            &self.headers_to_downstream_on_deny,
+            validate_mesh_ext_authz_mutable_header,
+        )?;
+        if self.include_additional_headers_in_check.len() > MAX_MESH_EXT_AUTHZ_HEADER_RULES {
+            return Err(format!(
+                "extensionProviders '{}' includeAdditionalHeadersInCheck supports at most {MAX_MESH_EXT_AUTHZ_HEADER_RULES} entries",
+                sanitize_mesh_ext_authz_diagnostic(&self.name)
+            ));
+        }
+        // Fixed operator headers OVERRIDE both a same-named client header and a
+        // same-named `includeRequestHeadersInCheck` value, so exactly one value
+        // per name must be admitted. Two entries differing only in case would
+        // otherwise make the override winner depend on iteration order, which
+        // an attacker-supplied client header could then sit beside.
+        let mut fixed_names: BTreeSet<String> = BTreeSet::new();
+        for header in &self.include_additional_headers_in_check {
+            let normalized =
+                validate_mesh_ext_authz_forwarded_header(&header.name).map_err(|error| {
+                    format!(
+                        "extensionProviders '{}' includeAdditionalHeadersInCheck {error}",
+                        sanitize_mesh_ext_authz_diagnostic(&self.name)
+                    )
+                })?;
+            if !fixed_names.insert(normalized.clone()) {
+                return Err(format!(
+                    "extensionProviders '{}' includeAdditionalHeadersInCheck declares '{normalized}' more than once (header names are case-insensitive)",
+                    sanitize_mesh_ext_authz_diagnostic(&self.name)
+                ));
+            }
+            if header.name != normalized {
+                return Err(format!(
+                    "extensionProviders '{}' includeAdditionalHeadersInCheck names must be normalized to lowercase ('{normalized}')",
+                    sanitize_mesh_ext_authz_diagnostic(&self.name)
+                ));
+            }
+            if header.value.len() > MAX_MESH_EXT_AUTHZ_HEADER_VALUE_LEN
+                || header
+                    .value
+                    .bytes()
+                    .any(|byte| byte.is_ascii_control() || !byte.is_ascii())
+            {
+                return Err(format!(
+                    "extensionProviders '{}' includeAdditionalHeadersInCheck value for '{}' must be printable ASCII and at most {MAX_MESH_EXT_AUTHZ_HEADER_VALUE_LEN} bytes",
+                    sanitize_mesh_ext_authz_diagnostic(&self.name),
+                    sanitize_mesh_ext_authz_diagnostic(&header.name)
+                ));
+            }
+        }
+        if let Some(body) = self.include_request_body_in_check.as_ref() {
+            if body.max_request_bytes == 0
+                || body.max_request_bytes > MESH_EXT_AUTHZ_MAX_REQUEST_BODY_BYTES
+            {
+                return Err(format!(
+                    "extensionProviders '{}' includeRequestBodyInCheck.maxRequestBytes must be between 1 and {MESH_EXT_AUTHZ_MAX_REQUEST_BODY_BYTES}",
+                    sanitize_mesh_ext_authz_diagnostic(&self.name)
+                ));
+            }
+            // `allowPartialMessage: true` is REFUSED, not approximated.
+            //
+            // Envoy's partial-message mode checks a bounded PREFIX and still
+            // forwards the complete original body upstream. Ferrum's
+            // authorize-phase body is the single pre-`before_proxy` buffer the
+            // proxy will also forward, so honouring the flag would mean either
+            // truncating the backend-visible request (changing what the client
+            // sent) or retaining an unbounded body behind a cap the operator
+            // asked for. Neither is acceptable, and an accepted-but-unreachable
+            // flag is worse than a visible refusal: an operator would believe
+            // large bodies are being checked when the request is really 413ed.
+            if body.allow_partial_message {
+                return Err(format!(
+                    "extensionProviders '{}' includeRequestBodyInCheck.allowPartialMessage is not supported: Ferrum checks the complete buffered body and returns 413 at maxRequestBytes instead of checking a truncated prefix",
+                    sanitize_mesh_ext_authz_diagnostic(&self.name)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_header_list(
+        provider: &str,
+        field: &str,
+        names: &[String],
+        validator: fn(&str) -> Result<String, String>,
+    ) -> Result<(), String> {
+        if names.len() > MAX_MESH_EXT_AUTHZ_HEADER_RULES {
+            return Err(format!(
+                "extensionProviders '{}' {field} supports at most {MAX_MESH_EXT_AUTHZ_HEADER_RULES} entries",
+                sanitize_mesh_ext_authz_diagnostic(provider)
+            ));
+        }
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for name in names {
+            let normalized = validator(name).map_err(|error| {
+                format!(
+                    "extensionProviders '{}' {field} {error}",
+                    sanitize_mesh_ext_authz_diagnostic(provider)
+                )
+            })?;
+            if !seen.insert(normalized.clone()) {
+                return Err(format!(
+                    "extensionProviders '{}' {field} declares '{normalized}' more than once (header names are case-insensitive)",
+                    sanitize_mesh_ext_authz_diagnostic(provider)
+                ));
+            }
+            if *name != normalized {
+                return Err(format!(
+                    "extensionProviders '{}' {field} names must be normalized to lowercase ('{normalized}')",
+                    sanitize_mesh_ext_authz_diagnostic(provider)
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Fail-closed validation that every `PolicyAction::Custom` rule binds a
+/// declared, structurally valid provider.
+///
+/// Runs at the native/file mesh boundary (and therefore on every source that
+/// funnels through `MeshConfig::validate`). The Kubernetes translator already
+/// refuses an unbound CUSTOM policy earlier and with a richer diagnostic; this
+/// is the boundary for hand-authored and xDS-recovered mesh documents, where a
+/// silently unbound CUSTOM policy would otherwise reach the data plane and be
+/// discovered only as a per-request denial.
+pub fn validate_mesh_ext_authz_binding(
+    policies: &[MeshPolicy],
+    providers: &[MeshExtAuthzProvider],
+    errors: &mut Vec<String>,
+) {
+    if let Err(error) = validate_mesh_ext_authz_providers(providers) {
+        errors.push(format!("MeshConfig.ext_authz_providers: {error}"));
+    }
+    for policy in policies {
+        for rule in &policy.rules {
+            let Some(provider) = rule.action.custom_provider() else {
+                continue;
+            };
+            if !providers.iter().any(|candidate| candidate.name == provider) {
+                errors.push(format!(
+                    "AuthorizationPolicy '{}' in namespace '{}' uses action CUSTOM with provider '{}', which is not declared in meshConfig.extensionProviders",
+                    sanitize_mesh_ext_authz_diagnostic(&policy.name),
+                    sanitize_mesh_ext_authz_diagnostic(&policy.namespace),
+                    sanitize_mesh_ext_authz_diagnostic(provider)
+                ));
+            }
+        }
+    }
+}
+
+/// Fail-closed validation of a whole provider set: bounded cardinality, unique
+/// names, and per-provider structural validity.
+pub fn validate_mesh_ext_authz_providers(providers: &[MeshExtAuthzProvider]) -> Result<(), String> {
+    if providers.len() > MAX_MESH_EXT_AUTHZ_PROVIDERS {
+        return Err(format!(
+            "mesh ext-authz providers support at most {MAX_MESH_EXT_AUTHZ_PROVIDERS} entries"
+        ));
+    }
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for provider in providers {
+        provider.validate()?;
+        if !seen.insert(provider.name.as_str()) {
+            return Err(format!(
+                "duplicate mesh ext-authz provider '{}'",
+                sanitize_mesh_ext_authz_diagnostic(&provider.name)
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -2308,18 +2979,15 @@ pub struct MeshSidecarIngress {
     /// Istio `port.name` — informational; preserved for observability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Istio `bind` — the address the listener binds. Ferrum's capture model
-    /// funnels all inbound through the shared `:15006` listener, so a custom
-    /// `bind` does not create a separate OS listener; it is preserved for
-    /// observability and surfaced as a documented limitation when non-default.
-    /// Unix sockets are not valid here (Istio rejects them too).
+    /// Istio `bind` — the IP the listener binds (IPv4 or IPv6). Unix-domain
+    /// sockets are not valid here (Istio rejects them too).
     ///
-    /// **Scope boundary (issue #3266):** arbitrary Sidecar ingress `bind`
-    /// socket materialization is intentionally out of scope for stream-ingress
-    /// modeling (#3260). Supported non-HTTP ingress still requires the shared
-    /// capture-listener contract (orig-dst / authority selects the declared
-    /// listener port). Do not treat a non-default `bind` as opening a dedicated
-    /// socket here.
+    /// **Issue #3266:** omitted / empty / unspecified (`0.0.0.0` / `::`) keep
+    /// the shared capture-listener contract (`:15006`). A supported dedicated
+    /// loopback bind is conflict-checked and materialized as a real OS listener
+    /// through the Gateway/stream ownership path. Unsupported or unrepresentable values
+    /// fail closed at [`Self::resolve`] with a field-specific reason rather
+    /// than being accepted as inert metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind: Option<String>,
     /// Istio `defaultEndpoint` — where inbound traffic is forwarded. Supported
@@ -2429,6 +3097,14 @@ pub struct ResolvedIngressListener {
     /// `owner_namespace`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub owner_service: String,
+    /// Dedicated OS bind IP for this listener (issue #3266).
+    ///
+    /// `None` means the shared capture contract (`:15006` / orig-dst). `Some`
+    /// is a conflict-checked dedicated bind that Gateway/stream listener
+    /// ownership must honor. An untrusted carrier that forges a non-loopback
+    /// address is rejected again at materialization before any socket is claimed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind: Option<std::net::IpAddr>,
 }
 
 /// The typed, routable backend one [`ResolvedIngressListener`] forwards to.
@@ -2483,6 +3159,13 @@ impl ResolvedIngressListener {
     /// external mesh-validation test crate; it is a pure, side-effect-free
     /// validator over already-public fields.
     pub fn endpoint_is_valid(&self, allowed_roots: &[String]) -> bool {
+        // Hostile carriers can forge a non-loopback dedicated bind. Fail closed
+        // here so materialization never claims a socket resolve() would refuse.
+        if let Some(ip) = self.bind
+            && !ip.is_loopback()
+        {
+            return false;
+        }
         self.backend(allowed_roots).is_some()
     }
 
@@ -2598,6 +3281,66 @@ pub enum IngressListenerUnsupported {
     /// field-specific reason rather than materialized into a listener that
     /// would refuse every request at runtime (issue #3261).
     UnixProtocolUnsupported,
+    /// `bind` named a Unix-domain socket. Istio rejects UDS binds on ingress
+    /// listeners; Ferrum fails closed with the same field-specific reason
+    /// rather than accepting inert metadata (issue #3266).
+    UnixBindUnsupported,
+    /// A non-empty `bind` was not a bare IPv4/IPv6 address (hostname,
+    /// `ip:port`, or otherwise unparseable). Empty/whitespace-only values use
+    /// the shared-capture contract.
+    UnparseableBind,
+    /// `bind` named an IP Ferrum cannot represent as a dedicated socket at
+    /// resolve time (not loopback and not the unspecified wildcard that maps
+    /// to shared capture). Such addresses are rejected rather than deferred to
+    /// a later locality guess; resolve never silently accepts an arbitrary IP.
+    BindNotRepresentable,
+}
+
+/// Parsed Istio Sidecar ingress `bind` (issue #3266).
+///
+/// Distinguishes the shared capture contract from a dedicated OS bind so a
+/// custom address is never preserved as inert observability-only metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngressBind {
+    /// Omitted, empty, or unspecified (`0.0.0.0` / `::`) — traffic stays on
+    /// the shared capture / `:15006` listener keyed by declared port.
+    SharedCapture,
+    /// Dedicated loopback IP the runtime must bind.
+    Dedicated(std::net::IpAddr),
+}
+
+impl IngressBind {
+    /// Dedicated bind IP, if any.
+    pub fn dedicated_ip(self) -> Option<std::net::IpAddr> {
+        match self {
+            Self::SharedCapture => None,
+            Self::Dedicated(ip) => Some(ip),
+        }
+    }
+}
+
+/// Parse Istio Sidecar ingress `bind` into a supported ownership class.
+///
+/// Fail closed with field-specific reasons: Unix sockets, hostnames,
+/// `ip:port` forms, and non-loopback / non-unspecified addresses that are not
+/// representable as shared capture or a dedicated loopback socket.
+pub fn parse_ingress_bind(bind: Option<&str>) -> Result<IngressBind, IngressListenerUnsupported> {
+    let Some(raw) = bind.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(IngressBind::SharedCapture);
+    };
+    if raw.starts_with("unix://") || raw.starts_with('/') || raw.starts_with('@') {
+        return Err(IngressListenerUnsupported::UnixBindUnsupported);
+    }
+    match raw.parse::<std::net::IpAddr>() {
+        Ok(ip) if ip.is_unspecified() => Ok(IngressBind::SharedCapture),
+        Ok(ip) if ip.is_loopback() => Ok(IngressBind::Dedicated(ip)),
+        Ok(_) => Err(IngressListenerUnsupported::BindNotRepresentable),
+        Err(_) => {
+            // `ip:port` / `[ip]:port` parse as SocketAddr but are not a bind
+            // address. Anything else (hostname, garbage) is likewise refused.
+            Err(IngressListenerUnsupported::UnparseableBind)
+        }
+    }
 }
 
 /// Which HTTP wire protocol Ferrum speaks to a Unix-stream backend for a given
@@ -2635,6 +3378,9 @@ impl MeshSidecarIngress {
         if self.port == 0 {
             return Err(IngressListenerUnsupported::ZeroPort);
         }
+        // Bind ownership is decided BEFORE endpoint parsing so a malformed
+        // bind cannot be papered over by a valid defaultEndpoint (issue #3266).
+        let bind = parse_ingress_bind(self.bind.as_deref())?.dedicated_ip();
         let (endpoint_host, endpoint_port, endpoint_unix_path, endpoint_unix_h2c) =
             match parse_ingress_default_endpoint(&self.default_endpoint)? {
                 MeshIngressBackend::Loopback { host, port } => (host, port, None, false),
@@ -2665,6 +3411,7 @@ impl MeshSidecarIngress {
             // Stamped by the slice builder once the local service is known.
             owner_namespace: String::new(),
             owner_service: String::new(),
+            bind,
         })
     }
 
@@ -3570,6 +4317,13 @@ pub struct MeshConfig {
     pub services: Vec<MeshService>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mesh_policies: Vec<MeshPolicy>,
+    /// Admitted root-namespace `meshConfig.extensionProviders[]` external
+    /// authorization providers (issue #3235). An `AuthorizationPolicy` with
+    /// `action: CUSTOM` binds to one of these by name; the set is mesh-wide
+    /// (root namespace only), so a workload can never reach a provider
+    /// declared in another tenant's namespace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ext_authz_providers: Vec<MeshExtAuthzProvider>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peer_authentications: Vec<PeerAuthentication>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3666,12 +4420,14 @@ pub struct MeshConfig {
     /// outbound registry / egress scope must not widen to the local service).
     #[serde(skip)]
     pub local_inbound_services: Option<Vec<MeshService>>,
-    /// Runtime-only back-projection of the slice's resolved Sidecar `ingress[]`
-    /// custom inbound listeners (`MeshSlice.local_ingress_listeners`), set by
-    /// mesh preparation. The router's INBOUND per-port sibling grouping and the
-    /// listen-path uniqueness exemption read this (via
-    /// `mesh_ingress_listener_groups`) so they see the same listeners
-    /// `materialize_sidecar_inbound_proxies` materialized. `serde(skip)`: never
+    /// Runtime-only projection of the slice's resolved Sidecar `ingress[]`
+    /// custom inbound listeners after cold-path admission
+    /// (`admit_sidecar_ingress_listeners` via `materialize_sidecar_ingress_listener_proxies`).
+    /// The router's INBOUND per-port sibling grouping, listen-path uniqueness
+    /// exemption, and authenticated CONNECT remap all read this so they see
+    /// the same surviving set the materializer emitted — including dedicated-bind
+    /// conflict rejection (issue #3266), which removes the whole entry rather
+    /// than silently degrading to shared capture / CONNECT. `serde(skip)`: never
     /// operator-settable, never serialized.
     #[serde(skip)]
     pub local_ingress_listeners: Vec<ResolvedIngressListener>,
@@ -3725,6 +4481,16 @@ pub struct MeshConfig {
     /// refused. `serde(skip)`: never operator-settable, never serialized.
     #[serde(skip)]
     pub local_workload_addresses: Vec<std::net::IpAddr>,
+    /// Runtime-only dedicated Sidecar ingress bind ownership (issue #3266).
+    ///
+    /// Populated by ingress materialization for every conflict-checked
+    /// dedicated `bind` that claimed a real OS listener. Gateway and stream
+    /// listener managers consult this map for per-port bind-address overrides
+    /// so ownership stays coordinated with those registries rather than a
+    /// second ad-hoc port table. Cleared / rewritten atomically with each
+    /// accepted slice apply (update and delete withdraw entries). `serde(skip)`.
+    #[serde(skip)]
+    pub sidecar_ingress_bind_overrides: std::collections::BTreeMap<u16, std::net::IpAddr>,
     /// Runtime-only allowlist of external UDP destinations this **EgressGateway**
     /// may relay datagram-over-mesh traffic to (issue #3263). Materialized by
     /// `materialize_egress_gateway_proxies` from `MESH_EXTERNAL` `ServiceEntry`
@@ -3852,8 +4618,8 @@ impl MeshConfig {
     ///    is not permission to remap a sibling replica's (or a bare loopback)
     ///    destination onto our application.
     /// 4. Malformed endpoint / unmodeled protocol / zero port, or a missing
-    ///    owner stamp ⇒ `Deny` (same pair of guards the back-projection
-    ///    chokepoint and the materializer apply).
+    ///    owner stamp ⇒ `Deny` (same admission guards the materializer applies
+    ///    before writing this prepared `local_ingress_listeners` set).
     /// 5. Not stream-family ⇒ `Deny`. An HTTP-family listener is served by its
     ///    materialized `__mesh-ingress-*` HTTP route; a bare byte-stream CONNECT
     ///    naming it is outside the declared contract and is refused rather than
@@ -4038,6 +4804,7 @@ impl Default for MeshConfig {
             workloads: Vec::new(),
             services: Vec::new(),
             mesh_policies: Vec::new(),
+            ext_authz_providers: Vec::new(),
             peer_authentications: Vec::new(),
             service_entries: Vec::new(),
             request_authentications: Vec::new(),
@@ -4060,9 +4827,18 @@ impl Default for MeshConfig {
             declared_ingress_http_ports: 0,
             local_inbound_tcp_routes: Vec::new(),
             local_workload_addresses: Vec::new(),
+            sidecar_ingress_bind_overrides: std::collections::BTreeMap::new(),
             egress_udp_destinations: Vec::new(),
             external_udp_egress_routes: Vec::new(),
         }
+    }
+}
+
+impl MeshConfig {
+    /// Dedicated OS bind IP for Sidecar ingress `bind` ownership on `port`
+    /// (issue #3266), if materialization claimed one.
+    pub fn sidecar_ingress_bind_override(&self, port: u16) -> Option<std::net::IpAddr> {
+        self.sidecar_ingress_bind_overrides.get(&port).copied()
     }
 }
 
@@ -4216,6 +4992,11 @@ impl MeshConfig {
             &mut errors,
         );
         validate_virtual_service_cors_policies(&self.virtual_service_cors_policies, &mut errors);
+        validate_mesh_ext_authz_binding(
+            &self.mesh_policies,
+            &self.ext_authz_providers,
+            &mut errors,
+        );
         errors
     }
 

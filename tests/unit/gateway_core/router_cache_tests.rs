@@ -1736,6 +1736,46 @@ fn port_scoped_siblings_select_by_frontend_port() {
     assert_eq!(exact_plain.proxy.id, "plain");
 }
 
+/// Dedicated Sidecar ingress `bind` routes must not ride single-listener
+/// Service remap onto `:15006` / process-global frontends (issue #3266).
+///
+/// A lone `__mesh-ingress-bind-*` listen_port would otherwise arm
+/// `single_nontls_listen_port`, beat the port-agnostic capture sibling on the
+/// shared inbound listener, then fail the bind-route exact-port gate and 502
+/// mesh peers that should have stayed on the capture path.
+#[test]
+fn dedicated_sidecar_ingress_bind_does_not_service_remap_over_capture() {
+    let host = "reviews.default.svc.cluster.local";
+    let mut capture = test_proxy("__mesh-ingress-default-reviews-8443", "/");
+    capture.hosts = vec![host.into()];
+    capture.listen_port = None;
+    capture.backend_port = 8080;
+
+    let mut dedicated = test_proxy("__mesh-ingress-bind-default-reviews-8443", "/");
+    dedicated.hosts = vec![host.into()];
+    dedicated.listen_port = Some(8443);
+    dedicated.backend_port = 8080;
+
+    let config = test_config(vec![capture, dedicated]);
+    let cache = RouterCache::new(&config, 100);
+
+    let on_shared = cache
+        .find_proxy_on_frontend(Some(host), "/", Some(15006), false)
+        .expect("shared capture frontend must keep the port-agnostic ingress route");
+    assert_eq!(
+        on_shared.proxy.id, "__mesh-ingress-default-reviews-8443",
+        "dedicated bind must not steal :15006 via Service remap"
+    );
+
+    let on_dedicated = cache
+        .find_proxy_on_frontend(Some(host), "/", Some(8443), false)
+        .expect("exact dedicated bind frontend");
+    assert_eq!(
+        on_dedicated.proxy.id, "__mesh-ingress-bind-default-reviews-8443",
+        "dedicated bind still wins on its own OS listener"
+    );
+}
+
 /// A TLS listener on `:443` in one namespace must not reclassify another
 /// namespace's plaintext `:443` route. The classification key is
 /// `(namespace, port)`, resolved once per candidate at table build time.
