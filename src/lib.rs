@@ -2824,10 +2824,13 @@ pub mod _test_support {
     }
 
     /// Drive the production h2c checkout with hooks around the point where the
-    /// shared carrier enters the map: `before_publish` can land a publication
-    /// during the dial, and `after_publish` observes the resulting window in
-    /// which a superseded carrier is visible but must not be handed out — the
-    /// h2c half of the H1 fence regression (issue #3764).
+    /// shared carrier enters the map: `before_publish` runs after the live-set
+    /// read and before the insert (the h2c twin of `checkin_h1_fenced`'s
+    /// `between_fence_reads`, so a publication can land in the one window that
+    /// still lets a superseded carrier reach the shared map), and
+    /// `after_publish` observes the resulting window in which that carrier is
+    /// visible but must not be handed out — the h2c half of the H1 fence
+    /// regression (issue #3764).
     #[cfg(unix)]
     pub async fn checkout_unix_h2c_with_publication_hooks(
         pool: &crate::proxy::unix_backend_pool::UnixBackendConnectionPool,

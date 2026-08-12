@@ -1240,6 +1240,102 @@ async fn a_checkout_in_the_post_insert_window_refuses_the_stale_carrier() {
     .await;
 }
 
+/// A withdraw/re-add of the SAME identity is a DISCONTINUITY, not continuity.
+///
+/// The withdrawal lands while this key has no slot at all, so there is nothing
+/// to tombstone and only the live-set snapshot moves. A check-in that already
+/// passed its live-set read then creates the slot and inserts its
+/// PRE-WITHDRAWAL carrier. The re-add that follows sees a byte-identical
+/// identity tuple under a live key: treating "declared now" as proof of
+/// continuity would restamp that entry to the current generation, and a
+/// checkout racing the losing cleanup would then find a current token and reuse
+/// a carrier from the previous incarnation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_same_identity_readd_refuses_a_carrier_inserted_during_the_absence() {
+    use ferrum_edge::_test_support::checkin_unix_h1_with_checkout_after_insert;
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let peer = HoldingPeer::bind(&socket);
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-readd-discontinuity");
+
+    // A fresh lease captured at the publication generation current now. Nothing
+    // is pooled for this key, so no slot exists for a withdrawal to tombstone.
+    let inflight = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout");
+    assert_eq!(
+        pool.stats().idle_h1_connections,
+        0,
+        "the slotless precondition: this key has no entry to tombstone"
+    );
+
+    let withdrawing = Arc::clone(&pool);
+    let readding = Arc::clone(&pool);
+    let readd_proxy = proxy.clone();
+    let readd_socket = socket.clone();
+    let racing = Arc::clone(&pool);
+    let race_proxy = proxy.clone();
+    let race_socket = socket.clone();
+    let race_roots = roots(&root);
+    let observed_reuse = Arc::new(AtomicUsize::new(usize::MAX));
+    let observed_in_hook = Arc::clone(&observed_reuse);
+
+    checkin_unix_h1_with_checkout_after_insert(
+        &pool,
+        inflight,
+        move || {
+            // The identity is withdrawn AFTER this check-in read the live set.
+            // No slot exists, so no tombstone is installed and the insert below
+            // still creates a default, non-withdrawn slot.
+            withdrawing.retain_live_targets(&std::collections::HashSet::new());
+        },
+        move || {
+            // The exact same identity tuple is declared again while the
+            // superseded entry is visible and the fence's cleanup has not run.
+            readding.retain_live_targets(&live_http1_set(&readd_proxy, &readd_socket));
+            let taken = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(racing.checkout_h1(
+                    &race_proxy,
+                    race_socket.to_str().expect("utf-8"),
+                    race_proxy.backend_connect_timeout_ms,
+                    &race_roots,
+                    &[],
+                ))
+            })
+            .expect("a checkout for the re-added incarnation still succeeds, by dialing");
+            observed_in_hook.store(usize::from(taken.reused()), Ordering::SeqCst);
+        },
+    );
+
+    assert_eq!(
+        observed_reuse.load(Ordering::SeqCst),
+        0,
+        "a re-added incarnation must begin with a freshly admitted carrier: the entry \
+         inserted during the absence may not be restamped into the new generation"
+    );
+    assert_eq!(
+        pool.stats().idle_h1_connections,
+        0,
+        "nothing inserted across the withdraw/re-add discontinuity may stay pooled"
+    );
+    expect_accepts(
+        &peer,
+        2,
+        "the re-added incarnation had to dial its own connection",
+    )
+    .await;
+}
+
 /// The exact-entry removal id still matters: the losing side of the fence must
 /// withdraw ITS entry and never a newer sibling pooled for the same key while
 /// it was racing.
@@ -1369,6 +1465,90 @@ async fn a_publication_that_keeps_an_identity_preserves_its_idle_carrier() {
         "the retained carrier must still be handed out after the publications"
     );
     expect_accepts(&peer, 1, "no publication may force a redial here").await;
+}
+
+/// The withdraw/re-add discontinuity is decided PER IDENTITY. A neighbouring
+/// identity churning through a withdrawal and a re-add must not cost a
+/// continuously-live identity its pooled carrier — the repair may not degenerate
+/// into draining the pool whenever any publication changes anything.
+#[tokio::test]
+async fn a_neighbours_withdraw_and_readd_leaves_a_continuously_live_carrier_pooled() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let peer = HoldingPeer::bind(&socket);
+    let pool = default_pool();
+    // Two proxies over one socket are two distinct identities, so they get two
+    // distinct pool keys and two independent liveness verdicts.
+    let steady = test_proxy("unix-pool-steady-neighbour");
+    let churning = test_proxy("unix-pool-churning-neighbour");
+    let both = {
+        let mut set = live_http1_set(&steady, &socket);
+        set.extend(live_http1_set(&churning, &socket));
+        set
+    };
+
+    for proxy in [&steady, &churning] {
+        let lease = pool
+            .checkout_h1(
+                proxy,
+                socket.to_str().expect("utf-8"),
+                proxy.backend_connect_timeout_ms,
+                &roots(&root),
+                &[],
+            )
+            .await
+            .expect("checkout");
+        pool.checkin_h1(lease);
+    }
+    pool.retain_live_targets(&both);
+    assert_eq!(pool.stats().idle_h1_connections, 2);
+
+    // The neighbour is withdrawn and then re-added under the same tuple.
+    pool.retain_live_targets(&live_http1_set(&steady, &socket));
+    pool.retain_live_targets(&both);
+
+    assert_eq!(
+        pool.stats().idle_h1_connections,
+        1,
+        "the churning identity loses its carrier; the steady one keeps its own"
+    );
+    let reused = pool
+        .checkout_h1(
+            &steady,
+            socket.to_str().expect("utf-8"),
+            steady.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout");
+    assert!(
+        reused.reused(),
+        "a continuously-live identity must still hand out its pooled carrier after a \
+         neighbour's withdrawal and re-add"
+    );
+    let redialed = pool
+        .checkout_h1(
+            &churning,
+            socket.to_str().expect("utf-8"),
+            churning.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout");
+    assert!(
+        !redialed.reused(),
+        "the re-added incarnation must dial afresh rather than inherit the carrier it \
+         held before the withdrawal"
+    );
+    expect_accepts(
+        &peer,
+        3,
+        "two initial dials plus the re-added incarnation's fresh dial",
+    )
+    .await;
 }
 
 /// A request routed by a SUPERSEDED request epoch can still dial a withdrawn
@@ -1600,6 +1780,83 @@ async fn the_h2c_selector_refuses_a_carrier_published_under_a_superseded_generat
         pool.stats().active_h2c_connections,
         0,
         "and the fence's cleanup removes it"
+    );
+}
+
+/// The h2c half of the withdraw/re-add discontinuity. The withdrawal lands
+/// after this publish read the live set and while no h2c slot exists for the
+/// key, so nothing is tombstoned and the superseded carrier still reaches the
+/// shared map. A re-add of the byte-identical identity must not adopt it: the
+/// production selector may not multiplex a new RPC onto a carrier that predates
+/// the absence.
+#[tokio::test]
+async fn the_h2c_publish_is_not_adopted_by_a_same_identity_readd() {
+    use ferrum_edge::_test_support::{
+        checkout_unix_h2c_with_publication_hooks, unix_pool_shared_h2c_selector_yields_carrier,
+    };
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let _peer = SettingsThenClosePeer::bind(&socket, std::time::Duration::from_secs(30));
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-h2c-readd-discontinuity");
+
+    let withdrawing = Arc::clone(&pool);
+    let readding = Arc::clone(&pool);
+    let readd_proxy = proxy.clone();
+    let readd_socket = socket.clone();
+    let observing = Arc::clone(&pool);
+    let observe_proxy = proxy.clone();
+    let observe_socket = socket.clone();
+    let observe_roots = roots(&root);
+    let yielded_after_readd = Arc::new(AtomicUsize::new(usize::MAX));
+    let observed_in_hook = Arc::clone(&yielded_after_readd);
+
+    let sender = checkout_unix_h2c_with_publication_hooks(
+        &pool,
+        &proxy,
+        socket.to_str().expect("utf-8"),
+        proxy.backend_connect_timeout_ms,
+        &roots(&root),
+        &[],
+        (
+            move || {
+                // Withdrawn after this checkout's live-set read, and with no
+                // h2c slot for the key: no tombstone is installed, so the
+                // publish below still creates a slot and inserts.
+                withdrawing.retain_live_targets(&std::collections::HashSet::new());
+            },
+            move || {
+                // The same identity tuple is declared again while the
+                // superseded carrier is visible and the fence cleanup has not
+                // run. It must not become multiplexable.
+                readding.retain_live_targets(&live_h2c_set(&readd_proxy, &readd_socket));
+                let yielded = unix_pool_shared_h2c_selector_yields_carrier(
+                    &observing,
+                    &observe_proxy,
+                    observe_socket.to_str().expect("utf-8"),
+                    &observe_roots,
+                    &[],
+                );
+                observed_in_hook.store(usize::from(yielded), Ordering::SeqCst);
+            },
+        ),
+    )
+    .await
+    .expect("h2c checkout still returns the sender it dialed");
+    drop(sender);
+
+    assert_eq!(
+        yielded_after_readd.load(Ordering::SeqCst),
+        0,
+        "a re-added h2c incarnation must not inherit a carrier published during its \
+         absence, however byte-identical the identity tuple is"
+    );
+    assert_eq!(
+        pool.stats().active_h2c_connections,
+        0,
+        "and nothing from the previous incarnation is left multiplexable"
     );
 }
 

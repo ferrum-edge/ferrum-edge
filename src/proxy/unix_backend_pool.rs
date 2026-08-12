@@ -176,11 +176,16 @@
 //!
 //!    So that an unrelated publication does not throw away every idle carrier
 //!    in the pool, `retain_live_targets` ADVANCES the token of each retained
-//!    entry to the new generation while it holds that entry's shard: an entry
-//!    the pass itself observed under a still-declared identity is, by
-//!    construction, a continuously-live carrier. A token can never run ahead of
-//!    the counter, so a lost update between two concurrent passes only ever
-//!    refuses reuse.
+//!    entry to the new generation while it holds that entry's shard. Being
+//!    observed under a still-declared identity is NOT on its own enough to earn
+//!    that: an identity can be withdrawn and re-added under a byte-identical
+//!    tuple, and a superseded check-in can insert into the gap. The pass
+//!    therefore keeps the PREVIOUS publication's live set and restamps only
+//!    identities declared by BOTH — the continuously-live intersection. An
+//!    identity absent then and declared now is a re-added incarnation, and its
+//!    slot is emptied rather than restamped. A token can never run ahead of the
+//!    counter, so a lost update between two concurrent passes only ever refuses
+//!    reuse.
 //! 3. **The live-set snapshot and withdrawal tombstone.** Publication installs
 //!    a lock-free snapshot of the exact identities it declares. A check-in or
 //!    h2c publish compares the identity already owned by its pool key against
@@ -199,7 +204,8 @@
 //! the shard, and re-reads.
 //!
 //! * *Publication sees the insert.* The retirement pass finds the entry: it
-//!   removes it (withdrawn identity) or advances its token (live identity).
+//!   removes it (withdrawn identity, or an identity re-added after an absence)
+//!   or advances its token (an identity live across both publications).
 //! * *Publication completes before the insert.* The check-in's post-insert
 //!   re-read observes the bump — the shard release/acquire pair orders it — and
 //!   withdraws exactly the entry it inserted, by id, so a losing cleanup can
@@ -210,9 +216,18 @@
 //!   re-stamped into a new request.
 //! * *Same-key withdraw/re-add ABA.* Rule 1 keeps the outstanding lease out
 //!   (its token is two generations stale). Rule 3 keeps a stale-epoch dial's
-//!   late check-in out for as long as the identity is withdrawn, including
-//!   when there was no slot at withdrawal, and the re-add clears an EMPTY slot,
-//!   so the new incarnation cannot inherit a carrier from the old one.
+//!   late check-in out for as long as the identity is withdrawn. The one
+//!   interleaving those two do not cover on their own is a withdrawal with NO
+//!   existing slot — nothing is tombstoned, so a check-in that already passed
+//!   its live-set read can still create a fresh slot and insert its
+//!   pre-withdrawal carrier before its own post-insert fence read runs. The
+//!   re-add is what would have laundered it: the identity tuple is
+//!   byte-identical, so a continuity rule based only on "declared now" would
+//!   restamp that entry to the current generation and a racing checkout would
+//!   accept it before the losing cleanup ran. Rule 2's continuity is therefore
+//!   defined against the PREVIOUS live set: a re-add is a discontinuity even
+//!   when the tuple is unchanged, and it empties the slot instead, so the new
+//!   incarnation cannot inherit a carrier from the old one.
 //! * *Late h2c publish.* `checkout_h2c` publishes its carrier into a shared map
 //!   after a dial that can straddle a publication, so it runs the identical
 //!   sequence: tombstone check, insert with a token, post-insert re-read,
@@ -692,23 +707,58 @@ mod imp {
     }
 
     /// Retire, tombstone, or re-stamp every slot of one map against the newly
-    /// published live set. Returns how many carriers were retired.
+    /// published live set. Returns how many carriers were dropped.
     ///
     /// `generation` is the value the publication just bumped to. Advancing a
     /// retained entry's token happens under the shard guard `retain` holds, so
     /// a concurrent checkout either sees the old token (and refuses) or the new
-    /// one (and the entry really was observed live by this pass).
+    /// one (and the entry really was CONTINUOUSLY live across this pass).
+    ///
+    /// Observing an entry under a currently-declared identity is NOT by itself
+    /// proof that the carrier is continuously live. An identity can be
+    /// withdrawn and re-added under a byte-identical tuple, and a check-in (or
+    /// h2c publish) that captured its generation before the withdrawal can land
+    /// its insertion in between: when the withdrawal pass found no slot for that
+    /// key there is not even a tombstone to refuse the insertion, and the
+    /// inserter's own post-insert fence read has not run yet. Re-stamping that
+    /// entry would republish a PRE-WITHDRAWAL carrier at the current generation,
+    /// and a racing checkout would then see a current token and reuse it — the
+    /// exact laundering the fence exists to prevent.
+    ///
+    /// `previously_live` is the live set the PREVIOUS publication installed, so
+    /// this pass can tell continuity from a same-tuple re-add:
+    ///
+    /// * declared in both sets → continuously live. Re-stamp, so an unrelated
+    ///   publication does not empty the whole pool.
+    /// * absent then, declared now → a RE-ADDED incarnation. The tuple is
+    ///   identical but the lifetime is not, so every entry under it necessarily
+    ///   predates the re-add: drop them and leave the slot empty and
+    ///   un-tombstoned, which is what makes the new incarnation start from a
+    ///   freshly admitted dial.
+    /// * absent now → drop the carriers and tombstone the slot.
+    ///
+    /// `previously_live` is `None` only before the first publication, where
+    /// there is no predecessor absence for an entry to be discontinuous with.
     fn retain_live_slots<T: PooledEntry>(
         map: &DashMap<UnixPoolKey, KeySlot<T>>,
         live: &std::collections::HashSet<UnixTargetIdentity>,
+        previously_live: Option<&std::collections::HashSet<UnixTargetIdentity>>,
         generation: u64,
     ) -> u64 {
         let mut retired = 0u64;
         map.retain(|key, slot| {
-            if live.contains(key.target_identity()) {
+            let identity = key.target_identity();
+            if live.contains(identity) {
+                // A re-add clears the tombstone either way; what differs is
+                // whether the carriers under it may be carried across.
                 slot.withdrawn = false;
-                for entry in &slot.entries {
-                    entry.generation().store(generation, Ordering::Release);
+                if previously_live.is_none_or(|previous| previous.contains(identity)) {
+                    for entry in &slot.entries {
+                        entry.generation().store(generation, Ordering::Release);
+                    }
+                } else {
+                    retired = retired.saturating_add(slot.entries.len() as u64);
+                    slot.entries.clear();
                 }
             } else {
                 retired = retired.saturating_add(slot.entries.len() as u64);
@@ -1893,13 +1943,21 @@ mod imp {
         /// has its entry removed by the pass or observes the new generation on
         /// its post-insert re-read and withdraws exactly its own entry.
         ///
-        /// What the pass does per key is therefore three-way, not two-way:
+        /// What the pass does per key is therefore four-way, not two-way, and
+        /// the split turns on the PREVIOUS publication's live set as well as
+        /// this one's (see `retain_live_slots`):
         ///
-        /// * identity still live → keep the slot and ADVANCE each retained
-        ///   entry's token to the new generation under the shard guard. These
-        ///   are continuously-live idle carriers, observed by this very pass,
-        ///   and they stay reusable — an unrelated publication must not empty
-        ///   the pool.
+        /// * identity live now AND live at the previous publication → keep the
+        ///   slot and ADVANCE each retained entry's token to the new generation
+        ///   under the shard guard. Only these are continuously-live idle
+        ///   carriers, and they stay reusable — an unrelated publication must
+        ///   not empty the pool.
+        /// * identity live now but ABSENT at the previous publication → a
+        ///   re-added incarnation under the same tuple. Drop the carriers and
+        ///   clear the tombstone, leaving the slot empty: a withdraw/re-add is
+        ///   a discontinuity, so anything pooled under the key was inserted by
+        ///   a superseded generation racing the absence and must not be
+        ///   restamped into the new incarnation.
         /// * identity withdrawn → drop the carriers and mark the slot
         ///   withdrawn. The mark survives, because a request routed by a
         ///   superseded epoch can still dial this target afterwards and would
@@ -1920,7 +1978,13 @@ mod imp {
             if config_generation <= *last_generation {
                 return;
             }
-            self.retain_live_targets_inner(live);
+            // The retirement body runs with this lock still held: it reads the
+            // PREVIOUS live snapshot and installs the new one, and those two
+            // steps have to be one step with respect to any other publication,
+            // or two concurrent passes could each see the other's snapshot as
+            // "the previous one" and disagree about which identities were
+            // continuously live.
+            self.retain_live_targets_locked(live);
             *last_generation = config_generation;
         }
 
@@ -1933,20 +1997,37 @@ mod imp {
         /// exercises the same retirement body without minting a request epoch.
         #[allow(dead_code)] // External unit tests call this; production uses the generation-ordered entry point.
         pub fn retain_live_targets(&self, live: &std::collections::HashSet<UnixTargetIdentity>) {
-            self.retain_live_targets_inner(live);
+            // Same serialization as the ordered entry point: the previous-set
+            // read and the new-set store are one step against another
+            // publication. This seam never nests inside the ordered one.
+            let _reconcile = self
+                .last_config_reconcile_generation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.retain_live_targets_locked(live);
         }
 
-        fn retain_live_targets_inner(&self, live: &std::collections::HashSet<UnixTargetIdentity>) {
+        /// The retirement body. The caller MUST hold
+        /// `last_config_reconcile_generation`, which is what linearizes the
+        /// previous-snapshot read against the new-snapshot store.
+        fn retain_live_targets_locked(&self, live: &std::collections::HashSet<UnixTargetIdentity>) {
             let generation = self.advance_publication_generation();
+            // What the LAST publication declared. An identity missing here but
+            // present in `live` is a re-added incarnation, not a continuously
+            // live one, and the slot walk below must not carry its pre-absence
+            // carriers forward. `None` is the pre-first-publication state.
+            let previous_snapshot = self.live_targets.load();
+            let previously_live = previous_snapshot.as_deref();
             // Install the liveness verdict before walking existing slots. A
             // stale-epoch dial that starts after the bump is therefore refused
             // even if no slot existed for the retirement pass to tombstone.
             // If a check-in races the tiny bump/store window, the slot walk
             // that follows observes and removes its insertion.
             self.live_targets.store(Some(Arc::new(live.clone())));
-            let retired_h1 = retain_live_slots(&self.h1_idle, live, generation);
+            let retired_h1 = retain_live_slots(&self.h1_idle, live, previously_live, generation);
             Self::note_pooled_removed(&self.idle_h1_gauge, retired_h1);
-            let retired_h2c = retain_live_slots(&self.h2c_carriers, live, generation);
+            let retired_h2c =
+                retain_live_slots(&self.h2c_carriers, live, previously_live, generation);
             Self::note_pooled_removed(&self.h2c_carrier_gauge, retired_h2c);
             let retired = retired_h1.saturating_add(retired_h2c);
             self.h2c_creation_locks
@@ -2821,11 +2902,16 @@ mod imp {
             let max_idle = self.max_idle_per_key();
             let entry_id = self.next_entry_id.fetch_add(1, Ordering::Relaxed);
             let mut refused_by_tombstone = false;
-            before_publish();
             if !self.target_is_live(&key) {
                 self.record_withdrawal_fenced_checkin();
                 return Ok(sender);
             }
+            // Placed AFTER the live-set read and before the insert, exactly
+            // where `checkin_h1_fenced` places `between_fence_reads`: that is
+            // the window a publication has to win for the post-insert half of
+            // the fence to be the thing that saves us, and the only one in
+            // which a superseded carrier can still reach the shared map.
+            before_publish();
             {
                 let mut slot = self.h2c_carriers.entry(key.clone()).or_default();
                 if slot.withdrawn {
