@@ -31,11 +31,11 @@ target SHA and as-of UTC) whenever the blocker set changes.
   "launch_tier": "ga",
   "private_blockers_redacted_count": 0,
   "counts_by_severity": {
-    "critical": 3,
-    "high": 7,
-    "medium": 13
+    "critical": 1,
+    "high": 9,
+    "medium": 14
   },
-  "notes": "Reviewed snapshot only. The five configured label definitions exist and every open severity-classified launch blocker is backfilled with launch-blocker plus exactly one severity label. Counts reflect the reconciled 2026-08-11 live inventory; #3332 is not launch-classified. Target SHA and as-of UTC come from the workflow's evaluated record; they are deliberately not asserted here."
+  "notes": "Reviewed post-merge snapshot for PR #3806. The five configured label definitions exist and every open severity-classified launch blocker is backfilled with launch-blocker plus exactly one severity label. The 2026-08-12 live inventory is critical 2 / high 9 / medium 14 while #3801 remains open; this snapshot projects its completed closure via PR #3806, leaving critical 1 / high 9 / medium 14. #3332 is not launch-classified. Target SHA and as-of UTC come from the workflow's evaluated record; they are deliberately not asserted here."
 }
 ```
 <!-- launch-readiness:end -->
