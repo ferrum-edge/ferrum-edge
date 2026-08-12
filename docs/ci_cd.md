@@ -601,7 +601,8 @@ runtime tool staging, the release publication workflow, the live fixture, and
 related docs. When relevant, the job builds the lib and functional test binaries
 (without running them as the invoking user), preflights `unshare` /
 `iptables` / `ip6tables` / TPROXY primitives, then runs
-`tests/k8s/ambient_host_udp_live/run.sh` as root with
+`tests/k8s/ambient_host_udp_live/run.sh` as root inside a disposable outer
+network namespace (`unshare --net`, #3804) with
 `FERRUM_LIVE_TESTS_REQUIRED=1`. The fixture exercises the production
 `ProxyHostUdpBackend` path: multi-veth dual-stack TPROXY delivery, original
 destination recovery, ingress-ifindex attribution, transparent replies,

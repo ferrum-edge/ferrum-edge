@@ -181,6 +181,156 @@ fn ambient_host_udp_live_runner_fail_closed_and_bounded_diagnostics() {
     );
 }
 
+/// #3804: teardown must be ownership-safe. Preflight/SKIP paths stay inert,
+/// pre-existing and concurrent owners fail before mutation, and cleanup may
+/// remove only ledger-owned canonical objects (IPv4 and IPv6 symmetrically).
+#[test]
+fn ambient_host_udp_live_runner_is_ownership_safe_before_mutation() {
+    let runner = read("tests/k8s/ambient_host_udp_live/run.sh");
+    let readme = read("tests/k8s/ambient_host_udp_live/README.md");
+
+    // Cleanup must not be armed until after root/tool/kernel/preflight.
+    let early_temp = runner
+        .find("trap early_temp_cleanup EXIT")
+        .expect("early temp-only trap must exist before preflight");
+    let preflight = runner
+        .find("throwaway netns / mangle preflight")
+        .expect("mangle preflight must remain");
+    let arm = runner
+        .find("arm_ownership_cleanup")
+        .expect("ownership cleanup must be armed explicitly");
+    assert!(
+        early_temp < preflight && preflight < arm,
+        "preflight must complete before ownership cleanup is armed"
+    );
+    assert!(
+        runner.contains("SKIP: not root")
+            && runner.contains("SKIP: $bin unavailable")
+            && runner.contains("SKIP: throwaway netns / mangle preflight failed"),
+        "early SKIP paths must remain available before mutation"
+    );
+    assert!(
+        !runner.contains("trap cleanup_trap EXIT"),
+        "the old unconditional cleanup_trap must not remain"
+    );
+
+    // Pre-existing canonical state and production owners refuse before mutation.
+    assert!(
+        runner.contains("canonical_state_present")
+            && runner.contains("pre-existing canonical Ferrum host-UDP state")
+            && runner.contains("refusing to mutate host networking: pre-existing canonical"),
+        "pre-existing canonical Ferrum host-UDP state must fail closed before mutation"
+    );
+    assert!(
+        runner.contains("production_ferrum_process_detected")
+            && runner.contains("production Ferrum process detected"),
+        "a detected production Ferrum owner must refuse before mutation"
+    );
+    assert!(
+        runner.contains("FERRUM_HOST_UDP_LIVE_IN_OUTER_NETNS")
+            && runner.contains("use a disposable outer netns"),
+        "production-process refusal must yield to disposable outer-netns isolation"
+    );
+
+    // Concurrent fixture owners: namespace-scoped exclusive flock.
+    assert!(
+        runner.contains("flock -n")
+            && runner.contains("another ambient_host_udp_live owner already holds the netns lock")
+            && runner.contains("netns-"),
+        "a second fixture invocation must fail before mutation via a netns-scoped lock"
+    );
+
+    // Verified-empty ledger acquisition; no snapshot-and-blind-delete.
+    assert!(
+        runner.contains("write_ownership_ledger")
+            && runner.contains("LEDGER_ACQUIRED_EMPTY")
+            && runner.contains("ledger_is_authoritative")
+            && runner.contains("no snapshot-and-blind-delete"),
+        "cleanup must use verified-empty acquisition plus authoritative ownership checks"
+    );
+    assert!(
+        runner.contains("owner changed during teardown")
+            && runner.contains("production owner appeared during teardown"),
+        "owner-change races during teardown must fail closed without deleting foreign state"
+    );
+
+    // IPv4 and IPv6 must be covered symmetrically for chains/jumps/rules/routes.
+    for family_marker in [
+        "chain:v4:",
+        "chain:v6:",
+        "jump:v4:PREROUTING:",
+        "jump:v6:PREROUTING:",
+        "rule:v4:101:33135",
+        "rule:v6:101:33135",
+        "route:v4:33135:local-default",
+        "route:v6:33135:local-default",
+    ] {
+        assert!(
+            runner.contains(family_marker),
+            "ownership inventory must cover `{family_marker}`"
+        );
+    }
+    assert!(
+        runner.contains("for family in v4 v6; do"),
+        "canonical inventory must iterate IPv4 and IPv6 together"
+    );
+
+    // Handled signals share the ownership-safe cleanup path.
+    assert!(
+        runner.contains("trap 'ownership_safe_cleanup; exit 130' INT")
+            && runner.contains("trap 'ownership_safe_cleanup; exit 143' TERM")
+            && runner.contains("trap 'ownership_safe_cleanup; exit 129' HUP"),
+        "INT/TERM/HUP must run ownership-safe cleanup"
+    );
+
+    // Emergency destroy is explicit and never the ordinary exit path.
+    assert!(
+        runner.contains("FERRUM_HOST_UDP_LIVE_EMERGENCY_DESTROY_CANONICAL")
+            && runner.contains("emergency_destroy_canonical"),
+        "emergency canonical destroy must be an explicit opt-in path"
+    );
+    assert!(
+        readme.contains("FERRUM_HOST_UDP_LIVE_EMERGENCY_DESTROY_CANONICAL")
+            && readme.contains("never armed by ordinary exits"),
+        "README must document the emergency destroy separately from ordinary runs"
+    );
+    assert!(
+        !readme.contains("unconditionally removes Ferrum-owned host UDP state")
+            && !readme.contains("tears that proxy's capture path down"),
+        "README must not document an ordinary run as tearing down a live proxy"
+    );
+    assert!(
+        readme.contains("ownership-safe")
+            && readme.contains("disposable outer network namespace"),
+        "README must describe ownership-safe cleanup and the outer netns boundary"
+    );
+}
+
+/// #3804: hosted execution must enforce the disposable outer netns boundary
+/// without rewriting the trusted relevance block owned by PR #3800.
+#[test]
+fn ambient_host_udp_live_workflow_enforces_outer_netns_without_touching_relevance() {
+    let workflow = read(".github/workflows/ambient-host-udp-live.yml");
+
+    assert!(
+        workflow.contains("unshare --net")
+            && workflow.contains("FERRUM_HOST_UDP_LIVE_IN_OUTER_NETNS: \"1\"")
+            && workflow.contains("Disposable outer network-namespace boundary (#3804)"),
+        "hosted live execution must wrap run.sh in a disposable outer netns"
+    );
+    assert!(
+        workflow.contains("trusted relevance / `changes` job above is untouched"),
+        "the outer-netns wrap must document composition with the #3800 relevance freeze"
+    );
+    // Relevance block markers from the trusted-base classifier must remain.
+    assert!(
+        workflow.contains("git cat-file blob \"$entry_object\" > \"$trusted_filter\"")
+            && workflow.contains("python3 -I \"$trusted_filter\" --self-test")
+            && !workflow.contains("python3 .github/scripts/live_suite_path_filter.py"),
+        "the trusted relevance block must remain intact"
+    );
+}
+
 #[test]
 fn ambient_host_udp_live_kernel_module_uses_production_scripts_and_skip_or_fail() {
     let live = read("src/proxy/host_udp_capture_live_tests.rs");
