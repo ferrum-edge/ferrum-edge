@@ -1503,10 +1503,9 @@ pub async fn run(
         background_handles.push(handle);
     }
 
-    // Set TLS config on stream listener manager for TCP proxies with frontend_tls.
-    // TCP+TLS / UDP+DTLS stream listeners do NOT participate in live reload —
-    // they keep their startup config across rotations, matching the existing
-    // mesh-mode behavior.
+    // Set the startup TLS config on the stream listener manager. TCP+TLS uses
+    // the shared rustls slot; UDP+DTLS publishes an immutable startup generation
+    // below and follows the opt-in frontend live-reload contract thereafter.
     if let Some(ref tls_cfg) = tls_config {
         proxy_state
             .stream_listener_manager
