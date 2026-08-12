@@ -4906,7 +4906,10 @@ fn materialize_sidecar_ingress_listener_proxies(
         local_spiffe,
     );
     if let Some(mesh) = config.mesh.as_deref_mut() {
-        mesh.local_ingress_listeners = listeners.iter().map(|listener| (*listener).clone()).collect();
+        mesh.local_ingress_listeners = listeners
+            .iter()
+            .map(|listener| (*listener).clone())
+            .collect();
         mesh.sidecar_ingress_bind_overrides = bind_overrides.clone();
     }
 
@@ -36466,7 +36469,10 @@ mod tests {
             "conflicting dedicated HTTP bind must not claim ownership"
         );
         assert!(
-            !config.proxies.iter().any(|p| is_mesh_ingress_route_id(&p.id)),
+            !config
+                .proxies
+                .iter()
+                .any(|p| is_mesh_ingress_route_id(&p.id)),
             "conflict must not materialize an HTTP ingress or dedicated-bind proxy"
         );
         assert!(
