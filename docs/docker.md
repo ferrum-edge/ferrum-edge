@@ -36,13 +36,24 @@ The Dockerfile uses a **multi-stage build** for optimal size:
 
 1. **Builder Stage**: Compiles the Ferrum Edge binaries with all build dependencies (`rust:latest`)
 2. **Common Runtime Stage**: Produces the ordinary Google distroless runtime (`gcr.io/distroless/cc-debian13:nonroot`) with neither an eBPF ELF nor `ip`
-3. **eBPF Builder Stage**: Only the explicit `runtime-ebpf` target compiles `ebpf/ferrum-ebpf` to a BPF ELF with nightly Rust, `rust-src`, `bpf-linker`, and `-Z build-std=core`
+3. **eBPF Builder Stage**: Only the explicit `runtime-ebpf` / `runtime-ebpf-tools` targets compile `ebpf/ferrum-ebpf` to a BPF ELF with nightly Rust, `rust-src`, `bpf-linker`, and `-Z build-std=core`
 4. **Runtime Tool Stage**: For `runtime-ebpf`, extracts the `ip` executable and only its non-base resolved shared-library closure from a digest-pinned Debian 13 image with an exact `iproute2` package version. The shared staging helper excludes glibc, the dynamic loader, libgcc, and libstdc++, which remain owned by the distroless base ABI
 5. **eBPF Runtime Stage**: Adds that bounded `ip` closure and the BPF ELF to the common runtime — no shell, package manager, or iptables fallback tools
+6. **Capture Tool Base Stage** (`capture-tools-base`): A digest-pinned Debian 13 root with the same pinned `iproute2` plus `iptables`, asserting at build time that `/bin/sh`, `ip`, `iptables`, `ip6tables`, `iptables-save`, and `ip6tables-save` are all executable
+7. **Ambient UDP Lifecycle Runtime Stage** (`runtime-ebpf-tools`): The published `-ebpf-tools` variant. A strict superset of `runtime-ebpf` — same binaries, same BPF ELF — built on the tool base because the Ambient UDP capture lifecycle executes generated `sh -c` `iptables`/`ip6tables` scripts that a distroless image cannot run at all
+
+**Image Targets And Their Contracts**:
+
+| Target | Published tag | Base | Shell / iptables | Selected for |
+|---|---|---|---|---|
+| `runtime` (default) | `:<tag>` | distroless | no (also no `ip`) | ordinary gateway |
+| `runtime-ebpf` | `:<tag>-ebpf` | distroless | no (`ip` only) | node-agent eBPF capture, NodeWaypoint |
+| `runtime-ebpf-tools` | `:<tag>-ebpf-tools` | Debian 13 slim | **yes** | Ambient UDP capture lifecycle, `FERRUM_NODE_AGENT_FALLBACK_MODE=iptables` |
 
 **Image Features**:
-- **Distroless**: The ordinary target omits `ip`; the source-build eBPF target adds only `ip` and non-base resolved shared objects. Both contain no shell, package manager, `iptables`, or `ip6tables`. PR CI builds both targets, runs their expected entrypoints, and inspects normalized exported filesystems for forbidden runtime tools
-- Non-root user execution by default (UID 65532, distroless `nonroot`; the node-agent chart overrides this for kernel capture)
+- **Distroless**: The ordinary target omits `ip`; the source-build `runtime-ebpf` target adds only `ip` and non-base resolved shared objects. Both contain no shell, package manager, `iptables`, or `ip6tables`. PR CI builds both targets, runs their expected entrypoints, and inspects normalized exported filesystems for forbidden runtime tools
+- **`runtime-ebpf-tools` is deliberately NOT distroless.** It carries a full Debian userland (shell, package manager, netfilter tooling) and runs as **root**, so its attack surface is materially larger than the other two. It exists because the Ambient UDP lifecycle's production backend shells out; use it only where that contract is required. The required `Ambient Host UDP Live` gate builds this exact target, proves it can execute the full tool set, and independently proves `runtime-ebpf` has **not** gained a shell or iptables
+- Non-root user execution by default (UID 65532, distroless `nonroot`; the node-agent chart overrides this for kernel capture, and `runtime-ebpf-tools` runs as UID 0 by construction)
 - Built-in health check via `ferrum-edge health` CLI subcommand
 - Multi-platform support (x86_64, ARM64)
 - OpenSSL is vendored (statically linked) — no runtime `libssl` dependency

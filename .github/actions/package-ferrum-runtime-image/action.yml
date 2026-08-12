@@ -28,6 +28,13 @@ inputs:
       images that package host-built artifacts instead of compiling in Docker.
     required: false
     default: ""
+  cni-binary-path:
+    description: >-
+      Optional prebuilt ferrum-cni binary to copy into /app/ferrum-cni. Required
+      for chart CNI installer / rollback / uninstall surfaces that invoke that
+      path directly.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -40,6 +47,7 @@ runs:
         BASE_IMAGE: ${{ inputs.base-image }}
         STRIP_BINARY: ${{ inputs.strip-binary }}
         BPF_ELF_PATH: ${{ inputs.bpf-elf-path }}
+        CNI_BINARY_PATH: ${{ inputs.cni-binary-path }}
       run: |
         set -euo pipefail
 
@@ -47,6 +55,7 @@ runs:
         image="$IMAGE"
         base_image="$BASE_IMAGE"
         bpf_elf_path="$BPF_ELF_PATH"
+        cni_binary_path="$CNI_BINARY_PATH"
 
         if [ ! -f "$binary_path" ]; then
           echo "::error title=Missing ferrum-edge binary::$binary_path does not exist"
@@ -56,6 +65,10 @@ runs:
           echo "::error title=Missing ferrum-ebpf ELF::$bpf_elf_path does not exist"
           exit 1
         fi
+        if [ -n "$cni_binary_path" ] && [ ! -f "$cni_binary_path" ]; then
+          echo "::error title=Missing ferrum-cni binary::$cni_binary_path does not exist"
+          exit 1
+        fi
 
         image_context="$(mktemp -d)"
         trap 'rm -rf "$image_context"' EXIT
@@ -63,6 +76,12 @@ runs:
         install -m 0755 "$binary_path" "$image_context/ferrum-edge"
         if [ "$STRIP_BINARY" = "true" ] && command -v strip >/dev/null 2>&1; then
           strip "$image_context/ferrum-edge" || true
+        fi
+        if [ -n "$cni_binary_path" ]; then
+          install -m 0755 "$cni_binary_path" "$image_context/ferrum-cni"
+          if [ "$STRIP_BINARY" = "true" ] && command -v strip >/dev/null 2>&1; then
+            strip "$image_context/ferrum-cni" || true
+          fi
         fi
         if [ -n "$bpf_elf_path" ]; then
           mkdir -p "$image_context/bpf"
@@ -80,6 +99,11 @@ runs:
 
         COPY --chown=nonroot:nonroot ferrum-edge /app/ferrum-edge
         DOCKERFILE
+          if [ -n "$cni_binary_path" ]; then
+            cat <<'DOCKERFILE'
+        COPY --chown=nonroot:nonroot ferrum-cni /app/ferrum-cni
+        DOCKERFILE
+          fi
           if [ -n "$bpf_elf_path" ]; then
             cat <<'DOCKERFILE'
         COPY --chown=nonroot:nonroot bpf /app/bpf

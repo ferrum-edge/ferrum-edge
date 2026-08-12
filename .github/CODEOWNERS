@@ -1,6 +1,7 @@
 # CODEOWNERS — Ferrum Edge
 #
-# Scoped to vendored-dependency governance (see docs/dependency-policy.md).
+# Scoped to vendored-dependency governance (see docs/dependency-policy.md) and
+# launch-readiness release governance (see docs/launch-readiness.md).
 # Listed owners are auto-requested for review on changes to these paths, and —
 # if branch protection enables "Require review from Code Owners" — must approve.
 # This file is intentionally narrow; broaden ownership deliberately.
@@ -20,3 +21,12 @@
 /scripts/check_vendored_patch_status.sh     @jeremyjpj0916
 /scripts/update_vendor_integrity.sh         @jeremyjpj0916
 /.claude/rules/dependencies.md              @jeremyjpj0916
+
+# Launch-readiness / release-governance gate (issue #3777).
+/PRODUCTION_READINESS.md                    @jeremyjpj0916
+/docs/launch-blocker-policy.json            @jeremyjpj0916
+/docs/launch-exemptions.json                @jeremyjpj0916
+/docs/launch-readiness.md                   @jeremyjpj0916
+/scripts/check_launch_readiness.py          @jeremyjpj0916
+/.github/workflows/launch-readiness.yml     @jeremyjpj0916
+/.github/workflows/release.yml              @jeremyjpj0916

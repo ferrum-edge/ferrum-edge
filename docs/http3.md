@@ -181,9 +181,12 @@ Flow:
 The bridge does **not** always dial `target.host:target.port` directly. Before
 reading the request body or dialing, both `dispatch_grpc` (buffered/retryable)
 and `dispatch_grpc_streaming` (channel-backed) resolve the LB-selected target
-through `grpc_proxy::GrpcDispatchTransport::for_target`, which materializes
-exactly one transport and never falls back to a direct dial for a mesh-tagged
-target:
+through `proxy::resolve_grpc_dispatch_transport` →
+`grpc_proxy::GrpcDispatchTransport::for_target`, which materializes exactly one
+transport and never falls back to a direct dial for a mesh-tagged target. That
+resolver is SHARED with the standard HTTP/1.1+HTTP/2 native-gRPC branch (issue
+#3728), so the `mesh.hbone` rows below describe both frontends and their target
+validation, dial planning, and refusal behavior cannot drift:
 
 | Selected target | Transport | Notes |
 |---|---|---|

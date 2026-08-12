@@ -340,7 +340,9 @@ nodeAgent:
   # Empty repository/tag inherit the top-level image repository/tag. When
   # captureMode=ebpf, the template automatically appends "-ebpf" to the
   # resolved tag unless it is already present, selecting the real capture image
-  # instead of the default mock/no-op image.
+  # instead of the default mock/no-op image. The node-agent always uses the
+  # DISTROLESS "-ebpf" variant; only the ambient proxy's UDP lifecycle selects
+  # the tools-capable "-ebpf-tools" superset (see ambient-daemonset.yaml).
   image:
     repository: ""
     tag: ""
@@ -410,8 +412,11 @@ nodeAgent:
   # Ambient per-pod-netns UDP lifecycle (#2013): the enabled producer and the
   # disabled stale-rule cleanup manager both consume it. For Ambient with an
   # eBPF node-agent, the chart mounts this dir into both DaemonSets and grants
-  # the ambient proxy the setns/NET_ADMIN capabilities plus tools-capable image
-  # needed to install or remove in-netns UDP TPROXY rules.
+  # the ambient proxy the setns/NET_ADMIN capabilities plus the tools-capable
+  # "<tag>-ebpf-tools" image (shell + iproute2 + iptables) needed to install or
+  # remove in-netns UDP TPROXY rules. The distroless "<tag>-ebpf" image cannot
+  # run those generated `sh -c` scripts at all, so the proxy refuses to start on
+  # it when UDP capture is enabled.
   podRegistryDir: /run/ferrum/node-waypoint-pods
   cgroupRoot: /sys/fs/cgroup
   bpfFsPath: /sys/fs/bpf

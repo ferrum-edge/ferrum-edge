@@ -26,11 +26,23 @@ MESH_E2E_SIDECAR_DOCUMENTATION_PATHS = frozenset(
     }
 )
 
+AMBIENT_HOST_UDP_DOCUMENTATION_PATHS = frozenset(
+    {
+        "docs/ci_cd.md",
+        "docs/configuration.md",
+        "docs/mesh.md",
+        "docs/node_agent.md",
+        "docs/tcp_udp_proxy.md",
+    }
+)
+
 # verify_required_ci.py requires the PR planner's protected documentation set
 # to cover this union, so new live-suite documentation triggers cannot silently
 # receive lightweight CI.
 LIVE_SUITE_DOCUMENTATION_PATHS = (
-    MESH_FEDERATION_DOCUMENTATION_PATHS | MESH_E2E_SIDECAR_DOCUMENTATION_PATHS
+    MESH_FEDERATION_DOCUMENTATION_PATHS
+    | MESH_E2E_SIDECAR_DOCUMENTATION_PATHS
+    | AMBIENT_HOST_UDP_DOCUMENTATION_PATHS
 )
 
 
@@ -208,6 +220,38 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^src/proxy/",
         *exact_path_patterns(MESH_E2E_SIDECAR_DOCUMENTATION_PATHS),
     ],
+    # Ambient host-network UDP live-kernel gate (#3705): production
+    # ProxyHostUdpBackend TPROXY capture, attribution, replies, and cleanup.
+    "ambient-host-udp": [
+        r"^\.github/workflows/(ci|ambient-host-udp-live|release)\.yml$",
+        # The trusted release-trust surfaces decide whether the tag the chart
+        # selects is owned, gated, signed, and attested at all.
+        r"^\.github/scripts/(live_suite_path_filter|pr_ci_plan|verify_cross_build_policy|verify_release_image_attestations)\.py$",
+        r"^\.github/scripts/stage_iproute2_runtime\.sh$",
+        r"^\.github/actions/setup-rust-ci/",
+        # The chart auto-selects a published runtime variant for the Ambient UDP
+        # lifecycle, so the image the chart names is part of this gate's subject:
+        # a Dockerfile or release-publication edit can make the selected tag stop
+        # shipping the shell/iptables tools the production backend executes.
+        r"^Dockerfile$",
+        r"^tests/k8s/ambient_host_udp_live/",
+        r"^tests/unit/gateway_core/(ambient_host_udp_live_contract_tests|mesh_host_udp_capture_plan_tests)\.rs$",
+        r"^tests/integration/mesh_k8s_pod_discovery/host_udp_capture_tests\.rs$",
+        r"^tests/functional/functional_mesh_mode_test\.rs$",
+        r"^Cargo\.(toml|lock)$",
+        r"^build\.rs$",
+        r"^rust-toolchain\.toml$",
+        r"^\.cargo/",
+        r"^vendor/",
+        r"^proto/",
+        r"^charts/ferrum-mesh/",
+        r"^src/capture/",
+        r"^src/modes/mesh/",
+        r"^src/proxy/(host_udp_capture|host_udp_capture_live_tests|mesh_udp_capture|netns_capture|netns_udp_capture|udp_batch|udp_placement_migration|mod)\.rs$",
+        r"^src/socket_opts\.rs$",
+        r"^src/ebpf/veth\.rs$",
+        *exact_path_patterns(AMBIENT_HOST_UDP_DOCUMENTATION_PATHS),
+    ],
 }
 
 
@@ -301,6 +345,29 @@ def self_test() -> int:
         ("mesh-e2e-sidecar", ["src/admin/backup.rs"], False),
         ("mesh-e2e-sidecar", ["src/plugins/utils/ai_providers.rs"], False),
         ("mesh-e2e-sidecar", ["charts/ferrum-mesh/values.yaml"], False),
+        ("ambient-host-udp", ["src/proxy/host_udp_capture.rs"], True),
+        ("ambient-host-udp", ["src/proxy/host_udp_capture_live_tests.rs"], True),
+        ("ambient-host-udp", ["tests/k8s/ambient_host_udp_live/run.sh"], True),
+        ("ambient-host-udp", [".github/workflows/ambient-host-udp-live.yml"], True),
+        ("ambient-host-udp", [".github/scripts/live_suite_path_filter.py"], True),
+        ("ambient-host-udp", ["charts/ferrum-mesh/values.yaml"], True),
+        ("ambient-host-udp", ["docs/tcp_udp_proxy.md"], True),
+        ("ambient-host-udp", ["docs/ci_cd.md"], True),
+        ("ambient-host-udp", ["Dockerfile"], True),
+        ("ambient-host-udp", [".github/workflows/release.yml"], True),
+        ("ambient-host-udp", [".github/scripts/stage_iproute2_runtime.sh"], True),
+        (
+            "ambient-host-udp",
+            [".github/scripts/verify_release_image_attestations.py"],
+            True,
+        ),
+        (
+            "ambient-host-udp",
+            ["charts/ferrum-mesh/templates/ambient-daemonset.yaml"],
+            True,
+        ),
+        ("ambient-host-udp", ["src/modes/data_plane.rs"], False),
+        ("ambient-host-udp", ["tests/k8s/mesh_e2e_sidecar/run.sh"], False),
     ]
     failures: list[str] = []
     for suite, changed, expected in cases:
