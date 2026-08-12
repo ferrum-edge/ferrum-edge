@@ -2473,6 +2473,18 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_mesh_udp_placement_migration_established_adoptions_total",
+    "type": "counter",
+    "help": "Ambient UDP placements adopted from the release-attested established placement without a node-local durable record.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_udp_migration",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_mesh_udp_placement_migration_failures_total",
     "type": "counter",
     "help": "Ambient UDP placement migration failures by bounded reason.",

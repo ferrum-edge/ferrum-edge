@@ -213,7 +213,12 @@ need them, or because they are blocked upstream / architecturally:
   it is not projected as effective policy. Use `http2MaxRequests`.
   (`http1MaxPendingRequests` IS enforced through Ferrum's documented honest
   reinterpretation — a 503-on-overflow concurrent in-flight-request gate on the
-  HTTP/1.1 dispatch path; see the DR table in `docs/mesh.md`.)
+  HTTP/1.1 dispatch path, keyed by logical destination
+  `(namespace, stable logical upstream/Service identity, optional K8s Service
+  UID when stamped, policy port, selected subset)` rather than selected
+  endpoint host; mesh VIP/service-host and direct-pod routes for one Service
+  share its FQDN identity, while native upstreams retain their resource ids;
+  see the DR table in `docs/mesh.md` and issue #3778.)
 - **DR `subsets[].trafficPolicy.portLevelSettings`** — detected and listed in
   `deferred_fields` with a translate-time warning, but not applied. Ferrum
   honors only top-level `trafficPolicy.portLevelSettings` (Istio's
