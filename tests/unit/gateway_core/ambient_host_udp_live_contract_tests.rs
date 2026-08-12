@@ -241,7 +241,8 @@ fn ambient_host_udp_live_runner_uses_disposable_outer_netns_ownership_boundary()
     assert!(
         runner.contains("flock -n")
             && runner.contains("/run/ferrum-edge-ambient-host-udp-live.lock")
-            && runner.contains("another ambient_host_udp_live owner already holds the exclusive lock"),
+            && runner
+                .contains("another ambient_host_udp_live owner already holds the exclusive lock"),
         "a second fixture invocation must fail before mutation via the fixed exclusive lock"
     );
     assert!(
@@ -363,7 +364,8 @@ fn ambient_host_udp_live_workflow_enforces_outer_netns_without_touching_relevanc
 
     assert!(
         workflow.contains("unshare --net")
-            && workflow.contains("Explicit hosted disposable outer network-namespace boundary (#3804)"),
+            && workflow
+                .contains("Explicit hosted disposable outer network-namespace boundary (#3804)"),
         "hosted live execution must wrap run.sh in a disposable outer netns"
     );
     assert!(
