@@ -63,12 +63,12 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
 use jsonwebtoken::{Algorithm, DecodingKey};
 use serde::Deserialize;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 
 use crate::fips::approved::Sha256;
 
@@ -82,6 +82,40 @@ const TRUST_BUNDLE_MAX_BYTES: u64 = 1024 * 1024;
 /// keeps the operator surface simple while preventing a path swap from turning
 /// the periodic reload worker into an unbounded file reader.
 const TRUST_MATERIAL_MAX_BYTES: u64 = TRUST_BUNDLE_MAX_BYTES;
+
+/// A stalled network filesystem must not silently stop trust-bundle reloads
+/// forever. The blocking read itself runs on a detached OS thread because a
+/// timed-out `spawn_blocking` task cannot be cancelled.
+const TRUST_BUNDLE_RELOAD_READ_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+/// At most one detached reload read may remain blocked in the kernel. The
+/// permit is owned by the OS thread, not by its async waiter, so a timeout
+/// cannot start an unbounded sequence of abandoned readers.
+static TRUST_BUNDLE_RELOAD_READ_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+pub(crate) fn trust_bundle_reload_read_limit() -> Arc<Semaphore> {
+    Arc::clone(TRUST_BUNDLE_RELOAD_READ_LIMIT.get_or_init(|| Arc::new(Semaphore::new(1))))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrustBundleReloadError {
+    ReadOrValidationFailed,
+    ReaderUnavailable,
+    ReaderFailed,
+    ReadTimedOut,
+}
+
+impl TrustBundleReloadError {
+    fn audit_reason(self) -> &'static str {
+        match self {
+            Self::ReadOrValidationFailed => "read_or_validation_failed",
+            Self::ReaderUnavailable => "reader_unavailable",
+            Self::ReaderFailed => "reload_reader_failed",
+            Self::ReadTimedOut => "reload_read_timed_out",
+        }
+    }
+}
 
 /// Open a trust-material path without letting a non-regular source stall the
 /// opener.
@@ -150,6 +184,76 @@ fn read_regular_utf8_file_bounded(
         ));
     }
     String::from_utf8(raw).map_err(|_| format!("{description} '{path}' is not valid UTF-8"))
+}
+
+async fn load_trust_bundle_reload_candidate_detached(
+    path: String,
+    fleet_secret: Option<String>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<CpDpVerifier, TrustBundleReloadError> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let join_handle = std::thread::Builder::new()
+        .name("ferrum-cp-trust-reload".to_string())
+        .spawn(move || {
+            // The permit belongs to the kernel operation. If the async caller
+            // times out or shuts down, no replacement reader can start until
+            // this detached read actually exits.
+            let _permit = permit;
+            let candidate = CpDpTrustBundle::load_from_path(&path, fleet_secret.as_deref())
+                .map(CpDpVerifier::TrustBundle)
+                .map_err(|_| TrustBundleReloadError::ReadOrValidationFailed);
+            let _ = sender.send(candidate);
+        })
+        .map_err(|_| TrustBundleReloadError::ReaderFailed)?;
+
+    // Joining a reader stuck in the kernel would defeat both the timeout and
+    // bounded shutdown. Dropping the handle deliberately detaches the thread.
+    drop(join_handle);
+    receiver
+        .await
+        .map_err(|_| TrustBundleReloadError::ReaderFailed)?
+}
+
+async fn load_trust_bundle_reload_candidate(
+    path: String,
+    fleet_secret: Option<String>,
+) -> Result<CpDpVerifier, TrustBundleReloadError> {
+    load_trust_bundle_reload_candidate_with_timeout(
+        path,
+        fleet_secret,
+        TRUST_BUNDLE_RELOAD_READ_TIMEOUT,
+    )
+    .await
+}
+
+async fn load_trust_bundle_reload_candidate_with_timeout(
+    path: String,
+    fleet_secret: Option<String>,
+    timeout: std::time::Duration,
+) -> Result<CpDpVerifier, TrustBundleReloadError> {
+    let read = async {
+        let permit = trust_bundle_reload_read_limit()
+            .acquire_owned()
+            .await
+            .map_err(|_| TrustBundleReloadError::ReaderUnavailable)?;
+        load_trust_bundle_reload_candidate_detached(path, fleet_secret, permit).await
+    };
+    match tokio::time::timeout(timeout, read).await {
+        Ok(result) => result,
+        Err(_) => Err(TrustBundleReloadError::ReadTimedOut),
+    }
+}
+
+#[doc(hidden)]
+#[allow(dead_code)] // reached via `_test_support` from the external test crate
+pub(crate) async fn load_trust_bundle_reload_candidate_for_test(
+    path: String,
+    timeout: std::time::Duration,
+) -> Result<(), &'static str> {
+    load_trust_bundle_reload_candidate_with_timeout(path, None, timeout)
+        .await
+        .map(|_| ())
+        .map_err(TrustBundleReloadError::audit_reason)
 }
 
 /// Upper bound on an operator-authored identifier (`kid`). Bounded so a
@@ -868,37 +972,29 @@ pub fn spawn_trust_bundle_reload(
                 }
             }
 
-            // Bundle parsing resolves file-backed key material. Keep every
-            // filesystem operation off Tokio's runtime workers, and use the
-            // same opened-handle type/size checks as startup so a post-startup
-            // path replacement cannot widen the reload boundary.
-            let candidate = match tokio::task::spawn_blocking({
-                let path = path.clone();
-                let fleet_secret = fleet_secret.clone();
-                move || {
-                    CpDpTrustBundle::load_from_path(&path, fleet_secret.as_deref())
-                        .map(CpDpVerifier::TrustBundle)
-                }
-            })
-            .await
-            {
-                Ok(Ok(candidate)) => candidate,
-                Ok(Err(_)) => {
-                    if !last_failed {
-                        tracing::warn!(
-                            audit.event = "cp_dp_trust_bundle_reload_rejected",
-                            reason = "read_or_validation_failed",
-                            "CP/DP trust-bundle reload rejected; retaining the active verifier"
-                        );
+            // Bundle parsing resolves file-backed key material. The detached
+            // reader plus timeout keeps a stalled mount from pinning Tokio's
+            // blocking pool or silently ending credential revocation. A
+            // process-wide permit remains with any abandoned OS thread so a
+            // persistent outage cannot accumulate blocked readers.
+            let read = load_trust_bundle_reload_candidate(path.clone(), fleet_secret.clone());
+            tokio::pin!(read);
+            let candidate = match tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
                     }
-                    last_failed = true;
                     continue;
                 }
-                Err(_) => {
+                candidate = &mut read => candidate,
+            } {
+                Ok(candidate) => candidate,
+                Err(error) => {
                     if !last_failed {
                         tracing::warn!(
                             audit.event = "cp_dp_trust_bundle_reload_rejected",
-                            reason = "reload_worker_failed",
+                            reason = error.audit_reason(),
                             "CP/DP trust-bundle reload rejected; retaining the active verifier"
                         );
                     }

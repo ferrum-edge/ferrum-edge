@@ -1565,6 +1565,46 @@ fn trust_bundle_and_file_backed_material_reads_are_bounded_regular_files() {
     assert!(error.contains("is not a regular file"), "{error}");
 }
 
+#[tokio::test]
+async fn trust_bundle_reload_times_out_without_accumulating_detached_readers() {
+    let dir = tempfile::tempdir().expect("create reload-reader fixture directory");
+    let bundle_path = dir.path().join("trust-bundle.json");
+    std::fs::write(
+        &bundle_path,
+        json!({
+            "version": 1,
+            "keys": [{
+                "kid": TENANT_A,
+                "algorithm": "HS256",
+                "secret": TENANT_A_SECRET,
+                "namespaces": [TENANT_A]
+            }]
+        })
+        .to_string(),
+    )
+    .expect("write valid trust-bundle fixture");
+
+    let permit =
+        ferrum_edge::_test_support::acquire_cp_dp_trust_bundle_read_permit_for_test().await;
+    assert_eq!(
+        ferrum_edge::_test_support::load_cp_dp_trust_bundle_for_reload_for_test(
+            bundle_path.to_string_lossy().into_owned(),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("the occupied reader must time out"),
+        "reload_read_timed_out"
+    );
+
+    drop(permit);
+    ferrum_edge::_test_support::load_cp_dp_trust_bundle_for_reload_for_test(
+        bundle_path.to_string_lossy().into_owned(),
+        Duration::from_secs(1),
+    )
+    .await
+    .expect("valid trust bundle must load after the detached-reader slot is released");
+}
+
 /// A bound credential backed by the fleet-wide `FERRUM_CP_DP_GRPC_JWT_SECRET`
 /// is structurally valid but semantically identical to the pre-advisory
 /// posture: every data plane already holds that value, so any of them could
