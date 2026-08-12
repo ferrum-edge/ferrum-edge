@@ -25,46 +25,52 @@ Local ad-hoc runs without that flag may still print `SKIP:`.
 
 ## Isolation and ownership (#3804)
 
-The hosted workflow runs the fixture inside a disposable outer network
-namespace (`unshare --net`). Canonical Ferrum host-UDP objects therefore exist
-only inside that sandbox; leaving `unshare` discards them. Pod-netns state
-(table `33133`, priority `100`) is never touched.
+The disposable outer network namespace is the ordinary ownership boundary.
 
-`run.sh` itself is ownership-safe even for ad-hoc root runs outside that
-boundary:
+Every normal root execution — hosted CI and ad-hoc alike — acquires a fixed
+shared-filesystem exclusive lock, then runs the complete fixture inside a
+**newly created** disposable outer netns (`unshare --net`). Canonical Ferrum
+host-UDP objects therefore exist only inside that sandbox and disappear when
+the owned netns lifetime ends. Ordinary teardown never enumerates or deletes
+canonical host chains, jumps, rules, or routes. Pre-existing canonical state in
+the caller's/host namespace remains byte-for-byte untouched because normal
+execution never mutates that namespace.
+
+Isolation is proven structurally before tests run: `/proc/self/ns/net` must
+differ from the parent-captured identity and from `/proc/1/ns/net`. An
+environment flag such as `FERRUM_HOST_UDP_LIVE_IN_OUTER_NETNS` is never accepted
+as proof (operators can forge it on the host).
+
+The hosted workflow also wraps execution in `unshare --net` explicitly. That
+defense-in-depth layer composes with the runner's own outer netns; the trusted
+relevance / `changes` job is untouched.
+
+Contract details:
 
 1. Root / tool / kernel / throwaway-netns preflight completes **before** any
-   destructive cleanup trap is armed. Early `SKIP` and prerequisite failures
-   leave host networking byte-for-byte unchanged.
-2. Pre-existing canonical v4/v6 chains, `PREROUTING` jumps, priority-`101`
-   rules, or table-`33135` local defaults cause an immediate refusal before
-   mutation (unless the loud development override
-   `FERRUM_HOST_UDP_LIVE_ALLOW_DESTRUCTIVE_ADOPT=1` is set — that path still
-   refuses to claim or tear down the pre-existing objects).
-3. A detected production `ferrum-edge` process is refused unless the run is
-   already inside a disposable outer netns
-   (`FERRUM_HOST_UDP_LIVE_IN_OUTER_NETNS=1`).
-4. A namespace-scoped exclusive `flock` rejects a concurrent second fixture
-   invocation before mutation.
-5. An ownership ledger is written only after verified-empty acquisition under
-   that lock. Cleanup removes only canonical objects while the ledger remains
-   authoritative for this run; foreign/reconciled ownership fails closed
-   (no snapshot-and-blind-delete).
-
-Ordinary success, failure, `SKIP`, and handled-signal paths therefore cannot
-tear down a live proxy's capture path.
+   lock acquisition or outer-netns creation. Early `SKIP` and prerequisite
+   failures leave host networking byte-for-byte unchanged.
+2. A fixed exclusive `flock` at
+   `/tmp/ferrum-host-udp-live-locks/ambient-host-udp-live.lock` is acquired
+   before the outer netns is created. A concurrent second invocation is
+   rejected before mutation; the lock FD is held for the entire child run.
+   Lock open/close uses safe Bash dynamic-FD redirection (no `eval`).
+3. After the child exits, only temp files and the lock are released. Networking
+   cleanup is the kernel discarding the owned outer netns — not per-object
+   deletion in the parent/host namespace.
+4. IPv4 and IPv6 live coverage remain symmetric inside the isolated environment.
 
 ### Explicit emergency destroy (development only)
 
 If you intentionally need to wipe canonical Ferrum host-UDP objects in the
 **current** network namespace, set
 `FERRUM_HOST_UDP_LIVE_EMERGENCY_DESTROY_CANONICAL=1` and invoke `run.sh` as
-root. That path is loud, never armed by ordinary exits, and is not used by the
-hosted gate.
+root. That path is loud, separately gated, never armed by ordinary exits, and
+is not used by the hosted gate. It does not weaken the normal isolation proof.
 
 ## Diagnostics
 
 Bounded, redacted snapshots of `ip rule` / table `33135`, Ferrum mangle chains,
-interface indexes, UDP bind state, and the ownership ledger are written under
+interface indexes, UDP bind state, and netns identities are written under
 `target/ambient-host-udp-live/` and uploaded by the workflow. Raw test output is
 kept in temporary files outside the artifact tree and removed by cleanup.

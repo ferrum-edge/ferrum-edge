@@ -283,14 +283,14 @@ jobs:
           FERRUM_HOST_UDP_LIB_TEST_BIN: ${{ steps.build_test_bin.outputs.lib_test_bin }}
           FERRUM_HOST_UDP_FUNCTIONAL_TEST_BIN: ${{ steps.build_test_bin.outputs.functional_test_bin }}
           FERRUM_HOST_UDP_LIVE_RESULTS: ${{ github.workspace }}/target/ambient-host-udp-live
-          FERRUM_HOST_UDP_LIVE_IN_OUTER_NETNS: "1"
         run: |
           set -euo pipefail
-          # Disposable outer network-namespace boundary (#3804). Composes with
-          # PR #3800: the trusted relevance / `changes` job above is untouched;
-          # only this live execution step is wrapped so canonical Ferrum
-          # host-UDP chains, jumps, rules, and table-33135 routes exist only
-          # inside the sandbox and vanish when unshare exits.
+          # Explicit hosted disposable outer network-namespace boundary (#3804).
+          # Composes with PR #3800: the trusted relevance / `changes` job above
+          # is untouched; only this live execution step is wrapped. run.sh also
+          # creates its own proven disposable outer netns for every ordinary
+          # root execution (including ad-hoc), so isolation does not depend on
+          # a forgeable environment flag.
           sudo -E unshare --net -- bash -c '
             set -euo pipefail
             ip link set lo up
