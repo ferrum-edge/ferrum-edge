@@ -3307,3 +3307,151 @@ async fn grpc_transport_mesh_mtls_cross_cluster_dial_plan_failures_are_field_spe
     );
     assert!(!err.message().contains(secret_sni));
 }
+
+// ── Standard H1/H2 frontend: native gRPC over Ambient HBONE (issue #3728) ────
+//
+// The nested-HTTP/2-over-HBONE transport was wired for the H3 gRPC bridge first
+// (#3284) while the standard frontend still refused a `mesh.hbone` target
+// pre-dial. These guards pin the wiring that removed that protocol-dependent
+// capability boundary: BOTH frontends must materialize the transport through the
+// SAME resolver, before any dial, on every attempt.
+
+/// The standard native-gRPC branch must no longer hard-wire
+/// `GrpcDispatchTransport::Direct`, and both frontends must reach the transport
+/// through the one shared resolver — otherwise H2 and H3 can drift on target
+/// validation, identity enforcement, and error mapping for the same route.
+#[test]
+fn standard_grpc_frontend_and_h3_bridge_share_one_mesh_transport_resolver() {
+    const FOR_TARGET: &str = "GrpcDispatchTransport::for_target(";
+    const SHARED_RESOLVER: &str = "resolve_grpc_dispatch_transport(";
+    let proxy_src = include_str!("../../../src/proxy/mod.rs");
+    let h3_src = include_str!("../../../src/http3/cross_protocol.rs");
+
+    assert!(
+        proxy_src.contains("pub(crate) fn resolve_grpc_dispatch_transport<'a>("),
+        "the shared native-gRPC transport resolver must live in proxy/mod.rs"
+    );
+    assert_eq!(
+        proxy_src.matches(FOR_TARGET).count(),
+        1,
+        "exactly ONE call site may materialize a gRPC dispatch transport in \
+         proxy/mod.rs — a second one is the drift this resolver exists to prevent"
+    );
+    assert!(
+        h3_src.contains("crate::proxy::resolve_grpc_dispatch_transport(state, target)"),
+        "the H3 gRPC bridge must delegate to the SHARED resolver, not re-implement it"
+    );
+    assert_eq!(
+        h3_src.matches(FOR_TARGET).count(),
+        0,
+        "the H3 bridge must not keep a private materialization path"
+    );
+
+    // The native-gRPC branch resolves once for the first attempt and again for
+    // every retry attempt (rotation re-binds the dial plan).
+    assert_eq!(
+        proxy_src.matches(SHARED_RESOLVER).count(),
+        2,
+        "expected exactly two call sites in proxy/mod.rs: the first attempt and \
+         the per-retry-attempt re-resolution"
+    );
+    assert!(
+        !proxy_src.contains("grpc_proxy::GrpcDispatchTransport::Direct(&state.grpc_pool)"),
+        "the native-gRPC dispatch sites must use the materialized transport, never \
+         a hard-wired direct pool that would bypass a mesh target's secured hop"
+    );
+}
+
+/// The transport must be materialized BEFORE the backend URL is built and
+/// before any dispatch call, so an unresolvable mesh target fails closed with no
+/// socket opened and no application byte forwarded.
+#[test]
+fn standard_grpc_frontend_materializes_the_transport_before_dispatch() {
+    let proxy_src = include_str!("../../../src/proxy/mod.rs");
+    let resolve_at = proxy_src
+        .find("let grpc_transport =")
+        .expect("the native-gRPC branch must bind a materialized transport");
+    let first_dispatch_at = proxy_src
+        .find("grpc_proxy::proxy_grpc_request_core(")
+        .expect("the native-gRPC branch must dispatch through proxy_grpc_request_core");
+    assert!(
+        resolve_at < first_dispatch_at,
+        "the transport must be resolved before the first dispatch; \
+         resolve@{resolve_at} dispatch@{first_dispatch_at}"
+    );
+
+    // The fail-closed arm answers UNAVAILABLE and releases the half-open probe
+    // slot instead of letting the armed guard double-release it.
+    let tail = &proxy_src[resolve_at..first_dispatch_at];
+    assert!(
+        tail.contains("grpc_probe_guard.disarm();"),
+        "the transport refusal must disarm the RAII probe guard before its \
+         explicit release, mirroring the sibling egress-policy reject"
+    );
+    assert!(
+        tail.contains("release_circuit_breaker_probe_on_admission_reject("),
+        "the transport refusal must release a HALF_OPEN probe slot it consumed"
+    );
+}
+
+/// A gRPC retry may rotate between the direct pool and the Ambient HBONE
+/// transport — both are hyper HTTP/2 with an identical trailer contract — but
+/// must still fail closed on every other class rather than switching response
+/// pipelines mid-loop.
+#[test]
+fn native_grpc_retry_rotation_admits_only_http2_equivalent_transports() {
+    let proxy_src = include_str!("../../../src/proxy/mod.rs");
+    let screen_at = proxy_src
+        .find("Direct gRPC retry rotated onto a mesh target")
+        .expect("the retry rotation screen must exist");
+    let window = &proxy_src[screen_at.saturating_sub(2000)..screen_at];
+    for admitted in [
+        "grpc_proxy::GrpcMeshDispatch::Direct",
+        "grpc_proxy::GrpcMeshDispatch::Hbone",
+        "grpc_proxy::GrpcMeshDispatch::HboneCrossCluster",
+    ] {
+        assert!(
+            window.contains(admitted),
+            "the retry rotation screen must admit {admitted}"
+        );
+    }
+    assert!(
+        !window.contains("GrpcMeshDispatch::MeshMtls"),
+        "a rotation onto a Sidecar mesh-mTLS target must NOT be admitted by the \
+         native gRPC retry loop — it does not own that response pipeline"
+    );
+}
+
+/// The fully-streaming H1/H2 fast path must take an already-materialized
+/// transport. It consumes the request body on the wire, so it is never
+/// replayable: carrying a mesh transport here is what lets a client-streaming /
+/// bidi RPC reach an Ambient target without the gateway buffering the upload.
+#[test]
+fn grpc_streaming_fast_path_takes_a_materialized_transport_and_never_retries() {
+    let src = include_str!("../../../src/proxy/grpc_proxy.rs");
+    let start = src
+        .find("pub async fn proxy_grpc_request_streaming(")
+        .expect("the H1/H2 streaming gRPC entry must exist");
+    let signature_end = src[start..]
+        .find(") -> Result<GrpcResponseKind, GrpcProxyError> {")
+        .expect("streaming entry signature must terminate");
+    let signature = &src[start..start + signature_end];
+    assert!(
+        signature.contains("transport: &GrpcDispatchTransport<'_>"),
+        "the streaming fast path must accept the caller's materialized transport, \
+         not a hard-wired GrpcConnectionPool"
+    );
+    assert!(
+        !signature.contains("grpc_pool: &GrpcConnectionPool"),
+        "the streaming fast path must no longer take the direct pool directly"
+    );
+
+    // The caller gates this path on "no retry configured", so a partially
+    // transmitted streaming upload can never be replayed on any transport.
+    let proxy_src = include_str!("../../../src/proxy/mod.rs");
+    let fast_path_gate = "grpc_can_use_streaming_fast_path = grpc_should_stream && !grpc_has_retry";
+    assert!(
+        proxy_src.contains(fast_path_gate),
+        "the fully-streaming gRPC fast path must remain mutually exclusive with retry"
+    );
+}

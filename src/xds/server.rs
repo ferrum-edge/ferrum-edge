@@ -1,7 +1,6 @@
 use crate::fips::approved::Sha256;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use dashmap::mapref::entry::Entry;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -11,6 +10,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, warn};
 
+use super::admission::{
+    XdsAdmissionController, XdsAdmissionLimits, XdsAdmissionRejection, XdsStreamPermit,
+    principal_key, redacted_identifier, xds_state_key,
+};
 use super::nonce::{AckOutcome, XdsNonceTracker};
 use super::proto::aggregated_discovery_service_server::{
     AggregatedDiscoveryService, AggregatedDiscoveryServiceServer,
@@ -24,7 +27,10 @@ use super::translator::translate_mesh_slice_to_snapshot;
 use crate::FERRUM_VERSION;
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot;
 use crate::config::types::GatewayConfig;
-use crate::grpc::auth::{AllowedNamespaces, verify_grpc_jwt_metadata_with_claims};
+use crate::grpc::auth::{
+    AllowedNamespaces, GrpcAudiencePolicy, VerifiedGrpcIdentity,
+    verify_grpc_jwt_metadata_with_audience,
+};
 use crate::grpc::cp_server::{CpGrpcServer, CpScope, NamespaceBroadcasts};
 use crate::grpc::cp_trust::{CpDpVerifier, CpGrpcConnectInfo};
 use crate::grpc::proto::ConfigUpdate;
@@ -33,12 +39,6 @@ use crate::xds::carrier::XdsNodeScoping;
 
 const MAX_SUBSCRIPTIONS_PER_STREAM: usize = 32;
 const MAX_RESOURCE_NAMES_PER_REQUEST: usize = 1024;
-/// Default per-node concurrent ADS stream ceiling when the operator does not
-/// set `FERRUM_XDS_MAX_STREAMS_PER_NODE`. A healthy DP keeps a single ADS
-/// stream; the small headroom tolerates brief overlap during a client
-/// reconnect (old stream draining while the new one establishes) without
-/// admitting a stream-exhaustion flood.
-pub const DEFAULT_XDS_MAX_STREAMS_PER_NODE: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct XdsSubscription {
@@ -89,13 +89,17 @@ pub struct XdsAdsServer {
     stream_channel_capacity: usize,
     snapshot_cache: Arc<XdsSnapshotCache>,
     nonce_tracker: Arc<XdsNonceTracker>,
-    active_streams: Arc<XdsStreamRegistry>,
+    /// Shared ADS admission accounting (issue #3741). One controller per CP
+    /// process, cloned by reference into every SotW and Delta stream so the two
+    /// methods draw from ONE aggregate budget and cannot be split against each
+    /// other.
+    admission: XdsAdmissionController,
     /// Per-node workload SPIFFE identities learned from the DP's `Node.metadata`
-    /// on the ADS stream. The CP keys snapshots by `node_id` (a per-pod
-    /// hostname by default), so the workload SPIFFE — needed to compute
-    /// Sidecar-aware narrowing and the un-narrowed local-inbound-service view —
-    /// is recorded here when first seen and read at snapshot-build time.
-    /// Cleared when the node's last stream ends.
+    /// on the ADS stream. The CP keys snapshots by state key (namespace +
+    /// authenticated-principal digest + `Node.id`), so the workload SPIFFE —
+    /// needed to compute Sidecar-aware narrowing and the un-narrowed
+    /// local-inbound-service view — is recorded here when first seen and read
+    /// at snapshot-build time. Cleared when the node's last stream ends.
     workload_identities: Arc<DashMap<String, String>>,
     waypoint_names: Arc<DashMap<String, String>>,
     /// Per-node cross-namespace inventory scoping learned from the DP's
@@ -121,73 +125,22 @@ pub struct XdsAdsServer {
     cluster_domain: String,
 }
 
-struct XdsStreamRegistry {
-    // ADS stream counts are outside the proxy hot path and exist only when
-    // FERRUM_XDS_ENABLED=true, so default DashMap sharding is intentional here.
-    counts: DashMap<String, usize>,
-    // Per-node concurrent ADS stream ceiling. `0` disables the cap (unbounded,
-    // back-compat with the historical count-only behavior). A misbehaving or
-    // hostile DP that opens many authenticated streams under one node id can
-    // otherwise pin server memory (one snapshot/nonce/subscription set per
-    // stream), so this is a DoS guard for `FERRUM_XDS_ENABLED=true` fleets.
-    max_streams_per_node: usize,
-}
-
-impl XdsStreamRegistry {
-    fn new(max_streams_per_node: usize) -> Self {
-        Self {
-            counts: DashMap::new(),
-            max_streams_per_node,
-        }
-    }
-
-    /// Increment the per-node ADS stream count, rejecting registration when the
-    /// node is already at its concurrent-stream ceiling.
-    ///
-    /// On `Err` the caller must NOT treat the stream as registered (the count
-    /// is left untouched), so no matching `unregister` is owed.
-    #[allow(clippy::result_large_err)]
-    fn register(&self, node_id: &str) -> Result<(), Status> {
-        match self.counts.entry(node_id.to_string()) {
-            Entry::Occupied(mut entry) => {
-                if self.max_streams_per_node != 0 && *entry.get() >= self.max_streams_per_node {
-                    return Err(Status::resource_exhausted(format!(
-                        "xDS per-node concurrent stream limit exceeded (max {} per node id)",
-                        self.max_streams_per_node
-                    )));
-                }
-                *entry.get_mut() += 1;
-            }
-            Entry::Vacant(entry) => {
-                // First stream for this node is always admitted (a cap of 1
-                // still allows exactly one stream).
-                entry.insert(1);
-            }
-        }
-        Ok(())
-    }
-
-    fn unregister(&self, node_id: &str) -> bool {
-        match self.counts.entry(node_id.to_string()) {
-            Entry::Occupied(mut entry) => {
-                if *entry.get() > 1 {
-                    *entry.get_mut() -= 1;
-                    false
-                } else {
-                    entry.remove();
-                    true
-                }
-            }
-            Entry::Vacant(_) => true,
-        }
-    }
-}
-
+/// Per-stream cleanup owner (issue #3741).
+///
+/// Holds the [`XdsStreamPermit`] that carries this stream's total /
+/// namespace / principal reservation, and owns every node-scoped map entry the
+/// stream created. Dropping the guard releases the node registration first
+/// (cleaning node-scoped state when this was the node's last stream) and then
+/// drops the permit, which releases the aggregate reservation exactly once.
+///
+/// The guard lives inside the spawned relay task, so an abort, a panic, a
+/// client disconnect, a receiver drop, and process shutdown all unwind through
+/// this `Drop` — no termination path needs an explicit release.
 struct XdsStreamGuard {
-    node_id: Option<String>,
+    node_state_key: Option<String>,
+    permit: XdsStreamPermit,
     snapshot_cache: Arc<XdsSnapshotCache>,
     nonce_tracker: Arc<XdsNonceTracker>,
-    active_streams: Arc<XdsStreamRegistry>,
     workload_identities: Arc<DashMap<String, String>>,
     waypoint_names: Arc<DashMap<String, String>>,
     node_scoping: Arc<DashMap<String, XdsNodeScoping>>,
@@ -195,46 +148,55 @@ struct XdsStreamGuard {
 
 impl XdsStreamGuard {
     fn new(
+        permit: XdsStreamPermit,
         snapshot_cache: Arc<XdsSnapshotCache>,
         nonce_tracker: Arc<XdsNonceTracker>,
-        active_streams: Arc<XdsStreamRegistry>,
         workload_identities: Arc<DashMap<String, String>>,
         waypoint_names: Arc<DashMap<String, String>>,
         node_scoping: Arc<DashMap<String, XdsNodeScoping>>,
     ) -> Self {
         Self {
-            node_id: None,
+            node_state_key: None,
+            permit,
             snapshot_cache,
             nonce_tracker,
-            active_streams,
             workload_identities,
             waypoint_names,
             node_scoping,
         }
     }
 
-    #[allow(clippy::result_large_err)]
-    fn set_node_id(&mut self, node_id: &str) -> Result<(), Status> {
-        if self.node_id.as_deref() == Some(node_id) {
+    /// Register the stream's resolved node state key against the innermost
+    /// (per-node) and distinct-node budgets.
+    ///
+    /// On `Err` nothing was registered, so no matching release is owed and the
+    /// stream still holds only its aggregate reservation.
+    fn set_node_state_key(&mut self, state_key: &str) -> Result<(), XdsAdmissionRejection> {
+        if self.node_state_key.as_deref() == Some(state_key) {
             return Ok(());
         }
         self.clear_current();
-        self.active_streams.register(node_id)?;
-        self.node_id = Some(node_id.to_string());
+        self.permit.register_node(state_key)?;
+        self.node_state_key = Some(state_key.to_string());
         Ok(())
     }
 
     fn clear_current(&mut self) {
-        let Some(node_id) = self.node_id.take() else {
+        let Some(state_key) = self.node_state_key.take() else {
             return;
         };
-        if self.active_streams.unregister(&node_id) {
-            self.snapshot_cache.remove(&node_id);
-            self.nonce_tracker.remove_node(&node_id);
-            self.workload_identities.remove(&node_id);
-            self.waypoint_names.remove(&node_id);
-            self.node_scoping.remove(&node_id);
-        }
+        let snapshot_cache = Arc::clone(&self.snapshot_cache);
+        let nonce_tracker = Arc::clone(&self.nonce_tracker);
+        let workload_identities = Arc::clone(&self.workload_identities);
+        let waypoint_names = Arc::clone(&self.waypoint_names);
+        let node_scoping = Arc::clone(&self.node_scoping);
+        let _ = self.permit.release_node_with_cleanup(|| {
+            snapshot_cache.remove(&state_key);
+            nonce_tracker.remove_node(&state_key);
+            workload_identities.remove(&state_key);
+            waypoint_names.remove(&state_key);
+            node_scoping.remove(&state_key);
+        });
     }
 }
 
@@ -285,7 +247,7 @@ impl XdsAdsServer {
             stream_channel_capacity: stream_channel_capacity.max(1),
             snapshot_cache: Arc::new(XdsSnapshotCache::new()),
             nonce_tracker: Arc::new(XdsNonceTracker::new()),
-            active_streams: Arc::new(XdsStreamRegistry::new(DEFAULT_XDS_MAX_STREAMS_PER_NODE)),
+            admission: XdsAdmissionController::new(XdsAdmissionLimits::default()),
             workload_identities: Arc::new(DashMap::new()),
             waypoint_names: Arc::new(DashMap::new()),
             node_scoping: Arc::new(DashMap::new()),
@@ -334,12 +296,38 @@ impl XdsAdsServer {
         self
     }
 
-    /// Override the per-node concurrent ADS stream ceiling. `0` disables the
-    /// cap (unbounded). Replaces the registry, so call this during setup
-    /// before any stream is served.
-    pub fn with_max_streams_per_node(mut self, max_streams_per_node: usize) -> Self {
-        self.active_streams = Arc::new(XdsStreamRegistry::new(max_streams_per_node));
+    /// Override every ADS admission budget at once. Replaces the shared
+    /// controller, so call this during setup before any stream is served.
+    pub fn with_admission_limits(mut self, limits: XdsAdmissionLimits) -> Self {
+        self.admission = XdsAdmissionController::new(limits);
         self
+    }
+
+    /// Override only the per-node concurrent ADS stream ceiling, keeping every
+    /// other budget at its default. `0` disables that one cap (unbounded).
+    /// Replaces the controller, so call this during setup before any stream is
+    /// served.
+    pub fn with_max_streams_per_node(self, max_streams_per_node: usize) -> Self {
+        let limits = XdsAdmissionLimits {
+            max_streams_per_node,
+            ..*self.admission.limits()
+        };
+        self.with_admission_limits(limits)
+    }
+
+    /// The shared ADS admission controller. Exposed so operators' tests and the
+    /// CP runtime can read current occupancy without reaching into internals.
+    pub fn admission(&self) -> XdsAdmissionController {
+        self.admission.clone()
+    }
+
+    /// Reserve an aggregate permit for the existing inline guard tests, which
+    /// exercise node-scoped cleanup rather than the aggregate budget.
+    #[cfg(test)]
+    fn test_permit(&self) -> XdsStreamPermit {
+        self.admission
+            .reserve_stream(&self.namespace, "test-principal")
+            .expect("default aggregate budget admits a test stream")
     }
 
     pub fn into_service(self) -> AggregatedDiscoveryServiceServer<Self> {
@@ -354,18 +342,49 @@ impl XdsAdsServer {
         self.nonce_tracker.clone()
     }
 
+    /// Verify the stream's bearer and return BOTH the tenant ceiling and the
+    /// authenticated principal (JWT `sub`).
+    ///
+    /// The audience posture is unchanged from the previous
+    /// `verify_grpc_jwt_metadata_with_claims` call
+    /// ([`GrpcAudiencePolicy::ReservedForbidden`]); the only difference is that
+    /// the subject is no longer discarded — ADS needs it to keep unrelated
+    /// principals off one mutable state key and one quota (issue #3741).
     #[allow(clippy::result_large_err)]
     fn verify_jwt_metadata(
         &self,
         metadata: &tonic::metadata::MetadataMap,
         extensions: &tonic::Extensions,
-    ) -> Result<AllowedNamespaces, Status> {
-        verify_grpc_jwt_metadata_with_claims(
+    ) -> Result<VerifiedGrpcIdentity, Status> {
+        verify_grpc_jwt_metadata_with_audience(
             metadata,
             &self.verifier,
             &self.expected_issuer,
+            GrpcAudiencePolicy::ReservedForbidden,
             extensions.get::<CpGrpcConnectInfo>(),
         )
+        .map_err(|(status, _)| status)
+    }
+
+    /// Reserve total + namespace + principal ADS capacity for one stream.
+    ///
+    /// MUST be called before the relay task is spawned, before the per-stream
+    /// response channel is allocated, and before the filtered `GatewayConfig`
+    /// snapshot is built — those are exactly the allocations the aggregate
+    /// budget exists to bound (issue #3741).
+    #[allow(clippy::result_large_err)]
+    fn reserve_stream_capacity(
+        &self,
+        method: &'static str,
+        namespace: &str,
+        principal_key: &str,
+    ) -> Result<XdsStreamPermit, Status> {
+        self.admission
+            .reserve_stream(namespace, principal_key)
+            .map_err(|rejection| {
+                record_xds_admission_rejection(method, namespace, None, rejection);
+                rejection.into_status()
+            })
     }
 
     #[allow(clippy::result_large_err)]
@@ -653,11 +672,11 @@ impl XdsAdsServer {
             .unwrap_or_default()
     }
 
-    fn stream_guard(&self) -> XdsStreamGuard {
+    fn stream_guard(&self, permit: XdsStreamPermit) -> XdsStreamGuard {
         XdsStreamGuard::new(
+            permit,
             self.snapshot_cache.clone(),
             self.nonce_tracker.clone(),
-            self.active_streams.clone(),
             self.workload_identities.clone(),
             self.waypoint_names.clone(),
             self.node_scoping.clone(),
@@ -1023,13 +1042,13 @@ impl XdsAdsServer {
         if !request.response_nonce.is_empty() {
             match self.record_sotw_ack(cache_key, request) {
                 AckOutcome::Acked => debug!(
-                    node_id = %node_id,
+                    node = %redacted_identifier(node_id),
                     type_url = %request.type_url,
                     "xDS ACK accepted"
                 ),
                 AckOutcome::Nacked { message } => {
                     warn!(
-                        node_id = %node_id,
+                        node = %redacted_identifier(node_id),
                         type_url = %request.type_url,
                         error = %message,
                         "xDS NACK received"
@@ -1037,7 +1056,7 @@ impl XdsAdsServer {
                 }
                 outcome => {
                     warn!(
-                        node_id = %node_id,
+                        node = %redacted_identifier(node_id),
                         type_url = %request.type_url,
                         outcome = ?outcome,
                         "xDS ACK ignored"
@@ -1207,13 +1226,13 @@ impl XdsAdsServer {
         let outcome = self.record_delta_ack(node_id, request);
         match &outcome {
             AckOutcome::Acked | AckOutcome::VersionDrift { .. } => debug!(
-                node_id = %node_id,
+                node = %redacted_identifier(node_id),
                 type_url = %request.type_url,
                 "xDS delta ACK accepted"
             ),
             AckOutcome::Nacked { message } => {
                 warn!(
-                    node_id = %node_id,
+                    node = %redacted_identifier(node_id),
                     type_url = %request.type_url,
                     error = %message,
                     "xDS delta NACK received"
@@ -1221,7 +1240,7 @@ impl XdsAdsServer {
             }
             outcome => {
                 warn!(
-                    node_id = %node_id,
+                    node = %redacted_identifier(node_id),
                     type_url = %request.type_url,
                     outcome = ?outcome,
                     "xDS delta ACK ignored"
@@ -1528,6 +1547,11 @@ fn enforce_subscription_limits(
     Ok(())
 }
 
+/// Structured warning for a rejected ADS request.
+///
+/// The node id is redacted to a non-reversible digest: it is client-supplied,
+/// so logging it raw would let an authenticated peer inject arbitrary bytes
+/// into the CP's log stream and inflate log volume (issue #3741).
 fn warn_xds_request_rejected(
     method: &'static str,
     namespace: &str,
@@ -1539,7 +1563,7 @@ fn warn_xds_request_rejected(
     warn!(
         method,
         namespace,
-        node_id,
+        node = %redacted_identifier(node_id),
         type_url,
         resource_name_count,
         status_code = ?status.code(),
@@ -1588,10 +1612,6 @@ fn config_fingerprint(config: &GatewayConfig) -> XdsConfigFingerprint {
     ])
 }
 
-fn xds_state_key(namespace: &str, node_id: &str) -> String {
-    format!("{}:{}{}", namespace.len(), namespace, node_id)
-}
-
 fn fingerprint_bytes<const N: usize>(parts: [&[u8]; N]) -> XdsConfigFingerprint {
     let mut hasher = Sha256::new();
     for part in parts {
@@ -1613,8 +1633,8 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         &self,
         request: Request<tonic::Streaming<DiscoveryRequest>>,
     ) -> Result<Response<Self::StreamAggregatedResourcesStream>, Status> {
-        let allowed = match self.verify_jwt_metadata(request.metadata(), request.extensions()) {
-            Ok(allowed) => allowed,
+        let identity = match self.verify_jwt_metadata(request.metadata(), request.extensions()) {
+            Ok(identity) => identity,
             Err(status) => {
                 warn!(
                     method = "xDS.StreamAggregatedResources",
@@ -1632,6 +1652,8 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                 return Err(status);
             }
         };
+        let allowed = identity.allowed_namespaces;
+        let stream_principal_key = principal_key(&identity.subject);
         let stream_namespace = match self.resolve_xds_namespace(&allowed) {
             Ok(namespace) => namespace,
             Err(status) => {
@@ -1651,6 +1673,15 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                 return Err(status);
             }
         };
+        // Reserve aggregate capacity BEFORE the relay task, the response
+        // channel, the broadcast subscription, and the filtered config snapshot
+        // exist. A refusal here allocates none of them (issue #3741).
+        let permit = self.reserve_stream_capacity(
+            "xDS.StreamAggregatedResources",
+            &stream_namespace,
+            &stream_principal_key,
+        )?;
+
         CpGrpcServer::audit_tenant_subscription(
             "xDS.StreamAggregatedResources",
             "",
@@ -1664,9 +1695,16 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         server.ambient_udp_source_bearer_namespaces = allowed.effective_namespaces().cloned();
         let mut updates = server.updates_for_namespace(&stream_namespace);
         let (tx, rx) = mpsc::channel(server.stream_channel_capacity);
+        let max_node_id_bytes = server.admission.limits().max_node_id_bytes;
+        let first_request_timeout = server.admission.limits().first_request_timeout;
 
         tokio::spawn(async move {
-            let mut stream_guard = server.stream_guard();
+            // Owns the permit for the whole stream lifetime; its `Drop` is the
+            // single release path for every normal, error, cancellation, abort,
+            // and shutdown exit below.
+            let mut stream_guard = server.stream_guard(permit);
+            let first_request_deadline = tokio::time::sleep(first_request_timeout);
+            tokio::pin!(first_request_deadline);
             let mut node_id: Option<String> = None;
             let mut node_state_key: Option<String> = None;
             let mut subscriptions: HashMap<String, XdsSubscription> = HashMap::new();
@@ -1679,6 +1717,32 @@ impl AggregatedDiscoveryService for XdsAdsServer {
             let mut last_snapshot: Option<Arc<XdsSnapshot>> = None;
             loop {
                 tokio::select! {
+                    // Bounds a stalled stream that holds a task, a channel, a
+                    // config snapshot, and a permit without ever identifying a
+                    // node. Disabled the moment a node id is resolved, and
+                    // disabled entirely when the deadline is configured to `0`.
+                    _ = &mut first_request_deadline,
+                        if node_id.is_none() && !first_request_timeout.is_zero() =>
+                    {
+                        record_xds_admission_rejection(
+                            "xDS.StreamAggregatedResources",
+                            &stream_namespace,
+                            None,
+                            XdsAdmissionRejection::FirstRequestTimeout,
+                        );
+                        let _ = tx
+                            .send(Err(XdsAdmissionRejection::FirstRequestTimeout.into_status()))
+                            .await;
+                        return;
+                    }
+                    // The outbound response receiver is gone (tonic ended the
+                    // RPC, or an in-process consumer dropped the stream):
+                    // nothing can observe further work, so exit and let the
+                    // guard release the permit, node-scoped state, broadcast
+                    // receiver, and channel.
+                    _ = tx.closed() => {
+                        return;
+                    }
                     maybe_request = requests.next() => {
                         let Some(request) = maybe_request else {
                             return;
@@ -1690,29 +1754,67 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 return;
                             }
                         };
+                        // Validate the client-supplied `Node.id` BEFORE it is
+                        // cloned, stored in any map, folded into a state key, or
+                        // reaches a log line.
+                        let requested_id = match requested_node_id(
+                            request.node.as_ref(),
+                            max_node_id_bytes,
+                        ) {
+                            Ok(requested) => requested,
+                            Err(rejection) => {
+                                record_xds_admission_rejection(
+                                    "xDS.StreamAggregatedResources",
+                                    &stream_namespace,
+                                    None,
+                                    rejection,
+                                );
+                                let _ = tx.send(Err(rejection.into_status())).await;
+                                return;
+                            }
+                        };
                         let current_node_id = match resolve_stream_node_id(
                             node_id.as_deref(),
-                            request.node.as_ref().and_then(|node| non_empty_string(&node.id)),
+                            requested_id,
                         ) {
                             Ok(node_id) => node_id,
                             Err(status) => {
+                                // First-message `Node` omission is the only
+                                // resolve failure while no node is established
+                                // yet. Route it through the same bounded
+                                // rejection accounting as an explicitly present
+                                // empty id (counted above via
+                                // `requested_node_id`) — never double-count.
+                                if node_id.is_none() {
+                                    record_xds_admission_rejection(
+                                        "xDS.StreamAggregatedResources",
+                                        &stream_namespace,
+                                        None,
+                                        XdsAdmissionRejection::NodeIdEmpty,
+                                    );
+                                }
                                 let _ = tx.send(Err(status)).await;
                                 return;
                             }
                         };
-                        let current_state_key = node_state_key
-                            .clone()
-                            .unwrap_or_else(|| xds_state_key(&stream_namespace, &current_node_id));
+                        let current_state_key = node_state_key.clone().unwrap_or_else(|| {
+                            xds_state_key(
+                                &stream_namespace,
+                                &stream_principal_key,
+                                &current_node_id,
+                            )
+                        });
                         if node_id.is_none() {
-                            if let Err(status) = stream_guard.set_node_id(&current_state_key) {
-                                warn!(
-                                    node_id = %current_node_id,
-                                    namespace = %stream_namespace,
-                                    error = %status.message(),
-                                    "Rejecting xDS ADS stream: per-node stream ceiling exceeded"
+                            if let Err(rejection) =
+                                stream_guard.set_node_state_key(&current_state_key)
+                            {
+                                record_xds_admission_rejection(
+                                    "xDS.StreamAggregatedResources",
+                                    &stream_namespace,
+                                    Some(&current_node_id),
+                                    rejection,
                                 );
-                                crate::plugins::mesh::prometheus_helpers::increment_xds_stream_rejected();
-                                let _ = tx.send(Err(status)).await;
+                                let _ = tx.send(Err(rejection.into_status())).await;
                                 return;
                             }
                             node_id = Some(current_node_id.clone());
@@ -1899,8 +2001,8 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         &self,
         request: Request<tonic::Streaming<DeltaDiscoveryRequest>>,
     ) -> Result<Response<Self::DeltaAggregatedResourcesStream>, Status> {
-        let allowed = match self.verify_jwt_metadata(request.metadata(), request.extensions()) {
-            Ok(allowed) => allowed,
+        let identity = match self.verify_jwt_metadata(request.metadata(), request.extensions()) {
+            Ok(identity) => identity,
             Err(status) => {
                 warn!(
                     method = "xDS.DeltaAggregatedResources",
@@ -1918,6 +2020,8 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                 return Err(status);
             }
         };
+        let allowed = identity.allowed_namespaces;
+        let stream_principal_key = principal_key(&identity.subject);
         let stream_namespace = match self.resolve_xds_namespace(&allowed) {
             Ok(namespace) => namespace,
             Err(status) => {
@@ -1937,6 +2041,15 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                 return Err(status);
             }
         };
+        // Delta reserves from the SAME controller as SotW, so splitting a flood
+        // across the two ADS methods (or across connections) cannot double a
+        // client's budget (issue #3741).
+        let permit = self.reserve_stream_capacity(
+            "xDS.DeltaAggregatedResources",
+            &stream_namespace,
+            &stream_principal_key,
+        )?;
+
         CpGrpcServer::audit_tenant_subscription(
             "xDS.DeltaAggregatedResources",
             "",
@@ -1950,9 +2063,16 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         server.ambient_udp_source_bearer_namespaces = allowed.effective_namespaces().cloned();
         let mut updates = server.updates_for_namespace(&stream_namespace);
         let (tx, rx) = mpsc::channel(server.stream_channel_capacity);
+        let max_node_id_bytes = server.admission.limits().max_node_id_bytes;
+        let first_request_timeout = server.admission.limits().first_request_timeout;
 
         tokio::spawn(async move {
-            let mut stream_guard = server.stream_guard();
+            // Owns the permit for the whole stream lifetime; its `Drop` is the
+            // single release path for every normal, error, cancellation, abort,
+            // and shutdown exit below.
+            let mut stream_guard = server.stream_guard(permit);
+            let first_request_deadline = tokio::time::sleep(first_request_timeout);
+            tokio::pin!(first_request_deadline);
             let mut node_id: Option<String> = None;
             let mut node_state_key: Option<String> = None;
             let mut subscriptions: HashMap<String, XdsSubscription> = HashMap::new();
@@ -1967,6 +2087,28 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                 HashMap::new();
             loop {
                 tokio::select! {
+                    _ = &mut first_request_deadline,
+                        if node_id.is_none() && !first_request_timeout.is_zero() =>
+                    {
+                        record_xds_admission_rejection(
+                            "xDS.DeltaAggregatedResources",
+                            &stream_namespace,
+                            None,
+                            XdsAdmissionRejection::FirstRequestTimeout,
+                        );
+                        let _ = tx
+                            .send(Err(XdsAdmissionRejection::FirstRequestTimeout.into_status()))
+                            .await;
+                        return;
+                    }
+                    // The outbound response receiver is gone (tonic ended the
+                    // RPC, or an in-process consumer dropped the stream):
+                    // nothing can observe further work, so exit and let the
+                    // guard release the permit, node-scoped state, broadcast
+                    // receiver, and channel.
+                    _ = tx.closed() => {
+                        return;
+                    }
                     maybe_request = requests.next() => {
                         let Some(request) = maybe_request else {
                             return;
@@ -1978,29 +2120,64 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 return;
                             }
                         };
+                        let requested_id = match requested_node_id(
+                            request.node.as_ref(),
+                            max_node_id_bytes,
+                        ) {
+                            Ok(requested) => requested,
+                            Err(rejection) => {
+                                record_xds_admission_rejection(
+                                    "xDS.DeltaAggregatedResources",
+                                    &stream_namespace,
+                                    None,
+                                    rejection,
+                                );
+                                let _ = tx.send(Err(rejection.into_status())).await;
+                                return;
+                            }
+                        };
                         let current_node_id = match resolve_stream_node_id(
                             node_id.as_deref(),
-                            request.node.as_ref().and_then(|node| non_empty_string(&node.id)),
+                            requested_id,
                         ) {
                             Ok(node_id) => node_id,
                             Err(status) => {
+                                // First-message `Node` omission is the only
+                                // resolve failure while no node is established
+                                // yet. Route it through the same bounded
+                                // rejection accounting as an explicitly present
+                                // empty id (counted above via
+                                // `requested_node_id`) — never double-count.
+                                if node_id.is_none() {
+                                    record_xds_admission_rejection(
+                                        "xDS.DeltaAggregatedResources",
+                                        &stream_namespace,
+                                        None,
+                                        XdsAdmissionRejection::NodeIdEmpty,
+                                    );
+                                }
                                 let _ = tx.send(Err(status)).await;
                                 return;
                             }
                         };
-                        let current_state_key = node_state_key
-                            .clone()
-                            .unwrap_or_else(|| xds_state_key(&stream_namespace, &current_node_id));
+                        let current_state_key = node_state_key.clone().unwrap_or_else(|| {
+                            xds_state_key(
+                                &stream_namespace,
+                                &stream_principal_key,
+                                &current_node_id,
+                            )
+                        });
                         if node_id.is_none() {
-                            if let Err(status) = stream_guard.set_node_id(&current_state_key) {
-                                warn!(
-                                    node_id = %current_node_id,
-                                    namespace = %stream_namespace,
-                                    error = %status.message(),
-                                    "Rejecting xDS delta ADS stream: per-node stream ceiling exceeded"
+                            if let Err(rejection) =
+                                stream_guard.set_node_state_key(&current_state_key)
+                            {
+                                record_xds_admission_rejection(
+                                    "xDS.DeltaAggregatedResources",
+                                    &stream_namespace,
+                                    Some(&current_node_id),
+                                    rejection,
                                 );
-                                crate::plugins::mesh::prometheus_helpers::increment_xds_stream_rejected();
-                                let _ = tx.send(Err(status)).await;
+                                let _ = tx.send(Err(rejection.into_status())).await;
                                 return;
                             }
                             node_id = Some(current_node_id.clone());
@@ -2196,27 +2373,75 @@ impl AggregatedDiscoveryService for XdsAdsServer {
     }
 }
 
-fn non_empty_string(value: &str) -> Option<String> {
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
+/// Extract and validate the `Node.id` carried on one ADS request.
+///
+/// Returns `Ok(None)` when the message carries no node (ACK/NACK follow-ups
+/// legitimately omit it). An explicitly present empty id is rejected and
+/// counted here. A **first-message** omission (`Ok(None)` while no node is
+/// established yet) is rejected and counted at the resolve site in both SotW
+/// and Delta relays, using the same `node_id_empty` reason without
+/// double-counting this explicit-empty path. A **present** id is validated
+/// against the configured contract before it is cloned, stored, keyed, or
+/// logged, so a hostile value never reaches a map or a log line (issue #3741).
+fn requested_node_id(
+    node: Option<&super::proto::Node>,
+    max_node_id_bytes: usize,
+) -> Result<Option<&str>, XdsAdmissionRejection> {
+    let Some(node) = node else {
+        return Ok(None);
+    };
+    if node.id.is_empty() {
+        return Err(XdsAdmissionRejection::NodeIdEmpty);
     }
+    crate::xds::admission::validate_node_id(&node.id, max_node_id_bytes)?;
+    Ok(Some(node.id.as_str()))
 }
 
 fn resolve_stream_node_id(
     current: Option<&str>,
-    requested: Option<String>,
+    requested: Option<&str>,
 ) -> Result<String, Status> {
     match (current, requested) {
-        (None, Some(requested)) => Ok(requested),
-        (None, None) => Err(Status::invalid_argument("xDS Node.id is required")),
+        (None, Some(requested)) => Ok(requested.to_string()),
+        (None, None) => Err(Status::invalid_argument(
+            XdsAdmissionRejection::NodeIdEmpty.status_message(),
+        )),
         (Some(current), None) => Ok(current.to_string()),
-        (Some(current), Some(requested)) if requested == current => Ok(requested),
+        (Some(current), Some(requested)) if requested == current => Ok(requested.to_string()),
+        // Never echo either id: both are client-supplied. The redacted digests
+        // still let an operator correlate the two values across log lines.
         (Some(current), Some(requested)) => Err(Status::invalid_argument(format!(
-            "xDS Node.id cannot change on an established stream: {current} -> {requested}"
+            "xDS Node.id cannot change on an established stream: {} -> {}",
+            redacted_identifier(current),
+            redacted_identifier(requested)
         ))),
     }
+}
+
+/// Log and count one ADS admission rejection.
+///
+/// `namespace` is the CP-resolved tenant (server-side, bounded by CP
+/// configuration), never caller-supplied text. The node id is reduced to a
+/// non-reversible digest, and the metric carries only the bounded
+/// [`XdsAdmissionRejection::metric_reason`] label — no node id, principal,
+/// subject, token, or SPIFFE URI reaches `/metrics` or the log.
+fn record_xds_admission_rejection(
+    method: &'static str,
+    namespace: &str,
+    node_id: Option<&str>,
+    rejection: XdsAdmissionRejection,
+) {
+    warn!(
+        method,
+        namespace,
+        node = %node_id.map(redacted_identifier).unwrap_or_else(|| "unresolved".to_string()),
+        reason = rejection.metric_reason(),
+        "Rejecting xDS ADS stream at admission"
+    );
+    crate::plugins::mesh::prometheus_helpers::increment_xds_stream_rejected();
+    crate::plugins::mesh::prometheus_helpers::increment_xds_stream_admission_rejection(
+        rejection.metric_reason(),
+    );
 }
 
 fn remember_delta_accepted_snapshot(
@@ -2706,115 +2931,65 @@ mod tests {
         subscriptions
     }
 
-    #[test]
-    fn stream_registry_caps_concurrent_streams_per_node() {
-        let registry = XdsStreamRegistry::new(2);
-        assert!(registry.register("node-a").is_ok());
-        assert!(registry.register("node-a").is_ok());
-        // Third concurrent stream for the same node exceeds the ceiling.
-        let err = registry
-            .register("node-a")
-            .expect_err("third stream must be rejected");
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
-        assert!(err.message().contains("per-node concurrent stream limit"));
-
-        // A different node id is unaffected by node-a's count.
-        assert!(registry.register("node-b").is_ok());
-
-        // Dropping a node-a stream frees one slot.
-        assert!(!registry.unregister("node-a"));
-        assert!(
-            registry.register("node-a").is_ok(),
-            "a freed slot admits a new stream"
-        );
+    fn test_guard(
+        controller: &XdsAdmissionController,
+        snapshot_cache: Arc<XdsSnapshotCache>,
+        nonce_tracker: Arc<XdsNonceTracker>,
+    ) -> XdsStreamGuard {
+        let permit = controller
+            .reserve_stream("ferrum", "principal-a")
+            .expect("aggregate capacity available");
+        XdsStreamGuard::new(
+            permit,
+            snapshot_cache,
+            nonce_tracker,
+            Arc::new(DashMap::new()),
+            Arc::new(DashMap::new()),
+            Arc::new(DashMap::new()),
+        )
     }
 
     #[test]
-    fn stream_registry_cap_of_one_allows_single_stream() {
-        let registry = XdsStreamRegistry::new(1);
-        assert!(registry.register("solo").is_ok());
-        assert!(
-            registry.register("solo").is_err(),
-            "a cap of 1 admits exactly one concurrent stream"
-        );
-    }
-
-    #[test]
-    fn stream_registry_zero_cap_is_unbounded() {
-        let registry = XdsStreamRegistry::new(0);
-        for _ in 0..1000 {
-            assert!(
-                registry.register("flood").is_ok(),
-                "cap of 0 disables the ceiling"
-            );
-        }
-    }
-
-    #[test]
-    fn stream_registry_unregister_returns_true_on_last_stream() {
-        let registry = XdsStreamRegistry::new(4);
-        assert!(registry.register("node-a").is_ok());
-        assert!(registry.register("node-a").is_ok());
-        // First unregister leaves one stream → not the last.
-        assert!(!registry.unregister("node-a"));
-        // Second unregister removes the last stream → caller drops per-node state.
-        assert!(registry.unregister("node-a"));
-        // Unregistering an absent node is a no-op that reports "last".
-        assert!(registry.unregister("never-seen"));
-    }
-
-    #[test]
-    fn stream_guard_set_node_id_propagates_ceiling_error() {
+    fn stream_guard_set_node_state_key_propagates_ceiling_error() {
         let snapshot_cache = Arc::new(XdsSnapshotCache::new());
         let nonce_tracker = Arc::new(XdsNonceTracker::new());
-        let active_streams = Arc::new(XdsStreamRegistry::new(1));
+        let controller = XdsAdmissionController::new(XdsAdmissionLimits {
+            max_streams_per_node: 1,
+            ..XdsAdmissionLimits::default()
+        });
 
-        let mut first = XdsStreamGuard::new(
-            snapshot_cache.clone(),
-            nonce_tracker.clone(),
-            active_streams.clone(),
-            Arc::new(DashMap::new()),
-            Arc::new(DashMap::new()),
-            Arc::new(DashMap::new()),
-        );
+        let mut first = test_guard(&controller, snapshot_cache.clone(), nonce_tracker.clone());
         first
-            .set_node_id("node-a")
+            .set_node_state_key("node-a")
             .expect("first stream for node admitted");
 
-        let mut second = XdsStreamGuard::new(
-            snapshot_cache.clone(),
-            nonce_tracker.clone(),
-            active_streams.clone(),
-            Arc::new(DashMap::new()),
-            Arc::new(DashMap::new()),
-            Arc::new(DashMap::new()),
-        );
-        let err = second
-            .set_node_id("node-a")
+        let mut second = test_guard(&controller, snapshot_cache.clone(), nonce_tracker.clone());
+        let rejection = second
+            .set_node_state_key("node-a")
             .expect_err("second concurrent stream rejected by guard");
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(rejection, XdsAdmissionRejection::NodeStreams);
+        assert_eq!(
+            rejection.into_status().code(),
+            tonic::Code::ResourceExhausted
+        );
 
         // The rejected guard never registered, so dropping it must not free the
         // first stream's slot.
         drop(second);
         assert_eq!(
-            active_streams.counts.get("node-a").map(|c| *c),
-            Some(1),
+            controller.node_streams("node-a"),
+            1,
             "a failed registration must neither consume nor free a slot"
         );
 
         // Releasing the first (registered) guard frees the only slot.
         drop(first);
-        let mut third = XdsStreamGuard::new(
-            snapshot_cache,
-            nonce_tracker,
-            active_streams.clone(),
-            Arc::new(DashMap::new()),
-            Arc::new(DashMap::new()),
-            Arc::new(DashMap::new()),
-        );
+        assert_eq!(controller.node_streams("node-a"), 0);
+        assert_eq!(controller.active_nodes(), 0);
+        assert_eq!(controller.active_streams(), 0);
+        let mut third = test_guard(&controller, snapshot_cache, nonce_tracker);
         assert!(
-            third.set_node_id("node-a").is_ok(),
+            third.set_node_state_key("node-a").is_ok(),
             "after the registered stream drops, the slot is available"
         );
     }
@@ -2822,15 +2997,25 @@ mod tests {
     #[test]
     fn resolve_stream_node_id_rejects_mid_stream_mutation() {
         assert_eq!(
-            resolve_stream_node_id(None, Some("node-a".to_string())).unwrap(),
+            resolve_stream_node_id(None, Some("node-a")).unwrap(),
             "node-a"
         );
         assert_eq!(
             resolve_stream_node_id(Some("node-a"), None).unwrap(),
             "node-a"
         );
-        assert!(resolve_stream_node_id(Some("node-a"), Some("node-a".to_string())).is_ok());
-        assert!(resolve_stream_node_id(Some("node-a"), Some("node-b".to_string())).is_err());
+        assert!(resolve_stream_node_id(Some("node-a"), Some("node-a")).is_ok());
+        assert!(resolve_stream_node_id(Some("node-a"), Some("node-b")).is_err());
+        let omitted = resolve_stream_node_id(None, None).expect_err("first-message Node omission");
+        assert_eq!(omitted.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            omitted.message(),
+            XdsAdmissionRejection::NodeIdEmpty.status_message()
+        );
+        assert!(
+            !omitted.message().contains("node-"),
+            "omission rejection must never echo caller data"
+        );
     }
 
     #[test]
@@ -3014,8 +3199,8 @@ mod tests {
     fn xds_state_keys_partition_same_node_id_by_namespace() {
         let server = test_server(gateway_config_with_service(true, 0));
         let stream_config = XdsStreamConfig::new(gateway_config_with_service(true, 0));
-        let tenant_a_key = xds_state_key("tenant-a", "node-a");
-        let tenant_b_key = xds_state_key("tenant-b", "node-a");
+        let tenant_a_key = xds_state_key("tenant-a", "principal-a", "node-a");
+        let tenant_b_key = xds_state_key("tenant-b", "principal-a", "node-a");
 
         let tenant_a_snapshot = server.snapshot_for_stream_config_with_cache_key(
             &tenant_a_key,
@@ -3040,7 +3225,7 @@ mod tests {
     fn xds_node_metadata_uses_authenticated_state_key_for_snapshot_build() {
         let config = waypoint_gateway_config("reviews", 0);
         let server = test_server(config.clone());
-        let tenant_key = xds_state_key("infra", "node-a");
+        let tenant_key = xds_state_key("infra", "principal-a", "node-a");
         let bare_node_key = "node-a";
 
         assert!(server.reconcile_node_metadata(
@@ -3200,7 +3385,7 @@ mod tests {
             Some("waypoint".to_string()),
             XdsNodeScoping::default(),
         ));
-        let state_key = xds_state_key("infra", "node-a");
+        let state_key = xds_state_key("infra", "principal-a", "node-a");
         server.reconcile_node_metadata(
             &state_key,
             crate::xds::carrier::XdsNodeMetadata {
@@ -4160,8 +4345,10 @@ mod tests {
             .issue_nonce("node-a", super::super::translator::CDS_TYPE_URL, "v1");
 
         {
-            let mut guard = server.stream_guard();
-            guard.set_node_id("node-a").expect("stream registers");
+            let mut guard = server.stream_guard(server.test_permit());
+            guard
+                .set_node_state_key("node-a")
+                .expect("stream registers");
             assert!(server.snapshot_cache.get("node-a").is_some());
             assert_eq!(server.nonce_tracker.len(), 1);
         }
@@ -4179,11 +4366,13 @@ mod tests {
             .nonce_tracker
             .issue_nonce("node-a", super::super::translator::CDS_TYPE_URL, "v1");
 
-        let mut first = server.stream_guard();
-        first.set_node_id("node-a").expect("first stream registers");
-        let mut second = server.stream_guard();
+        let mut first = server.stream_guard(server.test_permit());
+        first
+            .set_node_state_key("node-a")
+            .expect("first stream registers");
+        let mut second = server.stream_guard(server.test_permit());
         second
-            .set_node_id("node-a")
+            .set_node_state_key("node-a")
             .expect("second stream within default cap registers");
 
         drop(first);

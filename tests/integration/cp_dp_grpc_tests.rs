@@ -5558,3 +5558,690 @@ async fn delta_broadcast_body_stays_parseable_by_a_legacy_removal_id_shape() {
         "a resource delta must never be flagged as a heartbeat"
     );
 }
+
+// ── xDS ADS aggregate admission (issue #3741) ──────────────────────────────
+//
+// The per-node ceiling alone bounded nothing in aggregate: `Node.id` is chosen
+// by the client, so cycling unique ids reset the allowance while each admitted
+// stream still cost a task, a response channel, a filtered config snapshot, a
+// broadcast receiver, and node-scoped state. These tests drive the real ADS
+// service over the wire and assert that the aggregate budgets hold, that both
+// ADS methods draw from ONE budget, and that every termination path returns the
+// controller to baseline.
+
+/// Start an ADS server with explicit admission budgets. Returns the listen URL
+/// and the shared controller so occupancy can be observed from the test.
+async fn start_test_xds_server_with_limits(
+    limits: ferrum_edge::xds::XdsAdmissionLimits,
+) -> (
+    String,
+    ferrum_edge::xds::XdsAdmissionController,
+    tokio::task::JoinHandle<()>,
+) {
+    let config_arc = Arc::new(ArcSwap::new(Arc::new(create_test_mesh_config())));
+    let (_cp_server, update_tx) =
+        CpGrpcServer::new(config_arc.clone(), TEST_JWT_SECRET.to_string());
+    let xds_server = XdsAdsServer::new(
+        config_arc,
+        update_tx,
+        TEST_JWT_SECRET.to_string(),
+        ferrum_edge::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER.to_string(),
+        "ferrum".to_string(),
+        32,
+    )
+    .with_admission_limits(limits);
+    let admission = xds_server.admission();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let handle = tokio::spawn(async move {
+        let _ = Server::builder()
+            .add_service(xds_server.into_service())
+            .serve_with_incoming(incoming)
+            .await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (
+        format!("http://127.0.0.1:{}", addr.port()),
+        admission,
+        handle,
+    )
+}
+
+fn ads_lds_request(node_id: &str) -> ferrum_edge::xds::proto::DiscoveryRequest {
+    ferrum_edge::xds::proto::DiscoveryRequest {
+        version_info: String::new(),
+        node: Some(ferrum_edge::xds::proto::Node {
+            id: node_id.to_string(),
+            cluster: String::new(),
+            metadata: Vec::new(),
+        }),
+        resource_names: vec!["*".to_string()],
+        type_url: LDS_TYPE_URL.to_string(),
+        response_nonce: String::new(),
+        error_detail: None,
+    }
+}
+
+fn ads_delta_lds_request(node_id: &str) -> ferrum_edge::xds::proto::DeltaDiscoveryRequest {
+    ferrum_edge::xds::proto::DeltaDiscoveryRequest {
+        node: Some(ferrum_edge::xds::proto::Node {
+            id: node_id.to_string(),
+            cluster: String::new(),
+            metadata: Vec::new(),
+        }),
+        type_url: LDS_TYPE_URL.to_string(),
+        resource_names_subscribe: vec!["*".to_string()],
+        resource_names_unsubscribe: Vec::new(),
+        initial_resource_versions: HashMap::new(),
+        response_nonce: String::new(),
+        error_detail: None,
+    }
+}
+
+fn bearer_for(subject: &str) -> tonic::metadata::MetadataValue<tonic::metadata::Ascii> {
+    let token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, subject).unwrap();
+    tonic::metadata::MetadataValue::try_from(format!("Bearer {token}")).unwrap()
+}
+
+async fn ads_client(
+    url: &str,
+) -> ferrum_edge::xds::proto::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient<
+    tonic::transport::Channel,
+> {
+    let channel = tonic::transport::Channel::from_shared(url.to_string())
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    ferrum_edge::xds::proto::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient::new(
+        channel,
+    )
+}
+
+/// Open one SotW ADS stream, drive it to its first response, and keep the
+/// request sender alive so the stream stays established.
+async fn open_established_sotw_stream(
+    url: &str,
+    subject: &str,
+    node_id: &str,
+) -> (
+    tokio::sync::mpsc::Sender<ferrum_edge::xds::proto::DiscoveryRequest>,
+    tonic::Streaming<ferrum_edge::xds::proto::DiscoveryResponse>,
+) {
+    let mut client = ads_client(url).await;
+    let (req_tx, req_rx) = tokio::sync::mpsc::channel(4);
+    req_tx.send(ads_lds_request(node_id)).await.unwrap();
+    let mut request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(req_rx));
+    request
+        .metadata_mut()
+        .insert("authorization", bearer_for(subject));
+    let mut stream = client
+        .stream_aggregated_resources(request)
+        .await
+        .expect("stream admitted")
+        .into_inner();
+    let first = timeout(Duration::from_secs(5), stream.message())
+        .await
+        .expect("first response arrives")
+        .expect("no transport error")
+        .expect("a response is produced");
+    assert_eq!(first.type_url, LDS_TYPE_URL);
+    (req_tx, stream)
+}
+
+/// Open one Delta ADS stream, drive it to its first response, and keep the
+/// request sender alive so the stream stays established.
+async fn open_established_delta_stream(
+    url: &str,
+    subject: &str,
+    node_id: &str,
+) -> (
+    tokio::sync::mpsc::Sender<ferrum_edge::xds::proto::DeltaDiscoveryRequest>,
+    tonic::Streaming<ferrum_edge::xds::proto::DeltaDiscoveryResponse>,
+) {
+    let mut client = ads_client(url).await;
+    let (req_tx, req_rx) = tokio::sync::mpsc::channel(4);
+    req_tx.send(ads_delta_lds_request(node_id)).await.unwrap();
+    let mut request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(req_rx));
+    request
+        .metadata_mut()
+        .insert("authorization", bearer_for(subject));
+    let mut stream = client
+        .delta_aggregated_resources(request)
+        .await
+        .expect("stream admitted")
+        .into_inner();
+    let first = timeout(Duration::from_secs(5), stream.message())
+        .await
+        .expect("first delta response arrives")
+        .expect("no transport error")
+        .expect("a delta response is produced");
+    assert_eq!(first.type_url, LDS_TYPE_URL);
+    (req_tx, stream)
+}
+
+async fn wait_for_active_streams(
+    admission: &ferrum_edge::xds::XdsAdmissionController,
+    expected: usize,
+) {
+    let settled = timeout(Duration::from_secs(5), async {
+        loop {
+            if admission.active_streams() == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        settled.is_ok(),
+        "active streams settled at {} instead of {expected}",
+        admission.active_streams()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_xds_total_stream_budget_rejects_unique_node_id_flood() {
+    // Two total streams, an effectively unlimited per-node ceiling, and a
+    // client that never reuses a node id: exactly the bypass in issue #3741.
+    let limits = ferrum_edge::xds::XdsAdmissionLimits {
+        max_total_streams: 2,
+        max_streams_per_namespace: 1_000,
+        max_streams_per_principal: 1_000,
+        max_streams_per_node: 1_000,
+        max_active_nodes: 1_000,
+        max_node_id_bytes: 253,
+        first_request_timeout: Duration::from_secs(30),
+    };
+    let (url, admission, _handle) = start_test_xds_server_with_limits(limits).await;
+
+    let (_tx_one, _stream_one) = open_established_sotw_stream(&url, "flooder", "node-1").await;
+    let (_tx_two, _stream_two) = open_established_sotw_stream(&url, "flooder", "node-2").await;
+    assert_eq!(admission.active_streams(), 2);
+
+    // The third stream is refused by the TOTAL budget at the handler, before a
+    // relay task, response channel, or filtered config snapshot is allocated —
+    // so the refusal is the RPC's own error, not a stream-borne one.
+    let mut client = ads_client(&url).await;
+    let (req_tx, req_rx) = tokio::sync::mpsc::channel(4);
+    req_tx.send(ads_lds_request("node-3")).await.unwrap();
+    let mut request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(req_rx));
+    request
+        .metadata_mut()
+        .insert("authorization", bearer_for("flooder"));
+    let rejection = client
+        .stream_aggregated_resources(request)
+        .await
+        .expect_err("the total ADS budget must refuse the third stream");
+    assert_eq!(rejection.code(), tonic::Code::ResourceExhausted);
+    assert!(
+        rejection.message().contains("FERRUM_XDS_MAX_TOTAL_STREAMS"),
+        "unexpected message: {}",
+        rejection.message()
+    );
+    assert_eq!(
+        admission.active_streams(),
+        2,
+        "a refused stream must not consume aggregate capacity"
+    );
+    drop(req_tx);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_xds_sotw_and_delta_share_one_aggregate_budget() {
+    let limits = ferrum_edge::xds::XdsAdmissionLimits {
+        max_total_streams: 1,
+        max_streams_per_namespace: 100,
+        max_streams_per_principal: 100,
+        max_streams_per_node: 100,
+        max_active_nodes: 100,
+        max_node_id_bytes: 253,
+        first_request_timeout: Duration::from_secs(30),
+    };
+    let (url, admission, _handle) = start_test_xds_server_with_limits(limits).await;
+
+    // One SotW stream consumes the whole process budget...
+    let (_tx, _stream) = open_established_sotw_stream(&url, "dp", "node-sotw").await;
+    assert_eq!(admission.active_streams(), 1);
+
+    // ...so a Delta stream on a fresh connection and a fresh node id is refused.
+    let mut delta_client = ads_client(&url).await;
+    let (req_tx, req_rx) = tokio::sync::mpsc::channel(4);
+    req_tx
+        .send(ads_delta_lds_request("node-delta"))
+        .await
+        .unwrap();
+    let mut request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(req_rx));
+    request
+        .metadata_mut()
+        .insert("authorization", bearer_for("dp"));
+    let rejection = delta_client
+        .delta_aggregated_resources(request)
+        .await
+        .expect_err("Delta ADS must draw from the same aggregate budget as SotW");
+    assert_eq!(rejection.code(), tonic::Code::ResourceExhausted);
+    drop(req_tx);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_xds_principal_budget_isolates_credentials() {
+    let limits = ferrum_edge::xds::XdsAdmissionLimits {
+        max_total_streams: 100,
+        max_streams_per_namespace: 100,
+        max_streams_per_principal: 1,
+        max_streams_per_node: 100,
+        max_active_nodes: 100,
+        max_node_id_bytes: 253,
+        first_request_timeout: Duration::from_secs(30),
+    };
+    let (url, admission, _handle) = start_test_xds_server_with_limits(limits).await;
+
+    let (_tx, _stream) = open_established_sotw_stream(&url, "credential-a", "node-a").await;
+
+    // The same credential is refused a second stream even under a new node id.
+    let mut client = ads_client(&url).await;
+    let (req_tx, req_rx) = tokio::sync::mpsc::channel(4);
+    req_tx.send(ads_lds_request("node-b")).await.unwrap();
+    let mut request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(req_rx));
+    request
+        .metadata_mut()
+        .insert("authorization", bearer_for("credential-a"));
+    let rejection = client
+        .stream_aggregated_resources(request)
+        .await
+        .expect_err("one credential is bounded regardless of node id");
+    assert_eq!(rejection.code(), tonic::Code::ResourceExhausted);
+    assert!(
+        rejection
+            .message()
+            .contains("FERRUM_XDS_MAX_STREAMS_PER_PRINCIPAL"),
+        "unexpected message: {}",
+        rejection.message()
+    );
+    drop(req_tx);
+
+    // A DIFFERENT credential still gets its own budget.
+    let (_tx_b, _stream_b) = open_established_sotw_stream(&url, "credential-b", "node-c").await;
+    assert_eq!(admission.active_streams(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_xds_unrelated_principals_do_not_share_one_node_quota() {
+    // A per-node ceiling of 1 with two DIFFERENT credentials choosing the SAME
+    // Node.id: the state key binds the authenticated principal, so neither can
+    // consume the other's quota or alias its mutable state.
+    let limits = ferrum_edge::xds::XdsAdmissionLimits {
+        max_total_streams: 100,
+        max_streams_per_namespace: 100,
+        max_streams_per_principal: 100,
+        max_streams_per_node: 1,
+        max_active_nodes: 100,
+        max_node_id_bytes: 253,
+        first_request_timeout: Duration::from_secs(30),
+    };
+    let (url, admission, _handle) = start_test_xds_server_with_limits(limits).await;
+
+    let (_tx_a, _stream_a) = open_established_sotw_stream(&url, "alice", "shared-node").await;
+    let (_tx_b, _stream_b) = open_established_sotw_stream(&url, "bob", "shared-node").await;
+
+    assert_eq!(admission.active_streams(), 2);
+    assert_eq!(
+        admission.active_nodes(),
+        2,
+        "the same Node.id under two principals is two distinct state keys"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_xds_invalid_node_id_is_rejected_and_releases_capacity() {
+    let limits = ferrum_edge::xds::XdsAdmissionLimits {
+        max_total_streams: 4,
+        max_streams_per_namespace: 100,
+        max_streams_per_principal: 100,
+        max_streams_per_node: 100,
+        max_active_nodes: 100,
+        max_node_id_bytes: 16,
+        first_request_timeout: Duration::from_secs(30),
+    };
+    let (url, admission, _handle) = start_test_xds_server_with_limits(limits).await;
+
+    for hostile in [String::new(), "a".repeat(17), "node\ninjected".to_string()] {
+        let mut client = ads_client(&url).await;
+        let (req_tx, req_rx) = tokio::sync::mpsc::channel(4);
+        req_tx.send(ads_lds_request(&hostile)).await.unwrap();
+        let mut request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(req_rx));
+        request
+            .metadata_mut()
+            .insert("authorization", bearer_for("dp"));
+        let mut stream = client
+            .stream_aggregated_resources(request)
+            .await
+            .expect("aggregate capacity is available, so the stream is admitted")
+            .into_inner();
+        let rejection = timeout(Duration::from_secs(5), stream.message())
+            .await
+            .expect("the first message is rejected promptly")
+            .expect_err("an invalid Node.id must fail the stream");
+        assert_eq!(rejection.code(), tonic::Code::InvalidArgument);
+        assert!(
+            !rejection.message().contains("injected"),
+            "a rejection must never echo the client-supplied Node.id: {}",
+            rejection.message()
+        );
+        drop(req_tx);
+        drop(stream);
+    }
+
+    // An id of EXACTLY the byte ceiling is admitted.
+    let (_tx, _stream) = open_established_sotw_stream(&url, "dp", &"n".repeat(16)).await;
+
+    // Every first-message failure released its permit, so the budget is intact.
+    wait_for_active_streams(&admission, 1).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_xds_stream_without_first_request_hits_the_initial_deadline() {
+    let limits = ferrum_edge::xds::XdsAdmissionLimits {
+        max_total_streams: 2,
+        max_streams_per_namespace: 100,
+        max_streams_per_principal: 100,
+        max_streams_per_node: 100,
+        max_active_nodes: 100,
+        max_node_id_bytes: 253,
+        first_request_timeout: Duration::from_millis(300),
+    };
+    let (url, admission, _handle) = start_test_xds_server_with_limits(limits).await;
+
+    // Open a stream and never send a request. It must not park the permit.
+    let mut client = ads_client(&url).await;
+    let (req_tx, req_rx) =
+        tokio::sync::mpsc::channel::<ferrum_edge::xds::proto::DiscoveryRequest>(4);
+    let mut request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(req_rx));
+    request
+        .metadata_mut()
+        .insert("authorization", bearer_for("stalled"));
+    let mut stream = client
+        .stream_aggregated_resources(request)
+        .await
+        .expect("stream admitted")
+        .into_inner();
+
+    let rejection = timeout(Duration::from_secs(5), stream.message())
+        .await
+        .expect("the initial-request deadline fires")
+        .expect_err("a stalled stream must be closed");
+    assert_eq!(rejection.code(), tonic::Code::DeadlineExceeded);
+    drop(req_tx);
+    drop(stream);
+
+    wait_for_active_streams(&admission, 0).await;
+    assert_eq!(admission.active_nodes(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_xds_client_cancellation_releases_stream_and_node_occupancy() {
+    // A real client cancellation over tonic/h2 releases BOTH transport halves.
+    // That is deliberate, not incidental: tonic's response decoder owns the h2
+    // `RecvStream` while the live request encoder owns the same stream's
+    // `SendStream`, so dropping only the response `Streaming` sends no
+    // RST_STREAM and the server observes no cancellation at all. This test
+    // therefore models cancellation the way a client actually performs it —
+    // drop the request sender and the response stream together — and asserts
+    // that every admitted stream returns aggregate, namespace, principal, and
+    // node occupancy to baseline afterwards, on both ADS methods.
+    let limits = ferrum_edge::xds::XdsAdmissionLimits {
+        max_total_streams: 3,
+        max_streams_per_namespace: 100,
+        max_streams_per_principal: 100,
+        max_streams_per_node: 100,
+        max_active_nodes: 100,
+        max_node_id_bytes: 253,
+        first_request_timeout: Duration::from_secs(30),
+    };
+    let (url, admission, _handle) = start_test_xds_server_with_limits(limits).await;
+
+    let (req_tx, stream) = open_established_sotw_stream(&url, "cancelling", "node-sotw").await;
+    assert_eq!(admission.active_streams(), 1);
+    assert_eq!(admission.active_nodes(), 1);
+
+    // Cancel: release both transport halves, which is what puts RST_STREAM on
+    // the wire and lets the server observe the client going away.
+    drop(req_tx);
+    drop(stream);
+    wait_for_active_streams(&admission, 0).await;
+    assert_eq!(
+        admission.active_nodes(),
+        0,
+        "node occupancy must return to baseline after a client cancellation"
+    );
+    assert_eq!(admission.tracked_namespaces(), 0);
+    assert_eq!(admission.tracked_principals(), 0);
+
+    // Delta ADS shares the same admission accounting and the same release path.
+    let (delta_tx, delta_stream) =
+        open_established_delta_stream(&url, "cancelling", "node-delta").await;
+    assert_eq!(admission.active_streams(), 1);
+    assert_eq!(admission.active_nodes(), 1);
+    drop(delta_tx);
+    drop(delta_stream);
+    wait_for_active_streams(&admission, 0).await;
+    assert_eq!(admission.active_nodes(), 0);
+    assert_eq!(admission.tracked_namespaces(), 0);
+    assert_eq!(admission.tracked_principals(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_xds_client_cancellation_rapid_churn_returns_to_baseline() {
+    let limits = ferrum_edge::xds::XdsAdmissionLimits {
+        max_total_streams: 3,
+        max_streams_per_namespace: 100,
+        max_streams_per_principal: 100,
+        max_streams_per_node: 100,
+        max_active_nodes: 100,
+        max_node_id_bytes: 253,
+        first_request_timeout: Duration::from_secs(30),
+    };
+    let (url, admission, _handle) = start_test_xds_server_with_limits(limits).await;
+
+    // Rapid connect/cancel under unique node ids. `max_active_nodes` is the
+    // scarce resource issue #3741 is about: if a cancelled stream leaked its
+    // node registration, unique-id churn would exhaust the node budget even
+    // though no stream is active.
+    for index in 0..12u32 {
+        let (req_tx, stream) =
+            open_established_sotw_stream(&url, "churner", &format!("node-{index}")).await;
+        // A real cancellation releases both transport halves together.
+        drop(req_tx);
+        drop(stream);
+        wait_for_active_streams(&admission, 0).await;
+        assert_eq!(admission.active_nodes(), 0);
+    }
+
+    assert_eq!(admission.active_streams(), 0);
+    assert_eq!(admission.active_nodes(), 0);
+    assert_eq!(admission.tracked_namespaces(), 0);
+    assert_eq!(admission.tracked_principals(), 0);
+
+    // The full budget is available again after the churn.
+    let mut held = Vec::new();
+    for index in 0..3u32 {
+        held.push(open_established_sotw_stream(&url, "churner", &format!("fresh-{index}")).await);
+    }
+    assert_eq!(admission.active_streams(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_xds_omitted_node_on_first_message_counts_node_id_empty_rejection() {
+    use ferrum_edge::plugins::mesh::prometheus_helpers::{
+        xds_stream_admission_rejection_count, xds_streams_rejected_total,
+    };
+    use ferrum_edge::xds::XdsAdmissionRejection;
+
+    let limits = ferrum_edge::xds::XdsAdmissionLimits {
+        max_total_streams: 4,
+        max_streams_per_namespace: 100,
+        max_streams_per_principal: 100,
+        max_streams_per_node: 100,
+        max_active_nodes: 100,
+        max_node_id_bytes: 253,
+        first_request_timeout: Duration::from_secs(30),
+    };
+    let (url, admission, _handle) = start_test_xds_server_with_limits(limits).await;
+
+    let reason = XdsAdmissionRejection::NodeIdEmpty.metric_reason();
+    let before_reason = xds_stream_admission_rejection_count(reason);
+    let before_total = xds_streams_rejected_total();
+
+    // SotW: first message with Node omitted entirely.
+    {
+        let mut client = ads_client(&url).await;
+        let (req_tx, req_rx) = tokio::sync::mpsc::channel(4);
+        req_tx
+            .send(ferrum_edge::xds::proto::DiscoveryRequest {
+                version_info: String::new(),
+                node: None,
+                resource_names: vec!["*".to_string()],
+                type_url: LDS_TYPE_URL.to_string(),
+                response_nonce: String::new(),
+                error_detail: None,
+            })
+            .await
+            .unwrap();
+        let mut request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(req_rx));
+        request
+            .metadata_mut()
+            .insert("authorization", bearer_for("omit-sotw"));
+        let mut stream = client
+            .stream_aggregated_resources(request)
+            .await
+            .expect("aggregate capacity is available, so the stream is admitted")
+            .into_inner();
+        let rejection = timeout(Duration::from_secs(5), stream.message())
+            .await
+            .expect("omission is rejected promptly")
+            .expect_err("first-message Node omission must fail the stream");
+        assert_eq!(rejection.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            rejection.message(),
+            XdsAdmissionRejection::NodeIdEmpty.status_message()
+        );
+        drop(req_tx);
+        drop(stream);
+    }
+
+    // Delta: same first-message omission path.
+    {
+        let mut client = ads_client(&url).await;
+        let (req_tx, req_rx) = tokio::sync::mpsc::channel(4);
+        req_tx
+            .send(ferrum_edge::xds::proto::DeltaDiscoveryRequest {
+                node: None,
+                type_url: LDS_TYPE_URL.to_string(),
+                resource_names_subscribe: vec!["*".to_string()],
+                resource_names_unsubscribe: Vec::new(),
+                initial_resource_versions: HashMap::new(),
+                response_nonce: String::new(),
+                error_detail: None,
+            })
+            .await
+            .unwrap();
+        let mut request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(req_rx));
+        request
+            .metadata_mut()
+            .insert("authorization", bearer_for("omit-delta"));
+        let mut stream = client
+            .delta_aggregated_resources(request)
+            .await
+            .expect("aggregate capacity is available, so the stream is admitted")
+            .into_inner();
+        let rejection = timeout(Duration::from_secs(5), stream.message())
+            .await
+            .expect("omission is rejected promptly")
+            .expect_err("first-message Node omission must fail the stream");
+        assert_eq!(rejection.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            rejection.message(),
+            XdsAdmissionRejection::NodeIdEmpty.status_message()
+        );
+        drop(req_tx);
+        drop(stream);
+    }
+
+    assert_eq!(
+        xds_stream_admission_rejection_count(reason) - before_reason,
+        2,
+        "omission must advance ferrum_xds_stream_admission_rejections_total{{reason=\"node_id_empty\"}} once per method"
+    );
+    assert_eq!(
+        xds_streams_rejected_total() - before_total,
+        2,
+        "omission must also advance the label-free aggregate rejection counter"
+    );
+
+    // Explicit empty id is a separate path that must still count exactly once
+    // (never double-count with the omission branch above).
+    let before_empty = xds_stream_admission_rejection_count(reason);
+    let before_empty_total = xds_streams_rejected_total();
+    {
+        let mut client = ads_client(&url).await;
+        let (req_tx, req_rx) = tokio::sync::mpsc::channel(4);
+        req_tx.send(ads_lds_request("")).await.unwrap();
+        let mut request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(req_rx));
+        request
+            .metadata_mut()
+            .insert("authorization", bearer_for("empty-id"));
+        let mut stream = client
+            .stream_aggregated_resources(request)
+            .await
+            .expect("aggregate capacity is available, so the stream is admitted")
+            .into_inner();
+        let rejection = timeout(Duration::from_secs(5), stream.message())
+            .await
+            .expect("empty id is rejected promptly")
+            .expect_err("explicit empty Node.id must fail the stream");
+        assert_eq!(rejection.code(), tonic::Code::InvalidArgument);
+        drop(req_tx);
+        drop(stream);
+    }
+    assert_eq!(
+        xds_stream_admission_rejection_count(reason) - before_empty,
+        1,
+        "explicit empty must count exactly once via requested_node_id, not double with resolve"
+    );
+    assert_eq!(xds_streams_rejected_total() - before_empty_total, 1);
+
+    wait_for_active_streams(&admission, 0).await;
+    assert_eq!(admission.active_nodes(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_xds_simultaneous_client_disconnect_releases_every_permit() {
+    // Note: aborting the accept-loop task does NOT sever established tonic
+    // streams (see `.claude/rules/testing.md`), so this exercises simultaneous
+    // client disconnect. Forced *task* cancellation of a permit-holding task is
+    // covered directly in `tests/unit/gateway_core/xds_admission_tests.rs`.
+    let limits = ferrum_edge::xds::XdsAdmissionLimits {
+        max_total_streams: 4,
+        max_streams_per_namespace: 100,
+        max_streams_per_principal: 100,
+        max_streams_per_node: 100,
+        max_active_nodes: 100,
+        max_node_id_bytes: 253,
+        first_request_timeout: Duration::from_secs(30),
+    };
+    let (url, admission, _handle) = start_test_xds_server_with_limits(limits).await;
+
+    let mut held = Vec::new();
+    for index in 0..3u32 {
+        held.push(open_established_sotw_stream(&url, "dp", &format!("node-{index}")).await);
+    }
+    assert_eq!(admission.active_streams(), 3);
+    assert_eq!(admission.active_nodes(), 3);
+
+    drop(held);
+    wait_for_active_streams(&admission, 0).await;
+    assert_eq!(admission.active_nodes(), 0);
+    assert_eq!(admission.tracked_principals(), 0);
+}

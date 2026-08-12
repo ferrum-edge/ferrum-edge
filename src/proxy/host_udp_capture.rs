@@ -116,19 +116,23 @@ use crate::capture::IptablesPlan;
 use crate::modes::mesh::hbone::UdpSourceIdentity;
 
 /// How long shutdown waits for the node-agent to acknowledge that its BPF UDP
-/// gate closed before giving up and leaving the datapath fail-closed. Mirrors the
-/// pod-netns producer's bounded handshake window.
-const GATE_CLOSE_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+/// gate closed before taking the fail-closed path (install DROP guard, then
+/// retire capture jumps/routes). Must stay **strictly below** mesh mode's
+/// background-task drain (`MESH_STARTUP_BACKGROUND_DRAIN_TIMEOUT` = 5s): a longer
+/// wait is aborted mid-handshake, the capture listener dies with the process, and
+/// Ferrum-owned v4/v6 jumps + fwmark routes are left installed with no socket.
+/// Matches the pod-netns producer's shutdown acknowledgement window (1s).
+const GATE_CLOSE_ACK_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Poll interval for the gate-close acknowledgement.
 const GATE_CLOSE_ACK_POLL: Duration = Duration::from_millis(100);
 
 /// How long ONE reconcile pass waits for a departing pod's gate-close
 /// acknowledgement before leaving the protective guard up and retrying on the
-/// next poll. Deliberately shorter than the shutdown budget: the reconcile loop
-/// retries anyway, so a stalled node-agent must not stall reconciliation for
-/// every other pod on the node. Waiting longer would not change the posture —
-/// the departing pod's rules and guard are retained either way.
+/// next poll. Same ceiling as shutdown: the reconcile loop retries anyway, so a
+/// stalled node-agent must not stall reconciliation for every other pod on the
+/// node. Waiting longer would not change the posture — the departing pod's rules
+/// and guard are retained either way.
 const RECONCILE_GATE_CLOSE_ACK_WAIT: Duration = Duration::from_secs(1);
 
 /// One enrolled pod's host-side capture binding: the interface its egress enters
@@ -1542,6 +1546,10 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
     /// listener stops; a socketless TPROXY path drops traffic, while removing the
     /// path could release it as plaintext while the node-agent still believes
     /// capture is live.
+    ///
+    /// The acknowledgement wait is capped so guard install + capture teardown
+    /// still finish inside mesh mode's background-task drain; otherwise the
+    /// manager task is aborted and host jumps/routes survive process exit.
     pub async fn shutdown(&mut self) {
         // A shutdown that races an unfinished startup recovery must remove
         // NOTHING. This process published no readiness of its own and installed
@@ -1577,7 +1585,10 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
         // whole set, not a subset of it.
         let pods = leaving.len();
 
-        let budget = self.gate_close_timeout;
+        // Cap at the production shutdown ceiling even when a test raises
+        // `gate_close_timeout`: mesh aborts this task after 5s, and teardown must
+        // still run (see [`GATE_CLOSE_ACK_TIMEOUT`]).
+        let budget = self.gate_close_timeout.min(GATE_CLOSE_ACK_TIMEOUT);
         let requested = self.begin_gate_close(&leaving);
         let acknowledged = requested && self.await_gate_close(budget).await;
 

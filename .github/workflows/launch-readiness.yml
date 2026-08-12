@@ -1,0 +1,67 @@
+name: Launch Readiness
+
+# Fail-closed live launch gate for PRODUCTION_READINESS.md.
+# Evaluates paginated GitHub issue state plus a redacted private-advisory count
+# against docs/launch-blocker-policy.json. Synthetic self-tests always run first.
+#
+# Private advisories: the Actions GITHUB_TOKEN cannot list repository security
+# advisories (that is a separate GitHub permission, NOT `security-events`), so
+# trusted runs may use an explicitly provisioned read-only advisory token and
+# every other run falls back to externally maintained repository variables that
+# carry only a redacted count and an audit timestamp. A pull request can read
+# those variables but cannot change them. See docs/launch-readiness.md.
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  schedule:
+    # Daily — catch label/issue drift between PRs without relying on a stale PASS.
+    - cron: "15 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.event_name == 'merge_group' && format('launch-readiness-merge-group-{0}', github.event.merge_group.head_sha) || github.event_name == 'pull_request' && format('launch-readiness-pr-{0}', github.event.pull_request.number) || format('launch-readiness-{0}-{1}', github.event_name, github.sha) }}
+  cancel-in-progress: ${{ github.event_name != 'merge_group' }}
+
+permissions:
+  contents: read
+
+jobs:
+  launch-readiness:
+    name: Launch Readiness Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          # Evaluate the exact commit under test — PR head, merge-group head, or
+          # the push/schedule/tag SHA — never a synthetic merge commit alone.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.sha }}
+
+      - name: Synthetic policy/checker self-tests
+        run: python3 -I scripts/check_launch_readiness.py --self-test
+
+      - name: Verify live launch verdict
+        env:
+          # Public issue state only; this token cannot read private advisories.
+          GITHUB_TOKEN: ${{ github.token }}
+          LAUNCH_TIER: ga
+          LAUNCH_TARGET_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.sha }}
+          # Externally maintained, redacted, and read-only from a pull request.
+          LAUNCH_PRIVATE_BLOCKER_COUNT: ${{ vars.LAUNCH_PRIVATE_BLOCKER_COUNT }}
+          LAUNCH_PRIVATE_ADVISORY_AS_OF: ${{ vars.LAUNCH_PRIVATE_ADVISORY_AS_OF }}
+          # Never expose a privileged advisory token to pull-request or
+          # merge-group code; those runs use the redacted variables above.
+          LAUNCH_ADVISORY_READ_TOKEN: ${{ (github.event_name != 'pull_request' && github.event_name != 'merge_group') && secrets.LAUNCH_ADVISORY_READ_TOKEN || '' }}
+        run: python3 -I scripts/check_launch_readiness.py --verify --verify-checkout

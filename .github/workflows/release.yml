@@ -39,9 +39,46 @@ jobs:
 
           echo "Release tag ${TAG_NAME} matches Cargo.toml package version ${cargo_version}"
 
+  validate-launch-readiness:
+    name: Validate launch readiness
+    needs: validate-release-version
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # `security-events: read` is NOT the repository security-advisories
+    # permission, so it is deliberately absent: the advisory listing comes from
+    # an explicitly provisioned read-only token, or from redacted repository
+    # variables, or the verdict is UNKNOWN and the release stops.
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Synthetic policy/checker self-tests
+        run: python3 -I scripts/check_launch_readiness.py --self-test
+
+      - name: Require live launch PASS for the exact tag commit
+        env:
+          # Public issue state only; this token cannot read private advisories.
+          GITHUB_TOKEN: ${{ github.token }}
+          LAUNCH_TIER: ga
+          # No LAUNCH_TARGET_SHA: with the tag ref checked out, the evaluated
+          # target is resolved from HEAD, so it is exactly the tagged commit
+          # whatever object the tag itself is.
+          LAUNCH_PRIVATE_BLOCKER_COUNT: ${{ vars.LAUNCH_PRIVATE_BLOCKER_COUNT }}
+          LAUNCH_PRIVATE_ADVISORY_AS_OF: ${{ vars.LAUNCH_PRIVATE_ADVISORY_AS_OF }}
+          LAUNCH_ADVISORY_READ_TOKEN: ${{ secrets.LAUNCH_ADVISORY_READ_TOKEN }}
+        run: python3 -I scripts/check_launch_readiness.py --verify --require-pass
+
   validate-release-sha:
     name: Validate release SHA
-    needs: validate-release-version
+    needs:
+      - validate-release-version
+      - validate-launch-readiness
     runs-on: ubuntu-latest
     timeout-minutes: 350
     permissions:
@@ -363,13 +400,13 @@ jobs:
 
   create-release:
     name: Create GitHub Release
-    # Wait for BOTH manifests: the release notes advertise the `:<tag>` default
-    # image AND the `:<tag>-ebpf` variant, so the GitHub Release must not publish
-    # until the eBPF manifest exists — otherwise the notes link `-ebpf` tags that
-    # were never pushed. Both `docker-manifest` and `docker-ebpf-manifest` run
-    # unconditionally on every `v*` tag (no `if:`/path filters), so this keeps the
-    # default release path intact.
-    needs: [build-release-binaries, build-release-arm64-cross, docker-manifest, docker-ebpf-manifest]
+    # Wait for ALL THREE manifests: the release notes advertise the `:<tag>`
+    # default image, the `:<tag>-ebpf` variant, AND the `:<tag>-ebpf-tools`
+    # Ambient UDP lifecycle variant, so the GitHub Release must not publish until
+    # every advertised manifest exists — otherwise the notes link tags that were
+    # never pushed. All three manifest jobs run unconditionally on every `v*` tag
+    # (no `if:`/path filters), so this keeps the default release path intact.
+    needs: [build-release-binaries, build-release-arm64-cross, docker-manifest, docker-ebpf-manifest, docker-ebpf-tools-manifest]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -499,18 +536,32 @@ jobs:
           On a node whose kernel/cgroup/bpffs probe fails, the \`-ebpf\` pod
           **exits** (default \`FERRUM_NODE_AGENT_FALLBACK_MODE=fail\`) rather than
           degrading. The published \`-ebpf\` image is **distroless** — it has no
-          \`/bin/sh\` and no \`iptables\`, and the fallback runs commands via
-          \`sh -c\`, so \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` on the
-          published image **crash-loops**. To use the iptables fallback, build a
-          custom runtime image that adds \`/bin/sh\` + \`iptables\`/\`ip6tables\`
-          (see [docs/node_agent.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/node_agent.md#kernel-fallback)),
-          then set \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` to fall back to
-          host iptables capture:
+          \`/bin/sh\` and no \`iptables\` — and stays that way on purpose:
 
           \`\`\`bash
           docker pull ferrumedge/ferrum-edge:$TAG_NAME-ebpf
           docker pull ghcr.io/ferrum-edge/ferrum-edge:$TAG_NAME-ebpf
           \`\`\`
+
+          The host iptables fallback and the Ambient host-network UDP capture
+          lifecycle run generated \`sh -c\` \`iptables\`/\`ip6tables\`/\`ip\`
+          commands, which the distroless \`-ebpf\` image cannot execute, so
+          \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` crash-loops there. Use the
+          **\`-ebpf-tools\`** variant instead: the same Linux-only eBPF build on a
+          Debian slim base carrying \`/bin/sh\`, \`iptables\`, \`ip6tables\`, and
+          \`ip\` (see [docs/node_agent.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/node_agent.md#kernel-fallback)).
+          The mesh Helm chart auto-selects it for the Ambient UDP lifecycle:
+
+          \`\`\`bash
+          docker pull ferrumedge/ferrum-edge:$TAG_NAME-ebpf-tools
+          docker pull ghcr.io/ferrum-edge/ferrum-edge:$TAG_NAME-ebpf-tools
+          \`\`\`
+
+          All three image families — default, \`-ebpf\`, and \`-ebpf-tools\` — are
+          Cosign-signed on their immutable multi-arch digests in both registries
+          and carry SLSA provenance plus per-platform SPDX SBOM attestations; see
+          [docs/ci_cd.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/ci_cd.md#image-signatures-sboms-and-provenance)
+          for the verification commands.
 
           ## Checksums
 
@@ -756,17 +807,44 @@ jobs:
           outputs: type=image,"name=ferrumedge/ferrum-edge,ghcr.io/${{ github.repository }}",push-by-digest=true,name-canonical=true,push=true
           provenance: false
 
+      # `-ebpf-tools`: the Ambient UDP lifecycle runtime the mesh chart selects
+      # for `ambient.captureMode`-independent UDP capture (#3705). It is built in
+      # THIS job, from the same source and the same `FEATURES`, so the tools tag
+      # can never lag or drift from the `-ebpf` tag the chart's other tiers use;
+      # its manifest is gated by exactly the same release path below.
+      - name: Build and push per-platform eBPF tools digest
+        id: build_tools
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime-ebpf-tools
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            FEATURES=cloud-secrets,ebpf
+          outputs: type=image,"name=ferrumedge/ferrum-edge,ghcr.io/${{ github.repository }}",push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+
       - name: Export digest
         run: |
-          mkdir -p /tmp/digests
+          mkdir -p /tmp/digests /tmp/digests-tools
           digest="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${digest#sha256:}"
+          tools_digest="${{ steps.build_tools.outputs.digest }}"
+          touch "/tmp/digests-tools/${tools_digest#sha256:}"
 
       - name: Upload digest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: docker-ebpf-digest-${{ matrix.arch_dir }}
           path: /tmp/digests/*
+          if-no-files-found: error
+
+      - name: Upload tools digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: docker-ebpf-tools-digest-${{ matrix.arch_dir }}
+          path: /tmp/digests-tools/*
           if-no-files-found: error
 
   docker-ebpf-manifest:
@@ -842,9 +920,100 @@ jobs:
             -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.MAJOR_MINOR }}-ebpf \
             $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
 
+  docker-ebpf-tools-manifest:
+    # ── Ambient UDP lifecycle image variant (`-ebpf-tools` suffix) ───────────
+    # The mesh Helm chart AUTO-SELECTS `:<tag>-ebpf-tools` for the Ambient UDP
+    # capture lifecycle, because that datapath executes generated `sh -c`
+    # iptables/ip6tables scripts the distroless `-ebpf` image cannot run at all
+    # (#3705). These tags are therefore a chart-rendering prerequisite, not an
+    # optional extra: a release that publishes `-ebpf` but not `-ebpf-tools`
+    # makes every Ambient UDP install reference a nonexistent image.
+    #
+    # This is a SEPARATE job rather than two more steps in
+    # `docker-ebpf-manifest` so each published tag family keeps its own frozen,
+    # independently auditable assembly contract and its own digest artifact name
+    # space. The gating is kept equivalent by construction: the same `needs` as
+    # `docker-ebpf-manifest`, plus `docker-ebpf-manifest` itself, so the tools
+    # tags can never be published for a release whose core artifacts or `-ebpf`
+    # variant did not ship. Both variants are built from one source tree in the
+    # same `docker-ebpf` matrix job, so their contents cannot drift apart
+    # either. `create-release` and `attest-release-images` both depend on this
+    # job, so a failed tools manifest blocks the GitHub Release and the
+    # signing/attestation pass alike, and this job's whole step list plus the
+    # `docker-ebpf-tools-digest-*` wildcard it consumes are frozen by the
+    # trusted cross-build policy.
+    #
+    # Keep this comment INSIDE the job: a comment between two jobs belongs to
+    # the preceding job's frozen `steps` block and would break that contract.
+    name: Docker eBPF Tools Manifest
+    needs: [build-release-binaries, docker-manifest, docker-ebpf, docker-ebpf-manifest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Extract version tag
+        id: version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "Invalid release tag format: $TAG_NAME" >&2
+            exit 1
+          fi
+          VERSION="${TAG_NAME#v}"
+          MAJOR_MINOR="${VERSION%.*}"
+          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "MAJOR_MINOR=$MAJOR_MINOR" >> $GITHUB_OUTPUT
+
+      # Distinct artifact name space from `docker-ebpf-digest-*`: mixing the two
+      # variants into one directory would hand `imagetools create` four
+      # descriptors and publish a manifest spanning both images.
+      - name: Download tools digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: /tmp/digests-tools
+          pattern: docker-ebpf-tools-digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create and push multi-arch eBPF tools manifest (Docker Hub)
+        working-directory: /tmp/digests-tools
+        run: |
+          docker buildx imagetools create \
+            -t ferrumedge/ferrum-edge:${{ steps.version.outputs.TAG_NAME }}-ebpf-tools \
+            -t ferrumedge/ferrum-edge:${{ steps.version.outputs.VERSION }}-ebpf-tools \
+            -t ferrumedge/ferrum-edge:${{ steps.version.outputs.MAJOR_MINOR }}-ebpf-tools \
+            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)
+
+      - name: Create and push multi-arch eBPF tools manifest (GHCR)
+        working-directory: /tmp/digests-tools
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.TAG_NAME }}-ebpf-tools \
+            -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.VERSION }}-ebpf-tools \
+            -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.MAJOR_MINOR }}-ebpf-tools \
+            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
+
   attest-release-images:
     name: Sign and attest release images
-    needs: [docker-manifest, docker-ebpf-manifest]
+    needs: [docker-manifest, docker-ebpf-manifest, docker-ebpf-tools-manifest]
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -917,6 +1086,10 @@ jobs:
           resolve_manifest standard_ghcr "ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}"
           resolve_manifest ebpf_docker "ferrumedge/ferrum-edge:${TAG_NAME}-ebpf"
           resolve_manifest ebpf_ghcr "ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}-ebpf"
+          resolve_manifest ebpftools_docker \
+            "ferrumedge/ferrum-edge:${TAG_NAME}-ebpf-tools"
+          resolve_manifest ebpftools_ghcr \
+            "ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}-ebpf-tools"
 
           compare_registry_manifests() {
             local family="$1"
@@ -934,6 +1107,7 @@ jobs:
 
           compare_registry_manifests standard
           compare_registry_manifests ebpf
+          compare_registry_manifests ebpftools
 
       - name: Generate SPDX SBOMs and manifest provenance
         env:
@@ -945,6 +1119,8 @@ jobs:
           STANDARD_GHCR_REF: ${{ steps.images.outputs.standard_ghcr_ref }}
           EBPF_DOCKER_REF: ${{ steps.images.outputs.ebpf_docker_ref }}
           EBPF_GHCR_REF: ${{ steps.images.outputs.ebpf_ghcr_ref }}
+          EBPF_TOOLS_DOCKER_REF: ${{ steps.images.outputs.ebpftools_docker_ref }}
+          EBPF_TOOLS_GHCR_REF: ${{ steps.images.outputs.ebpftools_ghcr_ref }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
@@ -994,6 +1170,12 @@ jobs:
             "$DOCKERHUB_USERNAME" "$DOCKERHUB_PASSWORD"
           generate_sboms \
             ebpf ghcr "$EBPF_GHCR_REF" \
+            "$GHCR_USERNAME" "$GHCR_TOKEN"
+          generate_sboms \
+            ebpftools docker "$EBPF_TOOLS_DOCKER_REF" \
+            "$DOCKERHUB_USERNAME" "$DOCKERHUB_PASSWORD"
+          generate_sboms \
+            ebpftools ghcr "$EBPF_TOOLS_GHCR_REF" \
             "$GHCR_USERNAME" "$GHCR_TOKEN"
 
           cat > "$work/create_provenance.jq" <<'JQ'
@@ -1069,6 +1251,16 @@ jobs:
             "ghcr.io/${GITHUB_REPOSITORY}" \
             "$work/ebpf_ghcr.manifest.json" \
             "$work/ebpf_ghcr.provenance.json"
+          create_provenance \
+            ebpftools \
+            ferrumedge/ferrum-edge \
+            "$work/ebpftools_docker.manifest.json" \
+            "$work/ebpftools_docker.provenance.json"
+          create_provenance \
+            ebpftools \
+            "ghcr.io/${GITHUB_REPOSITORY}" \
+            "$work/ebpftools_ghcr.manifest.json" \
+            "$work/ebpftools_ghcr.provenance.json"
 
       - name: Sign and attest immutable image digests
         env:
@@ -1076,6 +1268,8 @@ jobs:
           STANDARD_GHCR_REF: ${{ steps.images.outputs.standard_ghcr_ref }}
           EBPF_DOCKER_REF: ${{ steps.images.outputs.ebpf_docker_ref }}
           EBPF_GHCR_REF: ${{ steps.images.outputs.ebpf_ghcr_ref }}
+          EBPF_TOOLS_DOCKER_REF: ${{ steps.images.outputs.ebpftools_docker_ref }}
+          EBPF_TOOLS_GHCR_REF: ${{ steps.images.outputs.ebpftools_ghcr_ref }}
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/image-attestations"
@@ -1105,6 +1299,8 @@ jobs:
           sign_and_attest standard ghcr "$STANDARD_GHCR_REF"
           sign_and_attest ebpf docker "$EBPF_DOCKER_REF"
           sign_and_attest ebpf ghcr "$EBPF_GHCR_REF"
+          sign_and_attest ebpftools docker "$EBPF_TOOLS_DOCKER_REF"
+          sign_and_attest ebpftools ghcr "$EBPF_TOOLS_GHCR_REF"
 
       - name: Verify signatures, provenance, subjects, and SBOMs
         env:
@@ -1112,6 +1308,8 @@ jobs:
           STANDARD_GHCR_REF: ${{ steps.images.outputs.standard_ghcr_ref }}
           EBPF_DOCKER_REF: ${{ steps.images.outputs.ebpf_docker_ref }}
           EBPF_GHCR_REF: ${{ steps.images.outputs.ebpf_ghcr_ref }}
+          EBPF_TOOLS_DOCKER_REF: ${{ steps.images.outputs.ebpftools_docker_ref }}
+          EBPF_TOOLS_GHCR_REF: ${{ steps.images.outputs.ebpftools_ghcr_ref }}
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/image-attestations"
@@ -1199,6 +1397,8 @@ jobs:
           verify_image standard ghcr "$STANDARD_GHCR_REF"
           verify_image ebpf docker "$EBPF_DOCKER_REF"
           verify_image ebpf ghcr "$EBPF_GHCR_REF"
+          verify_image ebpftools docker "$EBPF_TOOLS_DOCKER_REF"
+          verify_image ebpftools ghcr "$EBPF_TOOLS_GHCR_REF"
 
   release-attestation-gate:
     name: Gate release on image attestation

@@ -2511,6 +2511,68 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_mesh_workload_api_active_connections",
+    "type": "gauge",
+    "help": "SPIFFE Workload API connections currently admitted by the transport admission boundary.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_workload_api_active_rpcs",
+    "type": "gauge",
+    "help": "SPIFFE Workload API RPCs currently admitted by RPC admission (service-wide ceiling and per-peer-UID quota); counts service-dispatched RPC streams only — each occupies one HTTP/2 stream, but streams refused inside HTTP/2 or rejected before service dispatch are not observable here.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_workload_api_connections_closed_total",
+    "type": "counter",
+    "help": "Established SPIFFE Workload API connections closed by a transport deadline or the bounded shutdown force-close, by fixed reason.",
+    "labels": [
+      "reason",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_workload_api_connections_rejected_total",
+    "type": "counter",
+    "help": "SPIFFE Workload API connections refused before any tonic allocation, by fixed admission reason.",
+    "labels": [
+      "reason",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_workload_api_rpcs_rejected_total",
+    "type": "counter",
+    "help": "SPIFFE Workload API RPCs shed by RPC admission — the service-wide concurrency ceiling or the per-peer-UID quota — before any producer work was spawned; the HTTP/2 stream is already open and carries a RESOURCE_EXHAUSTED result, so this is not a protocol-level stream refusal.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_node_agent_attach_errors_total",
     "type": "counter",
     "help": "Node-agent BPF attachment or map update errors.",
@@ -3557,6 +3619,30 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_xds_active_node_ids",
+    "type": "gauge",
+    "help": "Distinct node state keys with at least one active ADS stream.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_xds_active_streams",
+    "type": "gauge",
+    "help": "Currently active ADS streams (SotW plus Delta) admitted by the control plane.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_xds_first_slice_nacks_total",
     "type": "counter",
     "help": "NACKs of a required mesh-slice type while the data plane is still waiting for its first slice.",
@@ -3571,9 +3657,22 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_xds_stream_admission_rejections_total",
+    "type": "counter",
+    "help": "ADS streams rejected at admission, by bounded reason.",
+    "labels": [
+      "reason",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_xds_streams_rejected_total",
     "type": "counter",
-    "help": "ADS streams rejected for exceeding the per-node concurrent-stream ceiling.",
+    "help": "ADS streams rejected at admission by any scope (total, namespace, principal, node, node cardinality, invalid Node.id, or initial-request deadline).",
     "labels": [
       "gateway_namespace"
     ],

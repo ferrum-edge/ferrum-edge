@@ -9,6 +9,7 @@
 // allowance scoped to dead code only; unused imports should still be caught.
 #![allow(dead_code)]
 
+pub mod admission;
 pub mod carrier;
 pub mod conformance;
 pub mod nonce;
@@ -55,6 +56,15 @@ pub mod stock_proto {
 // target only reaches xDS through narrower module paths.
 #[allow(unused_imports)]
 pub use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+#[allow(unused_imports)]
+pub use admission::{
+    DEFAULT_XDS_FIRST_REQUEST_TIMEOUT_SECS, DEFAULT_XDS_MAX_ACTIVE_NODES,
+    DEFAULT_XDS_MAX_NODE_ID_BYTES, DEFAULT_XDS_MAX_STREAMS_PER_NAMESPACE,
+    DEFAULT_XDS_MAX_STREAMS_PER_NODE, DEFAULT_XDS_MAX_STREAMS_PER_PRINCIPAL,
+    DEFAULT_XDS_MAX_TOTAL_STREAMS, XdsAdmissionController, XdsAdmissionLimits,
+    XdsAdmissionRejection, XdsStreamPermit, principal_key, redacted_identifier, validate_node_id,
+    xds_state_key,
+};
 #[allow(unused_imports)]
 pub use carrier::{
     FERRUM_ECDS_LABELS_TYPE_URL, FERRUM_ECDS_MESH_POLICIES_TYPE_URL,

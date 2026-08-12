@@ -80,10 +80,12 @@
 {{- fail "ambient FERRUM_MESH_CAPTURE_UDP_ENABLED=true requires nodeAgent.captureMode=ebpf so the node-agent enrolls pods and publishes the registry" -}}
 {{- end -}}
 {{- end -}}
-{{- /* Registry + host cgroup + tools-capable image: needed by NodeWaypoint TCP,
-       BOTH Ambient UDP placements, and the disabled stale-rule cleanup. The host
-       placement uses the registry for the enrolled-pod set and the cgroup mount
-       to resolve each pod's host-side interface. */ -}}
+{{- /* Registry + host cgroup: needed by NodeWaypoint TCP, BOTH Ambient UDP
+       placements, and the disabled stale-rule cleanup. The host placement uses
+       the registry for the enrolled-pod set and the cgroup mount to resolve each
+       pod's host-side interface. The tools-capable image is selected separately
+       below (`-ebpf-tools` for the UDP lifecycle, distroless `-ebpf` otherwise);
+       do not conflate the two — they have different security contracts. */ -}}
 {{- $ambientInNetnsCapture := or $nodeWaypointRegistryEnabled $ambientUdpLifecycle -}}
 {{- /* setns privileges (hostPID + SYS_ADMIN + SYS_PTRACE) are needed ONLY by the
        placements that enter another namespace: NodeWaypoint's in-netns TCP
@@ -171,17 +173,39 @@
 {{- end -}}
 {{- end -}}
 {{- end -}}
-{{- /* Select the tools-capable "-ebpf" runtime image (shell + iproute2 +
-       iptables) instead of the default distroless image (`Dockerfile` FROM
-       distroless/cc, no shell/`ip`/`iptables`) whenever this pod needs OS tools:
-       eBPF capture, the NodeWaypoint topology, OR the Ambient UDP lifecycle
-       (#2013). Both the producer and disabled stale-rule cleanup run in-netns
-       `sh -c` scripts calling `ip`/`iptables`; without adding
-       `$ambientUdpLifecycle` here an enabled-to-disabled rollout would render the
-       default distroless image and could not clean predecessor rules. Mirrors the
+{{- /* Two DIFFERENT published runtime variants, because they are two different
+       security contracts (#3705):
+
+       * "-ebpf"       — `Dockerfile` target `runtime-ebpf`. Still DISTROLESS: it
+                         adds the eBPF ELF and a staged `ip` closure but has NO
+                         `/bin/sh` and NO `iptables`/`ip6tables`. Selected for
+                         eBPF capture and the NodeWaypoint topology, which need
+                         `ip` (policy rule/route) but never a shell.
+       * "-ebpf-tools" — `Dockerfile` target `runtime-ebpf-tools`, a strict
+                         SUPERSET of the above that also ships `/bin/sh`,
+                         `iptables`, `ip6tables`, and the `*-save` helpers.
+
+       The Ambient UDP lifecycle (#2013) must select "-ebpf-tools", not "-ebpf":
+       both the producer and the disabled stale-rule cleanup manager execute
+       generated `sh -c` scripts calling `ip`/`iptables`/`ip6tables`, which the
+       distroless "-ebpf" image cannot run at all — `preflight_capture_tools`
+       refuses startup there by design. Selecting "-ebpf" for this pod (as the
+       chart previously did) rendered an image that could not run the backend it
+       was chosen for, and an enabled-to-disabled rollout could not clean
+       predecessor rules. Ordering matters: the UDP lifecycle wins because its
+       image already satisfies every eBPF/NodeWaypoint requirement. An operator
+       tag that already names a variant is left alone, and an explicit "-ebpf"
+       tag is PROMOTED (not double-suffixed) when tools are required. Mirrors the
        established auto-append convention (values.yaml image docs). */ -}}
-{{- if and (or (eq (lower (toString .Values.ambient.captureMode)) "ebpf") (eq $ambientTopology "node_waypoint") $ambientUdpLifecycle) (not (hasSuffix "-ebpf" $ambientImageTag)) -}}
+{{- if $ambientUdpLifecycle -}}
+{{- if not (hasSuffix "-ebpf-tools" $ambientImageTag) -}}
+{{- $ambientImageTag = printf "%s-ebpf-tools" (trimSuffix "-ebpf" $ambientImageTag) -}}
+{{- end -}}
+{{- else if or (eq (lower (toString .Values.ambient.captureMode)) "ebpf") (eq $ambientTopology "node_waypoint") -}}
+{{- /* "-ebpf-tools" already satisfies this tier, so never suffix it again. */ -}}
+{{- if not (or (hasSuffix "-ebpf" $ambientImageTag) (hasSuffix "-ebpf-tools" $ambientImageTag)) -}}
 {{- $ambientImageTag = printf "%s-ebpf" $ambientImageTag -}}
+{{- end -}}
 {{- end -}}
 {{- $ambientImage := printf "%s:%s" $ambientImageRepository $ambientImageTag -}}
 apiVersion: apps/v1
