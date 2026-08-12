@@ -896,7 +896,7 @@ def verify_repository_labels(
     *,
     opener: Callable[..., Any] | None = None,
     label_fetcher: Callable[..., dict[str, Any]] | None = None,
-) -> list[str]:
+) -> dict[str, int]:
     """Prove every configured blocker/exemption/severity label exists.
 
     The Issues API answers `labels=launch-blocker` with an empty list both when
@@ -914,7 +914,7 @@ def verify_repository_labels(
     """
 
     fetch = label_fetcher or fetch_repository_label
-    verified: list[str] = []
+    verified: dict[str, int] = {}
     for name in configured_policy_labels(policy):
         try:
             payload = fetch(repo, name, token, opener=opener)
@@ -937,7 +937,16 @@ def verify_repository_labels(
                 LABEL_INVENTORY_CODE,
                 f"configured label {name} resolves to a differently named repository label",
             )
-        verified.append(name)
+        live_id = payload.get("id")
+        if (
+            not isinstance(live_id, int)
+            or isinstance(live_id, bool)
+            or live_id < 1
+        ):
+            raise GateError(
+                "schema", f"repository label payload for {name} has a malformed id"
+            )
+        verified[name] = live_id
     return verified
 
 
@@ -1242,7 +1251,7 @@ def evaluate_live(
         # Establish the label vocabulary from repository metadata BEFORE any
         # issue listing. Until this succeeds an empty labeled inventory carries
         # no information at all, so it may not be accepted as a clean set.
-        verify_repository_labels(
+        initial_label_inventory = verify_repository_labels(
             repo, policy, token, opener=opener, label_fetcher=label_fetcher
         )
 
@@ -1300,6 +1309,19 @@ def evaluate_live(
                     repo, number, token, opener=opener
                 )
             by_number[number] = record
+
+        # Fence deletion/rename/recreation during the issue walk. A label that
+        # disappears after the first proof can make GitHub return an empty issue
+        # list; comparing immutable label ids prevents that race from becoming
+        # a false PASS, including delete-and-recreate under the same name.
+        final_label_inventory = verify_repository_labels(
+            repo, policy, token, opener=opener, label_fetcher=label_fetcher
+        )
+        if final_label_inventory != initial_label_inventory:
+            raise GateError(
+                LABEL_INVENTORY_CODE,
+                "configured label identity changed during issue discovery",
+            )
 
         records: list[IssueRecord] = []
         for record in sorted(by_number.values(), key=lambda item: item.number):
@@ -1659,7 +1681,7 @@ def _label_fetcher(
         if payloads is not None and name in payloads:
             return payloads[name]
         if renamed is not None and name in renamed:
-            return {"name": renamed[name]}
+            return {"name": renamed[name], "id": 1}
         if name not in known:
             raise GateError("api", "HTTP 404")
         return {"name": name, "id": 1, "color": "ededed"}
@@ -1942,6 +1964,8 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
         ("missing name", {"id": 7}),
         ("non-string name", {"name": 7}),
         ("malformed name", {"name": "not a label!"}),
+        ("missing id", {"name": "launch-blocker"}),
+        ("non-integer id", {"name": "launch-blocker", "id": "7"}),
     ):
         ev = _evaluate(
             _base_policy(),
@@ -1987,6 +2011,22 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     ev = _evaluate(_base_policy(), labeled_fetcher=empty_labeled)
     check("existing but empty label inventory passes", ev.verdict == "PASS", ev.verdict)
     check("empty inventory was actually queried", empty_inventory_calls == [1])
+
+    # A definition deleted/recreated while the issue pages are read must not
+    # turn a temporarily empty listing into PASS. Identity is fenced by id.
+    inventory_reads: dict[str, int] = {}
+
+    def replaced_label(repo, name, token, opener=None):  # noqa: ARG001
+        inventory_reads[name] = inventory_reads.get(name, 0) + 1
+        live_id = 2 if name == "launch-blocker" and inventory_reads[name] > 1 else 1
+        return {"name": name, "id": live_id}
+
+    ev = _evaluate(_base_policy(), label_fetcher=replaced_label)
+    check(
+        "label replacement during issue discovery is UNKNOWN",
+        unknown_because(ev, "label identity changed during issue discovery"),
+        str(ev.unknown_reasons),
+    )
 
     # ...and label verification runs BEFORE issue discovery, so a missing
     # definition never even reaches the issue listing.

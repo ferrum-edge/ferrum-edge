@@ -37,10 +37,11 @@ classification input.
 The Issues API answers `labels=launch-blocker` with an empty list in two very
 different situations: the label exists and no issue carries it, and the label
 does not exist at all. Treating those alike is fail-open, so before any issue
-listing the checker calls `GET /repos/{owner}/{repo}/labels/{name}` once per
-configured label and requires an exact, case-sensitive name match. GitHub
-resolves label lookups case-insensitively, so a case-only rename is caught by
-comparing the returned `name` rather than by the lookup succeeding.
+listing the checker calls `GET /repos/{owner}/{repo}/labels/{name}` before and
+after the paginated issue walk and requires an exact, case-sensitive name plus a
+stable label id. GitHub resolves label lookups case-insensitively, so a case-only
+rename is caught by comparing the returned `name` rather than by the lookup
+succeeding; the id fence catches deletion/recreation during discovery.
 
 - Missing definition ⇒ `UNKNOWN` (`label_inventory:configured label … is not
   defined in repository metadata`).
