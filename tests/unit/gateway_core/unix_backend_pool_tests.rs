@@ -136,6 +136,7 @@ fn test_proxy(id: &str) -> Proxy {
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
+        pending_limit_scope: None,
         upstream_id: Some("unix-upstream".to_string()),
         upstream_subset: None,
         api_spec_id: None,
