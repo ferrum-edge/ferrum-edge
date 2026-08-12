@@ -436,6 +436,18 @@ global HTTPS port whose route table cannot match the port-scoped route. A port
 whose QUIC bind fails keeps serving H1/H2, reports the failure on
 `GatewayListenerManager::bind_failures`, advertises no HTTP/3, and is retried.
 
+A UDP/DTLS stream proxy on the same **numeric** port is a QUIC-only conflict:
+TCP and UDP are independent socket namespaces, so the HTTPS TCP listener stays
+bound and keeps serving H1/H2. The optional QUIC half is refused with a bounded
+`udp_stream_collision` reason, `ensure_quic` is not called while the claim
+exists, and the TCP port is **not** added to the whole-listener refused-route
+set. Adding the UDP/DTLS claim on reload drains only QUIC (existing H1/H2
+connections continue); removing it starts QUIC on the already-running TCP
+listener. A stale reconcile cannot restore QUIC after a newer epoch reserved
+the UDP port. TCP/TLS raw-stream collisions still refuse the whole HTTP-family
+listener; plaintext HTTP listeners remain unaffected by UDP/DTLS same-port
+claims.
+
 **Single-listener protocol remap.** When the whole route table declares exactly
 one listener port of a protocol class, a request arriving on the global process
 bind of that class is also served by it. This exists for the Service-fronted
