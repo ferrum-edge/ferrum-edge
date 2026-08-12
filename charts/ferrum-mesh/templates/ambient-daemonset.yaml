@@ -96,6 +96,36 @@
        privileges. Note the disabled-cleanup manager still enters pod netns to
        reap predecessor rules, so the lifecycle term keeps them when UDP capture
        is off. */ -}}
+{{- /* Release-level attestation that the rendered placement was already
+       established by a COMPLETED earlier migration release (#3703). The
+       node-local durable record lives in the pod-registry hostPath, which on the
+       default `/run/...` path is tmpfs: a node reboot destroys it, and a node
+       that joins the cluster after the migration never had one. Without this
+       attestation such a node would refuse the host placement forever and never
+       publish readiness, so routine reboots and scale-out would each need their
+       own cleanup/finalize rollout.
+       It is derived ONLY from the INSTALLED placement ConfigMap and only when
+       that installed contract already recorded this exact target in a settled
+       phase, so the release performing a change can never attest itself. A
+       reboot also destroys every pod netns on the node, so an attested node has
+       provably no predecessor rules left to retire. The runtime consults it only
+       when its durable record is ABSENT; a present, conflicting record is still
+       a hard rejection. */ -}}
+{{- $ambientUdpTarget := "disabled" -}}
+{{- if $ambientUdpCaptureEnabled -}}
+{{- $ambientUdpTarget = ternary "host-netns" "pod-netns" $ambientUdpHostNetns -}}
+{{- end -}}
+{{- $ambientUdpEstablished := "" -}}
+{{- if and (eq $ambientTopology "ambient") (eq $ambientUdpMigrationPhase "stable") .Release.IsUpgrade -}}
+{{- $ambientUdpContractName := printf "ferrum-mesh-udp-placement-%s" .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- $ambientUdpInstalled := lookup "v1" "ConfigMap" .Release.Namespace $ambientUdpContractName -}}
+{{- if $ambientUdpInstalled -}}
+{{- $ambientUdpInstalledData := default dict $ambientUdpInstalled.data -}}
+{{- if and (eq (toString (index $ambientUdpInstalledData "target")) $ambientUdpTarget) (has (toString (index $ambientUdpInstalledData "phase")) (list "stable" "finalize")) -}}
+{{- $ambientUdpEstablished = $ambientUdpTarget -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- $ambientUdpMigrationNeedsSetns := and (eq $ambientUdpMigrationPhase "cleanup") (has $ambientUdpMigrationFrom (list "pod-netns" "disabled")) -}}
 {{- $ambientSetnsCapture := or $nodeWaypointRegistryEnabled (and $ambientUdpLifecycle (or (not $ambientUdpHostNetns) $ambientUdpMigrationNeedsSetns)) -}}
 {{- $nodeAgentProxyMode := replace "-" "_" (lower (toString .Values.nodeAgent.proxyMode)) -}}
@@ -283,6 +313,14 @@ spec:
             {{- if and $ambientInNetnsCapture (not (hasKey $ambientEnv "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR")) }}
             - name: FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR
               value: {{ .Values.nodeAgent.podRegistryDir | quote }}
+            {{- end }}
+            {{- /* Chart-managed: derived from the installed placement contract,
+                   never from values. An explicit ambient.env entry still wins so
+                   a GitOps/client-render pipeline can supply its own equivalent
+                   cluster-state attestation. */ -}}
+            {{- if and $ambientUdpEstablished (not (hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED")) }}
+            - name: FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED
+              value: {{ $ambientUdpEstablished | quote }}
             {{- end }}
             {{- /* The tc ingress redirect preserves the packet's original
                    destination instead of NAT-ing it, so the proxy answers it on

@@ -70,6 +70,7 @@ fn slice_with_one_service() -> MeshSlice {
             spiffe_id: workload.spiffe_id.clone(),
         }],
         protocol_overrides: HashMap::new(),
+        uid: None,
     };
     let peer_auth = PeerAuthentication {
         name: "strict".to_string(),

@@ -89,6 +89,7 @@ fn create_mesh_proxy(backend_port: u16) -> Proxy {
         allowed_ws_origins: vec![],
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        pending_limit_scope: None,
     }
 }
 

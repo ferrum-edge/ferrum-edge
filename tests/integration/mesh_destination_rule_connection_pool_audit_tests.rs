@@ -93,6 +93,7 @@ fn proxy_for_backend(port: u16) -> Proxy {
         compiled_stream_match: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        pending_limit_scope: None,
     }
 }
 
@@ -606,74 +607,70 @@ fn reqwest_lane_lookup_normalizes_host_case_and_ipv6_brackets() {
 
 #[test]
 fn subset_http1_pending_admission_lanes_do_not_leak() {
-    use ferrum_edge::backend_pending_limit::BackendPendingLimiter;
+    use ferrum_edge::backend_pending_limit::{BackendPendingLimiter, BackendPendingScopeBase};
 
     let limiter = BackendPendingLimiter::new();
-    let stable = limiter
-        .try_acquire_for_subset("reviews", 8080, Some("stable"), Some(1))
+    let stable = BackendPendingScopeBase::new("default", "reviews", None, Some("stable"));
+    let canary = BackendPendingScopeBase::new("default", "reviews", None, Some("canary"));
+    let unmatched = BackendPendingScopeBase::new("default", "reviews", None, None);
+
+    let stable_guard = limiter
+        .try_acquire(&stable, 8080, Some(1))
         .expect("stable first slot")
         .expect("stable guard");
     limiter
-        .try_acquire_for_subset("reviews", 8080, Some("stable"), Some(1))
+        .try_acquire(&stable, 8080, Some(1))
         .expect_err("stable lane is full");
 
-    let canary = limiter
-        .try_acquire_for_subset("reviews", 8080, Some("canary"), Some(1))
+    let canary_guard = limiter
+        .try_acquire(&canary, 8080, Some(1))
         .expect("canary has an independent slot")
         .expect("canary guard");
-    let unmatched = limiter
-        .try_acquire_for_subset("reviews", 8080, None, Some(1))
+    let unmatched_guard = limiter
+        .try_acquire(&unmatched, 8080, Some(1))
         .expect("unmatched destination has an independent slot")
         .expect("unmatched guard");
 
-    assert_eq!(
-        limiter.current_for_subset("reviews", 8080, Some("stable")),
-        1
-    );
-    assert_eq!(
-        limiter.current_for_subset("reviews", 8080, Some("canary")),
-        1
-    );
-    assert_eq!(limiter.current_for_subset("reviews", 8080, None), 1);
+    assert_eq!(limiter.current(&stable, 8080), 1);
+    assert_eq!(limiter.current(&canary, 8080), 1);
+    assert_eq!(limiter.current(&unmatched, 8080), 1);
 
-    drop((stable, canary, unmatched));
-    assert_eq!(
-        limiter.current_for_subset("reviews", 8080, Some("stable")),
-        0
-    );
-    assert_eq!(
-        limiter.current_for_subset("reviews", 8080, Some("canary")),
-        0
-    );
-    assert_eq!(limiter.current_for_subset("reviews", 8080, None), 0);
+    drop((stable_guard, canary_guard, unmatched_guard));
+    assert_eq!(limiter.current(&stable, 8080), 0);
+    assert_eq!(limiter.current(&canary, 8080), 0);
+    assert_eq!(limiter.current(&unmatched, 8080), 0);
 }
 
 #[tokio::test]
 async fn subset_http1_pending_guard_releases_on_cancellation() {
-    use ferrum_edge::backend_pending_limit::BackendPendingLimiter;
+    use ferrum_edge::backend_pending_limit::{BackendPendingLimiter, BackendPendingScopeBase};
 
     let limiter = Arc::new(BackendPendingLimiter::new());
+    let scope = Arc::new(BackendPendingScopeBase::new(
+        "default",
+        "reviews",
+        None,
+        Some("stable"),
+    ));
     let task_limiter = Arc::clone(&limiter);
+    let task_scope = Arc::clone(&scope);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let _guard = task_limiter
-            .try_acquire_for_subset("reviews", 8080, Some("stable"), Some(1))
+            .try_acquire(&task_scope, 8080, Some(1))
             .expect("slot")
             .expect("guard");
         let _ = ready_tx.send(());
         std::future::pending::<()>().await;
     });
     ready_rx.await.expect("guard acquired");
-    assert_eq!(
-        limiter.current_for_subset("reviews", 8080, Some("stable")),
-        1
-    );
+    assert_eq!(limiter.current(&scope, 8080), 1);
 
     task.abort();
     let error = task.await.expect_err("task cancelled");
     assert!(error.is_cancelled());
     assert_eq!(
-        limiter.current_for_subset("reviews", 8080, Some("stable")),
+        limiter.current(&scope, 8080),
         0,
         "RAII drop on cancellation must release the subset lane"
     );

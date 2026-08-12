@@ -10329,6 +10329,7 @@ fn row_to_proxy_inner(
         dispatch_port_override_fallback: None,
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
+        pending_limit_scope: None,
     })
 }
 
@@ -10702,6 +10703,8 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
             .flatten(),
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
+        k8s_service_uid: None,
+        pending_limit_scope: None,
     })
 }
 

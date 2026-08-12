@@ -4299,6 +4299,7 @@ mod tests {
                 .collect(),
             workloads: Vec::new(),
             protocol_overrides: HashMap::new(),
+            uid: None,
         }
     }
 
@@ -7051,6 +7052,7 @@ mod tests {
                 }],
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
+                uid: None,
             }],
             ..MeshSlice::default()
         };
@@ -7076,6 +7078,7 @@ mod tests {
                 ports: Vec::new(),
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
+                uid: None,
             }],
             ..MeshSlice::default()
         };
@@ -7108,6 +7111,7 @@ mod tests {
                     ports: vec![http_port.clone()],
                     workloads: Vec::new(),
                     protocol_overrides: HashMap::new(),
+                    uid: None,
                 },
                 MeshService {
                     cluster_ips: Vec::new(),
@@ -7116,6 +7120,7 @@ mod tests {
                     ports: vec![http_port],
                     workloads: Vec::new(),
                     protocol_overrides: HashMap::new(),
+                    uid: None,
                 },
             ],
             ..MeshSlice::default()
@@ -7146,6 +7151,7 @@ mod tests {
                 }],
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
+                uid: None,
             }],
             ..MeshSlice::default()
         };
@@ -7283,6 +7289,7 @@ mod tests {
                     }],
                     workloads: Vec::new(),
                     protocol_overrides: HashMap::new(),
+                    uid: None,
                 },
                 MeshService {
                     cluster_ips: Vec::new(),
@@ -7296,6 +7303,7 @@ mod tests {
                     }],
                     workloads: Vec::new(),
                     protocol_overrides: HashMap::new(),
+                    uid: None,
                 },
             ],
             ..MeshSlice::default()

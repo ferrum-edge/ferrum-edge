@@ -2930,6 +2930,7 @@ mod tests {
             }],
             protocol_overrides: Default::default(),
             cluster_ips: Vec::new(),
+            uid: None,
         };
         let source_workload = Workload {
             spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/clients/sa/client")
@@ -3434,6 +3435,7 @@ mod tests {
             workloads: Vec::new(),
             protocol_overrides: Default::default(),
             cluster_ips: Vec::new(),
+            uid: None,
         };
         let destination_rule = |namespace: &str, name: &str, host: &str| MeshDestinationRule {
             name: name.to_string(),

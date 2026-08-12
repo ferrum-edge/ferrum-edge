@@ -2977,6 +2977,7 @@ fn east_west_gateway_proxy(gateway: &EastWestGateway, listen_port: u16) -> Proxy
         allowed_ws_origins: Vec::new(),
         created_at: now,
         updated_at: now,
+        pending_limit_scope: None,
     }
 }
 
@@ -3117,6 +3118,8 @@ fn build_east_west_service_proxies_and_upstreams(
                 api_spec_id: None,
                 created_at: now,
                 updated_at: now,
+                k8s_service_uid: None,
+                pending_limit_scope: None,
             };
             upstreams.push(upstream);
 
@@ -3498,6 +3501,7 @@ fn east_west_service_proxy(
         allowed_ws_origins: Vec::new(),
         created_at: now,
         updated_at: now,
+        pending_limit_scope: None,
     }
 }
 
@@ -3939,8 +3943,10 @@ pub(crate) fn mesh_ingress_listener_groups(
 /// [`mesh_route_direction`] / [`is_mesh_outbound_route_id`] — those predicates
 /// run on proxy ids, and a shared prefix would be a latent footgun if one were
 /// ever handed an upstream id. Parallels the east-west `__mesh-ew-upstream-` id.
+pub(crate) const MESH_OUTBOUND_UPSTREAM_ID_PREFIX: &str = "__mesh-out-upstream-";
+
 pub(crate) fn mesh_outbound_upstream_id(namespace: &str, name: &str, port: u16) -> String {
-    format!("__mesh-out-upstream-{namespace}-{name}-{port}").replace(['/', '.'], "-")
+    format!("{MESH_OUTBOUND_UPSTREAM_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")
 }
 
 /// Upstream id for a materialized raw-TCP egress port, one per stream-family
@@ -3997,13 +4003,16 @@ pub(crate) fn mesh_outbound_tcp_bywl_upstream_id(
 /// service-host route. Kept out of the route-id prefix space (like the VIP
 /// outbound upstream ids); the paired proxy below carries the direction-scoped
 /// route prefix.
+pub(crate) const MESH_OUTBOUND_HTTP_BYWL_UPSTREAM_ID_PREFIX: &str =
+    "__mesh-out-http-bywl-upstream-";
+
 pub(crate) fn mesh_outbound_http_bywl_upstream_id(
     namespace: &str,
     name: &str,
     port: u16,
     canonical_ip: std::net::IpAddr,
 ) -> String {
-    format!("__mesh-out-http-bywl-upstream-{namespace}-{name}-{port}-{canonical_ip}")
+    format!("{MESH_OUTBOUND_HTTP_BYWL_UPSTREAM_ID_PREFIX}{namespace}-{name}-{port}-{canonical_ip}")
         .replace(['/', '.', ':'], "-")
 }
 
@@ -5121,6 +5130,8 @@ fn mesh_ingress_unix_upstream(
         api_spec_id: None,
         created_at: now,
         updated_at: now,
+        k8s_service_uid: None,
+        pending_limit_scope: None,
     }
 }
 
@@ -5214,6 +5225,7 @@ fn mesh_inbound_loopback_proxy_to(
         allowed_ws_origins: Vec::new(),
         created_at: now,
         updated_at: now,
+        pending_limit_scope: None,
     }
 }
 
@@ -5296,6 +5308,7 @@ pub(crate) fn mesh_inbound_tcp_relay_proxy(route: &MeshInboundTcpRoute) -> Proxy
         allowed_ws_origins: Vec::new(),
         created_at: now,
         updated_at: now,
+        pending_limit_scope: None,
     }
 }
 
@@ -5423,6 +5436,7 @@ fn mesh_inbound_connect_relay_proxy(id: &str, host: &str, port: u16) -> Proxy {
         allowed_ws_origins: Vec::new(),
         created_at: now,
         updated_at: now,
+        pending_limit_scope: None,
     }
 }
 
@@ -5624,6 +5638,7 @@ fn materialize_mesh_outbound_proxies(
                 &service.namespace,
                 &service_fqdn,
                 targets,
+                service.uid.clone(),
                 now,
             );
             if let Some(existing) = config
@@ -5682,6 +5697,7 @@ fn materialize_mesh_outbound_proxies(
                 &spec.service.namespace,
                 &service_fqdn,
                 vec![target],
+                spec.service.uid.clone(),
                 now,
             );
             let proxy = mesh_outbound_http_bywl_route_proxy(&spec, now);
@@ -5834,6 +5850,7 @@ fn materialize_mesh_outbound_tcp_upstreams(
                 &service.namespace,
                 &service_fqdn,
                 targets,
+                service.uid.clone(),
                 now,
             );
             if let Some(existing) = config
@@ -5933,6 +5950,7 @@ fn materialize_mesh_outbound_tcp_upstreams(
             &spec.service.namespace,
             &service_fqdn,
             vec![target],
+            spec.service.uid.clone(),
             now,
         );
         if let Some(existing) = config
@@ -6057,6 +6075,7 @@ fn materialize_mesh_outbound_udp_upstreams(
                 &service.namespace,
                 &service_fqdn,
                 targets,
+                service.uid.clone(),
                 now,
             );
             if let Some(existing) = config
@@ -6348,6 +6367,7 @@ fn materialize_mesh_external_udp_egress_upstreams(
                     &entry.namespace,
                     &service_fqdn,
                     vec![target],
+                    None,
                     now,
                 ));
                 routes.push(MeshExternalUdpEgressRoute {
@@ -6611,6 +6631,7 @@ fn mesh_outbound_tcp_relay_proxy_with_id(
         allowed_ws_origins: Vec::new(),
         created_at: now,
         updated_at: now,
+        pending_limit_scope: None,
     }
 }
 
@@ -7968,6 +7989,7 @@ fn mesh_outbound_route_proxy(
         allowed_ws_origins: Vec::new(),
         created_at: now,
         updated_at: now,
+        pending_limit_scope: None,
     }
 }
 
@@ -8009,6 +8031,7 @@ fn mesh_outbound_route_upstream(
     namespace: &str,
     service_fqdn: &str,
     targets: Vec<UpstreamTarget>,
+    k8s_service_uid: Option<String>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Upstream {
     Upstream {
@@ -8040,6 +8063,8 @@ fn mesh_outbound_route_upstream(
         resolved_subset_tls: HashMap::new(),
         dispatch_port_override_fallback: None,
         api_spec_id: None,
+        k8s_service_uid,
+        pending_limit_scope: None,
         created_at: now,
         updated_at: now,
     }
@@ -10480,6 +10505,8 @@ fn build_egress_upstream(
         api_spec_id: None,
         created_at: now,
         updated_at: now,
+        k8s_service_uid: None,
+        pending_limit_scope: None,
     }
 }
 
@@ -10701,6 +10728,7 @@ fn egress_gateway_proxy(
         allowed_ws_origins: Vec::new(),
         created_at: now,
         updated_at: now,
+        pending_limit_scope: None,
     }
 }
 
@@ -10825,6 +10853,7 @@ fn stream_egress_gateway_proxy(
         allowed_ws_origins: Vec::new(),
         created_at: now,
         updated_at: now,
+        pending_limit_scope: None,
     }
 }
 
@@ -18186,6 +18215,7 @@ mod tests {
             generation: None,
             from: None,
             to: None,
+            established: None,
         };
         prepare_placement(registry.path(), &stable).expect("stable placement");
         let cleanup = UdpPlacementRequest {
@@ -18194,6 +18224,7 @@ mod tests {
             generation: Some("supervisor-test".to_string()),
             from: Some(UdpPlacement::PodNetns),
             to: Some(UdpPlacement::HostNetns),
+            established: None,
         };
         let context = match prepare_placement(registry.path(), &cleanup).expect("cleanup placement")
         {
@@ -19312,6 +19343,7 @@ mod tests {
                 spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/reviews").unwrap(),
             }],
             protocol_overrides: HashMap::new(),
+            uid: None,
         }
     }
 
@@ -19443,6 +19475,7 @@ mod tests {
                 spiffe_id: SpiffeId::new(spiffe).unwrap(),
             }],
             protocol_overrides: HashMap::new(),
+            uid: None,
         };
         let slice = MeshSlice {
             node_id: "node-a".to_string(),
@@ -19500,6 +19533,7 @@ mod tests {
                 spiffe_id: SpiffeId::new(spiffe).unwrap(),
             }],
             protocol_overrides: HashMap::new(),
+            uid: None,
         }
     }
 
@@ -22530,6 +22564,7 @@ mod tests {
                     spiffe_id: SpiffeId::new(spiffe).unwrap(),
                 }],
                 protocol_overrides: HashMap::new(),
+                uid: None,
             }],
             ..MeshSlice::default()
         };
@@ -23654,6 +23689,8 @@ mod tests {
             api_spec_id: None,
             created_at: now,
             updated_at: now,
+            k8s_service_uid: None,
+            pending_limit_scope: None,
         }
     }
 
@@ -26207,6 +26244,7 @@ mod tests {
                 }],
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
+                uid: None,
             }],
             outbound_traffic_policy: Some(
                 crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly,
@@ -26370,6 +26408,7 @@ mod tests {
                     workloads: Vec::new(),
                     protocol_overrides: HashMap::new(),
                     cluster_ips: Vec::new(),
+                    uid: None,
                 }],
                 ..MeshSlice::default()
             };
@@ -26705,6 +26744,7 @@ mod tests {
                 ports: Vec::new(),
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
+                uid: None,
             }],
             outbound_traffic_policy: None,
             ..MeshSlice::default()
@@ -26915,6 +26955,7 @@ mod tests {
                 }],
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
+                uid: None,
             }],
             outbound_traffic_policy: None,
             ..MeshSlice::default()
@@ -27894,6 +27935,7 @@ mod tests {
                                 .unwrap(),
                             }],
                             protocol_overrides: HashMap::new(),
+                            uid: None,
                         }],
                         workloads: vec![{
                             let mut wl = workload("reviews", "reviews");
@@ -27996,6 +28038,7 @@ mod tests {
                                 .unwrap(),
                             }],
                             protocol_overrides: HashMap::new(),
+                            uid: None,
                         }],
                         workloads: vec![{
                             let mut wl = workload("reviews", "reviews");
@@ -28098,6 +28141,7 @@ mod tests {
                                 .unwrap(),
                             }],
                             protocol_overrides: HashMap::new(),
+                            uid: None,
                         }],
                         workloads: vec![{
                             let mut wl = workload("reviews", "reviews");
@@ -28160,6 +28204,7 @@ mod tests {
                                 .unwrap(),
                             }],
                             protocol_overrides: HashMap::new(),
+                            uid: None,
                         }],
                         // Workload exists but has no addresses (pod IP not yet assigned).
                         workloads: vec![workload("pending", "pending")],
@@ -28221,6 +28266,7 @@ mod tests {
                                     .unwrap(),
                                 }],
                                 protocol_overrides: HashMap::new(),
+                                uid: None,
                             },
                             MeshService {
                                 cluster_ips: Vec::new(),
@@ -28239,6 +28285,7 @@ mod tests {
                                     .unwrap(),
                                 }],
                                 protocol_overrides: HashMap::new(),
+                                uid: None,
                             },
                         ],
                         workloads: vec![
@@ -28328,6 +28375,7 @@ mod tests {
                 },
             ],
             protocol_overrides: HashMap::new(),
+            uid: None,
         };
 
         let targets =
@@ -28397,6 +28445,8 @@ mod tests {
             api_spec_id: None,
             created_at: loaded_at,
             updated_at: loaded_at,
+            k8s_service_uid: None,
+            pending_limit_scope: None,
         });
         let mesh_slice = MeshSlice {
             namespace: "default".to_string(),
@@ -28623,6 +28673,8 @@ mod tests {
             api_spec_id: None,
             created_at: now,
             updated_at: now,
+            k8s_service_uid: None,
+            pending_limit_scope: None,
         }
     }
 
@@ -29102,6 +29154,8 @@ mod tests {
             api_spec_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            k8s_service_uid: None,
+            pending_limit_scope: None,
         });
         let mut config_b = config_a.clone();
 
@@ -29260,6 +29314,7 @@ mod tests {
             }],
             workloads: vec![crate::modes::mesh::config::WorkloadRef { spiffe_id: spiffe }],
             protocol_overrides: HashMap::new(),
+            uid: None,
         };
 
         let targets = build_east_west_service_targets(&service, &service.ports[0], &[wl], None);
@@ -29289,6 +29344,7 @@ mod tests {
             }],
             workloads: vec![crate::modes::mesh::config::WorkloadRef { spiffe_id: spiffe }],
             protocol_overrides: HashMap::new(),
+            uid: None,
         };
 
         let targets = build_east_west_service_targets(&service, &service.ports[0], &[legacy], None);
@@ -29352,6 +29408,7 @@ mod tests {
                                 },
                             ],
                             protocol_overrides: HashMap::new(),
+                            uid: None,
                         }],
                         workloads: vec![local, remote, clusterless],
                         multi_cluster: Some(MultiClusterConfig {
@@ -29412,6 +29469,7 @@ mod tests {
             }],
             workloads: vec![crate::modes::mesh::config::WorkloadRef { spiffe_id: spiffe }],
             protocol_overrides: HashMap::new(),
+            uid: None,
         };
 
         let workloads = vec![remote, local];
@@ -29832,6 +29890,7 @@ mod tests {
                     .unwrap(),
                 }],
                 protocol_overrides: HashMap::new(),
+                uid: None,
             }],
             multi_cluster: Some(multi_cluster),
             ..MeshSlice::default()
@@ -30311,6 +30370,7 @@ mod tests {
                 ports: Vec::new(),
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
+                uid: None,
             }],
             ..MeshSlice::default()
         });
@@ -31090,6 +31150,7 @@ mod tests {
                 spiffe_id: local.spiffe_id.clone(),
             }],
             protocol_overrides: HashMap::new(),
+            uid: None,
         };
         // The remote cluster's view of svc-b (refs the remote workload).
         let svc_remote = MeshService {

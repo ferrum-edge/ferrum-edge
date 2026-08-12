@@ -940,6 +940,7 @@ fn ambient_udp_service_waypoint_slice(policies: Vec<MeshPolicy>) -> MeshSlice {
             }],
             protocol_overrides: HashMap::new(),
             cluster_ips: Vec::new(),
+            uid: None,
         }],
         ..MeshSlice::default()
     }
@@ -3545,6 +3546,7 @@ async fn mesh_authz_node_waypoint_service_egress_uses_destination_policy_scope()
             }],
             protocol_overrides: HashMap::new(),
             cluster_ips: Vec::new(),
+            uid: None,
         }],
         workloads: vec![Workload {
             spiffe_id: dst_spiffe,
@@ -3699,6 +3701,7 @@ async fn mesh_authz_node_waypoint_service_egress_requires_all_destination_scopes
             ],
             protocol_overrides: HashMap::new(),
             cluster_ips: Vec::new(),
+            uid: None,
         }],
         workloads: vec![
             Workload {
@@ -3834,6 +3837,7 @@ async fn mesh_authz_node_waypoint_direct_service_backend_uses_destination_scope(
             }],
             protocol_overrides: HashMap::new(),
             cluster_ips: Vec::new(),
+            uid: None,
         }],
         workloads: vec![Workload {
             spiffe_id: dst_spiffe,
@@ -3965,6 +3969,7 @@ async fn mesh_authz_node_waypoint_does_not_authorize_backend_when_upstream_is_se
             }],
             protocol_overrides: HashMap::new(),
             cluster_ips: Vec::new(),
+            uid: None,
         }],
         workloads: vec![Workload {
             spiffe_id: dst_spiffe,
@@ -4081,6 +4086,7 @@ async fn mesh_authz_node_waypoint_short_service_backend_resolves_in_proxy_namesp
                 }],
                 protocol_overrides: HashMap::new(),
                 cluster_ips: Vec::new(),
+                uid: None,
             },
             MeshService {
                 name: "dst".to_string(),
@@ -4096,6 +4102,7 @@ async fn mesh_authz_node_waypoint_short_service_backend_resolves_in_proxy_namesp
                 }],
                 protocol_overrides: HashMap::new(),
                 cluster_ips: Vec::new(),
+                uid: None,
             },
         ],
         workloads: vec![
@@ -4332,6 +4339,7 @@ async fn mesh_authz_node_waypoint_virtual_service_split_upstream_uses_route_targ
             }],
             protocol_overrides: HashMap::new(),
             cluster_ips: Vec::new(),
+            uid: None,
         }],
         workloads: vec![Workload {
             spiffe_id: dst_spiffe,
@@ -4458,6 +4466,7 @@ fn node_waypoint_endpoint_route_slice() -> MeshSlice {
             }],
             protocol_overrides: HashMap::new(),
             cluster_ips: Vec::new(),
+            uid: None,
         }],
         workloads: vec![Workload {
             spiffe_id: dst_spiffe,
@@ -4965,6 +4974,7 @@ async fn mesh_authz_node_waypoint_destination_scopes_follow_target_port_eligibil
             ],
             protocol_overrides: HashMap::new(),
             cluster_ips: Vec::new(),
+            uid: None,
         }],
         workloads: vec![
             Workload {
@@ -5124,6 +5134,7 @@ async fn mesh_authz_node_waypoint_destination_scopes_skip_unroutable_workloads()
             ],
             protocol_overrides: HashMap::new(),
             cluster_ips: Vec::new(),
+            uid: None,
         }],
         workloads: vec![
             Workload {

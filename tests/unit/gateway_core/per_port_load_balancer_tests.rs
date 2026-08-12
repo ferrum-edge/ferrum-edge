@@ -111,6 +111,8 @@ fn upstream_with_overrides(
         api_spec_id: None,
         created_at: now,
         updated_at: now,
+        k8s_service_uid: None,
+        pending_limit_scope: None,
     }
 }
 

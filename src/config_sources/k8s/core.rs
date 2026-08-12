@@ -52,6 +52,9 @@ struct CoreService {
     /// sentinel `"None"` and empty strings. Raw-TCP egress maps captured
     /// original destinations to services through these VIPs.
     cluster_ips: Vec<String>,
+    /// Kubernetes `metadata.uid` for H1 pending-admission lane isolation
+    /// across Service delete/recreate (issue #3778). Empty when absent.
+    uid: String,
 }
 
 #[derive(Debug)]
@@ -249,6 +252,7 @@ pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError
             workloads,
             protocol_overrides: HashMap::new(),
             cluster_ips: service.cluster_ips.clone(),
+            uid: (!service.uid.is_empty()).then(|| service.uid.clone()),
         });
     }
 
@@ -327,6 +331,7 @@ fn collect_service(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<(), K
                 .and_then(Value::as_object)
                 .is_some_and(|selector| !selector.is_empty()),
             cluster_ips,
+            uid: object.metadata.uid.clone(),
         },
     );
     Ok(())
