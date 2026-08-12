@@ -22,7 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the Istio/Envoy HTTP ext-auth protocol exactly: HTTP `200` allows, HTTP `5xx`
   and communication failures are failed checks subject to `failOpen` (resolving
   to `statusOnError` when fail-closed), and every other status is an explicit
-  denial carrying the provider's own status; an unreadable or oversized
+  denial carrying the provider's own status, except that a status which cannot
+  frame the gateway-authored error body (`1xx`, a non-`200` `2xx` such as
+  `204`, and `304`) becomes a plain `403` rather than being forwarded verbatim;
+  an unreadable or oversized
   discarded body cannot reclassify that denial into a `failOpen` allow. The
   check is dispatched through a
   single-attempt seam on the shared plugin HTTP client, so an authorization

@@ -516,13 +516,34 @@ async fn a_two_hundred_and_four_is_a_denial_not_an_allow() {
     let executor = executor(vec![provider(stub.port)]);
     match check(&executor, "sample-ext-authz", &request_headers()).await {
         MeshExtAuthzOutcome::Deny { status, reason, .. } => {
+            // The denial is a gateway-AUTHORED response carrying a JSON error
+            // body, so a no-content status cannot be forwarded verbatim: it
+            // would frame content the client is required not to read, leaving
+            // those bytes to be misparsed as the next response on an HTTP/1.1
+            // keep-alive connection. The DECISION is unchanged.
             assert_eq!(
-                status, 204,
-                "an explicit denial keeps the provider's status"
+                status, 403,
+                "a denial status that cannot carry the gateway-authored body becomes a plain 403"
             );
             assert_eq!(reason, MeshExtAuthzReason::DeniedByProvider);
         }
         other => panic!("a non-200 success must never be read as an allow, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_redirect_denial_keeps_the_providers_own_status() {
+    // A redirect-to-login denial is an ordinary ext-authz pattern (it pairs
+    // with `headersToDownstreamOnDeny: [location]`), so a representable status
+    // must still reach the client unchanged.
+    let stub = start_status_stub(302).await;
+    let executor = executor(vec![provider(stub.port)]);
+    match check(&executor, "sample-ext-authz", &request_headers()).await {
+        MeshExtAuthzOutcome::Deny { status, reason, .. } => {
+            assert_eq!(status, 302);
+            assert_eq!(reason, MeshExtAuthzReason::DeniedByProvider);
+        }
+        other => panic!("a 302 is an explicit provider denial, got {other:?}"),
     }
 }
 

@@ -42,7 +42,10 @@
 //! failure) is a FAILED CHECK subject to `failOpen`, resolving to
 //! `statusOnError` when fail-closed; every other status (3xx / 4xx, and any
 //! non-`200` 2xx) is an explicit provider denial carrying the provider's own
-//! status. Because Ferrum never uses or forwards the provider response body,
+//! status — except one that cannot frame the gateway-authored error body
+//! (`1xx`, a non-`200` 2xx such as `204`, and `304`), which is emitted as a
+//! plain `403` (see `client_visible_denial_status`).
+//! Because Ferrum never uses or forwards the provider response body,
 //! an unreadable or oversized body cannot turn an explicit denial into a
 //! failed check that `failOpen` would admit.
 //!
@@ -819,8 +822,10 @@ impl MeshExtAuthzExecutor {
                 // Envoy forwards the provider's own status on a denial; Ferrum
                 // does the same, but deliberately does NOT forward the provider
                 // response BODY. Provider bytes are unvalidated and would be
-                // rendered into a gateway-authored client response.
-                status: status.as_u16(),
+                // rendered into a gateway-authored client response. A status
+                // that cannot carry that gateway-authored body at all becomes a
+                // plain 403 — see `client_visible_denial_status`.
+                status: client_visible_denial_status(status.as_u16()),
                 headers: deny_headers,
                 reason: MeshExtAuthzReason::DeniedByProvider,
             }
@@ -844,6 +849,30 @@ fn classify_provider_status(status: u16) -> ProviderStatusClass {
         200 => ProviderStatusClass::Allow,
         500..=599 => ProviderStatusClass::Error,
         _ => ProviderStatusClass::Denied,
+    }
+}
+
+/// The client-visible status for an explicit provider denial.
+///
+/// A denial is a gateway-AUTHORED response: it carries a fixed JSON error body,
+/// so it must be emitted with a status whose framing allows content. The
+/// classification above deliberately treats every non-`200`, non-`5xx` status
+/// as an explicit denial, which admits `1xx`, a non-`200` `2xx` such as `204`,
+/// and `304` — all of which forbid a body. Forwarding one verbatim would put
+/// `Content-Length` on a response the client is required not to read a body
+/// for, leaving those bytes in an HTTP/1.1 keep-alive stream to be misparsed as
+/// the head of the next response.
+///
+/// `3xx` (except `304`) and `4xx` pass through unchanged: a redirect-to-login
+/// denial is an ordinary ext-authz pattern and pairs with
+/// `headersToDownstreamOnDeny`. Everything else becomes a plain `403` — the
+/// decision (deny) is unchanged and the outcome is still counted as
+/// `denied_by_provider`; only the unrepresentable status is replaced.
+fn client_visible_denial_status(status: u16) -> u16 {
+    if status < 300 || status == 304 {
+        403
+    } else {
+        status
     }
 }
 
@@ -970,6 +999,24 @@ mod tests {
         assert_eq!(classify_provider_status(403), ProviderStatusClass::Denied);
         assert_eq!(classify_provider_status(500), ProviderStatusClass::Error);
         assert_eq!(classify_provider_status(503), ProviderStatusClass::Error);
+    }
+
+    #[test]
+    fn a_denial_status_that_cannot_carry_a_body_becomes_a_plain_forbidden() {
+        // The denial response is gateway-AUTHORED and carries a JSON body, so a
+        // no-content status would frame content the client must not read — on
+        // an HTTP/1.1 keep-alive connection those bytes are then parsed as the
+        // head of the next response.
+        assert_eq!(client_visible_denial_status(204), 403);
+        assert_eq!(client_visible_denial_status(205), 403);
+        assert_eq!(client_visible_denial_status(304), 403);
+        assert_eq!(client_visible_denial_status(101), 403);
+        // A redirect-to-login denial is an ordinary ext-authz pattern and pairs
+        // with `headersToDownstreamOnDeny`, so 3xx (except 304) and 4xx keep the
+        // provider's own status.
+        assert_eq!(client_visible_denial_status(302), 302);
+        assert_eq!(client_visible_denial_status(401), 401);
+        assert_eq!(client_visible_denial_status(403), 403);
     }
 
     #[test]

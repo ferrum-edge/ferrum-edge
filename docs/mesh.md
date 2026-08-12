@@ -1304,6 +1304,17 @@ exactly:
 | communication failure (connect / TLS / timeout, or an unreadable / oversize `200` response) | **failed check** — follows `failOpen`; `statusOnError` when fail-closed |
 | any other status (3xx, 4xx, and any non-`200` 2xx such as `204`) | **explicit denial**, carrying the provider's own status |
 
+The denial Ferrum emits is gateway-authored and carries a fixed JSON error
+body, so a denial status that cannot frame content — `1xx`, a non-`200` `2xx`
+such as `204`/`205`, and `304` — is replaced by a plain `403`. Forwarding one
+verbatim would put `Content-Length` on a response the client is required not to
+read a body for, leaving those bytes to be misparsed as the head of the next
+response on an HTTP/1.1 keep-alive connection. `3xx` (except `304`) and `4xx`
+pass through unchanged, so a redirect-to-login denial paired with
+`headersToDownstreamOnDeny: [location]` still works. Only the unrepresentable
+status is replaced: the decision is still a denial and is still counted as
+`denied_by_provider`.
+
 Ferrum never uses or forwards the provider response body. Once an explicit
 denial status has arrived, that status remains authoritative even if its
 discarded body is oversized or cannot be drained; `failOpen` therefore cannot

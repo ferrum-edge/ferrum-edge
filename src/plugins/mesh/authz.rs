@@ -2988,6 +2988,17 @@ impl Plugin for MeshAuthz {
         self.requires_request_body_before_authorize()
     }
 
+    /// The check forwards the RAW body bytes and never reads the UTF-8
+    /// `metadata["request_body"]` view, so retaining one would mint a second
+    /// full copy of an attacker-supplied body — up to `maxRequestBytes` per
+    /// in-flight request — and publish it into the shared plugin-metadata map
+    /// for no consumer. A later phase that genuinely needs the text view still
+    /// gets it: `request_body_requirements_before_before_proxy` re-stores the
+    /// metadata for an already-buffered body from its own `needs_text`.
+    fn needs_request_body_text(&self) -> bool {
+        false
+    }
+
     /// A body-inspecting CUSTOM provider must not make EVERY request on the
     /// workload buffer its body and inherit the shared `maxRequestBytes`
     /// ceiling — the ceiling is enforced as a `413` before the check runs, so a
