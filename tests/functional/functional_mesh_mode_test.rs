@@ -5519,32 +5519,84 @@ async fn functional_mesh_sidecar_egress_grpc_rejects_untrusted_client_gateway() 
     );
 }
 
-/// gRPC fail-closed (Ambient, issue #2003): a captured native-gRPC request to
-/// an HBONE-tagged destination is refused BEFORE any dial with a Trailers-Only
-/// gRPC UNAVAILABLE (HTTP 200 + `grpc-status: 14` in the response HEADERS) —
-/// the HBONE inner protocol is HTTP/1.1 and cannot carry gRPC trailers, and a
-/// direct plaintext dial would silently bypass the mesh transport. The refusal
-/// must never converge to a completed call.
+/// gRPC keystone (Ambient, issue #3728): a captured native-gRPC request at
+/// gateway A on the STANDARD HTTP/1.1+HTTP/2 frontend rides A's authenticated
+/// **HBONE** egress to the gRPC backend behind gateway B, and the backend's REAL
+/// HTTP/2 trailers (`grpc-status`, custom trailer) survive the whole relay back
+/// to point A's client.
+///
+/// This is the exact call that used to be refused pre-dial with a Trailers-Only
+/// UNAVAILABLE on this frontend while the H3 frontend served it. The refusal
+/// described the GENERIC HTTP-family HBONE dispatch, whose inner HTTP/1.1 client
+/// cannot carry gRPC trailers; native gRPC instead runs a nested
+/// `hyper::client::conn::http2` client over the same authenticated CONNECT byte
+/// tunnel, which is why the trailers below arrive as REAL trailers rather than
+/// response headers.
 #[ignore]
 #[tokio::test]
-async fn functional_mesh_ambient_egress_grpc_fails_closed_unavailable() {
+async fn functional_mesh_ambient_egress_grpc_routes_a_to_b_over_hbone_with_trailers() {
     let (resp, logs) = drive_grpc_egress_a_to_b("ambient", true, |resp| {
-        resp.status == 200 && resp.headers.get("grpc-status").map(String::as_str) == Some("14")
+        resp.status == 200
+            && resp.trailers.get("grpc-status").map(String::as_str) == Some("0")
+            && resp
+                .body
+                .windows(b"ferrum-mesh-grpc-payload".len())
+                .any(|w| w == b"ferrum-mesh-grpc-payload")
     })
     .await
-    .expect("ambient gRPC fail-closed drive");
+    .expect("ambient gRPC egress drive");
     assert_eq!(
         resp.status, 200,
-        "the HBONE gRPC refusal rides HTTP 200 Trailers-Only encoding: {resp:?}\n{logs}"
+        "the captured gRPC request must traverse A's HBONE egress to B's gRPC backend: {resp:?}\n{logs}"
     );
     assert_eq!(
-        resp.headers.get("grpc-status").map(String::as_str),
-        Some("14"),
-        "gRPC to an HBONE-tagged target must fail closed with UNAVAILABLE: {resp:?}\n{logs}"
+        resp.trailers.get("grpc-status").map(String::as_str),
+        Some("0"),
+        "the backend's grpc-status TRAILER must survive the nested HTTP/2 connection \
+         inside the HBONE tunnel: {resp:?}\n{logs}"
+    );
+    assert_eq!(
+        resp.trailers.get("x-mesh-trailer").map(String::as_str),
+        Some("echo-ok"),
+        "custom (non-hop-by-hop) trailers must survive the HBONE relay: {resp:?}\n{logs}"
     );
     assert!(
-        resp.body.is_empty(),
-        "the fail-closed refusal must not carry any backend bytes (no dial happened): {resp:?}\n{logs}"
+        !resp.headers.contains_key("grpc-status"),
+        "a completed RPC must NOT carry a header-borne grpc-status — that shape is the \
+         gateway's Trailers-Only refusal, not the backend's answer: {resp:?}\n{logs}"
+    );
+    assert!(
+        resp.body
+            .windows(b"ferrum-mesh-grpc-payload".len())
+            .any(|w| w == b"ferrum-mesh-grpc-payload"),
+        "the echoed gRPC payload must ride the relayed DATA frames: {resp:?}\n{logs}"
+    );
+}
+
+/// gRPC fail-closed negative (Ambient, issue #3728): an UNTRUSTED gateway A —
+/// whose SVID does not chain to the mesh CA — must never complete a gRPC call
+/// over HBONE. Reusing the mesh transport for native gRPC must not weaken its
+/// identity boundary: an unverifiable peer fails closed rather than falling back
+/// to an unauthenticated direct dial to the destination's app port.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_ambient_egress_grpc_rejects_untrusted_client_gateway() {
+    let (resp, logs) = drive_grpc_egress_a_to_b("ambient", false, |resp| {
+        // Success shape must never be observed; poll to the deadline.
+        resp.status == 200 && resp.trailers.get("grpc-status").map(String::as_str) == Some("0")
+    })
+    .await
+    .expect("untrusted ambient gRPC egress drive");
+    assert!(
+        !(resp.status == 200 && resp.trailers.get("grpc-status").map(String::as_str) == Some("0")),
+        "an untrusted gateway's gRPC request must fail closed, not complete: {resp:?}\n{logs}"
+    );
+    assert!(
+        !resp
+            .body
+            .windows(b"ferrum-mesh-grpc-payload".len())
+            .any(|w| w == b"ferrum-mesh-grpc-payload"),
+        "no backend payload may leak through an unauthenticated HBONE hop: {resp:?}\n{logs}"
     );
 }
 

@@ -28288,8 +28288,11 @@ async fn handle_proxy_request_inner(
     //     mesh-mTLS gate below fails closed with a gRPC UNAVAILABLE.
     //   * NATIVE-gRPC requests (and gRPC-Web the `grpc_web` plugin
     //     TRANSLATED — wire-native gRPC by dispatch time) to Ambient
-    //     `mesh.hbone` and cross-cluster targets FAIL CLOSED inside this
-    //     branch (see `grpc_mesh_dispatch_falls_through`), never direct-dial.
+    //     `mesh.hbone` targets DISPATCH inside this branch over the shared
+    //     nested-HTTP/2 HBONE transport (issue #3728) — never through the
+    //     generic HTTP-family HBONE path, whose HTTP/1.1 inner client would
+    //     drop their trailers, and never a direct plaintext dial. A
+    //     malformed cross-cluster target still fails closed here.
     //   * PASS-THROUGH gRPC-Web (protocol-classified gRPC for plugin routing,
     //     but NOT the native `application/grpc` content-type, and NOT
     //     translated by the `grpc_web` plugin) frames its trailers inside
@@ -28330,10 +28333,13 @@ async fn handle_proxy_request_inner(
         //   * Sidecar `mesh.mtls` targets, same-cluster and cross-cluster,
         //     normally fall through above to the generic trailer-preserving
         //     mesh-mTLS path. Refuse defensively if either reaches this branch.
-        //   * Ambient `mesh.hbone` targets remain unsupported on this H1/H2
-        //     frontend because its generic HBONE path runs HTTP/1.1 inside the
-        //     CONNECT tunnel and cannot carry gRPC trailers. The H3 bridge uses
-        //     a separate nested-HTTP/2 transport for these targets (#3284).
+        //   * Ambient `mesh.hbone` targets are DISPATCHED here (issue #3728)
+        //     over the shared nested-HTTP/2 HBONE transport the H3 bridge
+        //     already used (#3284): a `hyper::client::conn::http2` client run
+        //     inside the authenticated CONNECT byte tunnel, so `grpc-status`
+        //     trailers, flow control, deadlines, and cancellation relay end to
+        //     end. Only the GENERIC HTTP-family HBONE path (HTTP/1.1 inside the
+        //     tunnel) cannot carry them, and native gRPC never takes it.
         //   * Malformed cross-cluster targets fail closed because the secured
         //     east-west dial cannot be materialized without its transport,
         //     destination-FQDN SNI override, and trust-domain scope.
@@ -28344,15 +28350,18 @@ async fn handle_proxy_request_inner(
         if let Some(target) = upstream_target.as_deref() {
             let refusal = match grpc_proxy::classify_grpc_mesh_dispatch(target) {
                 grpc_proxy::GrpcMeshDispatch::Direct => None,
-                // The generic HTTP-family mesh path this frontend falls through
-                // to runs an HTTP/1.1 client inside the HBONE byte tunnel, so it
-                // cannot carry `grpc-status` trailers. (The H3 bridge does not
-                // use that path — it runs a nested HTTP/2 client over the same
-                // tunnel; see `GrpcDispatchTransport`, issue #3284.)
-                grpc_proxy::GrpcMeshDispatch::HboneCrossCluster => Some(
-                    "gRPC over cross-cluster Ambient HBONE east-west routing is not supported \
-                     on this frontend (its HBONE dispatch cannot carry gRPC trailers)",
-                ),
+                // Ambient `mesh.hbone` targets — same-cluster and cross-cluster
+                // — are DISPATCHED below over the shared nested-HTTP/2 HBONE
+                // transport (`GrpcDispatchTransport`), not refused (issue
+                // #3728). The refusal that used to live here described the
+                // GENERIC HTTP-family HBONE path, whose HTTP/1.1 inner client
+                // cannot carry `grpc-status` trailers; native gRPC never takes
+                // that path. `grpc_mesh_dispatch_falls_through` still keeps
+                // native gRPC out of it, and the transport materialization just
+                // below is what fails closed on incomplete or hostile mesh
+                // metadata — before a socket is opened.
+                grpc_proxy::GrpcMeshDispatch::Hbone
+                | grpc_proxy::GrpcMeshDispatch::HboneCrossCluster => None,
                 grpc_proxy::GrpcMeshDispatch::RefuseCrossClusterMalformed => Some(
                     "gRPC over cross-cluster east-west routing requires a destination SNI \
                      override and a remote trust domain",
@@ -28360,10 +28369,6 @@ async fn handle_proxy_request_inner(
                 grpc_proxy::GrpcMeshDispatch::RefuseCrossClusterNoTransport => {
                     Some("gRPC over cross-cluster east-west routing requires a mesh transport tag")
                 }
-                grpc_proxy::GrpcMeshDispatch::Hbone => Some(
-                    "gRPC over the Ambient HBONE mesh transport is not supported \
-                     on this frontend (its HBONE dispatch cannot carry gRPC trailers)",
-                ),
                 // `MeshMtlsCrossCluster` normally falls through to the generic
                 // mesh-mTLS path (its east-west branch) like `MeshMtls`; both are
                 // refused defensively here in case they reach this branch.
@@ -28509,6 +28514,79 @@ async fn handle_proxy_request_inner(
                 initial_response_header_policy_plugins.as_ref(),
             ));
         }
+        // Materialize the HTTP/2 transport for the LB-selected target BEFORE any
+        // socket is opened and before a single application byte is forwarded
+        // (issue #3728). This is the SAME `GrpcDispatchTransport::for_target`
+        // resolver the H3 bridge uses (`resolve_grpc_dispatch_transport`), so
+        // target validation, dial-plan resolution, error mapping, metrics, and
+        // transport lifecycle cannot drift between the two frontends:
+        //   * `Direct` — the untagged direct-dial `GrpcConnectionPool`.
+        //   * `Hbone` / `HboneCrossCluster` — a nested `hyper` HTTP/2 client run
+        //     inside the authenticated HBONE CONNECT byte tunnel, dialed on the
+        //     resolved plan (dial host + `:15008`-style HBONE port + CONNECT
+        //     authority host, with either a pinned peer SPIFFE or a remote
+        //     trust-domain scope plus destination-FQDN SNI override).
+        // A target whose mesh metadata is missing, corrupt, ambiguous
+        // (BOTH transport tags), or otherwise unmaterializable FAILS CLOSED here
+        // with a Trailers-Only gRPC UNAVAILABLE whose message names the failed
+        // contract and never echoes a SPIFFE ID, SNI name, trust domain, or dial
+        // address. There is deliberately no direct-dial fallback.
+        let grpc_transport =
+            match resolve_grpc_dispatch_transport(&state, upstream_target.as_deref()) {
+                Ok(transport) => transport,
+                Err(transport_error) => {
+                    let message = transport_error.message();
+                    let diagnostic = transport_error.diagnostic().as_str();
+                    warn!(
+                        proxy_id = %proxy.id,
+                        target_host = %grpc_effective_host,
+                        diagnostic,
+                        refusal = ?transport_error,
+                        message,
+                        "No dispatchable mesh transport for the selected gRPC target; failing \
+                         closed with gRPC UNAVAILABLE instead of an unauthenticated direct dial"
+                    );
+                    // This reject is AFTER `grpc_probe_guard` exists, so disarm
+                    // it before the explicit release (a still-armed Drop would
+                    // free a SECOND, unrelated in-flight probe slot).
+                    grpc_probe_guard.disarm();
+                    release_circuit_breaker_probe_on_admission_reject(
+                        &state,
+                        &proxy,
+                        cb_target_key.as_deref(),
+                        cb_is_half_open_probe,
+                    );
+                    record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
+                    if let Some(content_type) = grpc_web_response_content_type {
+                        return Ok(build_grpc_web_error_response(
+                            content_type,
+                            14,
+                            message,
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
+                        ));
+                    }
+                    if grpc_request_is_web_translated
+                        && let Some(response) = build_translated_grpc_web_error_response(
+                            &ctx,
+                            14,
+                            message,
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
+                        )
+                    {
+                        return Ok(response);
+                    }
+                    return Ok(grpc_proxy::build_grpc_error_response_with_policy(
+                        14, // UNAVAILABLE
+                        message,
+                        initial_response_header_policy_plugins.as_ref(),
+                    ));
+                }
+            };
+
         let grpc_effective_port = grpc_dispatch_proxy.backend_port;
         let mut grpc_backend_url = build_backend_url_with_target(
             grpc_dispatch_proxy,
@@ -28926,14 +29004,14 @@ async fn handle_proxy_request_inner(
                 crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
                 grpc_dispatch_proxy,
                 &grpc_backend_url,
-                // Direct-dial only, and provably so: this branch is entered
-                // only for `grpc_uses_native_dispatch`, whose mesh screen above
-                // refuses every non-`Direct` class before dispatch, and a
-                // `mesh.mtls` target is routed onto the generic mesh-mTLS path
-                // by `grpc_mesh_dispatch_falls_through` before that. The H3
-                // bridge is the surface that materializes the mesh transports
-                // (issues #2003, #3284).
-                &grpc_proxy::GrpcDispatchTransport::Direct(&state.grpc_pool),
+                // The transport materialized for THIS target before any dial:
+                // the direct pool for an untagged target, the nested-HTTP/2
+                // HBONE transport for an Ambient `mesh.hbone` one. A
+                // `mesh.mtls` target never reaches here — it is routed onto the
+                // generic mesh-mTLS path by `grpc_mesh_dispatch_falls_through`
+                // and defensively refused by the screen above (issues #2003,
+                // #3284, #3728).
+                &grpc_transport,
                 &state.dns_cache,
                 owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                 grpc_should_stream,
@@ -29085,7 +29163,11 @@ async fn handle_proxy_request_inner(
                     request,
                     grpc_dispatch_proxy,
                     &grpc_backend_url,
-                    &state.grpc_pool,
+                    // Same materialized transport as the buffered arms. A
+                    // fully-streamed (non-replayable) upload can therefore ride
+                    // the Ambient HBONE tunnel's nested HTTP/2 connection with
+                    // frames committed incrementally and no retry (issue #3728).
+                    &grpc_transport,
                     &state.dns_cache,
                     owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                     effective_max_grpc_recv_size_bytes,
@@ -29201,11 +29283,9 @@ async fn handle_proxy_request_inner(
                             crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
                             grpc_dispatch_proxy,
                             &grpc_backend_url,
-                            // Direct-dial only, for the same reason as the
-                            // split-path call above: the native-gRPC mesh screen
-                            // refuses every non-`Direct` class and `MeshMtls`
-                            // never reaches this branch (issues #2003, #3284).
-                            &grpc_proxy::GrpcDispatchTransport::Direct(&state.grpc_pool),
+                            // The same materialized transport as the split-path
+                            // call above (issues #2003, #3284, #3728).
+                            &grpc_transport,
                             &state.dns_cache,
                             owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                             grpc_should_stream,
@@ -29486,15 +29566,23 @@ async fn handle_proxy_request_inner(
                     .await);
                 }
 
-                // This loop owns the direct `GrpcConnectionPool` response/trailer
-                // pipeline. A rotation onto a mesh target must fail closed rather
-                // than direct-dial past its identity boundary; mesh-mTLS retries
-                // are handled by the generic mesh path when mesh was selected for
-                // the first attempt. Switching response pipelines mid-loop would
-                // lose the exact gRPC HeaderMap/trailer contract.
+                // This loop owns the HTTP/2 response/trailer pipeline shared by
+                // the direct `GrpcConnectionPool` and the nested-HTTP/2 HBONE
+                // transport — both yield a hyper `Incoming`, so rotating between
+                // them keeps the exact gRPC HeaderMap/trailer contract. Every
+                // OTHER class must fail closed rather than direct-dial past its
+                // identity boundary: Sidecar mesh-mTLS retries belong to the
+                // generic mesh path (selected for the first attempt), and a Unix
+                // or malformed cross-cluster target has no transport here.
+                // Switching to those response pipelines mid-loop would lose that
+                // contract (issues #2003, #3728).
                 if let Some(ref rotated_target) = grpc_current_target
-                    && grpc_proxy::classify_grpc_mesh_dispatch(rotated_target)
-                        != grpc_proxy::GrpcMeshDispatch::Direct
+                    && !matches!(
+                        grpc_proxy::classify_grpc_mesh_dispatch(rotated_target),
+                        grpc_proxy::GrpcMeshDispatch::Direct
+                            | grpc_proxy::GrpcMeshDispatch::Hbone
+                            | grpc_proxy::GrpcMeshDispatch::HboneCrossCluster
+                    )
                 {
                     warn!(
                         proxy_id = %proxy.id,
@@ -29671,6 +29759,56 @@ async fn handle_proxy_request_inner(
                     &proxy,
                     grpc_current_target.as_deref(),
                 );
+                // Re-materialize the transport for the (possibly rotated) target
+                // on EVERY attempt (issue #3728), exactly as the H3 bridge does.
+                // Re-resolving is what binds this attempt's dial host, CONNECT
+                // authority, pinned peer, and cross-cluster SNI / trust-domain
+                // scope, so a target that mutated across a live reload fails
+                // closed here instead of being dialed on a stale plan.
+                let grpc_retry_transport =
+                    match resolve_grpc_dispatch_transport(&state, grpc_current_target.as_deref()) {
+                        Ok(transport) => transport,
+                        Err(transport_error) => {
+                            let message = transport_error.message();
+                            warn!(
+                                proxy_id = %proxy.id,
+                                diagnostic = transport_error.diagnostic().as_str(),
+                                refusal = ?transport_error,
+                                message,
+                                "gRPC retry target has no dispatchable mesh transport; failing \
+                                 closed with gRPC UNAVAILABLE instead of an unauthenticated \
+                                 direct dial"
+                            );
+                            record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
+                            if let Some(content_type) = grpc_web_response_content_type {
+                                return Ok(build_grpc_web_error_response(
+                                    content_type,
+                                    14,
+                                    message,
+                                    plugin_cache_view
+                                        .initial_response_header_policy_plugins()
+                                        .as_ref(),
+                                ));
+                            }
+                            if grpc_request_is_web_translated
+                                && let Some(response) = build_translated_grpc_web_error_response(
+                                    &ctx,
+                                    14,
+                                    message,
+                                    plugin_cache_view
+                                        .initial_response_header_policy_plugins()
+                                        .as_ref(),
+                                )
+                            {
+                                return Ok(response);
+                            }
+                            return Ok(grpc_proxy::build_grpc_error_response_with_policy(
+                                14, // UNAVAILABLE
+                                message,
+                                initial_response_header_policy_plugins.as_ref(),
+                            ));
+                        }
+                    };
                 grpc_final_upstream_target = grpc_current_target.clone();
                 grpc_lb_connection_guard = Some(LoadBalancerConnectionGuard::new(
                     grpc_current_target.clone(),
@@ -29685,10 +29823,11 @@ async fn handle_proxy_request_inner(
                     crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
                     grpc_retry_effective_proxy.as_ref(),
                     &grpc_backend_url,
-                    // Direct-dial only: the loop re-screens every rotated
-                    // target above and refuses a mesh-tagged one before it can
-                    // reach this call (issue #2003).
-                    &grpc_proxy::GrpcDispatchTransport::Direct(&state.grpc_pool),
+                    // The transport re-materialized for THIS attempt's target:
+                    // the loop re-screens every rotated target above and refuses
+                    // any class this pipeline cannot carry before reaching here
+                    // (issues #2003, #3728).
+                    &grpc_retry_transport,
                     &state.dns_cache,
                     owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                     grpc_should_stream,
@@ -39385,6 +39524,33 @@ pub(crate) fn mesh_mtls_dispatch_authority<'a>(
         &target.host,
         target.port,
     ))
+}
+
+/// The ONE place any native-gRPC dispatch surface materializes its HTTP/2
+/// transport for an LB-selected target (issues #3284, #3728).
+///
+/// Both the standard H1/H2 frontend's native-gRPC branch and the H3
+/// cross-protocol bridge route through this helper, so target validation, the
+/// fail-closed dial-plan resolution (pinned peer SPIFFE / trust-domain scope /
+/// destination-FQDN SNI override / CONNECT authority host), error mapping, and
+/// transport lifecycle cannot drift between the two frontends. There is
+/// deliberately no "direct dial anyway" arm: an unresolvable mesh target is a
+/// [`grpc_proxy::GrpcTransportError`] the caller answers with a Trailers-Only
+/// gRPC UNAVAILABLE, never an unauthenticated plaintext dial that would bypass
+/// SVID-mTLS, identity pinning, and mesh authz identity.
+///
+/// `None` (no LB-selected target) keeps the direct pool: the proxy's own backend
+/// host is the destination and no mesh tag exists to honor.
+pub(crate) fn resolve_grpc_dispatch_transport<'a>(
+    state: &'a ProxyState,
+    target: Option<&'a UpstreamTarget>,
+) -> Result<grpc_proxy::GrpcDispatchTransport<'a>, grpc_proxy::GrpcTransportError> {
+    grpc_proxy::GrpcDispatchTransport::for_target(
+        &state.grpc_pool,
+        &state.mesh_mtls_pool,
+        &state.hbone_pool,
+        target,
+    )
 }
 
 /// Normalize a Host/authority value for host-based routing.

@@ -5,16 +5,68 @@ Method: four independent read-only audits (deferral markers, docs-vs-code truth,
 posture, ops/CI/release) → findings triaged → fixes implemented via reviewed PRs (codex
 review loop + full CI + orchestrator review on every PR) → merged.
 
-## Launch gate summary
+## Live launch gate (authoritative)
 
-| Gate | Status |
+This section is the **only** current go/no-go launch signal. It is verified by
+`scripts/check_launch_readiness.py` against live paginated GitHub issue state,
+structured exemptions, and a redacted private-advisory count. Policy:
+[`docs/launch-blocker-policy.json`](docs/launch-blocker-policy.json),
+[`docs/launch-readiness.md`](docs/launch-readiness.md).
+
+A historical clean static audit (below) does **not** imply a clean live gate.
+
+The block below is a **reviewed snapshot**, never a source of truth. It is not
+evidence that any blocker is resolved: the gate recomputes the verdict from live
+data on every run and fails whenever the snapshot disagrees, whenever the verdict
+is not `PASS`, and whenever the live data cannot be established. Refresh it from
+the `Launch Readiness Gate` job output (the evaluated record carries the exact
+target SHA and as-of UTC) whenever the blocker set changes.
+
+<!-- launch-readiness:begin -->
+```json
+{
+  "verdict": "FAIL",
+  "policy_version": "2",
+  "classification_version": "launch-blocker-v2",
+  "launch_tier": "ga",
+  "private_blockers_redacted_count": 0,
+  "counts_by_severity": {
+    "critical": 1,
+    "high": 6,
+    "medium": 0
+  },
+  "notes": "Reviewed snapshot only. Target SHA and as-of UTC come from the workflow's evaluated record; they are deliberately not asserted here."
+}
+```
+<!-- launch-readiness:end -->
+
+Hosted enforcement: `.github/workflows/launch-readiness.yml` (PR/`merge_group`/
+`main`/tag/schedule) and the release/tag job in `.github/workflows/release.yml`,
+which requires a computed `PASS` for the exact released commit. Only a computed
+`PASS` whose snapshot agrees exits zero: `FAIL` and `UNKNOWN` are both non-zero,
+so this check stays red while real launch blockers are open — that is the honest
+signal, not a defect. `UNKNOWN` covers a missing token, an API/rate-limit/
+pagination/schema failure, an issue without exactly one severity label, a live
+severity label that contradicts the tracked contract, and missing/malformed/
+stale/future private-advisory input. Private advisories contribute a redacted
+count only; setup and maintenance are described in
+[`docs/launch-readiness.md`](docs/launch-readiness.md).
+
+<!-- launch-readiness:historical -->
+
+## Historical epic summary (not the live gate)
+
+The tables below record the 2026-07-12 product-readiness epic and later ledger
+reconciliations. They are **historical evidence**, not the live launch verdict.
+
+| Gate | Historical status (epic / audit evidence) |
 |------|--------|
-| Feature set implemented or proven out of scope | PASS — zero doc overclaims across README/FEATURES/62 docs; genuine deferrals documented with graceful behavior. Historical umbrella: #2110; live residuals: dedicated issues in the Current residual map |
-| All deferral markers resolved or tracked | PASS — ~259 raw markers triaged: 1 medium fixed (PR #2113), lows fixed (#2114) or tracked; completed epic rows reconciled below; live leftovers use dedicated issues |
-| Critical/high/medium bugs fixed | PASS — 0 critical/high found in any audit; all 5 mediums fixed and merged |
-| Docs truthful vs code | PASS — stale REFACTORING_PLAN.md retired, WEBSOCKET.md/admin_api.md corrected (PR #2112); config/openapi/plugin-priority parity verified clean |
-| Security posture verified | PASS — 0 crit/high/med; both lows hardened (PR #2114); CRL revocation now symmetric inbound/outbound (PR #2113) |
-| Deployment/CI/release readiness | PASS — tag↔version guard + CHANGELOG policy (PR #2109); flake redness remediated pre-epic (#2057/#2060 fixes + #2103), main monitored green through the epic |
+| Feature set implemented or proven out of scope | Historical PASS — zero doc overclaims across README/FEATURES/62 docs; genuine deferrals documented with graceful behavior. Historical umbrella: #2110; live residuals: dedicated issues (see residual map; live gate above is authoritative) |
+| All deferral markers resolved or tracked | Historical PASS — ~259 raw markers triaged: 1 medium fixed (PR #2113), lows fixed (#2114) or tracked; completed epic rows reconciled below; live leftovers use dedicated issues |
+| Critical/high/medium bugs fixed | Historical static-audit evidence — 0 *new untracked* critical/high found in the 2026-07-12 audits; all 5 epic mediums fixed and merged. **Not** a claim about the current launch backlog |
+| Docs truthful vs code | Historical PASS — stale REFACTORING_PLAN.md retired, WEBSOCKET.md/admin_api.md corrected (PR #2112); config/openapi/plugin-priority parity verified clean |
+| Security posture verified | Historical PASS — 0 crit/high/med in the epic security audit; both lows hardened (PR #2114); CRL revocation now symmetric inbound/outbound (PR #2113) |
+| Deployment/CI/release readiness | Historical PASS — tag↔version guard + CHANGELOG policy (PR #2109); flake redness remediated pre-epic (#2057/#2060 fixes + #2103), main monitored green through the epic |
 
 ## Merged work (all codex-clean + CI-green + orchestrator-reviewed)
 
@@ -74,9 +126,11 @@ review loop + full CI + orchestrator review on every PR) → merged.
   dedup try_lock eviction, MCP stale-template serving, H3 streaming-trailer limitation,
   kTLS KeyUpdate userspace fallback, mcp_gateway V1 tool-result rejection.
 
-## Needs human decision
+## Needs human decision (historical note)
 
-None blocking launch. Post-launch discretionary items that remain open should be
+Launch-blocking human decisions are represented only by the live gate above (and by
+structured entries in `docs/launch-exemptions.json`). This historical note must not be
+read as a clean launch signal. Post-launch discretionary items that remain open should be
 tracked on their **dedicated** issues (not by treating #2110 as an unchanged
 snapshot). #2110 stays open only as the historical 2026-07-12 register; after
 docs reconciliation merges, root should retick/comment that register so completed
@@ -84,9 +138,10 @@ rows (Helm chart, scheduled stress job, mixed k8s status ownership, WsDisconnect
 schema, closed #2008/#2013/#2475, TLS-SNI L4 support) are not re-opened from the
 issue body alone.
 
-## Current residual map (live dedicated trackers)
+## Current residual map (historical narrative; live gate is authoritative)
 
-**Last reconciled:** 2026-08-06 (issue #3627; verified against `origin/main`).
+**Last narrative reconciliation:** 2026-08-06 (issue #3627). Subsequent launch state is
+owned by the live gate / policy inventory, not by copying this table by hand.
 
 | Residual | Live issue(s) | Notes |
 |----------|---------------|-------|

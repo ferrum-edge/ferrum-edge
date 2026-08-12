@@ -1921,6 +1921,54 @@ pub struct EnvConfig {
     /// that matches no rule is refused: the Workload API never assigns an
     /// identity it was not told to assign.
     pub mesh_workload_api_unix_identity_rules: Vec<String>,
+    /// Simultaneously accepted Workload API connections across all peers
+    /// (issue #3758). Enforced before the accepted socket reaches tonic, so a
+    /// refused connection allocates no HTTP/2 or RPC state. Minimum
+    /// [`crate::identity::workload_api::admission::MIN_MAX_CONNECTIONS`] (**2**),
+    /// hard ceiling
+    /// [`crate::identity::workload_api::admission::MAX_CONNECTIONS_CEILING`].
+    /// Both `0` and `1` are refused: `0` is not an "unbounded" spelling, and `1`
+    /// cannot satisfy the strictly-below per-UID quota rule, so a globally fair
+    /// transport needs room for at least two connections.
+    pub mesh_workload_api_max_connections: usize,
+    /// Simultaneously accepted Workload API connections per kernel-attested
+    /// peer UID. Keeps one compromised member of the socket group from
+    /// consuming the whole global pool and denying identity issuance to every
+    /// other workload on the node. Must be **strictly below**
+    /// `mesh_workload_api_max_connections`: a quota equal to the global ceiling
+    /// lets one UID hold every connection and is not a fair share.
+    pub mesh_workload_api_max_connections_per_uid: usize,
+    /// HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS` advertised on each Workload API
+    /// connection, and the per-connection request-concurrency limit paired with
+    /// load shedding (reject, never queue).
+    pub mesh_workload_api_max_concurrent_streams: u32,
+    /// Service-wide concurrently admitted Workload API RPCs. Bounds the product
+    /// of the connection and stream ceilings; a call over the limit is shed with
+    /// `RESOURCE_EXHAUSTED` before attestation, CA work, or any producer task.
+    /// A **streaming** RPC holds its permit for the whole life of its response
+    /// stream, so this bounds concurrently open Workload API streams rather than
+    /// request rate.
+    pub mesh_workload_api_max_concurrent_rpcs: usize,
+    /// Concurrently admitted Workload API RPCs per kernel-attested peer UID.
+    /// Keeps one socket-group member from occupying every RPC permit — which the
+    /// per-connection quota alone does not prevent, since the bundle RPCs need
+    /// only the mandatory metadata header — and so denying SVID renewal to every
+    /// other workload on the node. Must be **strictly below**
+    /// `mesh_workload_api_max_concurrent_rpcs`.
+    pub mesh_workload_api_max_concurrent_rpcs_per_uid: usize,
+    /// Seconds a newly admitted Workload API connection may go without sending
+    /// its first byte. Bounds the connect-and-say-nothing flood a per-request
+    /// timeout cannot see.
+    pub mesh_workload_api_initial_connection_timeout_seconds: u64,
+    /// Seconds a Workload API connection may go without a byte **read from the
+    /// peer**. HTTP/2 keepalive is derived from this, so a live long-lived
+    /// rotation stream is refreshed by PING ACKs while a peer that has stopped
+    /// participating is closed.
+    pub mesh_workload_api_idle_timeout_seconds: u64,
+    /// Seconds the Workload API listener drains gracefully at shutdown before
+    /// remaining connections are force-closed. Admission stops immediately;
+    /// this bounds only the drain.
+    pub mesh_workload_api_shutdown_grace_seconds: u64,
     /// Mesh runtime config source. `native` consumes Ferrum MeshSubscribe;
     /// `xds` consumes the Ferrum-private ADS profile; `file` loads a localized
     /// mesh config document from `FERRUM_MESH_FILE_CONFIG_PATH` (no control
@@ -3339,6 +3387,19 @@ impl Default for EnvConfig {
             mesh_jwt_svid_ttl_seconds: 300,
             mesh_jwt_key_lifetime_seconds: 0,
             mesh_workload_api_unix_identity_rules: Vec::new(),
+            mesh_workload_api_max_connections:
+                crate::identity::workload_api::admission::DEFAULT_MAX_CONNECTIONS,
+            mesh_workload_api_max_connections_per_uid:
+                crate::identity::workload_api::admission::DEFAULT_MAX_CONNECTIONS_PER_UID,
+            mesh_workload_api_max_concurrent_streams:
+                crate::identity::workload_api::admission::DEFAULT_MAX_CONCURRENT_STREAMS,
+            mesh_workload_api_max_concurrent_rpcs:
+                crate::identity::workload_api::admission::DEFAULT_MAX_CONCURRENT_RPCS,
+            mesh_workload_api_max_concurrent_rpcs_per_uid:
+                crate::identity::workload_api::admission::DEFAULT_MAX_CONCURRENT_RPCS_PER_UID,
+            mesh_workload_api_initial_connection_timeout_seconds: 10,
+            mesh_workload_api_idle_timeout_seconds: 900,
+            mesh_workload_api_shutdown_grace_seconds: 10,
             mesh_config_protocol: "native".to_string(),
             mesh_file_config_path: None,
             mesh_trust_domain_aliases: Vec::new(),
@@ -3887,6 +3948,14 @@ impl EnvConfig {
             mesh_jwt_svid_ttl_seconds: u64 = "FERRUM_MESH_JWT_SVID_TTL_SECONDS" => 300u64;
             mesh_jwt_key_lifetime_seconds: u64 = "FERRUM_MESH_JWT_KEY_LIFETIME_SECONDS" => 0u64;
             mesh_workload_api_unix_identity_rules: Vec<String> = "FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES" => Vec::new();
+            mesh_workload_api_max_connections: usize = "FERRUM_MESH_WORKLOAD_API_MAX_CONNECTIONS" => crate::identity::workload_api::admission::DEFAULT_MAX_CONNECTIONS;
+            mesh_workload_api_max_connections_per_uid: usize = "FERRUM_MESH_WORKLOAD_API_MAX_CONNECTIONS_PER_UID" => crate::identity::workload_api::admission::DEFAULT_MAX_CONNECTIONS_PER_UID;
+            mesh_workload_api_max_concurrent_streams: u32 = "FERRUM_MESH_WORKLOAD_API_MAX_CONCURRENT_STREAMS" => crate::identity::workload_api::admission::DEFAULT_MAX_CONCURRENT_STREAMS;
+            mesh_workload_api_max_concurrent_rpcs: usize = "FERRUM_MESH_WORKLOAD_API_MAX_CONCURRENT_RPCS" => crate::identity::workload_api::admission::DEFAULT_MAX_CONCURRENT_RPCS;
+            mesh_workload_api_max_concurrent_rpcs_per_uid: usize = "FERRUM_MESH_WORKLOAD_API_MAX_CONCURRENT_RPCS_PER_UID" => crate::identity::workload_api::admission::DEFAULT_MAX_CONCURRENT_RPCS_PER_UID;
+            mesh_workload_api_initial_connection_timeout_seconds: u64 = "FERRUM_MESH_WORKLOAD_API_INITIAL_CONNECTION_TIMEOUT_SECONDS" => 10u64;
+            mesh_workload_api_idle_timeout_seconds: u64 = "FERRUM_MESH_WORKLOAD_API_IDLE_TIMEOUT_SECONDS" => 900u64;
+            mesh_workload_api_shutdown_grace_seconds: u64 = "FERRUM_MESH_WORKLOAD_API_SHUTDOWN_GRACE_SECONDS" => 10u64;
             mesh_config_protocol: String = "FERRUM_MESH_CONFIG_PROTOCOL" => "native".to_string();
             mesh_file_config_path: Option<String> = "FERRUM_MESH_FILE_CONFIG_PATH";
             mesh_trust_domain_aliases: Vec<String> = "FERRUM_MESH_TRUST_DOMAIN_ALIASES" => Vec::new();
@@ -4681,6 +4750,14 @@ impl EnvConfig {
             mesh_jwt_svid_ttl_seconds,
             mesh_jwt_key_lifetime_seconds,
             mesh_workload_api_unix_identity_rules,
+            mesh_workload_api_max_connections,
+            mesh_workload_api_max_connections_per_uid,
+            mesh_workload_api_max_concurrent_streams,
+            mesh_workload_api_max_concurrent_rpcs,
+            mesh_workload_api_max_concurrent_rpcs_per_uid,
+            mesh_workload_api_initial_connection_timeout_seconds,
+            mesh_workload_api_idle_timeout_seconds,
+            mesh_workload_api_shutdown_grace_seconds,
             mesh_config_protocol,
             mesh_file_config_path,
             mesh_trust_domain_aliases,
@@ -6127,6 +6204,16 @@ impl EnvConfig {
                         format!("Invalid FERRUM_MESH_WORKLOAD_API_SOCKET_PATH: {e}")
                     })?;
 
+                    // Transport admission limits (issue #3758). Validated
+                    // through the same policy the listener enforces, so
+                    // `validate` and mesh startup cannot disagree about what a
+                    // bounded Workload API transport is. Refused rather than
+                    // clamped: a limit the operator set and a limit the process
+                    // enforces must be the same number.
+                    self.mesh_workload_api_admission_config()
+                        .validate()
+                        .map_err(|e| e.to_string())?;
+
                     // Parse the attestor configuration through the same
                     // identity-layer parser startup uses. This stays after the
                     // backend and socket gates so their decisive diagnostics
@@ -6959,6 +7046,28 @@ impl EnvConfig {
          once the verification overlap has elapsed. Generating a replacement in process would \
          give every replica a different key and lose the signer of every still-live token on \
          restart";
+
+    /// The Workload API transport-admission limits these settings describe
+    /// (issue #3758).
+    ///
+    /// One projection shared by `validate` and mesh startup, so the limits an
+    /// operator is told are acceptable are exactly the limits the listener
+    /// enforces. Ceilings are applied inside the admission layer as well, so a
+    /// caller that reaches it another way still cannot exceed one.
+    pub fn mesh_workload_api_admission_config(
+        &self,
+    ) -> crate::identity::workload_api::WorkloadApiAdmissionConfig {
+        crate::identity::workload_api::WorkloadApiAdmissionConfig::from_settings(
+            self.mesh_workload_api_max_connections,
+            self.mesh_workload_api_max_connections_per_uid,
+            self.mesh_workload_api_max_concurrent_streams,
+            self.mesh_workload_api_max_concurrent_rpcs,
+            self.mesh_workload_api_max_concurrent_rpcs_per_uid,
+            self.mesh_workload_api_initial_connection_timeout_seconds,
+            self.mesh_workload_api_idle_timeout_seconds,
+            self.mesh_workload_api_shutdown_grace_seconds,
+        )
+    }
 
     /// Enforce the JWT-SVID signing-material and rotation contract (issue #3617).
     ///

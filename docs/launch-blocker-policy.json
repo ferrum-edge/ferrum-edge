@@ -1,0 +1,122 @@
+{
+  "policy_version": "2",
+  "classification_version": "launch-blocker-v2",
+  "repository": "ferrum-edge/ferrum-edge",
+  "default_launch_tier": "ga",
+  "labels": {
+    "launch_blocker": "launch-blocker",
+    "launch_exempted": "launch-exempted",
+    "severity": {
+      "critical": "severity:critical",
+      "high": "severity:high",
+      "medium": "severity:medium"
+    }
+  },
+  "tiers": {
+    "ga": {
+      "blocking_severities": ["critical", "high", "medium"]
+    },
+    "beta": {
+      "blocking_severities": ["critical", "high"]
+    },
+    "experimental": {
+      "blocking_severities": ["critical"]
+    }
+  },
+  "state_machine": {
+    "open": "blocking",
+    "in_flight": "blocking",
+    "merged_awaiting_issue_close": "blocking",
+    "closed_completed": "cleared",
+    "closed_other": "blocking",
+    "exempted": "cleared_for_listed_tiers"
+  },
+  "closed_completed_reasons": ["completed"],
+  "closed_other_reasons": ["not_planned", "duplicate", null],
+  "in_flight_clears_blocker": false,
+  "merged_pr_clears_blocker_before_issue_close": false,
+  "tracked_blockers": [
+    {
+      "issue": 3725,
+      "severity": "critical",
+      "note": "CP/DP/config streams can outlive bearer authorization"
+    },
+    {
+      "issue": 3717,
+      "severity": "high",
+      "note": "service-discovery trust boundary / last-known retention"
+    },
+    {
+      "issue": 3721,
+      "severity": "high",
+      "note": "service-discovery poller supervision / dead-task health"
+    },
+    {
+      "issue": 3726,
+      "severity": "high",
+      "note": "CP/DP last-known-good config age / readiness degrade"
+    },
+    {
+      "issue": 3727,
+      "severity": "high",
+      "note": "namespace-scoped gateway trust bundle persistence/reload"
+    },
+    {
+      "issue": 3728,
+      "severity": "high",
+      "note": "nested HTTP/2 HBONE transport reuse on H1/H2 frontend"
+    },
+    {
+      "issue": 3741,
+      "severity": "high",
+      "note": "xDS aggregate admission / Node.id cardinality"
+    },
+    {
+      "issue": 3758,
+      "severity": "high",
+      "note": "Workload API transport admission bounds"
+    }
+  ],
+  "private_advisories": {
+    "enabled": true,
+    "blocking_states": ["triage", "draft"],
+    "closed_states": ["published", "closed", "withdrawn"],
+    "blocking_severities_by_tier": {
+      "ga": ["critical", "high", "medium"],
+      "beta": ["critical", "high"],
+      "experimental": ["critical"]
+    },
+    "representation": "redacted_count_only",
+    "never_emit_fields": [
+      "summary",
+      "description",
+      "ghsa_id",
+      "cve_id",
+      "html_url",
+      "url",
+      "vulnerabilities",
+      "identifiers",
+      "cvss",
+      "cwes",
+      "credits"
+    ],
+    "live_api": {
+      "token_env": "LAUNCH_ADVISORY_READ_TOKEN",
+      "actions_security_events_permission_is_insufficient": true,
+      "notes": "Repository security advisories are a separate GitHub permission. The Actions GITHUB_TOKEN is refused (403) even with security-events: read, so the live listing needs an explicitly provisioned read-only advisory token supplied only to trusted (non-pull-request, non-merge-group) runs."
+    },
+    "trusted_fallback": {
+      "count_variable": "LAUNCH_PRIVATE_BLOCKER_COUNT",
+      "as_of_variable": "LAUNCH_PRIVATE_ADVISORY_AS_OF",
+      "max_age_seconds": 604800,
+      "notes": "Repository Actions variables maintained outside this tree by a maintainer with advisory access. A pull request can read them but cannot change them, which is why they may substantiate a zero count while a checked-in value may not. Missing, malformed, future-dated, or stale values are UNKNOWN. This file deliberately carries no count and no as-of value."
+    }
+  },
+  "document": {
+    "path": "PRODUCTION_READINESS.md",
+    "marker_begin": "<!-- launch-readiness:begin -->",
+    "marker_end": "<!-- launch-readiness:end -->",
+    "historical_marker": "<!-- launch-readiness:historical -->"
+  },
+  "exemptions_path": "docs/launch-exemptions.json"
+}

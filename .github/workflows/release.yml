@@ -39,9 +39,46 @@ jobs:
 
           echo "Release tag ${TAG_NAME} matches Cargo.toml package version ${cargo_version}"
 
+  validate-launch-readiness:
+    name: Validate launch readiness
+    needs: validate-release-version
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # `security-events: read` is NOT the repository security-advisories
+    # permission, so it is deliberately absent: the advisory listing comes from
+    # an explicitly provisioned read-only token, or from redacted repository
+    # variables, or the verdict is UNKNOWN and the release stops.
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Synthetic policy/checker self-tests
+        run: python3 -I scripts/check_launch_readiness.py --self-test
+
+      - name: Require live launch PASS for the exact tag commit
+        env:
+          # Public issue state only; this token cannot read private advisories.
+          GITHUB_TOKEN: ${{ github.token }}
+          LAUNCH_TIER: ga
+          # No LAUNCH_TARGET_SHA: with the tag ref checked out, the evaluated
+          # target is resolved from HEAD, so it is exactly the tagged commit
+          # whatever object the tag itself is.
+          LAUNCH_PRIVATE_BLOCKER_COUNT: ${{ vars.LAUNCH_PRIVATE_BLOCKER_COUNT }}
+          LAUNCH_PRIVATE_ADVISORY_AS_OF: ${{ vars.LAUNCH_PRIVATE_ADVISORY_AS_OF }}
+          LAUNCH_ADVISORY_READ_TOKEN: ${{ secrets.LAUNCH_ADVISORY_READ_TOKEN }}
+        run: python3 -I scripts/check_launch_readiness.py --verify --require-pass
+
   validate-release-sha:
     name: Validate release SHA
-    needs: validate-release-version
+    needs:
+      - validate-release-version
+      - validate-launch-readiness
     runs-on: ubuntu-latest
     timeout-minutes: 350
     permissions:

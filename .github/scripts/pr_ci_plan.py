@@ -566,6 +566,11 @@ FULL_CI_GOVERNANCE_PATHS = frozenset(
     {
         "docs/dependency-policy.md",
         "docs/vendored-patch-lifecycle.json",
+        "docs/launch-blocker-policy.json",
+        "docs/launch-exemptions.json",
+        "docs/launch-readiness.md",
+        "PRODUCTION_READINESS.md",
+        "scripts/check_launch_readiness.py",
     }
 )
 
