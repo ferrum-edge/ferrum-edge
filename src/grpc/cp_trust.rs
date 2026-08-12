@@ -61,16 +61,199 @@
 //! that the operator already wrote into their own configuration.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
+use arc_swap::ArcSwap;
 use jsonwebtoken::{Algorithm, DecodingKey};
 use serde::Deserialize;
+use tokio::sync::{Semaphore, watch};
+
+use crate::fips::approved::Sha256;
 
 /// Upper bound on the trust-bundle document size. The file is operator-owned,
 /// but a bounded read keeps a mistyped path (a device node, a huge log) from
 /// allocating without limit during startup.
 const TRUST_BUNDLE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Apply the same ceiling to file-backed verification material. Public keys
+/// and symmetric secrets are tiny in practice; sharing the document limit
+/// keeps the operator surface simple while preventing a path swap from turning
+/// the periodic reload worker into an unbounded file reader.
+const TRUST_MATERIAL_MAX_BYTES: u64 = TRUST_BUNDLE_MAX_BYTES;
+
+/// A stalled network filesystem must not silently stop trust-bundle reloads
+/// forever. The blocking read itself runs on a detached OS thread because a
+/// timed-out `spawn_blocking` task cannot be cancelled.
+const TRUST_BUNDLE_RELOAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// At most one detached reload read may remain blocked in the kernel. The
+/// permit is owned by the OS thread, not by its async waiter, so a timeout
+/// cannot start an unbounded sequence of abandoned readers.
+static TRUST_BUNDLE_RELOAD_READ_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+pub(crate) fn trust_bundle_reload_read_limit() -> Arc<Semaphore> {
+    Arc::clone(TRUST_BUNDLE_RELOAD_READ_LIMIT.get_or_init(|| Arc::new(Semaphore::new(1))))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrustBundleReloadError {
+    ReadOrValidationFailed,
+    ReaderUnavailable,
+    ReaderFailed,
+    ReadTimedOut,
+}
+
+impl TrustBundleReloadError {
+    fn audit_reason(self) -> &'static str {
+        match self {
+            Self::ReadOrValidationFailed => "read_or_validation_failed",
+            Self::ReaderUnavailable => "reader_unavailable",
+            Self::ReaderFailed => "reload_reader_failed",
+            Self::ReadTimedOut => "reload_read_timed_out",
+        }
+    }
+}
+
+/// Open a trust-material path without letting a non-regular source stall the
+/// opener.
+///
+/// This mirrors the contract of [`crate::secrets::credential_file`], which
+/// cannot be reused directly here because its `HARD_MAX_CREDENTIAL_FILE_MAX_BYTES`
+/// ceiling (64 KiB) is far below the 1 MiB trust-bundle document limit. The two
+/// halves are both load-bearing: a FIFO or a carrier-less device opened with a
+/// plain blocking `open(2)` parks the caller *before* any regular-file check can
+/// run — which would hang CP startup outright, and would wedge the trust-bundle
+/// reload worker's `spawn_blocking` thread forever so accepted-credential
+/// removals could never be published again. Symlinked pathnames (Kubernetes
+/// projected ConfigMap/Secret mounts) are deliberately left to `open` so the
+/// opened target stays authoritative against a swap race.
+fn open_trust_material_file(path: &str, description: &str) -> Result<std::fs::File, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("failed to inspect {description} '{path}': {e}"))?;
+    if !metadata.file_type().is_symlink() && !metadata.is_file() {
+        return Err(format!("{description} '{path}' is not a regular file"));
+    }
+
+    #[cfg(unix)]
+    let opened = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let opened = std::fs::File::open(path);
+
+    opened.map_err(|e| format!("failed to open {description} '{path}': {e}"))
+}
+
+fn read_regular_utf8_file_bounded(
+    path: &str,
+    description: &str,
+    max_bytes: u64,
+) -> Result<String, String> {
+    let mut file = open_trust_material_file(path, description)?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("failed to inspect {description} '{path}': {e}"))?;
+    if !metadata.is_file() {
+        return Err(format!("{description} '{path}' is not a regular file"));
+    }
+    if metadata.len() > max_bytes {
+        return Err(format!(
+            "{description} '{path}' is {} bytes, above the {max_bytes}-byte limit",
+            metadata.len()
+        ));
+    }
+
+    // The descriptor metadata check is only an allocation hint. Bound the
+    // actual read as well so in-place growth after metadata() cannot bypass
+    // the ceiling or force an unbounded allocation.
+    let mut raw = Vec::with_capacity(metadata.len().min(max_bytes) as usize);
+    (&mut file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut raw)
+        .map_err(|e| format!("failed to read {description} '{path}': {e}"))?;
+    if raw.len() as u64 > max_bytes {
+        return Err(format!(
+            "{description} '{path}' grew above the {max_bytes}-byte limit while it was read"
+        ));
+    }
+    String::from_utf8(raw).map_err(|_| format!("{description} '{path}' is not valid UTF-8"))
+}
+
+async fn load_trust_bundle_reload_candidate_detached(
+    path: String,
+    fleet_secret: Option<String>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<CpDpVerifier, TrustBundleReloadError> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let join_handle = std::thread::Builder::new()
+        .name("ferrum-cp-trust-reload".to_string())
+        .spawn(move || {
+            // The permit belongs to the kernel operation. If the async caller
+            // times out or shuts down, no replacement reader can start until
+            // this detached read actually exits.
+            let _permit = permit;
+            let candidate = CpDpTrustBundle::load_from_path(&path, fleet_secret.as_deref())
+                .map(CpDpVerifier::TrustBundle)
+                .map_err(|_| TrustBundleReloadError::ReadOrValidationFailed);
+            let _ = sender.send(candidate);
+        })
+        .map_err(|_| TrustBundleReloadError::ReaderFailed)?;
+
+    // Joining a reader stuck in the kernel would defeat both the timeout and
+    // bounded shutdown. Dropping the handle deliberately detaches the thread.
+    drop(join_handle);
+    receiver
+        .await
+        .map_err(|_| TrustBundleReloadError::ReaderFailed)?
+}
+
+async fn load_trust_bundle_reload_candidate(
+    path: String,
+    fleet_secret: Option<String>,
+) -> Result<CpDpVerifier, TrustBundleReloadError> {
+    load_trust_bundle_reload_candidate_with_timeout(
+        path,
+        fleet_secret,
+        TRUST_BUNDLE_RELOAD_READ_TIMEOUT,
+    )
+    .await
+}
+
+async fn load_trust_bundle_reload_candidate_with_timeout(
+    path: String,
+    fleet_secret: Option<String>,
+    timeout: std::time::Duration,
+) -> Result<CpDpVerifier, TrustBundleReloadError> {
+    let read = async {
+        let permit = trust_bundle_reload_read_limit()
+            .acquire_owned()
+            .await
+            .map_err(|_| TrustBundleReloadError::ReaderUnavailable)?;
+        load_trust_bundle_reload_candidate_detached(path, fleet_secret, permit).await
+    };
+    match tokio::time::timeout(timeout, read).await {
+        Ok(result) => result,
+        Err(_) => Err(TrustBundleReloadError::ReadTimedOut),
+    }
+}
+
+#[doc(hidden)]
+#[allow(dead_code)] // reached via `_test_support` from the external test crate
+pub(crate) async fn load_trust_bundle_reload_candidate_for_test(
+    path: String,
+    timeout: std::time::Duration,
+) -> Result<(), &'static str> {
+    load_trust_bundle_reload_candidate_with_timeout(path, None, timeout)
+        .await
+        .map(|_| ())
+        .map_err(TrustBundleReloadError::audit_reason)
+}
 
 /// Upper bound on an operator-authored identifier (`kid`). Bounded so a
 /// hostile-looking bundle cannot smuggle an unbounded string into startup
@@ -230,9 +413,91 @@ pub struct TrustedKey {
     kid: String,
     algorithm: Algorithm,
     decoding_key: DecodingKey,
+    /// Stable, process-internal identity of the accepted verification
+    /// credential and namespace policy. This is derived from the configured
+    /// key material and namespace ceiling but is never logged or exported. It
+    /// lets an admitted stream survive an overlapping bundle rotation while
+    /// closing if its exact credential or authorization policy is removed.
+    identity: VerificationCredentialIdentity,
     /// Immutable namespace ceiling for every token this key verifies. Sourced
     /// exclusively from trusted CP configuration; a bearer can never change it.
     namespaces: HashSet<String>,
+}
+
+/// Opaque identity of one verification credential.
+///
+/// The digest is deliberately private and has no accessor or value-bearing
+/// `Debug` implementation. It is used only for equality against later trusted
+/// verifier snapshots; token bytes, claims, and key material are never retained
+/// by an admitted stream.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct VerificationCredentialIdentity([u8; 32]);
+
+impl std::fmt::Debug for VerificationCredentialIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("VerificationCredentialIdentity(<opaque>)")
+    }
+}
+
+fn credential_identity(
+    kid: Option<&str>,
+    algorithm: Algorithm,
+    material: &[u8],
+) -> VerificationCredentialIdentity {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ferrum-cp-dp-verification-credential-v1\0");
+    hasher.update(algorithm_identity_label(algorithm));
+    hasher.update(b"\0");
+    if let Some(kid) = kid {
+        hasher.update(kid.as_bytes());
+    }
+    hasher.update(b"\0");
+    hasher.update(material);
+    VerificationCredentialIdentity(hasher.finalize())
+}
+
+/// Bind a verification credential to the trusted namespace policy that was
+/// in force when it admitted a stream. Reloading the same key with an expanded
+/// or reduced namespace ceiling must not leave an established stream using the
+/// old authorization policy until its maximum lifetime happens to elapse.
+fn namespace_bound_credential_identity(
+    credential: VerificationCredentialIdentity,
+    namespaces: &HashSet<String>,
+) -> VerificationCredentialIdentity {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ferrum-cp-dp-authorization-credential-v1\0");
+    hasher.update(credential.0);
+    let mut namespaces: Vec<&str> = namespaces.iter().map(String::as_str).collect();
+    namespaces.sort_unstable();
+    for namespace in namespaces {
+        hasher.update(namespace.as_bytes());
+        hasher.update(b"\0");
+    }
+    VerificationCredentialIdentity(hasher.finalize())
+}
+
+fn algorithm_identity_label(algorithm: Algorithm) -> &'static [u8] {
+    match algorithm {
+        Algorithm::HS256 => b"HS256",
+        Algorithm::HS384 => b"HS384",
+        Algorithm::HS512 => b"HS512",
+        Algorithm::ES256 => b"ES256",
+        Algorithm::ES384 => b"ES384",
+        Algorithm::RS256 => b"RS256",
+        Algorithm::RS384 => b"RS384",
+        Algorithm::RS512 => b"RS512",
+        Algorithm::PS256 => b"PS256",
+        Algorithm::PS384 => b"PS384",
+        Algorithm::PS512 => b"PS512",
+        Algorithm::EdDSA => b"EdDSA",
+    }
+}
+
+fn canonical_public_key_identity_material(pem: &[u8]) -> Vec<u8> {
+    pem.iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect()
 }
 
 impl std::fmt::Debug for TrustedKey {
@@ -271,19 +536,8 @@ impl CpDpTrustBundle {
     /// operator configured one. It is used only to *refuse* a bound credential
     /// backed by that value; it is never rendered.
     pub fn load_from_path(path: &str, fleet_secret: Option<&str>) -> Result<Self, String> {
-        let metadata = std::fs::metadata(path)
-            .map_err(|e| format!("failed to stat CP/DP trust bundle '{path}': {e}"))?;
-        if !metadata.is_file() {
-            return Err(format!("CP/DP trust bundle '{path}' is not a regular file"));
-        }
-        if metadata.len() > TRUST_BUNDLE_MAX_BYTES {
-            return Err(format!(
-                "CP/DP trust bundle '{path}' is {} bytes, above the {TRUST_BUNDLE_MAX_BYTES}-byte limit",
-                metadata.len()
-            ));
-        }
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| format!("failed to read CP/DP trust bundle '{path}': {e}"))?;
+        let raw =
+            read_regular_utf8_file_bounded(path, "CP/DP trust bundle", TRUST_BUNDLE_MAX_BYTES)?;
         Self::from_document_str(&raw, path, fleet_secret)
     }
 
@@ -335,6 +589,27 @@ impl CpDpTrustBundle {
 
     pub fn key_count(&self) -> usize {
         self.keys.len()
+    }
+
+    fn configuration_fingerprint(&self) -> [u8; 32] {
+        let mut kids: Vec<&str> = self.keys.keys().map(String::as_str).collect();
+        kids.sort_unstable();
+        let mut hasher = Sha256::new();
+        hasher.update(b"ferrum-cp-dp-trust-bundle-v1\0");
+        for kid in kids {
+            let key = &self.keys[kid];
+            hasher.update(kid.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(key.identity.0);
+            let mut namespaces: Vec<&str> = key.namespaces.iter().map(String::as_str).collect();
+            namespaces.sort_unstable();
+            for namespace in namespaces {
+                hasher.update(namespace.as_bytes());
+                hasher.update(b"\0");
+            }
+            hasher.update(b"\xff");
+        }
+        hasher.finalize()
     }
 
     /// Every namespace any trusted credential may reach. Startup uses this to
@@ -400,6 +675,15 @@ impl std::fmt::Debug for CpDpVerifier {
 }
 
 impl CpDpVerifier {
+    fn configuration_fingerprint(&self) -> [u8; 32] {
+        match self {
+            Self::SharedSecret(secret) => {
+                credential_identity(None, Algorithm::HS256, secret.as_bytes()).0
+            }
+            Self::TrustBundle(bundle) => bundle.configuration_fingerprint(),
+        }
+    }
+
     /// True when this verifier provides server-derived namespace binding.
     pub fn has_namespace_binding(&self) -> bool {
         matches!(self, Self::TrustBundle(_))
@@ -452,7 +736,12 @@ impl CpDpVerifier {
         &self,
         kid: Option<&str>,
         alg: Algorithm,
-        f: impl FnOnce(&DecodingKey, Algorithm, Option<&HashSet<String>>) -> T,
+        f: impl FnOnce(
+            &DecodingKey,
+            Algorithm,
+            Option<&HashSet<String>>,
+            &VerificationCredentialIdentity,
+        ) -> T,
     ) -> Result<T, TenantAuthRejectReason> {
         match self {
             Self::SharedSecret(secret) => {
@@ -466,20 +755,277 @@ impl CpDpVerifier {
                 // with `SharedSecret(jwt_secret)`, and a trust-bundle CP
                 // threads `cp_dp_grpc_jwt_secret.unwrap_or_default()` (i.e.
                 // `""`) into those builders for token *minting*. A future
-                // call site that forgot `.verifier(..)` would otherwise
+                // call site that forgot `.verifier_store(..)` would otherwise
                 // verify against the empty HS256 key and accept anything.
                 if secret.is_empty() {
                     return Err(TenantAuthRejectReason::TokenValidation);
                 }
                 let key = DecodingKey::from_secret(secret.as_bytes());
-                Ok(f(&key, Algorithm::HS256, None))
+                let identity = credential_identity(None, Algorithm::HS256, secret.as_bytes());
+                Ok(f(&key, Algorithm::HS256, None, &identity))
             }
             Self::TrustBundle(bundle) => {
                 let key = bundle.select(kid, alg)?;
-                Ok(f(&key.decoding_key, key.algorithm, Some(&key.namespaces)))
+                Ok(f(
+                    &key.decoding_key,
+                    key.algorithm,
+                    Some(&key.namespaces),
+                    &key.identity,
+                ))
             }
         }
     }
+
+    fn credential_identities(&self) -> HashSet<VerificationCredentialIdentity> {
+        match self {
+            Self::SharedSecret(secret) if !secret.is_empty() => [credential_identity(
+                None,
+                Algorithm::HS256,
+                secret.as_bytes(),
+            )]
+            .into_iter()
+            .collect(),
+            Self::SharedSecret(_) => HashSet::new(),
+            Self::TrustBundle(bundle) => bundle
+                .keys
+                .values()
+                .map(|key| key.identity.clone())
+                .collect(),
+        }
+    }
+}
+
+/// One immutable verifier revision used for both token verification and
+/// admission-time credential-generation binding.
+///
+/// The fields stay private so callers cannot inspect credential identities or
+/// generations. Keeping the snapshot as the public load result prevents a
+/// verifier from being detached from the generation map that was current when
+/// it was captured.
+pub struct CpDpVerifierSnapshot {
+    verifier: Arc<CpDpVerifier>,
+    credential_generations: HashMap<VerificationCredentialIdentity, u64>,
+    revision: u64,
+    store_identity: Arc<()>,
+}
+
+impl CpDpVerifierSnapshot {
+    pub(crate) fn verifier(&self) -> &CpDpVerifier {
+        self.verifier.as_ref()
+    }
+
+    pub(crate) fn credential_generation(
+        &self,
+        identity: &VerificationCredentialIdentity,
+    ) -> Option<u64> {
+        self.credential_generations.get(identity).copied()
+    }
+}
+
+/// Atomically reloadable verifier shared by ConfigSync, MeshSubscribe, and
+/// both ADS services.
+///
+/// Verification takes one immutable snapshot. Streams retain only the opaque
+/// accepted credential identity plus its store generation and subscribe to the
+/// revision counter. A reload wakes every stream, but only streams whose exact
+/// credential generation vanished are revoked; adding an overlapping key does
+/// not churn established streams, while remove-then-readd cannot resurrect an
+/// old stream.
+pub struct CpDpVerifierStore {
+    active: ArcSwap<CpDpVerifierSnapshot>,
+    revision: watch::Sender<u64>,
+    replace_lock: Mutex<()>,
+    store_identity: Arc<()>,
+}
+
+impl std::fmt::Debug for CpDpVerifierStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let active = self.active.load();
+        f.debug_struct("CpDpVerifierStore")
+            .field("active", active.verifier.as_ref())
+            .field(
+                "active_credential_count",
+                &active.credential_generations.len(),
+            )
+            .field("revision", &active.revision)
+            .finish()
+    }
+}
+
+impl CpDpVerifierStore {
+    pub fn new(verifier: CpDpVerifier) -> Self {
+        Self::from_arc(Arc::new(verifier))
+    }
+
+    pub fn from_arc(verifier: Arc<CpDpVerifier>) -> Self {
+        let (revision, _) = watch::channel(0);
+        let store_identity = Arc::new(());
+        let credential_generations = verifier
+            .credential_identities()
+            .into_iter()
+            .map(|identity| (identity, 0))
+            .collect();
+        Self {
+            active: ArcSwap::from(Arc::new(CpDpVerifierSnapshot {
+                verifier,
+                credential_generations,
+                revision: 0,
+                store_identity: store_identity.clone(),
+            })),
+            revision,
+            replace_lock: Mutex::new(()),
+            store_identity,
+        }
+    }
+
+    /// Capture the verifier and its credential generations as one immutable
+    /// admission snapshot.
+    pub fn load(&self) -> Arc<CpDpVerifierSnapshot> {
+        self.active.load_full()
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.revision.subscribe()
+    }
+
+    pub fn replace(&self, verifier: CpDpVerifier) {
+        let _replace_guard = self.replace_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let current = self.active.load();
+        let revision = current.revision.saturating_add(1);
+        let credential_generations = verifier
+            .credential_identities()
+            .into_iter()
+            .map(|identity| {
+                let generation = current
+                    .credential_generations
+                    .get(&identity)
+                    .copied()
+                    .unwrap_or(revision);
+                (identity, generation)
+            })
+            .collect();
+        let verifier = Arc::new(verifier);
+        self.active.store(Arc::new(CpDpVerifierSnapshot {
+            verifier,
+            credential_generations,
+            revision,
+            store_identity: self.store_identity.clone(),
+        }));
+        self.revision.send_replace(revision);
+    }
+
+    pub fn credential_generation(&self, identity: &VerificationCredentialIdentity) -> Option<u64> {
+        self.active.load().credential_generation(identity)
+    }
+
+    pub fn credential_is_active(
+        &self,
+        identity: &VerificationCredentialIdentity,
+        generation: u64,
+    ) -> bool {
+        self.credential_generation(identity) == Some(generation)
+    }
+
+    pub(crate) fn active_generation_from_snapshot(
+        &self,
+        snapshot: &CpDpVerifierSnapshot,
+        identity: &VerificationCredentialIdentity,
+    ) -> Option<u64> {
+        if !Arc::ptr_eq(&snapshot.store_identity, &self.store_identity) {
+            return None;
+        }
+        let generation = snapshot.credential_generation(identity)?;
+        self.credential_is_active(identity, generation)
+            .then_some(generation)
+    }
+}
+
+/// Watch a file-backed namespace trust bundle and atomically publish valid
+/// replacements. Invalid or unreadable candidates never replace the last
+/// accepted verifier. Semantic fingerprints include resolved referenced key
+/// material, so quiet sources do not wake streams while a rotated key file is
+/// still detected even when the bundle document itself is unchanged.
+pub fn spawn_trust_bundle_reload(
+    path: String,
+    fleet_secret: Option<String>,
+    verifier: Arc<CpDpVerifierStore>,
+    multi_namespace: bool,
+    interval: std::time::Duration,
+    mut shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut accepted_fingerprint = verifier.load().verifier().configuration_fingerprint();
+        let mut last_failed = false;
+        let mut ticker = tokio::time::interval(interval.max(std::time::Duration::from_secs(1)));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                    continue;
+                }
+            }
+
+            // Bundle parsing resolves file-backed key material. The detached
+            // reader plus timeout keeps a stalled mount from pinning Tokio's
+            // blocking pool or silently ending credential revocation. A
+            // process-wide permit remains with any abandoned OS thread so a
+            // persistent outage cannot accumulate blocked readers.
+            let read = load_trust_bundle_reload_candidate(path.clone(), fleet_secret.clone());
+            tokio::pin!(read);
+            let candidate = match tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                    continue;
+                }
+                candidate = &mut read => candidate,
+            } {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    if !last_failed {
+                        tracing::warn!(
+                            audit.event = "cp_dp_trust_bundle_reload_rejected",
+                            reason = error.audit_reason(),
+                            "CP/DP trust-bundle reload rejected; retaining the active verifier"
+                        );
+                    }
+                    last_failed = true;
+                    continue;
+                }
+            };
+            if candidate.validate_for_scope(multi_namespace).is_err() {
+                if !last_failed {
+                    tracing::warn!(
+                        audit.event = "cp_dp_trust_bundle_reload_rejected",
+                        reason = "scope_validation_failed",
+                        "CP/DP trust-bundle reload rejected; retaining the active verifier"
+                    );
+                }
+                last_failed = true;
+                continue;
+            }
+            let fingerprint = candidate.configuration_fingerprint();
+            if accepted_fingerprint == fingerprint {
+                last_failed = false;
+                continue;
+            }
+            verifier.replace(candidate);
+            accepted_fingerprint = fingerprint;
+            last_failed = false;
+            tracing::info!(
+                audit.event = "cp_dp_trust_bundle_reloaded",
+                "CP/DP trust bundle reloaded; streams whose accepted credential was removed are closing"
+            );
+        }
+    })
 }
 
 /// Intersect the credential's namespace ceiling with the bearer's `ns` claim
@@ -697,7 +1243,7 @@ impl TrustBundleKeyDocument {
             ));
         }
 
-        let decoding_key = if symmetric {
+        let (decoding_key, identity) = if symmetric {
             let secret = if let Some(inline) = self.secret {
                 inline
             } else if let Some(var) = self.secret_env.as_deref() {
@@ -716,15 +1262,13 @@ impl TrustBundleKeyDocument {
                     )
                 })?
             } else if let Some(path) = self.secret_path.as_deref() {
-                std::fs::read_to_string(path)
-                    .map_err(|e| {
-                        format!(
-                            "CP/DP trust bundle '{origin}': key '{kid}' secret file '{path}' \
-                             could not be read: {e}"
-                        )
-                    })?
-                    .trim()
-                    .to_string()
+                read_regular_utf8_file_bounded(
+                    path,
+                    &format!("CP/DP trust bundle '{origin}' key '{kid}' secret file"),
+                    TRUST_MATERIAL_MAX_BYTES,
+                )?
+                .trim()
+                .to_string()
             } else {
                 // Unreachable: the source-count check above admits exactly one.
                 return Err(format!(
@@ -745,17 +1289,19 @@ impl TrustBundleKeyDocument {
             if fleet_secret.is_some_and(|fleet| !fleet.is_empty() && fleet == secret.as_str()) {
                 return Err(fleet_secret_reuse_error(origin, &kid));
             }
-            DecodingKey::from_secret(secret.as_bytes())
+            (
+                DecodingKey::from_secret(secret.as_bytes()),
+                credential_identity(Some(&kid), algorithm, secret.as_bytes()),
+            )
         } else {
             let pem = if let Some(inline) = self.public_key_pem {
                 inline
             } else if let Some(path) = self.public_key_path.as_deref() {
-                std::fs::read_to_string(path).map_err(|e| {
-                    format!(
-                        "CP/DP trust bundle '{origin}': key '{kid}' public key file '{path}' \
-                         could not be read: {e}"
-                    )
-                })?
+                read_regular_utf8_file_bounded(
+                    path,
+                    &format!("CP/DP trust bundle '{origin}' key '{kid}' public key file"),
+                    TRUST_MATERIAL_MAX_BYTES,
+                )?
             } else {
                 return Err(format!(
                     "CP/DP trust bundle '{origin}': key '{kid}' has no readable public key source"
@@ -778,18 +1324,24 @@ impl TrustBundleKeyDocument {
                     ));
                 }
             };
-            parsed.map_err(|e| {
+            let decoding_key = parsed.map_err(|e| {
                 format!(
                     "CP/DP trust bundle '{origin}': key '{kid}' public key is not valid PEM for \
                      '{algorithm:?}': {e}"
                 )
-            })?
+            })?;
+            let identity_material = canonical_public_key_identity_material(bytes);
+            let identity = credential_identity(Some(&kid), algorithm, &identity_material);
+            (decoding_key, identity)
         };
+
+        let identity = namespace_bound_credential_identity(identity, &namespaces);
 
         Ok(TrustedKey {
             kid,
             algorithm,
             decoding_key,
+            identity,
             namespaces,
         })
     }

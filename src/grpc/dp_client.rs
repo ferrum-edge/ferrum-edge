@@ -221,15 +221,17 @@ impl GrpcJwtSecret {
         self
     }
 
-    pub fn as_str(&self) -> &str {
-        &self.secret
-    }
-
     pub fn issuer(&self) -> &str {
         &self.issuer
     }
 
-    pub fn key_id(&self) -> Option<&str> {
+    #[cfg(test)]
+    pub(crate) fn secret_for_tests(&self) -> &str {
+        &self.secret
+    }
+
+    #[cfg(test)]
+    pub(crate) fn key_id_for_tests(&self) -> Option<&str> {
         self.key_id.as_deref()
     }
 

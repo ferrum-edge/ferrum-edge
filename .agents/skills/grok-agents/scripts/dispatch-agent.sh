@@ -5,16 +5,17 @@ set -euo pipefail
 usage() {
   printf '%s\n' \
     'Usage: dispatch-agent.sh --worktree ABS_PATH --prompt-file ABS_PATH' \
-    '                         [--effort medium|high|xhigh|max]' \
+    '                         [--effort low|medium|high|xhigh|max]' \
     '                         [--name NAME]' \
     '' \
-    'Note: --effort is accepted for CLI parity with sibling agent skills but is' \
-    'ignored. The Cursor Grok harness has no effort tiers; model is always grok-4.5.' >&2
+    'Runs the standalone `cursor-agent` CLI in print mode against a non-Fast' \
+    'Cursor Grok 4.5 SKU. --effort selects the SKU (default high); Cursor exposes' \
+    'low/medium/high only, so xhigh and max both resolve to high.' >&2
 }
 
 worktree=''
 prompt_file=''
-effort=''
+effort='high'
 name=''
 
 while (($#)); do
@@ -67,19 +68,24 @@ while (($#)); do
   esac
 done
 
-if [[ -n "$effort" ]]; then
-  case "$effort" in
-    medium|high|xhigh|max)
-      printf '[grok-agents] ignoring --effort %s: Cursor Grok has no effort tiers\n' \
-        "$effort" >&2
-      ;;
-    *)
-      printf 'Invalid effort: %s\n' "$effort" >&2
-      usage
-      exit 2
-      ;;
-  esac
-fi
+# Non-Fast SKUs only: the `-fast` variants bill fast credits. Cursor publishes
+# three Grok 4.5 reasoning tiers, so xhigh/max clamp to high rather than
+# silently pretending a higher tier was applied.
+case "$effort" in
+  low) model='cursor-grok-4.5-low' ;;
+  medium) model='cursor-grok-4.5-medium' ;;
+  high) model='cursor-grok-4.5-high' ;;
+  xhigh|max)
+    model='cursor-grok-4.5-high'
+    printf '[grok-agents] clamping --effort %s to high: Cursor Grok 4.5 tops out at high\n' \
+      "$effort" >&2
+    ;;
+  *)
+    printf 'Invalid effort: %s\n' "${effort:-<empty>}" >&2
+    usage
+    exit 2
+    ;;
+esac
 
 if [[ "$worktree" != /* || ! -d "$worktree" ]]; then
   printf 'Worktree must be an existing absolute directory: %s\n' "${worktree:-<empty>}" >&2
@@ -91,6 +97,15 @@ if [[ "$prompt_file" != /* || ! -f "$prompt_file" ]]; then
   exit 2
 fi
 
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+# shellcheck source=../../_lib/resolve-agent-bin.sh
+. "$script_dir/../../_lib/resolve-agent-bin.sh"
+
+cursor_bin=$(resolve_agent_bin cursor-agent CURSOR_AGENT_BIN \
+  "${HOME}/.local/bin/cursor-agent" \
+  /opt/homebrew/bin/cursor-agent \
+  /usr/local/bin/cursor-agent)
+
 repo_root=$(git -C "$worktree" rev-parse --show-toplevel)
 physical_worktree=$(cd "$worktree" && pwd -P)
 physical_root=$(cd "$repo_root" && pwd -P)
@@ -100,65 +115,30 @@ if [[ "$physical_worktree" != "$physical_root" ]]; then
   exit 2
 fi
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-runner="$script_dir/run-cursor-agent.mjs"
-
-if [[ ! -f "$runner" ]]; then
-  printf 'Missing runner script: %s\n' "$runner" >&2
-  exit 2
+# Auth: cursor-agent reads CURSOR_API_KEY from the environment when it is
+# exported, and otherwise uses the CLI's own stored login (`cursor-agent status`).
+# Never pass the key on argv — it would be visible in `ps`.
+if [[ -n "${CURSOR_API_KEY:-}" ]]; then
+  auth_source='CURSOR_API_KEY'
+else
+  auth_source='cursor-agent login'
 fi
-
-conductor_bin_dir=${CONDUCTOR_INTERNAL_BIN_DIR:-"${HOME}/Library/Application Support/com.conductor.app/bin"}
-node_bin="$conductor_bin_dir/.internal/node"
-worker_mjs="$conductor_bin_dir/.internal/cursor-node-worker.mjs"
-
-if [[ ! -x "$node_bin" ]]; then
-  printf 'Conductor Node runtime not found at %s\n' "$node_bin" >&2
-  printf 'Install/open Conductor.app so its Cursor harness is available.\n' >&2
-  exit 127
-fi
-
-if [[ ! -f "$worker_mjs" ]]; then
-  printf 'Conductor Cursor worker not found at %s\n' "$worker_mjs" >&2
-  exit 127
-fi
-
-if [[ -z "${CURSOR_API_KEY:-}" ]]; then
-  if ! CURSOR_API_KEY=$(
-    security find-generic-password \
-      -s 'com.conductor.app.production.settings' \
-      -a 'env:local:shared:CURSOR_API_KEY' \
-      -w 2>/dev/null
-  ); then
-    printf 'CURSOR_API_KEY is not available.\n' >&2
-    printf 'Export CURSOR_API_KEY or add a Cursor API key in Conductor provider settings.\n' >&2
-    exit 127
-  fi
-  export CURSOR_API_KEY
-fi
-
-export CONDUCTOR_INTERNAL_BIN_DIR="$conductor_bin_dir"
-export CONDUCTOR_CURSOR_SDK_REQUIRE_PATH="${CONDUCTOR_CURSOR_SDK_REQUIRE_PATH:-$worker_mjs}"
-export CONDUCTOR_WORKSPACE_PATH="$physical_worktree"
 
 cd "$physical_worktree"
 
-launch_args=(
-  "$node_bin"
-  "$runner"
-  --worktree "$physical_worktree"
-  --prompt-file "$prompt_file"
-)
+printf '[grok-agents] dispatch model=%s effort=%s worktree=%s bin=%s auth=%s%s\n' \
+  "$model" "$effort" "$physical_worktree" "$cursor_bin" "$auth_source" \
+  "${name:+ name=$name}" >&2
 
-if [[ -n "$effort" ]]; then
-  launch_args+=(--effort "$effort")
-fi
-
-if [[ -n "$name" ]]; then
-  launch_args+=(--name "$name")
-fi
-
-printf '[grok-agents] dispatch model=grok-4.5 worktree=%s\n' \
-  "$physical_worktree" >&2
-
-exec "${launch_args[@]}"
+# --print: non-interactive, full tool access (read, write, shell).
+# --force:  no per-command approval prompts; worktree isolation is the boundary.
+# --trust:  accept the freshly created worktree as a trusted directory, which the
+#           trust gate otherwise blocks on in a non-TTY.
+exec "$cursor_bin" \
+  --print \
+  --force \
+  --trust \
+  --model "$model" \
+  --output-format text \
+  --workspace "$physical_worktree" \
+  < "$prompt_file"

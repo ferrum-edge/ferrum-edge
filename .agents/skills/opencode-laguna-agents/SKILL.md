@@ -19,15 +19,15 @@ selected this session's model deliberately.
 ## Preflight
 
 1. Read `AGENTS.md`, the relevant `.claude/rules/*.md`, and the issue or PR before dispatching.
-2. Confirm the opencode CLI is resolvable. The launcher looks in this order and needs one to
-   succeed:
-   - `OPENCODE_BIN` if it points to an executable,
-   - `opencode` on `PATH`,
-   - the newest opencode Conductor bundles under
-     `~/Library/Application Support/com.conductor.app/agent-binaries/acp-providers/opencode/<version>/opencode`.
+2. Confirm the standalone opencode CLI is resolvable. The launcher resolves it in this order and
+   refuses any candidate under `com.conductor.app`, because Conductor's bundled ACP-provider copy
+   lags the standalone release:
+   - `OPENCODE_BIN` if it points at an executable absolute path,
+   - `~/.opencode/bin/opencode`, `/opt/homebrew/bin/opencode`, `/usr/local/bin/opencode`,
+   - `opencode` on `PATH`.
 3. Confirm the model resolves: `<opencode> models` must list `opencode/laguna-s-2.1-free`. The
-   opencode zen free tier serves these `-free` models without a local credential; Conductor manages
-   provider availability. Stop and report the exact error if the model list or a run is rejected.
+   opencode zen free tier serves these `-free` models without a local credential. Stop and report
+   the exact error if the model list or a run is rejected.
 4. Use the pinned model `opencode/laguna-s-2.1-free`. Pass `--model opencode/<other>` only when the
    user explicitly asks for a different opencode zen model (e.g. `opencode/deepseek-v4-pro`). Do not
    silently substitute a different provider or a non-opencode model.

@@ -51,9 +51,12 @@ use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
-use super::auth::{AllowedNamespaces, verify_grpc_jwt_metadata_with_claims};
+use super::auth::{
+    AllowedNamespaces, AuthorizedResponseStream, DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS,
+    StreamAuthSurface, VerifiedGrpcIdentity,
+};
 use super::configsync_lifecycle::CONFIGSYNC_HEARTBEAT_INTERVAL_SECS;
-use super::cp_trust::{CpDpVerifier, CpGrpcConnectInfo};
+use super::cp_trust::{CpDpVerifier, CpDpVerifierStore, CpGrpcConnectInfo};
 use super::proto::config_sync_server::{ConfigSync, ConfigSyncServer};
 use super::proto::{ConfigUpdate, FullConfigRequest, FullConfigResponse, SubscribeRequest};
 use crate::FERRUM_VERSION;
@@ -411,7 +414,8 @@ pub struct CpGrpcServer {
     /// bound to. Shared with the mesh and xDS servers so all three
     /// configuration surfaces enforce one authorization source
     /// (advisory GHSA-3f2j-wwqw-grmg).
-    verifier: Arc<CpDpVerifier>,
+    verifier: Arc<CpDpVerifierStore>,
+    max_stream_lifetime: Duration,
     /// Expected `iss` claim on inbound DP tokens. Tokens whose `iss` does not
     /// exactly match this string are rejected with `unauthenticated`.
     expected_issuer: String,
@@ -532,14 +536,17 @@ impl CpGrpcServer {
     /// Fluent builder seeded with the legacy fleet-wide shared secret.
     ///
     /// Production CP startup replaces the seeded verifier via
-    /// [`CpGrpcServerBuilder::verifier`] whenever a namespace-bound trust
-    /// bundle is configured; the shared-secret seed survives only for
-    /// single-namespace control planes and tests, where it is
-    /// security-equivalent.
+    /// [`CpGrpcServerBuilder::verifier_store`] so ConfigSync, MeshSubscribe,
+    /// and ADS share one reloadable authorization source. The shared-secret
+    /// seed survives only for single-namespace control planes and tests, where
+    /// it is security-equivalent.
     pub fn builder(config: Arc<ArcSwap<GatewayConfig>>, jwt_secret: String) -> CpGrpcServerBuilder {
         CpGrpcServerBuilder {
             config,
-            verifier: Arc::new(CpDpVerifier::SharedSecret(jwt_secret)),
+            verifier: Arc::new(CpDpVerifierStore::new(CpDpVerifier::SharedSecret(
+                jwt_secret,
+            ))),
+            max_stream_lifetime: Duration::from_secs(DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS),
             channel_capacity: 128,
             registry: None,
             expected_issuer: DEFAULT_CP_DP_JWT_ISSUER.to_string(),
@@ -720,12 +727,13 @@ impl CpGrpcServer {
         &self,
         metadata: &tonic::metadata::MetadataMap,
         extensions: &tonic::Extensions,
-    ) -> Result<AllowedNamespaces, Status> {
-        verify_grpc_jwt_metadata_with_claims(
+    ) -> Result<VerifiedGrpcIdentity, Status> {
+        let verifier_snapshot = self.verifier.load();
+        verifier_snapshot.verify_and_bind_grpc_identity(
             metadata,
-            &self.verifier,
             &self.expected_issuer,
             extensions.get::<CpGrpcConnectInfo>(),
+            &self.verifier,
         )
     }
 
@@ -1651,7 +1659,8 @@ impl CpGrpcServer {
 /// setters in any order, then `.build()`.
 pub struct CpGrpcServerBuilder {
     config: Arc<ArcSwap<GatewayConfig>>,
-    verifier: Arc<CpDpVerifier>,
+    verifier: Arc<CpDpVerifierStore>,
+    max_stream_lifetime: Duration,
     channel_capacity: usize,
     registry: Option<Arc<DpNodeRegistry>>,
     expected_issuer: String,
@@ -1676,10 +1685,13 @@ impl CpGrpcServerBuilder {
         self
     }
 
-    /// Replace the seeded shared-secret verifier with the CP's configured
-    /// namespace-bound trust bundle.
-    pub fn verifier(mut self, verifier: Arc<CpDpVerifier>) -> Self {
+    pub fn verifier_store(mut self, verifier: Arc<CpDpVerifierStore>) -> Self {
         self.verifier = verifier;
+        self
+    }
+
+    pub fn max_stream_lifetime(mut self, lifetime: Duration) -> Self {
+        self.max_stream_lifetime = lifetime;
         self
     }
 
@@ -1745,6 +1757,7 @@ impl CpGrpcServerBuilder {
             CpGrpcServer {
                 config: self.config,
                 verifier: self.verifier,
+                max_stream_lifetime: self.max_stream_lifetime,
                 expected_issuer: self.expected_issuer,
                 broadcasts,
                 registry,
@@ -1766,8 +1779,8 @@ impl ConfigSync for CpGrpcServer {
         &self,
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
-        let allowed = match self.verify_jwt_metadata(request.metadata(), request.extensions()) {
-            Ok(allowed) => allowed,
+        let identity = match self.verify_jwt_metadata(request.metadata(), request.extensions()) {
+            Ok(identity) => identity,
             Err(status) => {
                 let req = request.get_ref();
                 Self::audit_tenant_subscription(
@@ -1780,6 +1793,7 @@ impl ConfigSync for CpGrpcServer {
                 return Err(status);
             }
         };
+        let allowed = &identity.allowed_namespaces;
 
         let inner = request.into_inner();
         let node_id = inner.node_id;
@@ -1809,7 +1823,7 @@ impl ConfigSync for CpGrpcServer {
         // check. The returned sender is the per-namespace broadcast channel
         // — DPs in different namespaces are guaranteed to receive only their
         // own slice.
-        let namespace_tx = match self.authorise_namespace(&allowed, &dp_namespace) {
+        let namespace_tx = match self.authorise_namespace(allowed, &dp_namespace) {
             Ok(tx) => tx,
             Err(status) => {
                 Self::audit_tenant_subscription(
@@ -1967,16 +1981,23 @@ impl ConfigSync for CpGrpcServer {
             node_id,
             connected_at: now,
         };
+        let authorized = AuthorizedResponseStream::new(
+            tracked,
+            &identity,
+            self.verifier.clone(),
+            self.max_stream_lifetime,
+            StreamAuthSurface::ConfigSync,
+        );
 
-        Ok(Response::new(Box::pin(tracked)))
+        Ok(Response::new(Box::pin(authorized)))
     }
 
     async fn get_full_config(
         &self,
         request: Request<FullConfigRequest>,
     ) -> Result<Response<FullConfigResponse>, Status> {
-        let allowed = match self.verify_jwt_metadata(request.metadata(), request.extensions()) {
-            Ok(allowed) => allowed,
+        let identity = match self.verify_jwt_metadata(request.metadata(), request.extensions()) {
+            Ok(identity) => identity,
             Err(status) => {
                 let req = request.get_ref();
                 Self::audit_tenant_subscription(
@@ -1989,6 +2010,7 @@ impl ConfigSync for CpGrpcServer {
                 return Err(status);
             }
         };
+        let allowed = identity.allowed_namespaces;
 
         let req = request.get_ref();
         let dp_version = &req.ferrum_version;

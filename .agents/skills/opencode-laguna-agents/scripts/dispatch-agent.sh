@@ -103,6 +103,10 @@ if [[ "$prompt_file" != /* || ! -f "$prompt_file" ]]; then
   exit 2
 fi
 
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+# shellcheck source=../../_lib/resolve-agent-bin.sh
+. "$script_dir/../../_lib/resolve-agent-bin.sh"
+
 repo_root=$(git -C "$worktree" rev-parse --show-toplevel)
 physical_worktree=$(cd "$worktree" && pwd -P)
 physical_root=$(cd "$repo_root" && pwd -P)
@@ -112,34 +116,13 @@ if [[ "$physical_worktree" != "$physical_root" ]]; then
   exit 2
 fi
 
-# Resolve the opencode binary. Preference order: explicit OPENCODE_BIN, then a
-# standalone install on PATH, then the newest opencode that Conductor bundles as
-# an ACP provider (not on PATH by default).
-opencode_bin=''
-if [[ -n "${OPENCODE_BIN:-}" ]]; then
-  if [[ ! -x "$OPENCODE_BIN" ]]; then
-    printf 'OPENCODE_BIN is set but not executable: %s\n' "$OPENCODE_BIN" >&2
-    exit 127
-  fi
-  opencode_bin="$OPENCODE_BIN"
-elif command -v opencode >/dev/null 2>&1; then
-  opencode_bin=$(command -v opencode)
-else
-  conductor_oc_base="${HOME}/Library/Application Support/com.conductor.app/agent-binaries/acp-providers/opencode"
-  if [[ -d "$conductor_oc_base" ]]; then
-    opencode_bin=$(
-      find "$conductor_oc_base" -maxdepth 2 -mindepth 2 -name opencode -type f -perm -u+x 2>/dev/null \
-        | sort -V \
-        | tail -1
-    )
-  fi
-fi
-
-if [[ -z "$opencode_bin" || ! -x "$opencode_bin" ]]; then
-  printf 'opencode CLI not found.\n' >&2
-  printf 'Set OPENCODE_BIN, put opencode on PATH, or open Conductor.app so its bundled opencode is available.\n' >&2
-  exit 127
-fi
+# Resolve the operator's own opencode install. Conductor's bundled ACP-provider
+# copy under agent-binaries/acp-providers/opencode is deliberately NOT a fallback:
+# it lags the standalone release and is refused by the shared resolver.
+opencode_bin=$(resolve_agent_bin opencode OPENCODE_BIN \
+  "${HOME}/.opencode/bin/opencode" \
+  /opt/homebrew/bin/opencode \
+  /usr/local/bin/opencode)
 
 cd "$physical_worktree"
 

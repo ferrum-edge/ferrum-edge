@@ -1445,6 +1445,20 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_grpc_config_stream_terminations_total",
+    "type": "counter",
+    "help": "Authenticated configuration streams ended by fixed surface and reason.",
+    "labels": [
+      "surface",
+      "reason",
+      "gateway_namespace"
+    ],
+    "subsystem": "grpc_config",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_jwks_consecutive_failures",
     "type": "gauge",
     "help": "Maximum current consecutive failures among active remote stores by fixed failure class.",
