@@ -415,7 +415,9 @@ pub(crate) struct HostRouteTable {
 /// cannot use an older generation's successful decision. The listener manager
 /// replaces pending with a decided refusal set only after reconciling that same
 /// config generation. Ordinary OS bind failures are deliberately absent from
-/// the decided set so Service-fronted remapping remains available.
+/// the decided set so Service-fronted remapping remains available. Dedicated
+/// Sidecar ingress bind failures are included because remapping those would
+/// widen a loopback-only listener onto the process-global frontend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GatewayListenerAdmission {
     pending: bool,

@@ -84,11 +84,13 @@
 //! stream / TLS-class collisions, missing TLS material, deferred class flips),
 //! which are published in the exact request epoch so a refused listener cannot
 //! become reachable through the process-global proxy or the single-listener
-//! Service remap. Ordinary OS bind failures (for example
-//! privileged `:80` without `CAP_NET_BIND_SERVICE`) stay telemetry-only: the
-//! Service-fronted topology still remaps that listener port through
-//! `FERRUM_PROXY_HTTP_PORT` / `FERRUM_PROXY_HTTPS_PORT` when the table has
-//! exactly one listen port of that protocol class.
+//! Service remap. Ordinary OS bind failures (for example privileged `:80`
+//! without `CAP_NET_BIND_SERVICE`) stay telemetry-only: the Service-fronted
+//! topology still remaps that listener port through `FERRUM_PROXY_HTTP_PORT` /
+//! `FERRUM_PROXY_HTTPS_PORT` when the table has exactly one listen port of that
+//! protocol class. Dedicated Sidecar ingress bind failures are the exception:
+//! they are admission refusals because remapping a loopback-only listener onto
+//! a process-global frontend would widen its exposure.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
@@ -742,7 +744,10 @@ impl GatewayListenerManager {
         // for other reconcile-time decisions that likewise must not leak onto
         // the process-global proxy. Ordinary `spawn_listener` OS errors are
         // intentionally omitted so Service-fronted `:80`/`:443` remapping
-        // survives privileged-port bind failures.
+        // survives privileged-port bind failures. A dedicated Sidecar ingress
+        // bind is the exception: if its exact socket cannot be claimed, route
+        // admission must fail closed rather than widen the loopback-only route
+        // onto the process-global frontend via single-listener remapping.
         let mut refused_route_ports: BTreeSet<u16> = plan.refused.keys().copied().collect();
         refused_route_ports.extend(stale_route_ports);
         refused_route_ports.extend(retiring_ports.iter().copied());
@@ -790,6 +795,9 @@ impl GatewayListenerManager {
                 Err(error) => {
                     error!(port = *port, "Gateway API listener bind failed: {error}");
                     failures.push(GatewayListenerBindFailure { port: *port, error });
+                    if desired.mesh_direction.is_some() {
+                        refused_route_ports.insert(*port);
+                    }
                 }
             }
         }
@@ -1431,6 +1439,46 @@ mod tests {
         assert!(response.contains("dedicated-ok"), "{response}");
 
         backend_task.await.expect("backend task");
+        manager.shutdown_all().await;
+    }
+
+    /// An OS bind failure for a dedicated Sidecar ingress listener must refuse
+    /// route admission. Leaving it eligible would let the single-listener
+    /// Service remap serve a loopback-only route on the process-global frontend.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dedicated_bind_failure_refuses_process_global_remap() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("occupy loopback port");
+        let port = occupied.local_addr().expect("occupied addr").port();
+        let state = test_state(config_with_dedicated_bind(
+            port,
+            IpAddr::from([127, 0, 0, 1]),
+        ));
+        let manager = GatewayListenerManager::new(
+            state.clone(),
+            IpAddr::from([0, 0, 0, 0]),
+            GatewayListenerTls::default(),
+        );
+
+        let failures = manager.reconcile().await;
+        assert!(
+            failures.iter().any(|failure| failure.port == port),
+            "occupied dedicated bind must be surfaced: {failures:?}"
+        );
+        assert!(
+            state
+                .find_proxy_on_frontend_for_test(
+                    Some("app.example.com"),
+                    "/api",
+                    Some(0),
+                    false,
+                )
+                .is_none(),
+            "dedicated bind failure must not remap onto a process-global frontend"
+        );
+
+        drop(occupied);
         manager.shutdown_all().await;
     }
 
