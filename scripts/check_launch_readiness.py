@@ -962,11 +962,11 @@ def fetch_labeled_blocker_issues(
     blocker_label_id: int,
     opener: Callable[..., Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Every open issue carrying the verified launch-blocker label id.
+    """Every issue carrying the verified launch-blocker label id.
 
     GitHub's `labels=<name>` filter can transiently return an empty inventory if
     that label is renamed during the request and then renamed back before the
-    final metadata fence. Enumerate the unfiltered open issue set instead and
+    final metadata fence. Enumerate the unfiltered all-state issue set instead and
     select by the immutable id proven before the walk. The name carried beside
     that id must still match exactly; a rename is UNKNOWN rather than omission.
 
@@ -984,7 +984,10 @@ def fetch_labeled_blocker_issues(
     blocker_name = policy["labels"]["launch_blocker"]
     query = urllib.parse.urlencode(
         {
-            "state": "open",
+            # `closed_other` is deliberately blocking. Restricting discovery to
+            # open issues would silently drop a dynamically labeled issue closed
+            # as duplicate/not-planned before the gate observed it.
+            "state": "all",
             "per_page": str(PER_PAGE),
         }
     )
@@ -2571,9 +2574,9 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     except GateError:
         check("non-GitHub request refused", True)
 
-    # ---- label discovery walks every open issue page and drops PR nodes -----
+    # ---- label discovery walks every issue page and drops PR nodes ----------
     label_query = urllib.parse.urlencode(
-        {"state": "open", "per_page": str(PER_PAGE)}
+        {"state": "all", "per_page": str(PER_PAGE)}
     )
     label_page_one = f"{API_ORIGIN}repos/ferrum-edge/ferrum-edge/issues?{label_query}"
     label_page_two = f"{label_page_one}&page=2"
@@ -2625,6 +2628,27 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
         "label discovery paginates and excludes PR nodes",
         [item["number"] for item in discovered] == [9001, 9003],
         str([item.get("number") for item in discovered]),
+    )
+
+    # Closed-as-duplicate/not-planned issues remain blocking by contract, so
+    # immutable-id discovery must include closed labeled issues as well as open.
+    closed_other = _evaluate(
+        _base_policy(),
+        labeled=[
+            _issue(
+                9006,
+                state="closed",
+                state_reason="duplicate",
+                labels=["launch-blocker", "severity:high"],
+            )
+        ],
+    )
+    check(
+        "dynamically labeled closed_other issue remains blocking",
+        closed_other.verdict == "FAIL"
+        and closed_other.blocking_issues
+        and closed_other.blocking_issues[0]["classification"] == "closed_other",
+        str(closed_other.blocking_issues),
     )
 
     # A rename away-and-back can preserve the metadata id seen before and after

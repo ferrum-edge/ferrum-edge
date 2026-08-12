@@ -40,9 +40,9 @@ does not exist at all. It can also transiently return an empty set when a label
 is renamed away and back during the request. Treating those cases as clean is
 fail-open. The checker therefore calls
 `GET /repos/{owner}/{repo}/labels/{name}` before and after discovery, requires an
-exact case-sensitive name plus a stable unique id, and walks the unfiltered open
-issue inventory. Blockers are selected by the verified immutable id; every
-in-page id/name pair must still agree. GitHub resolves label lookups
+exact case-sensitive name plus a stable unique id, and walks the unfiltered
+all-state issue inventory. Blockers are selected by the verified immutable id;
+every in-page id/name pair must still agree. GitHub resolves label lookups
 case-insensitively, so a case-only rename is caught rather than accepted, while
 the identity fences catch deletion/recreation and rename-roundtrip races.
 
@@ -72,13 +72,16 @@ correct fail-closed answer — not a `PASS`.
 
 ## Classification
 
-1. **Label discovery:** after the vocabulary is proven to exist, the whole open
-   issue inventory is walked with pagination and the immutable blocker-label id
-   selects the authoritative set. Pull-request nodes are excluded. Each
-   remaining issue must carry exactly one configured
+1. **Label discovery:** after the vocabulary is proven to exist, the whole
+   all-state issue inventory is walked with pagination. The immutable
+   blocker-label id selects the authoritative set. Pull-request nodes are
+   excluded. Each remaining issue must carry exactly one configured
    `severity:{critical,high,medium}` label; zero, several, or an unconfigured
    severity-shaped label is `UNKNOWN`, never a silent omission. A newly filed
    blocker with one valid severity is discovered without editing the policy.
+   Closed issues are included because `duplicate`, `not_planned`, and a missing
+   close reason remain blocking until the issue is completed or explicitly
+   exempted; an `open`-only walk would silently drop them.
 2. **Tracked inventory:** `tracked_blockers` in the policy is an explicit,
    CODEOWNERS-reviewed list, kept as defense in depth against a labeling
    mistake. It is never the only functioning inventory: the labeled walk above
