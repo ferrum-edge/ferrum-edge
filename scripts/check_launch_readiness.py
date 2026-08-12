@@ -124,6 +124,10 @@ ISO_Z_RE = re.compile(
 OWNER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
 LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._/-]{0,63}$")
+# Repository label payloads may also contain ordinary GitHub labels with
+# spaces or Unicode. They are never emitted, but must remain structurally
+# bounded so an unrelated valid label cannot make the unfiltered walk UNKNOWN.
+LIVE_LABEL_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,100}$")
 ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 COUNT_RE = re.compile(r"^(?:0|[1-9][0-9]{0,5})$")
 GIT_REF_RE = re.compile(r"^refs/[A-Za-z0-9._/-]{1,200}$")
@@ -667,7 +671,7 @@ def parse_issue_payload(
     labels: set[str] = set()
     for label in label_items:
         name = label.get("name") if isinstance(label, dict) else label
-        if not isinstance(name, str) or not LABEL_RE.fullmatch(name):
+        if not isinstance(name, str) or not LIVE_LABEL_RE.fullmatch(name):
             raise GateError("schema", f"issue #{number} label name malformed")
         labels.add(name)
 
@@ -1008,7 +1012,7 @@ def fetch_labeled_blocker_issues(
                 raise GateError("schema", "issue label payload is not an object")
             label_name = label.get("name")
             label_id = label.get("id")
-            if not isinstance(label_name, str) or not LABEL_RE.fullmatch(label_name):
+            if not isinstance(label_name, str) or not LIVE_LABEL_RE.fullmatch(label_name):
                 raise GateError("schema", "issue label name is malformed")
             if (
                 not isinstance(label_id, int)
@@ -2249,20 +2253,33 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     # ---- tiers -------------------------------------------------------------
     for sev in SEVERITIES:
         policy = _tracked(_base_policy(), 2100, sev)
-        ev = _evaluate(policy, issues={2100: _issue(2100, labels=["launch-blocker"])})
+        ev = _evaluate(
+            policy,
+            issues={2100: _issue(2100, labels=["launch-blocker", f"severity:{sev}"])},
+        )
         check(f"ga blocks {sev}", ev.verdict == "FAIL", ev.verdict)
 
     policy = _tracked(_base_policy(), 2101, "medium")
-    ev = _evaluate(policy, launch_tier="experimental", issues={2101: _issue(2101, labels=["launch-blocker"])})
+    ev = _evaluate(
+        policy,
+        launch_tier="experimental",
+        issues={2101: _issue(2101, labels=["launch-blocker", "severity:medium"])},
+    )
     check("experimental ignores medium", ev.verdict == "PASS", ev.verdict)
     policy = _tracked(_base_policy(), 2102, "high")
-    ev = _evaluate(policy, launch_tier="beta", issues={2102: _issue(2102, labels=["launch-blocker"])})
+    ev = _evaluate(
+        policy,
+        launch_tier="beta",
+        issues={2102: _issue(2102, labels=["launch-blocker", "severity:high"])},
+    )
     check("beta blocks high", ev.verdict == "FAIL", ev.verdict)
 
     # ---- issue state machine ----------------------------------------------
     policy = _tracked(_base_policy(), 3001, "high")
     ev = _evaluate(
-        policy, issues={3001: _issue(3001, labels=["launch-blocker"])}, timelines={3001: ([555], [])}
+        policy,
+        issues={3001: _issue(3001, labels=["launch-blocker", "severity:high"])},
+        timelines={3001: ([555], [])},
     )
     check("open PR does not clear", ev.verdict == "FAIL", ev.verdict)
     check(
@@ -2272,7 +2289,9 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     )
 
     ev = _evaluate(
-        policy, issues={3001: _issue(3001, labels=["launch-blocker"])}, timelines={3001: ([], [556])}
+        policy,
+        issues={3001: _issue(3001, labels=["launch-blocker", "severity:high"])},
+        timelines={3001: ([], [556])},
     )
     check(
         "merged awaiting close blocks",
@@ -2319,7 +2338,11 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     valid_exemption = validate_exemptions(
         {"exemptions_version": "1", "exemptions": [exemption()]}, FIXED_NOW
     )
-    ev = _evaluate(policy, exemptions=valid_exemption, issues={5001: _issue(5001, labels=["launch-blocker"])})
+    ev = _evaluate(
+        policy,
+        exemptions=valid_exemption,
+        issues={5001: _issue(5001, labels=["launch-blocker", "severity:high"])},
+    )
     check("active exemption clears", ev.verdict == "PASS", ev.verdict)
     check("exemption reported", len(ev.exempted_issues) == 1)
 
@@ -2330,12 +2353,21 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
         },
         FIXED_NOW,
     )
-    ev = _evaluate(policy, exemptions=stale_exemption, issues={5001: _issue(5001, labels=["launch-blocker"])})
+    ev = _evaluate(
+        policy,
+        exemptions=stale_exemption,
+        issues={5001: _issue(5001, labels=["launch-blocker", "severity:high"])},
+    )
     check("expired exemption blocks", ev.verdict == "FAIL", ev.verdict)
 
     ev = _evaluate(
         policy,
-        issues={5001: _issue(5001, labels=["launch-blocker", "launch-exempted"])},
+        issues={
+            5001: _issue(
+                5001,
+                labels=["launch-blocker", "launch-exempted", "severity:high"],
+            )
+        },
     )
     check(
         "bare exempt label is UNKNOWN",
@@ -2345,10 +2377,14 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
 
     # ---- deterministic clock ----------------------------------------------
     policy = _tracked(_base_policy(), 6001, "high")
-    first = _evaluate(policy, issues={6001: _issue(6001, labels=["launch-blocker"])}, now=FIXED_NOW)
+    first = _evaluate(
+        policy,
+        issues={6001: _issue(6001, labels=["launch-blocker", "severity:high"])},
+        now=FIXED_NOW,
+    )
     second = _evaluate(
         policy,
-        issues={6001: _issue(6001, labels=["launch-blocker"])},
+        issues={6001: _issue(6001, labels=["launch-blocker", "severity:high"])},
         now=OTHER_NOW,
         env={FALLBACK_COUNT_VAR: "0", FALLBACK_AS_OF_VAR: format_utc(OTHER_NOW)},
     )
@@ -2589,6 +2625,7 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
                         "labels": [
                             {"name": "launch-blocker", "id": 41},
                             {"name": "severity:high", "id": 42},
+                            {"name": "good first issue 🚀", "id": 44},
                         ],
                     },
                     {
@@ -2628,6 +2665,25 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
         "label discovery paginates and excludes PR nodes",
         [item["number"] for item in discovered] == [9001, 9003],
         str([item.get("number") for item in discovered]),
+    )
+
+    ev = _evaluate(
+        _base_policy(),
+        labeled=[
+            _issue(
+                9007,
+                labels=[
+                    "launch-blocker",
+                    "severity:high",
+                    "good first issue 🚀",
+                ],
+            )
+        ],
+    )
+    check(
+        "unrelated labels with spaces or Unicode remain valid",
+        ev.verdict == "FAIL" and ev.counts_by_severity["high"] == 1,
+        str(ev.unknown_reasons),
     )
 
     # Closed-as-duplicate/not-planned issues remain blocking by contract, so
@@ -2744,7 +2800,10 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
             check(f"claim rejects {name}", True)
 
     policy = _tracked(_base_policy(), 8001, "critical")
-    failing = _evaluate(policy, issues={8001: _issue(8001, labels=["launch-blocker"])})
+    failing = _evaluate(
+        policy,
+        issues={8001: _issue(8001, labels=["launch-blocker", "severity:critical"])},
+    )
     passing = _evaluate(_base_policy())
     unknown = _evaluate(_base_policy(), env={})
 
