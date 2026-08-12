@@ -83,13 +83,46 @@ const TRUST_BUNDLE_MAX_BYTES: u64 = 1024 * 1024;
 /// the periodic reload worker into an unbounded file reader.
 const TRUST_MATERIAL_MAX_BYTES: u64 = TRUST_BUNDLE_MAX_BYTES;
 
+/// Open a trust-material path without letting a non-regular source stall the
+/// opener.
+///
+/// This mirrors the contract of [`crate::secrets::credential_file`], which
+/// cannot be reused directly here because its `HARD_MAX_CREDENTIAL_FILE_MAX_BYTES`
+/// ceiling (64 KiB) is far below the 1 MiB trust-bundle document limit. The two
+/// halves are both load-bearing: a FIFO or a carrier-less device opened with a
+/// plain blocking `open(2)` parks the caller *before* any regular-file check can
+/// run — which would hang CP startup outright, and would wedge the trust-bundle
+/// reload worker's `spawn_blocking` thread forever so accepted-credential
+/// removals could never be published again. Symlinked pathnames (Kubernetes
+/// projected ConfigMap/Secret mounts) are deliberately left to `open` so the
+/// opened target stays authoritative against a swap race.
+fn open_trust_material_file(path: &str, description: &str) -> Result<std::fs::File, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("failed to inspect {description} '{path}': {e}"))?;
+    if !metadata.file_type().is_symlink() && !metadata.is_file() {
+        return Err(format!("{description} '{path}' is not a regular file"));
+    }
+
+    #[cfg(unix)]
+    let opened = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let opened = std::fs::File::open(path);
+
+    opened.map_err(|e| format!("failed to open {description} '{path}': {e}"))
+}
+
 fn read_regular_utf8_file_bounded(
     path: &str,
     description: &str,
     max_bytes: u64,
 ) -> Result<String, String> {
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| format!("failed to open {description} '{path}': {e}"))?;
+    let mut file = open_trust_material_file(path, description)?;
     let metadata = file
         .metadata()
         .map_err(|e| format!("failed to inspect {description} '{path}': {e}"))?;

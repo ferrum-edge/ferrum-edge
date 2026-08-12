@@ -2206,12 +2206,17 @@ async fn fetch_remote_slice(
         // verification credentials must check this signature
         // (advisory GHSA-3f2j-wwqw-grmg); the audience keeps the token
         // non-transferable between peer clusters.
-        // `GrpcJwtSecret::mint` also re-reads an externally issued token file
-        // on every polling/reconnect attempt. The external issuer owns its
-        // namespace and audience claims; a node must never decode or rewrite
-        // them locally.
+        // Minting goes through `GrpcJwtSecret` so a fresh, short-lived token is
+        // produced on every poll — the CP now closes an admitted stream at the
+        // verified `exp`, so a reused token would simply be refused. Use the
+        // ASYNC form: `GrpcJwtSecret::mint` reads an externally issued token
+        // file inline, which would block a Tokio core worker here (remote
+        // discovery never configures one today, but the sync helper must not be
+        // reachable from an async path). The external issuer owns its namespace
+        // and audience claims; a node must never decode or rewrite them locally.
         let auth_token = jwt_secret
-            .mint(node_id, Some(namespace), Some(audience))
+            .mint_async(node_id, Some(namespace), Some(audience))
+            .await
             .map_err(|e| format!("mint remote CP JWT: {e}"))?;
         let token: MetadataValue<_> = format!("Bearer {auth_token}")
             .parse()
