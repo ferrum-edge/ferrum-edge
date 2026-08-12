@@ -86,8 +86,7 @@ const TRUST_MATERIAL_MAX_BYTES: u64 = TRUST_BUNDLE_MAX_BYTES;
 /// A stalled network filesystem must not silently stop trust-bundle reloads
 /// forever. The blocking read itself runs on a detached OS thread because a
 /// timed-out `spawn_blocking` task cannot be cancelled.
-const TRUST_BUNDLE_RELOAD_READ_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(5);
+const TRUST_BUNDLE_RELOAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// At most one detached reload read may remain blocked in the kernel. The
 /// permit is owned by the OS thread, not by its async waiter, so a timeout
