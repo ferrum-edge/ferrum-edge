@@ -266,16 +266,18 @@ impl GatewayListenerPlan {
                 if *existing == class {
                     already_served.insert(port, class);
                 } else {
-                    refused.entry(port).or_insert_with(|| GatewayListenerRefusal {
-                        reason: GatewayListenerFailureReason::ProcessGlobalClassMismatch,
-                        message: format!(
-                            "port {port} is already owned by a process-global {} proxy \
+                    refused
+                        .entry(port)
+                        .or_insert_with(|| GatewayListenerRefusal {
+                            reason: GatewayListenerFailureReason::ProcessGlobalClassMismatch,
+                            message: format!(
+                                "port {port} is already owned by a process-global {} proxy \
                              listener, but this Gateway listener requires {}; the Gateway \
                              listener is not served",
-                            existing.label(),
-                            class.label()
-                        ),
-                    });
+                                existing.label(),
+                                class.label()
+                            ),
+                        });
                 }
                 continue;
             }
@@ -284,23 +286,27 @@ impl GatewayListenerPlan {
             // proxy ports this gateway did not adopt as a same-class frontend
             // above — name the set rather than guessing which member it was.
             if reserved.contains(&port) {
-                refused.entry(port).or_insert_with(|| GatewayListenerRefusal {
-                    reason: GatewayListenerFailureReason::Reserved,
-                    message: format!(
-                        "port {port} is reserved by another Ferrum listener \
+                refused
+                    .entry(port)
+                    .or_insert_with(|| GatewayListenerRefusal {
+                        reason: GatewayListenerFailureReason::Reserved,
+                        message: format!(
+                            "port {port} is reserved by another Ferrum listener \
                          (proxy/admin/control-plane/capture); the Gateway listener is not bound"
-                    ),
-                });
+                        ),
+                    });
                 continue;
             }
             if tcp_stream_ports.contains(&port) {
-                refused.entry(port).or_insert_with(|| GatewayListenerRefusal {
-                    reason: GatewayListenerFailureReason::TcpStreamCollision,
-                    message: format!(
-                        "port {port} is claimed by a TCP/TLS stream proxy in the same config; \
+                refused
+                    .entry(port)
+                    .or_insert_with(|| GatewayListenerRefusal {
+                        reason: GatewayListenerFailureReason::TcpStreamCollision,
+                        message: format!(
+                            "port {port} is claimed by a TCP/TLS stream proxy in the same config; \
                          the HTTP-family Gateway listener is not bound"
-                    ),
-                });
+                        ),
+                    });
                 continue;
             }
             // UDP/DTLS claims the UDP namespace only. Keep the TCP listener in
@@ -1453,15 +1459,15 @@ mod tests {
     /// not leave HTTP/3 up when that newer epoch reserved the UDP port.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stale_quic_bind_is_fenced_after_udp_claim() {
-        let _ =
-            rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::ring::default_provider(),
+        );
         let port = free_port().await;
         let https = port_scoped_config(port);
         let mut tls_https = https.clone();
-        tls_https.http_tls_listen_ports.insert((
-            crate::config::types::default_namespace(),
-            port,
-        ));
+        tls_https
+            .http_tls_listen_ports
+            .insert((crate::config::types::default_namespace(), port));
         let state = test_state(tls_https.clone());
         let manager = GatewayListenerManager::new(
             state.clone(),
@@ -1513,9 +1519,7 @@ mod tests {
                 task.abort();
                 let _ = task.await;
             }
-            let _ = manager
-                .ensure_quic(port, listener, stale_generation)
-                .await;
+            let _ = manager.ensure_quic(port, listener, stale_generation).await;
             assert!(
                 listener.quic.is_none(),
                 "stale generation must not restore QUIC after a newer UDP claim"
