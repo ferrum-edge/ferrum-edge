@@ -72,18 +72,17 @@ fn ambient_host_udp_live_workflow_is_unconditional_with_a_trusted_base_relevance
         "merge-group runs must bind relevance to the event's base SHA"
     );
 
-    // Bootstrap: origin/main does not yet know the `ambient-host-udp` suite, so
-    // the introducing pull request must still run the live suite. Only that
-    // exact unknown-suite rejection may force relevance; everything else fails
-    // closed.
+    // The introducing bootstrap is gone now that main knows the suite. The
+    // permanent path must execute the trusted classifier directly and must not
+    // retain an stderr-shaped exception that could force relevance on failure.
     assert!(
-        workflow.contains("invalid choice: 'ambient-host-udp'"),
-        "the introducing pull request must force relevance on the exact \
-         unknown-suite classifier rejection"
+        workflow.contains("plan=\"$(python3 -I \"$trusted_filter\" \"${filter_args[@]}\")\""),
+        "the permanent relevance path must execute the immutable trusted-base classifier"
     );
     assert!(
-        workflow.contains("::error::trusted relevance filter failed"),
-        "every other classifier failure must fail closed"
+        !workflow.contains("invalid choice: 'ambient-host-udp'")
+            && !workflow.contains("filter_err="),
+        "the one-time unknown-suite bootstrap must be fully removed"
     );
 
     assert!(
@@ -101,6 +100,20 @@ fn ambient_host_udp_live_workflow_is_unconditional_with_a_trusted_base_relevance
     assert!(
         workflow.contains("${{ needs.ambient-host-udp-live.result }}\" != \"success\""),
         "the gate must fail when a relevant live job fails or is absent"
+    );
+
+    // The separately trusted verifier freezes both the relevance block above
+    // and its binding to the live job. This pull request intentionally makes
+    // its own base-loaded policy check red, but once merged no later pull
+    // request can rewrite the gate to self-declare irrelevance.
+    let cross_policy = read(".github/scripts/verify_cross_build_policy.py");
+    assert!(
+        cross_policy.contains(
+            "\"ambient-host-udp-live.yml\": (\n        \"changes\",\n        \
+             \"ambient-host-udp-live\",\n        \"Ambient host-UDP trigger\",\n        \
+             \"ambient-host-udp\",\n        \"ambient-host-udp\",\n    ),"
+        ),
+        "the trusted cross-policy verifier must freeze the Ambient host-UDP relevance contract"
     );
 }
 

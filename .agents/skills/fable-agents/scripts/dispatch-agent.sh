@@ -72,10 +72,14 @@ if [[ "$prompt_file" != /* || ! -f "$prompt_file" ]]; then
   exit 2
 fi
 
-if ! command -v claude >/dev/null 2>&1; then
-  printf 'claude is not installed or not on PATH\n' >&2
-  exit 127
-fi
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+# shellcheck source=../../_lib/resolve-agent-bin.sh
+. "$script_dir/../../_lib/resolve-agent-bin.sh"
+
+claude_bin=$(resolve_agent_bin claude CLAUDE_BIN \
+  "${HOME}/.local/bin/claude" \
+  /opt/homebrew/bin/claude \
+  /usr/local/bin/claude)
 
 repo_root=$(git -C "$worktree" rev-parse --show-toplevel)
 physical_worktree=$(cd "$worktree" && pwd -P)
@@ -94,7 +98,10 @@ unset CLAUDE_CODE_DISABLE_1M_CONTEXT
 unset CLAUDE_CODE_DISABLE_THINKING
 unset MAX_THINKING_TOKENS
 
-exec claude -p \
+printf '[fable-agents] dispatch model=claude-fable-5 effort=%s worktree=%s bin=%s\n' \
+  "$effort" "$physical_worktree" "$claude_bin" >&2
+
+exec "$claude_bin" -p \
   --model claude-fable-5 \
   --effort "$effort" \
   --permission-mode bypassPermissions \
