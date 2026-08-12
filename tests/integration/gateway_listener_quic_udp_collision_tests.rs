@@ -35,7 +35,8 @@ use ferrum_edge::tls::{NoVerifier, TlsPolicy};
 const HOST: &str = "app.example.com";
 
 fn ensure_crypto_provider() {
-    let _ = rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 }
 
 fn port_scoped_https_proxy(id: &str, backend_port: u16, listen_port: u16) -> Proxy {
@@ -128,10 +129,9 @@ fn tls_config_with(proxies: Vec<Proxy>, listen_port: u16) -> GatewayConfig {
         ..GatewayConfig::default()
     };
     config.resolve_dispatch_kind();
-    config.http_tls_listen_ports.insert((
-        ferrum_edge::config::types::default_namespace(),
-        listen_port,
-    ));
+    config
+        .http_tls_listen_ports
+        .insert((ferrum_edge::config::types::default_namespace(), listen_port));
     config
 }
 
@@ -245,10 +245,7 @@ async fn start_body_backend(body: &'static [u8]) -> (u16, tokio::task::JoinHandl
     (port, handle)
 }
 
-fn build_manager(
-    state: ProxyState,
-    bind_addr: IpAddr,
-) -> GatewayListenerManager {
+fn build_manager(state: ProxyState, bind_addr: IpAddr) -> GatewayListenerManager {
     GatewayListenerManager::new(
         state,
         bind_addr,
@@ -310,7 +307,10 @@ async fn https_negotiated_alpn(port: u16, alpn: &[&[u8]]) -> Option<Vec<u8>> {
     tls.get_ref().1.alpn_protocol().map(|p| p.to_vec())
 }
 
-fn assert_quic_udp_collision(failures: &[ferrum_edge::proxy::gateway_listener::GatewayListenerBindFailure], port: u16) {
+fn assert_quic_udp_collision(
+    failures: &[ferrum_edge::proxy::gateway_listener::GatewayListenerBindFailure],
+    port: u16,
+) {
     assert!(
         failures.iter().any(|failure| {
             failure.port == port
