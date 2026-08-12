@@ -4506,12 +4506,10 @@ fn resolve_h3_grpc_transport<'a>(
     state: &'a ProxyState,
     target: Option<&'a UpstreamTarget>,
 ) -> Result<grpc_proxy::GrpcDispatchTransport<'a>, grpc_proxy::GrpcTransportError> {
-    grpc_proxy::GrpcDispatchTransport::for_target(
-        &state.grpc_pool,
-        &state.mesh_mtls_pool,
-        &state.hbone_pool,
-        target,
-    )
+    // Delegated to the SHARED resolver the standard H1/H2 native-gRPC branch
+    // also uses (issue #3728), so the two frontends cannot drift on target
+    // validation, dial-plan resolution, or error mapping.
+    crate::proxy::resolve_grpc_dispatch_transport(state, target)
 }
 
 #[allow(clippy::too_many_arguments)]

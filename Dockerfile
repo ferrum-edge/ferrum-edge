@@ -1,10 +1,21 @@
 # syntax=docker/dockerfile:1
 # Multi-stage build for Ferrum Edge
 
-# Build features for the main binary. The final `runtime` target is the ordinary
-# gateway image and contains neither the eBPF ELF nor `ip`. Build the explicit
-# `runtime-ebpf` target with `FEATURES=cloud-secrets,ebpf` for node-agent /
-# ambient capture; hosted CI exercises both contracts.
+# Build features for the main binary. There are three published runtime targets:
+#
+#   * `runtime`            — the ordinary gateway image. Distroless, and contains
+#                            neither the eBPF ELF nor `ip`.
+#   * `runtime-ebpf`       — node-agent / NodeWaypoint capture. Still distroless:
+#                            it adds the eBPF ELF and a staged `ip` closure and
+#                            deliberately has NO `/bin/sh` and NO iptables.
+#   * `runtime-ebpf-tools` — a strict superset of `runtime-ebpf` for the Ambient
+#                            host/pod-netns UDP lifecycle, which drives generated
+#                            `sh -c` iptables/ip6tables scripts and therefore
+#                            cannot run on a distroless image. Debian-based, so
+#                            it is NOT distroless by construction.
+#
+# Build the eBPF targets with `FEATURES=cloud-secrets,ebpf`; hosted CI exercises
+# all three contracts.
 ARG FEATURES=cloud-secrets
 ARG RUNTIME_BASE=gcr.io/distroless/cc-debian13:nonroot
 ARG IPROUTE2_BASE=debian:13-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2
@@ -136,6 +147,86 @@ COPY --from=iproute2-runtime /iproute2-root/usr/lib64/ /usr/lib64/
 COPY --from=ebpf-builder --chown=65532:65532 \
     /build/ebpf/target/bpfel-unknown-none/release/ferrum-ebpf /app/bpf/ferrum-ebpf
 ENV FERRUM_NODE_AGENT_BPF_ELF_PATH=/app/bpf/ferrum-ebpf
+
+# --- Ambient UDP lifecycle tool base ------------------------------------------
+# The Ambient UDP capture lifecycle (host-netns and per-pod-netns producers, plus
+# the disabled stale-rule cleanup manager) executes GENERATED `sh -c` scripts that
+# call `ip`, `iptables`, `ip6tables`, and the `*-save` readback helpers. A
+# distroless image ships none of them, so `preflight_capture_tools` refuses
+# startup there by design. That lifecycle therefore needs its own tools-capable
+# runtime rather than a silent weakening of the published `-ebpf` contract.
+#
+# This stage is deliberately a FULL Debian userland, not a staged closure:
+# `iptables` resolves through the `xtables-nft-multi` alternatives links and
+# needs its own `/usr/lib/x86_64-linux-gnu/xtables` extension directory plus
+# `/etc/ethertypes`, so hand-staging it into distroless would reproduce a Debian
+# root with none of Debian's security-update path. `iproute2` shares the exact
+# pinned version used by the distroless staging closure; `iptables` tracks the
+# digest-pinned base suite's security-updated package, because pinning an exact
+# package revision here would break every Debian point release without bounding
+# anything the release manifest digest does not already bound.
+#
+# Splitting the tool provisioning into its own stage lets CI smoke the tool
+# contract without paying for the Rust + nightly eBPF builds, while the final
+# runtime below still inherits exactly these bytes.
+FROM ${IPROUTE2_BASE} AS capture-tools-base
+ARG IPROUTE2_VERSION
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        "iproute2=${IPROUTE2_VERSION}" \
+        iptables \
+    && rm -rf /var/lib/apt/lists/*
+# Fail the BUILD, not a node at 3am, if the tool contract the Ambient UDP
+# lifecycle depends on is ever absent. Keep this list in lock-step with
+# `preflight_capture_tools` and the `ambient-host-udp-live` image smoke.
+RUN set -eu; \
+    test -x /bin/sh; \
+    for tool in ip iptables ip6tables iptables-save ip6tables-save; do \
+        command -v "$tool" >/dev/null 2>&1 || { \
+            echo "capture-tools-base is missing required tool: $tool" >&2; \
+            exit 1; \
+        }; \
+    done; \
+    iptables --version >/dev/null; \
+    ip6tables --version >/dev/null
+
+# Ambient UDP lifecycle runtime, published as the `-ebpf-tools` tag. A strict
+# superset of `runtime-ebpf`: same binaries, same BPF ELF, plus the shell and
+# netfilter/iproute2 tools above. It runs as root because every consumer of this
+# image needs root + NET_ADMIN (and, for the per-pod producer, `setns`) to
+# install capture rules; the mesh/node-agent charts already select UID 0. The
+# ENV/EXPOSE/HEALTHCHECK/ENTRYPOINT block mirrors `runtime-common`, which cannot
+# be inherited here because this target does not descend from the distroless base.
+FROM capture-tools-base AS runtime-ebpf-tools
+
+WORKDIR /app
+
+COPY --from=builder /build/target/release/ferrum-edge /app/ferrum-edge
+COPY --from=builder /build/target/release/ferrum-cni /app/ferrum-cni
+COPY --from=ebpf-builder \
+    /build/ebpf/target/bpfel-unknown-none/release/ferrum-ebpf /app/bpf/ferrum-ebpf
+
+ENV PATH="/app:${PATH}" \
+    FERRUM_MODE=database \
+    FERRUM_LOG_LEVEL=error \
+    FERRUM_PROXY_HTTP_PORT=8000 \
+    FERRUM_PROXY_HTTPS_PORT=8443 \
+    FERRUM_ADMIN_HTTP_PORT=9000 \
+    FERRUM_ADMIN_HTTPS_PORT=9443 \
+    FERRUM_NODE_AGENT_BPF_ELF_PATH=/app/bpf/ferrum-ebpf
+
+EXPOSE 8000 8443 9000 9443 50051
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD ["/app/ferrum-edge", "health"]
+
+LABEL org.opencontainers.image.title="Ferrum Edge (Ambient UDP lifecycle)" \
+      org.opencontainers.image.description="Ferrum Edge eBPF runtime plus the shell, iproute2, and iptables tools the Ambient UDP capture lifecycle executes" \
+      org.opencontainers.image.source="https://github.com/ferrum-edge/ferrum-edge"
+
+USER 0
+ENTRYPOINT ["/app/ferrum-edge"]
+CMD ["run"]
 
 # Keep the ordinary runtime as the default final target.
 FROM runtime-common AS runtime

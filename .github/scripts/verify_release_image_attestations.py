@@ -23,7 +23,24 @@ TRUSTED_CREATE_RELEASE_NEEDS = {
     "build-release-arm64-cross",
     "docker-manifest",
     "docker-ebpf-manifest",
+    "docker-ebpf-tools-manifest",
 }
+# Every published multi-arch image family, as the frozen attestation job names
+# it. Each entry must be resolved to an immutable digest, cross-compared between
+# registries, scanned on both platforms, signed, attested, and verified.
+IMAGE_FAMILIES = (
+    ("standard", "", "STANDARD"),
+    ("ebpf", "-ebpf", "EBPF"),
+    ("ebpftools", "-ebpf-tools", "EBPF_TOOLS"),
+)
+FINAL_MANIFEST_JOBS = {
+    "docker-manifest",
+    "docker-ebpf-manifest",
+    "docker-ebpf-tools-manifest",
+}
+# One per push-by-digest platform build: the `docker` job, plus the `-ebpf` and
+# `-ebpf-tools` builds that share the `docker-ebpf` matrix job.
+EXPECTED_PROVENANCE_DISABLED = 3
 
 
 def extract_job(workflow: str, job: str) -> str:
@@ -73,10 +90,10 @@ def validate_release_workflow(workflow: str) -> list[str]:
     except RuntimeError as error:
         return [*errors, str(error)]
 
-    if extract_needs(attest_job) != {"docker-manifest", "docker-ebpf-manifest"}:
+    if extract_needs(attest_job) != FINAL_MANIFEST_JOBS:
         errors.append(
-            "jobs.attest-release-images must depend exactly on both final "
-            "manifest jobs"
+            "jobs.attest-release-images must depend exactly on every final "
+            "manifest job"
         )
 
     create_needs = extract_needs(create_release)
@@ -131,9 +148,12 @@ def validate_release_workflow(workflow: str) -> list[str]:
             "write permission block"
         )
 
-    if workflow.count("provenance: false") != 2 or "provenance: true" in workflow:
+    if (
+        workflow.count("provenance: false") != EXPECTED_PROVENANCE_DISABLED
+        or "provenance: true" in workflow
+    ):
         errors.append(
-            "both push-by-digest platform builds must keep provenance disabled; "
+            "every push-by-digest platform build must keep provenance disabled; "
             "manifest provenance is generated after assembly"
         )
 
@@ -151,12 +171,6 @@ def validate_release_workflow(workflow: str) -> list[str]:
         "any(.subject[]?; .digest.sha256 == $digest)",
         ".digest.gitCommit == $source_sha",
         "] | length >= 2",
-        "compare_registry_manifests standard",
-        "compare_registry_manifests ebpf",
-        'generate_sboms \\\n            standard docker "$STANDARD_DOCKER_REF"',
-        'generate_sboms \\\n            standard ghcr "$STANDARD_GHCR_REF"',
-        'generate_sboms \\\n            ebpf docker "$EBPF_DOCKER_REF"',
-        'generate_sboms \\\n            ebpf ghcr "$EBPF_GHCR_REF"',
         'jq -e -f "$work/require_manifest.jq"',
         'jq -n \\',
         '--arg build_type',
@@ -168,20 +182,43 @@ def validate_release_workflow(workflow: str) -> list[str]:
                 f"jobs.attest-release-images is missing contract token {token!r}"
             )
 
-    for invocation in (
-        'resolve_manifest standard_docker "ferrumedge/ferrum-edge:${TAG_NAME}"',
-        'resolve_manifest standard_ghcr "ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}"',
-        'resolve_manifest ebpf_docker "ferrumedge/ferrum-edge:${TAG_NAME}-ebpf"',
-        'resolve_manifest ebpf_ghcr "ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}-ebpf"',
-        'sign_and_attest standard docker "$STANDARD_DOCKER_REF"',
-        'sign_and_attest standard ghcr "$STANDARD_GHCR_REF"',
-        'sign_and_attest ebpf docker "$EBPF_DOCKER_REF"',
-        'sign_and_attest ebpf ghcr "$EBPF_GHCR_REF"',
-        'verify_image standard docker "$STANDARD_DOCKER_REF"',
-        'verify_image standard ghcr "$STANDARD_GHCR_REF"',
-        'verify_image ebpf docker "$EBPF_DOCKER_REF"',
-        'verify_image ebpf ghcr "$EBPF_GHCR_REF"',
-    ):
+    # Each family is checked as a whole: resolved from its canonical tag to an
+    # immutable digest, cross-compared between registries, scanned on both
+    # platforms, signed, attested, and verified. A family that is published but
+    # missing any of these would ship unsigned under an advertised release tag.
+    family_invocations: list[str] = []
+    for family, tag_suffix, variable_prefix in IMAGE_FAMILIES:
+        docker_reference = f"${variable_prefix}_DOCKER_REF"
+        ghcr_reference = f"${variable_prefix}_GHCR_REF"
+        # The canonical tag must stay bound to its own family key, whether the
+        # invocation fits on one line or uses a shell line continuation.
+        for registry_repository in (
+            r"ferrumedge/ferrum-edge:\$\{TAG_NAME\}",
+            r"ghcr\.io/\$\{GITHUB_REPOSITORY\}:\$\{TAG_NAME\}",
+        ):
+            registry_key = "docker" if "ferrumedge" in registry_repository else "ghcr"
+            resolution = (
+                rf"resolve_manifest {family}_{registry_key}"
+                rf"(?: \\\n\s+| )\"{registry_repository}"
+                rf"{re.escape(tag_suffix)}\"\n"
+            )
+            if not re.search(resolution, attest_job):
+                errors.append(
+                    "jobs.attest-release-images does not resolve the canonical "
+                    f"{family!r} {registry_key} tag to an immutable digest"
+                )
+        family_invocations.extend(
+            (
+                f"compare_registry_manifests {family}\n",
+                f'generate_sboms \\\n            {family} docker "{docker_reference}"',
+                f'generate_sboms \\\n            {family} ghcr "{ghcr_reference}"',
+                f'sign_and_attest {family} docker "{docker_reference}"',
+                f'sign_and_attest {family} ghcr "{ghcr_reference}"',
+                f'verify_image {family} docker "{docker_reference}"',
+                f'verify_image {family} ghcr "{ghcr_reference}"',
+            )
+        )
+    for invocation in family_invocations:
         if invocation not in attest_job:
             errors.append(
                 "jobs.attest-release-images does not cover every image family "
@@ -241,8 +278,67 @@ def run_self_test(workflow: str) -> list[str]:
         (
             "trusted create-release needs",
             workflow.replace(
+                "    needs: [build-release-binaries, build-release-arm64-cross, docker-manifest, docker-ebpf-manifest, docker-ebpf-tools-manifest]",
+                "    needs: [build-release-binaries, build-release-arm64-cross, docker-manifest, docker-ebpf-manifest, docker-ebpf-tools-manifest, attest-release-images]",
+                1,
+            ),
+        ),
+        (
+            "create-release tools-manifest dependency",
+            workflow.replace(
+                "    needs: [build-release-binaries, build-release-arm64-cross, docker-manifest, docker-ebpf-manifest, docker-ebpf-tools-manifest]",
                 "    needs: [build-release-binaries, build-release-arm64-cross, docker-manifest, docker-ebpf-manifest]",
-                "    needs: [build-release-binaries, build-release-arm64-cross, docker-manifest, docker-ebpf-manifest, attest-release-images]",
+                1,
+            ),
+        ),
+        (
+            "attestation tools-manifest dependency",
+            workflow.replace(
+                "    needs: [docker-manifest, docker-ebpf-manifest, docker-ebpf-tools-manifest]",
+                "    needs: [docker-manifest, docker-ebpf-manifest]",
+                1,
+            ),
+        ),
+        (
+            "tools-image canonical tag resolution",
+            workflow.replace(
+                'resolve_manifest ebpftools_docker \\\n'
+                '            "ferrumedge/ferrum-edge:${TAG_NAME}-ebpf-tools"\n',
+                "",
+                1,
+            ),
+        ),
+        (
+            "tools-image signing",
+            workflow.replace(
+                '          sign_and_attest ebpftools ghcr "$EBPF_TOOLS_GHCR_REF"\n',
+                "",
+                1,
+            ),
+        ),
+        (
+            "tools-image SBOM generation",
+            workflow.replace(
+                "          generate_sboms \\\n"
+                '            ebpftools docker "$EBPF_TOOLS_DOCKER_REF" \\\n'
+                '            "$DOCKERHUB_USERNAME" "$DOCKERHUB_PASSWORD"\n',
+                "",
+                1,
+            ),
+        ),
+        (
+            "tools-image attestation verification",
+            workflow.replace(
+                '          verify_image ebpftools docker "$EBPF_TOOLS_DOCKER_REF"\n',
+                "",
+                1,
+            ),
+        ),
+        (
+            "tools-image cross-registry manifest comparison",
+            workflow.replace(
+                "          compare_registry_manifests ebpftools\n",
+                "",
                 1,
             ),
         ),
@@ -302,9 +398,10 @@ def main() -> int:
     errors.extend(run_self_test(workflow))
     if not errors:
         print(
-            "Release image attestation contract covers two image families, "
-            "two registries, immutable subjects, least-privilege OIDC, and a "
-            "fail-closed publication gate compatible with trusted Cross policy."
+            "Release image attestation contract covers three image families "
+            "(default, -ebpf, -ebpf-tools), two registries, immutable subjects, "
+            "least-privilege OIDC, and a fail-closed publication gate compatible "
+            "with trusted Cross policy."
         )
         return 0
     for error in errors:

@@ -145,7 +145,8 @@ BPF map read are gated behind `#[cfg(all(feature = "ebpf", target_os = "linux"))
 >   published `-ebpf` runtime remains distroless but includes the `ip` executable
 >   and its resolved runtime-library closure, which the exact NodeWaypoint
 >   ingress policy-rule lifecycle requires. It still omits a shell, package
->   manager, and `iptables`/`ip6tables`.
+>   manager, and `iptables`/`ip6tables` — that omission is deliberate and is not
+>   relaxed for any consumer.
 >   On a node that fails the kernel/cgroup/bpffs probe the `-ebpf` pod does **not**
 >   silently degrade to the mock backend: `run()` hands off to `handle_fallback`,
 >   whose default `FERRUM_NODE_AGENT_FALLBACK_MODE=fail` returns an error and the
@@ -169,6 +170,26 @@ BPF map read are gated behind `#[cfg(all(feature = "ebpf", target_os = "linux"))
 >   the release. Conversely, `docker-ebpf-manifest` itself `needs:` the core
 >   release path, so the `-ebpf` tags are never published for a release whose
 >   core artifacts failed.
+> - **`-ebpf-tools` (tools-capable capture runtime, Linux-only).**
+>   `ferrumedge/ferrum-edge:<tag>-ebpf-tools` /
+>   `ghcr.io/ferrum-edge/ferrum-edge:<tag>-ebpf-tools` are built by the SAME
+>   release job (`docker-ebpf`), from the same source and the same `FEATURES`,
+>   using the root `Dockerfile` target `runtime-ebpf-tools`. It is a strict
+>   **superset** of
+>   `-ebpf` (identical binaries and BPF ELF) on a Debian 13 base that also ships
+>   `/bin/sh`, `ip`, `iptables`, `ip6tables`, `iptables-save`, and
+>   `ip6tables-save`. Use it for the two paths that shell out: the Ambient UDP
+>   capture lifecycle (the mesh chart selects this tag automatically) and
+>   `FERRUM_NODE_AGENT_FALLBACK_MODE=iptables`. It is **not distroless**, has a
+>   package manager, and runs as **root**, so prefer `-ebpf` wherever the tool
+>   contract is not required.
+>   Its manifests are published by `docker-ebpf-tools-manifest`, which `needs:`
+>   the same core release path plus `docker-ebpf-manifest`, so the tools tags
+>   are never published for a release whose core artifacts or `-ebpf` variant
+>   did not ship. `create-release` and `attest-release-images` both `needs:` it,
+>   so it is Cosign-signed on its immutable multi-arch digest in both registries
+>   and carries SLSA provenance plus per-platform SPDX SBOM attestations exactly
+>   like the other two families — see `docs/ci_cd.md`.
 
 **Building the capture image.** The compiled BPF ELF and the `--features ebpf`
 binary are produced by the explicit target:
@@ -435,6 +456,8 @@ device as a distinct peer rather than a self-linked bridge/uplink. A broader
 route through a shared bridge is refused because it is not per-pod interface
 ownership evidence. It requires a CNI that gives each pod its own host-side
 interface.
+The production host-netns TPROXY datapath is live-gated by the required
+`ambient-host-udp-live` workflow ([#3705](https://github.com/ferrum-edge/ferrum-edge/issues/3705)).
 Full behaviour, ownership, and the enforced generation-bound cleanup/finalize
 workflow are in [`docs/mesh.md`](mesh.md) → "Ambient UDP placement migration".
 During cleanup the node-agent retracts `.udp-registry-synced` at relist start and
@@ -912,7 +935,7 @@ If any prerequisite is missing, the node agent fails fast by default. It logs th
 | Value | Behaviour |
 |---|---|
 | `fail` (default) | Refuse to start, surface the kernel deficiency in the error log, and exit. This matches the published distroless `-ebpf` image, which includes `ip` for the supported eBPF path but deliberately omits a shell and `iptables`/`ip6tables`. |
-| `iptables` | Apply host iptables capture rules and continue serving. This requires a custom runtime image that includes `/bin/sh`, `iptables`, and `ip6tables` when IPv6 capture is enabled. The gauge records the reason; pod-level eBPF enrollment is skipped. Existing pods that were enrolled before degradation keep working until the next reconcile; new pods rely on the iptables capture path. |
+| `iptables` | Apply host iptables capture rules and continue serving. This requires a runtime image that includes `/bin/sh`, `iptables`, and `ip6tables` when IPv6 capture is enabled — use the published `:<tag>-ebpf-tools` variant, or your own equivalent. The gauge records the reason; pod-level eBPF enrollment is skipped. Existing pods that were enrolled before degradation keep working until the next reconcile; new pods rely on the iptables capture path. |
 
 Suggested remediations by reason label:
 
@@ -927,7 +950,7 @@ Suggested remediations by reason label:
 In a cluster with heterogeneous kernels, the recommended pattern is:
 
 1. Deploy the node-agent DaemonSet to every node with the default `FERRUM_NODE_AGENT_FALLBACK_MODE=fail`; degraded nodes stay NotReady and the startup error identifies the remediation reason.
-2. If you intentionally want degraded nodes to keep routing while kernels are upgraded, run a custom node-agent image that includes `/bin/sh`, `iptables`, and `ip6tables`, then set `FERRUM_NODE_AGENT_FALLBACK_MODE=iptables` for those nodes.
+2. If you intentionally want degraded nodes to keep routing while kernels are upgraded, run a node-agent image that includes `/bin/sh`, `iptables`, and `ip6tables` — the published `:<tag>-ebpf-tools` variant, or your own equivalent — then set `FERRUM_NODE_AGENT_FALLBACK_MODE=iptables` for those nodes.
 3. Configure the admission webhook (`FERRUM_MODE=injector`) to inject iptables init containers for pods scheduled on degraded nodes. The injector decides this from a Helm-templated `NodeSelector` driven by your node labels (e.g., `ferrum.io/capture-mode=iptables`).
 
 The mesh control plane is not changed by node-level degradation: slice apply, `mesh_authz`, `mesh_workload_metrics`, and HBONE all continue to function as ambient. Only the per-pod capture mechanism on the affected node changes.

@@ -126,4 +126,5 @@ mod udp_placement_migration_tests;
 mod upstream_name_uniqueness_tests;
 mod vendor_integrity_tests;
 // websocket_gateway_test is a standalone binary (has fn main), not a test module
+mod workload_api_admission_tests;
 mod workload_api_jwt_svid_tests;
