@@ -193,6 +193,7 @@ mod tests {
             compiled_stream_match: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            pending_limit_scope: None,
         }
     }
 
@@ -236,6 +237,8 @@ mod tests {
             api_spec_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            k8s_service_uid: None,
+            pending_limit_scope: None,
         }
     }
 

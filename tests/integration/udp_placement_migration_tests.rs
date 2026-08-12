@@ -78,6 +78,14 @@ fn stable(target: UdpPlacement) -> UdpPlacementRequest {
         generation: None,
         from: None,
         to: None,
+        established: None,
+    }
+}
+
+fn stable_attested(target: UdpPlacement, established: UdpPlacement) -> UdpPlacementRequest {
+    UdpPlacementRequest {
+        established: Some(established),
+        ..stable(target)
     }
 }
 
@@ -93,6 +101,7 @@ fn transition(
         generation: Some(generation.to_string()),
         from: Some(from),
         to: Some(to),
+        established: None,
     }
 }
 
@@ -150,6 +159,123 @@ fn legacy_or_fresh_host_placement_requires_explicit_cleanup_proof() {
         .err()
         .expect("host bootstrap without predecessor proof must fail");
     assert!(error.contains("no durable predecessor proof"));
+}
+
+#[test]
+fn rebooted_or_new_node_adopts_the_release_attested_established_placement() {
+    // A node that joined after the migration, or whose tmpfs registry directory
+    // was recreated by a reboot, carries no durable record but provably no
+    // predecessor rules either. Without adoption it would refuse host-netns
+    // forever and never publish readiness.
+    let registry = tempfile::tempdir().expect("registry");
+    assert!(matches!(
+        prepare_placement(
+            registry.path(),
+            &stable_attested(UdpPlacement::HostNetns, UdpPlacement::HostNetns),
+        ),
+        Ok(UdpPlacementDecision::RunStable)
+    ));
+    assert!(
+        ferrum_edge::proxy::udp_placement_migration::snapshot().established_adoption,
+        "adoption must be visible to operators"
+    );
+    // The adoption is durable: a later restart resumes its own record and does
+    // not depend on the attestation staying rendered.
+    assert!(matches!(
+        prepare_placement(registry.path(), &stable(UdpPlacement::HostNetns)),
+        Ok(UdpPlacementDecision::RunStable)
+    ));
+}
+
+#[test]
+fn established_attestation_cannot_authorize_an_in_place_flip_or_a_mismatch() {
+    let registry = tempfile::tempdir().expect("registry");
+    prepare_placement(registry.path(), &stable(UdpPlacement::PodNetns))
+        .expect("pod placement bootstrap");
+    // A PRESENT durable record is never overridden by the attestation.
+    let error = prepare_placement(
+        registry.path(),
+        &stable_attested(UdpPlacement::HostNetns, UdpPlacement::HostNetns),
+    )
+    .err()
+    .expect("attested in-place flip must still fail");
+    assert!(error.contains("unsafe one-step"));
+
+    // An attestation naming a different placement proves nothing about this one.
+    let fresh = tempfile::tempdir().expect("fresh registry");
+    let error = prepare_placement(
+        fresh.path(),
+        &stable_attested(UdpPlacement::HostNetns, UdpPlacement::PodNetns),
+    )
+    .err()
+    .expect("mismatched attestation must fail");
+    assert!(error.contains("no durable predecessor proof"));
+}
+
+#[test]
+fn quarantine_tombstone_refuses_attested_adoption_until_finalize_clears_it() {
+    let registry = tempfile::tempdir().expect("registry");
+    std::fs::write(registry.path().join(".udp-placement-quarantined"), b"")
+        .expect("quarantine tombstone");
+    let attested = stable_attested(UdpPlacement::HostNetns, UdpPlacement::HostNetns);
+    let error = prepare_placement(registry.path(), &attested)
+        .err()
+        .expect("quarantined ownership must refuse adoption");
+    assert!(error.contains("quarantined"));
+    // Every placement is refused, not just the attested host one: the operator
+    // quarantined ownership precisely because it is unknown.
+    let error = prepare_placement(registry.path(), &stable(UdpPlacement::PodNetns))
+        .err()
+        .expect("quarantined ownership must refuse any absent-state bootstrap");
+    assert!(error.contains("quarantined"));
+
+    // Only a proven cleanup/finalize pair clears the quarantine.
+    let cleanup = transition(
+        UdpMigrationPhase::Cleanup,
+        "repair-1",
+        UdpPlacement::PodNetns,
+        UdpPlacement::HostNetns,
+    );
+    let context = cleanup_context(registry.path(), &cleanup);
+    complete_cleanup(&context);
+    assert!(matches!(
+        prepare_placement(
+            registry.path(),
+            &transition(
+                UdpMigrationPhase::Finalize,
+                "repair-1",
+                UdpPlacement::PodNetns,
+                UdpPlacement::HostNetns,
+            ),
+        ),
+        Ok(UdpPlacementDecision::RunStable)
+    ));
+    assert!(
+        !registry.path().join(".udp-placement-quarantined").exists(),
+        "finalize proof must clear the quarantine tombstone"
+    );
+
+    // Model a crash or transient removal failure after the durable finalize
+    // state was written. An idempotent finalize retry must retry its cleanup
+    // side effect instead of returning early and stranding the marker.
+    std::fs::create_dir(registry.path().join(".udp-placement-quarantined"))
+        .expect("empty directory tombstone");
+    assert!(matches!(
+        prepare_placement(
+            registry.path(),
+            &transition(
+                UdpMigrationPhase::Finalize,
+                "repair-1",
+                UdpPlacement::PodNetns,
+                UdpPlacement::HostNetns,
+            ),
+        ),
+        Ok(UdpPlacementDecision::RunStable)
+    ));
+    assert!(
+        !registry.path().join(".udp-placement-quarantined").exists(),
+        "idempotent finalize must retry safe tombstone removal"
+    );
 }
 
 #[test]

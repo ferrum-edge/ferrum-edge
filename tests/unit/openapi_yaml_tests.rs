@@ -6450,6 +6450,7 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
         phase: UdpMigrationStatusPhase::CleaningPodNetns,
         outstanding: 2,
         failure_reason: UdpMigrationFailureReason::GateAcknowledgementMissing,
+        established_adoption: false,
     };
     assert_component_validity(
         &spec,

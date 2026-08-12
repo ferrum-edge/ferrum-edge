@@ -1730,8 +1730,9 @@ fn translate_connection_pool_http(
     // in-flight HTTP/1.1 request cap because reqwest exposes no true
     // connection-pending-queue hook. Validated as a positive integer like the
     // other uint32 knobs (zero would shed every H1 request). Applied at runtime
-    // as a per-`(host, policy port, selected subset)` in-flight gate on the
-    // reqwest/H1 dispatch path (503 "upstream overflow" when full); see
+    // as a per-logical-destination `(namespace, upstream/Service identity,
+    // policy port, selected subset)` in-flight gate on the reqwest/H1 dispatch
+    // path and H3→plain bridge (503 "upstream overflow" when full); see
     // `Proxy.pool_http1_max_pending_requests` and
     // `src/backend_pending_limit.rs`. No longer deferred at top-level/port.
     let http1_max_pending_requests = match http.get("http1MaxPendingRequests") {

@@ -75,6 +75,7 @@ fn service_in(namespace: &str, name: &str) -> MeshService {
                 .expect("valid spiffe id"),
         }],
         protocol_overrides: HashMap::new(),
+        uid: None,
     }
 }
 

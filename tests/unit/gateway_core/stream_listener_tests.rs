@@ -90,6 +90,7 @@ fn create_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
         compiled_stream_match: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        pending_limit_scope: None,
     };
     proxy.resolved_tls = BackendTlsConfig::from_proxy(&proxy);
     proxy

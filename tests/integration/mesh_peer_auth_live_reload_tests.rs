@@ -348,6 +348,7 @@ async fn mesh_peer_auth_live_reload_tcp_tls_swap_takes_effect_on_next_accept() {
         compiled_stream_match: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        pending_limit_scope: None,
     };
     proxy.dispatch_kind = DispatchKind::TcpTls;
 

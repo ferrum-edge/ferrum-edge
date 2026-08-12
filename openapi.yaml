@@ -11528,7 +11528,7 @@ components:
 
     UdpPlacementMigrationStatusSnapshot:
       type: object
-      required: [enabled, phase, outstanding, failure_reason]
+      required: [enabled, phase, outstanding, failure_reason, established_adoption]
       properties:
         enabled:
           type: boolean
@@ -11565,6 +11565,14 @@ components:
             - state_persistence_failed
             - durable_state_rejected
           description: Closed-set node-local failure reason; never includes pod UIDs or generations.
+        established_adoption:
+          type: boolean
+          description: |
+            True when this node started its placement from the release-attested
+            established placement (`FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED`)
+            because it carried no node-local durable record — a fresh node, or a
+            node whose registry directory was recreated by a reboot. False for a
+            node resuming its own durable record and for every migration phase.
 
     NodeWaypointObservabilitySnapshot:
       type: object

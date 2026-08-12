@@ -200,6 +200,12 @@ ambient:
   # Requires nodeAgent.enabled=true. Ambient always shares the node-local
   # pod-registry hostPath with the node-agent so UDP placement ownership and
   # cleanup proof remain durable even when UDP capture itself is disabled.
+  # That hostPath is node-local and boot-scoped on the default `/run/...` path,
+  # so from the first settled release onward the chart also renders
+  # FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED from the INSTALLED
+  # ferrum-mesh-udp-placement-<release> ConfigMap. That lets a rebooted or newly
+  # joined node adopt the already-established placement instead of refusing it
+  # forever. It is never rendered by the release that changes the placement.
   enabled: false
   inboundPort: 15006
   outboundPort: 15001

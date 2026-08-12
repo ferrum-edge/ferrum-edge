@@ -2364,6 +2364,7 @@ mod tests {
             ports: Vec::new(),
             workloads,
             protocol_overrides: HashMap::new(),
+            uid: None,
         }
     }
 
@@ -2800,6 +2801,7 @@ mod tests {
                 ports: Vec::new(),
                 workloads: Vec::new(),
                 protocol_overrides: std::collections::HashMap::new(),
+                uid: None,
             },
         );
 

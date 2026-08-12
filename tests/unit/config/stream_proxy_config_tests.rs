@@ -75,6 +75,7 @@ fn make_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
         compiled_stream_match: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        pending_limit_scope: None,
     }
 }
 
@@ -143,6 +144,7 @@ fn make_http_proxy(id: &str, listen_path: &str) -> Proxy {
         compiled_stream_match: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        pending_limit_scope: None,
     }
 }
 

@@ -94,8 +94,12 @@ In mesh mode, authenticated health detail includes
 asserted-identity decisions, destination-policy rejections, missing destination
 metadata, and blocked plaintext fallback attempts; `enabled` is true only for
 `node_waypoint` topology), and `mesh.udp_placement_migration` (bounded phase,
-outstanding count, and closed-set failure reason for the node-local Ambient UDP
-placement guard; no generation or pod UID is exposed). The authenticated `/overload`
+outstanding count, closed-set failure reason, and an `established_adoption` flag
+for the node-local Ambient UDP placement guard; no generation or pod UID is
+exposed). `established_adoption` is true when the node had no durable placement
+record and started from the release-attested established placement
+(`FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED`) — expected for a fresh node or
+one whose registry directory was recreated by a reboot. The authenticated `/overload`
 snapshot also includes `node_waypoint_drops`, with monotonic counters for
 missing/unknown socket-cookie metadata, missing pod/workload identity data,
 unknown pods, and workload-hash mismatches. These fields are omitted from the
