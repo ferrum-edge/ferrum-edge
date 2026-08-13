@@ -253,19 +253,19 @@ impl HbonePoolError {
     /// Whether this error is affirmative evidence that the selected peer
     /// cannot establish HBONE with the configured identity/TLS contract.
     ///
-    /// DNS, TCP reachability, and post-TLS HTTP/2 preface/handshake errors
-    /// fail the current request closed, but they are not capability evidence.
-    /// `H2Handshake` is reached only after TLS (including ALPN) already
-    /// succeeded; peer restart, EOF, or reset during the H2 handshake is
-    /// transient transport loss. Marking any of these `Unsupported` would make
-    /// a rolling peer restart permanent: the dispatch gate suppresses every
-    /// later tunnel attempt, so live traffic can never prove recovery.
+    /// DNS and TCP reachability errors fail the current request closed, but
+    /// they are not capability evidence. An HTTP/2 handshake failure occurs
+    /// after TLS and ALPN succeeded, so it is affirmative evidence that the
+    /// selected peer is not currently capable of speaking HBONE. Caching that
+    /// result prevents every request from repeating the expensive handshake;
+    /// the periodic capability probe can prove recovery later.
     pub fn is_capability_failure(&self) -> bool {
         match self {
             Self::NoSvid
             | Self::NoLeafCert
             | Self::InvalidServerName { .. }
-            | Self::TlsConfig(_) => true,
+            | Self::TlsConfig(_)
+            | Self::H2Handshake { .. } => true,
             Self::TlsHandshake { source, .. } => tls_handshake_is_capability_failure(source),
             _ => false,
         }
@@ -3645,8 +3645,8 @@ mod tests {
             message: "peer reset connection during HTTP/2 preface".to_string(),
         };
         assert!(
-            !h2_failure.is_capability_failure(),
-            "post-TLS H2 handshake loss during peer restart must preserve prior capability"
+            h2_failure.is_capability_failure(),
+            "post-TLS H2 handshake failure must dampen repeated attempts against a bad peer"
         );
 
         let tls_reset_error = std::io::Error::new(
