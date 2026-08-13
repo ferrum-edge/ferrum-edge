@@ -175,6 +175,8 @@ fn sd_upstream() -> Upstream {
             consul: None,
             mesh: None,
             default_weight: 1,
+            max_stale_seconds: None,
+            stale_policy: None,
         }),
         subsets: None,
         port_overrides: HashMap::new(),
@@ -193,6 +195,8 @@ fn sd_upstream() -> Upstream {
         api_spec_id: None,
         created_at: now,
         updated_at: now,
+        k8s_service_uid: None,
+        pending_limit_scope: None,
     }
 }
 
@@ -305,6 +309,8 @@ fn prepared_mesh_sd_with_dr(stamp: chrono::DateTime<Utc>, idle_ms: u64) -> Gatew
             topology: Default::default(),
         }),
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     upstream.created_at = stamp;
     upstream.updated_at = stamp;

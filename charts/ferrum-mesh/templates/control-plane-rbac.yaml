@@ -19,7 +19,17 @@ rules:
       - udproutes
       - referencegrants
       - backendtlspolicies
+      - backendlbpolicies
       - listenersets
+    verbs: ["get", "list", "watch"]
+  # GEP-1619 session persistence. On the pinned v1.5.1 experimental channel
+  # `BackendLBPolicy` was replaced by `XBackendTrafficPolicy` in its own API
+  # group, so the grant above does not cover it. Without this rule the watcher
+  # this controller always starts is rejected 403 on every list and retries for
+  # the life of the process, which is watch pressure the reconciler pays for.
+  - apiGroups: ["gateway.networking.x-k8s.io"]
+    resources:
+      - xbackendtrafficpolicies
     verbs: ["get", "list", "watch"]
   # GEP-1748: MCS ServiceImport backendRef targets (skipped when CRD absent).
   - apiGroups: ["multicluster.x-k8s.io"]
@@ -50,12 +60,17 @@ rules:
       # (`status.ancestors[]`). The writer reads live status first so
       # third-party controllers' ancestors are preserved.
       - backendtlspolicies/status
+      - backendlbpolicies/status
       - listenersets/status
     # The status writer reads live status before merge-patching so it can
     # preserve non-Ferrum conditions. Newer kube-rs SSA paths may fall
     # back to `update status` after a 409 conflict, and the Gateway API
     # conformance docs reference both verbs. Granting both now keeps the
     # chart stable if we move to server-side apply.
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["gateway.networking.x-k8s.io"]
+    resources:
+      - xbackendtrafficpolicies/status
     verbs: ["get", "patch", "update"]
   {{- end }}
   {{- if .Values.controlPlane.rbac.istio }}

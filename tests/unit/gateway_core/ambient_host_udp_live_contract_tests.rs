@@ -72,18 +72,17 @@ fn ambient_host_udp_live_workflow_is_unconditional_with_a_trusted_base_relevance
         "merge-group runs must bind relevance to the event's base SHA"
     );
 
-    // Bootstrap: origin/main does not yet know the `ambient-host-udp` suite, so
-    // the introducing pull request must still run the live suite. Only that
-    // exact unknown-suite rejection may force relevance; everything else fails
-    // closed.
+    // The introducing bootstrap is gone now that main knows the suite. The
+    // permanent path must execute the trusted classifier directly and must not
+    // retain an stderr-shaped exception that could force relevance on failure.
     assert!(
-        workflow.contains("invalid choice: 'ambient-host-udp'"),
-        "the introducing pull request must force relevance on the exact \
-         unknown-suite classifier rejection"
+        workflow.contains("plan=\"$(python3 -I \"$trusted_filter\" \"${filter_args[@]}\")\""),
+        "the permanent relevance path must execute the immutable trusted-base classifier"
     );
     assert!(
-        workflow.contains("::error::trusted relevance filter failed"),
-        "every other classifier failure must fail closed"
+        !workflow.contains("invalid choice: 'ambient-host-udp'")
+            && !workflow.contains("filter_err="),
+        "the one-time unknown-suite bootstrap must be fully removed"
     );
 
     assert!(
@@ -101,6 +100,20 @@ fn ambient_host_udp_live_workflow_is_unconditional_with_a_trusted_base_relevance
     assert!(
         workflow.contains("${{ needs.ambient-host-udp-live.result }}\" != \"success\""),
         "the gate must fail when a relevant live job fails or is absent"
+    );
+
+    // The separately trusted verifier freezes both the relevance block above
+    // and its binding to the live job. This pull request intentionally makes
+    // its own base-loaded policy check red, but once merged no later pull
+    // request can rewrite the gate to self-declare irrelevance.
+    let cross_policy = read(".github/scripts/verify_cross_build_policy.py");
+    assert!(
+        cross_policy.contains(
+            "\"ambient-host-udp-live.yml\": (\n        \"changes\",\n        \
+             \"ambient-host-udp-live\",\n        \"Ambient host-UDP trigger\",\n        \
+             \"ambient-host-udp\",\n        \"ambient-host-udp\",\n    ),"
+        ),
+        "the trusted cross-policy verifier must freeze the Ambient host-UDP relevance contract"
     );
 }
 
@@ -178,6 +191,221 @@ fn ambient_host_udp_live_runner_fail_closed_and_bounded_diagnostics() {
     assert!(
         runner.contains("expected exactly 1 ambient host-UDP functional live test"),
         "runner must pin the functional live pass count"
+    );
+}
+
+/// #3804: the disposable outer netns is the ordinary ownership boundary.
+/// Ordinary teardown must not delete canonical host objects; isolation is
+/// proven structurally; early SKIP paths stay network-inert; the privileged
+/// lock is rooted safely; and lock FD open never uses eval.
+#[test]
+fn ambient_host_udp_live_runner_uses_disposable_outer_netns_ownership_boundary() {
+    let runner = read("tests/k8s/ambient_host_udp_live/run.sh");
+    let readme = read("tests/k8s/ambient_host_udp_live/README.md");
+
+    // Early SKIP / preflight before lock or outer-netns creation.
+    let early_main = runner
+        .find("# Temp cleanup only until the exclusive lock is held")
+        .expect("main-path early temp cleanup marker must exist");
+    let preflight = runner
+        .find("SKIP: throwaway netns / mangle preflight failed")
+        .expect("mangle preflight SKIP must remain");
+    let lock_gate = runner
+        .find("# --- From here on: exclusive lock, then disposable outer netns")
+        .expect("post-preflight lock gate marker must exist");
+    let outer = runner
+        .find("unshare --mount --net --propagation private")
+        .expect("ordinary root execution must create a disposable outer netns");
+    assert!(
+        early_main < preflight && preflight < lock_gate && lock_gate < outer,
+        "preflight, then lock, then outer netns creation must stay ordered"
+    );
+    assert!(
+        runner.contains("trap early_temp_cleanup EXIT")
+            && runner.contains("SKIP: not root")
+            && runner.contains("SKIP: $bin unavailable")
+            && runner.contains("SKIP: throwaway netns / mangle preflight failed"),
+        "early SKIP paths must remain available before mutation"
+    );
+    assert!(
+        !runner.contains("trap cleanup_trap EXIT"),
+        "the old unconditional cleanup_trap must not remain"
+    );
+
+    // Structural isolation proof — never trust an env flag alone.
+    assert!(
+        runner.contains("prove_disposable_outer_netns")
+            && runner.contains("/proc/1/ns/net")
+            && runner.contains("still in the init/host network namespace")
+            && runner.contains("still in the parent network namespace"),
+        "outer-netns isolation must be proven via self vs parent/init identities"
+    );
+    assert!(
+        runner.contains("mount_and_prove_disposable_sysfs")
+            && runner.contains("mount -t sysfs -o ro,nosuid,nodev,noexec sysfs /sys")
+            && runner.contains("ip link add \"$probe_host\" type veth peer name \"$probe_peer\"")
+            && runner.contains("disposable sysfs view does not track the owned network namespace")
+            && runner.contains("disposable sysfs view retained a removed namespace probe"),
+        "the private mount namespace must expose a freshly mounted sysfs tied to the owned netns"
+    );
+    assert!(
+        runner.contains("Do not trust FERRUM_HOST_UDP_LIVE_IN_OUTER_NETNS")
+            || runner.contains("never trusted as proof"),
+        "forgeable IN_OUTER_NETNS env flags must not be the isolation proof"
+    );
+    assert!(
+        !runner.contains("IN_OUTER_NETNS=\"${FERRUM_HOST_UDP_LIVE_IN_OUTER_NETNS"),
+        "runner must not gate ownership on a forgeable IN_OUTER_NETNS env value"
+    );
+
+    // Fixed shared-filesystem lock before outer netns; safe dynamic FD, no eval.
+    assert!(
+        runner.contains("flock -n")
+            && runner.contains("/run/ferrum-edge-ambient-host-udp-live.lock")
+            && runner
+                .contains("another ambient_host_udp_live owner already holds the exclusive lock"),
+        "a second fixture invocation must fail before mutation via the fixed exclusive lock"
+    );
+    assert!(
+        runner.contains("exec {LOCK_FD}>\"$FERRUM_HOST_UDP_LIVE_LOCK_PATH\"")
+            && runner.contains("exec {LOCK_FD}>&-")
+            && !runner.contains("eval \"exec"),
+        "lock FD open/close must use safe Bash dynamic-FD redirection without eval"
+    );
+    assert!(
+        runner.contains("ignoring FERRUM_HOST_UDP_LIVE_LOCK_DIR")
+            && runner.contains("lock path is fixed"),
+        "configurable lock directories must not be accepted as hostile-input surface"
+    );
+    assert!(
+        runner.contains("stat -Lc '%u:%a'")
+            && runner.contains("root-owned and not group/world-writable")
+            && runner.contains("must be a regular file, never a symlink")
+            && runner.contains("must be root-owned and mode 0600")
+            && runner.contains("umask 077")
+            && !runner.contains("/tmp/ferrum-host-udp-live-locks"),
+        "the root-opened lock must not be redirectable through attacker-owned /tmp state"
+    );
+
+    // Ordinary teardown never deletes canonical networking objects.
+    assert!(
+        runner.contains("ordinary_exit_cleanup")
+            && runner.contains("must NEVER enumerate or delete"),
+        "ordinary cleanup must document the no-host-object-deletion contract"
+    );
+    assert!(
+        !runner.contains("ownership_safe_cleanup")
+            && !runner.contains("remove_owned_object")
+            && !runner.contains("write_ownership_ledger")
+            && !runner.contains("list_canonical_host_udp_objects"),
+        "per-object ledger deletion is not the ordinary ownership model"
+    );
+    let ordinary = runner
+        .find("ordinary_exit_cleanup()")
+        .expect("ordinary_exit_cleanup definition");
+    let emergency = runner
+        .find("emergency_destroy_canonical()")
+        .expect("emergency_destroy_canonical definition");
+    let ordinary_body = &runner[ordinary..emergency];
+    assert!(
+        !ordinary_body.contains("iptables -t mangle -D")
+            && !ordinary_body.contains("ip6tables -t mangle -D")
+            && !ordinary_body.contains("ip rule del")
+            && !ordinary_body.contains("ip route del"),
+        "ordinary_exit_cleanup must not delete iptables/rules/routes"
+    );
+
+    // Handled signals terminate and reap the complete owned child process
+    // group before ordinary (non-destructive) cleanup releases the lock.
+    assert!(
+        runner.contains("setsid unshare --mount --net --propagation private")
+            && runner.contains("OUTER_PID=$!")
+            && runner.contains("kill -TERM -- \"-$outer_pid\"")
+            && runner.contains("kill -KILL -- \"-$outer_pid\"")
+            && runner.contains("wait \"$outer_pid\"")
+            && runner.contains("trap 'handle_outer_signal 130' INT")
+            && runner.contains("trap 'handle_outer_signal 143' TERM")
+            && runner.contains("trap 'handle_outer_signal 129' HUP"),
+        "INT/TERM/HUP must terminate and reap the child tree before lock release"
+    );
+    assert!(
+        runner.contains("trap 'early_temp_cleanup; exit 130' INT")
+            && runner.contains("trap 'early_temp_cleanup; exit 143' TERM")
+            && runner.contains("trap 'early_temp_cleanup; exit 129' HUP"),
+        "inner fixture signals must stay temp-only"
+    );
+
+    // Emergency destroy is explicit, loud, and never the ordinary exit path.
+    assert!(
+        runner.contains("FERRUM_HOST_UDP_LIVE_EMERGENCY_DESTROY_CANONICAL")
+            && runner.contains("emergency_destroy_canonical")
+            && runner.contains("this path is never reached from ordinary fixture exits"),
+        "emergency canonical destroy must be an explicit opt-in path"
+    );
+    // Emergency path still covers IPv4 and IPv6 symmetrically.
+    assert!(
+        runner.contains("iptables -t mangle -D PREROUTING")
+            && runner.contains("ip6tables -t mangle -D PREROUTING")
+            && runner.contains("ip rule del priority 101 lookup 33135")
+            && runner.contains("ip -6 rule del priority 101 lookup 33135")
+            && runner.contains("ip route del local 0.0.0.0/0")
+            && runner.contains("ip -6 route del local ::/0"),
+        "emergency destroy must cover v4/v6 chains, jumps, rules, and routes"
+    );
+    assert!(
+        readme.contains("FERRUM_HOST_UDP_LIVE_EMERGENCY_DESTROY_CANONICAL")
+            && readme.contains("never armed by ordinary exits"),
+        "README must document the emergency destroy separately from ordinary runs"
+    );
+    assert!(
+        !readme.contains("unconditionally removes Ferrum-owned host UDP state")
+            && !readme.contains("tears that proxy's capture path down"),
+        "README must not document an ordinary run as tearing down a live proxy"
+    );
+    assert!(
+        readme.contains("disposable outer network namespace is the ordinary ownership boundary")
+            && readme.contains("never enumerates or deletes")
+            && readme.contains("structurally")
+            && readme.contains("fresh read-only sysfs instance")
+            && readme.contains("disposable veth probe"),
+        "README must describe the outer-netns ownership boundary and structural proof"
+    );
+
+    // IPv4 and IPv6 live coverage stay pinned by the runner's pass counts.
+    assert!(
+        runner.contains("expected exactly 2 ambient host-UDP lib live tests")
+            && runner.contains("expected exactly 1 ambient host-UDP functional live test"),
+        "runner must keep dual-stack live pass-count pins"
+    );
+}
+
+/// #3804: hosted execution must enforce the disposable outer netns boundary
+/// without rewriting the trusted relevance block owned by PR #3800.
+#[test]
+fn ambient_host_udp_live_workflow_enforces_outer_netns_without_touching_relevance() {
+    let workflow = read(".github/workflows/ambient-host-udp-live.yml");
+
+    assert!(
+        workflow.contains("unshare --net")
+            && workflow
+                .contains("Explicit hosted disposable outer network-namespace boundary (#3804)"),
+        "hosted live execution must wrap run.sh in a disposable outer netns"
+    );
+    assert!(
+        !workflow.contains("FERRUM_HOST_UDP_LIVE_IN_OUTER_NETNS"),
+        "hosted workflow must not rely on a forgeable IN_OUTER_NETNS env flag"
+    );
+    assert!(
+        workflow.contains("trusted relevance / `changes` job above")
+            && workflow.contains("is untouched"),
+        "the outer-netns wrap must document composition with the #3800 relevance freeze"
+    );
+    // Relevance block markers from the trusted-base classifier must remain.
+    assert!(
+        workflow.contains("git cat-file blob \"$entry_object\" > \"$trusted_filter\"")
+            && workflow.contains("python3 -I \"$trusted_filter\" --self-test")
+            && !workflow.contains("python3 .github/scripts/live_suite_path_filter.py"),
+        "the trusted relevance block must remain intact"
     );
 }
 

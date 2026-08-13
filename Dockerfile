@@ -20,6 +20,9 @@ ARG FEATURES=cloud-secrets
 ARG RUNTIME_BASE=gcr.io/distroless/cc-debian13:nonroot
 ARG IPROUTE2_BASE=debian:13-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2
 ARG IPROUTE2_VERSION=6.15.0-1
+ARG BPF_LINKER_VERSION=0.11.0
+ARG BPF_LINKER_AMD64_SHA256=10f62ba9ab7e544d538370552660efcb4f1a19153d5752bbf0f6b51f3bada450
+ARG BPF_LINKER_ARM64_SHA256=d09ddd83303e9ab1443f51e0e284680154009646a3ce141c63d838ee61b73eb9
 
 # --- eBPF build stage (nightly, Linux only) ---
 # Compiles the no_std `ferrum-ebpf` crate to a BPF ELF using nightly +
@@ -36,8 +39,34 @@ ARG IPROUTE2_VERSION=6.15.0-1
 # is honored (and install rust-src on that pinned toolchain). core-only
 # build-std matches the crate's `#![no_std]` + `panic = "abort"`.
 FROM rust:latest AS ebpf-builder
+ARG TARGETARCH
+ARG BPF_LINKER_VERSION
+ARG BPF_LINKER_AMD64_SHA256
+ARG BPF_LINKER_ARM64_SHA256
+# Use the upstream static release instead of compiling bpf-linker against the
+# mutable LLVM installation in rust:latest. Both architecture-specific assets
+# and their SHA-256 digests are pinned above.
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+        amd64) asset_arch=x86_64; asset_sha="${BPF_LINKER_AMD64_SHA256}" ;; \
+        arm64) asset_arch=aarch64; asset_sha="${BPF_LINKER_ARM64_SHA256}" ;; \
+        *) echo "unsupported bpf-linker architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl zstd; \
+    rm -rf /var/lib/apt/lists/*; \
+    archive=/tmp/bpf-linker.tar.zst; \
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
+        --connect-timeout 30 --max-time 300 \
+        -o "${archive}" \
+        "https://github.com/aya-rs/bpf-linker/releases/download/v${BPF_LINKER_VERSION}/bpf-linker-${asset_arch}-unknown-linux-musl.tar.zst"; \
+    printf '%s  %s\n' "${asset_sha}" "${archive}" | sha256sum --check --strict; \
+    tar --zstd -xf "${archive}" -C /usr/local/bin bpf-linker; \
+    chmod 0755 /usr/local/bin/bpf-linker; \
+    rm -f "${archive}"; \
+    bpf-linker --version
 RUN rustup toolchain install nightly --component rust-src \
-    && cargo +nightly install bpf-linker --locked
+    && rustup run nightly rustc --version
 COPY ebpf/ /build/ebpf/
 WORKDIR /build/ebpf
 RUN cargo +nightly build \

@@ -808,6 +808,22 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         return 1;
     }
 
+    // Publish the bounded discovery staleness policy on the same seam, so an
+    // expiry policy can never be resolved from defaults after a poller started.
+    if let Err(e) = crate::service_discovery::health::install_discovery_staleness_policy(
+        crate::config::env_config::DiscoveryStalenessPolicy {
+            max_stale_seconds: env_config.service_discovery_max_stale_seconds,
+            policy: env_config.service_discovery_stale_policy,
+            allow_unbounded: env_config.service_discovery_allow_unbounded_stale,
+        },
+    ) {
+        error!(
+            "Configuration error: {}",
+            secrets::redact_external_secret_values(&e)
+        );
+        return 1;
+    }
+
     // Apply the delayed-work admission budget before any listener can accept
     // traffic, so a fault-injection delay is never admitted against the
     // compiled-in default when the operator configured a smaller bound.

@@ -6,12 +6,14 @@ usage() {
   printf '%s\n' \
     'Usage: dispatch-agent.sh --worktree ABS_PATH --prompt-file ABS_PATH' \
     '                         --effort low|medium|high|xhigh|max' \
+    '                         [--fast]' \
     "                         [--model 'claude-opus-5[1m]'|'opus[1m]']" >&2
 }
 
 worktree=''
 prompt_file=''
 effort=''
+fast='false'
 model='claude-opus-5[1m]'
 
 while (($#)); do
@@ -42,6 +44,10 @@ while (($#)); do
       fi
       effort=${2-}
       shift 2
+      ;;
+    --fast)
+      fast='true'
+      shift
       ;;
     --model)
       if (($# < 2)); then
@@ -92,10 +98,14 @@ if [[ "$prompt_file" != /* || ! -f "$prompt_file" ]]; then
   exit 2
 fi
 
-if ! command -v claude >/dev/null 2>&1; then
-  printf 'claude is not installed or not on PATH\n' >&2
-  exit 127
-fi
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+# shellcheck source=../../_lib/resolve-agent-bin.sh
+. "$script_dir/../../_lib/resolve-agent-bin.sh"
+
+claude_bin=$(resolve_agent_bin claude CLAUDE_BIN \
+  "${HOME}/.local/bin/claude" \
+  /opt/homebrew/bin/claude \
+  /usr/local/bin/claude)
 
 repo_root=$(git -C "$worktree" rev-parse --show-toplevel)
 physical_worktree=$(cd "$worktree" && pwd -P)
@@ -113,9 +123,18 @@ unset CLAUDE_CODE_DISABLE_1M_CONTEXT
 unset CLAUDE_CODE_DISABLE_THINKING
 unset MAX_THINKING_TOKENS
 
-exec claude -p \
+fast_settings='{"fastMode":false}'
+if [[ "$fast" == 'true' ]]; then
+  fast_settings='{"fastMode":true}'
+fi
+
+printf '[opus-agents] dispatch model=%s effort=%s fast=%s worktree=%s bin=%s\n' \
+  "$model" "$effort" "$fast" "$physical_worktree" "$claude_bin" >&2
+
+exec "$claude_bin" -p \
   --model "$model" \
   --effort "$effort" \
+  --settings "$fast_settings" \
   --permission-mode bypassPermissions \
   --output-format text \
   --verbose \

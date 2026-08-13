@@ -4787,6 +4787,7 @@ fn mesh_services_from_gateway(
                 // Gateway listeners are not ClusterIP services; raw-TCP
                 // egress VIP mapping does not apply to them.
                 cluster_ips: Vec::new(),
+                uid: None,
             });
             acc.gateway_api_materialized_gateway_listeners
                 .insert(listener_key);

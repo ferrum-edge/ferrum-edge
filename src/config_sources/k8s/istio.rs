@@ -61,9 +61,12 @@ pub(super) fn translate(
 ) -> Result<bool, K8sTranslateError> {
     match object.kind.as_str() {
         "AuthorizationPolicy" => {
-            acc.mesh
-                .mesh_policies
-                .push(authorization_policy(acc, object)?);
+            let policy = authorization_policy(acc, object)?;
+            // Bind the resolved CUSTOM provider onto the published mesh in the
+            // SAME step that admits the policy, so a generation can never carry
+            // a CUSTOM policy whose provider is absent.
+            record_custom_action_providers(acc, object, &policy)?;
+            acc.mesh.mesh_policies.push(policy);
             Ok(true)
         }
         "PeerAuthentication" => {
@@ -131,6 +134,9 @@ fn authorization_policy(
         "ALLOW" => PolicyAction::Allow,
         "DENY" => PolicyAction::Deny,
         "AUDIT" => PolicyAction::Audit,
+        "CUSTOM" => PolicyAction::Custom {
+            provider: resolve_custom_action_provider(acc, object)?,
+        },
         other => {
             return Err(invalid_resource(
                 object,
@@ -138,6 +144,13 @@ fn authorization_policy(
             ));
         }
     };
+    let is_custom = matches!(action, PolicyAction::Custom { .. });
+    if !is_custom && object.spec.get("provider").is_some() {
+        return Err(invalid_resource(
+            object,
+            "AuthorizationPolicy provider is only valid with action CUSTOM",
+        ));
+    }
 
     let has_selector = object.spec.get("selector").is_some();
     let has_target_refs = object.spec.get("targetRefs").is_some();
@@ -163,7 +176,17 @@ fn authorization_policy(
         .into_iter()
         .flatten()
     {
-        rules.extend(mesh_rules(object, rule, action)?);
+        rules.extend(mesh_rules(object, rule, &action)?);
+    }
+    if is_custom && rules.is_empty() {
+        // Istio refuses a CUSTOM policy without rules, and so must Ferrum: a
+        // ruleless CUSTOM policy has no matching surface, so admitting one
+        // would produce an accepted-but-inert delegation — exactly the
+        // fail-open shape this issue exists to remove.
+        return Err(invalid_resource(
+            object,
+            "AuthorizationPolicy with action CUSTOM requires at least one rule",
+        ));
     }
     if rules.is_empty() && action == PolicyAction::Allow {
         tracing::warn!(
@@ -180,6 +203,166 @@ fn authorization_policy(
         scope,
         rules,
     })
+}
+
+/// Resolve `AuthorizationPolicy.spec.provider.name` for `action: CUSTOM`
+/// (issue #3235).
+///
+/// Every failure mode is DISTINCT and field-shaped so an operator can tell a
+/// typo from an unsupported provider variant from a missing meshConfig entry:
+///
+/// * absent / non-object / unknown-field `provider` block
+/// * empty, over-long, or non-string `provider.name`
+/// * a name declared as `envoyExtAuthzGrpc` (a variant Ferrum refuses)
+/// * a name declared as some other provider kind (e.g. a tracing provider)
+/// * a name not declared in `meshConfig.extensionProviders` at all
+///
+/// The lookup is against the ROOT-namespace meshConfig registry only, so a
+/// tenant namespace can never introduce (or shadow) a provider — cross-namespace
+/// provider resolution is structurally impossible rather than filtered.
+fn resolve_custom_action_provider(
+    acc: &K8sAccumulator,
+    object: &K8sObject,
+) -> Result<String, K8sTranslateError> {
+    use crate::modes::mesh::config::{
+        MAX_MESH_EXT_AUTHZ_NAME_LEN, sanitize_mesh_ext_authz_diagnostic,
+    };
+
+    let Some(provider) = object.spec.get("provider") else {
+        return Err(invalid_resource(
+            object,
+            "AuthorizationPolicy with action CUSTOM requires provider.name",
+        ));
+    };
+    let Some(provider_object) = provider.as_object() else {
+        return Err(invalid_resource(
+            object,
+            "AuthorizationPolicy provider must be an object",
+        ));
+    };
+    for key in provider_object.keys() {
+        if key != "name" {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "AuthorizationPolicy provider does not support field '{}'",
+                    sanitize_mesh_ext_authz_diagnostic(key)
+                ),
+            ));
+        }
+    }
+    let name = match provider_object.get("name") {
+        Some(Value::String(name)) => name.trim(),
+        Some(_) => {
+            return Err(invalid_resource(
+                object,
+                "AuthorizationPolicy provider.name must be a string",
+            ));
+        }
+        None => {
+            return Err(invalid_resource(
+                object,
+                "AuthorizationPolicy with action CUSTOM requires provider.name",
+            ));
+        }
+    };
+    if name.is_empty() {
+        return Err(invalid_resource(
+            object,
+            "AuthorizationPolicy provider.name must be non-empty",
+        ));
+    }
+    if name.len() > MAX_MESH_EXT_AUTHZ_NAME_LEN {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "AuthorizationPolicy provider.name must be at most {MAX_MESH_EXT_AUTHZ_NAME_LEN} characters"
+            ),
+        ));
+    }
+
+    if acc.mesh_config_registry.ext_authz_provider(name).is_some() {
+        return Ok(name.to_string());
+    }
+    let display = sanitize_mesh_ext_authz_diagnostic(name);
+    let root_namespace = &acc.options.istio_root_namespace;
+    if acc
+        .mesh_config_registry
+        .is_unsupported_ext_authz_provider(name)
+    {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "AuthorizationPolicy provider.name '{display}' is declared in meshConfig as an external authorization provider variant Ferrum does not implement (only envoyExtAuthzHttp is supported)"
+            ),
+        ));
+    }
+    if acc.mesh_config_registry.is_known_non_tracing_provider(name)
+        || acc.mesh_config_registry.tracing_provider(name).is_some()
+    {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "AuthorizationPolicy provider.name '{display}' is declared in meshConfig but is not an external authorization provider"
+            ),
+        ));
+    }
+    Err(invalid_resource(
+        object,
+        format!(
+            "AuthorizationPolicy provider.name '{display}' is not declared in meshConfig.extensionProviders in the Istio root namespace '{root_namespace}'"
+        ),
+    ))
+}
+
+/// Copy every provider a freshly admitted policy binds onto the published mesh.
+///
+/// Idempotent and order-independent: the same provider referenced by several
+/// policies is recorded once. A conflicting redefinition is impossible here
+/// because the registry itself refuses divergent duplicates.
+fn record_custom_action_providers(
+    acc: &mut K8sAccumulator,
+    object: &K8sObject,
+    policy: &MeshPolicy,
+) -> Result<(), K8sTranslateError> {
+    use crate::modes::mesh::config::MAX_MESH_EXT_AUTHZ_PROVIDERS;
+
+    for rule in &policy.rules {
+        let Some(name) = rule.action.custom_provider() else {
+            continue;
+        };
+        if acc
+            .mesh
+            .ext_authz_providers
+            .iter()
+            .any(|provider| provider.name == name)
+        {
+            continue;
+        }
+        let Some(provider) = acc.mesh_config_registry.ext_authz_provider(name).cloned() else {
+            // Unreachable through `authorization_policy` (the action only
+            // resolves against an admitted provider), but a lookup that
+            // silently produced nothing would publish an unbindable CUSTOM
+            // policy, so fail closed rather than assume.
+            return Err(invalid_resource(
+                object,
+                "AuthorizationPolicy CUSTOM provider could not be resolved",
+            ));
+        };
+        if acc.mesh.ext_authz_providers.len() >= MAX_MESH_EXT_AUTHZ_PROVIDERS {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "mesh external authorization providers are limited to {MAX_MESH_EXT_AUTHZ_PROVIDERS} entries"
+                ),
+            ));
+        }
+        acc.mesh.ext_authz_providers.push(provider);
+    }
+    acc.mesh
+        .ext_authz_providers
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(())
 }
 
 const AUTHZ_TARGET_REF_MAX: usize = crate::modes::mesh::config::MAX_POLICY_TARGET_REFS;
@@ -478,7 +661,7 @@ fn allow_nothing_rule() -> MeshRule {
 fn mesh_rules(
     object: &K8sObject,
     rule: &Value,
-    action: PolicyAction,
+    action: &PolicyAction,
 ) -> Result<Vec<MeshRule>, K8sTranslateError> {
     let sources: Vec<&Value> = rule
         .get("from")
@@ -544,7 +727,7 @@ fn mesh_rules(
             not_request_principals: Vec::new(),
             source_negation: SourceNegationMatch::default(),
             never_matches: false,
-            action,
+            action: action.clone(),
         }]);
     }
 
@@ -559,7 +742,7 @@ fn mesh_rules(
                 not_request_principals: string_array(source, "notRequestPrincipals"),
                 source_negation: source_negation_match(object, source)?,
                 never_matches: false,
-                action,
+                action: action.clone(),
             })
         })
         .collect()
@@ -1730,8 +1913,9 @@ fn translate_connection_pool_http(
     // in-flight HTTP/1.1 request cap because reqwest exposes no true
     // connection-pending-queue hook. Validated as a positive integer like the
     // other uint32 knobs (zero would shed every H1 request). Applied at runtime
-    // as a per-`(host, policy port, selected subset)` in-flight gate on the
-    // reqwest/H1 dispatch path (503 "upstream overflow" when full); see
+    // as a per-logical-destination `(namespace, upstream/Service identity,
+    // policy port, selected subset)` in-flight gate on the reqwest/H1 dispatch
+    // path and H3→plain bridge (503 "upstream overflow" when full); see
     // `Proxy.pool_http1_max_pending_requests` and
     // `src/backend_pending_limit.rs`. No longer deferred at top-level/port.
     let http1_max_pending_requests = match http.get("http1MaxPendingRequests") {

@@ -1,4 +1,4 @@
 interface:
-  display_name: "Grok 4.5 Agents"
-  short_description: "Orchestrate local Cursor Grok 4.5 coding agents"
-  default_prompt: "Use $grok-agents to dispatch Cursor Grok 4.5 agents for this Ferrum Edge task."
+  display_name: "Grok 4.6 Agents"
+  short_description: "Orchestrate local Cursor Grok 4.6 coding agents"
+  default_prompt: "Use $grok-agents to dispatch Cursor Grok 4.6 agents for this Ferrum Edge task."

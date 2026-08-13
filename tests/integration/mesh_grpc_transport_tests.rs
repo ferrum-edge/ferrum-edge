@@ -197,6 +197,7 @@ fn grpc_proxy_for_test() -> Proxy {
         compiled_stream_match: None,
         created_at: now,
         updated_at: now,
+        pending_limit_scope: None,
     }
 }
 
@@ -246,7 +247,19 @@ enum GrpcPeerBehavior {
     /// Observe the request and never answer. Used to prove the client
     /// `grpc-timeout` deadline is honored over the mesh transport.
     NeverRespond,
+    /// Drain the upload, then answer with an APPLICATION-LEVEL failure: HTTP 200
+    /// plus a terminal `grpc-status: 9` (FAILED_PRECONDITION), a `grpc-message`,
+    /// and a custom non-hop-by-hop trailer. A mesh transport must relay this
+    /// verbatim rather than collapsing it into a gateway-authored UNAVAILABLE
+    /// (issue #3728 acceptance: "non-zero upstream `grpc-status` and trailers are
+    /// returned unchanged").
+    RespondWithNonZeroStatus,
 }
+
+/// The application-level failure `RespondWithNonZeroStatus` answers with.
+const PEER_FAILED_PRECONDITION: &str = "9";
+const PEER_FAILURE_MESSAGE: &str = "upstream refused the RPC";
+const PEER_CUSTOM_TRAILER: &str = "real-http2-trailer";
 
 /// Serve exactly ONE gRPC RPC over an already-established byte stream: observe
 /// the request, then answer per `behavior`.
@@ -380,8 +393,23 @@ async fn serve_grpc_stream(
     }
 
     let mut trailers = HeaderMap::new();
-    trailers.insert("grpc-status", "0".parse().expect("status value"));
-    trailers.insert("grpc-message", "ok".parse().expect("message value"));
+    if behavior == GrpcPeerBehavior::RespondWithNonZeroStatus {
+        trailers.insert(
+            "grpc-status",
+            PEER_FAILED_PRECONDITION.parse().expect("status"),
+        );
+        trailers.insert(
+            "grpc-message",
+            PEER_FAILURE_MESSAGE.parse().expect("message"),
+        );
+        trailers.insert(
+            "x-mesh-peer-trailer",
+            PEER_CUSTOM_TRAILER.parse().expect("trailer"),
+        );
+    } else {
+        trailers.insert("grpc-status", "0".parse().expect("status value"));
+        trailers.insert("grpc-message", "ok".parse().expect("message value"));
+    }
     send.send_trailers(trailers).expect("send trailers");
 }
 
@@ -1322,5 +1350,81 @@ async fn grpc_over_ambient_hbone_honors_the_client_deadline() {
     assert!(
         observed.grpc_timeout.is_some(),
         "the client deadline must be propagated to the destination as `grpc-timeout`"
+    );
+}
+
+/// A NON-ZERO upstream `grpc-status`, its `grpc-message`, and a custom
+/// non-hop-by-hop trailer must relay over the Ambient HBONE tunnel unchanged
+/// (issue #3728 acceptance). Collapsing an application-level failure into a
+/// gateway-authored UNAVAILABLE would make an Ambient destination's errors
+/// indistinguishable from a transport failure, on the very frontend whose
+/// pre-dial refusal this work removed.
+#[tokio::test]
+async fn grpc_over_ambient_hbone_relays_a_non_zero_status_and_custom_trailers() {
+    let ids = mesh_identities();
+    let expected_body = grpc_message(b"detail");
+    let behavior = GrpcPeerBehavior::RespondWithNonZeroStatus;
+    let (app_addr, _app_observed_rx) = start_h2c_grpc_app(expected_body.clone(), behavior).await;
+    let (relay_addr, _connect_observed_rx) = start_hbone_grpc_relay(ids.server_slot).await;
+
+    let grpc_pool = GrpcConnectionPool::default();
+    let mesh_pool = mesh_mtls_pool(Arc::clone(&ids.gateway_slot));
+    let ambient_pool = hbone_pool(ids.gateway_slot);
+    let proxy = grpc_proxy_for_test();
+    let target = hbone_target(app_addr.port(), relay_addr.port(), ids.peer_id.as_str());
+
+    let transport =
+        GrpcDispatchTransport::for_target(&grpc_pool, &mesh_pool, &ambient_pool, Some(&target))
+            .expect("mesh.hbone target must resolve the Ambient HBONE transport");
+    assert_eq!(transport.label(), "hbone");
+
+    let (headers, proxy_headers) = grpc_request_headers();
+    let dns = DnsCache::new(DnsConfig::default());
+    let result = proxy_grpc_request_from_bytes(
+        hyper::Method::POST,
+        headers,
+        grpc_message(b"ping"),
+        None,
+        &proxy,
+        &format!("http://127.0.0.1:{}/reviews.Reviews/Get", app_addr.port()),
+        &transport,
+        &dns,
+        &proxy_headers,
+        false,
+        0,
+        None,
+    )
+    .await
+    .expect("an application-level gRPC failure is a SUCCESSFUL dispatch, not a transport error");
+
+    let response = match result {
+        GrpcResponseKind::Buffered(response) => response,
+        GrpcResponseKind::Streaming(_) => panic!("buffered dispatch returned a streaming response"),
+    };
+    assert_eq!(
+        response.status, 200,
+        "gRPC application errors ride HTTP 200 + trailers"
+    );
+    assert_eq!(
+        response.body, expected_body,
+        "the peer's DATA must relay even when the terminal status is non-zero"
+    );
+    assert_eq!(
+        response.trailers.get("grpc-status").map(String::as_str),
+        Some(PEER_FAILED_PRECONDITION),
+        "the upstream grpc-status must relay UNCHANGED; trailers were {:?}",
+        response.trailers
+    );
+    assert_eq!(
+        response.trailers.get("grpc-message").map(String::as_str),
+        Some(PEER_FAILURE_MESSAGE)
+    );
+    assert_eq!(
+        response
+            .trailers
+            .get("x-mesh-peer-trailer")
+            .map(String::as_str),
+        Some(PEER_CUSTOM_TRAILER),
+        "custom (non-hop-by-hop) trailers must survive the HBONE tunnel"
     );
 }

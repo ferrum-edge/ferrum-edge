@@ -1,0 +1,85 @@
+name: Setup bpf-linker
+description: >-
+  Install a pinned upstream bpf-linker release after verifying its repository-
+  pinned SHA-256 digest. Never compiles against the runner's mutable LLVM and
+  never pipes remote content to a shell.
+
+inputs:
+  version:
+    description: bpf-linker release version without the v prefix
+    required: false
+    default: "0.11.0"
+  amd64-sha256:
+    description: SHA-256 for the x86_64-unknown-linux-musl release archive
+    required: false
+    default: "10f62ba9ab7e544d538370552660efcb4f1a19153d5752bbf0f6b51f3bada450"
+  arm64-sha256:
+    description: SHA-256 for the aarch64-unknown-linux-musl release archive
+    required: false
+    default: "d09ddd83303e9ab1443f51e0e284680154009646a3ce141c63d838ee61b73eb9"
+
+runs:
+  using: composite
+  steps:
+    - name: Install verified bpf-linker release
+      shell: bash
+      env:
+        BPF_LINKER_VERSION: ${{ inputs.version }}
+        BPF_LINKER_AMD64_SHA256: ${{ inputs.amd64-sha256 }}
+        BPF_LINKER_ARM64_SHA256: ${{ inputs.arm64-sha256 }}
+      run: |
+        set -euo pipefail
+
+        os="$(uname -s)"
+        machine="$(uname -m)"
+        if [ "$os" != "Linux" ]; then
+          echo "::error::setup-bpf-linker supports Linux only (got ${os}/${machine})"
+          exit 1
+        fi
+        case "$machine" in
+          x86_64|amd64)
+            asset_arch=x86_64
+            asset_sha="$BPF_LINKER_AMD64_SHA256"
+            ;;
+          aarch64|arm64)
+            asset_arch=aarch64
+            asset_sha="$BPF_LINKER_ARM64_SHA256"
+            ;;
+          *)
+            echo "::error::unsupported bpf-linker architecture: ${machine}"
+            exit 1
+            ;;
+        esac
+
+        if ! [[ "$BPF_LINKER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "::error::version must be a numeric release such as 0.11.0"
+          exit 1
+        fi
+        if ! [[ "$asset_sha" =~ ^[0-9a-f]{64}$ ]]; then
+          echo "::error::bpf-linker SHA-256 must be 64-character lowercase hex"
+          exit 1
+        fi
+        if ! command -v zstd >/dev/null 2>&1; then
+          echo "::error::zstd is required to unpack the pinned bpf-linker release"
+          exit 1
+        fi
+
+        install_dir="${RUNNER_TEMP}/ferrum-bpf-linker/bin"
+        work_dir="$(mktemp -d "${RUNNER_TEMP}/ferrum-bpf-linker.XXXXXX")"
+        archive="${work_dir}/bpf-linker.tar.zst"
+        mkdir -p "$install_dir"
+        trap 'rm -rf "$work_dir"' EXIT
+
+        url="https://github.com/aya-rs/bpf-linker/releases/download/v${BPF_LINKER_VERSION}/bpf-linker-${asset_arch}-unknown-linux-musl.tar.zst"
+        curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
+          --connect-timeout 30 --max-time 300 \
+          -o "$archive" "$url"
+        if [ ! -s "$archive" ]; then
+          echo "::error::bpf-linker download produced an empty archive: ${url}"
+          exit 1
+        fi
+        printf '%s  %s\n' "$asset_sha" "$archive" | sha256sum --check --strict
+        tar --zstd -xf "$archive" -C "$work_dir" bpf-linker
+        install -m 0755 "${work_dir}/bpf-linker" "${install_dir}/bpf-linker"
+        "${install_dir}/bpf-linker" --version
+        echo "$install_dir" >> "$GITHUB_PATH"

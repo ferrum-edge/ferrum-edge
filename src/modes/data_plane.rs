@@ -521,6 +521,11 @@ pub async fn run(
     // as a config carrying them is published, and closes them on withdrawal.
     // Bind failures are never fatal here — a data plane must not die on
     // control-plane input.
+    // Bounded realization status shared with `AdminState` and `/metrics`
+    // (issue #3810).
+    let gateway_listener_status =
+        Arc::new(crate::proxy::gateway_listener_status::GatewayListenerStatus::new());
+    crate::proxy::gateway_listener_status::install_for_metrics(&gateway_listener_status);
     let gateway_listener_manager = crate::proxy::gateway_listener::GatewayListenerManager::new(
         proxy_state.clone(),
         env_config.proxy_socket_addr(0).ip(),
@@ -528,7 +533,8 @@ pub async fn run(
             static_config: tls_config.clone(),
             reload_slot: proxy_frontend_tls_slot.clone(),
         },
-    );
+    )
+    .with_status(gateway_listener_status.clone());
     // Every TLS-class Gateway listener port also gets its own QUIC socket, so
     // a port-scoped HTTPS route is reachable over HTTP/3 exactly as it is over
     // HTTP/1.1 and HTTP/2. Without it the single global UDP socket leaves a
@@ -666,6 +672,11 @@ pub async fn run(
         startup_ready: Some(startup_ready.clone()),
         serving_degraded: Some(serving_degraded.clone()),
         serving_listener_failures: None,
+        // Recoverable, per-port, and cleared by the next successful retry —
+        // deliberately not folded into the sticky `serving_degraded` signal.
+        gateway_listener_status: Some(gateway_listener_status.clone()),
+        gateway_listener_failure_fails_readiness: env_config
+            .gateway_listener_failure_fails_readiness,
         db_available: None,
         config_rejected: None,
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
@@ -928,6 +939,8 @@ pub async fn run(
         crate::overload::wait_for_drain(&proxy_state.overload, Duration::from_secs(drain_seconds))
             .await;
     }
+    // Release backend transport pools that hold kernel objects (issue #3731).
+    proxy_state.drain_transport_pools_for_shutdown().await;
 
     // Wait for background tasks to drain cleanly, with a timeout to prevent
     // hanging if a task is stuck (e.g., blocked on a gRPC stream read).

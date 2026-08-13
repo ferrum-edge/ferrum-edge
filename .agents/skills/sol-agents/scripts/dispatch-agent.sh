@@ -5,12 +5,14 @@ set -euo pipefail
 usage() {
   printf '%s\n' \
     'Usage: dispatch-agent.sh --worktree ABS_PATH --prompt-file ABS_PATH' \
-    '                         --effort medium|high|xhigh' >&2
+    '                         --effort medium|high|xhigh' \
+    '                         [--fast]' >&2
 }
 
 worktree=''
 prompt_file=''
 effort=''
+fast='false'
 
 while (($#)); do
   case "$1" in
@@ -41,6 +43,10 @@ while (($#)); do
       effort=${2-}
       shift 2
       ;;
+    --fast)
+      fast='true'
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -62,6 +68,11 @@ case "$effort" in
     ;;
 esac
 
+service_tier='default'
+if [[ "$fast" == 'true' ]]; then
+  service_tier='priority'
+fi
+
 if [[ "$worktree" != /* || ! -d "$worktree" ]]; then
   printf 'Worktree must be an existing absolute directory: %s\n' "${worktree:-<empty>}" >&2
   exit 2
@@ -72,10 +83,14 @@ if [[ "$prompt_file" != /* || ! -f "$prompt_file" ]]; then
   exit 2
 fi
 
-if ! command -v codex >/dev/null 2>&1; then
-  printf 'codex is not installed or not on PATH\n' >&2
-  exit 127
-fi
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+# shellcheck source=../../_lib/resolve-agent-bin.sh
+. "$script_dir/../../_lib/resolve-agent-bin.sh"
+
+codex_bin=$(resolve_agent_bin codex CODEX_BIN \
+  /opt/homebrew/bin/codex \
+  /usr/local/bin/codex \
+  "${HOME}/.local/bin/codex")
 
 repo_root=$(git -C "$worktree" rev-parse --show-toplevel)
 physical_worktree=$(cd "$worktree" && pwd -P)
@@ -88,9 +103,13 @@ fi
 
 cd "$physical_worktree"
 
-exec codex exec \
+printf '[sol-agents] dispatch model=gpt-5.6-sol effort=%s fast=%s service_tier=%s worktree=%s bin=%s\n' \
+  "$effort" "$fast" "$service_tier" "$physical_worktree" "$codex_bin" >&2
+
+exec "$codex_bin" exec \
   --model gpt-5.6-sol \
   --config "model_reasoning_effort=\"$effort\"" \
+  --config "service_tier=\"$service_tier\"" \
   --sandbox danger-full-access \
   --cd "$physical_worktree" \
   - < "$prompt_file"

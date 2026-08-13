@@ -562,16 +562,62 @@ fn test_apply_run_overrides_no_verbose_does_not_set_log_level() {
     );
 }
 
-/// Point `FERRUM_CONF_PATH` at a path that does not exist, so `ConfFile::load()`
-/// inside `infer_file_mode()` yields an empty settings file.
+/// Point `FERRUM_CONF_PATH` at a real, value-free settings file so
+/// `ConfFile::load()` inside `infer_file_mode()` yields an empty settings file.
 ///
 /// Without this the inference tests would consult whatever `./ferrum.conf` the
 /// test process happens to sit next to, which is the repository's own operator
 /// template — a file that could start declaring `FERRUM_MODE` at any time.
-fn pin_absent_conf_file(temp_dir: &TempDir) {
-    let missing = temp_dir.path().join("no-such-ferrum.conf");
-    assert!(!missing.exists());
-    unsafe { std::env::set_var("FERRUM_CONF_PATH", &missing) };
+///
+/// The pinned file must EXIST. Since issue #3776 an explicitly configured
+/// `FERRUM_CONF_PATH` that is absent is a fail-closed load *error*, and
+/// `ConfFile::load()` memoizes its outcome — accepted snapshot **or** sticky
+/// error — into the process-wide `CONF_FILE_CACHE` for the rest of the test
+/// binary. Pinning an absent path would therefore let whichever inference test
+/// happens to reach the cache first pin an `Err`, which
+/// `EnvConfig::from_env()` propagates verbatim: every later
+/// `EnvConfig::from_env().unwrap()` in this binary would then panic. An empty
+/// accepted snapshot is indistinguishable from the all-commented repository
+/// template, so it is safe for every other test in the binary to observe.
+fn pin_empty_conf_file(temp_dir: &TempDir) {
+    let empty = temp_dir.path().join("empty-ferrum.conf");
+    std::fs::write(&empty, "# no settings configured\n").unwrap();
+    unsafe { std::env::set_var("FERRUM_CONF_PATH", &empty) };
+}
+
+/// The settings path the inference tests pin must satisfy the fail-closed load
+/// contract on its own.
+///
+/// `infer_file_mode()` reaches `ConfFile::load()`, which memoizes its outcome
+/// into the process-wide `CONF_FILE_CACHE` — and since issue #3776 that cache
+/// holds a `Result`, so a pinned path that cannot load caches a *sticky error*
+/// which `EnvConfig::from_env()` propagates to every later test in this binary.
+/// Exercise the production selection rule against the pinned value so a helper
+/// that regresses back to an absent path fails here rather than as a remote
+/// panic in an unrelated `EnvConfig::from_env().unwrap()`.
+#[test]
+fn pinned_inference_settings_path_loads_and_cannot_poison_the_process_cache() {
+    without_env_vars(&["FERRUM_CONF_PATH"], || {
+        let temp_dir = TempDir::new().unwrap();
+        pin_empty_conf_file(&temp_dir);
+        let configured = std::env::var("FERRUM_CONF_PATH").expect("helper pins the settings path");
+
+        let (path, absent_ok) =
+            ferrum_edge::config::conf_file::conf_path_selection(Some(configured.as_str()));
+        assert_eq!(path, std::path::PathBuf::from(&configured));
+        assert!(
+            !absent_ok,
+            "an explicit FERRUM_CONF_PATH stays fail-closed, so the pinned file must exist"
+        );
+
+        let conf = ferrum_edge::config::conf_file::ConfFile::load_from_path(&path, absent_ok)
+            .expect("the pinned inference settings file must load without a sticky error");
+        assert!(
+            conf.is_empty(),
+            "the pinned file must declare no values so it cannot supply FERRUM_MODE"
+        );
+        assert!(conf.get("FERRUM_MODE").is_none());
+    });
 }
 
 fn write_non_file_conf(path: &Path, mode: &str) {
@@ -609,7 +655,7 @@ fn test_infer_file_mode_from_spec_path() {
         ],
         || {
             let temp_dir = TempDir::new().unwrap();
-            pin_absent_conf_file(&temp_dir);
+            pin_empty_conf_file(&temp_dir);
             let args = RunArgs {
                 settings: None,
                 spec: Some("/tmp/some-spec.yaml".into()),
@@ -647,7 +693,7 @@ fn test_apply_run_overrides_explicit_mode_not_overridden_by_spec() {
         ],
         || {
             let temp_dir = TempDir::new().unwrap();
-            pin_absent_conf_file(&temp_dir);
+            pin_empty_conf_file(&temp_dir);
             let args = RunArgs {
                 settings: None,
                 spec: Some("/tmp/spec.yaml".into()),
@@ -673,7 +719,7 @@ fn test_infer_file_mode_yields_to_resolved_mode_env_var() {
         &["FERRUM_MODE", "FERRUM_CONF_PATH", "FERRUM_FILE_CONFIG_PATH"],
         || {
             let temp_dir = TempDir::new().unwrap();
-            pin_absent_conf_file(&temp_dir);
+            pin_empty_conf_file(&temp_dir);
             unsafe {
                 std::env::set_var("FERRUM_MODE", "database");
                 std::env::set_var("FERRUM_FILE_CONFIG_PATH", "/tmp/spec.yaml");
@@ -699,15 +745,9 @@ fn test_infer_file_mode_yields_to_conf_file_mode() {
     without_env_vars(
         &["FERRUM_MODE", "FERRUM_CONF_PATH", "FERRUM_FILE_CONFIG_PATH"],
         || {
-            let temp_dir = TempDir::new().unwrap();
-            let conf_path = temp_dir.path().join("ferrum.conf");
-            std::fs::write(&conf_path, "FERRUM_MODE = database\n").unwrap();
-            unsafe {
-                std::env::set_var("FERRUM_CONF_PATH", &conf_path);
-                std::env::set_var("FERRUM_FILE_CONFIG_PATH", "/tmp/spec.yaml");
-            }
+            unsafe { std::env::set_var("FERRUM_FILE_CONFIG_PATH", "/tmp/spec.yaml") };
 
-            ferrum_edge::cli::infer_file_mode();
+            ferrum_edge::cli::infer_file_mode_from_conf_mode(Some("database"));
 
             assert!(
                 std::env::var("FERRUM_MODE").is_err(),
@@ -732,7 +772,7 @@ fn test_infer_file_mode_treats_blank_conf_mode_as_unset() {
                 std::env::set_var("FERRUM_FILE_CONFIG_PATH", "/tmp/spec.yaml");
             }
 
-            ferrum_edge::cli::infer_file_mode();
+            ferrum_edge::cli::infer_file_mode_from_conf_mode(Some(""));
 
             assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "file");
         },
@@ -771,7 +811,7 @@ fn test_run_explicit_spec_does_not_override_conf_file_mode() {
                 "overrides must not synthesize a mode before inference"
             );
 
-            ferrum_edge::cli::infer_file_mode();
+            ferrum_edge::cli::infer_file_mode_from_conf_mode(Some("database"));
 
             assert!(
                 std::env::var("FERRUM_MODE").is_err(),
@@ -801,7 +841,7 @@ fn test_validate_explicit_spec_does_not_override_conf_file_mode() {
                 fips_mode: None,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
-            ferrum_edge::cli::infer_file_mode();
+            ferrum_edge::cli::infer_file_mode_from_conf_mode(Some("cp"));
 
             assert!(
                 std::env::var("FERRUM_MODE").is_err(),
@@ -825,7 +865,7 @@ fn test_apply_validate_overrides_sets_spec_path() {
         &["FERRUM_MODE", "FERRUM_CONF_PATH", "FERRUM_FILE_CONFIG_PATH"],
         || {
             let temp_dir = TempDir::new().unwrap();
-            pin_absent_conf_file(&temp_dir);
+            pin_empty_conf_file(&temp_dir);
             let args = ValidateArgs {
                 settings: None,
                 spec: Some("/etc/ferrum/config.yaml".into()),
@@ -850,7 +890,7 @@ fn test_apply_validate_overrides_sets_mode() {
         &["FERRUM_MODE", "FERRUM_CONF_PATH", "FERRUM_FILE_CONFIG_PATH"],
         || {
             let temp_dir = TempDir::new().unwrap();
-            pin_absent_conf_file(&temp_dir);
+            pin_empty_conf_file(&temp_dir);
             let args = ValidateArgs {
                 settings: None,
                 spec: None,
@@ -870,7 +910,7 @@ fn test_apply_validate_overrides_explicit_mode_not_overridden_by_spec() {
         &["FERRUM_MODE", "FERRUM_CONF_PATH", "FERRUM_FILE_CONFIG_PATH"],
         || {
             let temp_dir = TempDir::new().unwrap();
-            pin_absent_conf_file(&temp_dir);
+            pin_empty_conf_file(&temp_dir);
             let args = ValidateArgs {
                 settings: None,
                 spec: Some("/tmp/spec.yaml".into()),
@@ -943,7 +983,7 @@ fn test_validate_mode_and_spec_sets_env_before_infer() {
         &["FERRUM_MODE", "FERRUM_CONF_PATH", "FERRUM_FILE_CONFIG_PATH"],
         || {
             let temp_dir = TempDir::new().unwrap();
-            pin_absent_conf_file(&temp_dir);
+            pin_empty_conf_file(&temp_dir);
             let args = ValidateArgs {
                 settings: None,
                 spec: Some("/tmp/config.yaml".into()),

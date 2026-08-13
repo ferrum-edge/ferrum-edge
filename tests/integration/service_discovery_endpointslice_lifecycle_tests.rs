@@ -38,6 +38,8 @@ fn make_upstream(id: &str) -> Upstream {
             consul: None,
             mesh: None,
             default_weight: 1,
+            max_stale_seconds: None,
+            stale_policy: None,
         }),
         subsets: None,
         port_overrides: HashMap::new(),
@@ -56,6 +58,8 @@ fn make_upstream(id: &str) -> Upstream {
         api_spec_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        k8s_service_uid: None,
+        pending_limit_scope: None,
     }
 }
 

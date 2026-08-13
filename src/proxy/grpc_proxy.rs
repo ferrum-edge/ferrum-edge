@@ -2431,7 +2431,10 @@ pub enum GrpcMeshDispatch {
     /// This class does NOT fall through to the generic HTTP-family mesh path
     /// (that path's HBONE dispatch runs an HTTP/1.1 client inside the byte
     /// tunnel and would drop gRPC trailers), so `grpc_mesh_dispatch_falls_through`
-    /// still refuses it for native gRPC.
+    /// still refuses the fall-through for native gRPC. That refusal is about the
+    /// GENERIC path only: native gRPC dispatches IN-BRANCH over
+    /// [`GrpcDispatchTransport`] on both the H1/H2 and H3 frontends (issue
+    /// #3728).
     HboneCrossCluster,
     /// Cross-cluster Sidecar `mesh.mtls` east-west target that is MALFORMED —
     /// missing the destination-FQDN SNI override (`mesh.eastwest_sni`) or the
@@ -2447,7 +2450,8 @@ pub enum GrpcMeshDispatch {
     /// so it must not use the plain HTTP-family fallback.
     RefuseCrossClusterNoTransport,
     /// Same-cluster Ambient `mesh.hbone=true` target: dispatch through the
-    /// nested-HTTP/2 HBONE transport (issue #3284).
+    /// nested-HTTP/2 HBONE transport (issue #3284 for the H3 frontend, #3728 for
+    /// the standard H1/H2 frontend).
     ///
     /// The GENERIC HTTP-family HBONE path runs `hyper::client::conn::http1`
     /// inside the CONNECT byte tunnel, which cannot carry the HTTP/2 trailers
@@ -2459,7 +2463,9 @@ pub enum GrpcMeshDispatch {
     /// RST_STREAM all survive end to end.
     ///
     /// Still does NOT fall through to the generic HTTP-family mesh path for
-    /// native gRPC (see [`HboneCrossCluster`](Self::HboneCrossCluster)).
+    /// native gRPC (see [`HboneCrossCluster`](Self::HboneCrossCluster)) — the
+    /// native-gRPC branch on EVERY frontend materializes
+    /// [`GrpcDispatchTransport`] itself instead (issue #3728).
     Hbone,
 }
 
@@ -2550,12 +2556,13 @@ pub fn classify_grpc_mesh_dispatch(
 ///   `grpc-status` trailers; it is unrelated to
 ///   [`GrpcDispatchTransport`]'s nested-HTTP/2 HBONE transport, which native
 ///   gRPC surfaces use directly instead of falling through (issue #3284).
-///   Native gRPC must therefore still be refused inside the branch, and so must
-///   gRPC-Web the `grpc_web` plugin TRANSLATED (codex r2-1): by dispatch time
-///   the outbound request is wire-native gRPC (`content-type:
-///   application/grpc`), so letting it ride the HBONE HTTP/1.1 inner tunnel
-///   or the cross-cluster paths would hit the exact no-trailer corruption the
-///   refusal exists to prevent. The original request content-type
+///   Native gRPC must therefore stay inside the native branch, where it uses
+///   [`GrpcDispatchTransport`]'s nested-HTTP/2 HBONE transport (issues #3284,
+///   #3728), and so must gRPC-Web the `grpc_web` plugin TRANSLATED (codex r2-1):
+///   by dispatch time the outbound request is wire-native gRPC (`content-type:
+///   application/grpc`), so letting either shape ride the generic HBONE
+///   HTTP/1.1 inner tunnel would hit the exact no-trailer corruption this gate
+///   prevents. The original request content-type
 ///   (`request_uses_grpc_content_type`) alone cannot see the translation —
 ///   pair it with the plugin's spoof-proof context marker
 ///   (`grpc_web::request_is_grpc_web_translated`).
@@ -2583,11 +2590,12 @@ pub fn grpc_mesh_dispatch_falls_through(
         GrpcMeshDispatch::RefuseCrossClusterNoTransport
         | GrpcMeshDispatch::RefuseCrossClusterMalformed => false,
         // Pass-through gRPC-Web only. For HBONE that is because the generic
-        // HTTP-family path runs an HTTP/1.1 client inside the byte tunnel; for
-        // an HTTP/1.1 Unix socket it is because the socket itself speaks
-        // HTTP/1.1. Either way a non-gRPC-content-type request is ordinary HTTP
-        // and rides the generic path, while a genuine gRPC request must NOT and
-        // is refused by the caller instead.
+        // HTTP-family path runs an HTTP/1.1 client inside the byte tunnel;
+        // native / translated gRPC stays in-branch and uses the nested-HTTP/2
+        // transport. For an HTTP/1.1 Unix socket, native / translated gRPC also
+        // stays in-branch but is refused because this dispatch surface has no
+        // trailer-preserving Unix transport. A non-gRPC-content-type request is
+        // ordinary HTTP in either case and rides the generic path.
         GrpcMeshDispatch::HboneCrossCluster
         | GrpcMeshDispatch::Hbone
         | GrpcMeshDispatch::RefuseUnixSocketHttp1 => {
@@ -3136,9 +3144,10 @@ fn hbone_dispatch_authority<'a>(
 /// connect budget.
 ///
 /// The asserted source identity is left `None`, which makes the CONNECT baggage
-/// carry this gateway's own SVID — the ambient-egress default. A gRPC request
-/// arriving on the H3 frontend is a north-south client, not an authenticated
-/// mesh peer whose principal could be forwarded.
+/// carry this gateway's own SVID — the ambient-egress default, and the same
+/// assertion the generic HTTP-family Ambient egress makes. A gRPC request
+/// arriving on a north-south frontend (H1/H2 or H3) is a client, not an
+/// authenticated mesh peer whose principal could be forwarded.
 async fn open_hbone_grpc_sender(
     hbone: &HboneGrpcTransport<'_>,
     proxy: &Proxy,
@@ -3583,12 +3592,20 @@ pub async fn proxy_grpc_request_from_bytes(
 /// `upload_observer`, when present, is fired from the request body's `Drop` once
 /// the upload terminates (clean EOF or overflow abort) — see
 /// `GrpcUploadTerminationObserver`.
+///
+/// `transport` is the ALREADY-MATERIALIZED [`GrpcDispatchTransport`] the caller
+/// resolved for its LB-selected target (issue #3728). It is a parameter rather
+/// than a hard-wired direct pool so the H1/H2 frontend's fully-streaming fast
+/// path can carry native gRPC over the Ambient HBONE transport's nested HTTP/2
+/// connection — the SAME transport the H3 bridge uses — instead of being
+/// limited to the direct-dial pool. The request body is consumed on the wire
+/// here, so this entry is never replayable and its caller never retries it.
 #[allow(clippy::too_many_arguments)]
 pub async fn proxy_grpc_request_streaming(
     req: Request<Incoming>,
     proxy: &Proxy,
     backend_url: &str,
-    grpc_pool: &GrpcConnectionPool,
+    transport: &GrpcDispatchTransport<'_>,
     _dns_cache: &DnsCache,
     proxy_headers: &HashMap<String, String>,
     max_grpc_recv_size_bytes: usize,
@@ -3622,10 +3639,12 @@ pub async fn proxy_grpc_request_streaming(
         grpc_body,
         proxy,
         backend_url,
-        // The H1/H2 streaming fast path is direct-dial only: a mesh-tagged
-        // target never reaches it (`grpc_mesh_dispatch_falls_through` routes it
-        // onto the generic mesh-mTLS path first).
-        &GrpcDispatchTransport::Direct(grpc_pool),
+        // The caller resolved this transport from the LB-selected target before
+        // reading a byte of the body (issue #3728): `Direct` for an untagged
+        // target, the nested-HTTP/2 HBONE transport for a `mesh.hbone` one. A
+        // Sidecar `mesh.mtls` target still never reaches this entry — it falls
+        // through to the generic mesh-mTLS path first.
+        transport,
         max_grpc_recv_size_bytes,
         body_size_exceeded,
         grpc_deadline_at,
@@ -4890,6 +4909,7 @@ mod tests {
             compiled_stream_match: None,
             created_at: now,
             updated_at: now,
+            pending_limit_scope: None,
         }
     }
 

@@ -135,8 +135,12 @@ pub enum HbonePoolError {
     InvalidPeerSpiffeTag { value: String, message: String },
     #[error("SPIFFE TLS config failed: {0}")]
     TlsConfig(#[from] SpiffeTlsError),
-    #[error("TLS handshake failed for {host}: {message}")]
-    TlsHandshake { host: String, message: String },
+    #[error("TLS handshake failed for {host}: {source}")]
+    TlsHandshake {
+        host: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("HTTP/2 handshake failed for {host}: {message}")]
     H2Handshake { host: String, message: String },
     #[error("failed to build HBONE CONNECT request for {authority}: {message}")]
@@ -246,20 +250,44 @@ impl HbonePoolError {
         }
     }
 
+    /// Whether this error is affirmative evidence that the selected peer
+    /// cannot establish HBONE with the configured identity/TLS contract.
+    ///
+    /// DNS, TCP reachability, and post-TLS HTTP/2 preface/handshake errors
+    /// fail the current request closed, but they are not capability evidence.
+    /// `H2Handshake` is reached only after TLS (including ALPN) already
+    /// succeeded; peer restart, EOF, or reset during the H2 handshake is
+    /// transient transport loss. Marking any of these `Unsupported` would make
+    /// a rolling peer restart permanent: the dispatch gate suppresses every
+    /// later tunnel attempt, so live traffic can never prove recovery.
     pub fn is_capability_failure(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::NoSvid
-                | Self::NoLeafCert
-                | Self::DnsLookup { .. }
-                | Self::ConnectTimeout { .. }
-                | Self::Connect { .. }
-                | Self::InvalidServerName { .. }
-                | Self::TlsConfig(_)
-                | Self::TlsHandshake { .. }
-                | Self::H2Handshake { .. }
-        )
+            | Self::NoLeafCert
+            | Self::InvalidServerName { .. }
+            | Self::TlsConfig(_) => true,
+            Self::TlsHandshake { source, .. } => tls_handshake_is_capability_failure(source),
+            _ => false,
+        }
     }
+}
+
+/// Distinguish affirmative TLS protocol/identity rejection from a connection
+/// that disappeared while the handshake was in flight. The latter is ordinary
+/// peer-restart/reachability loss and must remain retryable so live traffic can
+/// prove recovery instead of being suppressed by the capability cache.
+fn tls_handshake_is_capability_failure(error: &std::io::Error) -> bool {
+    !matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::Interrupted
+    )
 }
 
 /// Upper bound on retired-generation records kept while waiting for their
@@ -1750,16 +1778,20 @@ pub(crate) async fn dial_h2_connect_sender(
                 pool_config.tcp_keepalive_seconds,
             );
 
-            let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
-                HbonePoolError::TlsHandshake {
+            let tls_stream = connector
+                .connect(server_name, tcp)
+                .await
+                .map_err(|source| HbonePoolError::TlsHandshake {
                     host: target_host.to_string(),
-                    message: e.to_string(),
-                }
-            })?;
+                    source,
+                })?;
             if !matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2")) {
                 return Err(HbonePoolError::TlsHandshake {
                     host: target_host.to_string(),
-                    message: "peer did not negotiate ALPN h2".to_string(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "peer did not negotiate ALPN h2",
+                    ),
                 });
             }
 
@@ -2671,6 +2703,7 @@ mod tests {
             compiled_stream_match: None,
             created_at: now,
             updated_at: now,
+            pending_limit_scope: None,
         }
     }
 
@@ -3558,7 +3591,37 @@ mod tests {
     }
 
     #[test]
-    fn capability_failure_excludes_per_request_connect_failures() {
+    fn capability_failure_requires_protocol_or_configuration_evidence() {
+        let dns_failure = HbonePoolError::DnsLookup {
+            host: "orders.default.svc.cluster.local".to_string(),
+            message: "temporary resolver failure".to_string(),
+        };
+        assert!(
+            !dns_failure.is_capability_failure(),
+            "a DNS outage must fail the request without permanently disabling HBONE"
+        );
+
+        let timeout = HbonePoolError::ConnectTimeout {
+            addr: "10.0.0.8:15008".to_string(),
+            timeout_ms: 1_000,
+        };
+        assert!(
+            !timeout.is_capability_failure(),
+            "a peer startup timeout must remain retryable after the peer recovers"
+        );
+
+        let refused = HbonePoolError::Connect {
+            addr: "10.0.0.8:15008".to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "peer is restarting",
+            ),
+        };
+        assert!(
+            !refused.is_capability_failure(),
+            "connection refusal during a rolling restart must not poison the capability cache"
+        );
+
         let rejected = HbonePoolError::ConnectRejected {
             authority: "orders.default.svc.cluster.local:8080".to_string(),
             status: 403,
@@ -3579,11 +3642,37 @@ mod tests {
 
         let h2_failure = HbonePoolError::H2Handshake {
             host: "orders.default.svc.cluster.local".to_string(),
-            message: "ALPN mismatch".to_string(),
+            message: "peer reset connection during HTTP/2 preface".to_string(),
         };
         assert!(
-            h2_failure.is_capability_failure(),
-            "pre-CONNECT HTTP/2 establishment failure is a capability signal"
+            !h2_failure.is_capability_failure(),
+            "post-TLS H2 handshake loss during peer restart must preserve prior capability"
+        );
+
+        let tls_reset_error = std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "peer reset during handshake",
+        );
+        let tls_reset = HbonePoolError::TlsHandshake {
+            host: "orders.default.svc.cluster.local".to_string(),
+            source: tls_reset_error,
+        };
+        assert!(
+            !tls_reset.is_capability_failure(),
+            "TLS transport interruption during peer restart must preserve prior capability"
+        );
+
+        let tls_protocol_error = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "peer certificate or protocol rejected",
+        );
+        let alpn_rejection = HbonePoolError::TlsHandshake {
+            host: "orders.default.svc.cluster.local".to_string(),
+            source: tls_protocol_error,
+        };
+        assert!(
+            alpn_rejection.is_capability_failure(),
+            "explicit HBONE TLS/ALPN rejection remains capability evidence"
         );
     }
 

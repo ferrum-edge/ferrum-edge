@@ -348,6 +348,7 @@ async fn mesh_peer_auth_live_reload_tcp_tls_swap_takes_effect_on_next_accept() {
         compiled_stream_match: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        pending_limit_scope: None,
     };
     proxy.dispatch_kind = DispatchKind::TcpTls;
 
@@ -536,16 +537,25 @@ async fn mesh_peer_auth_live_reload_dtls_swap_noop_without_dtls_listeners() {
     let swapped = manager
         .swap_active_dtls_frontend_configs(|| {
             build_invocations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // If this ever runs, return a deliberate error so the swap is
-            // visible in the swap count too.
-            Err(anyhow::anyhow!("build_config should not have been called"))
+            let certificate =
+                ferrum_edge::dtls::generate_ephemeral_cert_public().expect("ephemeral cert");
+            let config = dimpl::Config::builder().build().expect("dtls config");
+            Ok(ferrum_edge::dtls::FrontendDtlsConfig {
+                dimpl_config: std::sync::Arc::new(config),
+                certificate,
+                client_cert_verifier: None,
+            })
         })
         .await;
 
-    assert_eq!(swapped, 0, "no active DTLS listeners means no swaps");
+    assert_eq!(swapped, 0, "no active DTLS listeners means no live swaps");
     assert_eq!(
         build_invocations.load(std::sync::atomic::Ordering::Relaxed),
-        0,
-        "the build closure must not be invoked when no DTLS listeners exist"
+        1,
+        "the build closure runs once to publish the accepted generation for later listeners"
+    );
+    assert!(
+        manager.snapshot_frontend_dtls_generation().is_some(),
+        "generation must be published even when no DTLS listeners are bound yet"
     );
 }

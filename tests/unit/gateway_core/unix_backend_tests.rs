@@ -25,6 +25,17 @@ use ferrum_edge::proxy::unix_backend::{
 };
 use ferrum_edge::util::unix_socket::{UnixSocketPathRejection, admit_socket_for_connect};
 
+/// `connect_admitted` takes the caller's ONE establishment deadline rather than
+/// deriving its own, so a dial and the admission that preceded it cannot each
+/// get a full `backend_connect_timeout_ms` budget (issue #3764). These tests
+/// exercise refusal ordering, not timing, so a generous shared budget is fine.
+fn shared_deadline(timeout_ms: u64) -> (tokio::time::Instant, u64) {
+    (
+        tokio::time::Instant::now() + Duration::from_millis(timeout_ms),
+        timeout_ms,
+    )
+}
+
 /// A listener that accepts and then counts every byte it is ever sent.
 ///
 /// The refusal contract is an ORDERING claim, so the substituted peer has to be
@@ -190,7 +201,8 @@ async fn a_socket_swapped_after_admission_is_refused_before_any_request_byte() {
     std::fs::remove_file(&path).expect("unlink the admitted socket");
     let substituted = CountingPeer::bind(&path);
 
-    let outcome = connect_admitted(&admitted, 2_000).await;
+    let (deadline, timeout_ms) = shared_deadline(2_000);
+    let outcome = connect_admitted(&admitted, deadline, timeout_ms).await;
     assert!(
         matches!(outcome, Err(UnixBackendError::SocketIdentityChanged)),
         "a swapped socket must be refused as an identity change, got {outcome:?}"
@@ -244,7 +256,8 @@ async fn an_unlinked_socket_is_refused_rather_than_dialed_blind() {
     drop(listener);
     std::fs::remove_file(&path).expect("unlink socket");
 
-    let outcome = connect_admitted(&admitted, 2_000).await;
+    let (deadline, timeout_ms) = shared_deadline(2_000);
+    let outcome = connect_admitted(&admitted, deadline, timeout_ms).await;
     assert!(
         matches!(outcome, Err(UnixBackendError::Connect(_))),
         "an absent socket must fail closed at connect, got {outcome:?}"

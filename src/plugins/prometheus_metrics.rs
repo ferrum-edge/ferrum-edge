@@ -745,6 +745,24 @@ pub struct MetricsRegistry {
     /// Kubernetes EndpointSliceList envelopes rejected as malformed (missing /
     /// null / non-array `items`, invalid JSON, incompatible top-level shape).
     service_discovery_malformed_envelope: AtomicU64,
+    /// Supervised discovery pollers that exited unexpectedly (panic or abort).
+    service_discovery_task_panics: AtomicU64,
+    /// Supervised discovery pollers restarted after an unexpected exit.
+    service_discovery_task_restarts: AtomicU64,
+    /// Discovery tasks whose last admitted snapshot crossed the staleness bound.
+    service_discovery_stale_expiries: AtomicU64,
+    /// Stale episodes whose expiry policy withdrew discovered targets.
+    service_discovery_stale_withdrawals: AtomicU64,
+    /// Stale episodes cleared by a freshly admitted and published snapshot.
+    service_discovery_stale_recoveries: AtomicU64,
+    /// Reconciles that kept an unchanged discovery task running.
+    service_discovery_tasks_kept: AtomicU64,
+    /// Discovery tasks started for newly configured upstreams.
+    service_discovery_tasks_started: AtomicU64,
+    /// Discovery tasks replaced because their effective specification changed.
+    service_discovery_tasks_replaced: AtomicU64,
+    /// Discovery tasks stopped because their upstream was removed.
+    service_discovery_tasks_stopped: AtomicU64,
     /// Current ai_federation circuits in an open/half-open recovery state.
     ai_federation_circuits_open: AtomicI64,
     /// ai_federation closed-to-open transitions.
@@ -937,6 +955,15 @@ impl MetricsRegistry {
             service_discovery_response_oversized: AtomicU64::new(0),
             service_discovery_body_budget_rejected: AtomicU64::new(0),
             service_discovery_malformed_envelope: AtomicU64::new(0),
+            service_discovery_task_panics: AtomicU64::new(0),
+            service_discovery_task_restarts: AtomicU64::new(0),
+            service_discovery_stale_expiries: AtomicU64::new(0),
+            service_discovery_stale_withdrawals: AtomicU64::new(0),
+            service_discovery_stale_recoveries: AtomicU64::new(0),
+            service_discovery_tasks_kept: AtomicU64::new(0),
+            service_discovery_tasks_started: AtomicU64::new(0),
+            service_discovery_tasks_replaced: AtomicU64::new(0),
+            service_discovery_tasks_stopped: AtomicU64::new(0),
             ai_federation_circuits_open: AtomicI64::new(0),
             ai_federation_circuits_opened: AtomicU64::new(0),
             ai_federation_circuits_closed: AtomicU64::new(0),
@@ -1464,6 +1491,125 @@ impl MetricsRegistry {
         self.service_discovery_malformed_envelope
             .fetch_add(1, Ordering::Relaxed);
         self.maybe_invalidate_cache();
+    }
+
+    // Discovery task lifecycle / staleness (issues #3717 / #3721 / #3722).
+    // Fixed-cardinality process counters only: namespaced upstream identity is
+    // operator-supplied and never becomes a Prometheus label. Per-upstream
+    // detail lives on the authenticated `/health` and `/status` surfaces.
+    pub fn record_service_discovery_task_panic(&self) {
+        self.service_discovery_task_panics
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_task_restart(&self) {
+        self.service_discovery_task_restarts
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_stale_expiry(&self) {
+        self.service_discovery_stale_expiries
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_stale_withdrawal(&self) {
+        self.service_discovery_stale_withdrawals
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_stale_recovery(&self) {
+        self.service_discovery_stale_recoveries
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_tasks_kept(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.service_discovery_tasks_kept
+            .fetch_add(count, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_tasks_started(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.service_discovery_tasks_started
+            .fetch_add(count, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_tasks_replaced(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.service_discovery_tasks_replaced
+            .fetch_add(count, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_tasks_stopped(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.service_discovery_tasks_stopped
+            .fetch_add(count, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_task_panics_total(&self) -> u64 {
+        self.service_discovery_task_panics.load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_task_restarts_total(&self) -> u64 {
+        self.service_discovery_task_restarts.load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_stale_expiries_total(&self) -> u64 {
+        self.service_discovery_stale_expiries
+            .load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_stale_withdrawals_total(&self) -> u64 {
+        self.service_discovery_stale_withdrawals
+            .load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_stale_recoveries_total(&self) -> u64 {
+        self.service_discovery_stale_recoveries
+            .load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_tasks_kept_total(&self) -> u64 {
+        self.service_discovery_tasks_kept.load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_tasks_started_total(&self) -> u64 {
+        self.service_discovery_tasks_started.load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_tasks_replaced_total(&self) -> u64 {
+        self.service_discovery_tasks_replaced
+            .load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_tasks_stopped_total(&self) -> u64 {
+        self.service_discovery_tasks_stopped.load(Ordering::Relaxed)
     }
 
     // Test-crate observation seams for issue #3719 / #3718 / #3720 counters.
@@ -2564,8 +2710,11 @@ impl MetricsRegistry {
         };
         self.append_mesh_observability_prometheus(&mut output);
         self.append_node_waypoint_observability_prometheus(&mut output);
+        self.append_grpc_stream_auth_prometheus(&mut output);
         self.append_udp_placement_migration_prometheus(&mut output);
         self.append_dp_config_freshness_prometheus(&mut output);
+        self.append_cp_dp_trust_reload_prometheus(&mut output);
+        self.append_gateway_listener_status_prometheus(&mut output);
         output
     }
 
@@ -2587,6 +2736,48 @@ impl MetricsRegistry {
             output,
             &ns_label,
             crate::dp_config_freshness::snapshot().as_ref(),
+        );
+    }
+
+    /// Append the bounded CP/DP trust-reload families from live state.
+    ///
+    /// Kept off the render cache for the same reason as the DP families
+    /// (issue #3813): the last-acceptance age, the degraded/stale bits, and
+    /// the stalled-worker gauge come from process-static atomics and the
+    /// passage of time, so a memoized body would report a stale-trust state
+    /// that is wrong by however long the cache has been held — exactly the
+    /// window an operator is watching during a failed rotation.
+    fn append_cp_dp_trust_reload_prometheus(&self, output: &mut String) {
+        let ns_label = self
+            .namespace_label
+            .read()
+            .map(|label| label.clone())
+            .unwrap_or_default();
+        render_cp_dp_trust_reload_prometheus(
+            output,
+            &ns_label,
+            crate::grpc::cp_trust_health::snapshot().as_ref(),
+        );
+    }
+
+    /// Append the bounded dynamic Gateway API listener realization families.
+    ///
+    /// Kept off the render cache (issue #3810) for the same reason as DP
+    /// configuration freshness: these gauges are the CURRENT bind state, and a
+    /// memoized body would keep reporting a listener as failed for up to the
+    /// cache TTL after a retry bound it — exactly the window an operator is
+    /// watching. Emits nothing outside the modes that bind dynamic Gateway
+    /// listeners.
+    fn append_gateway_listener_status_prometheus(&self, output: &mut String) {
+        let ns_label = self
+            .namespace_label
+            .read()
+            .map(|label| label.clone())
+            .unwrap_or_default();
+        crate::proxy::gateway_listener_status::render_prometheus(
+            output,
+            &ns_label,
+            crate::proxy::gateway_listener_status::global().map(|status| &**status),
         );
     }
 
@@ -2622,6 +2813,22 @@ impl MetricsRegistry {
             output,
             &gateway_ns_label,
         );
+        // Issue #3235: CUSTOM external-authorization outcomes. Rendered here,
+        // outside the render cache, for the same reason as the series above —
+        // the counters are process-static and a fail-closed spike must be
+        // visible on the next scrape. Labels are a closed outcome enum plus the
+        // gateway namespace; never provider, policy, route, host, or principal.
+        crate::plugins::mesh::ext_authz::render_prometheus(output, &gateway_ns_label);
+    }
+
+    fn append_grpc_stream_auth_prometheus(&self, output: &mut String) {
+        let ns_label = self
+            .namespace_label
+            .read()
+            .map(|label| label.clone())
+            .unwrap_or_default();
+        let gateway_ns_label = gateway_namespace_label(&ns_label);
+        crate::grpc::auth::render_stream_auth_metrics(output, &gateway_ns_label);
     }
 
     /// Append the bounded Ambient UDP placement migration state outside the
@@ -2651,8 +2858,11 @@ impl MetricsRegistry {
         let mut output = self.render_cacheable_body();
         self.append_mesh_observability_prometheus(&mut output);
         self.append_node_waypoint_observability_prometheus(&mut output);
+        self.append_grpc_stream_auth_prometheus(&mut output);
         self.append_udp_placement_migration_prometheus(&mut output);
         self.append_dp_config_freshness_prometheus(&mut output);
+        self.append_cp_dp_trust_reload_prometheus(&mut output);
+        self.append_gateway_listener_status_prometheus(&mut output);
         output
     }
 
@@ -3196,10 +3406,116 @@ impl MetricsRegistry {
                 self.service_discovery_shared_admission_rejected
                     .load(Ordering::Relaxed),
             ),
+            (
+                "ferrum_service_discovery_stale_expiries_total",
+                "Service-discovery tasks whose last admitted snapshot crossed the configured staleness bound.",
+                self.service_discovery_stale_expiries
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_stale_recoveries_total",
+                "Service-discovery stale episodes cleared by a freshly admitted and published snapshot.",
+                self.service_discovery_stale_recoveries
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_stale_withdrawals_total",
+                "Service-discovery stale episodes whose expiry policy withdrew discovered targets and retained static targets.",
+                self.service_discovery_stale_withdrawals
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_task_panics_total",
+                "Service-discovery pollers that exited unexpectedly instead of stopping cleanly.",
+                self.service_discovery_task_panics.load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_task_restarts_total",
+                "Service-discovery pollers restarted by their supervisor after an unexpected exit.",
+                self.service_discovery_task_restarts.load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_tasks_kept_total",
+                "Service-discovery tasks kept running across a config reconcile because their effective specification was unchanged.",
+                self.service_discovery_tasks_kept.load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_tasks_replaced_total",
+                "Service-discovery tasks replaced across a config reconcile because their effective specification changed.",
+                self.service_discovery_tasks_replaced
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_tasks_started_total",
+                "Service-discovery tasks started for newly configured upstreams.",
+                self.service_discovery_tasks_started.load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_tasks_stopped_total",
+                "Service-discovery tasks stopped because their upstream no longer configures service discovery.",
+                self.service_discovery_tasks_stopped.load(Ordering::Relaxed),
+            ),
         ] {
             output.push_str(&format!("# HELP {name} {help}\n"));
             output.push_str(&format!("# TYPE {name} counter\n"));
             render_process_counter(&mut output, name, value, &ns_label);
+        }
+
+        // Service-discovery task lifecycle / staleness gauges (issues #3717 /
+        // #3721 / #3722). Aggregated across every configured upstream — the
+        // namespaced upstream identity stays off `/metrics` entirely and is
+        // exposed only on the authenticated `/health` and `/status` surfaces.
+        let discovery_health = crate::service_discovery::health::aggregate();
+        for (name, help, value) in [
+            (
+                "ferrum_service_discovery_tasks",
+                "Service-discovery tasks currently supervised.",
+                discovery_health.tasks as i64,
+            ),
+            (
+                "ferrum_service_discovery_tasks_running",
+                "Service-discovery tasks whose poller is running.",
+                discovery_health.running as i64,
+            ),
+            (
+                "ferrum_service_discovery_tasks_restarting",
+                "Service-discovery tasks waiting out a restart backoff after an unexpected poller exit.",
+                discovery_health.restarting as i64,
+            ),
+            (
+                "ferrum_service_discovery_tasks_crash_looping",
+                "Service-discovery tasks that exited unexpectedly repeatedly without an intervening published snapshot.",
+                discovery_health.crash_looping as i64,
+            ),
+            (
+                "ferrum_service_discovery_tasks_stale",
+                "Service-discovery tasks whose last admitted snapshot is older than the configured staleness bound.",
+                discovery_health.stale as i64,
+            ),
+            (
+                "ferrum_service_discovery_tasks_withdrawn",
+                "Service-discovery tasks whose discovered targets are currently withdrawn by the staleness policy.",
+                discovery_health.withdrawn as i64,
+            ),
+            (
+                "ferrum_service_discovery_tasks_readiness_failing",
+                "Stale service-discovery tasks failing readiness by policy or because withdrawal publication is still retrying.",
+                discovery_health.readiness_failing as i64,
+            ),
+            (
+                "ferrum_service_discovery_tasks_never_succeeded",
+                "Service-discovery tasks that have never published an admitted snapshot.",
+                discovery_health.never_succeeded as i64,
+            ),
+            (
+                "ferrum_service_discovery_last_success_age_seconds_max",
+                "Maximum age in seconds of the staleness anchor across service-discovery tasks (task start when no snapshot has ever been published).",
+                discovery_health.max_anchor_age_seconds as i64,
+            ),
+        ] {
+            output.push_str(&format!("# HELP {name} {help}\n"));
+            output.push_str(&format!("# TYPE {name} gauge\n"));
+            render_process_gauge(&mut output, name, value, &ns_label);
         }
 
         // Compression codec admission / worker outcomes (process-wide).
@@ -4621,6 +4937,156 @@ pub fn render_dp_config_freshness_prometheus(
         output,
         "ferrum_dp_config_snapshot_apply_failures_total",
         freshness.apply_failed_total,
+        ns_label,
+    );
+}
+
+/// Render the bounded CP/DP trust-reload families (issue #3813).
+///
+/// A free function taking the projection explicitly so the exact rendered text
+/// is testable without installing the process-global CP status, which would
+/// publish CP-wide state inside a shared test binary.
+///
+/// Present only on a control plane that watches a trust bundle (`status` is
+/// `None` everywhere else). Every series is fixed-cardinality: `namespace` and
+/// the closed [`crate::grpc::cp_trust_health::TrustReloadFailure`] set are the
+/// only labels. No bundle path, `kid`, namespace inventory, credential
+/// identifier, generation identifier, fingerprint, HMAC tag, or any other
+/// value derived from key material is ever a label value or a sample value.
+/// The keyed `active_generation` identifier is authenticated `/health` only.
+pub fn render_cp_dp_trust_reload_prometheus(
+    output: &mut String,
+    ns_label: &str,
+    status: Option<&crate::grpc::cp_trust_health::CpDpTrustReloadSnapshot>,
+) {
+    let Some(status) = status else {
+        return;
+    };
+    output.push_str(
+        "# HELP ferrum_cp_dp_trust_reload_attempts_total CP/DP trust-bundle reload attempts started since process start. A wedged in-flight read is counted here before it produces an acceptance or rejection.\n",
+    );
+    output.push_str("# TYPE ferrum_cp_dp_trust_reload_attempts_total counter\n");
+    render_process_counter(
+        output,
+        "ferrum_cp_dp_trust_reload_attempts_total",
+        status.attempts_total,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_cp_dp_trust_reload_acceptances_total Reload attempts that produced a usable trust generation (replaced or confirmed unchanged).\n",
+    );
+    output.push_str("# TYPE ferrum_cp_dp_trust_reload_acceptances_total counter\n");
+    render_process_counter(
+        output,
+        "ferrum_cp_dp_trust_reload_acceptances_total",
+        status.acceptances_total,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_cp_dp_trust_reload_rejections_total Reload candidates refused or reload workers exited unexpectedly, by closed reason. The previous verifier was retained when applicable.\n",
+    );
+    output.push_str("# TYPE ferrum_cp_dp_trust_reload_rejections_total counter\n");
+    for failure in crate::grpc::cp_trust_health::TRUST_RELOAD_FAILURES {
+        let value = status
+            .rejections_by_reason
+            .get(failure.as_str())
+            .copied()
+            .unwrap_or(0);
+        output.push_str(&format!(
+            "ferrum_cp_dp_trust_reload_rejections_total{{reason=\"{}\"{}}} {}\n",
+            failure.as_str(),
+            ns_label,
+            value,
+        ));
+    }
+
+    output.push_str(
+        "# HELP ferrum_cp_dp_trust_reload_recoveries_total Failure episodes ended by a later valid candidate.\n",
+    );
+    output.push_str("# TYPE ferrum_cp_dp_trust_reload_recoveries_total counter\n");
+    render_process_counter(
+        output,
+        "ferrum_cp_dp_trust_reload_recoveries_total",
+        status.recoveries_total,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_cp_dp_trust_reload_consecutive_failures Consecutive refused reload candidates or fatal worker exits since the last accepted generation.\n",
+    );
+    output.push_str("# TYPE ferrum_cp_dp_trust_reload_consecutive_failures gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_cp_dp_trust_reload_consecutive_failures",
+        status.consecutive_failures,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_cp_dp_trust_last_acceptance_age_seconds Seconds since the CP last accepted (replaced or confirmed) its trust source, on a monotonic clock.\n",
+    );
+    output.push_str("# TYPE ferrum_cp_dp_trust_last_acceptance_age_seconds gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_cp_dp_trust_last_acceptance_age_seconds",
+        status.last_acceptance_age_seconds.unwrap_or(0),
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_cp_dp_trust_max_stale_seconds Configured maximum unrevalidated trust-generation age before admission fails closed (0 = unbounded, explicit opt-in).\n",
+    );
+    output.push_str("# TYPE ferrum_cp_dp_trust_max_stale_seconds gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_cp_dp_trust_max_stale_seconds",
+        status.max_stale_seconds,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_cp_dp_trust_degraded Whether the CP is authorizing with a trust generation it could not revalidate, or the reload worker is stalled or failed (1) or not (0).\n",
+    );
+    output.push_str("# TYPE ferrum_cp_dp_trust_degraded gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_cp_dp_trust_degraded",
+        u64::from(status.degraded),
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_cp_dp_trust_stale Whether the active trust generation has aged past its bound, refusing new configuration streams (1) or not (0).\n",
+    );
+    output.push_str("# TYPE ferrum_cp_dp_trust_stale gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_cp_dp_trust_stale",
+        u64::from(status.stale),
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_cp_dp_trust_reload_worker_running Whether the trust-bundle reload worker is alive (1) or stopped/failed (0). A stalled worker is still alive.\n",
+    );
+    output.push_str("# TYPE ferrum_cp_dp_trust_reload_worker_running gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_cp_dp_trust_reload_worker_running",
+        u64::from(status.worker_running),
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_cp_dp_trust_reload_worker_stalled Whether the trust-bundle reload worker is alive but has not completed an attempt inside the stall window (1) or not (0).\n",
+    );
+    output.push_str("# TYPE ferrum_cp_dp_trust_reload_worker_stalled gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_cp_dp_trust_reload_worker_stalled",
+        u64::from(status.worker_state == "stalled"),
         ns_label,
     );
 }

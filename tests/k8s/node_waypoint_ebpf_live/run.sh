@@ -3158,7 +3158,7 @@ expect_attributed_forged_assertion_blocked() {
   before_count="$(policy_deny_count_for_source_and_reasons "$before_file" "$expected_assertor" scope_missing untrusted_assertor)"
 
   dispatch_not_ready_body='{"error":"Bad Gateway","message":"HBONE dispatch required for this backend target"}'
-  for attempt in $(seq 1 30); do
+  for attempt in $(seq 1 120); do
     set +e
     output="$(curl_for_family_from "$family" "$from" "$url" 2>"$err")"
     status=$?
@@ -3171,12 +3171,12 @@ expect_attributed_forged_assertion_blocked() {
       break
     fi
 
-    # A restarted source NodeWaypoint can report ready after accepting the
-    # slice but before its per-workload HBONE target tags are materialized.
-    # Retry only that explicit convergence response; every other transport or
-    # HTTP outcome remains an immediate failure, and success still requires a
-    # destination policy rejection plus the deny-recorder increment below.
-    if [[ "$status" -eq 0 && "$code" == "502" && "$body" == "$dispatch_not_ready_body" && "$attempt" -lt 30 ]]; then
+    # A hosted DaemonSet rollout can report ready after accepting the slice but
+    # before the restarted source NodeWaypoint has materialized its per-workload
+    # HBONE target tags. Retry only that exact fail-closed convergence response;
+    # every other transport/HTTP outcome still fails immediately, and success
+    # still requires a destination-policy rejection plus the deny counter below.
+    if [[ "$status" -eq 0 && "$code" == "502" && "$body" == "$dispatch_not_ready_body" && "$attempt" -lt 120 ]]; then
       sleep 0.5
       continue
     fi

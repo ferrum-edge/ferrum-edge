@@ -6450,6 +6450,7 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
         phase: UdpMigrationStatusPhase::CleaningPodNetns,
         outstanding: 2,
         failure_reason: UdpMigrationFailureReason::GateAcknowledgementMissing,
+        established_adoption: false,
     };
     assert_component_validity(
         &spec,
@@ -6542,6 +6543,13 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
             json!({
                 "dtls_demux_sessions_total": 0,
                 "dtls_demux_sessions": [],
+                "frontend_dtls_reload": {
+                    "generation": 0,
+                    "last_swapped_listeners": 0,
+                    "last_success_unix": null,
+                    "last_failure_unix": null,
+                    "last_outcome": "none"
+                },
                 "bind_failures_total": 0,
                 "bind_failures": []
             }),

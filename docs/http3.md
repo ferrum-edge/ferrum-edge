@@ -33,6 +33,14 @@ FERRUM_FRONTEND_TLS_CERT_PATH=/path/to/cert.pem
 FERRUM_FRONTEND_TLS_KEY_PATH=/path/to/key.pem
 ```
 
+Gateway API TLS-class listener ports follow the same convention: each gets its
+own QUIC socket beside its TCP HTTPS listener when HTTP/3 is enabled. If a raw
+UDP or DTLS stream proxy claims that numeric UDP port in the same config, Ferrum
+keeps the HTTPS TCP/H1/H2 listener and disables only QUIC/H3 for that port —
+`Alt-Svc` is omitted until a live QUIC task exists again. See
+[gateway_api_conformance.md](gateway_api_conformance.md) (HTTP/3 on Gateway
+listener ports).
+
 ## Dispatch model
 
 Every H3 request goes through the same plugin lifecycle as H1/H2 (route match → `on_request_received` → `authenticate` → `authorize` → `before_proxy`), runs circuit-breaker and load-balancer decisions, then branches on the matched proxy's pre-computed `DispatchKind` plus the startup-refreshed backend capability registry:
@@ -181,9 +189,12 @@ Flow:
 The bridge does **not** always dial `target.host:target.port` directly. Before
 reading the request body or dialing, both `dispatch_grpc` (buffered/retryable)
 and `dispatch_grpc_streaming` (channel-backed) resolve the LB-selected target
-through `grpc_proxy::GrpcDispatchTransport::for_target`, which materializes
-exactly one transport and never falls back to a direct dial for a mesh-tagged
-target:
+through `proxy::resolve_grpc_dispatch_transport` →
+`grpc_proxy::GrpcDispatchTransport::for_target`, which materializes exactly one
+transport and never falls back to a direct dial for a mesh-tagged target. That
+resolver is SHARED with the standard HTTP/1.1+HTTP/2 native-gRPC branch (issue
+#3728), so the `mesh.hbone` rows below describe both frontends and their target
+validation, dial planning, and refusal behavior cannot drift:
 
 | Selected target | Transport | Notes |
 |---|---|---|

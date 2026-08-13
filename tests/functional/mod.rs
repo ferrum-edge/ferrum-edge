@@ -70,6 +70,7 @@ mod functional_logging_test;
 mod functional_mcp_aggregate_sse_test;
 mod functional_mcp_gateway_batch_test;
 mod functional_mesh_mode_test;
+mod functional_mesh_stock_xds_test;
 mod functional_mesh_vs_traffic_mgmt_test;
 mod functional_migrate_mode_test;
 mod functional_mongodb_test;

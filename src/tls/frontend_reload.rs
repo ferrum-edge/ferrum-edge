@@ -22,10 +22,13 @@
 //! [`quinn::Endpoint::set_server_config`]. Existing QUIC connections keep
 //! serving.
 //!
-//! Backend client TLS, per-proxy `backend_tls_client_cert_path`, and the DTLS
-//! frontend are intentionally NOT live-reloaded here — backend SVID rotation
-//! lives in [`crate::proxy`] under the `gateway_svid_*` watch, and DTLS
-//! material remains a static startup input.
+//! Frontend DTLS (UDP) material is live-reloaded under the same opt-in flag by
+//! [`crate::proxy::ProxyState`]'s DTLS source watcher: it validates one
+//! immutable generation (server cert/key, optional client CA, CRLs) and
+//! publishes it into every active `DtlsServer` without rebinding. Backend
+//! client TLS and per-proxy `backend_tls_client_cert_path` remain outside this
+//! module — backend SVID rotation lives in [`crate::proxy`] under the
+//! `gateway_svid_*` watch.
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -29,6 +29,9 @@ use tonic::{Request, Response, Status};
 use ferrum_edge::grpc::dp_client::GrpcJwtSecret;
 use ferrum_edge::grpc::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
 use ferrum_edge::grpc::proto::{MeshConfigUpdate, MeshSubscribeRequest};
+use ferrum_edge::modes::mesh::config::{
+    MeshExtAuthzProvider, MeshPolicy, MeshRule, PolicyAction, PolicyScope,
+};
 use ferrum_edge::modes::mesh::config_consumer::native_client::{
     NativeMeshClientConfig, NativeMeshConfigConsumer, start_native_mesh_client_with_shutdown,
 };
@@ -279,6 +282,130 @@ fn validator_rejects_a_heartbeat_frame_on_the_install_path() {
     assert_eq!(
         reason_for(&heartbeat(), &expected),
         MeshUpdateRejectReason::UnexpectedHeartbeat
+    );
+}
+
+fn valid_ext_authz_provider(name: &str) -> MeshExtAuthzProvider {
+    MeshExtAuthzProvider {
+        name: name.to_string(),
+        service: "127.0.0.1".to_string(),
+        port: 9000,
+        tls: false,
+        path_prefix: None,
+        timeout_ms: 250,
+        fail_open: false,
+        status_on_error: 403,
+        include_request_headers_in_check: Vec::new(),
+        include_additional_headers_in_check: Vec::new(),
+        include_request_body_in_check: None,
+        headers_to_upstream_on_allow: Vec::new(),
+        headers_to_downstream_on_deny: Vec::new(),
+        headers_to_downstream_on_allow: Vec::new(),
+    }
+}
+
+fn custom_policy(provider: &str) -> MeshPolicy {
+    MeshPolicy {
+        name: "delegate".to_string(),
+        namespace: NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            action: PolicyAction::Custom {
+                provider: provider.to_string(),
+            },
+            ..MeshRule::default()
+        }],
+    }
+}
+
+/// Malformed `ext_authz_providers` are a per-frame content failure: refuse
+/// before install, keep the stream, leave last-good untouched.
+#[test]
+fn validator_rejects_malformed_ext_authz_providers_as_content_failure() {
+    let expected = expectation(None, None);
+    let mut malformed = valid_ext_authz_provider("broken");
+    malformed.port = 0; // structural refusal from validate_mesh_ext_authz_providers
+    let slice = MeshSlice {
+        ext_authz_providers: vec![malformed],
+        ..bound_slice()
+    };
+    let rejection = validate_mesh_config_update(&update_for(&slice), &expected, NATIVE)
+        .expect_err("malformed providers must be refused at MeshSubscribe admission");
+    assert_eq!(
+        rejection.reason(),
+        MeshUpdateRejectReason::InvalidExtAuthzContent
+    );
+    assert!(
+        !rejection.terminates_stream(),
+        "ext-authz content failure must not tear the stream"
+    );
+    assert!(
+        rejection.detail().contains("ext-authz content refused"),
+        "diagnostic must stay field-shaped and bounded: {}",
+        rejection.detail()
+    );
+}
+
+/// A CUSTOM policy that binds an undeclared provider is refused at the same
+/// admission boundary, not deferred to plugin preparation.
+#[test]
+fn validator_rejects_unbound_custom_policy_as_content_failure() {
+    let expected = expectation(None, None);
+    let slice = MeshSlice {
+        mesh_policies: vec![custom_policy("missing-provider")],
+        ext_authz_providers: vec![valid_ext_authz_provider("other-provider")],
+        ..bound_slice()
+    };
+    let rejection = validate_mesh_config_update(&update_for(&slice), &expected, NATIVE)
+        .expect_err("unbound CUSTOM must be refused at MeshSubscribe admission");
+    assert_eq!(
+        rejection.reason(),
+        MeshUpdateRejectReason::InvalidExtAuthzContent
+    );
+    assert!(!rejection.terminates_stream());
+}
+
+/// `NativeMeshConfigConsumer::apply_update` must not replace last-good when
+/// the frame's ext-authz content is invalid.
+#[test]
+fn apply_update_keeps_last_good_on_invalid_ext_authz_content() {
+    let state = MeshRuntimeState::new();
+    let request = client_config(None, None).subscribe_request(ferrum_edge::FERRUM_VERSION);
+    let consumer = NativeMeshConfigConsumer::new(
+        state.clone(),
+        MeshUpdateExpectation::from_subscribe_request(&request),
+    );
+
+    let last_good = MeshSlice {
+        version: "v-last-good".to_string(),
+        ..bound_slice()
+    };
+    state.install_slice(last_good);
+
+    let mut malformed = valid_ext_authz_provider("broken");
+    malformed.port = 0;
+    let bad = MeshSlice {
+        version: "v-bad-ext-authz".to_string(),
+        mesh_policies: vec![custom_policy("broken")],
+        ext_authz_providers: vec![malformed],
+        ..bound_slice()
+    };
+    let rejection = consumer
+        .apply_update(&update_for(&bad))
+        .expect_err("invalid ext-authz must not install");
+    assert_eq!(
+        rejection.reason_label(),
+        MeshUpdateRejectReason::InvalidExtAuthzContent.as_metric_label()
+    );
+    assert!(!rejection.terminates_stream());
+    assert_eq!(
+        state
+            .snapshot()
+            .as_ref()
+            .as_ref()
+            .map(|slice| slice.version.as_str()),
+        Some("v-last-good"),
+        "last-good runtime state must remain untouched"
     );
 }
 

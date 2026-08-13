@@ -81,6 +81,8 @@ fn admin_state_with_mesh_runtime(
         startup_ready: None,
         serving_degraded: None,
         serving_listener_failures: None,
+        gateway_listener_status: None,
+        gateway_listener_failure_fails_readiness: false,
         db_available: None,
         config_rejected: None,
         admin_restore_max_body_size_mib: 100,

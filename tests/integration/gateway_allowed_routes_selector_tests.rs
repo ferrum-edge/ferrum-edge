@@ -499,3 +499,163 @@ fn status_is_owned_by_ferrum_controller_for_selector_rejections() {
         "NotAllowedByListeners"
     );
 }
+
+// --- Upstream `HTTPRouteCrossNamespace` fixture shape -----------------------
+//
+// The upstream Gateway API conformance suite attaches an HTTPRoute in
+// `gateway-conformance-web-backend` to the `backend-namespaces` Gateway in
+// `gateway-conformance-infra` through a `Selector` listener, with NO
+// `sectionName` on the parentRef. That combination exercises the
+// "scan every listener of the named parent" branch of the namespace gate,
+// which the `sectionName`-pinned cases above never reach, and the accepted
+// direction of the boundary, which none of them assert at all.
+
+/// Namespace names, labels, and Gateway shape mirror
+/// `conformance/base/manifests.yaml` and
+/// `conformance/tests/httproute-cross-namespace.yaml` at the pinned
+/// Gateway API version.
+const CONFORMANCE_INFRA_NS: &str = "gateway-conformance-infra";
+const CONFORMANCE_WEB_BACKEND_NS: &str = "gateway-conformance-web-backend";
+
+fn conformance_gateway() -> K8sObject {
+    object(
+        "Gateway",
+        "backend-namespaces",
+        CONFORMANCE_INFRA_NS,
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [{
+                "name": "http",
+                "port": 80,
+                "protocol": "HTTP",
+                "allowedRoutes": {
+                    "namespaces": {
+                        "from": "Selector",
+                        "selector": {"matchLabels": {"gateway-conformance": "backend"}}
+                    }
+                }
+            }]
+        }),
+    )
+}
+
+/// No `sectionName`: the parentRef names the Gateway only, exactly as the
+/// upstream fixture does.
+fn conformance_route() -> K8sObject {
+    object(
+        "HTTPRoute",
+        "cross-namespace",
+        CONFORMANCE_WEB_BACKEND_NS,
+        json!({
+            "parentRefs": [{
+                "name": "backend-namespaces",
+                "namespace": CONFORMANCE_INFRA_NS
+            }],
+            "rules": [{
+                "backendRefs": [{"name": "web-backend", "port": 8080}]
+            }]
+        }),
+    )
+}
+
+fn conformance_objects(route_namespace_labels: &[(&str, &str)]) -> Vec<K8sObject> {
+    vec![
+        namespace(CONFORMANCE_INFRA_NS, &[("gateway-conformance", "infra")]),
+        namespace(CONFORMANCE_WEB_BACKEND_NS, route_namespace_labels),
+        conformance_gateway(),
+        conformance_route(),
+    ]
+}
+
+fn route_parent_condition(objects: &[K8sObject], condition_type: &str) -> Value {
+    let updates = plan_gateway_api_status_updates(objects, options(), &[]);
+    let route_status = updates
+        .iter()
+        .find(|update| update.kind == "HTTPRoute")
+        .expect("route status update");
+    route_status.status["parents"][0]["conditions"]
+        .as_array()
+        .expect("route parent conditions")
+        .iter()
+        .find(|condition| condition["type"] == condition_type)
+        .cloned()
+        .unwrap_or_else(|| panic!("route parent {condition_type} condition"))
+}
+
+#[test]
+fn labelled_namespace_attaches_cross_namespace_through_a_selector_listener() {
+    let objects = conformance_objects(&[("gateway-conformance", "backend")]);
+
+    let translation = translate_k8s_objects(&objects, options())
+        .expect("a selector-matching cross-namespace attachment must translate");
+    assert_eq!(
+        translation.config.proxies.len(),
+        1,
+        "the accepted attachment must materialize a route"
+    );
+
+    let accepted = route_parent_condition(&objects, "Accepted");
+    assert_eq!(
+        accepted["status"], "True",
+        "a route whose namespace matches the listener selector must be accepted: {accepted}"
+    );
+    assert_eq!(accepted["reason"], "Accepted");
+}
+
+#[test]
+fn unlabelled_namespace_is_still_refused_by_the_selector_listener() {
+    let objects = conformance_objects(&[("gateway-conformance", "frontend")]);
+
+    let accepted = route_parent_condition(&objects, "Accepted");
+    assert_eq!(accepted["status"], "False");
+    assert_eq!(accepted["reason"], "NotAllowedByListeners");
+}
+
+/// The controller resolves the selector against the route namespace's own
+/// `Namespace` object. When that object is absent from the reconcile snapshot
+/// the decision has no evidence, and the boundary must deny rather than admit.
+#[test]
+fn an_unobserved_route_namespace_is_refused_by_the_selector_listener() {
+    let objects: Vec<K8sObject> = conformance_objects(&[("gateway-conformance", "backend")])
+        .into_iter()
+        .filter(|object| {
+            object.kind != "Namespace" || object.metadata.name != CONFORMANCE_WEB_BACKEND_NS
+        })
+        .collect();
+
+    let accepted = route_parent_condition(&objects, "Accepted");
+    assert_eq!(
+        accepted["status"], "False",
+        "an unobserved Namespace must not authorize a selector attachment"
+    );
+    assert_eq!(accepted["reason"], "NotAllowedByListeners");
+}
+
+/// `from: Same` is unaffected by the selector path: a correctly labelled
+/// namespace must not smuggle a cross-namespace attachment onto a Same listener.
+#[test]
+fn same_namespace_listener_still_refuses_a_labelled_foreign_namespace() {
+    let mut same_gateway = conformance_gateway();
+    same_gateway.spec = json!({
+        "gatewayClassName": "ferrum",
+        "listeners": [{
+            "name": "http",
+            "port": 80,
+            "protocol": "HTTP",
+            "allowedRoutes": {"namespaces": {"from": "Same"}}
+        }]
+    });
+    let objects = vec![
+        namespace(CONFORMANCE_INFRA_NS, &[("gateway-conformance", "infra")]),
+        namespace(
+            CONFORMANCE_WEB_BACKEND_NS,
+            &[("gateway-conformance", "backend")],
+        ),
+        same_gateway,
+        conformance_route(),
+    ];
+
+    let accepted = route_parent_condition(&objects, "Accepted");
+    assert_eq!(accepted["status"], "False");
+    assert_eq!(accepted["reason"], "NotAllowedByListeners");
+}

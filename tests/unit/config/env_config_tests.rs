@@ -7007,3 +7007,75 @@ fn test_trusted_proxies_rejects_junk_and_empty_segments() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Sidecar-ingress Unix transport capacity (issue #3731).
+// ---------------------------------------------------------------------------
+
+/// The bound is enforced by DEFAULT, not opt-in: an unbounded local transport is
+/// exactly what issue #3731 exists to prevent.
+#[test]
+fn unix_ingress_max_connections_defaults_to_a_real_bound() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS");
+            let config = EnvConfig::from_env().expect("defaults are valid");
+            assert_eq!(
+                config.mesh_unix_ingress_max_connections,
+                ferrum_edge::proxy::unix_backend_pool::DEFAULT_UNIX_INGRESS_MAX_CONNECTIONS,
+                "the Unix ingress connection bound must default to a real ceiling"
+            );
+            assert_ne!(
+                ferrum_edge::proxy::unix_backend_pool::DEFAULT_UNIX_INGRESS_MAX_CONNECTIONS,
+                0,
+                "0 is the explicit operator opt-out and must never be the default"
+            );
+        },
+    );
+}
+
+/// `0` is the documented "no bound" sentinel and must be accepted.
+#[test]
+fn unix_ingress_max_connections_accepts_the_disable_sentinel() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+            ("FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().expect("0 disables the bound");
+            assert_eq!(config.mesh_unix_ingress_max_connections, 0);
+        },
+    );
+}
+
+/// A value above the ceiling is rejected at the config boundary rather than
+/// clamped, so an operator typo is visible instead of advertising a bound that
+/// the file-descriptor limit would reach first.
+#[test]
+fn unix_ingress_max_connections_rejects_an_unreachable_ceiling() {
+    let over = ferrum_edge::proxy::unix_backend_pool::MAX_UNIX_INGRESS_MAX_CONNECTIONS + 1;
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+            (
+                "FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS",
+                &over.to_string(),
+            ),
+        ],
+        || {
+            let result = EnvConfig::from_env();
+            let err = result.expect_err("an unreachable bound must fail startup");
+            assert!(
+                err.contains("FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS"),
+                "the error must name the setting, got {err}"
+            );
+        },
+    );
+}

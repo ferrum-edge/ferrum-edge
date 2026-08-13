@@ -19,10 +19,9 @@ cluster runs SPIRE plus the hand-crafted sidecar workloads (and, since issue
   same-trust-domain mTLS and is then denied by the destination's
   identity-scoped AuthorizationPolicy (`mesh_authz` 403) — a
   destination-sourced negative, not an incidental client-side TLS failure.
-- **wssvc** — a second destination pod (`sa/wssvc`, **its own identity**: one
-  local pod backs exactly one service, so the WS listener must not be a
-  second local `service_name` on `sa/svc` — `resolve_local_workloads` fails
-  closed on that ambiguity and materializes no inbound routes) running a
+- **wssvc** — a second destination pod (`sa/wssvc`, **its own identity**: a
+  distinct WebSocket echo app on a distinct pod UID, so it is not folded into
+  `sa/svc`'s inbound Host table) running a
   minimal RFC 6455 echo that answers upgrades with a correct
   `Sec-WebSocket-Accept` and **holds** the session — the target of the DR
   `maxConnections=1` probe.

@@ -148,6 +148,12 @@ pub const FERRUM_ECDS_VS_L4_UPSTREAMS_TYPE_URL: &str =
 /// Inner `type_url` for the authorization-policy carrier (`MeshPolicy` list).
 pub const FERRUM_ECDS_MESH_POLICIES_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.MeshPoliciesCarrier";
+/// Inner `type_url` for the external-authorization provider carrier
+/// (`meshConfig.extensionProviders` ext-authz subset, issue #3235). A CUSTOM
+/// `AuthorizationPolicy` is inert without it, so the DP re-validates every
+/// decoded provider before it can bind.
+pub const FERRUM_ECDS_EXT_AUTHZ_PROVIDERS_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.ExtAuthzProvidersCarrier";
 /// Inner `type_url` for VirtualService-derived host-level CORS policies
 /// (issue #1973); the DP synthesizes per-route `cors` plugin instances onto
 /// materialized outbound routes from these.
@@ -255,6 +261,7 @@ pub enum MeshSliceCarrier {
     VirtualServiceL4Proxies(Vec<serde_json::Value>),
     VirtualServiceL4Upstreams(Vec<serde_json::Value>),
     MeshPolicies(Vec<MeshPolicy>),
+    ExtAuthzProviders(Vec<crate::modes::mesh::config::MeshExtAuthzProvider>),
     VirtualServiceCorsPolicies(Vec<MeshVirtualServiceCorsPolicy>),
     PeerAuthentications(Vec<PeerAuthentication>),
     RequestAuthentications(Vec<MeshRequestAuthentication>),
@@ -321,6 +328,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::VirtualServiceL4Proxies(_) => FERRUM_ECDS_VS_L4_PROXIES_TYPE_URL,
             MeshSliceCarrier::VirtualServiceL4Upstreams(_) => FERRUM_ECDS_VS_L4_UPSTREAMS_TYPE_URL,
             MeshSliceCarrier::MeshPolicies(_) => FERRUM_ECDS_MESH_POLICIES_TYPE_URL,
+            MeshSliceCarrier::ExtAuthzProviders(_) => FERRUM_ECDS_EXT_AUTHZ_PROVIDERS_TYPE_URL,
             MeshSliceCarrier::VirtualServiceCorsPolicies(_) => {
                 FERRUM_ECDS_VS_CORS_POLICIES_TYPE_URL
             }
@@ -367,6 +375,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::VirtualServiceL4Proxies(_) => "virtual-service-l4-proxies",
             MeshSliceCarrier::VirtualServiceL4Upstreams(_) => "virtual-service-l4-upstreams",
             MeshSliceCarrier::MeshPolicies(_) => "mesh-policies",
+            MeshSliceCarrier::ExtAuthzProviders(_) => "ext-authz-providers",
             MeshSliceCarrier::VirtualServiceCorsPolicies(_) => "virtual-service-cors-policies",
             MeshSliceCarrier::PeerAuthentications(_) => "peer-authentications",
             MeshSliceCarrier::RequestAuthentications(_) => "request-authentications",
@@ -404,6 +413,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::VirtualServiceL4Proxies(value) => encode(value),
             MeshSliceCarrier::VirtualServiceL4Upstreams(value) => encode(value),
             MeshSliceCarrier::MeshPolicies(value) => encode(value),
+            MeshSliceCarrier::ExtAuthzProviders(value) => encode(value),
             MeshSliceCarrier::VirtualServiceCorsPolicies(value) => encode(value),
             MeshSliceCarrier::PeerAuthentications(value) => encode(value),
             MeshSliceCarrier::RequestAuthentications(value) => encode(value),
@@ -487,6 +497,14 @@ impl MeshSliceCarrier {
             }
             FERRUM_ECDS_MESH_POLICIES_TYPE_URL => {
                 MeshSliceCarrier::MeshPolicies(decode_json(value)?)
+            }
+            // Structural (fail-closed) content validation for this carrier runs
+            // at the ACK boundary in
+            // `config_consumer::xds_client::validate_recognized_mesh_slice_carrier`,
+            // where a rejection can NACK the ECDS response and retain the last
+            // accepted slice. Decoding only proves the shape.
+            FERRUM_ECDS_EXT_AUTHZ_PROVIDERS_TYPE_URL => {
+                MeshSliceCarrier::ExtAuthzProviders(decode_json(value)?)
             }
             FERRUM_ECDS_VS_CORS_POLICIES_TYPE_URL => {
                 let mut policies: Vec<MeshVirtualServiceCorsPolicy> = decode_json(value)?;
@@ -596,6 +614,7 @@ pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str
             Some("ferrum-mesh-carrier/virtual-service-l4-upstreams")
         }
         FERRUM_ECDS_MESH_POLICIES_TYPE_URL => Some("ferrum-mesh-carrier/mesh-policies"),
+        FERRUM_ECDS_EXT_AUTHZ_PROVIDERS_TYPE_URL => Some("ferrum-mesh-carrier/ext-authz-providers"),
         FERRUM_ECDS_VS_CORS_POLICIES_TYPE_URL => {
             Some("ferrum-mesh-carrier/virtual-service-cors-policies")
         }
@@ -783,6 +802,11 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
     if !slice.mesh_policies.is_empty() {
         carriers.push(MeshSliceCarrier::MeshPolicies(slice.mesh_policies.clone()));
     }
+    if !slice.ext_authz_providers.is_empty() {
+        carriers.push(MeshSliceCarrier::ExtAuthzProviders(
+            slice.ext_authz_providers.clone(),
+        ));
+    }
     if !slice.virtual_service_cors_policies.is_empty() {
         carriers.push(MeshSliceCarrier::VirtualServiceCorsPolicies(
             slice.virtual_service_cors_policies.clone(),
@@ -897,6 +921,7 @@ pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
             slice.virtual_service_l4_upstreams = value
         }
         MeshSliceCarrier::MeshPolicies(value) => slice.mesh_policies = value,
+        MeshSliceCarrier::ExtAuthzProviders(value) => slice.ext_authz_providers = value,
         MeshSliceCarrier::VirtualServiceCorsPolicies(value) => {
             slice.virtual_service_cors_policies = value
         }
@@ -1077,6 +1102,7 @@ mod tests {
                 endpoint_unix_h2c: false,
                 owner_namespace: "default".to_string(),
                 owner_service: "reviews".to_string(),
+                bind: None,
             }]),
             MeshSliceCarrier::SidecarIngressDeclared(true),
             MeshSliceCarrier::SidecarIngressDeclaredPorts(2),
@@ -1201,6 +1227,7 @@ mod tests {
             MeshSliceCarrier::VirtualServiceL4Proxies(Vec::new()),
             MeshSliceCarrier::VirtualServiceL4Upstreams(Vec::new()),
             MeshSliceCarrier::MeshPolicies(Vec::new()),
+            MeshSliceCarrier::ExtAuthzProviders(Vec::new()),
             MeshSliceCarrier::VirtualServiceCorsPolicies(Vec::new()),
             MeshSliceCarrier::PeerAuthentications(Vec::new()),
             MeshSliceCarrier::RequestAuthentications(Vec::new()),

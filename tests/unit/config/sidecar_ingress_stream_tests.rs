@@ -40,6 +40,7 @@ fn resolved(
         endpoint_unix_h2c: false,
         owner_namespace: "default".to_string(),
         owner_service: "redis".to_string(),
+        bind: None,
     }
 }
 
@@ -169,15 +170,72 @@ fn stream_ingress_rejects_unix_and_off_box_endpoints() {
 }
 
 #[test]
-fn custom_bind_is_preserved_but_does_not_affect_resolve() {
-    // Issue #3266 boundary: custom bind is observability-only under the
-    // shared :15006 capture contract required by #3260. Resolve still keys
-    // off port + protocol + defaultEndpoint.
+fn omitted_and_unspecified_bind_stay_shared_capture() {
+    for bind in [None, Some(""), Some("0.0.0.0"), Some("::")] {
+        let mut entry = entry(9000, AppProtocol::Tcp, "127.0.0.1:6000");
+        entry.bind = bind.map(str::to_string);
+        let resolved = entry.resolve().expect("shared-capture bind resolves");
+        assert_eq!(
+            resolved.bind, None,
+            "bind={bind:?} must stay shared capture"
+        );
+    }
+}
+
+#[test]
+fn dedicated_loopback_bind_is_carried_on_resolve() {
     let mut with_bind = entry(9000, AppProtocol::Tcp, "127.0.0.1:6000");
     with_bind.bind = Some("127.0.0.1".to_string());
-    let resolved = with_bind.resolve().expect("bind does not block resolve");
-    assert_eq!(resolved.port, 9000);
-    assert_eq!(resolved.endpoint_port, 6000);
+    let resolved = with_bind.resolve().expect("loopback bind resolves");
+    assert_eq!(
+        resolved.bind,
+        Some("127.0.0.1".parse().expect("loopback")),
+        "dedicated loopback bind must be ownership, not inert metadata"
+    );
+
+    let mut v6 = entry(9000, AppProtocol::Http, "127.0.0.1:6000");
+    v6.bind = Some("::1".to_string());
+    let resolved = v6.resolve().expect("::1 bind resolves");
+    assert_eq!(resolved.bind, Some("::1".parse().expect("v6 loopback")));
+}
+
+#[test]
+fn unsupported_binds_fail_closed_with_field_specific_reasons() {
+    use ferrum_edge::modes::mesh::config::{IngressListenerUnsupported, parse_ingress_bind};
+
+    assert_eq!(
+        parse_ingress_bind(Some("unix:///tmp/x.sock")),
+        Err(IngressListenerUnsupported::UnixBindUnsupported)
+    );
+    assert_eq!(
+        parse_ingress_bind(Some("127.0.0.1:8080")),
+        Err(IngressListenerUnsupported::UnparseableBind)
+    );
+    assert_eq!(
+        parse_ingress_bind(Some("not-an-ip")),
+        Err(IngressListenerUnsupported::UnparseableBind)
+    );
+    assert_eq!(
+        parse_ingress_bind(Some("10.0.0.5")),
+        Err(IngressListenerUnsupported::BindNotRepresentable)
+    );
+
+    let mut entry = entry(9000, AppProtocol::Tcp, "127.0.0.1:6000");
+    entry.bind = Some("10.0.0.5".to_string());
+    assert_eq!(
+        entry.resolve(),
+        Err(IngressListenerUnsupported::BindNotRepresentable)
+    );
+}
+
+#[test]
+fn hostile_carrier_non_loopback_bind_fails_endpoint_validity() {
+    let mut carried = redis_listener();
+    carried.bind = Some("10.0.0.5".parse().expect("ip"));
+    assert!(
+        !carried.endpoint_is_valid(&[]),
+        "carrier-forged non-loopback bind must fail closed at re-validation"
+    );
 }
 
 // ── Carrier decode boundary ───────────────────────────────────────────────

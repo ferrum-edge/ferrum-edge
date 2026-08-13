@@ -120,6 +120,7 @@ fn create_http3_test_proxy() -> Proxy {
         compiled_stream_match: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        pending_limit_scope: None,
     }
 }
 
@@ -380,6 +381,13 @@ async fn test_http3_proxy_state_creation() {
                 ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
                 Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
                 64,
+            ),
+        ),
+        unix_backend_pool: Arc::new(
+            ferrum_edge::proxy::unix_backend_pool::UnixBackendConnectionPool::new(
+                ferrum_edge::config::PoolConfig::default(),
+                64,
+                ferrum_edge::proxy::unix_backend_pool::DEFAULT_UNIX_INGRESS_MAX_CONNECTIONS,
             ),
         ),
         h3_pool: Arc::new(ferrum_edge::http3::client::Http3ConnectionPool::new(
@@ -686,6 +694,13 @@ async fn test_http3_full_integration() {
                 64,
             ),
         ),
+        unix_backend_pool: Arc::new(
+            ferrum_edge::proxy::unix_backend_pool::UnixBackendConnectionPool::new(
+                ferrum_edge::config::PoolConfig::default(),
+                64,
+                ferrum_edge::proxy::unix_backend_pool::DEFAULT_UNIX_INGRESS_MAX_CONNECTIONS,
+            ),
+        ),
         h3_pool: Arc::new(ferrum_edge::http3::client::Http3ConnectionPool::new(
             Arc::new(ferrum_edge::config::EnvConfig::default()),
             ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
@@ -883,6 +898,7 @@ async fn test_http3_streaming_decision_logic() {
         compiled_stream_match: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        pending_limit_scope: None,
     };
 
     // --- Case 2: Proxy with retry configured → should buffer ---
@@ -1503,6 +1519,8 @@ fn create_sticky_cookie_upstream() -> ferrum_edge::config::types::Upstream {
         api_spec_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        k8s_service_uid: None,
+        pending_limit_scope: None,
     }
 }
 

@@ -51,6 +51,11 @@ pub struct MeshResourceCounts {
     pub mesh_telemetry: usize,
     pub mesh_proxy_configs: usize,
     pub extension_configs: usize,
+    /// Admitted `meshConfig.extensionProviders` external authorization
+    /// providers on this slice (issue #3235). Dropping to zero while CUSTOM
+    /// policies remain is exactly the drift that turns every delegated
+    /// decision into a fail-closed denial, so it gets its own count.
+    pub ext_authz_providers: usize,
 }
 
 impl MeshResourceCounts {
@@ -70,6 +75,7 @@ impl MeshResourceCounts {
             mesh_telemetry: slice.telemetry_resources.len(),
             mesh_proxy_configs: slice.proxy_configs.len(),
             extension_configs: slice.extension_configs.len(),
+            ext_authz_providers: slice.ext_authz_providers.len(),
         }
     }
 }

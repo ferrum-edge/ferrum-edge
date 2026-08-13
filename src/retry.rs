@@ -473,6 +473,21 @@ fn classify_typed_chain(
         {
             return Some(dial_err.error_class());
         }
+        // `UnixBackendError` is the sidecar-ingress Unix dial/admission error the
+        // WebSocket egress path boxes (issue #3732 / #3764). Most variants are
+        // PRE-WIRE (admission, connect, and protocol setup before an upgrade /
+        // request byte). `WebSocketHandshakeTimeout` is the deliberate exception:
+        // the RFC 6455 upgrade request is flushed before the 101 wait, so
+        // `error_class()` maps it to post-wire `ReadWriteTimeout` and
+        // `retry_on_connect_failure` must not replay it. Match BEFORE the source
+        // walk so a boxed `Connect(io)` is not re-derived from its io source, a
+        // source-less policy reject does not fall through to the post-wire
+        // `RequestError` default, and the upgrade-timeout class is not collapsed
+        // into the substring `"timed out"` → `ConnectionTimeout` fallback.
+        // Mirrors the `HbonePoolError` / `MeshMtlsDialError` arms.
+        if let Some(unix_err) = err.downcast_ref::<crate::proxy::unix_backend::UnixBackendError>() {
+            return Some(unix_err.error_class());
+        }
         if let Some(setup_err) = err.downcast_ref::<crate::proxy::stream_error::StreamSetupError>()
         {
             return Some(classify_stream_setup_kind(setup_err.kind));
@@ -619,6 +634,29 @@ fn classify_typed_chain(
 pub const WS_BACKEND_TLS_SNI_UNSUPPORTED: &str = "WebSocket backend dial refused: backend TLS SNI override is not supported on the WebSocket \
      transport";
 
+/// Pre-dial refusal for a WebSocket upgrade to an `http2`/`grpc`-declared Unix
+/// ingress socket (issue #3732).
+///
+/// That form would require RFC 8441 Extended CONNECT over the h2c Unix carrier.
+/// It is deliberately NOT implemented, and it is deliberately NOT downgraded to
+/// an HTTP/1.1 upgrade: the app behind an `http2`-declared socket speaks h2c
+/// prior-knowledge only, so an H1 upgrade is unanswerable, and silently changing
+/// the wire protocol the listener declared is exactly the fail-open the Unix
+/// transport gate exists to prevent. Gateway-side and pre-dial, so it classifies
+/// as `DispatchPolicyRejected`: non-retryable and neutral to backend health.
+pub const WS_UNIX_H2C_EXTENDED_CONNECT_UNSUPPORTED: &str = "WebSocket backend dial refused: RFC 8441 Extended CONNECT over an h2c unix-socket ingress \
+     carrier is not supported";
+
+/// Pre-dial refusal for a WebSocket upgrade to a `mesh.unix_socket` target whose
+/// tagged path failed data-plane admission (issue #3732).
+///
+/// The refusal is what keeps the fail-closed contract absolute: a Unix-tagged
+/// target must never fall through to its schema-only loopback placeholder, which
+/// on a sidecar is the gateway's OWN inbound listener port. Gateway-side and
+/// pre-dial, so it is health-neutral and non-retryable.
+pub const WS_UNIX_SOCKET_INADMISSIBLE: &str =
+    "WebSocket backend dial refused: unix-socket ingress target failed data-plane admission";
+
 /// Tightened substring fallback for boxed/reqwest errors when the typed
 /// walk is exhausted.
 ///
@@ -648,6 +686,17 @@ fn classify_substring_fallback(error_str: &str, debug_str: &str) -> Option<Error
     // egress denial above. Anchored BEFORE the certificate/TLS tokens, which
     // would otherwise misreport it as a handshake failure the backend caused.
     if error_str.contains(WS_BACKEND_TLS_SNI_UNSUPPORTED) {
+        return Some(ErrorClass::DispatchPolicyRejected);
+    }
+    // Gateway-side refusal of a WebSocket upgrade to a Unix ingress socket that
+    // is either h2c-declared (Extended CONNECT unimplemented) or inadmissible
+    // (issue #3732). No dial happened and no upgrade byte was written, so this
+    // is the same non-retryable, backend-health-neutral dispatch class as the
+    // two refusals above — and never a connect/protocol failure attributable to
+    // the application.
+    if error_str.contains(WS_UNIX_H2C_EXTENDED_CONNECT_UNSUPPORTED)
+        || error_str.contains(WS_UNIX_SOCKET_INADMISSIBLE)
+    {
         return Some(ErrorClass::DispatchPolicyRejected);
     }
     if error_str.contains("connect timeout") || error_str.contains("timed out") {

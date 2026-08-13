@@ -1,0 +1,414 @@
+name: Trusted Launch Advisory Gate
+
+# The only place `LAUNCH_ADVISORY_READ_TOKEN` is ever referenced.
+#
+# A `v*` tag can be created at any commit, and for a `push` event GitHub loads
+# BOTH the workflow definition and every file it executes from that tag target.
+# A tag-triggered job is therefore candidate-controlled code, and handing it a
+# privileged advisory credential exposes the credential before the release SHA
+# has any established provenance (issue #3802).
+#
+# This workflow is never reachable from a tag, a pull request, or a merge
+# group. `workflow_run` and `schedule` are loaded by GitHub from the protected
+# default branch, so the definition below and the checker it runs are trusted
+# code no matter what the candidate contains. The
+# candidate commit is carried only as an inert 40-hex SHA:
+#
+#   1. `establish-trust` holds no secret. It pins the trusted anchor from the
+#      literal protected-branch checkout, runs both secretless preflights — the
+#      checker's self-test AND this boundary verifier's own `--self-test`, so the
+#      contract below is proved on the trusted tree before the protected
+#      environment can release the credential — resolves the tag to exactly one
+#      commit, requires that commit to be reachable from protected `main`, and
+#      requires successful push CI/coverage runs for that exact SHA. Anything
+#      missing, ambiguous, or stale fails closed.
+#   2. `advisory-verdict` is a CLOSED two-step job: a pinned `actions/checkout`
+#      directly at that same trusted anchor commit, immediately followed by the
+#      one credential-bearing checker invocation. There is deliberately no other
+#      step — no pin script, no self-test, no setup — because any executable step
+#      running before the credential step shares its workspace and could replace
+#      `scripts/check_launch_readiness.py` (or derive the candidate indirectly
+#      from the event payload, the API, or the environment) before the checker
+#      runs with the credential bound. It never checks out, fetches, imports, or
+#      executes a single byte of the candidate tree. Its `env:` is an exact
+#      closed mapping, and this workflow declares no top-level `env:` or
+#      `defaults:`, because the anchored command is only as exact as the
+#      environment that resolves it.
+#   3. `publish-verdict` holds no secret and publishes a fixed-text commit
+#      status on the candidate SHA, under a context bound to the exact Release
+#      run and run attempt that asked for it. `release.yml` consumes only its
+#      own context; it never needs the credential itself.
+#
+# A commit-wide status context would be replayable: the daily audit, an earlier
+# tag release on the same commit, or an earlier attempt of the same Release run
+# would already satisfy a later release before that release's own trusted
+# evaluation finished, so a blocker opened in between would be invisible. Every
+# release verdict is therefore published as
+# `trusted-launch-advisory-gate/release-<run_id>-attempt-<attempt>`, and the
+# scheduled default-branch audit uses a separate `.../main-audit` context that
+# can never satisfy any release.
+#
+# Nothing here prints the credential or any private advisory identifier: the
+# checker refuses to emit advisory fields, and the published status text is a
+# constant.
+
+on:
+  workflow_run:
+    workflows:
+      - Release
+    types:
+      # `in_progress`, not `requested`: GitHub documents that `requested` does
+      # not fire when a workflow run is re-run, so a re-run Release attempt
+      # would never get its own trusted verdict and would fail closed forever.
+      - in_progress
+  schedule:
+    # Daily trusted re-audit of the protected default-branch tip. The standalone
+    # launch-readiness workflow runs on untrusted refs and holds no credential,
+    # so this is the live private-advisory read.
+    - cron: "45 6 * * *"
+
+concurrency:
+  group: launch-advisory-trust-${{ github.event_name }}-${{ github.event.workflow_run.id || github.run_id }}-${{ github.event.workflow_run.run_attempt || github.run_attempt }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  establish-trust:
+    name: Establish candidate trust
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      candidate_sha: ${{ steps.candidate.outputs.candidate_sha }}
+      candidate_label: ${{ steps.candidate.outputs.candidate_label }}
+      trusted_sha: ${{ steps.candidate.outputs.trusted_sha }}
+      status_context: ${{ steps.candidate.outputs.status_context }}
+    steps:
+      # `refs/heads/main` is the protected default branch. It is written as a
+      # literal so no event payload field can redirect the checkout. The commit
+      # it resolves to is validated and exported as `trusted_sha`, and the
+      # secret-bearing job checks that exact commit out directly, so it evaluates
+      # the identical tree even if `main` advances mid-run.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Secretless by construction, and deliberately hosted here rather than in
+      # the credential-bearing job: an executable step in that job could mutate
+      # its workspace before the credential is used.
+      - name: Synthetic policy/checker self-tests
+        run: python3 -I scripts/check_launch_readiness.py --self-test
+
+      # The boundary contract itself, proved on the trusted tree in the same run
+      # that then uses the credential. The protected `launch-advisory`
+      # environment releases the credential only after this job succeeds, so a
+      # `main` that no longer satisfies the contract cannot reach the credential
+      # step. Secretless, and hosted here for the same reason as above.
+      - name: Trust-boundary contract self-test
+        run: python3 -I .github/scripts/verify_launch_advisory_trust.py --self-test
+
+      - name: Resolve the trusted anchor and the candidate commit
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_RUN_NAME: ${{ github.event.workflow_run.name }}
+          WORKFLOW_RUN_EVENT: ${{ github.event.workflow_run.event }}
+          WORKFLOW_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          WORKFLOW_RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+          WORKFLOW_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          set -euo pipefail
+
+          fail() {
+            echo "::error title=Launch advisory trust::$1" >&2
+            exit 1
+          }
+
+          # Strict positive decimal: no sign, no leading zero, no whitespace, no
+          # separators, bounded so the value stays inside 64-bit shell
+          # arithmetic and cannot lengthen or reshape the derived status
+          # context. Anything else is refused before it reaches a context.
+          require_run_number() {
+            [[ "$1" =~ ^[1-9][0-9]{0,17}$ ]] || fail "$2"
+          }
+
+          trusted_sha="$(git rev-parse HEAD)"
+          [[ "$trusted_sha" =~ ^[0-9a-f]{40}$ ]] \
+            || fail "the trusted anchor did not resolve to a commit"
+
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+          main_tip="$(git rev-parse "refs/remotes/origin/main^{commit}")"
+          [[ "$main_tip" =~ ^[0-9a-f]{40}$ ]] \
+            || fail "the protected default branch did not resolve to a commit"
+          git merge-base --is-ancestor "$trusted_sha" "$main_tip" \
+            || fail "the checked-out anchor ${trusted_sha} is not on protected main"
+
+          tag=""
+          event_head=""
+          release_run_id=""
+          release_run_attempt=""
+          case "$EVENT_NAME" in
+            workflow_run)
+              [ "$WORKFLOW_RUN_NAME" = "Release" ] \
+                || fail "unexpected triggering workflow"
+              [ "$WORKFLOW_RUN_EVENT" = "push" ] \
+                || fail "the triggering Release run was not a push event"
+              tag="$WORKFLOW_RUN_HEAD_BRANCH"
+              event_head="$WORKFLOW_RUN_HEAD_SHA"
+              release_run_id="$WORKFLOW_RUN_ID"
+              release_run_attempt="$WORKFLOW_RUN_ATTEMPT"
+              [ -n "$tag" ] || fail "the triggering Release run carried no ref name"
+              [[ "$event_head" =~ ^[0-9a-f]{40}$ ]] \
+                || fail "the triggering Release run carried no head SHA"
+              require_run_number "$release_run_id" \
+                "the triggering Release run carried no usable run ID"
+              require_run_number "$release_run_attempt" \
+                "the triggering Release run carried no usable run attempt"
+              ;;
+            schedule)
+              tag=""
+              ;;
+            *)
+              fail "unsupported event ${EVENT_NAME}"
+              ;;
+          esac
+
+          if [ -z "$tag" ]; then
+            candidate="$main_tip"
+            label="main"
+            # Deliberately not of the release shape: a default-branch audit can
+            # never satisfy any release gate.
+            status_context="trusted-launch-advisory-gate/main-audit"
+          else
+            if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+              fail "release tag name is not a normalized version tag"
+            fi
+
+            # The tag must exist exactly once on the trusted remote. `ls-remote`
+            # returns the tag object and, for an annotated tag, its peeled
+            # commit; anything else is an ambiguous or absent ref.
+            remote_listing="$(git ls-remote --tags origin "refs/tags/${tag}")"
+            [ -n "$remote_listing" ] || fail "release tag does not exist on the remote"
+            plain_seen=0
+            while read -r _ remote_name; do
+              case "$remote_name" in
+                "refs/tags/${tag}") plain_seen=$((plain_seen + 1)) ;;
+                "refs/tags/${tag}^{}") ;;
+                *) fail "release tag resolution is ambiguous" ;;
+              esac
+            done <<<"$remote_listing"
+            [ "$plain_seen" = "1" ] || fail "release tag resolution is ambiguous"
+
+            git fetch --no-tags origin "+refs/tags/${tag}:refs/tags/${tag}"
+            tag_object="$(git rev-parse "refs/tags/${tag}")"
+            candidate="$(git rev-list -n 1 "refs/tags/${tag}")"
+            [[ "$candidate" =~ ^[0-9a-f]{40}$ ]] \
+              || fail "release tag does not resolve to exactly one commit"
+
+            if [ -n "$event_head" ] \
+              && [ "$event_head" != "$candidate" ] \
+              && [ "$event_head" != "$tag_object" ]; then
+              fail "the release tag moved after the triggering event; refusing a stale target"
+            fi
+
+            git merge-base --is-ancestor "$candidate" "$main_tip" \
+              || fail "candidate ${candidate} is not reachable from protected main"
+            label="$tag"
+            # Unique per Release run AND per run attempt, so no earlier
+            # release, earlier attempt, or scheduled audit on this same commit
+            # can ever satisfy a later release.
+            status_context="trusted-launch-advisory-gate/release-${release_run_id}-attempt-${release_run_attempt}"
+          fi
+
+          # Both operands were validated above; re-assert the whole derived
+          # context so nothing unexpected can be published.
+          if [[ ! "$status_context" =~ ^trusted-launch-advisory-gate/(main-audit|release-[1-9][0-9]{0,17}-attempt-[1-9][0-9]{0,17})$ ]]; then
+            fail "derived status context is not of an admitted shape"
+          fi
+
+          echo "candidate_sha=${candidate}" >> "$GITHUB_OUTPUT"
+          echo "candidate_label=${label}" >> "$GITHUB_OUTPUT"
+          echo "trusted_sha=${trusted_sha}" >> "$GITHUB_OUTPUT"
+          echo "status_context=${status_context}" >> "$GITHUB_OUTPUT"
+          echo "trusted anchor ${trusted_sha}; candidate ${candidate} (${label}); context ${status_context}"
+
+      - name: Require successful push CI for the exact candidate SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=Launch advisory trust::candidate SHA is missing" >&2
+            exit 1
+          fi
+
+          require_success() {
+            local workflow_file="$1"
+            local label="$2"
+            local max_attempts=240
+
+            for attempt in $(seq 1 "$max_attempts"); do
+              local runs
+              runs="$(gh run list \
+                --repo "$GITHUB_REPOSITORY" \
+                --workflow "$workflow_file" \
+                --commit "$CANDIDATE_SHA" \
+                --limit 50 \
+                --json status,conclusion,event,url,createdAt 2>/dev/null || true)"
+              if [ -z "$runs" ]; then
+                echo "${label} lookup failed transiently (attempt ${attempt}/${max_attempts}); retrying"
+                sleep 30
+                continue
+              fi
+
+              local success_url
+              success_url="$(jq -r '[.[] | select(.conclusion == "success" and .event == "push")] | sort_by(.createdAt) | last | .url // empty' <<<"$runs" 2>/dev/null || true)"
+              if [ -n "$success_url" ]; then
+                echo "${label} passed for ${CANDIDATE_SHA}: ${success_url}"
+                return 0
+              fi
+
+              local active
+              active="$(jq -r '[.[] | select((.status == "queued" or .status == "in_progress") and .event == "push")] | length' <<<"$runs" 2>/dev/null || true)"
+              active="${active:-0}"
+              local failed_url
+              failed_url="$(jq -r '[.[] | select(.status == "completed" and .event == "push" and .conclusion != null and .conclusion != "success")] | sort_by(.createdAt) | last | .url // empty' <<<"$runs" 2>/dev/null || true)"
+              if [ "$active" = "0" ] && [ -n "$failed_url" ]; then
+                echo "::error title=Launch advisory trust::${label} did not succeed for ${CANDIDATE_SHA}: ${failed_url}" >&2
+                return 1
+              fi
+              echo "${label} has no successful push run for ${CANDIDATE_SHA} yet (attempt ${attempt}/${max_attempts}, active=${active}); waiting"
+              sleep 30
+            done
+
+            echo "::error title=Launch advisory trust::${label} never completed successfully for ${CANDIDATE_SHA}" >&2
+            return 1
+          }
+
+          require_success "ci.yml" "CI"
+          require_success "coverage.yml" "Coverage"
+
+  advisory-verdict:
+    name: Evaluate advisories from trusted code
+    needs: establish-trust
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The credential lives in this protected environment, not in repository
+    # secret scope. Its deployment ref policy must admit only the protected
+    # default branch, so a tag-triggered workflow that names this environment is
+    # refused by GitHub before any job step runs. See docs/launch-readiness.md.
+    environment: launch-advisory
+    # `security-events: read` is NOT the repository security-advisories
+    # permission and is deliberately absent; the advisory listing comes from the
+    # explicitly provisioned read-only credential or the verdict is UNKNOWN.
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    # EXACTLY TWO STEPS, IN THIS ORDER. `verify_launch_advisory_trust.py`
+    # enforces the whole sequence structurally. The workspace this job hands to
+    # the credential step must be a fresh checkout of the trusted anchor and
+    # nothing else: an arbitrary step here needs no secret and no literal
+    # candidate expression to be dangerous, because it could read
+    # `.workflow_run.head_sha` out of `$GITHUB_EVENT_PATH`, ask the API, or read
+    # `printenv`, then fetch candidate bytes or simply overwrite
+    # `scripts/check_launch_readiness.py` — and the exact credential command
+    # below would then execute the replaced file with the credential bound.
+    #
+    # The credential step's `env:` below is likewise an EXACT CLOSED MAPPING:
+    # exactly these keys with exactly these values. An anchored command is only
+    # as exact as the environment that resolves it — `BASH_ENV` runs a file
+    # before Bash reaches the command, `PATH` picks a different `python3`,
+    # `PYTHONPATH`/`LD_PRELOAD` reach inside the interpreter. The verifier
+    # enforces the mapping as an allowlist of key and value, so a variable nobody
+    # has named yet fails closed, and it refuses any top-level `env:` or
+    # `defaults:` in this file for the same reason: both are inherited here
+    # without appearing in either step below.
+    steps:
+      # Checked out directly AT the trusted anchor commit resolved by the
+      # literal `refs/heads/main` checkout in `establish-trust`, so no in-job
+      # command is needed to move HEAD onto it. `fetch-depth: 1` fetches that
+      # one commit; the checker resolves HEAD from `.git` and re-asserts the pin.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          ref: ${{ needs.establish-trust.outputs.trusted_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Evaluate the candidate commit as data
+        env:
+          # Public issue state only; this token cannot read private advisories.
+          GITHUB_TOKEN: ${{ github.token }}
+          LAUNCH_TIER: ga
+          # The candidate is inert input. The policy, the exemptions, the
+          # readiness document, and the checker all come from the pinned trusted
+          # anchor that `--trusted-tree-sha` re-asserts inside the checker.
+          LAUNCH_TARGET_SHA: ${{ needs.establish-trust.outputs.candidate_sha }}
+          TRUSTED_SHA: ${{ needs.establish-trust.outputs.trusted_sha }}
+          LAUNCH_PRIVATE_BLOCKER_COUNT: ${{ vars.LAUNCH_PRIVATE_BLOCKER_COUNT }}
+          LAUNCH_PRIVATE_ADVISORY_AS_OF: ${{ vars.LAUNCH_PRIVATE_ADVISORY_AS_OF }}
+          LAUNCH_ADVISORY_READ_TOKEN: ${{ secrets.LAUNCH_ADVISORY_READ_TOKEN }}
+        run: python3 -I scripts/check_launch_readiness.py --verify --require-pass --trusted-execution --trusted-tree-sha "$TRUSTED_SHA"
+
+  publish-verdict:
+    name: Publish trusted advisory verdict
+    needs:
+      - establish-trust
+      - advisory-verdict
+    if: always() && needs.establish-trust.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      statuses: write
+    steps:
+      # No checkout: this job runs no repository code at all, and the status
+      # text is a constant so neither the credential nor any advisory
+      # identifier can reach a public commit status.
+      - name: Publish the verdict status on the candidate commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ needs.establish-trust.outputs.candidate_sha }}
+          STATUS_CONTEXT: ${{ needs.establish-trust.outputs.status_context }}
+          VERDICT_RESULT: ${{ needs.advisory-verdict.result }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=Launch advisory trust::candidate SHA is missing" >&2
+            exit 1
+          fi
+
+          # Re-assert the run-bound context here too: this job is the only
+          # writer, so a malformed or commit-wide context must never be posted.
+          if [[ ! "$STATUS_CONTEXT" =~ ^trusted-launch-advisory-gate/(main-audit|release-[1-9][0-9]{0,17}-attempt-[1-9][0-9]{0,17})$ ]]; then
+            echo "::error title=Launch advisory trust::status context is missing or not run-bound" >&2
+            exit 1
+          fi
+
+          state="failure"
+          if [ "$VERDICT_RESULT" = "success" ]; then
+            state="success"
+          fi
+
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${CANDIDATE_SHA}" \
+            -f "state=${state}" \
+            -f "context=${STATUS_CONTEXT}" \
+            -f "description=Launch advisory verdict computed from protected main" \
+            -f "target_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            > /dev/null
+
+          echo "published ${STATUS_CONTEXT}=${state} for ${CANDIDATE_SHA}"
+          if [ "$state" != "success" ]; then
+            exit 1
+          fi

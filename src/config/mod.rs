@@ -3,6 +3,7 @@
 //! - `types` — Core domain model (Proxy, Consumer, Upstream, PluginConfig, etc.)
 //! - `env_config` — Environment variable parsing (90+ vars) + conf file overlay
 //! - `conf_file` — `ferrum.conf` parser (env vars take precedence over conf values)
+//! - `stable_file` — Shared bounded stable-file reader for authoritative config docs
 //! - `batch_atomicity` — Graph-level all-or-nothing vocabulary for `POST /batch`
 //! - `db_loader` — Database config loader with incremental polling
 //! - `file_loader` — YAML/JSON file loader with version migration
@@ -21,6 +22,7 @@
 pub mod batch_atomicity;
 pub mod conf_file;
 pub mod config_backup;
+pub mod stable_file;
 // Wake-up plumbing for backend-native config-change watchers. Some accessors
 // are consumed only through external tests, which the bin target cannot see.
 #[allow(dead_code)]

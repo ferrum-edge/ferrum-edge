@@ -1070,6 +1070,23 @@ fn cluster_peer_identities(
                     format!("{field}.validation_context.custom_validator_config"),
                 ));
             }
+            // Envoy's DEPRECATED `match_subject_alt_names` (field 9, a plain
+            // repeated StringMatcher with no SAN type). Peer identities are read
+            // only from `match_typed_subject_alt_names`, so accepting the cluster
+            // here would drop the control plane's peer constraint and then blame
+            // a field the operator never set ("no pinned peer identity" against
+            // the typed field). Refuse with the field that is actually in the
+            // way — the outcome is the same fail-closed narrowing, with an
+            // actionable diagnostic.
+            if !validation.match_subject_alt_names.is_empty() {
+                return Err((
+                    refusal::UNSUPPORTED_PEER_IDENTITY_MATCHER,
+                    format!(
+                        "{field}.validation_context.match_subject_alt_names (deprecated; use \
+                         match_typed_subject_alt_names with san_type URI)"
+                    ),
+                ));
+            }
             for matcher in &validation.match_typed_subject_alt_names {
                 // SanType URI = 3. Ferrum pins SPIFFE URIs only; a DNS or IP
                 // SAN constraint is a different assertion and is skipped
@@ -1987,7 +2004,18 @@ fn build_discovery(accumulator: &StockXdsAccumulator) -> StockDiscovery {
     }
 
     // ── emit the typed model ──
-    let mut workloads_by_key: BTreeMap<(String, String), Workload> = BTreeMap::new();
+    // Key by the SERVICE the endpoint attaches to, not just (SPIFFE, address).
+    // Two services can share an identity and a socket; collapsing them to one
+    // Workload would stamp whichever service BTree order encountered first,
+    // and the later cross-namespace narrowing would then keep or drop that
+    // endpoint based on an arbitrary owner. Duplicate (SPIFFE, address)
+    // records are valid: `matched_local_service_workloads` matches by
+    // (attached namespace, service name, SPIFFE), so each service keeps its
+    // own endpoint representation and a narrowed-away foreign owner cannot
+    // take a visible service's reachability with it. Same-service ports still
+    // merge onto one record via this key.
+    let mut workloads_by_key: BTreeMap<(String, String, String, String), Workload> =
+        BTreeMap::new();
     let mut mesh_services = Vec::new();
 
     for ((namespace, name), build) in services {
@@ -2031,7 +2059,12 @@ fn build_discovery(accumulator: &StockXdsAccumulator) -> StockDiscovery {
             };
             for endpoint in &port_build.endpoints {
                 let address = endpoint.address.to_string();
-                let key = (identity.as_str().to_string(), address.clone());
+                let key = (
+                    namespace.clone(),
+                    name.clone(),
+                    identity.as_str().to_string(),
+                    address.clone(),
+                );
                 let workload = workloads_by_key.entry(key).or_insert_with(|| Workload {
                     spiffe_id: identity.clone(),
                     selector: WorkloadSelector::default(),
@@ -2084,6 +2117,7 @@ fn build_discovery(accumulator: &StockXdsAccumulator) -> StockDiscovery {
             workloads: workload_refs,
             protocol_overrides: HashMap::new(),
             cluster_ips,
+            uid: None,
         });
     }
 
@@ -2093,6 +2127,11 @@ fn build_discovery(accumulator: &StockXdsAccumulator) -> StockDiscovery {
             .as_str()
             .cmp(right.spiffe_id.as_str())
             .then_with(|| left.addresses.cmp(&right.addresses))
+            .then_with(|| {
+                left.attached_service_namespace()
+                    .cmp(right.attached_service_namespace())
+            })
+            .then_with(|| left.service_name.cmp(&right.service_name))
     });
 
     StockDiscovery {

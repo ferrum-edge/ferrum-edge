@@ -283,6 +283,7 @@ fn native_mesh_service(namespace: &str, name: &str) -> MeshService {
         ports: Vec::new(),
         workloads: Vec::new(),
         protocol_overrides: HashMap::new(),
+        uid: None,
     }
 }
 
@@ -558,6 +559,7 @@ fn a_same_name_collision_gives_kubernetes_precedence_then_restores_the_base() {
         ports: Vec::new(),
         workloads: Vec::new(),
         protocol_overrides: HashMap::new(),
+        uid: None,
     };
     let base = other_source_config(MeshConfig {
         services: vec![base_service.clone()],
@@ -988,6 +990,7 @@ fn overlay_slot_compose_restores_a_non_kubernetes_object_the_overlay_shadowed() 
         ports: Vec::new(),
         workloads: Vec::new(),
         protocol_overrides: HashMap::new(),
+        uid: None,
     };
     let non_kubernetes_base = other_source_config(MeshConfig {
         services: vec![base_service.clone()],
@@ -1292,6 +1295,7 @@ fn all_collections(key_suffix: &str, marker: &str) -> MeshConfig {
             ports: Vec::new(),
             workloads: Vec::new(),
             protocol_overrides: HashMap::new(),
+            uid: None,
         }],
         mesh_policies: vec![MeshPolicy {
             name: name("policy"),
@@ -1425,12 +1429,15 @@ fn mesh_config_fields_are_accounted_for_in_overlay_ownership() {
         proxy_configs: _,
         sidecars: _,
         waypoint_bindings: _,
-        // Mesh-global blocks: never produced by the Kubernetes translator and
-        // therefore never withdrawn by it.
+        // Mesh-global blocks: not namespaced collections, so the Kubernetes
+        // overlay never layers or withdraws them by object identity.
+        // `ext_authz_providers` is root-namespace meshConfig state (issue
+        // #3235); the rest are never produced by the Kubernetes translator.
         trust_bundles: _,
         multi_cluster: _,
         outbound_traffic_policy: _,
         extension_configs: _,
+        ext_authz_providers: _,
         // Runtime-only back-projections: derived per slice, never source-owned,
         // always default on a control-plane snapshot.
         node_waypoint_assertors: _,
@@ -1442,6 +1449,7 @@ fn mesh_config_fields_are_accounted_for_in_overlay_ownership() {
         declared_ingress_http_ports: _,
         local_inbound_tcp_routes: _,
         local_workload_addresses: _,
+        sidecar_ingress_bind_overrides: _,
         // EgressGateway external-UDP relay admissions and the source-side
         // captured-UDP routes that originate them (issue #3263): both are
         // rebuilt from the slice on every mesh apply, never Kubernetes-owned.

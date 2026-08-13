@@ -7,8 +7,109 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Sidecar inbound now treats one pod selected by multiple Services as the same
+  local identity only when those workload records share a SPIFFE and the same
+  non-empty pod UID, and materializes one inbound Host route per Service.
+  Missing or divergent UIDs stay fail-closed even when endpoint addresses
+  match (hostNetwork pods can share an IP). The stock xDS live matrix stamps
+  one synthetic destination-pod UID on every Service that pod backs so a
+  representable extra cluster can reach the backend through preserved Host
+  headers (issue #3317).
+- A workload whose cross-namespace attachment (Istio `WorkloadEntry.service`)
+  lost the authorizing `MeshService` to namespace or Sidecar-egress narrowing is
+  now dropped from the slice's routing view instead of being retained as an
+  attachment nothing in that view can authorize. This applies to every config
+  source, not just `stock_xds`: such a slice failed `validate_mesh_config` at
+  proxy apply, and the resulting rollback to the last applied generation blocked
+  every LATER control-plane change — including a legitimate withdrawal — rather
+  than losing just the out-of-view resource. Same-namespace attachments (every
+  Pod-derived workload) are untouched, and the separate inbound anchor
+  (`local_inbound_workloads` / `local_inbound_services`) is unaffected, so an
+  authorized cross-namespace WorkloadEntry keeps serving its own inbound traffic
+  (issue #3244) (issue #3317).
+
 ### Added
 
+- Live data-path coverage for the stock Envoy / third-party Istio xDS
+  interoperability profile `FERRUM_MESH_CONFIG_PROTOCOL=stock_xds` (issue
+  #3317). A scripted third-party ADS server — standard v3
+  `Cluster`/`ClusterLoadAssignment`/`Listener`/`RouteConfiguration` on the wire,
+  never Ferrum's own xDS server — drives the production `stock_xds` client on a
+  real sidecar, and a captured plaintext request traverses the materialized
+  egress route and SVID-mTLS into a second real sidecar and its backend. The
+  same fixture asserts, on that data path, that an endpoint withdrawal and a
+  state-of-the-world cluster withdrawal each remove reachability while their
+  replacements restore it, that a structurally invalid response is NACKed with a
+  field-specific `error_detail` while the last-good view keeps serving, that an
+  unpinned-peer or subset cluster first routes under a representable resource
+  and then loses reachability after only the refusal-causing field changes, that
+  a foreign-namespace cluster is ACKed into the applied generation without
+  freezing a later withdrawal, that a listener carrying `envoy.filters.http.rbac`
+  and a route using `weighted_clusters` are ACKed with field-specific refusal
+  diagnostics while the accepted service keeps serving (semantic coverage that
+  those constructs contribute no listener or virtual host lives in the
+  unit/integration suites), and that re-pinning a cluster's peer identity to an
+  impostor SPIFFE fails the dial closed. The discovery/policy split of
+  authority, refusal boundary, and out-of-scope list are unchanged.
+
+- Istio `AuthorizationPolicy` `action: CUSTOM` external authorization (issue
+  #3235). A matching policy delegates the decision to a root-namespace
+  `meshConfig.extensionProviders` `envoyExtAuthzHttp` provider, evaluated in
+  Istio's action order (CUSTOM → DENY → ALLOW) inside the `mesh_authz`
+  `authorize` phase, so every HTTP-family ingress path — HTTP/1.1, HTTP/2,
+  native gRPC, HTTP/3, and HTTP relayed inside a mesh/HBONE CONNECT — is
+  covered by one implementation. Providers ride the mesh slice and a new
+  `ExtAuthzProvidersCarrier` ECDS carrier; the DP proves the complete
+  policy↔provider binding after xDS recovery, so an incoherent generation
+  NACKs and the last-good slice keeps serving. Outcome classification follows
+  the Istio/Envoy HTTP ext-auth protocol exactly: HTTP `200` allows, HTTP `5xx`
+  and communication failures are failed checks subject to `failOpen` (resolving
+  to `statusOnError` when fail-closed), and every other status is an explicit
+  denial carrying the provider's own status, except that a status which cannot
+  frame the gateway-authored error body (`1xx`, a non-`200` `2xx` such as
+  `204`, and `304`) becomes a plain `403` rather than being forwarded verbatim;
+  an unreadable or oversized
+  discarded body cannot reclassify that denial into a `failOpen` allow. The
+  check is dispatched through a
+  single-attempt seam on the shared plugin HTTP client, so an authorization
+  decision is never replayed by `FERRUM_PLUGIN_HTTP_MAX_RETRIES`. It carries the
+  protocol's automatic fields (original method, prefixed path, original `Host`
+  authority as a header only — the dial destination is always the provider's own
+  configured `service`/`port` — and `Content-Length`), and
+  `includeAdditionalHeadersInCheck` values are authoritative over a same-named
+  client or `includeRequestHeadersInCheck` value. At most one extension provider
+  may apply to a request: same-provider policies coalesce, a workload-scoped
+  conflict is refused at plugin construction, and a request that can see two
+  distinct providers is denied with the stable reason
+  `custom:provider-conflict`; a request spanning several destination scopes
+  evaluates every applicable scope before applying a decision, so a DENY in an
+  earlier scope no longer skips a later scope's CUSTOM delegation (Istio orders
+  CUSTOM before DENY) while the first DENY in scope order still refuses the
+  request. On a non-HTTP port, HTTP-only fields are treated
+  as always matched for CUSTOM exactly as for DENY, so an L4 CUSTOM rule closes
+  the connection instead of becoming inert. Fixed-cardinality
+  `ferrum_mesh_ext_authz_checks_total{outcome}` /
+  `ferrum_mesh_ext_authz_check_failures_total{disposition}` series count every
+  matched delegation exactly once, including the outcomes decided without
+  contacting a provider. Deliberate narrowings, all rejected at admission with
+  field-shaped diagnostics rather than silently dropped: `envoyExtAuthzGrpc`,
+  unmodelled provider fields, `packAsBytes`, wildcard header entries,
+  `headersToUpstreamOnAllow` / `headersToDownstreamOnAllow`, plaintext transport
+  to a non-loopback provider, namespace-qualified `[<namespace>/]<hostname>`
+  service syntax, URL-ambiguous `pathPrefix` percent encodings / dot segments,
+  and `includeRequestBodyInCheck.allowPartialMessage: true`.
+  `maxRequestBytes` is enforced as a `413` before the check runs, matching Envoy
+  without partial messages; the proxy's shared prebuffer ceiling is the maximum
+  cap across the generation's providers, so the SELECTED provider's own cap is
+  re-enforced at check time as an unconditional `413` — decided before any
+  provider I/O and never subject to `failOpen`, so a high-cap provider cannot
+  raise the cap a low-cap provider enforces. A missing (rather than oversize)
+  body remains a failed check that still honours `failOpen`, and the two have
+  distinct `body_unavailable` / `body_too_large` outcome series. That ceiling
+  applies only to requests a body-inspecting CUSTOM rule could reach.
+  See `docs/mesh.md` → "AuthorizationPolicy `action: CUSTOM`".
 - **BREAKING (dp mode):** a data plane's last-known-good configuration now has
   a bounded age (issue #3726). `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` (default
   `3600`) bounds how long a DP may keep serving its last **validated and

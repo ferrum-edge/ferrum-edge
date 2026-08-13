@@ -75,6 +75,7 @@ fn mesh_service(name: &str) -> MeshService {
         }],
         workloads: Vec::new(),
         protocol_overrides: std::collections::HashMap::new(),
+        uid: None,
     }
 }
 
@@ -118,6 +119,8 @@ fn build_admin_state(jwt: JwtManager, mesh_runtime_state: Option<MeshRuntimeStat
         startup_ready: None,
         serving_degraded: None,
         serving_listener_failures: None,
+        gateway_listener_status: None,
+        gateway_listener_failure_fails_readiness: false,
         db_available: None,
         config_rejected: None,
         admin_restore_max_body_size_mib: 100,

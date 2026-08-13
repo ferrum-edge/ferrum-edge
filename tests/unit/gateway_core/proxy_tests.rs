@@ -144,6 +144,7 @@ fn test_proxy() -> Proxy {
         compiled_stream_match: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        pending_limit_scope: None,
     }
 }
 
@@ -2192,9 +2193,12 @@ fn upload_deadline_exits_use_finalized_rejection_cleanup_and_logging() {
 #[test]
 fn streaming_deadline_wraps_client_visible_body_after_inspection() {
     let source = include_str!("../../../src/proxy/mod.rs");
+    // Issue #3731 takes a Unix HTTP/1.1 pool lease from response extensions
+    // before `into_body()`, so this arm binds `mut resp`. That is the legitimate
+    // body owner; the deadline must still wrap inspector output after it.
     for (arm, next_arm) in [
         (
-            "ResponseBody::StreamingH2(resp) => {",
+            "ResponseBody::StreamingH2(mut resp) => {",
             "ResponseBody::StreamingH3(h3_resp) => {",
         ),
         (
@@ -2219,7 +2223,90 @@ fn streaming_deadline_wraps_client_visible_body_after_inspection() {
             inspection < deadline,
             "{arm} must base the deadline DATA decision on inspector output"
         );
+        if arm.starts_with("ResponseBody::StreamingH2") {
+            assert!(
+                body.contains("PooledBackendLeaseSlot")
+                    && body.contains("with_pooled_backend_lease("),
+                "{arm} must re-attach any Unix pool lease to the backend-facing body"
+            );
+            let lease_attach = body
+                .find("with_pooled_backend_lease(")
+                .expect("lease attach");
+            // #3731: the lease anchors to the body that OWNS the backend
+            // `Incoming`, so its `Ready(None)` really is a backend EOF. The
+            // response inspector is the one adapter that does NOT preserve that
+            // — it moves the backend body into a detached task and feeds the
+            // client from a channel that also closes on a policy `Terminate`,
+            // an early return, and task cancellation. Attaching the lease after
+            // that split would re-pool an exclusive HTTP/1.1 carrier
+            // mid-response, so it must come BEFORE it (and therefore before the
+            // deadline wrapper, which decorates the same client-visible body).
+            assert!(
+                lease_attach < inspection,
+                "{arm} must anchor the Unix pool lease to the backend-facing body, before the \
+                 inspector bridge"
+            );
+            assert!(
+                lease_attach < deadline,
+                "{arm} must attach the Unix pool lease before the deadline wrapper"
+            );
+        }
     }
+}
+
+#[test]
+fn unix_h1_keep_alive_buffers_only_within_the_eager_buffer_contract() {
+    // #3731: mesh ingress streams by default; a SMALL Content-Length response
+    // checks in inside proxy_to_backend_unix when keep-alive is on, so a
+    // frontend Connection: close cannot retire a reusable carrier.
+    //
+    // The gate is the repo's existing eager-buffer contract, not "any declared
+    // length": buffering past `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES` would make
+    // the retained size unbounded by that knob, fold an `unlimited` response
+    // ceiling down to the fail-closed per-response fallback (a `502` for a
+    // response that used to stream), and multiply resident bytes by concurrency
+    // against the shared response-buffer budget. SSE must stream regardless.
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let dispatch = source
+        .split("async fn proxy_to_backend_unix(")
+        .nth(1)
+        .expect("unix dispatch");
+    assert!(
+        dispatch.contains("checkout.keep_alive()"),
+        "unix dispatch must gate in-dispatch buffering on the lease's keep-alive decision"
+    );
+    assert!(
+        dispatch.contains("state.response_buffer_cutoff_bytes > 0")
+            && dispatch.contains("len <= state.response_buffer_cutoff_bytes"),
+        "unix dispatch must bound in-dispatch buffering by the eager-buffer cutoff"
+    );
+    assert!(
+        dispatch.contains("!is_streaming_content_type(&resp_headers)"),
+        "unix dispatch must never eagerly buffer a stream-mandated content type"
+    );
+}
+
+#[test]
+fn direct_h2_body_size_hint_does_not_leak_incoming_exact_length() {
+    // Streaming framing strips Content-Length and passes content_length=None
+    // into DirectH2Body. Falling through to Incoming's exact hint would let
+    // hyper reconstruct Content-Length and finish without Ready(None).
+    let source = include_str!("../../../src/proxy/body.rs");
+    let arm = source
+        .split("struct DirectH2Body {")
+        .nth(1)
+        .expect("DirectH2Body")
+        .split("/// Wraps a streaming HTTP/2 response body with a per-frame idle read deadline.")
+        .next()
+        .expect("DirectH2Body impl bound");
+    assert!(
+        arm.contains("content_length_hint(self.content_length)"),
+        "DirectH2Body::size_hint must use content_length_hint only"
+    );
+    assert!(
+        !arm.contains("self.inner.size_hint()"),
+        "DirectH2Body::size_hint must not fall through to Incoming's exact hint"
+    );
 }
 
 #[test]

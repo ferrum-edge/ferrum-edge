@@ -13,6 +13,7 @@ use ferrum_edge::proxy::hbone_pool::HbonePoolError;
 use ferrum_edge::proxy::http2_pool::{
     BackendUnavailableSource, Http2PoolError, InternalSource, classify_http2_pool_error,
 };
+use ferrum_edge::proxy::unix_backend::UnixBackendError;
 use ferrum_edge::retry::{ErrorClass, classify_boxed_setup_error, request_reached_wire};
 use std::io;
 
@@ -584,5 +585,68 @@ fn test_boxed_hbone_missing_cross_cluster_authority_host_is_pre_wire_connection_
     assert!(
         !request_reached_wire(class),
         "a missing cross-cluster authority host is a pre-wire fail-closed reject (no dial happened)"
+    );
+}
+
+// ── Unix WebSocket upgrade-response timeout (issue #3764) ───────────────
+//
+// `client_async_with_config` flushes the RFC 6455 upgrade before waiting for
+// 101. A remaining-budget timeout after that write is post-wire and must not
+// classify as `ConnectTimeout` / satisfy `retry_on_connect_failure`.
+
+#[test]
+fn boxed_unix_websocket_handshake_timeout_is_reached_wire() {
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        Box::new(UnixBackendError::WebSocketHandshakeTimeout { timeout_ms: 5_000 });
+    let class = classify_boxed_setup_error(err.as_ref());
+    assert_eq!(class, ErrorClass::ReadWriteTimeout);
+    assert!(
+        request_reached_wire(class),
+        "unix websocket upgrade-response timeout is post-wire: the upgrade may \
+         already have reached the application"
+    );
+    assert_eq!(
+        err.to_string(),
+        "unix backend websocket upgrade timed out after 5000ms",
+        "display must not embed socket paths or other sensitive metadata"
+    );
+}
+
+#[test]
+fn boxed_unix_connect_timeout_remains_pre_wire() {
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        Box::new(UnixBackendError::ConnectTimeout { timeout_ms: 5_000 });
+    let class = classify_boxed_setup_error(err.as_ref());
+    assert_eq!(class, ErrorClass::ConnectionTimeout);
+    assert!(
+        !request_reached_wire(class),
+        "a true unix connect timeout remains pre-wire / connect-retryable"
+    );
+}
+
+#[test]
+fn unix_websocket_upgrade_timeout_source_uses_post_wire_variant() {
+    // Source-level contract: the remaining-budget upgrade wait must box
+    // `WebSocketHandshakeTimeout`, never `ConnectTimeout`.
+    let src = include_str!("../../../src/proxy/mod.rs");
+    let dial = src
+        .find("async fn connect_unix_websocket_backend(")
+        .expect("connect_unix_websocket_backend not found");
+    let next_fn = src[dial + 1..]
+        .find("\nasync fn ")
+        .map(|idx| dial + 1 + idx)
+        .unwrap_or(src.len());
+    let body = &src[dial..next_fn];
+    assert!(
+        body.contains("WebSocketHandshakeTimeout"),
+        "upgrade-response timeout must use WebSocketHandshakeTimeout"
+    );
+    assert!(
+        !body.contains("UnixBackendError::ConnectTimeout"),
+        "upgrade-response timeout must not reuse pre-wire ConnectTimeout"
+    );
+    assert!(
+        body.contains("client_async_with_config"),
+        "contract is anchored on the tungstenite upgrade helper"
     );
 }

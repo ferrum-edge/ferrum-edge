@@ -36,7 +36,7 @@ The Dockerfile uses a **multi-stage build** for optimal size:
 
 1. **Builder Stage**: Compiles the Ferrum Edge binaries with all build dependencies (`rust:latest`)
 2. **Common Runtime Stage**: Produces the ordinary Google distroless runtime (`gcr.io/distroless/cc-debian13:nonroot`) with neither an eBPF ELF nor `ip`
-3. **eBPF Builder Stage**: Only the explicit `runtime-ebpf` / `runtime-ebpf-tools` targets compile `ebpf/ferrum-ebpf` to a BPF ELF with nightly Rust, `rust-src`, `bpf-linker`, and `-Z build-std=core`
+3. **eBPF Builder Stage**: Only the explicit `runtime-ebpf` / `runtime-ebpf-tools` targets compile `ebpf/ferrum-ebpf` to a BPF ELF with the architecture-specific upstream `bpf-linker` 0.11.0 static release (verified against repository-pinned SHA-256 digests), nightly Rust, `rust-src`, and `-Z build-std=core`. The linker is not rebuilt against mutable base-image LLVM packages
 4. **Runtime Tool Stage**: For `runtime-ebpf`, extracts the `ip` executable and only its non-base resolved shared-library closure from a digest-pinned Debian 13 image with an exact `iproute2` package version. The shared staging helper excludes glibc, the dynamic loader, libgcc, and libstdc++, which remain owned by the distroless base ABI
 5. **eBPF Runtime Stage**: Adds that bounded `ip` closure and the BPF ELF to the common runtime — no shell, package manager, or iptables fallback tools
 6. **Capture Tool Base Stage** (`capture-tools-base`): A digest-pinned Debian 13 root with the same pinned `iproute2` plus `iptables`, asserting at build time that `/bin/sh`, `ip`, `iptables`, `ip6tables`, `iptables-save`, and `ip6tables-save` are all executable

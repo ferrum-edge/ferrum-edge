@@ -11,6 +11,7 @@ use ferrum_edge::config::types::{
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::load_balancer::LoadBalancerCache;
+use ferrum_edge::modes::mesh::config::MeshConfig;
 use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::proxy::client_ip::TrustedProxies;
 use ferrum_edge::proxy::stream_listener::{StreamListenerDegradation, StreamListenerManager};
@@ -90,6 +91,7 @@ fn create_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
         compiled_stream_match: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        pending_limit_scope: None,
     };
     proxy.resolved_tls = BackendTlsConfig::from_proxy(&proxy);
     proxy
@@ -2015,28 +2017,138 @@ async fn swap_frontend_tls_config_replaces_slot_without_reconcile() {
     );
 }
 
-/// `swap_active_dtls_frontend_configs` is a no-op when there are no active
-/// UDP+DTLS listeners. This proves the swap path doesn't crash on an empty
-/// manager (the common case when a PeerAuth slice apply fires before any
-/// stream listener has bound).
+/// `swap_active_dtls_frontend_configs` validates the candidate once and
+/// publishes it as the accepted generation even when no DTLS listeners are
+/// active yet, so a later-started listener converges on the same material.
 #[tokio::test]
-async fn swap_active_dtls_frontend_configs_is_noop_with_no_listeners() {
+async fn swap_active_dtls_frontend_configs_publishes_generation_without_listeners() {
     let manager = create_manager(empty_config());
     let calls = std::sync::atomic::AtomicUsize::new(0);
     let swapped = manager
         .swap_active_dtls_frontend_configs(|| {
             calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Err(anyhow::anyhow!(
-                "build_config must not be called when no DTLS listeners exist"
-            ))
+            Ok(ephemeral_frontend_dtls_config())
         })
         .await;
-    assert_eq!(swapped, 0, "no listeners should mean no swaps");
+    assert_eq!(swapped, 0, "no listeners should mean no live swaps");
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::Relaxed),
-        0,
-        "build_config must not be invoked when there are no active DTLS listeners"
+        1,
+        "build_config must run exactly once so the accepted generation is published"
     );
+    let generation = manager
+        .snapshot_frontend_dtls_generation()
+        .expect("generation published with zero listeners");
+    assert_eq!(generation.generation, 1);
+    let status = manager.frontend_dtls_reload_status();
+    assert_eq!(status.last_outcome, "accepted");
+    assert_eq!(status.generation, 1);
+    let overload = manager.overload_snapshot();
+    assert_eq!(overload.frontend_dtls_reload.generation, 1);
+    assert_eq!(overload.frontend_dtls_reload.last_outcome, "accepted");
+}
+
+#[tokio::test]
+async fn concurrent_dtls_publishers_cannot_regress_the_accepted_generation() {
+    let manager = create_manager(empty_config());
+    let first_config = ephemeral_frontend_dtls_config();
+    let second_config = ephemeral_frontend_dtls_config();
+
+    let (first, second) = tokio::join!(
+        manager.publish_frontend_dtls_generation(first_config),
+        manager.publish_frontend_dtls_generation(second_config)
+    );
+    let mut published = [first.0.generation, second.0.generation];
+    published.sort_unstable();
+    assert_eq!(published, [1, 2]);
+    assert_eq!(
+        manager
+            .snapshot_frontend_dtls_generation()
+            .expect("accepted generation")
+            .generation,
+        2
+    );
+}
+
+#[tokio::test]
+async fn collected_dtls_server_cannot_publish_an_older_generation_after_rotation() {
+    let manager = Arc::new(create_manager(empty_config()));
+    manager
+        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config())
+        .await;
+
+    // Hold the shared fence, queue generation 2 first, then queue the collector
+    // observation. Tokio's mutex is FIFO, so after release the publisher must
+    // complete before the collector can apply and expose its server. A collector
+    // that loaded the generation outside this fence would observe 1 here and
+    // could restore it after the generation-2 publisher missed its empty slot.
+    let publish_lock = manager.frontend_dtls_publish_lock_for_test();
+    let guard = publish_lock.lock().await;
+
+    let (publisher_started_tx, publisher_started_rx) = tokio::sync::oneshot::channel();
+    let publisher_manager = Arc::clone(&manager);
+    let publisher = tokio::spawn(async move {
+        let _ = publisher_started_tx.send(());
+        publisher_manager
+            .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config())
+            .await
+            .0
+            .generation
+    });
+    publisher_started_rx.await.expect("publisher started");
+
+    let (collector_started_tx, collector_started_rx) = tokio::sync::oneshot::channel();
+    let collector_manager = Arc::clone(&manager);
+    let collector = tokio::spawn(async move {
+        let _ = collector_started_tx.send(());
+        collector_manager
+            .collected_frontend_dtls_generation_for_test()
+            .await
+    });
+    collector_started_rx.await.expect("collector started");
+    drop(guard);
+
+    assert_eq!(publisher.await.expect("publisher task"), 2);
+    assert_eq!(
+        collector.await.expect("collector task"),
+        Some(2),
+        "collector must apply the generation that won the shared publication fence"
+    );
+}
+
+#[tokio::test]
+async fn rejected_dtls_candidate_retains_previous_generation() {
+    let manager = create_manager(empty_config());
+    let (_gen, swapped) = manager
+        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config())
+        .await;
+    assert_eq!(swapped, 0);
+    let before = manager
+        .snapshot_frontend_dtls_generation()
+        .expect("initial generation");
+
+    let swapped = manager
+        .swap_active_dtls_frontend_configs(|| Err(anyhow::anyhow!("simulated bad candidate")))
+        .await;
+    assert_eq!(swapped, 0);
+    let after = manager
+        .snapshot_frontend_dtls_generation()
+        .expect("previous generation retained");
+    assert_eq!(before.generation, after.generation);
+    let status = manager.frontend_dtls_reload_status();
+    assert_eq!(status.last_outcome, "rejected");
+    assert_eq!(status.generation, before.generation);
+    assert!(status.last_failure_unix.is_some());
+}
+
+fn ephemeral_frontend_dtls_config() -> ferrum_edge::dtls::FrontendDtlsConfig {
+    let certificate = ferrum_edge::dtls::generate_ephemeral_cert_public().expect("ephemeral cert");
+    let config = dimpl::Config::builder().build().expect("dtls config");
+    ferrum_edge::dtls::FrontendDtlsConfig {
+        dimpl_config: std::sync::Arc::new(config),
+        certificate,
+        client_cert_verifier: None,
+    }
 }
 
 /// Minimal cert resolver for the swap-pointer test. Never gets driven, so
@@ -2052,4 +2164,85 @@ impl rustls::server::ResolvesServerCert for NoopCertResolver {
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
         None
     }
+}
+
+fn config_with_sidecar_bind(proxy: Proxy, port: u16, bind: IpAddr) -> GatewayConfig {
+    let mut mesh = MeshConfig::default();
+    mesh.sidecar_ingress_bind_overrides.insert(port, bind);
+    GatewayConfig {
+        proxies: vec![proxy],
+        mesh: Some(Box::new(mesh)),
+        ..empty_config()
+    }
+}
+
+/// A dedicated Sidecar ingress bind-address change must register as listener
+/// drift and rebind — port/scheme alone are not enough restart identity.
+#[tokio::test]
+async fn test_reconcile_restarts_on_dedicated_bind_address_change() {
+    let port = ephemeral_port().await;
+    let first: IpAddr = "127.0.0.1".parse().expect("ip");
+    let second: IpAddr = "127.0.0.2".parse().expect("ip");
+    let proxy = create_stream_proxy("tcp-bind-rebind", BackendScheme::Tcp, port);
+    let config = config_with_sidecar_bind(proxy.clone(), port, first);
+    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
+    let manager = create_manager_with_config_arc(config_arc.clone(), &config);
+
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "initial dedicated-bind listener should start: {failures:?}"
+    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("initial dedicated-bind listener should bind");
+    assert_eq!(
+        manager.active_binds().await,
+        vec![(
+            format!(
+                "{}|tcp-bind-rebind",
+                ferrum_edge::config::types::default_namespace()
+            ),
+            first
+        )]
+    );
+
+    // Prove the old address is reachable before the rebind.
+    tokio::net::TcpStream::connect((first, port))
+        .await
+        .expect("pre-rebind connect to first bind must succeed");
+
+    config_arc.store(Arc::new(config_with_sidecar_bind(proxy, port, second)));
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "bind-address restart should wait for the old socket before probing: {failures:?}"
+    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("rebound dedicated-bind listener should bind");
+    assert_eq!(
+        manager.active_binds().await,
+        vec![(
+            format!(
+                "{}|tcp-bind-rebind",
+                ferrum_edge::config::types::default_namespace()
+            ),
+            second
+        )],
+        "bind-address drift must rebind the live stream listener"
+    );
+
+    // Old ownership must be gone; new ownership must accept.
+    assert!(
+        tokio::net::TcpStream::connect((first, port)).await.is_err(),
+        "old dedicated bind must not keep accepting after rebind"
+    );
+    tokio::net::TcpStream::connect((second, port))
+        .await
+        .expect("new dedicated bind must accept after rebind");
+
+    manager.shutdown_all().await;
 }

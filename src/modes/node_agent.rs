@@ -1264,6 +1264,8 @@ async fn start_node_agent_admin_listeners(
         // the bounded drift monitor may lower it after startup.
         serving_degraded: None,
         serving_listener_failures: None,
+        gateway_listener_status: None,
+        gateway_listener_failure_fails_readiness: false,
         db_available: None,
         config_rejected: None,
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,

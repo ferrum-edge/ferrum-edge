@@ -248,6 +248,13 @@ cp:
   # any tenant holding it can re-sign the JWT `ns` claim and read another
   # tenant's config (advisory GHSA-3f2j-wwqw-grmg). The chart fails render, and
   # the binary refuses to start, without it. See docs/cp_namespace_tenancy.md.
+  #
+  # Keep the bundle document and every secret_path/public_key_path file it
+  # references in ONE projected volume: Ferrum pins that volume's `..data`
+  # generation before reading the document, so a rotation can never pair one
+  # generation's namespace ceiling with another generation's key material. A
+  # referenced file outside the pinned generation must declare `material_sha256`
+  # and is refused without it.
   trustBundlePath: ""
   # gRPC Service (ClusterIP) exposing the CP to DP pods.
   service:

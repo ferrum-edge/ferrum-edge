@@ -258,6 +258,7 @@ REQUIRED_MERGE_GROUP_WORKFLOWS = {
     ".github/workflows/gateway-api-conformance.yml": "Gateway API Conformance",
     ".github/workflows/mesh-e2e-sidecar-live.yml": "Mesh E2E Sidecar Live",
     ".github/workflows/cross-build-policy.yml": "Trusted Cross Build Policy",
+    ".github/workflows/launch-integrity.yml": "Launch Readiness Integrity",
     ".github/workflows/multicluster-federation-live.yml": (
         "Multicluster Federation Live"
     ),
@@ -823,6 +824,26 @@ def main() -> int:
             if re.search(r"(?m)^\s+contents:\s+write\s*$", workflow_yml):
                 planner_errors.append(
                     f"{workflow_path} must not grant contents: write"
+                )
+        if workflow_path == ".github/workflows/launch-integrity.yml":
+            # The integrity lane must stay a trusted-base evaluator: no secret,
+            # no write scope, and no credentialed checkout of candidate code.
+            if "pull_request_target:" not in workflow_yml:
+                planner_errors.append(
+                    f"{workflow_path} must keep pull_request_target so the "
+                    "verifier runs from the trusted base"
+                )
+            if "persist-credentials: false" not in workflow_yml:
+                planner_errors.append(
+                    f"{workflow_path} must keep persist-credentials disabled"
+                )
+            if "secrets." in workflow_yml:
+                planner_errors.append(
+                    f"{workflow_path} must not consume repository secrets"
+                )
+            if re.search(r"(?m)^\s+(?:contents|packages|id-token|actions):\s+write\s*$", workflow_yml):
+                planner_errors.append(
+                    f"{workflow_path} must not grant a write permission"
                 )
         if workflow_path == ".github/workflows/ci.yml":
             if "github.event_name == 'merge_group'" not in workflow_yml:

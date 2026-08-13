@@ -1933,6 +1933,7 @@ mod tests {
                 endpoint_unix_h2c: false,
                 owner_namespace: "default".to_string(),
                 owner_service: "redis".to_string(),
+                bind: None,
             }],
             sidecar_ingress_declared: true,
             local_workload_addresses: vec!["10.244.1.7".parse().unwrap()],

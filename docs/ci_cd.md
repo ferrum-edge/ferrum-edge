@@ -42,6 +42,8 @@ adding, removing, or materially changing a workflow.
 | `mesh-e2e-sidecar-live.yml` | Mesh E2E Sidecar Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking sidecar datapath validation; `Mesh E2E Sidecar Live` is directly required on PRs and merge-queue groups. |
 | `cross-build-policy.yml` | Cross Build Policy | `pull_request_target` for PRs to `main`, `merge_group` | Read-only trusted-base validation of every PR-controlled ARM64 Cross configuration and invocation surface on PRs; merge-group mode verifies the synthesized combined SHA with `contents: read` only. `Trusted Cross Build Policy` is directly required. |
 | `ambient-host-udp-live.yml` | Ambient Host UDP Live Kernel | Every PR, `merge_group`, manual | Privileged live-kernel gate for Ambient host-network UDP capture (`ProxyHostUdpBackend`), plus a production-image contract job that proves the chart-selected `-ebpf-tools` runtime can execute the shell/iptables tool set while `-ebpf` stays distroless; relevance is decided by a trusted-base classifier and `Ambient Host UDP Live` reports on every run. |
+| `launch-integrity.yml` | Launch Readiness Integrity | `pull_request_target` for PRs to `main`, `merge_group` | Read-only trusted-base validation that a candidate preserved the launch/release governance contract. Executable gate code (checker, readiness/release/integrity/advisory-trust workflows and verifiers) is byte-frozen to protected `main`; candidate-editable data (blocker policy, exemption schema, document markers, CODEOWNERS coverage) is structurally validated, and check-name/advisory-secret scanning covers every workflow including ones the candidate adds. It never computes a launch verdict, so open launch blockers keep it green. `Launch Readiness Integrity` is directly required. See [launch-readiness.md](launch-readiness.md). |
+| `launch-readiness.yml` | Launch Readiness | PRs, `merge_group`, push to `main`, `v*` tags, daily schedule, manual | Live go/no-go launch verdict (`Launch Readiness Gate`). Expected to stay red while real blockers are open; it is release-blocking, **not** a required PR context. |
 | `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | Path-filtered PRs, manual | Live eBPF datapath validation in kind. |
 | `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking multicluster federation datapath validation; `Multicluster Federation Live` is directly required on PRs and merge-queue groups. |
 | `multicluster-poller-partition-live.yml` | Multicluster Poller Partition Live | PRs, `merge_group`, push to `main`, manual | Release-blocking two-CP/two-DP trust/discovery partition and bounded last-good-retention validation; `Multicluster Poller Partition Live` is directly required. |
@@ -64,6 +66,9 @@ adding, removing, or materially changing a workflow.
 
 ```
 Pull Request / Merge Queue group
+    ├─► Launch Readiness Integrity
+            ├─► PR: `pull_request_target`, trusted-base verifier, candidate tree as data
+            └─► Merge group: synthesized queue SHA, `contents: read`, no secrets
     ├─► Trusted Cross Build Policy
             ├─► PR: `pull_request_target`, base code only, PR tree as data
             └─► Merge group: synthesized queue SHA, `contents: read`, no secrets
@@ -96,7 +101,7 @@ Push to main
 
 ### Required checks and merge queue
 
-Branch protection / repository rulesets for `main` must require these seven
+Branch protection / repository rulesets for `main` must require these nine
 GitHub Actions check names (exact spelling; source app is **GitHub Actions**,
 app id `15368`):
 
@@ -110,6 +115,14 @@ app id `15368`):
 | `Multicluster Federation Live` | `.github/workflows/multicluster-federation-live.yml` | `gate` |
 | `Multicluster Poller Partition Live` | `.github/workflows/multicluster-poller-partition-live.yml` | `gate` |
 | `Ambient Host UDP Live` | `.github/workflows/ambient-host-udp-live.yml` | `gate` |
+| `Launch Readiness Integrity` | `.github/workflows/launch-integrity.yml` | `verify` |
+
+`Launch Readiness Gate` (from `launch-readiness.yml`) is deliberately **not** in
+this list: it is the live go/no-go verdict and stays red while any real launch
+blocker is open, so requiring it would deadlock blocker-fix pull requests. The
+merge control is the separate integrity context above; the go/no-go verdict
+remains release-blocking through `release.yml`'s `validate-launch-readiness`
+job. See [launch-readiness.md](launch-readiness.md).
 
 Each owner declares a `merge_group` (`types: [checks_requested]`) trigger in
 addition to its existing `pull_request` / `pull_request_target` / `push` /
@@ -496,7 +509,8 @@ cargo clippy --all-targets -- -D warnings
 
 The planner schedules this job on PRs only when files under `ebpf/` changed, so
 unrelated PRs consume no runner; pushes to `main` and manual runs force it on.
-The job installs stable and nightly Rust toolchains plus `bpf-linker`, uses
+The job installs stable and nightly Rust toolchains plus the repository-pinned,
+SHA-256-verified upstream `bpf-linker` static release, uses
 nightly to build `ferrum-ebpf`, uses stable to run
 `cargo test -p ferrum-ebpf-common`, and uploads the compiled `ebpf-programs`
 artifact with 14-day retention. If this job is edited, preserve the intent that
@@ -554,46 +568,14 @@ every run: green when the suite passed or was legitimately irrelevant, red when
 a relevant live job failed or was unexpectedly absent. Every checkout, parsing,
 or classifier error fails closed.
 
-One narrow bootstrap exception exists for the pull request that introduces the
-suite: `origin/main` does not yet list `ambient-host-udp` among the classifier's
-`--suite` choices, so the trusted classifier rejects it with argparse's exact
-`invalid choice: 'ambient-host-udp'`. Only that exact rejection forces
-`relevant=true`, so the introducing pull request still runs the live suite
-rather than deferring it to a future merge; every other classifier failure still
-exits non-zero. Once `main` carries the suite the branch is unreachable and
-ordinary trusted-base classification applies. The required-CI verifier pins
-the workflow's unconditional pull-request / merge-group ownership and exact
-`Ambient Host UDP Live` context. The separately trusted cross-build verifier
-cannot be changed by a pull request, so the introducing bootstrap is also an
-explicit root-review boundary rather than a self-authorizing verifier change.
-
-**Required follow-up: freeze this gate's relevance job.** The other three
-required live gates (`mesh-e2e-sidecar-live.yml`,
-`multicluster-federation-live.yml`, `multicluster-poller-partition-live.yml`)
-have their `changes` job frozen byte-for-byte by
-`LIVE_SUITE_RELEVANCE_CONTRACTS` in `.github/scripts/verify_cross_build_policy.py`,
-together with the live job's `needs`/`if` binding — the only freeze a pull
-request cannot edit, because that verifier runs from the trusted base.
-`ambient-host-udp-live.yml` is **not yet** in that set, and it cannot be added
-by the pull request that introduces it: the trusted base still runs the
-three-entry contract, and the bootstrap block above makes this workflow's
-`changes` job differ from `LIVE_SUITE_RELEVANCE_JOB_TEMPLATE`, so adding the
-entry here would turn `Trusted Cross Build Policy` red on `main` immediately
-after merge. Until the follow-up lands, `Ambient Host UDP Live` is the one
-required live gate whose relevance verdict and live-job binding a later pull
-request could rewrite — note that `verify_required_ci.py` runs from the pull
-request's own checkout in `ci.yml` and is therefore a consistency check, not a
-trust boundary. Once `main` carries the `ambient-host-udp` suite, a follow-up
-pull request must (1) delete the bootstrap exception so the `changes` job is
-byte-identical to the template and (2) add
-`"ambient-host-udp-live.yml": ("changes", "ambient-host-udp-live", "Ambient host-UDP trigger", "ambient-host-udp", "ambient-host-udp")`
-to `LIVE_SUITE_RELEVANCE_CONTRACTS`. Both halves must land in the **same** pull
-request. That pull request's own gate still runs the trusted base's three-entry
-contract and so cannot see the mismatch; if the entry merged without the
-bootstrap removal, `main` would then hold a contract its own workflow violates
-and every subsequent pull request's `Trusted Cross Build Policy` would fail.
-Removing the bootstrap on its own is safe but leaves the gate unfrozen, which is
-the state this note exists to close.
+The `changes` job is frozen byte-for-byte by
+`LIVE_SUITE_RELEVANCE_CONTRACTS` in
+`.github/scripts/verify_cross_build_policy.py`, together with the live job's
+`needs`/`if` binding. The trusted-base verifier therefore rejects any pull
+request that rewrites the Ambient gate's relevance logic, points it at
+pull-request-supplied classifier code, severs the live job binding, or removes
+the required workflow. This is the same fail-closed contract used by the other
+required live-datapath gates.
 
 The relevant surfaces are host-UDP capture, mesh UDP serving, capture plan
 generators, Ambient mesh serving, Helm mesh charts, the `Dockerfile` and its
@@ -601,8 +583,12 @@ runtime tool staging, the release publication workflow, the live fixture, and
 related docs. When relevant, the job builds the lib and functional test binaries
 (without running them as the invoking user), preflights `unshare` /
 `iptables` / `ip6tables` / TPROXY primitives, then runs
-`tests/k8s/ambient_host_udp_live/run.sh` as root with
-`FERRUM_LIVE_TESTS_REQUIRED=1`. The fixture exercises the production
+`tests/k8s/ambient_host_udp_live/run.sh` as root inside an explicit hosted
+disposable outer network + private mount namespace (`unshare --mount --net`,
+#3804) with a fresh read-only sysfs view tied to the owned network namespace and
+`FERRUM_LIVE_TESTS_REQUIRED=1`. The runner itself also creates a structurally
+proven disposable outer netns for every ordinary root execution so ad-hoc runs
+share the same ownership boundary. The fixture exercises the production
 `ProxyHostUdpBackend` path: multi-veth dual-stack TPROXY delivery, original
 destination recovery, ingress-ifindex attribution, transparent replies,
 restart/cleanup ownership, and explicit negative cases. Skips under required

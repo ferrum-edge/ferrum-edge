@@ -5,17 +5,22 @@ set -euo pipefail
 usage() {
   printf '%s\n' \
     'Usage: dispatch-agent.sh --worktree ABS_PATH --prompt-file ABS_PATH' \
-    '                         [--effort medium|high|xhigh|max]' \
+    '                         [--effort low|medium|high|xhigh|max]' \
+    '                         [--fast]' \
     '                         [--name NAME]' \
     '' \
+    'Runs the standalone `cursor-agent` CLI in print mode against composer-2.5.' \
     'Note: --effort is accepted for CLI parity with sibling agent skills but is' \
-    'ignored. Composer has no effort tiers; model is always composer-2.5.' >&2
+    'ignored. Composer 2.5 publishes no reasoning tiers.' >&2
 }
 
 worktree=''
 prompt_file=''
 effort=''
+fast='false'
 name=''
+
+MODEL='composer-2.5'
 
 while (($#)); do
   case "$1" in
@@ -46,6 +51,10 @@ while (($#)); do
       effort=${2-}
       shift 2
       ;;
+    --fast)
+      fast='true'
+      shift
+      ;;
     --name)
       if (($# < 2)); then
         printf 'Missing value for --name\n' >&2
@@ -69,8 +78,8 @@ done
 
 if [[ -n "$effort" ]]; then
   case "$effort" in
-    medium|high|xhigh|max)
-      printf '[composer-agents] ignoring --effort %s: Composer has no effort tiers\n' \
+    low|medium|high|xhigh|max)
+      printf '[composer-agents] ignoring --effort %s: Composer 2.5 has no effort tiers\n' \
         "$effort" >&2
       ;;
     *)
@@ -79,6 +88,10 @@ if [[ -n "$effort" ]]; then
       exit 2
       ;;
   esac
+fi
+
+if [[ "$fast" == 'true' ]]; then
+  MODEL='composer-2.5-fast'
 fi
 
 if [[ "$worktree" != /* || ! -d "$worktree" ]]; then
@@ -91,6 +104,15 @@ if [[ "$prompt_file" != /* || ! -f "$prompt_file" ]]; then
   exit 2
 fi
 
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+# shellcheck source=../../_lib/resolve-agent-bin.sh
+. "$script_dir/../../_lib/resolve-agent-bin.sh"
+
+cursor_bin=$(resolve_agent_bin cursor-agent CURSOR_AGENT_BIN \
+  "${HOME}/.local/bin/cursor-agent" \
+  /opt/homebrew/bin/cursor-agent \
+  /usr/local/bin/cursor-agent)
+
 repo_root=$(git -C "$worktree" rev-parse --show-toplevel)
 physical_worktree=$(cd "$worktree" && pwd -P)
 physical_root=$(cd "$repo_root" && pwd -P)
@@ -100,65 +122,34 @@ if [[ "$physical_worktree" != "$physical_root" ]]; then
   exit 2
 fi
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-runner="$script_dir/run-cursor-agent.mjs"
-
-if [[ ! -f "$runner" ]]; then
-  printf 'Missing runner script: %s\n' "$runner" >&2
-  exit 2
+# Auth: cursor-agent reads CURSOR_API_KEY from the environment when it is
+# exported, and otherwise uses the CLI's own stored login (`cursor-agent status`).
+# Current Cursor CLI releases can initialize the default macOS credential
+# manager before reaching their environment-key fallback. Force the process-local
+# memory store for API-key runs so they never consult or mutate Keychain. Never
+# pass the key on argv — it would be visible in `ps`.
+if [[ -n "${CURSOR_API_KEY:-}" ]]; then
+  auth_source='CURSOR_API_KEY'
+  export AGENT_CLI_CREDENTIAL_STORE=memory
+else
+  auth_source='cursor-agent login'
 fi
-
-conductor_bin_dir=${CONDUCTOR_INTERNAL_BIN_DIR:-"${HOME}/Library/Application Support/com.conductor.app/bin"}
-node_bin="$conductor_bin_dir/.internal/node"
-worker_mjs="$conductor_bin_dir/.internal/cursor-node-worker.mjs"
-
-if [[ ! -x "$node_bin" ]]; then
-  printf 'Conductor Node runtime not found at %s\n' "$node_bin" >&2
-  printf 'Install/open Conductor.app so its Cursor harness is available.\n' >&2
-  exit 127
-fi
-
-if [[ ! -f "$worker_mjs" ]]; then
-  printf 'Conductor Cursor worker not found at %s\n' "$worker_mjs" >&2
-  exit 127
-fi
-
-if [[ -z "${CURSOR_API_KEY:-}" ]]; then
-  if ! CURSOR_API_KEY=$(
-    security find-generic-password \
-      -s 'com.conductor.app.production.settings' \
-      -a 'env:local:shared:CURSOR_API_KEY' \
-      -w 2>/dev/null
-  ); then
-    printf 'CURSOR_API_KEY is not available.\n' >&2
-    printf 'Export CURSOR_API_KEY or add a Cursor API key in Conductor provider settings.\n' >&2
-    exit 127
-  fi
-  export CURSOR_API_KEY
-fi
-
-export CONDUCTOR_INTERNAL_BIN_DIR="$conductor_bin_dir"
-export CONDUCTOR_CURSOR_SDK_REQUIRE_PATH="${CONDUCTOR_CURSOR_SDK_REQUIRE_PATH:-$worker_mjs}"
-export CONDUCTOR_WORKSPACE_PATH="$physical_worktree"
 
 cd "$physical_worktree"
 
-launch_args=(
-  "$node_bin"
-  "$runner"
-  --worktree "$physical_worktree"
-  --prompt-file "$prompt_file"
-)
+printf '[composer-agents] dispatch model=%s fast=%s worktree=%s bin=%s auth=%s%s\n' \
+  "$MODEL" "$fast" "$physical_worktree" "$cursor_bin" "$auth_source" \
+  "${name:+ name=$name}" >&2
 
-if [[ -n "$effort" ]]; then
-  launch_args+=(--effort "$effort")
-fi
-
-if [[ -n "$name" ]]; then
-  launch_args+=(--name "$name")
-fi
-
-printf '[composer-agents] dispatch model=composer-2.5 worktree=%s\n' \
-  "$physical_worktree" >&2
-
-exec "${launch_args[@]}"
+# --print: non-interactive, full tool access (read, write, shell).
+# --force:  no per-command approval prompts; worktree isolation is the boundary.
+# --trust:  accept the freshly created worktree as a trusted directory, which the
+#           trust gate otherwise blocks on in a non-TTY.
+exec "$cursor_bin" \
+  --print \
+  --force \
+  --trust \
+  --model "$MODEL" \
+  --output-format text \
+  --workspace "$physical_worktree" \
+  < "$prompt_file"

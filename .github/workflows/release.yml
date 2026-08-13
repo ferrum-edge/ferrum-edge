@@ -43,38 +43,109 @@ jobs:
     name: Validate launch readiness
     needs: validate-release-version
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    # `security-events: read` is NOT the repository security-advisories
-    # permission, so it is deliberately absent: the advisory listing comes from
-    # an explicitly provisioned read-only token, or from redacted repository
-    # variables, or the verdict is UNKNOWN and the release stops.
+    timeout-minutes: 200
+    # This job holds NO advisory credential, and it never can: for a tag push,
+    # GitHub loads this workflow definition and every file it executes from the
+    # tag target, which is candidate-controlled until `validate-release-sha`
+    # establishes provenance. Issue #3802: handing the tag target the private
+    # advisory credential exposed it before any trust was established.
+    #
+    # The privileged evaluation lives in
+    # `.github/workflows/launch-advisory-trust.yml`, whose definition GitHub
+    # always loads from the protected default branch and whose credential is
+    # bound to the protected `launch-advisory` environment. This job only reads
+    # the fixed-text commit status that trusted run publishes for the exact tag
+    # commit, so nothing here can reach the credential or private advisory data.
+    #
+    # The status is accepted only under the context bound to THIS run and THIS
+    # run attempt. A commit-wide context would be replayable: the daily audit,
+    # an earlier tag release on the same commit, or an earlier attempt of this
+    # run would already have posted a success, and a blocker opened after it
+    # would let the release proceed on a stale verdict.
     permissions:
       contents: read
-      issues: read
-      pull-requests: read
+      statuses: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           fetch-depth: 0
           persist-credentials: false
 
+      # Runs the tag target's own checker with no secret in the environment.
+      # This is a consistency check on the released tree, not a trust decision.
       - name: Synthetic policy/checker self-tests
         run: python3 -I scripts/check_launch_readiness.py --self-test
 
-      - name: Require live launch PASS for the exact tag commit
+      - name: Require the trusted launch advisory verdict for the tag commit
         env:
-          # Public issue state only; this token cannot read private advisories.
-          GITHUB_TOKEN: ${{ github.token }}
-          LAUNCH_TIER: ga
-          # No LAUNCH_TARGET_SHA: with the tag ref checked out, the evaluated
-          # target is resolved from HEAD, so it is exactly the tagged commit
-          # whatever object the tag itself is.
-          LAUNCH_PRIVATE_BLOCKER_COUNT: ${{ vars.LAUNCH_PRIVATE_BLOCKER_COUNT }}
-          LAUNCH_PRIVATE_ADVISORY_AS_OF: ${{ vars.LAUNCH_PRIVATE_ADVISORY_AS_OF }}
-          # Never expose the advisory token to code selected by a movable tag.
-          # Release runs use the externally maintained redacted fallback above.
-          LAUNCH_ADVISORY_READ_TOKEN: ''
-        run: python3 -I scripts/check_launch_readiness.py --verify --require-pass
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+          RELEASE_RUN_ID: ${{ github.run_id }}
+          RELEASE_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "::error title=Release validation failed::invalid release tag format: ${TAG_NAME}" >&2
+            exit 1
+          fi
+
+          release_sha="$(git rev-list -n 1 "refs/tags/${TAG_NAME}")"
+          if [[ ! "$release_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=Release validation failed::release tag did not resolve to exactly one commit" >&2
+            exit 1
+          fi
+          echo "Release tag ${TAG_NAME} resolves to ${release_sha}"
+
+          # Strict positive decimals, matching the trusted publisher's own
+          # validation, so the context this job waits for is exactly the one it
+          # can derive and no other run's status can be mistaken for it.
+          if [[ ! "$RELEASE_RUN_ID" =~ ^[1-9][0-9]{0,17}$ ]] \
+            || [[ ! "$RELEASE_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,17}$ ]]; then
+            echo "::error title=Release validation failed::this run has no usable run ID or run attempt" >&2
+            exit 1
+          fi
+          expected_context="trusted-launch-advisory-gate/release-${RELEASE_RUN_ID}-attempt-${RELEASE_RUN_ATTEMPT}"
+          echo "Requiring the trusted verdict published for ${expected_context}"
+
+          max_attempts=240
+          for attempt in $(seq 1 "$max_attempts"); do
+            statuses="$(gh api \
+              "repos/${GITHUB_REPOSITORY}/commits/${release_sha}/statuses?per_page=100" \
+              2>/dev/null || true)"
+            if [ -z "$statuses" ]; then
+              echo "Trusted advisory status lookup failed transiently (attempt ${attempt}/${max_attempts}); retrying"
+              sleep 30
+              continue
+            fi
+
+            state="$(jq -r --arg ctx "$expected_context" '[.[] | select(.context == $ctx)] | sort_by(.created_at) | last | .state // empty' <<<"$statuses" 2>/dev/null || true)"
+            case "$state" in
+              success)
+                echo "Trusted launch advisory verdict is PASS for ${release_sha}"
+                {
+                  echo "### Trusted Launch Advisory Gate"
+                  echo ""
+                  echo "Validated ${release_sha} from protected \`main\` code."
+                  echo ""
+                  echo "Verdict context: \`${expected_context}\`"
+                  echo ""
+                } >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+                ;;
+              failure|error)
+                echo "::error title=Release validation failed::the trusted launch advisory verdict for this run attempt did not pass for ${release_sha}" >&2
+                exit 1
+                ;;
+              *)
+                echo "No trusted launch advisory verdict for this run attempt on ${release_sha} yet (attempt ${attempt}/${max_attempts}); waiting"
+                sleep 30
+                ;;
+            esac
+          done
+
+          echo "::error title=Missing release validation::no trusted launch advisory verdict was published for this run attempt on ${release_sha}" >&2
+          exit 1
 
   validate-release-sha:
     name: Validate release SHA

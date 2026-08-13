@@ -358,13 +358,11 @@ pub fn apply_validate_overrides(args: &ValidateArgs) {
 /// `FERRUM_CONF_PATH_FILE` source has been materialized; before that this would
 /// consult the wrong settings file.
 ///
-/// The read goes through a fresh `ConfFile::load()`, not
-/// `config::conf_file::resolve_ferrum_var`. The latter memoizes into the
-/// process-wide `CONF_FILE_CACHE`, and this helper must not be the thing that
-/// pins that cache for the rest of the process — `EnvConfig::from_env()` loads
-/// the file itself and reports a malformed one properly. A load failure here is
-/// therefore *not* treated as "a mode is configured": inference proceeds and the
-/// real error surfaces from settings validation a moment later.
+/// The read goes through `ConfFile::load()` so it shares the process-wide
+/// immutable settings snapshot with every later consumer. A load failure here
+/// is *not* treated as "a mode is configured": inference proceeds and
+/// `EnvConfig::from_env()` surfaces the same cached error before any listener
+/// starts.
 pub fn infer_file_mode() {
     use crate::config::conf_file::ConfFile;
 
@@ -377,6 +375,22 @@ pub fn infer_file_mode() {
     let conf_mode = ConfFile::load()
         .ok()
         .and_then(|conf| conf.get("FERRUM_MODE").map(str::to_string));
+    infer_file_mode_from_conf_mode(conf_mode.as_deref());
+}
+
+/// Apply the file-mode smart default after the immutable settings snapshot has
+/// already been resolved.
+///
+/// Kept as a small public seam because process-level callers may already hold
+/// the accepted `ferrum.conf` value, and tests must not attempt to replace the
+/// process-wide `OnceLock` snapshot with several different files.
+#[doc(hidden)]
+pub fn infer_file_mode_from_conf_mode(conf_mode: Option<&str>) {
+    // Preserve CLI/direct-env precedence even for callers that already loaded
+    // the settings snapshot.
+    if direct_env_var_is_set("FERRUM_MODE") {
+        return;
+    }
     if conf_mode.is_some_and(|mode| !mode.trim().is_empty()) {
         return;
     }

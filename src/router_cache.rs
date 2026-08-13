@@ -121,8 +121,8 @@ struct HttpPortMatchContext<'a> {
     single_tls_listen_port: Option<u16>,
     /// Listener admission published with the exact request/config generation.
     /// A pending generation rejects every listener-scoped route. Once the
-    /// matching reconcile acknowledges it, only admission-refused ports remain
-    /// ineligible; ordinary OS bind failures stay eligible for Service remap.
+    /// matching reconcile acknowledges it, every admission-refused or
+    /// bind-failed port remains ineligible for Service remap.
     listener_admission: &'a GatewayListenerAdmission,
 }
 
@@ -137,13 +137,24 @@ struct PortScopedProxy {
     proxy: Arc<Proxy>,
     listen_port: Option<u16>,
     listen_port_tls: bool,
+    /// Dedicated Sidecar ingress `bind` routes own an exclusive OS listener
+    /// (issue #3266). They must never ride the single-listener Service remap
+    /// onto another frontend — that would beat the port-agnostic capture
+    /// sibling on `:15006` / process-global binds, then fail the bind-route
+    /// exact-port gate and 502 mesh peers. Capture stays port-agnostic.
+    allow_service_remap: bool,
 }
 
 impl PortScopedProxy {
     /// Rank this candidate against the request frontend. See
     /// [`port_match_priority`].
     fn match_priority(&self, ctx: HttpPortMatchContext) -> Option<u8> {
-        port_match_priority(self.listen_port, self.listen_port_tls, ctx)
+        port_match_priority(
+            self.listen_port,
+            self.listen_port_tls,
+            self.allow_service_remap,
+            ctx,
+        )
     }
 
     fn new(proxy: Arc<Proxy>, tls_listen_ports: &BTreeSet<(String, u16)>) -> Self {
@@ -157,10 +168,13 @@ impl PortScopedProxy {
             // build time (once per config publication), not the request path.
             tls_listen_ports.contains(&(proxy.namespace.clone(), port))
         });
+        let allow_service_remap =
+            !crate::modes::mesh::is_mesh_ingress_bind_route_id(proxy.id.as_str());
         Self {
             proxy,
             listen_port,
             listen_port_tls,
+            allow_service_remap,
         }
     }
 }
@@ -173,6 +187,7 @@ impl PortScopedProxy {
 fn port_match_priority(
     listen_port: Option<u16>,
     listen_port_tls: bool,
+    allow_service_remap: bool,
     ctx: HttpPortMatchContext<'_>,
 ) -> Option<u8> {
     let Some(port) = listen_port else {
@@ -192,7 +207,12 @@ fn port_match_priority(
     if ctx.frontend_port == Some(port) {
         return Some(0);
     }
-    // Single-listener protocol remap (Service-fronted topology).
+    // Single-listener protocol remap (Service-fronted topology). Dedicated
+    // Sidecar ingress binds are excluded: exclusive OS ownership must not
+    // widen onto `:15006` / process-global frontends (#3266).
+    if !allow_service_remap {
+        return None;
+    }
     let single_for_class = if ctx.frontend_is_tls {
         ctx.single_tls_listen_port
     } else {
@@ -414,8 +434,11 @@ pub(crate) struct HostRouteTable {
 /// New config generations start pending so a newly published port-scoped route
 /// cannot use an older generation's successful decision. The listener manager
 /// replaces pending with a decided refusal set only after reconciling that same
-/// config generation. Ordinary OS bind failures are deliberately absent from
-/// the decided set so Service-fronted remapping remains available.
+/// config generation. The decided set includes both pre-bind admission
+/// refusals and OS bind failures so neither can expose a listener-scoped route
+/// through Service-fronted remapping. This also preserves the dedicated
+/// Sidecar-ingress boundary: a failed loopback bind cannot widen onto the
+/// process-global frontend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GatewayListenerAdmission {
     pending: bool,
@@ -3036,10 +3059,16 @@ impl RouterCache {
         // exactly one listen port of that class, so a remapped request can only
         // ever have meant one listener. Classified per proxy from its own
         // `(namespace, listen_port)` entry, never from the bare port number.
+        // Dedicated Sidecar ingress `bind` routes are excluded: a lone
+        // loopback bind must not arm Service remap (issue #3266) — that would
+        // steal `:15006` / process-global matches from the capture sibling.
         let mut nontls_ports: BTreeSet<u16> = BTreeSet::new();
         let mut tls_ports: BTreeSet<u16> = BTreeSet::new();
         for proxy in &config.proxies {
             if proxy.dispatch_kind.is_stream() {
+                continue;
+            }
+            if crate::modes::mesh::is_mesh_ingress_bind_route_id(proxy.id.as_str()) {
                 continue;
             }
             let Some(port) = proxy.listen_port else {
@@ -4918,6 +4947,7 @@ mod tests {
             compiled_stream_match: None,
             created_at: now,
             updated_at: now,
+            pending_limit_scope: None,
         }
     }
 
@@ -5065,6 +5095,7 @@ mod tests {
                         .collect(),
                     workloads: Vec::new(),
                     protocol_overrides: std::collections::HashMap::new(),
+                    uid: None,
                 })
                 .collect(),
             ..MeshConfig::default()
@@ -5839,6 +5870,7 @@ mod tests {
                         endpoint_unix_h2c: false,
                         owner_namespace: "default".to_string(),
                         owner_service: "reviews".to_string(),
+                        bind: None,
                     },
                     ResolvedIngressListener {
                         port: 8443,
@@ -5849,6 +5881,7 @@ mod tests {
                         endpoint_unix_h2c: false,
                         owner_namespace: "default".to_string(),
                         owner_service: "reviews".to_string(),
+                        bind: None,
                     },
                 ],
                 ..MeshConfig::default()
@@ -5919,6 +5952,7 @@ mod tests {
                     endpoint_unix_h2c: false,
                     owner_namespace: "default".to_string(),
                     owner_service: "reviews".to_string(),
+                    bind: None,
                 }],
                 ..MeshConfig::default()
             })),
@@ -6018,6 +6052,7 @@ mod tests {
                     endpoint_unix_h2c: false,
                     owner_namespace: "default".to_string(),
                     owner_service: "reviews".to_string(),
+                    bind: None,
                 }],
                 // Operator declared TWO HTTP-family ingress ports; only one
                 // resolved. The declared count must drive the router.
@@ -6159,6 +6194,7 @@ mod tests {
             workloads: Vec::new(),
             protocol_overrides: std::collections::HashMap::new(),
             cluster_ips: vec!["10.96.0.1".to_string()],
+            uid: None,
         };
         let upstream: crate::config::types::Upstream = serde_json::from_value(serde_json::json!({
             "id": "__mesh-out-tcp-upstream-default-redis-6379",
@@ -6384,6 +6420,7 @@ mod tests {
             workloads: Vec::new(),
             protocol_overrides: std::collections::HashMap::new(),
             cluster_ips: vec!["10.96.0.10".to_string()],
+            uid: None,
         };
         let upstream: crate::config::types::Upstream = serde_json::from_value(serde_json::json!({
             "id": "__mesh-out-udp-upstream-default-dns-53",
@@ -6539,6 +6576,7 @@ mod tests {
             protocol_overrides: std::collections::HashMap::new(),
             // Headless: no VIP at all — the whole point of the by-workload path.
             cluster_ips: Vec::new(),
+            uid: None,
         };
         let workload = Workload {
             spiffe_id: SpiffeId::new(spiffe).unwrap(),
@@ -6665,6 +6703,7 @@ mod tests {
             }],
             protocol_overrides: std::collections::HashMap::new(),
             cluster_ips: Vec::new(),
+            uid: None,
         };
         let workload = Workload {
             spiffe_id: SpiffeId::new(spiffe).unwrap(),
@@ -6801,6 +6840,7 @@ mod tests {
             }],
             protocol_overrides: std::collections::HashMap::new(),
             cluster_ips: Vec::new(),
+            uid: None,
         };
 
         let canonical_ip = "10.0.0.7".parse().unwrap();

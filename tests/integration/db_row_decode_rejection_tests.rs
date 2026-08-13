@@ -100,6 +100,7 @@ fn test_proxy(id: &str, listen_path: &str) -> Proxy {
         compiled_stream_match: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        pending_limit_scope: None,
     }
 }
 
@@ -312,6 +313,8 @@ async fn undecodable_consumer_row_keeps_admin_writable_for_in_band_repair() {
         startup_ready: None,
         serving_degraded: None,
         serving_listener_failures: None,
+        gateway_listener_status: None,
+        gateway_listener_failure_fails_readiness: false,
         db_available: Some(db_available),
         config_rejected: Some(config_rejected),
         admin_restore_max_body_size_mib: 100,
@@ -477,6 +480,8 @@ async fn undecodable_proxy_row_allows_delete_repair() {
         startup_ready: None,
         serving_degraded: None,
         serving_listener_failures: None,
+        gateway_listener_status: None,
+        gateway_listener_failure_fails_readiness: false,
         db_available: Some(db_available),
         config_rejected: Some(config_rejected),
         admin_restore_max_body_size_mib: 100,
@@ -578,6 +583,8 @@ async fn undecodable_consumer_row_allows_put_overwrite_repair() {
         startup_ready: None,
         serving_degraded: None,
         serving_listener_failures: None,
+        gateway_listener_status: None,
+        gateway_listener_failure_fails_readiness: false,
         db_available: Some(db_available),
         config_rejected: Some(config_rejected),
         admin_restore_max_body_size_mib: 100,

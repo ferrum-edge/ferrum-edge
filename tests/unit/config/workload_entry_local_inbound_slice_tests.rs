@@ -69,6 +69,7 @@ fn mesh_service(namespace: &str, name: &str, workload_spiffe: Option<&str>) -> M
             .unwrap_or_default(),
         protocol_overrides: HashMap::new(),
         cluster_ips: Vec::new(),
+        uid: None,
     }
 }
 
@@ -105,6 +106,17 @@ fn enforced_slice_request(
         enforce_sidecar_identity_narrowing: false,
         ambient_udp_source_scoping: false,
         node_waypoint_capture_scoping: false,
+    }
+}
+
+/// An ordinary subscription: no Sidecar, no waypoint, so `services` narrow by
+/// plain namespace visibility.
+fn plain_slice_request(namespace: &str) -> MeshSliceRequest {
+    MeshSliceRequest {
+        node_id: "node-1".to_string(),
+        namespace: namespace.to_string(),
+        cluster_domain: "cluster.local".to_string(),
+        ..MeshSliceRequest::default()
     }
 }
 
@@ -169,6 +181,126 @@ fn sidecar_narrowing_retains_cross_namespace_attached_local_inbound_service() {
             .any(|service| service.namespace == "vms" && service.name == "reviews"),
         "must not anchor inbound traffic to a same-name Service in the identity namespace"
     );
+    let anchored = slice
+        .local_inbound_workloads
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|workload| workload.spiffe_id.as_str() == spiffe);
+    assert!(
+        anchored,
+        "the inbound anchor keeps the local workload even though the routing view \
+         narrows its out-of-view attachment away"
+    );
+    assert!(
+        slice.workloads.is_empty(),
+        "the ROUTING view drops an attachment it cannot authorize; the anchor above \
+         is what serves this workload's own inbound traffic"
+    );
+    assert_slice_validates_as_mesh_config(&slice);
+}
+
+/// Rebuild the mesh view the proxy apply path validates before it swaps a slice
+/// in (`prepare_normalized_gateway_config_for_mesh`), and assert it is valid.
+///
+/// A slice that fails this is not merely missing one resource: the apply is
+/// rejected and the runtime rolls back to the last applied generation, so every
+/// later generation — including a legitimate withdrawal — stops being applied.
+fn assert_slice_validates_as_mesh_config(slice: &MeshSlice) {
+    let config = GatewayConfig {
+        mesh: Some(Box::new(MeshConfig {
+            workloads: slice.workloads.clone(),
+            services: slice.services.clone(),
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    let errors = config.validate_mesh_fields();
+    assert!(
+        errors.is_empty(),
+        "the projected slice must validate exactly as the proxy apply path \
+         validates it, got {errors:?}"
+    );
+}
+
+#[test]
+fn cross_namespace_attachment_outside_the_view_narrows_out_of_the_slice() {
+    // The attaching Service lives outside this subscription's namespace view, so
+    // service narrowing drops it. Keeping the workload alone would leave an
+    // attachment nothing in the slice can authorize — `validate_mesh_config`
+    // refuses exactly that shape, and the apply-time refusal rolls the runtime
+    // back to the last applied generation, so one out-of-view discovery
+    // resource would block every later update. The endpoint narrows instead:
+    // without its Service this view has no route to it either way.
+    let spiffe = "spiffe://cluster.local/ns/default/sa/payments";
+    let workload = cross_namespace_workload(
+        "default",
+        "payments",
+        "other",
+        spiffe,
+        HashMap::from([("app".to_string(), "payments".to_string())]),
+    );
+    let mesh = MeshConfig {
+        workloads: vec![workload],
+        services: vec![
+            // Authorized where it was authored: the target Service does list the
+            // workload. It is still outside THIS workload's namespace view.
+            mesh_service("other", "payments", Some(spiffe)),
+            mesh_service("default", "checkout", None),
+        ],
+        ..MeshConfig::default()
+    };
+    let config = GatewayConfig {
+        mesh: Some(Box::new(mesh)),
+        ..GatewayConfig::default()
+    };
+    let slice = MeshSlice::from_gateway_config(&config, plain_slice_request("default"));
+
+    assert!(
+        slice
+            .services
+            .iter()
+            .all(|service| service.namespace == "default"),
+        "a Service outside the namespace view must not enter the slice"
+    );
+    assert!(
+        slice.workloads.is_empty(),
+        "the endpoint must narrow with the Service that authorizes its attachment"
+    );
+    assert_slice_validates_as_mesh_config(&slice);
+}
+
+#[test]
+fn same_namespace_attachment_is_unaffected_by_the_cross_namespace_narrowing() {
+    // The overwhelmingly common shape: no `service_namespace` stamp at all. It
+    // must be untouched by the cross-namespace narrowing above.
+    let spiffe = "spiffe://cluster.local/ns/default/sa/checkout";
+    let mut workload = cross_namespace_workload(
+        "default",
+        "checkout",
+        "default",
+        spiffe,
+        HashMap::from([("app".to_string(), "checkout".to_string())]),
+    );
+    workload.service_namespace = None;
+    let mesh = MeshConfig {
+        workloads: vec![workload],
+        services: vec![mesh_service("default", "checkout", Some(spiffe))],
+        ..MeshConfig::default()
+    };
+    let config = GatewayConfig {
+        mesh: Some(Box::new(mesh)),
+        ..GatewayConfig::default()
+    };
+    let slice = MeshSlice::from_gateway_config(&config, plain_slice_request("default"));
+
+    assert_eq!(
+        slice.workloads.len(),
+        1,
+        "a same-namespace attachment stays dialable"
+    );
+    assert_eq!(slice.services.len(), 1);
+    assert_slice_validates_as_mesh_config(&slice);
 }
 
 #[test]

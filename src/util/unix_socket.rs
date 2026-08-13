@@ -436,6 +436,18 @@ impl AdmittedUnixSocket {
         self.owner_uid
     }
 
+    /// Device id of the checked socket object (`st_dev`). Part of the pool-key
+    /// identity so a replaced socket at the same path cannot share a pooled
+    /// connection admitted against a prior inode.
+    pub fn device_id(&self) -> u64 {
+        self.dev
+    }
+
+    /// Inode of the checked socket object (`st_ino`). See [`device_id`].
+    pub fn inode(&self) -> u64 {
+        self.ino
+    }
+
     /// Whether a connected peer uid is exactly the checked socket owner.
     ///
     /// This predicate exposes the comparison for focused external regression

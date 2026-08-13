@@ -817,6 +817,7 @@ jobs:
               integration::mesh_node_waypoint_stream_scope_tests
               integration::mesh_runtime_overlay_consumers_tests
               integration::transformer_runtime_overlay_generation_tests
+              integration::mesh_local_reload_observability_tests
               integration::mesh_peer_auth_live_reload_tests
               integration::mesh_k8s_pod_discovery_tests
               integration::mesh_hbone_tests
@@ -832,6 +833,7 @@ jobs:
               integration::mesh_topology_hbone_tests
               integration::mesh_authz_e2e_tests
               integration::mesh_authz_negative_match_tests
+              integration::mesh_ext_authz_custom_tests
               integration::mesh_service_waypoint_tests
               integration::mesh_stock_xds_tests
               integration::mesh_ew_egress_e2e_tests
@@ -844,6 +846,7 @@ jobs:
               integration::mesh_destination_rule_visibility_tests
               integration::mesh_dr_service_entry_e2e_tests
               integration::mesh_sidecar_e2e_tests
+              integration::sidecar_ingress_bind_tests
               integration::mesh_config_revision_tests
               integration::mesh_subscribe_validation_tests
               integration::mesh_retry_rotation_tests
@@ -851,6 +854,7 @@ jobs:
               integration::cp_grpc_handshake_admission_tests
               integration::cp_multi_namespace_tests
               integration::cp_tenant_trust_binding_tests
+              integration::cp_trust_reload_health_tests
               integration::connection_pool_tests
               integration::http2_pool_tests
               integration::http3_integration_tests
@@ -858,8 +862,10 @@ jobs:
               integration::policy_path_canonicalization_tests
               integration::scripted_backend_smoke_tests
               integration::service_discovery_endpointslice_lifecycle_tests
+              integration::service_discovery_lifecycle_tests
               integration::dtls_integration_tests
               integration::dtls_accept_isolation_tests
+              integration::frontend_dtls_live_reload_tests
               integration::backend_mtls_tests
               integration::backend_tls_san_allow_list_tests
               integration::frontend_tls_live_reload_tests
@@ -869,6 +875,8 @@ jobs:
               integration::udp_fault_injection_tests
               integration::gateway_api_udproute_datapath_tests
               integration::gateway_hbone_pool_tests
+              integration::gateway_listener_observability_tests
+              integration::gateway_listener_quic_udp_collision_tests
               integration::gateway_multi_cert_sni_tests
               integration::mesh_grpc_transport_tests
               integration::gateway_svid_identity_tests
@@ -1262,6 +1270,7 @@ jobs:
               functional_db_tls_test
               functional_db_upstream_test
               functional_mesh_mode_test
+              functional_mesh_stock_xds_test
               functional_mongodb_test
               functional_namespace_test
               functional_redis_rate_limiting_test
@@ -4521,7 +4530,7 @@ jobs:
           cache-directories: ${{ github.workspace }}/.cache/sccache
 
       - name: Install bpf-linker
-        run: cargo install bpf-linker --locked
+        uses: ./.github/actions/setup-bpf-linker
 
       - name: Build BPF programs
         run: cd ebpf && cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
@@ -4580,7 +4589,7 @@ jobs:
           shared-key: "ci-ebpf-live"
 
       - name: Install bpf-linker
-        run: cargo install bpf-linker --locked
+        uses: ./.github/actions/setup-bpf-linker
 
       - name: Build BPF programs (kernel object)
         run: cd ebpf && cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf

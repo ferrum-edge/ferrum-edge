@@ -339,6 +339,11 @@ pub const MAX_BACKOFF_MS: u64 = 300_000;
 pub const MAX_TARGET_WEIGHT: u32 = 65_535;
 /// Maximum service discovery poll interval in seconds (1 hour).
 pub const MAX_SD_POLL_INTERVAL: u64 = 3600;
+/// Minimum non-zero service-discovery staleness window. `0` is the explicit
+/// unbounded sentinel and is separately gated by the process unsafe opt-in.
+pub const MIN_SD_MAX_STALE_SECONDS: u64 = 5;
+/// Hard maximum service-discovery staleness window (24 hours).
+pub const MAX_SD_MAX_STALE_SECONDS: u64 = 86_400;
 /// Maximum health check interval in seconds (1 hour).
 pub const MAX_HEALTH_CHECK_INTERVAL: u64 = 3600;
 /// Maximum UDP idle timeout in seconds (1 hour).
@@ -711,8 +716,9 @@ pub struct UpstreamPortOverride {
     /// cannot get an in-flight slot is shed with a 503 ("upstream overflow")
     /// before backend dispatch, rather than queued unboundedly. Projected onto
     /// the per-target effective proxy's `pool_http1_max_pending_requests`. The
-    /// cap is keyed per resolved `(host, policy port, selected subset name)`
-    /// lane, without logical upstream/Service identity.
+    /// cap is keyed per logical destination
+    /// `(namespace, upstream/Service identity, policy port, selected subset)` —
+    /// not per selected endpoint host (issue #3778).
     ///
     /// HTTP/1.1-scoped: the multiplexed transports (direct H2, gRPC, HTTP/3,
     /// HBONE, mesh-mTLS) do NOT consult this field — their request concurrency
@@ -1058,7 +1064,7 @@ pub const UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG: &str = "_ferrum_service_namespa
 pub const UPSTREAM_TARGET_SERVICE_NAME_TAG: &str = "_ferrum_service_name";
 pub const UPSTREAM_TARGET_SERVICE_PORT_TAG: &str = "_ferrum_service_port";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpstreamTarget {
     pub host: String,
     pub port: u16,
@@ -1767,6 +1773,32 @@ pub struct Upstream {
     /// spec is removed. NOT loaded by the gateway runtime — admin-only metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_spec_id: Option<String>,
+    /// Kubernetes Service `metadata.uid` stamped from the owning
+    /// [`crate::modes::mesh::config::MeshService`] when materializing mesh
+    /// egress upstreams. Participates in the H1 pending-admission scope
+    /// **alongside** the stable logical Service identity so a delete/recreate
+    /// of the same Service name cannot inherit a stale lane, while a reused
+    /// UID cannot collapse distinct Services (issue #3778). Absent for
+    /// non-mesh / native upstreams.
+    ///
+    /// Runtime-only carrier: `#[serde(skip)]` so the file/admin/API/
+    /// OpenAPI config surface neither accepts nor emits it (no schema
+    /// migration). Stamped in-process during mesh materialization / slice
+    /// apply; never an operator input field.
+    #[serde(skip)]
+    pub k8s_service_uid: Option<String>,
+    /// Precomputed top-level (no-subset) H1 pending-admission scope for this
+    /// upstream (issue #3778). Interned at config publication by
+    /// [`GatewayConfig::resolve_pending_limit_scopes`] so
+    /// [`crate::plugins::RequestContext::apply_route_overrides_with_upstreams`]
+    /// can Arc-clone it when an upstream-id route override rebinds the
+    /// effective proxy — without reconstructing namespace / upstream / UID /
+    /// subset strings on the request path. Subset is always `None` here
+    /// because an upstream change clears `Proxy.upstream_subset`.
+    /// `#[serde(skip)]` — derived only; never an operator input field.
+    #[serde(skip)]
+    pub pending_limit_scope:
+        Option<std::sync::Arc<crate::backend_pending_limit::BackendPendingScopeBase>>,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
@@ -1788,7 +1820,7 @@ pub enum SdProvider {
 }
 
 /// DNS-SD specific configuration (SRV record-based discovery).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DnsSdConfig {
     /// The DNS name to query for SRV records (e.g., "_http._tcp.my-service.example.com").
     pub service_name: String,
@@ -1798,7 +1830,7 @@ pub struct DnsSdConfig {
 }
 
 /// Kubernetes service discovery configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KubernetesConfig {
     /// Kubernetes namespace. Default: "default".
     #[serde(default = "default_k8s_namespace")]
@@ -1817,7 +1849,7 @@ pub struct KubernetesConfig {
 }
 
 /// Consul service discovery configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConsulConfig {
     /// Consul HTTP API address (e.g., "http://consul:8500").
     pub address: String,
@@ -1841,7 +1873,7 @@ pub struct ConsulConfig {
 }
 
 /// Ferrum mesh service discovery configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MeshSdConfig {
     /// Mesh service name to resolve from the CP-delivered mesh model.
     pub service_name: String,
@@ -1888,13 +1920,71 @@ impl MeshSdTopology {
     }
 }
 
+/// What to do with the last-known discovered target set once it exceeds the
+/// configured maximum staleness (issue #3717).
+///
+/// Staleness is measured from the last *successfully admitted and published*
+/// snapshot (or from task start when no snapshot has ever been admitted), not
+/// from the last poll attempt: a registry that answers with a payload Ferrum
+/// refuses is exactly as stale as one that does not answer at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SdStalePolicy {
+    /// Keep routing to the expired discovered set. Coarse health reports
+    /// `degraded`; readiness is unaffected. Legacy (pre-#3717) behavior — safe
+    /// only where the registry is not the authority on endpoint identity.
+    Retain,
+    /// Withdraw the expired *discovered* targets while retaining every
+    /// statically configured target for the upstream. Coarse health reports
+    /// `degraded`; readiness is unaffected. Production default.
+    #[default]
+    Withdraw,
+    /// Withdraw the expired discovered targets (as [`SdStalePolicy::Withdraw`])
+    /// **and** fail gateway readiness while any task remains expired, so an
+    /// orchestrator takes the instance out of rotation.
+    FailReadiness,
+}
+
+impl SdStalePolicy {
+    /// Fixed-cardinality label for logs, `/health`, and status output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Retain => "retain",
+            Self::Withdraw => "withdraw",
+            Self::FailReadiness => "fail_readiness",
+        }
+    }
+
+    /// Whether expiry withdraws discovered targets under this policy.
+    pub fn withdraws(self) -> bool {
+        matches!(self, Self::Withdraw | Self::FailReadiness)
+    }
+
+    /// Whether expiry fails gateway readiness under this policy.
+    pub fn fails_readiness(self) -> bool {
+        matches!(self, Self::FailReadiness)
+    }
+
+    /// Parse a policy token (env / config value). Case-insensitive.
+    pub fn parse_token(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "retain" => Some(Self::Retain),
+            "withdraw" => Some(Self::Withdraw),
+            "fail_readiness" => Some(Self::FailReadiness),
+            _ => None,
+        }
+    }
+}
+
 /// Service discovery configuration for an upstream.
 ///
 /// Attaches a dynamic service discovery source to an upstream. Discovered
 /// targets are merged with any statically configured targets and fed into
 /// the load balancer. If the discovery source becomes unavailable, the
-/// gateway continues serving with the last-known targets.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// gateway continues serving with the last-known targets **up to a bounded
+/// staleness window** (`max_stale_seconds` / `stale_policy`, issue #3717);
+/// past that window the configured expiry policy applies.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServiceDiscoveryConfig {
     /// The service discovery provider to use.
     pub provider: SdProvider,
@@ -1913,6 +2003,23 @@ pub struct ServiceDiscoveryConfig {
     /// Default weight assigned to discovered targets. Default: 1.
     #[serde(default = "default_weight")]
     pub default_weight: u32,
+    /// Per-upstream override of the maximum age of the last successfully
+    /// admitted and published snapshot, in seconds (issue #3717).
+    ///
+    /// Omitted uses `FERRUM_SERVICE_DISCOVERY_MAX_STALE_SECONDS`. `0` means
+    /// unbounded last-known retention and is admitted only when
+    /// `FERRUM_SERVICE_DISCOVERY_ALLOW_UNBOUNDED_STALE=true`; otherwise the
+    /// gateway warns once and falls back to the bounded process default.
+    ///
+    /// The effective window is never shorter than three poll intervals for the
+    /// configured provider, so a long poll interval cannot make an upstream
+    /// permanently stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_stale_seconds: Option<u64>,
+    /// Per-upstream override of the staleness expiry action. Omitted uses
+    /// `FERRUM_SERVICE_DISCOVERY_STALE_POLICY` (default `withdraw`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_policy: Option<SdStalePolicy>,
 }
 
 fn default_sd_poll_interval() -> u64 {
@@ -2490,7 +2597,8 @@ pub struct Proxy {
     /// honestly reinterpreted cap on concurrent in-flight requests on the
     /// reqwest/HTTP-1.1 backend-dispatch path. Consulted by `proxy_to_backend`
     /// via [`crate::backend_pending_limit::BackendPendingLimiter`]: a request
-    /// that cannot get a slot for its `(host, policy port, selected subset)`
+    /// that cannot get a slot for its logical destination
+    /// `(namespace, upstream/Service identity, policy port, selected subset)`
     /// lane is shed with a 503 ("upstream overflow") before backend dispatch.
     /// Does NOT gate direct-H2 / gRPC / HTTP/3 / HBONE / mesh-mTLS dispatch.
     ///
@@ -2504,6 +2612,17 @@ pub struct Proxy {
     /// dropped on reload. The DB loaders therefore always start it at `None`.
     #[serde(skip)]
     pub pool_http1_max_pending_requests: Option<u32>,
+    /// Precomputed logical H1 pending-admission scope identity (issue #3778).
+    /// Interned at config publication by
+    /// [`GatewayConfig::resolve_pending_limit_scopes`] so the reqwest/H1 (and
+    /// H3→plain bridge) hot path never reconstructs namespace / upstream /
+    /// subset strings. Upstream-id route overrides Arc-clone the destination
+    /// [`Upstream::pending_limit_scope`]; direct-backend overrides clear it.
+    /// The DestinationRule policy port is appended at acquire time.
+    /// `#[serde(skip)]` — derived only.
+    #[serde(skip)]
+    pub pending_limit_scope:
+        Option<std::sync::Arc<crate::backend_pending_limit::BackendPendingScopeBase>>,
     /// Optional upstream ID for load-balanced backends.
     /// When set, overrides backend_host/backend_port with upstream target selection.
     #[serde(default)]
@@ -3290,6 +3409,34 @@ fn non_canonical_listen_path_reason(path: &str) -> Option<&'static str> {
     }
 }
 
+/// Return the stable logical identity used by H1 pending-admission scopes.
+///
+/// Ordinary upstreams retain their resource id: display names are not unique
+/// and must never make unrelated operator resources share admission. Mesh HTTP
+/// egress is the exception. Its reserved internal upstream ids intentionally
+/// split one Service into a VIP/host upstream and one single-target upstream
+/// per directly addressed workload. Those upstreams are all cold-stamped with
+/// the same Service FQDN in `name`; using that FQDN prevents endpoint fan-out
+/// from multiplying the Service's cap. The optional Kubernetes UID remains an
+/// additive recreate fence, and the policy port is appended at acquire time.
+fn pending_limit_logical_id(upstream: &Upstream) -> &str {
+    let is_mesh_http_egress = upstream
+        .id
+        .starts_with(crate::modes::mesh::MESH_OUTBOUND_UPSTREAM_ID_PREFIX)
+        || upstream
+            .id
+            .starts_with(crate::modes::mesh::MESH_OUTBOUND_HTTP_BYWL_UPSTREAM_ID_PREFIX);
+    if is_mesh_http_egress {
+        upstream
+            .name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(upstream.id.as_str())
+    } else {
+        upstream.id.as_str()
+    }
+}
+
 impl GatewayConfig {
     /// Validate that all proxy (host, listen_path, listen_port) combinations are unique.
     ///
@@ -3808,6 +3955,10 @@ impl GatewayConfig {
         // the non-mesh common case (all `Upstream.port_overrides` empty →
         // every proxy gets `None`).
         self.resolve_dispatch_port_overrides();
+        // Intern logical H1 pending-admission scope identities (issue #3778)
+        // so reqwest/H1 + H3→plain acquire never reconstructs namespace /
+        // upstream / subset strings on the hot path.
+        self.resolve_pending_limit_scopes();
     }
 
     /// Resolve each proxy's `dispatch_kind` from `backend_scheme`, applying
@@ -3946,6 +4097,66 @@ impl GatewayConfig {
                     )
                 })
             });
+        }
+    }
+
+    /// Intern each proxy's and upstream's logical H1 pending-admission scope
+    /// (issue #3778).
+    ///
+    /// Proxy scopes are built from `(namespace, stable upstream/Service identity,
+    /// optional K8s Service UID when stamped, selected subset)`. Each
+    /// Upstream also carries a derived top-level (no-subset) scope so
+    /// request-time upstream route overrides can Arc-clone the destination
+    /// lane without reconstructing identity strings. The DestinationRule
+    /// policy port is appended at acquire time. Must run after
+    /// upstreams/proxies are settled (including mesh materialization that
+    /// stamps `Upstream.k8s_service_uid`). Invoked from `normalize_fields`
+    /// beside `resolve_dispatch_port_overrides`.
+    pub fn resolve_pending_limit_scopes(&mut self) {
+        for upstream in &mut self.upstreams {
+            let scope = {
+                let logical_id = pending_limit_logical_id(upstream);
+                std::sync::Arc::new(crate::backend_pending_limit::BackendPendingScopeBase::new(
+                    upstream.namespace.as_str(),
+                    logical_id,
+                    upstream.k8s_service_uid.as_deref(),
+                    // Top-level only: route overrides clear `upstream_subset`
+                    // when the effective upstream changes.
+                    None,
+                ))
+            };
+            upstream.pending_limit_scope = Some(scope);
+        }
+
+        let upstream_by_key: HashMap<(&str, &str), &Upstream> = self
+            .upstreams
+            .iter()
+            .map(|u| ((u.namespace.as_str(), u.id.as_str()), u))
+            .collect();
+
+        for proxy in &mut self.proxies {
+            let (logical_id, uid) = if let Some(ref upstream_id) = proxy.upstream_id {
+                match upstream_by_key.get(&(proxy.namespace.as_str(), upstream_id.as_str())) {
+                    Some(upstream) => (
+                        pending_limit_logical_id(upstream),
+                        upstream.k8s_service_uid.as_deref(),
+                    ),
+                    None => (upstream_id.as_str(), None),
+                }
+            } else {
+                // Direct-backend proxy: the proxy itself is the logical
+                // destination. Distinct proxies do not share a lane unless
+                // they intentionally share an upstream_id.
+                (proxy.id.as_str(), None)
+            };
+            proxy.pending_limit_scope = Some(std::sync::Arc::new(
+                crate::backend_pending_limit::BackendPendingScopeBase::new(
+                    proxy.namespace.as_str(),
+                    logical_id,
+                    uid,
+                    proxy.upstream_subset.as_deref(),
+                ),
+            ));
         }
     }
 
@@ -9375,6 +9586,18 @@ impl ServiceDiscoveryConfig {
                 "default_weight must be between 1 and {} (got {})",
                 MAX_TARGET_WEIGHT, self.default_weight
             ));
+        }
+
+        if let Some(max_stale_seconds) = self.max_stale_seconds
+            && max_stale_seconds != 0
+            && let Err(error) = validate_u64_range(
+                "max_stale_seconds",
+                max_stale_seconds,
+                MIN_SD_MAX_STALE_SECONDS,
+                MAX_SD_MAX_STALE_SECONDS,
+            )
+        {
+            errors.push(error);
         }
 
         match self.provider {

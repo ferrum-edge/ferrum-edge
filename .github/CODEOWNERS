@@ -22,11 +22,25 @@
 /scripts/update_vendor_integrity.sh         @jeremyjpj0916
 /.claude/rules/dependencies.md              @jeremyjpj0916
 
-# Launch-readiness / release-governance gate (issue #3777).
+# Launch-readiness / release-governance gate (issues #3777, #3803).
+# `Launch Readiness Integrity` independently re-checks that every path below
+# still carries an owner, so removing one of these lines is itself a finding.
 /PRODUCTION_READINESS.md                    @jeremyjpj0916
 /docs/launch-blocker-policy.json            @jeremyjpj0916
 /docs/launch-exemptions.json                @jeremyjpj0916
 /docs/launch-readiness.md                   @jeremyjpj0916
 /scripts/check_launch_readiness.py          @jeremyjpj0916
 /.github/workflows/launch-readiness.yml     @jeremyjpj0916
+/.github/workflows/launch-integrity.yml     @jeremyjpj0916
 /.github/workflows/release.yml              @jeremyjpj0916
+/.github/scripts/verify_launch_integrity.py @jeremyjpj0916
+
+# The ownership map itself. GitHub evaluates CODEOWNERS from the base branch,
+# so editing this file in a pull request cannot relax that pull request's own
+# review requirement; this entry additionally makes the edit owner-reviewed.
+/.github/CODEOWNERS                         @jeremyjpj0916
+
+# Advisory-credential trust boundary (issue #3802). These two files are the
+# whole reason a `v*` tag target cannot reach LAUNCH_ADVISORY_READ_TOKEN.
+/.github/workflows/launch-advisory-trust.yml        @jeremyjpj0916
+/.github/scripts/verify_launch_advisory_trust.py    @jeremyjpj0916

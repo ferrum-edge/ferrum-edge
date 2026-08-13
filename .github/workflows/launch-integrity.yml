@@ -1,0 +1,233 @@
+name: Launch Readiness Integrity
+
+# Trusted, candidate-independent integrity gate for launch/release governance
+# (issue #3803). It answers "did this revision preserve the gate contract?" and
+# never computes a launch verdict, so a truthful FAIL from open launch blockers
+# does not make this check red and blocker-fix pull requests can still merge.
+# The separate `Launch Readiness Gate` job stays the live go/no-go signal.
+#
+# Trust model: `pull_request_target` loads this workflow from the base branch
+# and keeps the checkout on that trusted base commit; `merge_group` loads it
+# from the synthesized queue commit whose entry already had to clear this same
+# check on its pull request. The verifier is read from a pinned trusted commit
+# and the candidate tree is only ever extracted as inert data with `git show`
+# into a confined directory: no candidate code is checked out into the
+# execution path, imported, or run. No secret is available to this workflow.
+#
+# Permission model: every executable launch-governance file (the checker, this
+# workflow, `launch-readiness.yml`, `release.yml`, the verifier, and the
+# `launch-advisory-trust.yml` / `verify_launch_advisory_trust.py` pair once the
+# trusted base carries them) is byte-frozen to the trusted base. No source or
+# YAML heuristic can prove rewritten gate code is still equivalent to the
+# reviewed code, so byte identity is the enforced property and changing one of
+# those files is an administrative trusted-base update, not a pull request.
+
+on:
+  pull_request_target:
+    branches:
+      - main
+  merge_group:
+    types:
+      - checks_requested
+
+concurrency:
+  group: ${{ github.event_name == 'merge_group' && format('launch-integrity-merge-group-{0}', github.event.merge_group.head_sha) || format('launch-integrity-{0}', github.event.pull_request.number) }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Launch Readiness Integrity
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          ref: ${{ github.event_name == 'merge_group' && github.sha || github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Enforce the trusted launch governance contract
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "merge_group" ]; then
+            if [[ ! "$MERGE_GROUP_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::invalid merge_group head SHA" >&2
+              exit 1
+            fi
+            if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::merge_group base_sha missing or malformed" >&2
+              exit 1
+            fi
+            checked_out="$(git rev-parse HEAD)"
+            if [ "$checked_out" != "$MERGE_GROUP_HEAD_SHA" ] || [ "$checked_out" != "${GITHUB_SHA}" ]; then
+              echo "::error::checkout ${checked_out} is not the merge_group head ${MERGE_GROUP_HEAD_SHA}" >&2
+              exit 1
+            fi
+            # The group's parent commit: the base branch tip plus any entries
+            # already ahead of this one, each of which had to clear this same
+            # required check before it could be queued.
+            if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+              git fetch --no-tags origin "${BASE_SHA}"
+            fi
+            trusted_base="$BASE_SHA"
+            candidate_commit="$MERGE_GROUP_HEAD_SHA"
+          elif [ "$EVENT_NAME" = "pull_request_target" ]; then
+            if [[ ! "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::invalid triggering pull-request head SHA" >&2
+              exit 1
+            fi
+            if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::invalid triggering base SHA" >&2
+              exit 1
+            fi
+            checked_out="$(git rev-parse HEAD)"
+            if [ "$checked_out" != "$BASE_SHA" ]; then
+              echo "::error::checkout ${checked_out} is not the triggering base ${BASE_SHA}" >&2
+              exit 1
+            fi
+            if [[ ! "$BASE_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$BASE_REF" == *".."* ]] \
+              || [[ "$BASE_REF" == -* ]] || [[ "$BASE_REF" == */ ]]; then
+              echo "::error::invalid triggering base ref" >&2
+              exit 1
+            fi
+            # `main` can advance after the event is created, so pin the live
+            # trusted tip and authenticate it against the triggering base.
+            git fetch --no-tags origin \
+              "+refs/heads/${BASE_REF}:refs/remotes/trusted-launch-base"
+            trusted_base="$(git rev-parse "refs/remotes/trusted-launch-base^{commit}")"
+            if [[ ! "$trusted_base" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::live trusted base did not resolve to a commit" >&2
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$BASE_SHA" "$trusted_base"; then
+              echo "::error::live base ${trusted_base} does not descend from ${BASE_SHA}" >&2
+              exit 1
+            fi
+            # This extraction contract was loaded from the event base, so it is
+            # authenticated by comparison; the verifier itself is read from the
+            # live tip below and is not subject to that limit.
+            if ! git diff --no-ext-diff --quiet "$BASE_SHA" "$trusted_base" \
+              -- ".github/workflows/launch-integrity.yml"; then
+              echo "::error::the trusted extraction contract changed on ${BASE_REF} after this event was created; re-run once the pull request base is updated" >&2
+              exit 1
+            fi
+            git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
+            fetched_head="$(git rev-parse FETCH_HEAD)"
+            if [ "$fetched_head" != "$PR_HEAD_SHA" ]; then
+              echo "::error::fetched head ${fetched_head} does not match triggering head ${PR_HEAD_SHA}" >&2
+              exit 1
+            fi
+            candidate_commit="$PR_HEAD_SHA"
+          else
+            echo "::error::unsupported event ${EVENT_NAME}" >&2
+            exit 1
+          fi
+
+          echo "candidate ${candidate_commit} against trusted base ${trusted_base}"
+
+          # One-time adoption: on the commit that introduces this lane the
+          # trusted base carries no verifier, so there is no protected contract
+          # to preserve and nothing trustworthy to execute. Report success with
+          # an explicit notice rather than pretending to have enforced
+          # anything; every later revision takes the enforcing path below.
+          if ! git cat-file -e "${trusted_base}:.github/scripts/verify_launch_integrity.py" 2>/dev/null; then
+            echo "::notice::the trusted base has not adopted the launch integrity verifier yet; this run is advisory"
+            exit 0
+          fi
+
+          work="$RUNNER_TEMP/launch-integrity"
+          rm -rf "$work"
+          mkdir -p "$work/base/workflows" "$work/candidate/workflows"
+
+          # Fixed slot names: no candidate-controlled path component is ever
+          # joined into a filesystem path, and a slot left unwritten is exactly
+          # how the verifier observes a deleted or renamed gate file.
+          extract_slot() {
+            local commit="$1"
+            local destination="$2"
+            local path="$3"
+            local slot="$4"
+            local entry
+            if ! git cat-file -e "${commit}:${path}" 2>/dev/null; then
+              return 0
+            fi
+            entry="$(git ls-tree "$commit" -- "$path")"
+            if [[ "$entry" != "100644 blob "* && "$entry" != "100755 blob "* ]]; then
+              echo "::error file=${path}::governed input must be a regular non-symlink blob" >&2
+              return 1
+            fi
+            git show "${commit}:${path}" > "${destination}/${slot}"
+          }
+
+          extract_workflows() {
+            local commit="$1"
+            local destination="$2"
+            local path relative entry listing
+            listing="${destination}.workflow-listing"
+            if ! git ls-tree -rz --name-only "$commit" -- .github/workflows > "$listing"; then
+              echo "::error::workflow tree enumeration failed" >&2
+              return 1
+            fi
+            while IFS= read -r -d '' path; do
+              relative="${path#.github/workflows/}"
+              if [[ "$relative" == */* ]]; then
+                continue
+              fi
+              if [[ ! "$relative" =~ ^[A-Za-z0-9._+@~\ -]+\.(yml|yaml)$ ]]; then
+                echo "::error file=${path}::unsupported workflow filename" >&2
+                return 1
+              fi
+              entry="$(git ls-tree "$commit" -- "$path")"
+              if [[ "$entry" != "100644 blob "* ]]; then
+                echo "::error file=${path}::workflow must be a regular non-symlink blob" >&2
+                return 1
+              fi
+              git show "${commit}:${path}" > "${destination}/workflows/${relative}"
+            done < "$listing"
+          }
+
+          extract_root() {
+            local commit="$1"
+            local destination="$2"
+            extract_slot "$commit" "$destination" scripts/check_launch_readiness.py check_launch_readiness.py
+            extract_slot "$commit" "$destination" .github/scripts/verify_launch_integrity.py verify_launch_integrity.py
+            extract_slot "$commit" "$destination" .github/scripts/verify_launch_advisory_trust.py verify_launch_advisory_trust.py
+            extract_slot "$commit" "$destination" docs/launch-blocker-policy.json launch-blocker-policy.json
+            extract_slot "$commit" "$destination" docs/launch-exemptions.json launch-exemptions.json
+            extract_slot "$commit" "$destination" PRODUCTION_READINESS.md PRODUCTION_READINESS.md
+            extract_slot "$commit" "$destination" .github/CODEOWNERS CODEOWNERS
+            extract_workflows "$commit" "$destination"
+            git ls-tree -r --name-only "$commit" > "${destination}/tree.txt"
+          }
+
+          extract_root "$trusted_base" "$work/base"
+          extract_root "$candidate_commit" "$work/candidate"
+
+          trusted_verifier="$work/trusted_verify_launch_integrity.py"
+          verifier_entry="$(git ls-tree "$trusted_base" -- .github/scripts/verify_launch_integrity.py)"
+          if [[ "$verifier_entry" != "100644 blob "* && "$verifier_entry" != "100755 blob "* ]]; then
+            echo "::error::the trusted launch integrity verifier must be a regular blob" >&2
+            exit 1
+          fi
+          git show "$trusted_base:.github/scripts/verify_launch_integrity.py" > "$trusted_verifier"
+
+          # Executed bytes come only from the pinned trusted commit; both roots
+          # are inert data. The self-test runs first, so a broken verifier fails
+          # closed instead of silently accepting the candidate.
+          python3 -I "$trusted_verifier" \
+            --self-test \
+            --base-dir "$work/base" \
+            --candidate-dir "$work/candidate"

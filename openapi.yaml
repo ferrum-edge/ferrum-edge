@@ -193,8 +193,10 @@ paths:
         `cached_config` proxy/consumer counts,
         `database_polling` degradation, `config_rejected`, mesh state,
         `logging`, `kafka_logging`, and `ai_transcript_audit` admitted capture
-        ceilings, fixed-cardinality `jwks_trust` aggregates, and the DP
-        `dp_config` staleness diagnostic — are
+        ceilings, fixed-cardinality `jwks_trust` aggregates, the bounded
+        `gateway_listeners` realization status, and the DP
+        `dp_config` staleness diagnostic, and the CP `cp_dp_trust` reload
+        diagnostic — are
         returned only when the caller presents a valid admin JWT, a matching
         `FERRUM_METRICS_BEARER_TOKEN`, or originates from
         `FERRUM_METRICS_ALLOWED_CIDRS`.
@@ -205,15 +207,23 @@ paths:
         `"degraded"` (DB disconnected / admin writes blocked / database
         incremental polling repeatedly rejecting the same delta while serving
         last known-good config; an active remote JWKS store in grace; or, in
-        database, control-plane, or file mode, a
+        database, control-plane, file, or mesh mode, a
         full config load/reload rejected while the previous generation keeps
         serving — `config_rejected: true`. In database/CP, rejection is by the
         runtime-config validation contract or by typed SQL row decoding while the
         backend is reachable, and the admin API stays writable as the in-band
         repair path, gated on any deferred schema migration applying first; in
         file mode the admin API stays read-only and operators repair by fixing
-        the file and reloading). `config_rejected` is a sticky flag cleared only
-        by an accepted authoritative full reload (Applied or Unchanged); while
+        the file and reloading. In mesh mode the flag additionally covers the
+        localized `file` and `stock_xds` mesh policy sources: a SIGHUP reload
+        whose read, parse, validation, revision-gate admission, or proxy apply
+        is rejected keeps the last known-good mesh slice / policy baseline and
+        sets the flag, and the admin API stays read-only exactly as in file
+        mode). `config_rejected` is a sticky flag cleared only
+        by an accepted authoritative full reload (Applied or Unchanged) — and,
+        for the localized mesh sources, only once the proxy apply lifecycle
+        accepts that exact recovery candidate, never on a provisional slice
+        install or policy channel send; while
         the backend is unreachable
         (`db_available` false / `admin_writes_enabled` false) the detail is
         suppressed so it never advertises the writable repair path during an
@@ -226,6 +236,26 @@ paths:
         same sticky state; authenticated responses include a sanitized
         `listener_failures` snapshot.
 
+        **Dynamic Gateway API listener ports** (`file`, `database`, and
+        data-plane modes) are reported separately and are **recoverable**. A
+        Gateway listener port that cannot be bound — occupied, reserved by
+        another Ferrum listener, colliding with a stream proxy, or whose accept
+        loop died after startup — is refused fail closed for routing and retried
+        every 30 seconds while every healthy listener keeps serving. While any
+        such failure is active, `/health` reports `status: "degraded"`;
+        authenticated callers additionally receive the bounded
+        `gateway_listeners` object (affected ports, `tcp`/`quic` protocol half,
+        closed-set reason, admission-vs-runtime origin, config generation,
+        sanitized detail, and first/last observation timestamps). By default the
+        response stays `200` with `ready: true`, because one unbindable port
+        must not withdraw a replica whose other listeners are serving. Setting
+        `FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS=true` makes the same
+        condition return `503` with `ready: false` while keeping
+        `status: "degraded"` — the outage is partial and clears by itself on the
+        next successful retry. `/live` is never affected, and unauthenticated
+        callers still receive only `status` and `ready`, never a port, error
+        string, or configuration detail.
+
         In **data-plane mode**, readiness is additionally bounded by the age of
         the last validated and successfully applied CP snapshot (issue #3726).
         Once that age reaches `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` while no
@@ -235,6 +265,19 @@ paths:
         the boundary itself; no grace period is added to it. Readiness is
         restored only by a snapshot that passes validation and applies, never by
         a reconnect alone.
+
+        In **control-plane mode with a watched CP/DP trust bundle**, readiness is
+        additionally bounded by how long the control plane has been unable to
+        revalidate its verification trust source (issue #3813). A rejected
+        reload retains the whole previous verifier and marks trust reload
+        degraded immediately; once the active generation reaches
+        `FERRUM_CP_DP_TRUST_MAX_STALE_SECONDS`, `/health` returns `503` with
+        `status: "unavailable"`, `ready: false`, and the CP refuses to admit new
+        ConfigSync, MeshSubscribe, and xDS streams while terminating established
+        ones. A reload worker that exits unexpectedly fails readiness
+        immediately, because no revocation can be published again in that
+        process. Recovery requires an accepted candidate — including a
+        semantically unchanged one — never the passage of time.
       tags: [Health]
       security: []
       responses:
@@ -2044,7 +2087,8 @@ paths:
         HTTPS traffic (native H3 pool vs. direct H2 pool vs. reqwest
         fallback) without per-request probing. Entries are populated at
         startup, refreshed on `FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS`
-        (default 24h), and eagerly downgraded on live failures — see
+        (default 24h), and eagerly downgraded on definitive live protocol
+        failures — see
         `docs/admin_api.md#backend-capability-registry` for the full model.
 
         The endpoint exposes **only** protocol classifications and probe
@@ -3123,6 +3167,7 @@ paths:
                           - mesh_telemetry
                           - mesh_proxy_configs
                           - extension_configs
+                          - ext_authz_providers
                         properties:
                           workloads: { type: integer, minimum: 0 }
                           services: { type: integer, minimum: 0 }
@@ -3135,6 +3180,7 @@ paths:
                           mesh_telemetry: { type: integer, minimum: 0 }
                           mesh_proxy_configs: { type: integer, minimum: 0 }
                           extension_configs: { type: integer, minimum: 0 }
+                          ext_authz_providers: { type: integer, minimum: 0 }
                       fingerprint:
                         type: string
                         pattern: "^sha256-[0-9a-f]{64}$"
@@ -3402,6 +3448,7 @@ paths:
                         mesh_telemetry: 2
                         mesh_proxy_configs: 1
                         extension_configs: 0
+                        ext_authz_providers: 1
                       fingerprint: "sha256-9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
                       source_protocol: native
                       source_cp_url: "grpcs://cp-primary.mesh.svc.cluster.local:50051"
@@ -3455,6 +3502,7 @@ paths:
                         mesh_telemetry: 0
                         mesh_proxy_configs: 0
                         extension_configs: 0
+                        ext_authz_providers: 0
                       source_protocol: native
                       source_cp_url: "grpcs://cp-primary.mesh.svc.cluster.local:50051"
                     revision:
@@ -11378,6 +11426,37 @@ components:
           format: uint32
           default: 1
           description: Default weight assigned to discovered targets
+        max_stale_seconds:
+          type: [integer, "null"]
+          format: uint64
+          anyOf:
+            - type: "null"
+            - type: integer
+              const: 0
+            - type: integer
+              minimum: 5
+              maximum: 86400
+          description: |
+            Per-upstream override of the maximum age of the last successfully
+            admitted **and published** discovery snapshot before the expiry
+            policy applies. Omitted uses
+            `FERRUM_SERVICE_DISCOVERY_MAX_STALE_SECONDS` (default 300). The
+            effective window is never shorter than three poll intervals for the
+            configured provider. `0` means unbounded last-known retention and is
+            honored only when `FERRUM_SERVICE_DISCOVERY_ALLOW_UNBOUNDED_STALE`
+            is `true`; otherwise the gateway warns and applies the bounded
+            process default. Non-zero values must be between 5 and 86400.
+        stale_policy:
+          type: [string, "null"]
+          enum: [retain, withdraw, fail_readiness, null]
+          description: |
+            Per-upstream override of the staleness expiry action. Omitted uses
+            `FERRUM_SERVICE_DISCOVERY_STALE_POLICY` (default `withdraw`).
+            `retain` keeps expired discovered targets routable and only degrades
+            `/health` status; `withdraw` withdraws the discovered targets while
+            retaining every statically configured target; `fail_readiness`
+            withdraws and additionally fails gateway readiness until a fresh
+            snapshot is published.
       allOf:
         - if:
             required: [provider]
@@ -11528,7 +11607,7 @@ components:
 
     UdpPlacementMigrationStatusSnapshot:
       type: object
-      required: [enabled, phase, outstanding, failure_reason]
+      required: [enabled, phase, outstanding, failure_reason, established_adoption]
       properties:
         enabled:
           type: boolean
@@ -11565,6 +11644,14 @@ components:
             - state_persistence_failed
             - durable_state_rejected
           description: Closed-set node-local failure reason; never includes pod UIDs or generations.
+        established_adoption:
+          type: boolean
+          description: |
+            True when this node started its placement from the release-attested
+            established placement (`FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED`)
+            because it carried no node-local durable record — a fresh node, or a
+            node whose registry directory was recreated by a reboot. False for a
+            node resuming its own durable record and for every migration phase.
 
     NodeWaypointObservabilitySnapshot:
       type: object
@@ -11680,10 +11767,12 @@ components:
         Tiered: unauthenticated callers receive only `status` and `ready`. The
         remaining detailed fields (`timestamp`, `mode`, `database`,
         `admin_writes_enabled`, `fips`, `cached_config`, `database_polling`,
-        `config_rejected`, `mesh`, `listener_failures`, `logging`,
+        `config_rejected`, `mesh`, `listener_failures`, `gateway_listeners`,
+        `logging`,
         `kafka_logging`, `ai_transcript_audit`, `audit_pipeline`, `jwks_trust`,
-        `dp_config`) are present only when the caller is authenticated (admin
-        JWT, metrics bearer token, or allowlisted CIDR).
+        `service_discovery`, `dp_config`, `cp_dp_trust`) are present only when
+        the caller is
+        authenticated (admin JWT, metrics bearer token, or allowlisted CIDR).
       required: [status, ready]
       properties:
         status:
@@ -11696,12 +11785,19 @@ components:
             with a healthy DB) — `admin_writes_enabled` is the right signal
             for that, not `status`. With no active remote JWKS the coarse
             status stays `ok` when otherwise healthy.
-            `degraded` — ready but the configured database is currently
-            unavailable (still 200; the gateway continues to serve from
-            cached config), the admin audit pipeline cannot durably record
-            committed mutations (see `audit_pipeline`), or an active remote
-            JWKS store is in grace after its refresh interval. Intentional
-            read-only mode does NOT set `degraded`.
+            `degraded` — the configured database is currently unavailable
+            (the gateway continues to serve from cached config), the admin
+            audit pipeline cannot durably record committed mutations (see
+            `audit_pipeline`), an active remote JWKS store is in grace after
+            its refresh interval, or a recoverable dynamic Gateway API listener
+            failure is active. These stay ready with HTTP 200 except when
+            `FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS=true`, which makes
+            the Gateway-listener case not ready with HTTP 503 while preserving
+            `status: "degraded"`. Intentional read-only mode does NOT set
+            `degraded`. A service-discovery task is
+            restarting after an unexpected poller exit, is crash-looping, or has
+            a snapshot past its staleness bound (including one whose discovered
+            targets the expiry policy withdrew) — see `service_discovery`.
             `starting` — startup not yet complete (returned with 503 and
             `ready: false`).
             `unavailable` — the gateway became ready but a supervised serving
@@ -11713,14 +11809,25 @@ components:
             and monotonic across a later readiness restore (returned with 503
             and `ready: false`). Expired JWKS trust clears after a later
             validated non-empty refresh. CP, DP, and mesh modes report the
-            sticky listener/poll form.
+            sticky listener/poll form. A service-discovery upstream configured
+            with the `fail_readiness` staleness policy whose snapshot expired,
+            or a `withdraw` upstream whose withdrawal publication is still
+            retrying, also reports `unavailable`; it clears as soon as a fresh
+            snapshot is admitted or the withdrawal publishes, without a config
+            reload.
         ready:
           type: boolean
           description: |
             `true` once the gateway has finished startup AND no supervised
             serving listener (or, in control-plane mode, the database config
             poll task) has failed unexpectedly since AND no active remote JWKS
-            store is past its maximum-stale deadline. While `false`, the
+            store is past its maximum-stale deadline AND no service-discovery
+            upstream using the `fail_readiness` staleness policy is expired AND
+            no expired `withdraw` upstream still has stale targets installed
+            because its withdrawal publication is retrying. A recoverable
+            dynamic Gateway API listener failure also sets `ready: false` when
+            `FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS=true`; it is ready
+            by default. While `false`, the
             endpoint returns `503 Service Unavailable`. In CP/DP/mesh modes a
             post-startup serving-listener failure sets `ready: false` durably
             (sticky) even though internal startup completed. In CP mode an
@@ -11902,13 +12009,17 @@ components:
         config_rejected:
           type: boolean
           description: |
-            Database, control-plane, and file modes, authenticated detail only.
+            Database, control-plane, file, and mesh modes, authenticated detail
+            only.
             Present and `true` when the latest **full** config load/reload was
             rejected: in database/CP, by the runtime-config validation contract
             (a reachable backend served a semantically-invalid snapshot) or by
             typed SQL row decoding (a reachable backend served an undecodable
             row); in file mode, when a SIGHUP candidate fails read, parse,
-            validation, or apply. The gateway keeps serving the last known-good
+            validation, or apply; in mesh mode, when a localized `file` or
+            `stock_xds` mesh policy reload candidate fails read, parse,
+            validation, config-revision-gate admission, or proxy apply. The
+            gateway keeps serving the last known-good
             config. In database/CP, because the backend is reachable, the admin
             API stays writable (`admin_writes_enabled` stays `true`) so the
             offending resource can be repaired in-band; `status` is forced to
@@ -11916,10 +12027,18 @@ components:
             migration applying first, so a reachable backend with a still-pending
             schema keeps writes blocked while this flag stays set. In file mode
             the admin API remains read-only; operators repair by fixing the
-            config file and reloading. The flag is sticky and clears only when
+            config file and reloading; the localized mesh sources are likewise
+            read-only and are repaired by fixing the mesh document and
+            re-signalling. The flag is sticky and clears only when
             an accepted authoritative **full** reload proves the candidate is
             valid again (Applied or Unchanged; an accepted incremental poll in
-            database/CP does not clear it). While the backend is unreachable
+            database/CP does not clear it). For the localized mesh sources the
+            clear is stricter: it happens only after the **proxy apply
+            lifecycle** accepts the exact current recovery candidate (Applied,
+            or a content-identical no-op). A provisional slice install, a stock
+            policy channel send, an older candidate's late success, or an
+            unrelated accepted slice never clears it. While the backend is
+            unreachable
             (`admin_writes_enabled` false) this detail is suppressed so it never
             advertises the writable repair path during an outage, even though the
             underlying flag remains set. A genuine connectivity failure is
@@ -11929,6 +12048,8 @@ components:
           $ref: "#/components/schemas/MeshHealthResponse"
         listener_failures:
           $ref: "#/components/schemas/ServingListenerFailureSnapshot"
+        gateway_listeners:
+          $ref: "#/components/schemas/GatewayListenerStatusSnapshot"
         audit_pipeline:
           $ref: "#/components/schemas/AuditPipelineStatus"
         logging:
@@ -11970,9 +12091,321 @@ components:
               sink_healthy: true
         jwks_trust:
           $ref: "#/components/schemas/JwksTrustHealthSnapshot"
+        service_discovery:
+          $ref: "#/components/schemas/ServiceDiscoveryHealthSnapshot"
         dp_config:
           $ref: "#/components/schemas/DpConfigFreshnessSnapshot"
+        cp_dp_trust:
+          $ref: "#/components/schemas/CpDpTrustReloadSnapshot"
 
+    CpDpTrustReloadSnapshot:
+      type: object
+      description: |
+        Control-plane mode only, authenticated detail. Published health of the
+        CP/DP verification trust-bundle reload worker and the bounded window in
+        which an unrevalidatable verifier may keep authorizing (issue #3813).
+
+        Every field is fixed-cardinality — booleans, seconds, counters, a
+        closed reason label, and `active_generation`. `active_generation` is a
+        replica-stable HMAC-SHA-256 identifier:
+        `HMAC-SHA-256(FERRUM_ADMIN_JWT_SECRET, "ferrum-cp-dp-trust-status-id-v1\0" || private_configuration_fingerprint)`
+        rendered as 64 lowercase hex characters. It is identical across
+        replicas that share the same accepted trust bundle and the same HMAC
+        key, changes when the accepted bundle changes semantically, and stays
+        identical across an unchanged revalidation. Replicas that do not share
+        the HMAC key are incomparable. An admin JWT authorizes seeing this
+        value; it does not reveal the HMAC key. The private fingerprint, an
+        unkeyed digest of it, bundle paths, key material, JWTs, `kid`s, and
+        namespace inventories are never published. Prometheus, logs, error
+        messages, and unauthenticated `/health`/`/status` never carry
+        `active_generation`.
+
+        Ages are measured on a monotonic clock, so a wall-clock/NTP step can
+        neither extend nor shorten the window. Only an accepted reload resets
+        `last_acceptance_age_seconds`; attempts, refusals, and the passage of
+        time do not. Once that age reaches `max_stale_seconds`, `stale` latches,
+        `admission_blocked` turns true for every configuration stream family,
+        and `/health` reports `ready: false` with `status: "unavailable"`. The
+        configured maximum is the boundary: no grace period is added to it.
+        A stalled reload worker sets `degraded` immediately and
+        `worker_state=stalled` without failing readiness inside the bound.
+      required:
+        [
+          configured,
+          worker_state,
+          worker_running,
+          degraded,
+          stale,
+          admission_blocked,
+          readiness_blocked,
+          reason,
+          last_attempt_age_seconds,
+          last_acceptance_age_seconds,
+          max_stale_seconds,
+          unbounded_stale_allowed,
+          consecutive_failures,
+          recoveries_total,
+          attempts_total,
+          acceptances_total,
+          rejections_total,
+          rejections_by_reason,
+          active_generation,
+        ]
+      properties:
+        configured:
+          type: boolean
+          description: Whether a file-backed CP/DP trust bundle is watched.
+        worker_state:
+          type: string
+          enum: [disabled, running, stalled, stopped, failed]
+          description: >
+            Closed-set supervision state. `stalled` is alive but with no
+            completed attempt in three poll intervals (a read parked in the
+            kernel); it is immediately `degraded` and
+            `ferrum_cp_dp_trust_reload_worker_stalled=1`, while readiness still
+            follows the stale bound. `stopped` is a clean shutdown and is never
+            a failure. `failed` is an unexpected exit or panic and fails
+            readiness immediately.
+        worker_running:
+          type: boolean
+          description: Whether the reload worker is still alive. True while stalled.
+        degraded:
+          type: boolean
+          description: >
+            Whether the control plane is authorizing with a trust generation it
+            could not revalidate, the reload worker is stalled, or the worker
+            died unexpectedly. True from the first refused attempt, and true
+            immediately on stall or unexpected exit.
+        stale:
+          type: boolean
+          description: >
+            Whether the active generation has aged past `max_stale_seconds`.
+            Sticky until a valid candidate is accepted.
+        admission_blocked:
+          type: boolean
+          description: >
+            Whether new ConfigSync, local/remote MeshSubscribe, SotW ADS, and
+            Delta ADS streams are currently refused. Established streams are
+            terminated at the same boundary.
+        readiness_blocked:
+          type: boolean
+          description: >
+            Whether this replica reports `ready: false` because of trust state —
+            `stale`, or a reload worker that exited unexpectedly.
+        reason:
+          type: string
+          enum:
+            [
+              ok,
+              document_unreadable,
+              document_invalid,
+              material_unreadable,
+              material_integrity_unbound,
+              material_integrity_malformed,
+              material_integrity_mismatch,
+              source_generation_escape,
+              source_generation_unstable,
+              source_generation_unsupported,
+              reader_unavailable,
+              reload_reader_failed,
+              reload_read_timed_out,
+              scope_validation_failed,
+              worker_exited,
+            ]
+          description: Closed-set reason currently blocking rotation.
+        last_attempt_age_seconds:
+          type: [integer, "null"]
+          format: uint64
+          description: Seconds since the last completed reload attempt.
+        last_acceptance_age_seconds:
+          type: [integer, "null"]
+          format: uint64
+          description: Seconds since the last accepted reload.
+        max_stale_seconds:
+          type: integer
+          format: uint64
+          description: >
+            Configured `FERRUM_CP_DP_TRUST_MAX_STALE_SECONDS`. `0` means
+            unbounded retention, which requires the explicit unsafe opt-in.
+        unbounded_stale_allowed:
+          type: boolean
+          description: Whether unbounded retention was explicitly opted into.
+        consecutive_failures:
+          type: integer
+          format: uint64
+          description: Consecutive refused attempts since the last acceptance.
+        recoveries_total:
+          type: integer
+          format: uint64
+          description: Failure episodes ended by a later valid candidate.
+        attempts_total:
+          type: integer
+          format: uint64
+          description: >
+            Reload attempts started since process start. Incremented when the
+            worker begins a read, before a verdict exists, so a wedged in-flight
+            operation is visible. `acceptances_total + rejections_total` may
+            trail this by one in-flight attempt.
+        acceptances_total:
+          type: integer
+          format: uint64
+          description: Attempts that replaced or confirmed the generation.
+        rejections_total:
+          type: integer
+          format: uint64
+          description: Attempts refused across every closed reason.
+        rejections_by_reason:
+          type: object
+          additionalProperties:
+            type: integer
+            format: uint64
+          description: >
+            Refusals per closed reason. Exactly the `reason` enum minus `ok`;
+            no key is derived from operator or attacker input.
+        active_generation:
+          type: [string, "null"]
+          description: >
+            Replica-stable HMAC-SHA-256 identifier of the accepted trust
+            generation, 64 lowercase hex characters. Constructed as
+            HMAC-SHA-256(FERRUM_ADMIN_JWT_SECRET,
+            "ferrum-cp-dp-trust-status-id-v1\0" || private fingerprint).
+            Identical across replicas that share the accepted bundle and HMAC
+            key; incomparable if HMAC keys differ. Null when no bundle is
+            watched. Authenticated `/health`/`/status` only — never Prometheus,
+            logs, errors, or unauthenticated output. Does not reveal the HMAC
+            key.
+
+    ServiceDiscoveryHealthSnapshot:
+      type: object
+      description: |
+        Authenticated `/health`/`/status` view of supervised service-discovery
+        tasks (issues #3717 / #3721 / #3722). Present only when at least one
+        upstream configures service discovery. Every field is a count, an age,
+        or a closed-set token, plus the operator-configured
+        `namespace|upstream_id` ownership key — never a registry URL, Consul or
+        Kubernetes token, or response payload. Unauthenticated probes never
+        receive this object; they see only the coarse `status`/`ready` effects
+        (stale/withdrawn/restarting → `degraded`; an expired `fail_readiness`
+        upstream or a failed withdrawal publication → `unavailable` +
+        not-ready).
+      required:
+        - tasks
+        - running
+        - restarting
+        - crash_looping
+        - stale
+        - withdrawn
+        - readiness_failing
+        - never_succeeded
+        - max_anchor_age_seconds
+        - upstreams
+      properties:
+        tasks:
+          type: integer
+          format: uint64
+          description: Supervised discovery tasks.
+        running:
+          type: integer
+          format: uint64
+        restarting:
+          type: integer
+          format: uint64
+          description: Tasks waiting out a restart backoff after an unexpected poller exit.
+        crash_looping:
+          type: integer
+          format: uint64
+          description: >
+            Tasks that exited unexpectedly repeatedly without an intervening
+            published snapshot. The supervisor keeps retrying at the capped
+            backoff; the state exists so the condition is visible.
+        stale:
+          type: integer
+          format: uint64
+          description: Tasks whose last published snapshot is older than their staleness bound.
+        withdrawn:
+          type: integer
+          format: uint64
+          description: Tasks whose discovered targets are currently withdrawn by the expiry policy.
+        readiness_failing:
+          type: integer
+          format: uint64
+          description: >
+            Stale tasks configured with the `fail_readiness` expiry policy,
+            plus `withdraw` tasks whose fail-closed withdrawal publication is
+            still retrying.
+        never_succeeded:
+          type: integer
+          format: uint64
+        max_anchor_age_seconds:
+          type: integer
+          format: uint64
+          description: >
+            Maximum staleness-anchor age across tasks. The anchor is the last
+            published snapshot, or task start when none has ever been published.
+        upstreams:
+          type: array
+          description: Per-upstream detail, sorted by namespaced upstream key.
+          items:
+            type: object
+            required:
+              - upstream
+              - provider
+              - state
+              - stale
+              - withdrawn
+              - policy
+              - max_stale_seconds
+              - anchor_age_seconds
+              - consecutive_failures
+              - consecutive_crashes
+              - restarts
+            properties:
+              upstream:
+                type: string
+                description: "`namespace|upstream_id` ownership key."
+              provider:
+                type: string
+                enum: [dns_sd, kubernetes, consul, mesh]
+              state:
+                type: string
+                enum: [starting, running, restarting, crash_looping, stopped]
+              stale:
+                type: boolean
+              withdrawn:
+                type: boolean
+                description: Always `false` under the `retain` policy.
+              policy:
+                type: string
+                enum: [retain, withdraw, fail_readiness]
+              max_stale_seconds:
+                type: integer
+                format: uint64
+                description: Effective staleness bound; `0` reports unbounded retention.
+              last_success_age_seconds:
+                type: [integer, "null"]
+                format: uint64
+                description: Null when the task has never published an admitted snapshot.
+              anchor_age_seconds:
+                type: integer
+                format: uint64
+              consecutive_failures:
+                type: integer
+                format: uint64
+              consecutive_crashes:
+                type: integer
+                format: uint64
+              restarts:
+                type: integer
+                format: uint64
+              last_error:
+                type: [string, "null"]
+                enum:
+                  - discover_failed
+                  - snapshot_rejected
+                  - publish_failed
+                  - task_exited
+                  - null
+                description: Closed-set reason token; never a provider error string.
     DpConfigFreshnessSnapshot:
       type: object
       description: |
@@ -12327,6 +12760,200 @@ components:
               kind:
                 type: string
                 enum: [serve_failed]
+
+    GatewayListenerStatusSnapshot:
+      type: object
+      description: |
+        Bounded realization status for dynamic Gateway API listener ports
+        (issue #3810). Present only in the authenticated detailed `/health` +
+        `/status` tier, and only in modes that bind a socket per Gateway API
+        listener port (`file`, `database`, `dp`).
+
+        A Gateway listener that cannot be bound is refused fail closed for
+        routing and retried every 30 seconds; the process stays alive and every
+        healthy listener keeps serving. This snapshot is therefore
+        **recoverable** — entries disappear as soon as a retry succeeds — and is
+        deliberately distinct from the sticky `listener_failures` surface, which
+        records fatal post-start serve-task exits.
+
+        While any entry is present, `/health` reports `status: "degraded"`.
+        Readiness is unaffected unless
+        `FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS=true`, in which case
+        `ready` is `false` with HTTP `503` and `status` stays `"degraded"`
+        rather than `"unavailable"` — the outage is partial and recoverable.
+        `/live` is never affected.
+
+        Bounded on two separate axes. The `failures` detail vector retains at
+        most 64 entries (`truncated` reports whether the cap dropped any) and
+        each `detail` is sanitized to printable ASCII and truncated to 200
+        characters. Behind it, a private text-free ledger keeps the first-seen
+        time and observation count of every active `(port, protocol half,
+        reason)` identity up to a hard bound of 4096, so `active_failures`,
+        `failed_ports`, the `active_by_category` breakdown, and the cumulative
+        `ferrum_gateway_listener_{failures,recoveries}_total` counters stay exact
+        for every active identity even when its detail was dropped: a retry does
+        not re-count an onset it already counted, and an identity that recovers
+        is counted once whether or not it was ever shown here. If a single pass
+        somehow exceeds the 4096-identity bound, `overflowed` is `true` and
+        previously tracked identities that still appear anywhere in the stream
+        keep their ledger slots while only brand-new identities are evicted in
+        deterministic key order — the snapshot reports the gap instead of
+        publishing figures it cannot stand behind.
+
+        Ports, `detail`, and `config_generation` appear here only — they are
+        never Prometheus labels and never appear in the unauthenticated
+        `/health` body.
+      required:
+        - config_generation
+        - desired_listeners
+        - active_listeners
+        - failed_ports
+        - active_failures
+        - retained_failures
+        - truncated
+        - overflowed
+        - active_by_category
+        - failures
+      properties:
+        config_generation:
+          type: integer
+          format: uint64
+          description: >-
+            Configuration generation this status was decided for. A reconcile
+            pass for an older generation can never replace a newer generation's
+            status.
+        desired_listeners:
+          type: integer
+          description: >-
+            Gateway listener ports this process must bind for this generation.
+            Ports already served by a same-class process-global proxy frontend
+            are excluded.
+        active_listeners:
+          type: integer
+          description: Gateway listener ports with a live accept loop.
+        failed_ports:
+          type: integer
+          description: Distinct ports carrying at least one active failure.
+        active_failures:
+          type: integer
+          description: >-
+            Active failure identities tracked for this generation, including any
+            whose detail was dropped by the 64-entry `failures` cap. Bounded by
+            the 4096-identity ledger; see `overflowed`.
+        retained_failures:
+          type: integer
+          description: Entries actually present in `failures`.
+        truncated:
+          type: boolean
+          description: Whether `failures` was truncated by the 64-entry cap.
+        overflowed:
+          type: boolean
+          description: >-
+            Whether this pass observed more distinct failure identities than the
+            4096-entry ledger can represent. When `true`, `active_failures`,
+            `failed_ports`, `active_by_category`, and the cumulative counters
+            account only for the tracked identities.
+        active_by_category:
+          type: array
+          description: >-
+            Fixed-cardinality active counts by protocol half and bounded
+            reason. Exact for every tracked identity — never reduced by the
+            64-entry `failures` detail cap.
+          items:
+            type: object
+            required: [protocol, category, count]
+            properties:
+              protocol:
+                type: string
+                enum: [tcp, quic]
+              category:
+                type: string
+                enum:
+                  - port_reserved
+                  - process_global_class_mismatch
+                  - stream_port_collision
+                  - udp_stream_collision
+                  - class_conflict
+                  - dedicated_bind_conflict
+                  - dedicated_bind_tls_unsupported
+                  - frontend_tls_missing
+                  - bind_failed
+                  - listener_task_ended
+                  - class_flip_deferred
+                  - retirement_pending
+              count:
+                type: integer
+                format: uint64
+        failures:
+          type: array
+          description: Active failures, bounded to 64 entries.
+          items:
+            type: object
+            required:
+              - port
+              - protocol
+              - category
+              - origin
+              - config_generation
+              - detail
+              - first_observed_unix_ms
+              - last_observed_unix_ms
+              - observations
+            properties:
+              port:
+                type: integer
+                format: uint16
+              protocol:
+                type: string
+                enum: [tcp, quic]
+                description: >-
+                  Which protocol half is not serving. A `quic` entry means
+                  HTTP/1.1 and HTTP/2 are still served on that port and only
+                  HTTP/3 is unavailable.
+              category:
+                type: string
+                enum:
+                  - port_reserved
+                  - process_global_class_mismatch
+                  - stream_port_collision
+                  - udp_stream_collision
+                  - class_conflict
+                  - dedicated_bind_conflict
+                  - dedicated_bind_tls_unsupported
+                  - frontend_tls_missing
+                  - bind_failed
+                  - listener_task_ended
+                  - class_flip_deferred
+                  - retirement_pending
+              origin:
+                type: string
+                enum: [admission, runtime]
+                description: >-
+                  `admission` means the listener was refused before any socket
+                  was attempted (repair the configuration); `runtime` means
+                  realizing it failed (repair the environment).
+              config_generation:
+                type: integer
+                format: uint64
+              detail:
+                type: string
+                maxLength: 203
+                description: >-
+                  Sanitized, bounded diagnostic. Printable ASCII only, capped at
+                  200 characters plus an ellipsis. Never a secret and never a
+                  metric label.
+              first_observed_unix_ms:
+                type: integer
+                format: uint64
+              last_observed_unix_ms:
+                type: integer
+                format: uint64
+              observations:
+                type: integer
+                format: uint64
+                description: >-
+                  Consecutive reconcile/retry passes that have observed this
+                  failure.
 
     AuditPipelineStatus:
       type: object
@@ -12706,7 +13333,7 @@ components:
           description: |
             Stream-listener (TCP/UDP/DTLS) diagnostics. Present only when the
             gateway has a proxy state (absent in control-plane mode).
-          required: [dtls_demux_sessions_total, dtls_demux_sessions, bind_failures_total, bind_failures]
+          required: [dtls_demux_sessions_total, dtls_demux_sessions, frontend_dtls_reload, bind_failures_total, bind_failures]
           properties:
             dtls_demux_sessions_total:
               type: integer
@@ -12727,6 +13354,28 @@ components:
                   sessions:
                     type: integer
                     format: uint64
+            frontend_dtls_reload:
+              type: object
+              description: Bounded, redacted frontend-DTLS material rotation and listener convergence status.
+              required: [generation, last_swapped_listeners, last_success_unix, last_failure_unix, last_outcome]
+              properties:
+                generation:
+                  type: integer
+                  format: uint64
+                  description: Last accepted immutable material generation; 0 means none has been published.
+                last_swapped_listeners:
+                  type: integer
+                  format: uint64
+                  description: Active DTLS listeners live-swapped during the last accepted publish.
+                last_success_unix:
+                  type: [integer, "null"]
+                  format: uint64
+                last_failure_unix:
+                  type: [integer, "null"]
+                  format: uint64
+                last_outcome:
+                  type: string
+                  enum: [none, accepted, rejected]
             bind_failures_total:
               type: integer
               description: |
@@ -12967,6 +13616,23 @@ components:
         pool_handshakes_total: { type: object, additionalProperties: { type: integer, format: uint64 } }
         pool_evictions_total: { type: object, additionalProperties: { type: integer, format: uint64 } }
         pool_failures_total: { type: object, additionalProperties: { type: integer, format: uint64 } }
+        unix_backend_pool:
+          type: object
+          description: >-
+            Sidecar-ingress Unix-domain backend connection pool accounting. Fixed
+            cardinality: one object for the whole pool, never per target. Counters
+            are monotonic; the three connection fields are gauges.
+          properties:
+            hits: { type: integer, format: uint64, description: "Checkouts served by an already-admitted pooled carrier" }
+            misses: { type: integer, format: uint64, description: "Checkouts that had to establish a new physical connection" }
+            physical_connects: { type: integer, format: uint64, description: "Physical connections established" }
+            identity_retirements: { type: integer, format: uint64, description: "Carriers retired by socket replacement or config withdrawal" }
+            setup_failures: { type: integer, format: uint64, description: "Connect or protocol-handshake failures" }
+            checkout_failures: { type: integer, format: uint64, description: "Gateway-side checkout refusals: path admission, the per-target Unix ingress connection bound, and the shutdown latch" }
+            idle_h1_connections: { type: integer, format: uint64, description: "Idle HTTP/1.1 carriers currently pooled" }
+            active_h2c_connections: { type: integer, format: uint64, description: "Shared h2c carriers currently pooled" }
+            open_physical_connections: { type: integer, format: uint64, description: "Physical connections currently open, including checked-out carriers" }
+            withdrawal_fenced_checkins: { type: integer, format: uint64, description: "Carriers the publication fence refused to re-pool" }
         tcp_rst_observed:
           type: object
           properties:
@@ -27554,9 +28220,13 @@ components:
           description: |
             Gateway-to-mesh HBONE support for upstream targets tagged
             `mesh.hbone=true`. `supported` means the gateway can open
-            HTTP/2 CONNECT over SPIFFE mTLS to the sidecar port; `unknown`
-            is used for untagged targets, gateways without SVIDs, or
-            not-yet-probed entries.
+            HTTP/2 CONNECT over SPIFFE mTLS to the sidecar port;
+            `unsupported` follows definitive identity/TLS configuration
+            evidence; `unknown` is used for untagged targets, gateways
+            without SVIDs, not-yet-probed entries, or cold probes that hit
+            only transient DNS/connect/timeout or post-TLS HTTP/2
+            preface/handshake failures. Transient failures preserve an
+            existing verdict so rolling peer restarts can recover.
         last_probe_at_unix_secs:
           type: integer
           format: int64
@@ -27574,7 +28244,9 @@ components:
             plaintext, H3 on most HTTPS backends, untagged HBONE,
             per-request HBONE CONNECT rejection) do NOT populate this
             field — only real connection / TLS-config errors and
-            in-flight live downgrades. An H3 probe failure against a
+            in-flight live downgrades. Transient HBONE reachability failures
+            populate this field while preserving the previous classification
+            (or leaving a cold probe unknown). An H3 probe failure against a
             target already classified `h3: supported` always populates
             it, including when a transient DNS/connect/refused/timeout
             class preserves that classification instead of downgrading

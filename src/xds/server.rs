@@ -4,6 +4,7 @@ use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
@@ -28,11 +29,11 @@ use crate::FERRUM_VERSION;
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot;
 use crate::config::types::GatewayConfig;
 use crate::grpc::auth::{
-    AllowedNamespaces, GrpcAudiencePolicy, VerifiedGrpcIdentity,
-    verify_grpc_jwt_metadata_with_audience,
+    AllowedNamespaces, AuthorizedResponseStream, DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS,
+    GrpcAudiencePolicy, StreamAuthSurface, StreamAuthorizationLease, VerifiedGrpcIdentity,
 };
 use crate::grpc::cp_server::{CpGrpcServer, CpScope, NamespaceBroadcasts};
-use crate::grpc::cp_trust::{CpDpVerifier, CpGrpcConnectInfo};
+use crate::grpc::cp_trust::{CpDpVerifier, CpDpVerifierStore, CpGrpcConnectInfo};
 use crate::grpc::proto::ConfigUpdate;
 use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use crate::xds::carrier::XdsNodeScoping;
@@ -81,7 +82,8 @@ pub struct XdsAdsServer {
     /// Shared with the ConfigSync and mesh servers so ADS enforces the same
     /// namespace-bound verification credentials, not a second authorization
     /// source (advisory GHSA-3f2j-wwqw-grmg).
-    verifier: Arc<CpDpVerifier>,
+    verifier: Arc<CpDpVerifierStore>,
+    max_stream_lifetime: Duration,
     expected_issuer: String,
     namespace: String,
     scope: CpScope,
@@ -239,7 +241,10 @@ impl XdsAdsServer {
             config,
             update_tx,
             namespace_broadcasts: None,
-            verifier: Arc::new(CpDpVerifier::SharedSecret(jwt_secret)),
+            verifier: Arc::new(CpDpVerifierStore::new(CpDpVerifier::SharedSecret(
+                jwt_secret,
+            ))),
+            max_stream_lifetime: Duration::from_secs(DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS),
             expected_issuer,
             namespace: namespace.clone(),
             scope: CpScope::Single(namespace),
@@ -269,10 +274,13 @@ impl XdsAdsServer {
         self
     }
 
-    /// Replace the seeded shared-secret verifier with the CP's configured
-    /// namespace-bound trust bundle.
-    pub fn with_verifier(mut self, verifier: Arc<CpDpVerifier>) -> Self {
+    pub fn with_verifier_store(mut self, verifier: Arc<CpDpVerifierStore>) -> Self {
         self.verifier = verifier;
+        self
+    }
+
+    pub fn with_max_stream_lifetime(mut self, lifetime: Duration) -> Self {
+        self.max_stream_lifetime = lifetime;
         self
     }
 
@@ -356,14 +364,16 @@ impl XdsAdsServer {
         metadata: &tonic::metadata::MetadataMap,
         extensions: &tonic::Extensions,
     ) -> Result<VerifiedGrpcIdentity, Status> {
-        verify_grpc_jwt_metadata_with_audience(
-            metadata,
-            &self.verifier,
-            &self.expected_issuer,
-            GrpcAudiencePolicy::ReservedForbidden,
-            extensions.get::<CpGrpcConnectInfo>(),
-        )
-        .map_err(|(status, _)| status)
+        let verifier_snapshot = self.verifier.load();
+        verifier_snapshot
+            .verify_and_bind_grpc_identity_with_audience(
+                metadata,
+                &self.expected_issuer,
+                GrpcAudiencePolicy::ReservedForbidden,
+                extensions.get::<CpGrpcConnectInfo>(),
+                &self.verifier,
+            )
+            .map_err(|(status, _)| status)
     }
 
     /// Reserve total + namespace + principal ADS capacity for one stream.
@@ -1652,9 +1662,8 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                 return Err(status);
             }
         };
-        let allowed = identity.allowed_namespaces;
         let stream_principal_key = principal_key(&identity.subject);
-        let stream_namespace = match self.resolve_xds_namespace(&allowed) {
+        let stream_namespace = match self.resolve_xds_namespace(&identity.allowed_namespaces) {
             Ok(namespace) => namespace,
             Err(status) => {
                 warn!(
@@ -1692,13 +1701,21 @@ impl AggregatedDiscoveryService for XdsAdsServer {
 
         let mut requests = request.into_inner();
         let mut server = self.clone();
-        server.ambient_udp_source_bearer_namespaces = allowed.effective_namespaces().cloned();
+        server.ambient_udp_source_bearer_namespaces =
+            identity.allowed_namespaces.effective_namespaces().cloned();
         let mut updates = server.updates_for_namespace(&stream_namespace);
         let (tx, rx) = mpsc::channel(server.stream_channel_capacity);
+        let authorization = StreamAuthorizationLease::new(
+            &identity,
+            self.verifier.clone(),
+            self.max_stream_lifetime,
+        );
         let max_node_id_bytes = server.admission.limits().max_node_id_bytes;
         let first_request_timeout = server.admission.limits().first_request_timeout;
 
         tokio::spawn(async move {
+            let authorization_end = authorization.wait_for_end();
+            tokio::pin!(authorization_end);
             // Owns the permit for the whole stream lifetime; its `Drop` is the
             // single release path for every normal, error, cancellation, abort,
             // and shutdown exit below.
@@ -1717,6 +1734,14 @@ impl AggregatedDiscoveryService for XdsAdsServer {
             let mut last_snapshot: Option<Arc<XdsSnapshot>> = None;
             loop {
                 tokio::select! {
+                    reason = &mut authorization_end => {
+                        // Deliver the authoritative status into the authorized
+                        // response wrapper. Dropping the producer alone can race
+                        // paused-time deadline auto-advance on the wrapper and
+                        // surface an unrelated Unauthenticated closure.
+                        let _ = tx.send(Err(reason.status())).await;
+                        return;
+                    }
                     // Bounds a stalled stream that holds a task, a channel, a
                     // config snapshot, and a permit without ever identifying a
                     // node. Disabled the moment a node id is resolved, and
@@ -1994,7 +2019,14 @@ impl AggregatedDiscoveryService for XdsAdsServer {
             }
         });
 
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        let authorized = AuthorizedResponseStream::new(
+            ReceiverStream::new(rx),
+            &identity,
+            self.verifier.clone(),
+            self.max_stream_lifetime,
+            StreamAuthSurface::XdsSotw,
+        );
+        Ok(Response::new(Box::pin(authorized)))
     }
 
     async fn delta_aggregated_resources(
@@ -2020,9 +2052,8 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                 return Err(status);
             }
         };
-        let allowed = identity.allowed_namespaces;
         let stream_principal_key = principal_key(&identity.subject);
-        let stream_namespace = match self.resolve_xds_namespace(&allowed) {
+        let stream_namespace = match self.resolve_xds_namespace(&identity.allowed_namespaces) {
             Ok(namespace) => namespace,
             Err(status) => {
                 warn!(
@@ -2060,13 +2091,21 @@ impl AggregatedDiscoveryService for XdsAdsServer {
 
         let mut requests = request.into_inner();
         let mut server = self.clone();
-        server.ambient_udp_source_bearer_namespaces = allowed.effective_namespaces().cloned();
+        server.ambient_udp_source_bearer_namespaces =
+            identity.allowed_namespaces.effective_namespaces().cloned();
         let mut updates = server.updates_for_namespace(&stream_namespace);
         let (tx, rx) = mpsc::channel(server.stream_channel_capacity);
+        let authorization = StreamAuthorizationLease::new(
+            &identity,
+            self.verifier.clone(),
+            self.max_stream_lifetime,
+        );
         let max_node_id_bytes = server.admission.limits().max_node_id_bytes;
         let first_request_timeout = server.admission.limits().first_request_timeout;
 
         tokio::spawn(async move {
+            let authorization_end = authorization.wait_for_end();
+            tokio::pin!(authorization_end);
             // Owns the permit for the whole stream lifetime; its `Drop` is the
             // single release path for every normal, error, cancellation, abort,
             // and shutdown exit below.
@@ -2087,6 +2126,14 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                 HashMap::new();
             loop {
                 tokio::select! {
+                    reason = &mut authorization_end => {
+                        // Deliver the authoritative status into the authorized
+                        // response wrapper. Dropping the producer alone can race
+                        // paused-time deadline auto-advance on the wrapper and
+                        // surface an unrelated Unauthenticated closure.
+                        let _ = tx.send(Err(reason.status())).await;
+                        return;
+                    }
                     _ = &mut first_request_deadline,
                         if node_id.is_none() && !first_request_timeout.is_zero() =>
                     {
@@ -2369,7 +2416,14 @@ impl AggregatedDiscoveryService for XdsAdsServer {
             }
         });
 
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        let authorized = AuthorizedResponseStream::new(
+            ReceiverStream::new(rx),
+            &identity,
+            self.verifier.clone(),
+            self.max_stream_lifetime,
+            StreamAuthSurface::XdsDelta,
+        );
+        Ok(Response::new(Box::pin(authorized)))
     }
 }
 
@@ -2739,6 +2793,7 @@ mod tests {
             }],
             workloads: Vec::new(),
             protocol_overrides: HashMap::new(),
+            uid: None,
         }
     }
 

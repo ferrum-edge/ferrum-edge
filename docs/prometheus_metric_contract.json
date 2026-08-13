@@ -1127,6 +1127,139 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_cp_dp_trust_degraded",
+    "type": "gauge",
+    "help": "Whether the CP is authorizing with a trust generation it could not revalidate, or the reload worker is stalled or failed (1) or not (0).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "cp_dp_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_dp_trust_last_acceptance_age_seconds",
+    "type": "gauge",
+    "help": "Seconds since the CP last accepted (replaced or confirmed) its trust source, on a monotonic clock.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "cp_dp_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_dp_trust_max_stale_seconds",
+    "type": "gauge",
+    "help": "Configured maximum unrevalidated trust-generation age before admission fails closed (0 = unbounded, explicit opt-in).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "cp_dp_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_dp_trust_reload_acceptances_total",
+    "type": "counter",
+    "help": "Reload attempts that produced a usable trust generation (replaced or confirmed unchanged).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "cp_dp_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_dp_trust_reload_attempts_total",
+    "type": "counter",
+    "help": "CP/DP trust-bundle reload attempts started since process start. A wedged in-flight read is counted here before it produces an acceptance or rejection.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "cp_dp_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_dp_trust_reload_consecutive_failures",
+    "type": "gauge",
+    "help": "Consecutive refused reload candidates or fatal worker exits since the last accepted generation.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "cp_dp_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_dp_trust_reload_recoveries_total",
+    "type": "counter",
+    "help": "Failure episodes ended by a later valid candidate.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "cp_dp_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_dp_trust_reload_rejections_total",
+    "type": "counter",
+    "help": "Reload candidates refused or reload workers exited unexpectedly, by closed reason. The previous verifier was retained when applicable.",
+    "labels": [
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "cp_dp_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_dp_trust_reload_worker_running",
+    "type": "gauge",
+    "help": "Whether the trust-bundle reload worker is alive (1) or stopped/failed (0). A stalled worker is still alive.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "cp_dp_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_dp_trust_reload_worker_stalled",
+    "type": "gauge",
+    "help": "Whether the trust-bundle reload worker is alive but has not completed an attempt inside the stall window (1) or not (0).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "cp_dp_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_dp_trust_stale",
+    "type": "gauge",
+    "help": "Whether the active trust generation has aged past its bound, refusing new configuration streams (1) or not (0).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "cp_dp_trust",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_cp_grpc_active_connections",
     "type": "gauge",
     "help": "CP gRPC listener connections currently admitted (pre-handshake through served HTTP/2 session).",
@@ -1442,6 +1575,98 @@
     "subsystem": "prometheus_metrics",
     "export_surface": "/metrics",
     "bundled": "dashboard",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_gateway_listener_failed_ports",
+    "type": "gauge",
+    "help": "Distinct dynamic Gateway API listener ports with at least one active failure.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "gateway_listener",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_process_initialized"
+  },
+  {
+    "name": "ferrum_gateway_listener_failures_active",
+    "type": "gauge",
+    "help": "Dynamic Gateway API listener halves currently failing, by protocol half and bounded reason.",
+    "labels": [
+      "protocol",
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "gateway_listener",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_process_initialized"
+  },
+  {
+    "name": "ferrum_gateway_listener_failures_total",
+    "type": "counter",
+    "help": "Dynamic Gateway API listener failures observed since process start, by protocol half and bounded reason.",
+    "labels": [
+      "protocol",
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "gateway_listener",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_process_initialized"
+  },
+  {
+    "name": "ferrum_gateway_listener_recoveries_total",
+    "type": "counter",
+    "help": "Dynamic Gateway API listener failures cleared by a later reconcile since process start, by protocol half and bounded reason.",
+    "labels": [
+      "protocol",
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "gateway_listener",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_process_initialized"
+  },
+  {
+    "name": "ferrum_gateway_listeners_active",
+    "type": "gauge",
+    "help": "Dynamic Gateway API listener ports currently bound and accepting.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "gateway_listener",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_process_initialized"
+  },
+  {
+    "name": "ferrum_gateway_listeners_desired",
+    "type": "gauge",
+    "help": "Dynamic Gateway API listener ports the published configuration asks this process to bind.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "gateway_listener",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_process_initialized"
+  },
+  {
+    "name": "ferrum_grpc_config_stream_terminations_total",
+    "type": "counter",
+    "help": "Authenticated configuration streams ended by fixed surface and reason.",
+    "labels": [
+      "surface",
+      "reason",
+      "gateway_namespace"
+    ],
+    "subsystem": "grpc_config",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
     "emission": "always"
   },
   {
@@ -1887,6 +2112,32 @@
     "export_surface": "/metrics",
     "bundled": "documented_only",
     "emission": "always"
+  },
+  {
+    "name": "ferrum_mesh_ext_authz_check_failures_total",
+    "type": "counter",
+    "help": "Failed CUSTOM external authorization checks by how the failure was resolved.",
+    "labels": [
+      "disposition",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_ext_authz_checks_total",
+    "type": "counter",
+    "help": "Istio AuthorizationPolicy CUSTOM external authorization check outcomes.",
+    "labels": [
+      "outcome",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
   },
   {
     "name": "ferrum_mesh_federation_bundle_age_seconds",
@@ -2473,6 +2724,18 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_mesh_udp_placement_migration_established_adoptions_total",
+    "type": "counter",
+    "help": "Ambient UDP placements adopted from the release-attested established placement without a node-local durable record.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_udp_migration",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_mesh_udp_placement_migration_failures_total",
     "type": "counter",
     "help": "Ambient UDP placement migration failures by bounded reason.",
@@ -2525,7 +2788,7 @@
   {
     "name": "ferrum_mesh_workload_api_active_rpcs",
     "type": "gauge",
-    "help": "SPIFFE Workload API RPCs currently admitted by RPC admission (service-wide ceiling and per-peer-UID quota); counts service-dispatched RPC streams only — each occupies one HTTP/2 stream, but streams refused inside HTTP/2 or rejected before service dispatch are not observable here.",
+    "help": "SPIFFE Workload API RPCs currently admitted by RPC admission (service-wide ceiling and per-peer-UID quota); counts service-dispatched RPC streams only \u2014 each occupies one HTTP/2 stream, but streams refused inside HTTP/2 or rejected before service dispatch are not observable here.",
     "labels": [
       "gateway_namespace"
     ],
@@ -2563,7 +2826,7 @@
   {
     "name": "ferrum_mesh_workload_api_rpcs_rejected_total",
     "type": "counter",
-    "help": "SPIFFE Workload API RPCs shed by RPC admission — the service-wide concurrency ceiling or the per-peer-UID quota — before any producer work was spawned; the HTTP/2 stream is already open and carries a RESOURCE_EXHAUSTED result, so this is not a protocol-level stream refusal.",
+    "help": "SPIFFE Workload API RPCs shed by RPC admission \u2014 the service-wide concurrency ceiling or the per-peer-UID quota \u2014 before any producer work was spawned; the HTTP/2 stream is already open and carries a RESOURCE_EXHAUSTED result, so this is not a protocol-level stream refusal.",
     "labels": [
       "gateway_namespace"
     ],
@@ -3281,6 +3544,18 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_service_discovery_last_success_age_seconds_max",
+    "type": "gauge",
+    "help": "Maximum age in seconds of the staleness anchor across service-discovery tasks (task start when no snapshot has ever been published).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_service_discovery_malformed_envelope_total",
     "type": "counter",
     "help": "Service-discovery Kubernetes EndpointSliceList envelopes rejected as malformed.",
@@ -3320,6 +3595,210 @@
     "name": "ferrum_service_discovery_shared_admission_rejected_total",
     "type": "counter",
     "help": "Service-discovery snapshots rejected by shared host/egress target admission.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_stale_expiries_total",
+    "type": "counter",
+    "help": "Service-discovery tasks whose last admitted snapshot crossed the configured staleness bound.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_stale_recoveries_total",
+    "type": "counter",
+    "help": "Service-discovery stale episodes cleared by a freshly admitted and published snapshot.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_stale_withdrawals_total",
+    "type": "counter",
+    "help": "Service-discovery stale episodes whose expiry policy withdrew discovered targets and retained static targets.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_task_panics_total",
+    "type": "counter",
+    "help": "Service-discovery pollers that exited unexpectedly instead of stopping cleanly.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_task_restarts_total",
+    "type": "counter",
+    "help": "Service-discovery pollers restarted by their supervisor after an unexpected exit.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_tasks",
+    "type": "gauge",
+    "help": "Service-discovery tasks currently supervised.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_tasks_crash_looping",
+    "type": "gauge",
+    "help": "Service-discovery tasks that exited unexpectedly repeatedly without an intervening published snapshot.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_tasks_kept_total",
+    "type": "counter",
+    "help": "Service-discovery tasks kept running across a config reconcile because their effective specification was unchanged.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_tasks_never_succeeded",
+    "type": "gauge",
+    "help": "Service-discovery tasks that have never published an admitted snapshot.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_tasks_readiness_failing",
+    "type": "gauge",
+    "help": "Stale service-discovery tasks failing readiness by policy or because withdrawal publication is still retrying.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_tasks_replaced_total",
+    "type": "counter",
+    "help": "Service-discovery tasks replaced across a config reconcile because their effective specification changed.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_tasks_restarting",
+    "type": "gauge",
+    "help": "Service-discovery tasks waiting out a restart backoff after an unexpected poller exit.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_tasks_running",
+    "type": "gauge",
+    "help": "Service-discovery tasks whose poller is running.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_tasks_stale",
+    "type": "gauge",
+    "help": "Service-discovery tasks whose last admitted snapshot is older than the configured staleness bound.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_tasks_started_total",
+    "type": "counter",
+    "help": "Service-discovery tasks started for newly configured upstreams.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_tasks_stopped_total",
+    "type": "counter",
+    "help": "Service-discovery tasks stopped because their upstream no longer configures service discovery.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_tasks_withdrawn",
+    "type": "gauge",
+    "help": "Service-discovery tasks whose discovered targets are currently withdrawn by the staleness policy.",
     "labels": [
       "namespace"
     ],

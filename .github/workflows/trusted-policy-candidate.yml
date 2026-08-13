@@ -9,14 +9,18 @@ on:
   pull_request:
     paths:
       - .github/scripts/verify_cross_build_policy.py
+      - .github/scripts/verify_launch_integrity.py
       - .github/workflows/ci.yml
+      - .github/workflows/launch-integrity.yml
       - .github/workflows/trusted-policy-candidate.yml
   push:
     branches:
       - main
     paths:
       - .github/scripts/verify_cross_build_policy.py
+      - .github/scripts/verify_launch_integrity.py
       - .github/workflows/ci.yml
+      - .github/workflows/launch-integrity.yml
       - .github/workflows/trusted-policy-candidate.yml
 
 permissions:
@@ -39,3 +43,13 @@ jobs:
           set -euo pipefail
           policy=.github/scripts/verify_cross_build_policy.py
           python3 -I "$policy" --self-test
+
+      # Same isolation for the launch-governance integrity verifier: the
+      # required `Launch Readiness Integrity` check always executes the trusted
+      # base copy, so this lane is the only place a proposed verifier runs its
+      # own adversarial fixtures. It produces nothing another job consumes.
+      - name: Exercise the candidate launch integrity verifier
+        run: |
+          set -euo pipefail
+          verifier=.github/scripts/verify_launch_integrity.py
+          python3 -I "$verifier" --self-test

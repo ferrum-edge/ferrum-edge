@@ -7,8 +7,12 @@ use std::time::Duration;
 use futures_util::{Stream, TryStreamExt};
 use kube::api::{ApiResource, DynamicObject, ListParams};
 use kube::discovery;
-use kube::runtime::reflector;
-use kube::runtime::watcher;
+// `WatchStreamExt` supplies `default_backoff`. `watcher()` yields its errors to
+// the consumer without pausing, so a watch that can never succeed — an RBAC gap
+// on an installed CRD, a served kind the API server rejects — would otherwise be
+// retried as fast as the task is polled, starving every other watcher's relist
+// generation on the same runtime.
+use kube::runtime::{WatchStreamExt, reflector, watcher};
 use kube::{Api, Client};
 use tracing::{debug, error, info, warn};
 
@@ -1001,11 +1005,16 @@ pub(crate) async fn run_watcher_generations<S, F>(
                             return;
                         }
                         Err(e) => {
+                            // The stream applies `DefaultBackoff` before it is
+                            // polled again, so a watch that can never succeed
+                            // logs (and re-lists) at most once per backoff step
+                            // rather than as fast as this task is scheduled.
                             error!(
                                 kind = %target.kind,
+                                api_version = %target.api_version,
                                 scope = %target.scope,
                                 error = %e,
-                                "Watch error, kube-rs will retry with backoff"
+                                "Watch error; the stream backs off before retrying"
                             );
                         }
                     }
@@ -1186,7 +1195,10 @@ pub(crate) async fn start_crd_watchers(
                 read_boundary,
                 shutdown.clone(),
                 move |writer| {
-                    reflector::reflector(writer, watcher(api.clone(), watcher_config.clone()))
+                    reflector::reflector(
+                        writer,
+                        watcher(api.clone(), watcher_config.clone()).default_backoff(),
+                    )
                 },
             );
 
@@ -1333,7 +1345,10 @@ pub(crate) async fn start_crd_watchers(
                     read_boundary,
                     shutdown.clone(),
                     move |writer| {
-                        reflector::reflector(writer, watcher(api.clone(), watcher_config.clone()))
+                        reflector::reflector(
+                            writer,
+                            watcher(api.clone(), watcher_config.clone()).default_backoff(),
+                        )
                     },
                 );
 

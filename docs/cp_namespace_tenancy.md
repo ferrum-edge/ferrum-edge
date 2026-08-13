@@ -185,6 +185,7 @@ token. `FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH` points at a JSON document:
       "kid": "tenant-a",
       "algorithm": "ES256",
       "public_key_path": "/etc/ferrum/trust/tenant-a.pub",
+      "material_sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
       "namespaces": ["tenant-a"]
     },
     {
@@ -222,9 +223,187 @@ token. `FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH` points at a JSON document:
   diagnostic names only the bundle path, the `kid`, and the variable name —
   never key material. Generate one fresh secret per credential — or, better,
   use an asymmetric key so the data plane cannot sign at all.
+- `material_sha256` is the lowercase hex SHA-256 of the exact bytes of that
+  key's `secret_path` / `public_key_path` file, as `sha256sum` prints them. It
+  binds the material to the document that names it — see
+  [Rotation is atomic per source generation](#rotation-is-atomic-per-source-generation)
+  for when it is required. It is parsed strictly (exactly 64 lowercase hex
+  digits, no `sha256:` prefix, no surrounding whitespace) and is rejected on
+  inline and environment-backed sources, which have nothing to bind.
 - Startup refuses duplicate `kid`s (ambiguous key selection), unknown
   algorithms, algorithm/material mismatches, empty namespace lists, and
   unreadable material.
+
+### Rotation is atomic per source generation
+
+The bundle document is a policy statement *about* the files it names. If the
+document is read from one filesystem generation and each referenced key is then
+resolved independently a moment later, a rotation can pair one generation's
+namespace ceiling with another generation's key material. Both halves are
+individually valid and the result is internally self-consistent, so a signing
+key ends up bound to a namespace allow-list that existed in neither the old nor
+the new configuration. Ferrum loads the document and every file it references as
+**one coherent source generation** instead.
+
+Which combinations are atomic:
+
+| Shape | Atomic? | Why |
+|---|---|---|
+| One self-contained document (`public_key_pem` / `secret` inline) | Yes | One bounded read of one file. The safest default for public verification material. |
+| `secret_env` | Yes | Resolved from the process environment, not the filesystem. |
+| Document and every referenced file in one Kubernetes projected mount | Yes | The mount's `..data` generation directory is pinned by descriptor **before** the document is read, and every same-mount file is opened through that descriptor. |
+| Any path outside that pinned generation | Only with `material_sha256` | Nothing else proves the bytes read belong to the generation the document came from. |
+| Several separate `mv`/`rename` operations over unrelated paths | **No** | Refused unless every referenced file carries `material_sha256`. |
+
+Concretely:
+
+- **Kubernetes projected ConfigMap/Secret mounts are the supported zero-effort
+  shape.** Put `bundle.json` and every `secret_path` / `public_key_path` file in
+  the *same* volume and reference them by their mount-visible paths
+  (`/etc/ferrum/cp-trust/tenant-a.pub`). Ferrum opens `..data` once, reads the
+  document through it, and resolves every reference against that one pinned
+  directory with `openat(…, O_NOFOLLOW)`. A rotation that lands mid-load cannot
+  redirect anything — including a rapid A→B→A sequence, which a document
+  re-read stability check would not notice.
+- **Anywhere else, declare `material_sha256`.** An arbitrary external path, an
+  ordinary filesystem, or a document that does not itself live in the projected
+  mount all fall here. A path-backed key with no digest is refused at startup
+  and on reload. There is deliberately **no unsafe compatibility opt-in**;
+  inline `public_key_pem` is the escape hatch when a digest is impractical.
+- **Non-Unix hosts cannot pin a generation.** A projected `..data` layout is
+  refused outright there rather than silently downgraded to per-file symlink
+  re-resolution; ordinary path-backed material still works with
+  `material_sha256`.
+- **Traversal and escapes are refused.** A `..` component in a referenced path,
+  and a symlink planted inside a pinned generation directory, are both closed
+  rejections.
+- **Candidate memory is bounded.** Each path-backed file and the aggregate
+  path-backed material retained while one coherent candidate is assembled are
+  limited to 1 MiB.
+
+Rejections are classified into a closed, fixed-cardinality set
+(`document_unreadable`, `document_invalid`, `material_unreadable`,
+`material_integrity_unbound`, `material_integrity_malformed`,
+`material_integrity_mismatch`, `source_generation_escape`,
+`source_generation_unstable`, `source_generation_unsupported`). The reason label
+is all that is ever logged: material bytes, referenced paths, namespace
+inventories, and digests never appear in logs, metrics, or errors — a digest
+over a symmetric secret is an offline verification oracle for that secret. A
+rejected candidate never partially replaces anything; the entire last accepted
+verifier is retained, and startup fails closed.
+
+#### Safe rotation example
+
+Rotating a credential's key material *and* its namespace binding together is the
+case the coherence contract exists for. With a projected mount, do it in one
+Secret update so the kubelet swaps `..data` atomically:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ferrum-cp-trust
+stringData:
+  # Both the policy and the material it describes move in one generation.
+  bundle.json: |
+    {
+      "version": 1,
+      "keys": [
+        { "kid": "tenant-a",
+          "algorithm": "ES256",
+          "public_key_path": "/etc/ferrum/cp-trust/tenant-a.pub",
+          "namespaces": ["tenant-a", "tenant-a-stage"] }
+      ]
+    }
+  tenant-a.pub: |
+    -----BEGIN PUBLIC KEY-----
+    ...the new key...
+    -----END PUBLIC KEY-----
+```
+
+mounted at `/etc/ferrum/cp-trust` with
+`FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH=/etc/ferrum/cp-trust/bundle.json`. The next
+poll observes both halves of the new generation or neither.
+
+Outside Kubernetes, update the material file first, then write the document that
+carries its new `material_sha256` (a `rename(2)` over the bundle path):
+
+```bash
+install -m 0644 tenant-a.pub.new /etc/ferrum/trust/tenant-a.pub
+digest=$(sha256sum /etc/ferrum/trust/tenant-a.pub | cut -d' ' -f1)
+jq --arg d "$digest" '.keys[0].material_sha256 = $d | .keys[0].namespaces = ["tenant-a","tenant-a-stage"]' \
+  /etc/ferrum/cp-dp-trust.json > /etc/ferrum/cp-dp-trust.json.new
+mv /etc/ferrum/cp-dp-trust.json.new /etc/ferrum/cp-dp-trust.json
+```
+
+Between the two steps the old document's digest no longer matches, so the
+candidate is refused and the CP keeps the last accepted verifier — the window is
+fail-closed rather than mixed.
+
+### Retention of an unrevalidatable verifier is bounded (issue #3813)
+
+Retaining the entire last accepted verifier through a transient failure is the
+right availability policy. Left unbounded it is also a silent one: a credential
+an operator removed from the bundle keeps authorizing for as long as every
+reload keeps failing, and the hourly maximum stream lifetime does not help —
+the reconnect re-verifies under the same retained key.
+
+The reload worker therefore publishes its own health, and the retention window
+has a finite default.
+
+**What is published.** Authenticated `/health` and `/status` carry a
+`cp_dp_trust` object, and `/metrics` carries the `ferrum_cp_dp_trust_*`
+families. Both are fixed-cardinality: booleans, counters, seconds, the closed
+reason set above (plus `reader_unavailable`, `reload_reader_failed`,
+`reload_read_timed_out`, `scope_validation_failed`, and `worker_exited`).
+Nothing more on Prometheus: no path, `kid`, namespace, token, key byte, or
+generation identifier. Authenticated health additionally carries
+`active_generation`, a replica-stable HMAC-SHA-256 of the private configuration
+fingerprint under the fleet-shared `FERRUM_ADMIN_JWT_SECRET` (domain
+`ferrum-cp-dp-trust-status-id-v1\0`). Replicas that share the same accepted
+bundle and the same HMAC key publish the same 64-hex value; a semantic bundle
+change mints a new value; an unchanged revalidation keeps it. Replicas that do
+not share the HMAC key are incomparable. An admin JWT lets an operator *see*
+the identifier; it does not reveal the HMAC key. An unkeyed digest of the
+fingerprint is never published — that would be an offline oracle against a
+guessed HS\* secret. The private fingerprint stays inside the reload worker.
+Unauthenticated probes still receive only the documented coarse `status` /
+`ready` pair.
+
+**What the states mean.**
+
+| State | Trigger | Effect |
+|---|---|---|
+| degraded | The first refused attempt in an episode, a stalled worker, or an unexpected worker exit | `status: degraded`; `ferrum_cp_dp_trust_degraded 1`. Streams and admission are unaffected inside the bound — the retained verifier is still serving. A stalled worker is also `ferrum_cp_dp_trust_reload_worker_stalled 1`. |
+| stale | The active generation reaches `FERRUM_CP_DP_TRUST_MAX_STALE_SECONDS` | `ready: false`, `status: unavailable`; new ConfigSync, local/remote MeshSubscribe, SotW ADS, and Delta ADS streams are refused with `UNAVAILABLE`, and established streams end at the same boundary through the shared authorization lease. |
+| worker stalled | No attempt has completed inside three poll intervals (floored at 60s) | Immediately degraded and `worker_state=stalled`. Readiness still follows the stale bound. Cleared by the next completed attempt (acceptance or rejection); a valid candidate also clears degraded. |
+| worker failed | The reload task exited or panicked without being asked to | `ready: false` immediately, independent of the bound: nothing in that process can publish a revocation again. A shutdown-signalled exit is `stopped` and is never reported as a failure. |
+| recovered | A valid candidate is accepted | Degraded and stale clear, admission and readiness return, and `ferrum_cp_dp_trust_reload_recoveries_total` increments exactly once for the episode. |
+
+The age is measured on a monotonic clock from the last **accepted** reload, so
+an NTP step cannot extend or shorten it, and attempts, refusals, and reconnects
+never reset it. A semantically *unchanged* candidate is an acceptance: no
+verifier swap is needed, but the source was read coherently and revalidated,
+which is exactly what the bound asks about.
+
+The configured maximum is the boundary; no grace period is added to it. It must
+be at least three poll intervals (`FERRUM_SECRET_REFRESH_INTERVAL_SECONDS`) or
+startup fails closed, because a shorter bound would latch between two healthy
+polls. `FERRUM_CP_DP_TRUST_MAX_STALE_SECONDS=0` means unbounded retention and is
+refused unless `FERRUM_CP_DP_TRUST_ALLOW_UNBOUNDED_STALE=true` — "retain a
+verifier nobody can revalidate, forever, while ready" is never an implicit
+default.
+
+Suggested alerts: `ferrum_cp_dp_trust_degraded == 1` for longer than one poll
+interval (a rotation is not landing), `ferrum_cp_dp_trust_stale == 1` (this
+replica is refusing its data planes), `ferrum_cp_dp_trust_reload_worker_stalled
+== 1` (the watcher is wedged), `ferrum_cp_dp_trust_reload_worker_running
+== 0` (supervision failure), disagreement of authenticated
+`cp_dp_trust.active_generation` across replicas that share
+`FERRUM_ADMIN_JWT_SECRET` (a replica has not accepted the same bundle), and
+`max(ferrum_cp_dp_trust_last_acceptance_age_seconds) > 3 *
+FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` (some replica has stopped revalidating
+even if it has not yet reached its bound).
 
 ### mTLS / SPIFFE intersection
 

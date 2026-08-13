@@ -33,24 +33,19 @@
 //! settled truncations that survive the stability window.
 
 use crate::config::config_migration::ConfigMigrator;
+use crate::config::stable_file::{
+    MAX_GATEWAY_CONFIG_FILE_BYTES, StableFileReadOptions, detect_json_or_yaml_extension,
+    read_stable_file, stable_file_error_anyhow,
+};
 use crate::config::types::{CURRENT_CONFIG_VERSION, GatewayConfig};
 use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
 use serde::Deserialize;
-use std::io::Read;
 use std::path::Path;
-use std::time::{Duration, SystemTime};
 use tracing::{info, warn};
 
 /// Hard ceiling on a single file-mode config document. Bounds allocation before
 /// YAML/JSON parse of a hostile or accidentally enormous path target.
-const MAX_CONFIG_FILE_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
-
-/// How many open/read/compare cycles to attempt before failing closed.
-const STABLE_READ_MAX_ATTEMPTS: usize = 5;
-
-/// Settle delay between unstable attempts. Gives in-place writers a chance to
-/// finish (or expose a metadata/content change) without busy-spinning.
-const STABLE_READ_RETRY_DELAY: Duration = Duration::from_millis(20);
+const MAX_CONFIG_FILE_BYTES: u64 = MAX_GATEWAY_CONFIG_FILE_BYTES;
 
 /// Optional file-mode integrity seal stripped before `GatewayConfig`
 /// deserialization (`deny_unknown_fields`). Validated against pre-namespace-
@@ -67,221 +62,10 @@ struct ResourceCounts {
     upstreams: usize,
 }
 
-/// Filesystem identity captured around a stable read. Unix includes device,
-/// inode, and ctime so rename/symlink swaps are visible even when size and
-/// mtime are unchanged; portable platforms lean on the mandatory second
-/// content-equal read.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ConfigFileIdentity {
-    len: u64,
-    modified: Option<SystemTime>,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    changed_seconds: i64,
-    #[cfg(unix)]
-    changed_nanoseconds: i64,
-}
-
-impl ConfigFileIdentity {
-    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
-        Self {
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-            #[cfg(unix)]
-            device: std::os::unix::fs::MetadataExt::dev(metadata),
-            #[cfg(unix)]
-            inode: std::os::unix::fs::MetadataExt::ino(metadata),
-            #[cfg(unix)]
-            changed_seconds: std::os::unix::fs::MetadataExt::ctime(metadata),
-            #[cfg(unix)]
-            changed_nanoseconds: std::os::unix::fs::MetadataExt::ctime_nsec(metadata),
-        }
-    }
-}
-
-#[derive(Debug)]
-enum StableReadError {
-    Io(std::io::Error),
-    NotRegularFile,
-    TooLarge { len: u64 },
-    Unstable(&'static str),
-    NotUtf8(std::string::FromUtf8Error),
-}
-
-impl std::fmt::Display for StableReadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(error) => write!(f, "{error}"),
-            Self::NotRegularFile => {
-                write!(f, "path exists but is not a regular file")
-            }
-            Self::TooLarge { len } => write!(
-                f,
-                "file is {len} bytes; maximum supported size is {MAX_CONFIG_FILE_BYTES} bytes"
-            ),
-            Self::Unstable(reason) => write!(f, "{reason}"),
-            Self::NotUtf8(error) => write!(f, "file is not valid UTF-8: {error}"),
-        }
-    }
-}
-
-impl From<std::io::Error> for StableReadError {
-    fn from(error: std::io::Error) -> Self {
-        Self::Io(error)
-    }
-}
-
-#[cfg(unix)]
-fn open_config_path(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    std::fs::OpenOptions::new()
-        .read(true)
-        // A regular-file path can be replaced with a FIFO/device after the
-        // pre-open metadata check. Non-blocking open makes that race safe; the
-        // opened-handle file-type/identity checks below still reject it.
-        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)
-}
-
-#[cfg(not(unix))]
-fn open_config_path(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::File::open(path)
-}
-
-fn require_regular_file(metadata: &std::fs::Metadata) -> Result<(), StableReadError> {
-    if metadata.is_file() {
-        Ok(())
-    } else {
-        Err(StableReadError::NotRegularFile)
-    }
-}
-
-fn read_opened_config_file(
-    path: &Path,
-    file: &mut std::fs::File,
-    identity: &ConfigFileIdentity,
-) -> Result<Vec<u8>, StableReadError> {
-    if identity.len > MAX_CONFIG_FILE_BYTES {
-        return Err(StableReadError::TooLarge { len: identity.len });
-    }
-
-    let mut bytes = Vec::new();
-    {
-        let mut bounded = file.take(identity.len.saturating_add(1));
-        bounded.read_to_end(&mut bytes)?;
-    }
-    if bytes.len() as u64 != identity.len {
-        return Err(StableReadError::Unstable(
-            "byte length diverged from metadata while reading",
-        ));
-    }
-
-    let after = file.metadata()?;
-    require_regular_file(&after)?;
-    let after_identity = ConfigFileIdentity::from_metadata(&after);
-    if &after_identity != identity {
-        return Err(StableReadError::Unstable(
-            "opened file identity changed while reading",
-        ));
-    }
-
-    let path_metadata = std::fs::metadata(path)?;
-    require_regular_file(&path_metadata)?;
-    let path_identity = ConfigFileIdentity::from_metadata(&path_metadata);
-    if path_identity != *identity {
-        return Err(StableReadError::Unstable(
-            "configured path target changed while reading (symlink or rename swap)",
-        ));
-    }
-
-    Ok(bytes)
-}
-
-fn read_config_snapshot(path: &Path) -> Result<(ConfigFileIdentity, Vec<u8>), StableReadError> {
-    let path_metadata_before = std::fs::metadata(path)?;
-    require_regular_file(&path_metadata_before)?;
-    let path_identity_before = ConfigFileIdentity::from_metadata(&path_metadata_before);
-
-    let mut file = open_config_path(path)?;
-    let opened_metadata = file.metadata()?;
-    require_regular_file(&opened_metadata)?;
-    let opened_identity = ConfigFileIdentity::from_metadata(&opened_metadata);
-    if opened_identity != path_identity_before {
-        return Err(StableReadError::Unstable(
-            "path target changed before the file handle was opened",
-        ));
-    }
-
-    let bytes = read_opened_config_file(path, &mut file, &opened_identity)?;
-    Ok((opened_identity, bytes))
-}
-
-/// Read the config path with a deterministic stability/atomicity contract.
-///
-/// Two independent open/read cycles must observe the same file identity and
-/// byte-identical contents. Metadata/size agreement without content equality
-/// is insufficient and is not treated as success.
+/// Read the config path with the shared bounded stability/atomicity contract.
 fn read_stable_config_file(path: &Path) -> Result<String, anyhow::Error> {
-    let display_path = path.display();
-    let mut last_reason = String::from("unknown instability");
-
-    for attempt in 1..=STABLE_READ_MAX_ATTEMPTS {
-        match (|| -> Result<String, StableReadError> {
-            let (first_identity, first_bytes) = read_config_snapshot(path)?;
-            let (second_identity, second_bytes) = read_config_snapshot(path)?;
-            if second_identity != first_identity {
-                return Err(StableReadError::Unstable(
-                    "file identity changed between consecutive stable-read probes",
-                ));
-            }
-            if second_bytes != first_bytes {
-                return Err(StableReadError::Unstable(
-                    "file content changed between consecutive stable-read probes",
-                ));
-            }
-            String::from_utf8(first_bytes).map_err(StableReadError::NotUtf8)
-        })() {
-            Ok(content) => {
-                if attempt > 1 {
-                    info!(
-                        attempt,
-                        path = %display_path,
-                        "Configuration file stabilized after retry"
-                    );
-                }
-                return Ok(content);
-            }
-            Err(StableReadError::Unstable(reason)) => {
-                last_reason = reason.to_string();
-                warn!(
-                    attempt,
-                    max_attempts = STABLE_READ_MAX_ATTEMPTS,
-                    path = %display_path,
-                    reason,
-                    "Configuration file read was unstable; retrying"
-                );
-                if attempt < STABLE_READ_MAX_ATTEMPTS {
-                    std::thread::sleep(STABLE_READ_RETRY_DELAY);
-                }
-            }
-            Err(other) => {
-                return Err(anyhow::anyhow!(
-                    "Failed to read configuration file {display_path}: {other}"
-                ));
-            }
-        }
-    }
-
-    Err(anyhow::anyhow!(
-        "Configuration file {display_path} remained unstable after {STABLE_READ_MAX_ATTEMPTS} read \
-         attempts ({last_reason}). Publish updates with an atomic replace (write a temp file, \
-         fsync, rename over the path) or equivalent; file-mode reload keeps the last \
-         known-good live generation when this guard fails closed."
-    ))
+    let options = StableFileReadOptions::new(MAX_CONFIG_FILE_BYTES, "configuration file");
+    read_stable_file(path, options).map_err(|error| stable_file_error_anyhow(path, options, error))
 }
 
 fn take_resource_counts_from_json(
@@ -367,21 +151,9 @@ pub fn load_config_from_file(
     }
 
     let content = read_stable_config_file(file_path)?;
-    let ext = file_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
-    // Determine if this is YAML or JSON
-    let is_yaml = match ext.as_str() {
-        "yaml" | "yml" => true,
-        "json" => false,
-        _ => {
-            // Heuristic: try YAML parse to detect format
-            serde_yaml::from_str::<serde_yaml::Value>(&content).is_ok()
-        }
-    };
+    // Extension only; unknown/extensionless paths use YAML, which also admits
+    // ordinary JSON without a separate full-document detection parse.
+    let is_yaml = detect_json_or_yaml_extension(file_path);
 
     if is_yaml {
         info!("Loading YAML configuration from {}", file_path.display());

@@ -423,6 +423,15 @@ pub struct MeshSlice {
     pub declared_ingress_http_ports: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mesh_policies: Vec<MeshPolicy>,
+    /// Admitted mesh-wide external authorization providers (issue #3235).
+    ///
+    /// Carried on every slice that retains at least one `PolicyAction::Custom`
+    /// rule, so the data plane can bind `spec.provider.name` without a second
+    /// lookup surface. The set is authored ONLY from the Istio root namespace,
+    /// so narrowing never has to consider tenant namespaces — a workload can
+    /// only ever reach a provider the mesh operator declared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ext_authz_providers: Vec<crate::modes::mesh::config::MeshExtAuthzProvider>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peer_authentications: Vec<PeerAuthentication>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -752,6 +761,14 @@ impl MeshSlice {
             // single-listener pass-through.
             && self.declared_ingress_http_ports == other.declared_ingress_http_ports
             && self.mesh_policies == other.mesh_policies
+            // The ext-authz provider set decides whether a CUSTOM policy binds
+            // at all, and it flips independently of `mesh_policies` (an
+            // operator editing only `meshConfig.extensionProviders` leaves
+            // every policy byte-identical). Omitting it from slice equality
+            // would let MeshSubscribe/update dedupe suppress the frame, so the
+            // DP would keep calling a retired provider — or keep denying a
+            // CUSTOM policy whose provider was just repaired.
+            && self.ext_authz_providers == other.ext_authz_providers
             && self.peer_authentications == other.peer_authentications
             && self.service_entries == other.service_entries
             && self.request_authentications == other.request_authentications
@@ -1787,12 +1804,40 @@ impl MeshSlice {
             waypoint_resources
         };
 
+        // A cross-namespace attachment must survive narrowing together with the
+        // MeshService that AUTHORIZES it, or not at all.
+        let workloads = retain_authorized_cross_namespace_attachments(workloads, &services);
+
         // Bind `request.namespace` so we can both move it into `self` and
         // borrow it inside the `multi_cluster` `.retain` closure below without
         // E0382. `String: Clone` is cheap relative to a slice-apply cycle and
         // happens once per slice; the alternative (reordering field
         // initialization) is fragile across future struct changes.
         let request_namespace = request.namespace;
+        // Issue #3235: carry ONLY the ext-authz providers the retained CUSTOM
+        // policies actually bind. The declared set is mesh-wide root-namespace
+        // configuration, so narrowing it to the referenced names keeps an
+        // unrelated tenant's provider endpoint (and any operator-authored
+        // check headers on it) off this workload's slice entirely. A CUSTOM
+        // policy whose provider is absent here DENIES at runtime — the
+        // narrowing is a projection of what the policy set already named, so
+        // it can never remove a provider a retained policy needs.
+        let ext_authz_providers: Vec<crate::modes::mesh::config::MeshExtAuthzProvider> = {
+            let referenced: BTreeSet<&str> = mesh_policies
+                .iter()
+                .flat_map(|policy| policy.rules.iter())
+                .filter_map(|rule| rule.action.custom_provider())
+                .collect();
+            if referenced.is_empty() {
+                Vec::new()
+            } else {
+                mesh.ext_authz_providers
+                    .iter()
+                    .filter(|provider| referenced.contains(provider.name.as_str()))
+                    .cloned()
+                    .collect()
+            }
+        };
         let waypoint_gateway_class = request.waypoint_name.as_deref().and_then(|name| {
             mesh.waypoint_bindings
                 .iter()
@@ -1828,6 +1873,7 @@ impl MeshSlice {
             sidecar_ingress_declared,
             declared_ingress_http_ports,
             mesh_policies,
+            ext_authz_providers,
             peer_authentications,
             service_entries,
             request_authentications,
@@ -1891,6 +1937,71 @@ fn service_waypoint_resource_namespaces(
             .map(|service| service.namespace.clone()),
     );
     Some(namespaces)
+}
+
+/// Drop workloads whose CROSS-NAMESPACE attachment lost the [`MeshService`]
+/// that authorizes it during this projection.
+///
+/// A workload may attach to a Service in another namespace (Istio
+/// `WorkloadEntry.service`), and Ferrum treats that attachment as authorized
+/// only when the target `MeshService` lists the workload's SPIFFE id —
+/// `validate_mesh_config_internal` enforces exactly that, so a bare
+/// `service_namespace` stamp cannot spoof membership. But the narrowing above
+/// keys services on the SERVICE namespace and workloads on the workload's own
+/// identity namespace, so an attachment pointing outside this view keeps the
+/// workload while its authorizing Service is dropped. The resulting slice fails
+/// that very check at proxy apply, and the rejection rolls the runtime back to
+/// the last applied generation — so ONE out-of-view resource (a stock xDS
+/// cluster for another namespace, say) would keep every LATER generation from
+/// being applied, including a legitimate state-of-the-world withdrawal.
+///
+/// Narrowing the endpoint away instead is the safe reading: without its Service
+/// this view has no route to it either way. Same-namespace attachments (every
+/// Pod-derived workload, and every author that omits the field) are untouched,
+/// and an attachment this view still admits — the Service survived namespace
+/// visibility or Sidecar egress narrowing — is retained with its Service.
+///
+/// Authorization is the set of `(service namespace, service name, SPIFFE)`
+/// triples. The index is borrowed from the already-narrowed service list
+/// (linear in that list's refs); each workload is then a hash lookup. A nested
+/// scan of every service and every ref for every workload would be
+/// `O(workloads × services × refs)` — stock xDS cardinalities are bounded but
+/// still control-plane influenced, and this is config-apply code, not a
+/// license for a large transient clone of the inventory.
+///
+/// This is the ROUTING view only. The separate inbound anchor
+/// (`local_inbound_workloads` / `local_inbound_services`, resolved above and
+/// deliberately exempt from namespace visibility) is untouched, so an
+/// authorized cross-namespace WorkloadEntry keeps serving its own inbound
+/// traffic (issue #3244) — that path reads the anchor, never this set.
+fn retain_authorized_cross_namespace_attachments(
+    workloads: Vec<Workload>,
+    services: &[MeshService],
+) -> Vec<Workload> {
+    let authorized: HashSet<(&str, &str, &str)> = services
+        .iter()
+        .flat_map(|service| {
+            service.workloads.iter().map(move |reference| {
+                (
+                    service.namespace.as_str(),
+                    service.name.as_str(),
+                    reference.spiffe_id.as_str(),
+                )
+            })
+        })
+        .collect();
+    workloads
+        .into_iter()
+        .filter(|workload| {
+            let attached_namespace = workload.attached_service_namespace();
+            attached_namespace == workload.namespace
+                || authorized.contains(&(
+                    attached_namespace,
+                    workload.service_name.as_str(),
+                    workload.spiffe_id.as_str(),
+                ))
+        })
+        .collect()
 }
 
 fn resource_namespace_visible(
@@ -3676,12 +3787,16 @@ pub(crate) fn workload_is_local(
 /// and the inbound route materializer so the two cannot diverge.
 ///
 /// A SPIFFE id is a service-account identity, not pod-unique, and labels aren't
-/// necessarily pod-unique either. So after matching by SPIFFE + labels + cluster
-/// (`workload_is_local`), if the matched set still backs **more than one distinct
-/// service** we cannot tell which one the local pod serves and return empty
-/// rather than materialize inbound routes to the wrong loopback app. A single
-/// backed service (including replicas that share one `service_name`) is
-/// unambiguous.
+/// necessarily pod-unique either. After matching by SPIFFE + labels + cluster
+/// (`workload_is_local`), a matched set that backs **more than one distinct
+/// service** is the Kubernetes-normal "one pod, several Services" case only
+/// when every record carries the same non-empty pod UID. Keep every record so
+/// inbound can materialize a Host route per Service. hostNetwork pods can share
+/// an IP, so equal address sets are not identity. A missing UID, an empty UID,
+/// or any divergent UID stays ambiguous — even when addresses or labels match
+/// — and returns empty rather than materialize inbound routes to the wrong
+/// loopback app. Replicas of one service share its `service_name` and collapse
+/// to a single distinct entry.
 pub(crate) fn resolve_local_workloads<'a>(
     workloads: &'a [Workload],
     local_spiffe: &str,
@@ -3692,17 +3807,11 @@ pub(crate) fn resolve_local_workloads<'a>(
         .iter()
         .filter(|w| workload_is_local(w, local_spiffe, sidecar_labels, local_cluster))
         .collect();
-    // A single local pod backs exactly ONE service. If the matched set spans more
-    // than one distinct service the identity is ambiguous — a shared
-    // service-account SPIFFE that the labels (if any) don't disambiguate, since
-    // labels aren't necessarily pod-unique either — so fail closed rather than
-    // materialize inbound routes to the wrong loopback app. (Replicas of one
-    // service share its `service_name` and collapse to a single distinct entry.)
     let distinct_services: BTreeSet<(&str, &str)> = matched
         .iter()
         .map(|w| (w.service_name.as_str(), w.attached_service_namespace()))
         .collect();
-    if distinct_services.len() > 1 {
+    if distinct_services.len() > 1 && !matched_workloads_are_same_pod(&matched) {
         warn!(
             local_spiffe,
             distinct_services = distinct_services.len(),
@@ -3714,6 +3823,26 @@ pub(crate) fn resolve_local_workloads<'a>(
         return Vec::new();
     }
     matched
+}
+
+/// True when every matched workload is the same local pod.
+///
+/// A non-empty pod UID is the only same-pod proof for a multi-Service match:
+/// every record must carry it, and they must agree. hostNetwork pods can share
+/// an IP, so equal address sets are not identity. A missing UID, an empty UID,
+/// or any divergent UID stays ambiguous even when addresses match — never fall
+/// back to addresses or labels.
+fn matched_workloads_are_same_pod(matched: &[&Workload]) -> bool {
+    if matched.len() <= 1 {
+        return true;
+    }
+    let mut uids = matched
+        .iter()
+        .map(|workload| workload.pod_uid.as_deref().filter(|uid| !uid.is_empty()));
+    let Some(first) = uids.next().flatten() else {
+        return false;
+    };
+    uids.all(|uid| uid == Some(first))
 }
 
 fn narrow_service_ports(
@@ -4299,6 +4428,7 @@ mod tests {
                 .collect(),
             workloads: Vec::new(),
             protocol_overrides: HashMap::new(),
+            uid: None,
         }
     }
 
@@ -4313,6 +4443,41 @@ mod tests {
             .map(|spiffe_id| WorkloadRef { spiffe_id })
             .collect();
         service
+    }
+
+    #[test]
+    fn cross_namespace_authorization_index_is_the_service_ref_triple() {
+        // The retain path builds a borrowed (namespace, name, SPIFFE) index
+        // linear in the service-ref list, then one lookup per workload. A
+        // decoy MeshService in the attached namespace that does not list this
+        // SPIFFE must not keep the workload; the authorizing triple must,
+        // regardless of how many other services sit in the list.
+        let mut workload = make_workload("default", "payments", HashMap::new());
+        workload.service_namespace = Some("other".into());
+        let decoy_spiffe = SpiffeId::from_parts(&td(), "ns/default/sa/someone-else").unwrap();
+        let services = vec![
+            make_service("other", "alpha"),
+            make_service_with_workload_refs("other", "bravo", vec![decoy_spiffe]),
+            make_service_with_workload_refs("other", "payments", vec![workload.spiffe_id.clone()]),
+            make_service("other", "zulu"),
+            make_service("default", "checkout"),
+        ];
+
+        let retained =
+            retain_authorized_cross_namespace_attachments(vec![workload.clone()], &services);
+        assert_eq!(
+            retained.len(),
+            1,
+            "the exact (other, payments, SPIFFE) triple retains the attachment"
+        );
+
+        let mut unlisted = services;
+        unlisted[2] = make_service("other", "payments");
+        let dropped = retain_authorized_cross_namespace_attachments(vec![workload], &unlisted);
+        assert!(
+            dropped.is_empty(),
+            "a same-namespace decoy or an unlisted target must not authorize the attachment"
+        );
     }
 
     #[test]
@@ -4620,6 +4785,7 @@ mod tests {
             sidecar_ingress_declared: false,
             declared_ingress_http_ports: 0,
             mesh_policies: vec![make_policy("p1", "ns", PolicyScope::MeshWide)],
+            ext_authz_providers: Vec::new(),
             peer_authentications: vec![make_peer_auth("pa1", "ns", None)],
             service_entries: vec![make_service_entry("se1", "ns", vec!["*".into()])],
             destination_rules: Vec::new(),
@@ -7051,6 +7217,7 @@ mod tests {
                 }],
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
+                uid: None,
             }],
             ..MeshSlice::default()
         };
@@ -7076,6 +7243,7 @@ mod tests {
                 ports: Vec::new(),
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
+                uid: None,
             }],
             ..MeshSlice::default()
         };
@@ -7108,6 +7276,7 @@ mod tests {
                     ports: vec![http_port.clone()],
                     workloads: Vec::new(),
                     protocol_overrides: HashMap::new(),
+                    uid: None,
                 },
                 MeshService {
                     cluster_ips: Vec::new(),
@@ -7116,6 +7285,7 @@ mod tests {
                     ports: vec![http_port],
                     workloads: Vec::new(),
                     protocol_overrides: HashMap::new(),
+                    uid: None,
                 },
             ],
             ..MeshSlice::default()
@@ -7146,6 +7316,7 @@ mod tests {
                 }],
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
+                uid: None,
             }],
             ..MeshSlice::default()
         };
@@ -7283,6 +7454,7 @@ mod tests {
                     }],
                     workloads: Vec::new(),
                     protocol_overrides: HashMap::new(),
+                    uid: None,
                 },
                 MeshService {
                     cluster_ips: Vec::new(),
@@ -7296,6 +7468,7 @@ mod tests {
                     }],
                     workloads: Vec::new(),
                     protocol_overrides: HashMap::new(),
+                    uid: None,
                 },
             ],
             ..MeshSlice::default()

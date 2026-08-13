@@ -884,7 +884,7 @@ Captured Sidecar/Ambient raw-TCP and UDP **egress** bypasses the generic stream 
 | `spiffe_identity` | ✓ | | Extracts peer SPIFFE IDs from TLS/DTLS client certificates |
 | `mtls_auth` | ✓ | | Maps the client certificate to a Consumer on TCP+TLS or UDP+DTLS |
 | `access_control` | ✓ | | Applies consumer and group allow/deny rules once a stream Consumer exists |
-| `mesh_authz` | ✓ | | Applies Layer 2 mesh authorization policies from SPIFFE/HBONE identity |
+| `mesh_authz` | ✓ | | Applies Layer 2 mesh authorization policies from SPIFFE/HBONE identity. An Istio `AuthorizationPolicy` with `action: CUSTOM` performs its bounded external-authorization check **in this phase** — before `before_proxy`, route dispatch, and every transformer — and fails closed on timeout/transport/oversize/malformed outcomes unless the provider sets `failOpen` (see [mesh.md](mesh.md#authorizationpolicy-action-custom-issue-3235)) |
 | `tcp_connection_throttle` | ✓ | | Owns an opaque permit that caps process-local active TCP/TCP+TLS connections per Consumer, else canonical client IP; UDP/DTLS attachment is rejected |
 | `geo_restriction` | ✓ | | Rejects connections from denied countries |
 | `rate_limiting` | ✓ | | Consumer-aware rate limiting when a stream identity exists, else IP-based |

@@ -60,6 +60,8 @@ fn upstream_with_target(id: &str, target: UpstreamTarget, updated_at: DateTime<U
         api_spec_id: None,
         created_at: updated_at,
         updated_at,
+        k8s_service_uid: None,
+        pending_limit_scope: None,
     }
 }
 
@@ -127,6 +129,7 @@ fn proxy_for_upstream(id: &str, upstream_id: &str, updated_at: DateTime<Utc>) ->
         compiled_stream_match: None,
         created_at: updated_at,
         updated_at,
+        pending_limit_scope: None,
     }
 }
 

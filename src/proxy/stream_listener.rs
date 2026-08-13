@@ -33,11 +33,66 @@ type DtlsServerSlot = Arc<arc_swap::ArcSwap<Option<Arc<crate::dtls::DtlsServer>>
 
 const STREAM_LISTENER_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 
+/// Bounded, redacted frontend DTLS live-reload status.
+///
+/// Exposes generation/convergence counters only — never PEM, key bytes, secret
+/// URIs, or source path material.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct FrontendDtlsReloadStatus {
+    /// Last accepted generation id (`0` means none published yet).
+    pub generation: u64,
+    /// Listeners successfully live-swapped on the last accepted publish.
+    pub last_swapped_listeners: u64,
+    /// Unix seconds of the last accepted publish, when any.
+    pub last_success_unix: Option<u64>,
+    /// Unix seconds of the last rejected candidate, when any.
+    pub last_failure_unix: Option<u64>,
+    /// Fixed-cardinality last outcome label (`none`, `accepted`, `rejected`).
+    pub last_outcome: &'static str,
+}
+
+impl Default for FrontendDtlsReloadStatus {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            last_swapped_listeners: 0,
+            last_success_unix: None,
+            last_failure_unix: None,
+            last_outcome: "none",
+        }
+    }
+}
+
+fn unix_now_secs() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
+/// Run one collector-side observation while generation publication is fenced.
+/// The consumer must both apply the snapshot and expose its listener handle
+/// inside this call so no newer publisher can miss the handle and then be
+/// overwritten by the stale snapshot.
+async fn with_current_frontend_dtls_generation<T>(
+    publish_lock: &Arc<tokio::sync::Mutex<()>>,
+    generation_slot: &Arc<arc_swap::ArcSwap<Option<Arc<crate::dtls::FrontendDtlsGeneration>>>>,
+    consume: impl FnOnce(Option<&Arc<crate::dtls::FrontendDtlsGeneration>>) -> T,
+) -> T {
+    let _publish_guard = publish_lock.lock().await;
+    let generation = generation_slot.load_full();
+    consume(generation.as_ref().as_ref())
+}
+
 /// Handle for a running stream listener — keeps the shutdown channel and task handle.
 struct ListenerHandle {
     shutdown_tx: watch::Sender<bool>,
     join_handle: JoinHandle<()>,
     listen_port: u16,
+    /// Exact OS bind address this listener was started with. Part of restart
+    /// identity so a dedicated Sidecar ingress bind change retires the old
+    /// socket instead of leaving it running indefinitely.
+    bind_addr: IpAddr,
     scheme: BackendScheme,
     frontend_tls: bool,
     passthrough: bool,
@@ -308,6 +363,8 @@ impl BackendTlsMaterialReloadKey {
 pub struct StreamListenerOverloadSnapshot {
     pub dtls_demux_sessions_total: u64,
     pub dtls_demux_sessions: Vec<DtlsDemuxSessionSnapshot>,
+    /// Bounded frontend-DTLS material generation and convergence status.
+    pub frontend_dtls_reload: FrontendDtlsReloadStatus,
     /// Number of configured stream-listener resources that are not serving
     /// after the most recent `reconcile()` — hard bind failures PLUS listeners
     /// deferred/degraded for a config reason (e.g. waiting on frontend TLS
@@ -726,6 +783,11 @@ struct DesiredStreamListener {
     /// produced it.
     identity: NamespacedResourceId,
     port: u16,
+    /// Exact OS bind address derived from the reconcile's `current_config`
+    /// (dedicated Sidecar ingress override or the manager default). Carried
+    /// through preflight and task startup so spawn never reloads config for
+    /// the bind after desired-state construction.
+    bind_addr: IpAddr,
     scheme: BackendScheme,
     frontend_tls: bool,
     passthrough: bool,
@@ -785,10 +847,27 @@ pub struct StreamListenerManager {
     /// loaded after `ProxyState::new()` (e.g., file mode where TLS certs are
     /// validated after the proxy state is built).
     frontend_tls_config: Arc<arc_swap::ArcSwap<Option<Arc<rustls::ServerConfig>>>>,
-    /// DTLS frontend material for UDP stream proxies with `frontend_tls: true`.
-    /// Stored as a single ArcSwap payload so cert/key and optional client-CA
-    /// path are published atomically to reconcile() and listener startup.
+    /// DTLS frontend source identity for UDP stream proxies with
+    /// `frontend_tls: true`. Stored as a single ArcSwap payload so cert/key
+    /// and optional client-CA source strings are published atomically to
+    /// reconcile() and listener startup. Live-reloaded crypto bytes live in
+    /// [`Self::frontend_dtls_generation`]; these strings identify the sources
+    /// only and are never logged as secret material.
     frontend_dtls_material: arc_swap::ArcSwap<Option<(String, String, Option<String>)>>,
+    /// Last accepted immutable frontend DTLS material generation. Live reload
+    /// and startup both publish here after validating a complete candidate so
+    /// every active `DtlsServer` and every listener created afterwards observe
+    /// the same generation. A rejected candidate never replaces this slot.
+    frontend_dtls_generation:
+        Arc<arc_swap::ArcSwap<Option<Arc<crate::dtls::FrontendDtlsGeneration>>>>,
+    /// Monotonic counter backing [`crate::dtls::FrontendDtlsGeneration::generation`].
+    frontend_dtls_generation_counter: AtomicU64,
+    /// Serializes the complete generation publish and active-listener swap so
+    /// concurrent frontend and mesh PeerAuth rotations cannot publish an older
+    /// generation after a newer one.
+    frontend_dtls_publish: Arc<tokio::sync::Mutex<()>>,
+    /// Redacted reload status for admin/metrics (no PEM, keys, or secret URIs).
+    frontend_dtls_reload_status: arc_swap::ArcSwap<FrontendDtlsReloadStatus>,
     /// Global override to disable backend TLS certificate verification.
     tls_no_verify: bool,
     /// Global CA bundle path for outbound TLS verification (fallback when proxy has no per-proxy CA).
@@ -1117,6 +1196,12 @@ impl StreamListenerManager {
             health_checker,
             frontend_tls_config: Arc::new(arc_swap::ArcSwap::new(Arc::new(frontend_tls_config))),
             frontend_dtls_material: arc_swap::ArcSwap::new(Arc::new(None)),
+            frontend_dtls_generation: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+            frontend_dtls_generation_counter: AtomicU64::new(0),
+            frontend_dtls_publish: Arc::new(tokio::sync::Mutex::new(())),
+            frontend_dtls_reload_status: arc_swap::ArcSwap::new(Arc::new(
+                FrontendDtlsReloadStatus::default(),
+            )),
             tls_no_verify,
             tls_ca_bundle_path,
             tcp_idle_timeout_seconds,
@@ -1276,10 +1361,12 @@ impl StreamListenerManager {
         }
     }
 
-    /// Update the DTLS cert/key paths used for UDP stream proxies with `frontend_tls: true`.
+    /// Update the DTLS cert/key sources used for UDP stream proxies with
+    /// `frontend_tls: true`.
     ///
-    /// After storing the config, automatically reconciles stream listeners so
-    /// any previously deferred UDP/DTLS listeners are started.
+    /// After storing the source identity, validates and publishes one immutable
+    /// generation (when the material loads), then reconciles stream listeners so
+    /// any previously deferred UDP/DTLS listeners start against that generation.
     pub async fn set_frontend_dtls_cert_key(
         &self,
         cert_path: String,
@@ -1287,10 +1374,28 @@ impl StreamListenerManager {
         client_ca_cert_path: Option<String>,
     ) {
         self.frontend_dtls_material.store(Arc::new(Some((
-            cert_path,
-            key_path,
-            client_ca_cert_path,
+            cert_path.clone(),
+            key_path.clone(),
+            client_ca_cert_path.clone(),
         ))));
+        match crate::dtls::build_frontend_dtls_config(
+            &cert_path,
+            &key_path,
+            client_ca_cert_path.as_deref(),
+            &self.crls.load_full(),
+        ) {
+            Ok(config) => {
+                let _ = self.publish_frontend_dtls_generation(config).await;
+            }
+            Err(err) => {
+                warn!(
+                    "Failed to build initial frontend DTLS generation from configured sources: {}; \
+                     listeners that need DTLS material remain deferred until a valid generation is published",
+                    err
+                );
+                self.record_frontend_dtls_candidate_failure();
+            }
+        }
         // Reconcile to start any listeners that were deferred due to missing DTLS config.
         let failures = self.reconcile().await;
         for (proxy_id, port, err) in &failures {
@@ -1314,7 +1419,7 @@ impl StreamListenerManager {
     /// config on the next handshake.
     ///
     /// Used by mesh PeerAuthentication live reload alongside
-    /// [`Self::swap_active_dtls_frontend_configs`]; ordinary HTTPS / non-mesh
+    /// [`Self::publish_frontend_dtls_generation`]; ordinary HTTPS / non-mesh
     /// modes continue to use [`Self::set_frontend_tls_config`] at startup
     /// (followed by a static lifetime — those modes do not call swap).
     pub fn swap_frontend_tls_config(&self, tls_config: Option<Arc<rustls::ServerConfig>>) {
@@ -1331,26 +1436,102 @@ impl StreamListenerManager {
         self.frontend_tls_config.load().as_ref().clone()
     }
 
-    /// Live-swap the frontend DTLS crypto material on every active DTLS
-    /// server held by this manager.
+    /// Snapshot of the last accepted frontend DTLS generation (if any).
+    #[allow(dead_code)] // Test / introspection surface.
+    pub fn snapshot_frontend_dtls_generation(
+        &self,
+    ) -> Option<Arc<crate::dtls::FrontendDtlsGeneration>> {
+        self.frontend_dtls_generation.load_full().as_ref().clone()
+    }
+
+    /// Test seam for deterministically fencing a collector against a concurrent
+    /// generation publish. Production collectors use the same lock through
+    /// [`with_current_frontend_dtls_generation`].
+    #[doc(hidden)]
+    #[allow(dead_code)] // External integration-test seam is unused by the bin test target.
+    pub fn frontend_dtls_publish_lock_for_test(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.frontend_dtls_publish)
+    }
+
+    /// Test seam that observes the generation exactly as a newly collected
+    /// DTLS server does, under the shared publication fence.
+    #[doc(hidden)]
+    #[allow(dead_code)] // External integration-test seam is unused by the bin test target.
+    pub async fn collected_frontend_dtls_generation_for_test(&self) -> Option<u64> {
+        with_current_frontend_dtls_generation(
+            &self.frontend_dtls_publish,
+            &self.frontend_dtls_generation,
+            |generation| generation.map(|generation| generation.generation),
+        )
+        .await
+    }
+
+    /// Bounded redacted DTLS live-reload status (no secrets or source paths).
+    pub fn frontend_dtls_reload_status(&self) -> FrontendDtlsReloadStatus {
+        (**self.frontend_dtls_reload_status.load()).clone()
+    }
+
+    /// Record a rejected DTLS candidate without replacing the accepted generation.
+    pub fn record_frontend_dtls_candidate_failure(&self) {
+        self.frontend_dtls_reload_status.rcu(|current| {
+            Arc::new(FrontendDtlsReloadStatus {
+                generation: current.generation,
+                last_swapped_listeners: current.last_swapped_listeners,
+                last_success_unix: current.last_success_unix,
+                last_failure_unix: unix_now_secs(),
+                last_outcome: "rejected",
+            })
+        });
+    }
+
+    /// Publish one prevalidated immutable DTLS generation and live-swap it
+    /// into every active DTLS server without rebinding sockets.
     ///
-    /// `build_config` is invoked once per active DTLS listener so the caller
-    /// can rebuild a fresh `FrontendDtlsConfig` for each (cloning the
-    /// `DtlsCertificateChain` and verifier is cheap; the dimpl `Config` itself
-    /// can be re-used since the build is symmetric). Existing in-flight
-    /// DTLS sessions keep the snapshot they handshake with until they end;
-    /// new sessions pick up the swapped material on the next ClientHello.
+    /// The generation is stored first so listeners created or restarted after
+    /// this call receive exactly the same material. Existing sessions keep
+    /// their handshake snapshot; new handshakes use the accepted generation.
+    /// This method never rebuilds from sources — callers must validate the
+    /// complete candidate before invoking it.
     ///
-    /// Returns the number of listeners whose DTLS server was swapped.
-    /// Listeners whose `dtls_server` slot has not yet been populated by the
-    /// collector task (a brief race window post-bind) are skipped — the
-    /// next slice apply re-runs this swap, and the in-flight session would
-    /// have been rejected anyway since no peer can complete a handshake
-    /// before the listener binds.
-    pub async fn swap_active_dtls_frontend_configs<F>(&self, mut build_config: F) -> usize
-    where
-        F: FnMut() -> Result<crate::dtls::FrontendDtlsConfig, anyhow::Error>,
-    {
+    /// Returns `(generation, swapped_listener_count)`.
+    pub async fn publish_frontend_dtls_generation(
+        &self,
+        config: crate::dtls::FrontendDtlsConfig,
+    ) -> (crate::dtls::FrontendDtlsGeneration, usize) {
+        let _publish_guard = self.frontend_dtls_publish.lock().await;
+        let generation = self
+            .frontend_dtls_generation_counter
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        let accepted = Arc::new(crate::dtls::FrontendDtlsGeneration { generation, config });
+        self.frontend_dtls_generation
+            .store(Arc::new(Some(Arc::clone(&accepted))));
+        let swapped = self
+            .swap_active_dtls_frontend_config(&accepted.config)
+            .await;
+        self.frontend_dtls_reload_status
+            .store(Arc::new(FrontendDtlsReloadStatus {
+                generation,
+                last_swapped_listeners: swapped as u64,
+                last_success_unix: unix_now_secs(),
+                last_failure_unix: self.frontend_dtls_reload_status.load().last_failure_unix,
+                last_outcome: "accepted",
+            }));
+        info!(
+            dtls_generation = generation,
+            swapped_dtls_listeners = swapped,
+            "Published frontend DTLS material generation; new DTLS sessions use this generation"
+        );
+        ((*accepted).clone(), swapped)
+    }
+
+    /// Live-swap a prevalidated `FrontendDtlsConfig` onto every active DTLS
+    /// server held by this manager (does not publish the shared generation
+    /// slot — prefer [`Self::publish_frontend_dtls_generation`]).
+    async fn swap_active_dtls_frontend_config(
+        &self,
+        config: &crate::dtls::FrontendDtlsConfig,
+    ) -> usize {
         let mut swapped = 0usize;
         let listeners = self.listeners.lock().await;
         for handle in listeners.values() {
@@ -1360,36 +1541,44 @@ impl StreamListenerManager {
             let snapshot = slot.load();
             let Some(server) = snapshot.as_ref().clone() else {
                 // Collector task has not yet published the server (race with
-                // bind). Skip — the next live-reload swap will catch it.
+                // bind). Skip — the collector applies the current generation
+                // when the server arrives, and the next publish re-converges.
                 continue;
             };
-            match build_config() {
-                Ok(cfg) => {
-                    server.swap_frontend_config(cfg);
-                    swapped += 1;
-                }
-                Err(err) => {
-                    warn!(
-                        listen_port = handle.listen_port,
-                        "Failed to rebuild frontend DTLS config for live swap: {}; \
-                         keeping previous DTLS config on remaining listeners",
-                        err
-                    );
-                    // `build_config` is invariant under iteration — the cert/key
-                    // paths and CRL list it closes over do not change across
-                    // listeners — so a failure on iteration N would have failed
-                    // on iteration 0 as well. The only realistic divergence is
-                    // a transient FS race (cert file briefly unreadable). Bail
-                    // out so a stuttering FS does not produce a mix of new and
-                    // old configs across long-lived listeners; the next slice
-                    // apply re-runs the swap and converges everything to the
-                    // newest material. Any listener already swapped this pass
-                    // keeps the new config — that is the desired direction of
-                    // travel.
-                    return swapped;
-                }
-            }
+            server.swap_frontend_config(config.clone());
+            swapped += 1;
         }
+        swapped
+    }
+
+    /// Build one validated `FrontendDtlsConfig` and publish it as the accepted
+    /// generation across every active DTLS server.
+    ///
+    /// `build_config` is invoked **once** before any listener is touched so a
+    /// transient source race cannot create mixed generations. Existing
+    /// in-flight DTLS sessions keep the snapshot they handshake with; new
+    /// sessions pick up the published generation on the next ClientHello.
+    ///
+    /// Returns the number of listeners whose DTLS server was swapped. On
+    /// build failure every listener retains the complete prior generation and
+    /// this returns `0`.
+    pub async fn swap_active_dtls_frontend_configs<F>(&self, mut build_config: F) -> usize
+    where
+        F: FnMut() -> Result<crate::dtls::FrontendDtlsConfig, anyhow::Error>,
+    {
+        let config = match build_config() {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                warn!(
+                    "Failed to rebuild frontend DTLS config for live swap: {}; \
+                     keeping previous DTLS generation on every listener",
+                    err
+                );
+                self.record_frontend_dtls_candidate_failure();
+                return 0;
+            }
+        };
+        let (_published, swapped) = self.publish_frontend_dtls_generation(config).await;
         swapped
     }
 
@@ -1639,6 +1828,7 @@ impl StreamListenerManager {
                 DesiredStreamListener {
                     identity: identity.clone(),
                     port: entry.port,
+                    bind_addr: self.resolve_bind_addr(&current_config, entry.port),
                     scheme: entry.scheme,
                     frontend_tls: entry.frontend_tls,
                     passthrough: entry.passthrough,
@@ -1661,6 +1851,7 @@ impl StreamListenerManager {
                     DesiredStreamListener {
                         identity: representative.clone(),
                         port: entry.port,
+                        bind_addr: self.resolve_bind_addr(&current_config, entry.port),
                         scheme: entry.scheme,
                         frontend_tls: entry.frontend_tls,
                         passthrough: entry.passthrough,
@@ -1681,6 +1872,7 @@ impl StreamListenerManager {
                     DesiredStreamListener {
                         identity: representative.clone(),
                         port: entry.port,
+                        bind_addr: self.resolve_bind_addr(&current_config, entry.port),
                         scheme: entry.scheme,
                         frontend_tls: entry.frontend_tls,
                         passthrough: false,
@@ -1747,6 +1939,7 @@ impl StreamListenerManager {
             let Some(DesiredStreamListener {
                 identity,
                 port,
+                bind_addr,
                 scheme,
                 frontend_tls,
                 passthrough,
@@ -1763,6 +1956,7 @@ impl StreamListenerManager {
             // (e.g. a port move with broken TLS material must still release
             // the old port).
             let identity_changed = handle.listen_port != *port
+                || handle.bind_addr != *bind_addr
                 || handle.scheme != *scheme
                 || handle.frontend_tls != *frontend_tls
                 || handle.passthrough != *passthrough
@@ -1872,6 +2066,7 @@ impl StreamListenerManager {
             let DesiredStreamListener {
                 identity,
                 port,
+                bind_addr,
                 scheme,
                 frontend_tls,
                 passthrough,
@@ -1891,7 +2086,9 @@ impl StreamListenerManager {
             // Passthrough proxies never terminate TLS, so they skip this check entirely.
             if *frontend_tls && !*passthrough {
                 if scheme.is_udp() {
-                    if self.frontend_dtls_material.load().is_none() {
+                    let has_generation = self.frontend_dtls_generation.load().is_some();
+                    let has_sources = self.frontend_dtls_material.load().is_some();
+                    if !has_generation && !has_sources {
                         info!(
                             proxy_id = %proxy_id,
                             port = port,
@@ -1949,8 +2146,10 @@ impl StreamListenerManager {
             // Pre-check port availability before spawning the listener task.
             // This catches EADDRINUSE early with a clear error rather than having
             // the spawned task fail silently in the background.
-            let bind_addr = self.bind_addr;
+            // Use the bind carried on the desired listener — never reload config
+            // for the address after desired-state construction.
             let port_val = *port;
+            let bind_addr = *bind_addr;
             let probe_addr = std::net::SocketAddr::new(bind_addr, port_val);
             let probe_result = if scheme.is_udp() {
                 tokio::net::UdpSocket::bind(probe_addr).await.map(drop)
@@ -2007,40 +2206,48 @@ impl StreamListenerManager {
                 // UDP or DTLS listener
                 // Passthrough proxies forward raw encrypted datagrams — no DTLS termination.
                 let frontend_dtls_config = if *frontend_tls && !*passthrough {
-                    let dtls_material = self.frontend_dtls_material.load();
-                    match dtls_material.as_ref() {
-                        Some((cert_path, key_path, client_ca_cert_path)) => {
-                            match crate::dtls::build_frontend_dtls_config(
-                                cert_path,
-                                key_path,
-                                client_ca_cert_path.as_deref(),
-                                &self.crls.load_full(),
-                            ) {
-                                Ok(cfg) => Some(cfg),
-                                Err(e) => {
-                                    warn!(
-                                        proxy_id = %proxy_id,
-                                        "Failed to build frontend DTLS config: {}", e
-                                    );
-                                    degraded.push(StreamBindFailure::new(
-                                        identity,
-                                        *port,
-                                        format!("Failed to build frontend DTLS config: {}", e),
-                                        StreamListenerDegradation::FrontendDtlsBuildFailed,
-                                    ));
-                                    continue;
+                    if let Some(generation) = self.frontend_dtls_generation.load_full().as_ref() {
+                        // Prefer the last accepted immutable generation so a
+                        // listener created/restarted after rotation converges
+                        // on the same material already live-swapped into
+                        // active DTLS servers — never re-read sources here.
+                        Some(generation.config.clone())
+                    } else {
+                        let dtls_material = self.frontend_dtls_material.load();
+                        match dtls_material.as_ref() {
+                            Some((cert_path, key_path, client_ca_cert_path)) => {
+                                match crate::dtls::build_frontend_dtls_config(
+                                    cert_path,
+                                    key_path,
+                                    client_ca_cert_path.as_deref(),
+                                    &self.crls.load_full(),
+                                ) {
+                                    Ok(cfg) => Some(cfg),
+                                    Err(e) => {
+                                        warn!(
+                                            proxy_id = %proxy_id,
+                                            "Failed to build frontend DTLS config: {}", e
+                                        );
+                                        degraded.push(StreamBindFailure::new(
+                                            identity,
+                                            *port,
+                                            format!("Failed to build frontend DTLS config: {}", e),
+                                            StreamListenerDegradation::FrontendDtlsBuildFailed,
+                                        ));
+                                        continue;
+                                    }
                                 }
                             }
-                        }
-                        None => {
-                            // Should not happen — guarded above, but be safe
-                            degraded.push(StreamBindFailure::new(
-                                identity,
-                                *port,
-                                "Deferred: frontend DTLS material unavailable at listener spawn",
-                                StreamListenerDegradation::FrontendDtlsDeferred,
-                            ));
-                            continue;
+                            None => {
+                                // Should not happen — guarded above, but be safe
+                                degraded.push(StreamBindFailure::new(
+                                    identity,
+                                    *port,
+                                    "Deferred: frontend DTLS material unavailable at listener spawn",
+                                    StreamListenerDegradation::FrontendDtlsDeferred,
+                                ));
+                                continue;
+                            }
                         }
                     }
                 } else {
@@ -2148,9 +2355,27 @@ impl StreamListenerManager {
                 let dtls_server_slot: Arc<arc_swap::ArcSwap<Option<Arc<crate::dtls::DtlsServer>>>> =
                     Arc::new(arc_swap::ArcSwap::from_pointee(None));
                 let dtls_server_slot_for_collector = Arc::clone(&dtls_server_slot);
+                let generation_slot_for_collector = self.frontend_dtls_generation.clone();
+                let publish_lock_for_collector = Arc::clone(&self.frontend_dtls_publish);
                 tokio::spawn(async move {
                     if let Ok(server) = dtls_server_rx.await {
-                        dtls_server_slot_for_collector.store(Arc::new(Some(server)));
+                        // Converge a server that bound during a publish race and
+                        // expose its handle in the same publication critical
+                        // section. Without this fence a collector could snapshot
+                        // generation A, a publisher could install B while the
+                        // handle was still absent, and the collector could then
+                        // expose the server after restoring stale A.
+                        with_current_frontend_dtls_generation(
+                            &publish_lock_for_collector,
+                            &generation_slot_for_collector,
+                            |generation| {
+                                if let Some(generation) = generation {
+                                    server.swap_frontend_config(generation.config.clone());
+                                }
+                                dtls_server_slot_for_collector.store(Arc::new(Some(server)));
+                            },
+                        )
+                        .await;
                     }
                 });
                 (
@@ -2309,6 +2534,7 @@ impl StreamListenerManager {
                     shutdown_tx,
                     join_handle,
                     listen_port: *port,
+                    bind_addr,
                     scheme: *scheme,
                     frontend_tls: *frontend_tls,
                     passthrough: *passthrough,
@@ -2443,6 +2669,7 @@ impl StreamListenerManager {
         StreamListenerOverloadSnapshot {
             dtls_demux_sessions_total,
             dtls_demux_sessions,
+            frontend_dtls_reload: self.frontend_dtls_reload_status(),
             bind_failures_total: bind_failures.len(),
             bind_failures: bind_failures.as_ref().clone(),
         }
@@ -2462,6 +2689,28 @@ impl StreamListenerManager {
     pub fn active_backend_session_estimate(&self) -> u64 {
         let entries = self.stream_backend_metrics.load();
         active_backend_session_estimate_from_entries(&entries)
+    }
+
+    /// `(listener_key, bind_addr)` pairs currently owned by this manager.
+    #[allow(dead_code)] // Test / introspection surface.
+    pub async fn active_binds(&self) -> Vec<(String, IpAddr)> {
+        let listeners = self.listeners.lock().await;
+        let mut out: Vec<_> = listeners
+            .iter()
+            .map(|(key, handle)| (key.clone(), handle.bind_addr))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Resolve the OS bind address for `port` from the reconcile generation's
+    /// config (dedicated Sidecar ingress override or the manager default).
+    fn resolve_bind_addr(&self, config: &GatewayConfig, port: u16) -> IpAddr {
+        config
+            .mesh
+            .as_ref()
+            .and_then(|mesh| mesh.sidecar_ingress_bind_override(port))
+            .unwrap_or(self.bind_addr)
     }
 
     /// Wait until all currently configured stream listeners have successfully

@@ -160,7 +160,7 @@ jobs:
           components: rust-src
 
       - name: Install bpf-linker
-        run: cargo +stable install bpf-linker --locked
+        uses: ./.github/actions/setup-bpf-linker
 
       - name: Build eBPF program
         run: cd ebpf && cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf

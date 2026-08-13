@@ -5,8 +5,13 @@
 //! just as important for an operator reading the matrix — what it explicitly
 //! cannot. The behavioural depth lives in
 //! `tests/unit/gateway_core/stock_xds_tests.rs` and
-//! `tests/integration/mesh_stock_xds_tests.rs`; these rows are the product
-//! contract.
+//! `tests/integration/mesh_stock_xds_tests.rs`, and the live traffic proof in
+//! `tests/functional/functional_mesh_stock_xds_test.rs` (a scripted third-party
+//! ADS server driving a real sidecar's data path through update, deletion,
+//! NACK, and refusal — unpinned-peer and subset refusals as reachability
+//! transitions; foreign-namespace narrowing and RBAC / weighted-route
+//! capability refusals as exact ACK + diagnostic + accepted-service continuity);
+//! these rows are the product contract.
 
 use prost::Message;
 
@@ -166,7 +171,12 @@ fn stock_cds_eds_discovery_maps_to_the_typed_mesh_model() {
         status = Status::Supported,
         notes = "An `outbound|<port>||<svc>.<ns>.svc.<domain>` cluster becomes a MeshService \
                  port; its EDS endpoints become Workloads carrying the SPIFFE identity the \
-                 control plane itself pins in the cluster's UpstreamTlsContext SAN matcher.",
+                 control plane itself pins in the cluster's UpstreamTlsContext SAN matcher. \
+                 Proven on the live data path in \
+                 tests/functional/functional_mesh_stock_xds_test.rs: a service discovered from a \
+                 scripted third-party ADS server routes captured traffic through the mesh \
+                 transport to its backend, and re-pinning the identity to an impostor SPIFFE \
+                 fails the dial closed.",
     );
     let discovery = converged().discovery();
     assert_eq!(discovery.services.len(), 1);
@@ -252,7 +262,10 @@ fn stock_dependency_ordering_and_deletion_follow_state_of_the_world() {
                  the complete-state types: a cluster absent from a new state-of-the-world CDS \
                  response is deleted, taking its endpoints with it. EDS/RDS responses may be \
                  partial, so they are merged and pruned against the subscription set instead — \
-                 an omitted assignment is not a deletion.",
+                 an omitted assignment is not a deletion. Both the endpoint withdrawal and the \
+                 state-of-the-world cluster withdrawal are asserted on live traffic (and their \
+                 replacements asserted to restore it) in \
+                 tests/functional/functional_mesh_stock_xds_test.rs.",
     );
     let mut accumulator = converged();
     assert_eq!(
@@ -279,7 +292,10 @@ fn stock_enforcement_filters_fail_closed_rather_than_degrading_to_plain_routing(
                  and every non-allowlisted network/listener filter refuse the whole listener \
                  with a field-specific diagnostic. Reducing an Istio listener that carries an \
                  RBAC or JWT filter to plain routing would turn the control plane's DENY into \
-                 an ALLOW, so the listener contributes no protocol classification and no VIP.",
+                 an ALLOW, so the listener contributes no protocol classification and no VIP. \
+                 The live matrix asserts the exact ACK of that generation, the field-specific \
+                 diagnostic, and accepted-service continuity; it does not claim a traffic-effect \
+                 proof for a host that was never dialable.",
     );
     let hcm = sp::HttpConnectionManager {
         stat_prefix: "outbound".to_string(),

@@ -402,10 +402,10 @@ without a restart. These bounds are deliberate and tested:
   (`:80` / `:443` without `CAP_NET_BIND_SERVICE`) fails and is retried. Either
   way the failure is logged and surfaced on
   `GatewayListenerManager::bind_failures`, and routes scoped to a genuinely
-  refused listener stay unreachable rather than being served somewhere else.
-  Once the matching generation is acknowledged, an ordinary OS bind failure
-  remains eligible for the intentional Service-fronted remap; only admission
-  refusals suppress routing.
+  refused or bind-failed listener stay unreachable rather than being served
+  somewhere else. Once the matching generation is acknowledged, both admission
+  refusals and ordinary OS bind failures suppress the intentional
+  Service-fronted remap.
 - **An HTTP↔HTTPS class flip retires the old generation first.** The retiring
   accept-loop task is awaited before the replacement binds, so with
   `FERRUM_ACCEPT_THREADS > 1` the `SO_REUSEPORT` sockets of the two classes
@@ -435,6 +435,18 @@ really exists, so a client is never steered from a port-scoped listener to the
 global HTTPS port whose route table cannot match the port-scoped route. A port
 whose QUIC bind fails keeps serving H1/H2, reports the failure on
 `GatewayListenerManager::bind_failures`, advertises no HTTP/3, and is retried.
+
+A UDP/DTLS stream proxy on the same **numeric** port is a QUIC-only conflict:
+TCP and UDP are independent socket namespaces, so the HTTPS TCP listener stays
+bound and keeps serving H1/H2. The optional QUIC half is refused with a bounded
+`udp_stream_collision` reason, `ensure_quic` is not called while the claim
+exists, and the TCP port is **not** added to the whole-listener refused-route
+set. Adding the UDP/DTLS claim on reload drains only QUIC (existing H1/H2
+connections continue); removing it starts QUIC on the already-running TCP
+listener. A stale reconcile cannot restore QUIC after a newer epoch reserved
+the UDP port. TCP/TLS raw-stream collisions still refuse the whole HTTP-family
+listener; plaintext HTTP listeners remain unaffected by UDP/DTLS same-port
+claims.
 
 **Single-listener protocol remap.** When the whole route table declares exactly
 one listener port of a protocol class, a request arriving on the global process
@@ -594,6 +606,46 @@ validation class; label keys, label values, and unknown operator text are not
 echoed. `attachedRoutes` is `0`, and reconciliation withdraws any attachment
 previously materialized by an older valid selector. Valid sibling listeners
 continue to reconcile independently.
+
+### Local listener realization is not fed back into Gateway status
+
+`Programmed` reports **translation and materialization** — that Ferrum accepted
+the Gateway, produced listeners, and (optionally) that the serving data-plane
+Service has a ready endpoint. It deliberately does not report whether a
+particular Ferrum process actually bound the socket for a listener port.
+
+That gap is structural, not an oversight. The Gateway API status writer runs
+only in **control-plane mode** (`k8s_controller::start_k8s_controller`, launched
+from `modes/control_plane.rs`), and control-plane mode binds no proxy listeners
+at all. The dynamic listener sockets are bound by the *data plane* — `file`,
+`database`, and `dp` modes, through
+`proxy::gateway_listener::GatewayListenerManager`. The CP↔DP gRPC plane
+(`proto/ferrum.proto`) carries configuration from CP to DP only:
+`SubscribeRequest` / `FullConfigRequest` advertise a node id, version,
+namespace, real-IP header, and heartbeat capability, and there is no DP→CP
+status, realization, or health report message. There is therefore no existing
+production path by which a DP's local bind outcome could reach a Gateway status
+patch, and inventing one — writing Gateway listener conditions from a process
+that never observed the socket, or synthesizing a DP report the wire protocol
+does not carry — would make `Programmed` less trustworthy than it is today.
+
+Local realization is instead reported where the process that owns the socket can
+report it honestly (issue #3810):
+
+* authenticated `/health` → `gateway_listeners` (affected ports, `tcp`/`quic`
+  half, closed-set reason, admission-vs-runtime origin, config generation,
+  sanitized detail, retry count), described in
+  [admin_api.md](admin_api.md);
+* the fixed-cardinality `ferrum_gateway_listener_*` Prometheus families,
+  described in
+  [prometheus_metrics.md](prometheus_metrics.md#dynamic-gateway-api-listener-realization);
+* `status: "degraded"` on `/health` for unauthenticated probes, and optional
+  readiness degradation via
+  `FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS`.
+
+Closing the gap in Gateway status proper requires a new DP→CP realization report
+on the ConfigSync plane; that is a protocol change and is deliberately out of
+scope here.
 
 ### Condition reasons that diverge from the upstream constants table
 

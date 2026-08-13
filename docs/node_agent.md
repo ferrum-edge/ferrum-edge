@@ -202,7 +202,9 @@ The `docker-ebpf` job in
 [`.github/workflows/release.yml`](../.github/workflows/release.yml) publishes it
 as the `-ebpf` release variant:
 
-- The `ebpf-builder` stage installs nightly + `rust-src` + `bpf-linker` and runs
+- The `ebpf-builder` stage installs the architecture-specific upstream
+  `bpf-linker` 0.11.0 static release after verifying its repository-pinned
+  SHA-256 digest, installs nightly + `rust-src`, and runs
   `cargo +nightly build -p ferrum-ebpf --target bpfel-unknown-none -Z build-std=core --release`
   (the `ebpf/rust-toolchain.toml` pins the nightly). The ELF is COPY'd into the
   runtime image at `/app/bpf/ferrum-ebpf`, and `FERRUM_NODE_AGENT_BPF_ELF_PATH`

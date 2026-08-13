@@ -39,7 +39,9 @@ use crate::config::validation_pipeline::{
 };
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::cp_server::{CpGrpcServer, CpScope};
-use crate::grpc::cp_trust::{CpDpTrustBundle, CpDpVerifier, CpGrpcConnectInfo, PeerNamespaceScope};
+use crate::grpc::cp_trust::{
+    CpDpTrustBundle, CpDpVerifier, CpDpVerifierStore, CpGrpcConnectInfo, PeerNamespaceScope,
+};
 use crate::grpc::mesh_registry::{
     MESH_NODE_REGISTRY_REAPER_INTERVAL, mesh_node_registry_stale_ttl,
 };
@@ -2035,11 +2037,11 @@ pub async fn run(
             // The legacy secret stays optional here: with a trust bundle
             // configured it is no longer an authorization input, and CP mode
             // mints nothing with it. Every server builder below is seeded with
-            // it purely so the pre-`.verifier(..)` shape stays uniform; the
-            // seeded `SharedSecret` arm is replaced before any request is
-            // served. An absent secret therefore leaves that seed empty, which
-            // `CpDpVerifier::with_decoding_key` refuses outright rather than
-            // verifying against an empty HS256 key.
+            // it purely so the builders' seeded shape stays uniform; the
+            // shared reloadable verifier store replaces that seed before any
+            // request is served. An absent secret therefore leaves the seed
+            // empty, which `CpDpVerifier::with_decoding_key` refuses outright
+            // rather than verifying against an empty HS256 key.
             //
             // In particular this is NOT the cross-cluster remote-discovery
             // minting key. That minting happens on a mesh-mode node
@@ -2072,7 +2074,64 @@ pub async fn run(
         "CP/DP gRPC namespace authorization source: {}",
         cp_dp_verifier.describe()
     );
-    let cp_dp_verifier = Arc::new(cp_dp_verifier);
+    // Published, bounded trust-reload health (issue #3813). The status is
+    // created only when a bundle is actually watched: without a watcher there
+    // is no reload to be degraded by, and a permanently blocked admission gate
+    // that nothing can clear would be strictly worse than none.
+    let trust_reload_interval = Duration::from_secs(env_config.secret_refresh_interval_seconds);
+    let trust_status = match env_config.cp_dp_grpc_trust_bundle_path.as_deref() {
+        Some(_) => {
+            let max_stale = env_config.cp_dp_trust_max_stale();
+            if max_stale.is_zero() {
+                warn!(
+                    "FERRUM_CP_DP_TRUST_ALLOW_UNBOUNDED_STALE=true: this control plane will keep \
+                     authorizing under its last accepted trust generation for as long as every \
+                     reload keeps failing. A credential removed from the bundle stays usable \
+                     until a valid reload lands or the process restarts. Alert on \
+                     ferrum_cp_dp_trust_degraded and ferrum_cp_dp_trust_reload_worker_stalled."
+                );
+            }
+            let status_hmac_key = env_config.admin_jwt_secret.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "FERRUM_ADMIN_JWT_SECRET must be set to publish a replica-stable CP/DP trust \
+                     generation identifier; an unkeyed digest is not a substitute"
+                )
+            })?;
+            if status_hmac_key.len() < crate::config::types::MIN_JWT_SECRET_LENGTH {
+                return Err(anyhow::anyhow!(
+                    "FERRUM_ADMIN_JWT_SECRET must be at least {} characters to publish a \
+                     replica-stable CP/DP trust generation identifier; an unkeyed digest is not \
+                     a substitute",
+                    crate::config::types::MIN_JWT_SECRET_LENGTH
+                ));
+            }
+            let status = Arc::new(
+                crate::grpc::cp_trust_health::CpDpTrustReloadStatus::watching(
+                    max_stale,
+                    env_config.cp_dp_trust_allow_unbounded_stale,
+                    trust_reload_interval,
+                    status_hmac_key.as_bytes(),
+                    &cp_dp_verifier.configuration_fingerprint(),
+                ),
+            );
+            crate::grpc::cp_trust_health::install(status)
+        }
+        None => crate::grpc::cp_trust_health::disabled_status(),
+    };
+    let cp_dp_verifier =
+        Arc::new(CpDpVerifierStore::new(cp_dp_verifier).with_trust_status(trust_status.clone()));
+    let max_stream_lifetime = Duration::from_secs(env_config.cp_grpc_max_stream_lifetime_seconds);
+    let trust_bundle_reload_handle = env_config.cp_dp_grpc_trust_bundle_path.clone().map(|path| {
+        crate::grpc::cp_trust::spawn_trust_bundle_reload(
+            path,
+            env_config.cp_dp_grpc_jwt_secret.clone(),
+            cp_dp_verifier.clone(),
+            cp_scope.requires_namespace_claim_by_default(),
+            trust_reload_interval,
+            trust_status,
+            shutdown_tx.subscribe(),
+        )
+    });
 
     // Create gRPC server with shared DP node registry. The expected JWT
     // issuer and namespace are threaded in from EnvConfig: DPs must mint
@@ -2086,7 +2145,8 @@ pub async fn run(
     let (grpc_server, update_tx) = CpGrpcServer::builder(config_arc.clone(), grpc_secret.clone())
         .channel_capacity(env_config.cp_broadcast_channel_capacity)
         .registry(dp_registry.clone())
-        .verifier(cp_dp_verifier.clone())
+        .verifier_store(cp_dp_verifier.clone())
+        .max_stream_lifetime(max_stream_lifetime)
         .expected_issuer(env_config.cp_dp_grpc_jwt_issuer.clone())
         .scope(cp_scope.clone())
         .require_ns_claim(env_config.cp_require_namespace_claim)
@@ -2098,7 +2158,8 @@ pub async fn run(
             .channel_capacity(env_config.cp_broadcast_channel_capacity)
             .registry(mesh_registry.clone())
             .drift(mesh_slice_drift.clone())
-            .verifier(cp_dp_verifier.clone())
+            .verifier_store(cp_dp_verifier.clone())
+            .max_stream_lifetime(max_stream_lifetime)
             .expected_issuer(env_config.cp_dp_grpc_jwt_issuer.clone())
             .namespace(env_config.namespace.clone())
             .scope(cp_scope.clone())
@@ -2163,7 +2224,8 @@ pub async fn run(
             .with_sidecar_enforcement_dry_run(env_config.mesh_sidecar_enforced_dry_run)
             .with_sidecar_identity_narrowing(env_config.mesh_sidecar_identity_narrowing)
             .with_cluster_domain(env_config.k8s_cluster_domain.clone())
-            .with_verifier(cp_dp_verifier.clone())
+            .with_verifier_store(cp_dp_verifier.clone())
+            .with_max_stream_lifetime(max_stream_lifetime)
             .with_scope(cp_scope.clone())
             .with_require_namespace_claim(env_config.cp_require_namespace_claim)
             .with_namespace_broadcasts(broadcasts.clone())
@@ -2231,6 +2293,8 @@ pub async fn run(
         startup_ready: Some(startup_ready.clone()),
         serving_degraded: Some(serving_degraded.clone()),
         serving_listener_failures: None,
+        gateway_listener_status: None,
+        gateway_listener_failure_fails_readiness: false,
         db_available: Some(db_available.clone()),
         config_rejected: Some(config_rejected.clone()),
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
@@ -3721,6 +3785,9 @@ pub async fn run(
     if let Some(handle) = db_tls_reload_handle {
         background_handles.push(handle);
     }
+    if let Some(handle) = trust_bundle_reload_handle {
+        background_handles.push(handle);
+    }
     crate::modes::file::join_background_handles(background_handles, Duration::from_secs(5)).await;
 
     // Drain accepted audit events while the database Arc is still alive (issue
@@ -4044,6 +4111,7 @@ mod tests {
             compiled_stream_match: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            pending_limit_scope: None,
         }
     }
 

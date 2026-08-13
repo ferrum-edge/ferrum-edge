@@ -194,6 +194,11 @@ pub struct ServeHandles {
     /// than inferring listener state from traffic.
     #[allow(dead_code)] // The binary path never reads it back; tests do.
     pub gateway_listeners: Arc<GatewayListenerManager>,
+    /// Bounded realization status those listeners publish (issue #3810). The
+    /// same handle `AdminState` reads for authenticated `/health` detail, so an
+    /// in-process caller observes exactly what an operator would.
+    #[allow(dead_code)] // The binary path never reads it back; tests do.
+    pub gateway_listener_status: Arc<crate::proxy::gateway_listener_status::GatewayListenerStatus>,
     /// Local addresses each listener is bound to (resolved from the pre-bound
     /// listener, **not** read from `EnvConfig`). Tests use this to build
     /// canonical proxy/admin URLs.
@@ -338,6 +343,10 @@ impl ServeHandles {
             )
             .await;
         }
+        // Release backend transport pools that hold kernel objects (issue
+        // #3731): after the bounded in-flight drain, no further request may be
+        // served, so idle sidecar-ingress Unix carriers must not outlive it.
+        self.proxy_state.drain_transport_pools_for_shutdown().await;
         let mut background_handles = self.background_handles;
         background_handles.extend(self.proxy_state.health_checker.take_active_check_handles());
         join_background_handles(background_handles, self.background_drain_timeout).await;
@@ -1044,6 +1053,14 @@ pub async fn serve(
         }
     };
     let config_rejected = Arc::new(AtomicBool::new(false));
+    // Bounded realization status for the dynamic Gateway API listener ports
+    // bound further below (issue #3810). Constructed here because `AdminState`
+    // is built before the listener manager; both hold the same handle, so
+    // authenticated `/health` detail and `/metrics` observe exactly what the
+    // manager last decided.
+    let gateway_listener_status =
+        Arc::new(crate::proxy::gateway_listener_status::GatewayListenerStatus::new());
+    crate::proxy::gateway_listener_status::install_for_metrics(&gateway_listener_status);
     let admin_state = AdminState {
         db: None,
         jwt_manager,
@@ -1059,6 +1076,11 @@ pub async fn serve(
         // readiness is governed by `startup_ready` alone.
         serving_degraded: None,
         serving_listener_failures: None,
+        // Recoverable, per-port, and cleared by the next successful retry —
+        // deliberately not folded into the sticky `serving_degraded` signal.
+        gateway_listener_status: Some(gateway_listener_status.clone()),
+        gateway_listener_failure_fails_readiness: env_config
+            .gateway_listener_failure_fails_readiness,
         db_available: None,
         config_rejected: Some(config_rejected.clone()),
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
@@ -1421,7 +1443,8 @@ pub async fn serve(
     .with_existing_frontends(
         bound.proxy_http.map(|addr| addr.port()),
         bound.proxy_https.map(|addr| addr.port()),
-    );
+    )
+    .with_status(gateway_listener_status.clone());
     // Every TLS-class Gateway listener port also gets its own QUIC socket, so
     // a port-scoped HTTPS route is reachable over HTTP/3 exactly as it is over
     // HTTP/1.1 and HTTP/2.
@@ -1548,6 +1571,7 @@ pub async fn serve(
         proxy_state: proxy_state.clone(),
         config_rejected,
         gateway_listeners: gateway_listeners.clone(),
+        gateway_listener_status: gateway_listener_status.clone(),
         bound,
         listener_handles: handles,
         background_handles,

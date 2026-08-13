@@ -104,6 +104,7 @@ fn svc_b_service(local: &Workload, remote: &Workload) -> MeshService {
             },
         ],
         protocol_overrides: std::collections::HashMap::new(),
+        uid: None,
     }
 }
 
@@ -390,6 +391,7 @@ fn sidecar_cross_cluster_target_for_tcp_service_port_uses_per_port_sni() {
             },
         ],
         protocol_overrides: std::collections::HashMap::new(),
+        uid: None,
     };
 
     let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
@@ -482,6 +484,7 @@ fn cross_cluster_target_for_each_http_service_port() {
             },
         ],
         protocol_overrides: std::collections::HashMap::new(),
+        uid: None,
     };
 
     let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
@@ -609,6 +612,7 @@ fn cross_cluster_sni_alias_keys_on_explicit_port_not_declaration_order() {
             },
         ],
         protocol_overrides: std::collections::HashMap::new(),
+        uid: None,
     };
 
     let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
@@ -697,6 +701,7 @@ fn cross_cluster_multiport_port_never_shares_base_fqdn_channel_with_single_port(
                 },
             ],
             protocol_overrides: std::collections::HashMap::new(),
+            uid: None,
         };
         let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
         // Gateway claims the base FQDN AND both per-port aliases, so selection
@@ -902,6 +907,7 @@ fn gateway_selection_accepts_alias_only_gateway_for_dialed_port() {
             },
         ],
         protocol_overrides: std::collections::HashMap::new(),
+        uid: None,
     };
 
     const ALIAS_9090: &str = "p9090.svc-b.default.svc.cluster.local";
@@ -1104,6 +1110,7 @@ fn no_cross_cluster_target_for_unreachable_remote_workload() {
             },
         ],
         protocol_overrides: std::collections::HashMap::new(),
+        uid: None,
     };
 
     let mut mesh = mesh_config_with(vec![local, unreachable], vec![service], Vec::new());
@@ -1164,6 +1171,7 @@ fn no_cross_cluster_target_for_unresolvable_named_target_port() {
             },
         ],
         protocol_overrides: std::collections::HashMap::new(),
+        uid: None,
     };
 
     let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
@@ -1348,6 +1356,7 @@ fn two_networks_on_same_gateway_host_yield_distinct_identities() {
             },
         ],
         protocol_overrides: std::collections::HashMap::new(),
+        uid: None,
     };
 
     // Two gateways on the SAME host, DIFFERENT ports — one per network.
@@ -1444,6 +1453,7 @@ fn cross_cluster_targets_for_same_spiffe_replicas_across_networks() {
             },
         ],
         protocol_overrides: std::collections::HashMap::new(),
+        uid: None,
     };
 
     const NET_B_GATEWAY_HOST: &str = "10.9.9.11";
@@ -1530,6 +1540,7 @@ fn no_cross_cluster_targets_when_two_trust_domains_share_one_gateway_endpoint() 
             },
         ],
         protocol_overrides: std::collections::HashMap::new(),
+        uid: None,
     };
 
     let mut mesh = mesh_config_with(
@@ -1601,6 +1612,7 @@ fn same_trust_domain_networks_sharing_one_gateway_endpoint_collapse_to_one() {
             },
         ],
         protocol_overrides: std::collections::HashMap::new(),
+        uid: None,
     };
 
     // Two gateways on the SAME host:port — one per network, SAME trust domain.
@@ -2008,6 +2020,7 @@ fn ambient_cross_cluster_skips_unresolvable_named_target_port() {
             },
         ],
         protocol_overrides: std::collections::HashMap::new(),
+        uid: None,
     };
 
     let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
@@ -2072,6 +2085,7 @@ fn ambient_cross_cluster_for_each_http_service_port() {
             },
         ],
         protocol_overrides: std::collections::HashMap::new(),
+        uid: None,
     };
 
     let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
@@ -2158,6 +2172,7 @@ fn ambient_cross_cluster_fails_closed_on_cross_td_shared_dial_endpoint() {
             },
         ],
         protocol_overrides: std::collections::HashMap::new(),
+        uid: None,
     };
 
     let mut mesh = mesh_config_with(
@@ -2227,6 +2242,7 @@ fn ambient_cross_cluster_distinct_td_distinct_endpoints_both_emitted() {
             },
         ],
         protocol_overrides: std::collections::HashMap::new(),
+        uid: None,
     };
 
     const GW_B_HOST: &str = "10.9.9.11";
@@ -2350,6 +2366,7 @@ fn ambient_cross_cluster_target_for_tcp_service_port_uses_per_port_sni() {
             },
         ],
         protocol_overrides: std::collections::HashMap::new(),
+        uid: None,
     };
 
     let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
@@ -2427,6 +2444,7 @@ fn cross_cluster_udp_materializes_per_port_targets_for_both_captured_topologies(
                 },
             ],
             protocol_overrides: std::collections::HashMap::new(),
+            uid: None,
         };
         let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
         mesh.multi_cluster = Some(multi_cluster_with_gateway(Some(REMOTE_NETWORK)));

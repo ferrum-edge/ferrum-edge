@@ -109,6 +109,8 @@ fn upstream() -> Upstream {
         api_spec_id: None,
         created_at: now,
         updated_at: now,
+        k8s_service_uid: None,
+        pending_limit_scope: None,
     }
 }
 
@@ -609,6 +611,8 @@ fn destination_rule_top_level_connection_pool_http_on_sd_upstream_goes_to_fallba
         consul: None,
         mesh: None,
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
 
     let mut config = GatewayConfig {
@@ -689,6 +693,8 @@ fn destination_rule_named_target_port_sd_keeps_per_port_and_fallback_separate() 
         consul: None,
         mesh: None,
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
 
     // Per-port entry on the DECLARED service port (80): conflicting maxRetries (5)

@@ -524,6 +524,34 @@ Do not keep `FERRUM_DB_TYPE`, `FERRUM_DB_URL`, `FERRUM_ADMIN_JWT_SECRET`, or
 `FERRUM_CP_DP_GRPC_JWT_SECRET` under `controlPlane.env`; Helm validation now
 rejects those reserved entries with a template-time error.
 
+### CP/DP Trust-Bundle Path Coherence (Breaking)
+
+CP startup and trust-bundle reload now require every `secret_path` or
+`public_key_path` to belong to the same pinned Kubernetes projected-volume
+generation as `FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH`. A reference outside that
+generation—including an ordinary file next to the projected entries—must carry
+the exact lowercase SHA-256 of its bytes in `material_sha256`. An existing CP
+whose path-backed references do not meet either condition will fail startup
+rather than independently re-resolving material from a potentially different
+generation.
+
+Before upgrading, either move the document and all referenced files into one
+projected volume or bind each external reference in the document. For example:
+
+```bash
+digest=$(sha256sum /etc/ferrum/trust/tenant-a.pub | cut -d' ' -f1)
+jq --arg d "$digest" '.keys[0].material_sha256 = $d' \
+  /etc/ferrum/cp-dp-trust.json > /etc/ferrum/cp-dp-trust.json.new
+mv /etc/ferrum/cp-dp-trust.json.new /etc/ferrum/cp-dp-trust.json
+```
+
+Repeat that binding for every external path before starting the new CP. Inline
+`secret`, `secret_env`, and `public_key_pem` sources must not declare
+`material_sha256`; they are already read atomically with their source. Each
+path-backed file and their aggregate material in one candidate are limited to 1
+MiB, so split oversized trust inventories across control planes before the
+upgrade.
+
 ### Version Negotiation (Built-In Safety Net)
 
 Starting in v0.9.0, CP and DP nodes exchange their Ferrum Edge binary version during gRPC handshake. Versions are parsed as **SemVer**. The **major and minor** components must match — patch-level differences (e.g., `0.9.0` vs `0.9.1`) are allowed. **Prerelease policy:** prerelease (`-rc.1`) and build metadata (`+git`) are ignored for compatibility; only major.minor are compared, so `0.9.0-rc.1` is compatible with `0.9.0` and `0.9.3`. Empty or malformed versions are rejected on both CP admission (`FailedPrecondition`) and DP ConfigUpdate processing. Every ConfigUpdate envelope — FULL_SNAPSHOT, DELTA, or negotiated heartbeat — must carry a valid compatible CP version.

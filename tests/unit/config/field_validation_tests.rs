@@ -81,6 +81,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         compiled_stream_match: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        pending_limit_scope: None,
     }
 }
 
@@ -133,6 +134,8 @@ fn make_upstream(id: &str) -> Upstream {
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        k8s_service_uid: None,
+        pending_limit_scope: None,
     }
 }
 
@@ -1362,6 +1365,8 @@ fn test_upstream_service_discovery_dns_sd_validated() {
         consul: None,
         mesh: None,
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     let errs = upstream.validate_fields().unwrap_err();
     assert!(errs.iter().any(|e| e.contains("dns_sd config is required")));
@@ -1377,6 +1382,8 @@ fn test_upstream_service_discovery_mesh_validated() {
         consul: None,
         mesh: None,
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     let errs = upstream.validate_fields().unwrap_err();
     assert!(errs.iter().any(|e| e.contains("mesh config is required")));
@@ -1399,6 +1406,8 @@ fn test_mesh_sd_namespace_must_match_upstream_namespace() {
             topology: Default::default(),
         }),
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     let errs = upstream.validate_fields().unwrap_err();
     assert!(
@@ -1426,6 +1435,8 @@ fn test_mesh_sd_namespace_matching_upstream_passes() {
             topology: Default::default(),
         }),
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     assert!(upstream.validate_fields().is_ok());
 }
@@ -1446,6 +1457,8 @@ fn test_mesh_sd_namespace_omitted_passes() {
             topology: Default::default(),
         }),
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     assert!(upstream.validate_fields().is_ok());
 }
@@ -2182,6 +2195,8 @@ fn test_k8s_port_name_too_long() {
         consul: None,
         mesh: None,
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     let errs = upstream.validate_fields().unwrap_err();
     assert!(
@@ -2206,6 +2221,8 @@ fn test_k8s_label_selector_too_long() {
         consul: None,
         mesh: None,
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     let errs = upstream.validate_fields().unwrap_err();
     assert!(
@@ -2232,6 +2249,8 @@ fn test_consul_datacenter_too_long() {
         }),
         mesh: None,
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     let errs = upstream.validate_fields().unwrap_err();
     assert!(
@@ -2258,6 +2277,8 @@ fn test_consul_tag_too_long() {
         }),
         mesh: None,
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     let errs = upstream.validate_fields().unwrap_err();
     assert!(
@@ -2284,6 +2305,8 @@ fn test_consul_token_control_chars() {
         }),
         mesh: None,
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     let errs = upstream.validate_fields().unwrap_err();
     assert!(
@@ -2310,6 +2333,8 @@ fn test_consul_valid_optional_fields() {
         }),
         mesh: None,
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     assert!(upstream.validate_fields().is_ok());
 }
@@ -2330,6 +2355,8 @@ fn test_k8s_valid_optional_fields() {
         consul: None,
         mesh: None,
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     assert!(upstream.validate_fields().is_ok());
 }
@@ -2350,6 +2377,8 @@ fn test_mesh_service_name_required() {
             topology: Default::default(),
         }),
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     let errs = upstream.validate_fields().unwrap_err();
     assert!(
@@ -2374,6 +2403,8 @@ fn test_mesh_port_zero_rejected() {
             topology: Default::default(),
         }),
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     let errs = upstream.validate_fields().unwrap_err();
     assert!(errs.iter().any(|e| e.contains("mesh.port")));
@@ -2396,6 +2427,8 @@ fn test_mesh_valid_optional_fields() {
             topology: Default::default(),
         }),
         default_weight: 1,
+        max_stale_seconds: None,
+        stale_policy: None,
     });
     assert!(upstream.validate_fields().is_ok());
 }
@@ -2886,6 +2919,8 @@ fn test_validate_backend_ip_policy_upstream_target_denied() {
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        k8s_service_uid: None,
+        pending_limit_scope: None,
     };
     let config = GatewayConfig {
         upstreams: vec![upstream],

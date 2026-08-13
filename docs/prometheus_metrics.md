@@ -96,6 +96,58 @@ replacement. To reconcile a gap, compare
 `outcome = 'unknown_outcome'`, and inspect
 `<FERRUM_ADMIN_AUDIT_SPOOL_DIR>/failed/`.
 
+### Dynamic Gateway API listener realization
+
+Emitted in `file`, `database`, and `dp` modes — the modes that bind a socket per
+Gateway API listener port. A listener port that cannot be bound is refused fail
+closed for routing and retried every 30s; the process deliberately stays alive
+and every healthy listener keeps serving, so these families (and the
+authenticated `/health` `gateway_listeners` detail) are the durable signal that
+part of the configuration is not realized.
+
+| Family | Type | Labels | Guidance |
+|--------|------|--------|----------|
+| `ferrum_gateway_listeners_desired` | gauge | `namespace` | Gateway listener ports the published configuration asks this process to bind. Ports already served by a process-global proxy frontend of the same class are excluded — no dynamic socket is wanted for them. |
+| `ferrum_gateway_listeners_active` | gauge | `namespace` | Gateway listener ports with a live accept loop. `desired - active` is the unrealized listener count. |
+| `ferrum_gateway_listener_failed_ports` | gauge | `namespace` | Distinct ports with at least one active failure. |
+| `ferrum_gateway_listener_failures_active` | gauge | `protocol`, `reason`, `namespace` | Currently-failing listener halves. `protocol` is `tcp` or `quic`; a QUIC-only failure means HTTP/1.1 and HTTP/2 are still served on that port and `Alt-Svc` simply stops advertising HTTP/3. |
+| `ferrum_gateway_listener_failures_total` | counter | `protocol`, `reason`, `namespace` | Failure onsets since process start. A retry that keeps failing does not re-increment; it raises `observations` on the `/health` entry instead. This holds for every active identity, including ones the authenticated `/health` detail dropped at its 64-entry cap — the onset/recovery ledger behind the counters is separate from that cap and tracks up to 4096 identities. |
+| `ferrum_gateway_listener_recoveries_total` | counter | `protocol`, `reason`, `namespace` | Failures cleared by a later reconcile, counted once per `(port, protocol half, reason)` identity — including identities that were never shown in the bounded `/health` detail. Pairs with the active gauge returning to `0`. |
+
+`reason` is a closed set: `port_reserved`, `process_global_class_mismatch`,
+`stream_port_collision`, `udp_stream_collision`, `class_conflict`,
+`dedicated_bind_conflict`, `dedicated_bind_tls_unsupported`,
+`frontend_tls_missing`, `bind_failed`, `listener_task_ended`,
+`class_flip_deferred`, `retirement_pending`. The first eight are admission
+refusals repaired in the configuration; the last four are runtime failures
+repaired in the environment.
+Port, listener name, host, config generation, and error text are **never**
+labels — they are authenticated `/health` detail only, so listener cardinality
+can never reach the time-series store.
+
+**Suggested alerts:** `sum(ferrum_gateway_listener_failures_active) > 0` for
+more than two retry intervals (about 60s), which distinguishes a real outage
+from a listener being rebound across a config change; and
+`ferrum_gateway_listeners_desired - ferrum_gateway_listeners_active > 0`
+sustained.
+
+**Runbook.** Read authenticated `/health` for the affected port and reason.
+`bind_failed` on `:80`/`:443` is usually a missing `CAP_NET_BIND_SERVICE` or a
+port already owned by another process; `port_reserved`,
+`stream_port_collision`, `udp_stream_collision`, `class_conflict`, and
+`process_global_class_mismatch` are configuration conflicts inside Ferrum's own
+port map; `dedicated_bind_conflict` and `dedicated_bind_tls_unsupported` identify
+Sidecar ingress bind declarations that cannot be realized without widening or
+misclassifying the listener; `listener_task_ended` means an accept loop died
+after a successful bind and is being rebound — a same-pass rebind increments
+the cumulative failure and recovery counters once while the active gauge stays
+`0` once the half is live again. On the `quic` half only the HTTP/3 listener is
+reaped and retried, so HTTP/1.1 and HTTP/2 keep serving that port and its routes
+stay admitted; `class_flip_deferred` means a frontend TLS-class change is waiting for the previous accept sockets to close;
+`retirement_pending` is the same fail-closed wait for another bind-identity
+change. No action clears these manually — the supervisor retries on its own,
+and the metrics clear when it succeeds.
+
 ## Complete family inventory
 
 Sorted by family name. Optional namespace labels are listed when the emitter supports them.
@@ -198,6 +250,17 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_configsync_diverged` | gauge | `namespace` | `configsync` | `documented_only` | `conditional` | Whether the DP is currently sticky-diverged after a rejected ConfigSync delta (1) or converged (0). |
 | `ferrum_configsync_divergence_recoveries_total` | counter | `namespace` | `configsync` | `documented_only` | `conditional` | ConfigSync divergence recoveries after an accepted authoritative FULL_SNAPSHOT. |
 | `ferrum_configsync_fenced_full_snapshots_total` | counter | `namespace` | `configsync` | `documented_only` | `conditional` | ConfigSync FULL_SNAPSHOTs the DP fenced without applying (stale/older, unorderable/inconsistent, or an implausibly-future CP clock stamp); last-known-good config keeps serving. |
+| `ferrum_cp_dp_trust_degraded` | gauge | `namespace` | `cp_dp_trust` | `documented_only` | `conditional` | Whether the CP is authorizing with a trust generation it could not revalidate, or the reload worker is stalled or failed (1) or not (0). |
+| `ferrum_cp_dp_trust_last_acceptance_age_seconds` | gauge | `namespace` | `cp_dp_trust` | `documented_only` | `conditional` | Seconds since the CP last accepted (replaced or confirmed) its trust source, on a monotonic clock. |
+| `ferrum_cp_dp_trust_max_stale_seconds` | gauge | `namespace` | `cp_dp_trust` | `documented_only` | `conditional` | Configured maximum unrevalidated trust-generation age before admission fails closed (0 = unbounded, explicit opt-in). |
+| `ferrum_cp_dp_trust_reload_acceptances_total` | counter | `namespace` | `cp_dp_trust` | `documented_only` | `conditional` | Reload attempts that produced a usable trust generation (replaced or confirmed unchanged). |
+| `ferrum_cp_dp_trust_reload_attempts_total` | counter | `namespace` | `cp_dp_trust` | `documented_only` | `conditional` | CP/DP trust-bundle reload attempts started since process start. A wedged in-flight read is counted here before it produces an acceptance or rejection. |
+| `ferrum_cp_dp_trust_reload_consecutive_failures` | gauge | `namespace` | `cp_dp_trust` | `documented_only` | `conditional` | Consecutive refused reload candidates or fatal worker exits since the last accepted generation. |
+| `ferrum_cp_dp_trust_reload_recoveries_total` | counter | `namespace` | `cp_dp_trust` | `documented_only` | `conditional` | Failure episodes ended by a later valid candidate. |
+| `ferrum_cp_dp_trust_reload_rejections_total` | counter | `reason`, `namespace` | `cp_dp_trust` | `documented_only` | `conditional` | Reload candidates refused or reload workers exited unexpectedly, by closed reason. The previous verifier was retained when applicable. |
+| `ferrum_cp_dp_trust_reload_worker_running` | gauge | `namespace` | `cp_dp_trust` | `documented_only` | `conditional` | Whether the trust-bundle reload worker is alive (1) or stopped/failed (0). A stalled worker is still alive. |
+| `ferrum_cp_dp_trust_reload_worker_stalled` | gauge | `namespace` | `cp_dp_trust` | `documented_only` | `conditional` | Whether the trust-bundle reload worker is alive but has not completed an attempt inside the stall window (1) or not (0). |
+| `ferrum_cp_dp_trust_stale` | gauge | `namespace` | `cp_dp_trust` | `documented_only` | `conditional` | Whether the active trust generation has aged past its bound, refusing new configuration streams (1) or not (0). |
 | `ferrum_cp_grpc_active_connections` | gauge | `namespace` | `cp_grpc` | `documented_only` | `conditional` | CP gRPC listener connections currently admitted (pre-handshake through served HTTP/2 session). |
 | `ferrum_cp_grpc_max_connections` | gauge | `namespace` | `cp_grpc` | `documented_only` | `conditional` | Configured CP gRPC connection cap (0 = unlimited). |
 | `ferrum_cp_grpc_max_connections_per_ip` | gauge | `namespace` | `cp_grpc` | `documented_only` | `conditional` | Configured per-source-IP CP gRPC connection cap (0 = unlimited). |
@@ -224,6 +287,13 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_dp_config_stale` | gauge | `namespace` | `dp_config` | `documented_only` | `conditional` | Whether the DP's applied configuration is past its bound with no authoritative CP (1) or not (0). |
 | `ferrum_dp_config_stale_transitions_total` | counter | `namespace` | `dp_config` | `documented_only` | `conditional` | Transitions into the stale state since process start. |
 | `ferrum_edge_overhead_ms` | histogram | `proxy_id`, `le`, `namespace` | `prometheus_metrics` | `dashboard` | `always` | Gateway overhead (excluding backend and plugins) in milliseconds. |
+| `ferrum_gateway_listener_failed_ports` | gauge | `namespace` | `gateway_listener` | `documented_only` | `when_process_initialized` | Distinct dynamic Gateway API listener ports with at least one active failure. |
+| `ferrum_gateway_listener_failures_active` | gauge | `protocol`, `reason`, `namespace` | `gateway_listener` | `documented_only` | `when_process_initialized` | Dynamic Gateway API listener halves currently failing, by protocol half and bounded reason. |
+| `ferrum_gateway_listener_failures_total` | counter | `protocol`, `reason`, `namespace` | `gateway_listener` | `documented_only` | `when_process_initialized` | Dynamic Gateway API listener failures observed since process start, by protocol half and bounded reason. |
+| `ferrum_gateway_listener_recoveries_total` | counter | `protocol`, `reason`, `namespace` | `gateway_listener` | `documented_only` | `when_process_initialized` | Dynamic Gateway API listener failures cleared by a later reconcile since process start, by protocol half and bounded reason. |
+| `ferrum_gateway_listeners_active` | gauge | `namespace` | `gateway_listener` | `documented_only` | `when_process_initialized` | Dynamic Gateway API listener ports currently bound and accepting. |
+| `ferrum_gateway_listeners_desired` | gauge | `namespace` | `gateway_listener` | `documented_only` | `when_process_initialized` | Dynamic Gateway API listener ports the published configuration asks this process to bind. |
+| `ferrum_grpc_config_stream_terminations_total` | counter | `surface`, `reason`, `gateway_namespace` | `grpc_config` | `documented_only` | `always` | Authenticated configuration streams ended by fixed surface and reason. |
 | `ferrum_jwks_consecutive_failures` | gauge | `class` | `jwks` | `documented_only` | `always` | Maximum current consecutive failures among active remote stores by fixed failure class. |
 | `ferrum_jwks_refresh_failures_total` | counter | `class` | `jwks` | `documented_only` | `always` | Remote JWKS refresh failures by fixed failure class. |
 | `ferrum_jwks_trust_age_seconds` | gauge | `state` | `jwks` | `documented_only` | `always` | Maximum age of the last validated non-empty JWKS among active remote stores in each trust state. |
@@ -259,6 +329,8 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_mesh_config_revision_rejections_total` | counter | `reason`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Mesh slices quarantined by the config-revision freshness gate before replacing live state, by reason. |
 | `ferrum_mesh_config_update_rejections_total` | counter | `consumer`, `reason`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | MeshSubscribe responses refused before apply, by consumer and reason. |
 | `ferrum_mesh_dns_upstream_id_exhaustions_total` | counter | `namespace` | `mesh` | `documented_only` | `always` | Mesh DNS upstream transaction ID exhaustion events. |
+| `ferrum_mesh_ext_authz_check_failures_total` | counter | `disposition`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Failed CUSTOM external authorization checks by how the failure was resolved. |
+| `ferrum_mesh_ext_authz_checks_total` | counter | `outcome`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Istio AuthorizationPolicy CUSTOM external authorization check outcomes. |
 | `ferrum_mesh_federation_bundle_age_seconds` | gauge | `trust_domain`, `gateway_namespace` | `mesh_federation` | `alert_and_dashboard` | `conditional` | Age of the cached federated trust bundle, in seconds. |
 | `ferrum_mesh_federation_last_success_timestamp_seconds` | gauge | `trust_domain`, `gateway_namespace` | `mesh_federation` | `documented_only` | `conditional` | Unix timestamp of last successful SPIFFE federation poll. |
 | `ferrum_mesh_federation_poll_failures_total` | counter | `trust_domain`, `endpoint`, `gateway_namespace` | `mesh_federation` | `alert_and_dashboard` | `conditional` | SPIFFE federation trust-bundle poll failures. |
@@ -293,6 +365,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_mesh_tcp_received_bytes_total` | counter | `source_workload`, `source_namespace`, `source_principal`, `source_app`, `source_service`, `destination_workload`, `destination_namespace`, `destination_principal`, `destination_app`, `destination_service`, `request_protocol`, `response_flags`, `connection_security_policy`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Mesh TCP request bytes received client->backend on closed connections. |
 | `ferrum_mesh_tcp_sent_bytes_total` | counter | `source_workload`, `source_namespace`, `source_principal`, `source_app`, `source_service`, `destination_workload`, `destination_namespace`, `destination_principal`, `destination_app`, `destination_service`, `request_protocol`, `response_flags`, `connection_security_policy`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Mesh TCP response bytes sent backend->client on closed connections. |
 | `ferrum_mesh_trust_bundle_version` | gauge | `trust_domain`, `source`, `gateway_namespace` | `mesh` | `dashboard` | `conditional` | Monotonic version of observed mesh trust bundles. |
+| `ferrum_mesh_udp_placement_migration_established_adoptions_total` | counter | `gateway_namespace` | `mesh_udp_migration` | `documented_only` | `conditional` | Ambient UDP placements adopted from the release-attested established placement without a node-local durable record. |
 | `ferrum_mesh_udp_placement_migration_failures_total` | counter | `reason`, `gateway_namespace` | `mesh_udp_migration` | `documented_only` | `conditional` | Ambient UDP placement migration failures by bounded reason. |
 | `ferrum_mesh_udp_placement_migration_outstanding` | gauge | `gateway_namespace` | `mesh_udp_migration` | `documented_only` | `conditional` | Outstanding pod netns or gate acknowledgements in the current node-local migration. |
 | `ferrum_mesh_udp_placement_migration_phase` | gauge | `phase`, `gateway_namespace` | `mesh_udp_migration` | `documented_only` | `conditional` | Ambient UDP placement migration phase (one bounded phase is 1). |
@@ -361,10 +434,28 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_service_discovery_body_budget_rejected_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery HTTP responses rejected because the concurrent body budget was exhausted. |
 | `ferrum_service_discovery_cursor_advance_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery blocking-query cursor advances after an admitted higher-index snapshot. |
 | `ferrum_service_discovery_cursor_rollback_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery blocking-query cursor rollbacks after an admitted lower-index snapshot. |
+| `ferrum_service_discovery_last_success_age_seconds_max` | gauge | `namespace` | `service_discovery` | `documented_only` | `always` | Maximum age in seconds of the staleness anchor across service-discovery tasks (task start when no snapshot has ever been published). |
 | `ferrum_service_discovery_malformed_envelope_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery Kubernetes EndpointSliceList envelopes rejected as malformed. |
 | `ferrum_service_discovery_provider_normalization_rejected_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery snapshots rejected because every provider catalog entry failed provider normalization. |
 | `ferrum_service_discovery_response_oversized_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery HTTP responses rejected for oversized or ambiguous body bounds. |
 | `ferrum_service_discovery_shared_admission_rejected_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery snapshots rejected by shared host/egress target admission. |
+| `ferrum_service_discovery_stale_expiries_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery tasks whose last admitted snapshot crossed the configured staleness bound. |
+| `ferrum_service_discovery_stale_recoveries_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery stale episodes cleared by a freshly admitted and published snapshot. |
+| `ferrum_service_discovery_stale_withdrawals_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery stale episodes whose expiry policy withdrew discovered targets and retained static targets. |
+| `ferrum_service_discovery_task_panics_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery pollers that exited unexpectedly instead of stopping cleanly. |
+| `ferrum_service_discovery_task_restarts_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery pollers restarted by their supervisor after an unexpected exit. |
+| `ferrum_service_discovery_tasks` | gauge | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery tasks currently supervised. |
+| `ferrum_service_discovery_tasks_crash_looping` | gauge | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery tasks that exited unexpectedly repeatedly without an intervening published snapshot. |
+| `ferrum_service_discovery_tasks_kept_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery tasks kept running across a config reconcile because their effective specification was unchanged. |
+| `ferrum_service_discovery_tasks_never_succeeded` | gauge | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery tasks that have never published an admitted snapshot. |
+| `ferrum_service_discovery_tasks_readiness_failing` | gauge | `namespace` | `service_discovery` | `documented_only` | `always` | Stale service-discovery tasks failing readiness by policy or because withdrawal publication is still retrying. |
+| `ferrum_service_discovery_tasks_replaced_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery tasks replaced across a config reconcile because their effective specification changed. |
+| `ferrum_service_discovery_tasks_restarting` | gauge | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery tasks waiting out a restart backoff after an unexpected poller exit. |
+| `ferrum_service_discovery_tasks_running` | gauge | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery tasks whose poller is running. |
+| `ferrum_service_discovery_tasks_stale` | gauge | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery tasks whose last admitted snapshot is older than the configured staleness bound. |
+| `ferrum_service_discovery_tasks_started_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery tasks started for newly configured upstreams. |
+| `ferrum_service_discovery_tasks_stopped_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery tasks stopped because their upstream no longer configures service discovery. |
+| `ferrum_service_discovery_tasks_withdrawn` | gauge | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery tasks whose discovered targets are currently withdrawn by the staleness policy. |
 | `ferrum_stream_connections_total` | counter | `proxy_id`, `protocol`, `namespace` | `stream` | `dashboard` | `conditional` | Total stream connections (TCP/UDP). |
 | `ferrum_stream_disconnects_total` | counter | `proxy_id`, `protocol`, `cause`, `direction`, `namespace` | `stream` | `dashboard` | `conditional` | Stream disconnects (TCP/UDP) by cause and direction. |
 | `ferrum_stream_duration_ms` | histogram | `proxy_id`, `le`, `namespace` | `stream` | `documented_only` | `conditional` | Stream connection duration in milliseconds. |
