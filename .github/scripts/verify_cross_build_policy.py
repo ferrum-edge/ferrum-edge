@@ -2468,6 +2468,53 @@ LIVE_SUITE_JOB_BINDING = {
     "if": "    if: needs.changes.outputs.relevant == 'true'\n",
 }
 
+# The ambient host-UDP check is security-relevant and required by branch
+# protection. Freeze its complete aggregate job so a pull request cannot keep
+# the check name while making a failed or skipped privileged live run pass.
+AMBIENT_HOST_UDP_GATE_JOB = r"""  gate:
+    name: Ambient Host UDP Live
+    needs:
+      - changes
+      - ambient-host-udp-live
+      - ambient-host-udp-image
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summarize ambient host-UDP live result
+        run: |
+          {
+            echo "## Ambient Host UDP Live"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "Failed before change detection completed." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ "${{ needs.changes.outputs.relevant }}" = "false" ]; then
+            echo "Skipped live-kernel validation: no ambient host-UDP capture, mesh UDP, fixture, documentation, or CI workflow surfaces changed." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "${{ needs.changes.outputs.relevant }}" != "true" ]; then
+            echo "Change detection returned an invalid relevance result: ${{ needs.changes.outputs.relevant }}." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ "${{ needs.ambient-host-udp-live.result }}" != "success" ]; then
+            echo "Live-kernel validation failed or did not complete: ${{ needs.ambient-host-udp-live.result }}." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ "${{ needs.ambient-host-udp-image.result }}" != "success" ]; then
+            echo "Production image contract failed or did not complete: ${{ needs.ambient-host-udp-image.result }}." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "Live-kernel validation and production image contract passed." >> "$GITHUB_STEP_SUMMARY"
+"""
+
 # ---------------------------------------------------------------------------
 # Admitted fuzz/property lane (issue #2461)
 # ---------------------------------------------------------------------------
@@ -10441,6 +10488,16 @@ def live_suite_relevance_errors(
                     f"{located} job {live_job!r} must keep {field!r} bound to the "
                     "trusted relevance output; rewriting it skips the live job just "
                     "as effectively as tampering with the relevance decision"
+                )
+        if name == "ambient-host-udp-live.yml":
+            gate, gate_failures = extract_job_block(
+                contents, located, "gate", required=True
+            )
+            errors.extend(gate_failures)
+            if not gate_failures and gate != AMBIENT_HOST_UDP_GATE_JOB:
+                errors.append(
+                    f"{located} job 'gate' must be exactly the fail-closed Ambient "
+                    "host-UDP aggregate contract"
                 )
     return errors
 
@@ -24521,7 +24578,14 @@ pre_build = []
             "the trusted-base relevance contract executes the pull request's own filter"
         )
 
-    def relevance_workflow(display: str, live_job: str, body: str) -> str:
+    def relevance_workflow(
+        contract_name: str, display: str, live_job: str, body: str
+    ) -> str:
+        gate = (
+            "\n" + AMBIENT_HOST_UDP_GATE_JOB
+            if contract_name == "ambient-host-udp-live.yml"
+            else ""
+        )
         return (
             "name: Self-test live suite\n"
             "on:\n"
@@ -24538,10 +24602,12 @@ pre_build = []
             + "    runs-on: ubuntu-latest\n"
             + "    steps:\n"
             + "      - run: echo live\n"
+            + gate
         )
 
     relevance_workflows = {
         contract_name: relevance_workflow(
+            contract_name,
             contract[2],
             contract[1],
             live_suite_relevance_job(contract[2], contract[3], contract[4]),
@@ -24550,6 +24616,20 @@ pre_build = []
     }
     if live_suite_relevance_errors(relevance_workflows, "self-test workflows"):
         failures.append("the trusted-base relevance contract was rejected")
+
+    weakened_ambient_gate = dict(relevance_workflows)
+    weakened_ambient_gate["ambient-host-udp-live.yml"] = weakened_ambient_gate[
+        "ambient-host-udp-live.yml"
+    ].replace(
+        '            echo "Live-kernel validation failed or did not complete: ${{ needs.ambient-host-udp-live.result }}." >> "$GITHUB_STEP_SUMMARY"\n            exit 1\n',
+        '            echo "Live-kernel validation failure ignored" >> "$GITHUB_STEP_SUMMARY"\n',
+    )
+    if weakened_ambient_gate == relevance_workflows:
+        failures.append("the Ambient host-UDP gate self-test mutation is stale")
+    elif not live_suite_relevance_errors(
+        weakened_ambient_gate, "self-test workflows"
+    ):
+        failures.append("a fail-open Ambient host-UDP aggregate gate was not rejected")
 
     relevance_mutations: dict[str, tuple[str, str]] = {
         "pull-request-supplied filter": (
