@@ -7,8 +7,8 @@ description: Dispatch and orchestrate local Cursor Grok 4.6 subagents via the st
 
 You are the ORCHESTRATOR. Grok agents implement/fix; you verify their diffs, drive/merge
 decisions, and never let an unreviewed PR merge. This skill drives the operator's own standalone
-`cursor-agent` CLI in print mode, pinned to a non-Fast Cursor Grok 4.6 SKU. It never uses
-Conductor's bundled Cursor harness, whose copies lag the standalone releases.
+`cursor-agent` CLI in print mode, pinned to a Cursor Grok 4.6 SKU. It never uses Conductor's
+bundled Cursor harness, whose copies lag the standalone releases.
 
 **Guard: do NOT use this skill when you are yourself a dispatched worker.** If your session prompt
 references `agent-brief.md` / `continuation-brief.md`, says "YOU are the implementer", or hands
@@ -29,9 +29,13 @@ prompt file outside the repo, then launch:
 `--effort low|medium|high|xhigh|max` selects the Grok reasoning SKU (default `high`). Cursor
 publishes four tiers, so `max` clamps to `xhigh` — do not claim a tier above `xhigh`.
 
+Append `--fast` only when the user explicitly requests fast mode for that dispatch or fleet. Never
+infer it from urgency, deadlines, task size, or available credits. Omit it otherwise; without the
+flag the launcher pins the non-Fast SKU.
+
 Non-negotiables:
-- The launcher pins a **non-Fast** SKU (`cursor-grok-4.6-{low,medium,high,xhigh}`) so runs bill at the
-  standard rate instead of consuming fast credits. The `-fast` variants are never used.
+- The launcher pins a standard SKU (`cursor-grok-4.6-{low,medium,high,xhigh}`) normally and appends
+  `-fast` only with the explicitly authorized `--fast` flag. Fast runs consume fast credits.
 - The `cursor-agent` binary is resolved from `CURSOR_AGENT_BIN`, then `~/.local/bin/cursor-agent`
   / `/opt/homebrew/bin/cursor-agent` / `/usr/local/bin/cursor-agent`, then `PATH`. Any candidate
   under `com.conductor.app` is refused — Conductor's bundle lags the standalone release.

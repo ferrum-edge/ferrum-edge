@@ -6,6 +6,7 @@ usage() {
   printf '%s\n' \
     'Usage: dispatch-agent.sh --worktree ABS_PATH --prompt-file ABS_PATH' \
     '                         [--effort low|medium|high|xhigh|max]' \
+    '                         [--fast]' \
     '                         [--name NAME]' \
     '' \
     'Runs the standalone `cursor-agent` CLI in print mode against composer-2.5.' \
@@ -16,9 +17,9 @@ usage() {
 worktree=''
 prompt_file=''
 effort=''
+fast='false'
 name=''
 
-# Non-Fast SKU: composer-2.5-fast would bill fast credits.
 MODEL='composer-2.5'
 
 while (($#)); do
@@ -49,6 +50,10 @@ while (($#)); do
       fi
       effort=${2-}
       shift 2
+      ;;
+    --fast)
+      fast='true'
+      shift
       ;;
     --name)
       if (($# < 2)); then
@@ -83,6 +88,10 @@ if [[ -n "$effort" ]]; then
       exit 2
       ;;
   esac
+fi
+
+if [[ "$fast" == 'true' ]]; then
+  MODEL='composer-2.5-fast'
 fi
 
 if [[ "$worktree" != /* || ! -d "$worktree" ]]; then
@@ -128,8 +137,8 @@ fi
 
 cd "$physical_worktree"
 
-printf '[composer-agents] dispatch model=%s worktree=%s bin=%s auth=%s%s\n' \
-  "$MODEL" "$physical_worktree" "$cursor_bin" "$auth_source" \
+printf '[composer-agents] dispatch model=%s fast=%s worktree=%s bin=%s auth=%s%s\n' \
+  "$MODEL" "$fast" "$physical_worktree" "$cursor_bin" "$auth_source" \
   "${name:+ name=$name}" >&2
 
 # --print: non-interactive, full tool access (read, write, shell).

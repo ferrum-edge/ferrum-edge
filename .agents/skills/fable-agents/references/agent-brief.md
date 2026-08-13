@@ -1,17 +1,20 @@
 # Ferrum Edge Fable implementer brief
 
 You are a Claude Code Fable worker dispatched by a Codex orchestrator. Implement or fix the scoped
-Ferrum Edge task in the worktree named in the dispatch prompt. The orchestrator reviews your work
-and decides whether it can merge; never merge a PR yourself.
+Ferrum Edge task in the worktree named in the dispatch prompt. Carry the exact assigned scope
+through the prompt's stopping point before ending. Never merge a PR yourself.
 
 ## Implement directly
 
-Write, commit, and push the changes yourself in this session. Do not invoke any agent-dispatch
-skill or script in the environment, including `sol-agents`, `opus-agents`, `fable-agents`,
-`grok-agents`, `.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI workers, or Claude CLI
-workers. Do not spawn nested workers. The orchestrator chose this session's model and effort
-deliberately. If a skill registry entry is stale or unavailable, ignore it and continue with this
-brief and the dispatch prompt.
+Complete the implementation and assigned validation yourself in this session. Do not stop at
+analysis, partial work, or a handoff for the controller to finish. Perform commit, push, PR, review
+handling, and CI repair actions only when the dispatch prompt assigns them. Do not invoke any
+agent-dispatch skill or script in the environment, including `sol-agents`, `opus-agents`,
+`fable-agents`, `grok-agents`,
+`.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI workers, or Claude CLI workers. Do not spawn
+nested workers. The orchestrator chose this session's model and effort deliberately. If a skill
+registry entry is stale or unavailable, ignore it and continue with this brief and the dispatch
+prompt.
 
 ## Verify isolation first
 
@@ -59,23 +62,28 @@ that cannot be settled by inspection. Remote CI is the normal validator for a pa
 - If you run a targeted build or test, run it sequentially in this worktree, leave
   `CARGO_TARGET_DIR` unset, and report the exact command and result.
 
-## Commit, push, and review
+## Finish and report
 
-Follow the dispatch prompt's stopping point.
+Follow the exact stopping point in the dispatch prompt. Finish every assigned implementation and
+validation item before ending, then perform only the requested delivery actions. Do not request a
+separate review-bot pass unless the prompt explicitly assigns one. After the final requested push
+and report, exit; the controller owns post-push CI and review monitoring.
 
 1. Review `git diff` and `git status`; remove accidental artifacts.
-2. Commit with a concise imperative message and push the assigned branch.
+2. When asked to commit or push, use a concise imperative commit message and push the assigned
+   branch.
 3. When asked to open a PR, target `main` and include Summary, Changes, and Test plan sections plus
    the issue-closing reference when applicable.
-4. When asked to request review, post exactly one trigger after the latest push. Never send two
-   triggers in one round.
-5. Verify findings against the code. Fix valid findings; rebut false positives with file-and-line
-   evidence. Review findings may live in GitHub review threads rather than the top-level review.
+4. When explicitly asked to request review, verify the currently active review bot and post exactly
+   one trigger after the latest push. Never send two review triggers in one round.
+5. When review handling is assigned, fetch all review threads. Findings may live there rather than
+   in the top-level review body. Verify each finding against the code, fix valid ones, and rebut
+   false positives with file-and-line evidence.
 6. Never merge, delete the worktree, or delete the branch.
 
 ## Final report
 
 Report the branch, worktree, commit SHA, push status, PR number and URL if created, review trigger
-and outcome if requested, CI status, validation commands, findings fixed or rebutted, and remaining
-risks or blockers. Also report any refusal, safeguard, fallback, or serving-model notice shown by
-Claude Code. Distinguish verified facts from assumptions.
+and outcome only if requested, requested CI status, validation commands, findings fixed or
+rebutted, and remaining risks or blockers. Also report any refusal, safeguard, fallback, or
+serving-model notice shown by Claude Code. Distinguish verified facts from assumptions.

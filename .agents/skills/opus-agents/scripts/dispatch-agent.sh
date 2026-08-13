@@ -6,12 +6,14 @@ usage() {
   printf '%s\n' \
     'Usage: dispatch-agent.sh --worktree ABS_PATH --prompt-file ABS_PATH' \
     '                         --effort low|medium|high|xhigh|max' \
+    '                         [--fast]' \
     "                         [--model 'claude-opus-5[1m]'|'opus[1m]']" >&2
 }
 
 worktree=''
 prompt_file=''
 effort=''
+fast='false'
 model='claude-opus-5[1m]'
 
 while (($#)); do
@@ -42,6 +44,10 @@ while (($#)); do
       fi
       effort=${2-}
       shift 2
+      ;;
+    --fast)
+      fast='true'
+      shift
       ;;
     --model)
       if (($# < 2)); then
@@ -117,12 +123,18 @@ unset CLAUDE_CODE_DISABLE_1M_CONTEXT
 unset CLAUDE_CODE_DISABLE_THINKING
 unset MAX_THINKING_TOKENS
 
-printf '[opus-agents] dispatch model=%s effort=%s worktree=%s bin=%s\n' \
-  "$model" "$effort" "$physical_worktree" "$claude_bin" >&2
+fast_settings='{"fastMode":false}'
+if [[ "$fast" == 'true' ]]; then
+  fast_settings='{"fastMode":true}'
+fi
+
+printf '[opus-agents] dispatch model=%s effort=%s fast=%s worktree=%s bin=%s\n' \
+  "$model" "$effort" "$fast" "$physical_worktree" "$claude_bin" >&2
 
 exec "$claude_bin" -p \
   --model "$model" \
   --effort "$effort" \
+  --settings "$fast_settings" \
   --permission-mode bypassPermissions \
   --output-format text \
   --verbose \

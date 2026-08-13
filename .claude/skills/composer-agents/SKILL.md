@@ -8,8 +8,8 @@ description: Dispatch and orchestrate local Cursor Composer 2.5 subagents via th
 You are the ORCHESTRATOR. Composer agents implement/fix; you verify their diffs, drive merge
 decisions, and never let an unreviewed PR merge. This skill drives the operator's own standalone
 `cursor-agent` CLI in print mode — the same launcher shape as `grok-agents` — pinned to
-`composer-2.5`, the fast tier of the fleet. It never uses Conductor's bundled Cursor harness,
-whose copies lag the standalone releases.
+`composer-2.5` by default, with an optional Fast SKU. It never uses Conductor's bundled Cursor
+harness, whose copies lag the standalone releases.
 
 **Guard: do NOT use this skill when you are yourself a dispatched worker.** If your session prompt
 references `agent-brief.md` / `continuation-brief.md`, says "YOU are the implementer", or hands
@@ -30,9 +30,13 @@ prompt file outside the repo, then launch:
 `--effort low|medium|high|xhigh|max` is accepted for CLI parity with sibling skills but is ignored —
 Composer 2.5 publishes no reasoning tiers. Do not claim an effort level was applied.
 
+Append `--fast` only when the user explicitly requests fast mode for that dispatch or fleet. Never
+infer it from urgency, deadlines, task size, the fleet's "fast tier" label, or available credits.
+Omit it otherwise; without the flag the launcher pins standard mode.
+
 Non-negotiables:
-- The launcher pins **`composer-2.5`**, the non-Fast SKU, so runs bill at the standard rate instead
-  of consuming fast credits. `composer-2.5-fast` is never used.
+- The launcher pins **`composer-2.5`** normally and selects **`composer-2.5-fast`** only with the
+  explicitly authorized `--fast` flag. Fast runs consume fast credits.
 - The `cursor-agent` binary is resolved from `CURSOR_AGENT_BIN`, then `~/.local/bin/cursor-agent`
   / `/opt/homebrew/bin/cursor-agent` / `/usr/local/bin/cursor-agent`, then `PATH`. Any candidate
   under `com.conductor.app` is refused — Conductor's bundle lags the standalone release.

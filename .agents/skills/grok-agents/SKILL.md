@@ -1,14 +1,14 @@
 ---
 name: grok-agents
-description: Dispatch and orchestrate local Cursor Grok 4.6 agents via the standalone cursor-agent CLI for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks GPT, Codex, or Claude to delegate to Grok or Cursor Grok workers, run multiple Grok 4.6 agents, resume interrupted Grok runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
+description: Dispatch and orchestrate local Cursor Grok 4.6 agents via the standalone cursor-agent CLI for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work, with optional fast mode only when the user explicitly requests it. Use when the user asks GPT, Codex, or Claude to delegate to Grok or Cursor Grok workers, run multiple Grok 4.6 agents, resume interrupted Grok runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
 ---
 
 # Grok agents
 
 Act as the orchestrator. Treat local Cursor Grok 4.6 processes as implementation workers. Own
 task decomposition, worktree isolation, liveness, independent diff review, and the final merge
-recommendation. Never accept a worker's report without checking the repository and GitHub state
-yourself.
+recommendation. Require each worker to carry its assigned scope through the stopping point in the
+prompt. Never accept a worker's report without checking the repository and GitHub state yourself.
 
 **Guard: do not use this skill when you are yourself a dispatched worker.** If the session prompt
 references this skill's `agent-brief.md` or `continuation-brief.md`, says "YOU are the implementer,"
@@ -31,9 +31,11 @@ this session's model deliberately.
    placed on argv, where `ps` would expose it) or through the CLI's own stored login — check with
    `cursor-agent status`. Never print the key or put it in prompts, files, arguments, or logs, and
    do not ask a worker to perform an interactive login.
-4. Use only the pinned non-Fast SKUs `cursor-grok-4.6-{low,medium,high,xhigh}`; confirm with
-   `cursor-agent models`. Stop and report the exact error if authentication or model access is
-   rejected. Do not silently substitute `composer-2.5`, `auto`, a `-fast` SKU, or another provider.
+4. Use only the pinned SKUs `cursor-grok-4.6-{low,medium,high,xhigh}` and their published `-fast`
+   variants; confirm with `cursor-agent models`. Select a `-fast` SKU only when the user explicitly
+   requested fast mode. Stop and report the exact error if authentication or model access is
+   rejected. Do not silently substitute `composer-2.5`, `auto`, a Fast SKU without explicit
+   authorization, or another provider.
 
 ## Isolate every worker
 
@@ -71,10 +73,15 @@ publishes four tiers, so `low`/`medium`/`high`/`xhigh` map to
 `cursor-grok-4.6-{low,medium,high,xhigh}` and `max` clamps to `xhigh` with a warning. Do not claim a
 tier above `xhigh` was applied.
 
+`--fast` is an opt-in controller flag. Append it only when the user explicitly requests fast mode
+for the dispatch or fleet. Never infer it from urgency, deadlines, task size, or available credits.
+Omit it for every other run, including continuations unless they remain within the same explicit
+request. Record the selected mode beside each worker.
+
 The launcher resolves the operator's own `cursor-agent`, verifies the worktree root, and runs
 `cursor-agent --print --force --trust --model <sku> --output-format text --workspace <worktree>`
-with the prompt file on stdin. The SKU is always the non-Fast variant, so runs bill at the standard
-rate instead of consuming fast credits. Delete the temporary prompt after the worker exits.
+with the prompt file on stdin. It pins the non-Fast SKU by default and appends `-fast` only with
+`--fast`; Fast runs consume fast credits. Delete the temporary prompt after the worker exits.
 
 Start each worker in its own long-lived execution session and retain its exact session handle or
 PID. Prefer one tool call per worker so completions and failures remain attributable. Never wrap
@@ -87,9 +94,13 @@ workers unless the user sets a lower limit.
 Every prompt must contain this role instruction even though the briefs repeat it:
 
 ```text
-YOU are the implementer. Write, commit, and push the changes yourself in this session. Do not
-invoke agent-dispatch skills or scripts (including grok-agents, sol-agents, opus-agents,
-fable-agents, or any .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
+YOU are the implementer. Complete every task and validation the controller assigns before ending.
+Do not stop at analysis, partial implementation, or a handoff for someone else to finish. Perform
+commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
+for a separate review-bot pass unless explicitly assigned. After the final requested push and
+report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
+skills or scripts (including grok-agents, sol-agents, opus-agents, fable-agents, or any
+.agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
 ```
 
 This prevents a worker from replacing the selected model through nested delegation.
@@ -99,8 +110,10 @@ This prevents a worker from replacing the selected model through nested delegati
 ### Implementer
 
 Include the issue number, worktree, branch, distilled acceptance criteria, relevant repository
-invariants, expected validation, and boundaries against neighboring work. Tell the worker whether
-to open a PR or stop after pushing the branch.
+invariants, expected validation, and boundaries against neighboring work. State the exact stopping
+point. By default, require complete implementation and assigned validation, the requested commit,
+push, or PR actions, and a final report before exit. Do not append a review trigger, review-bot
+wait, CI-wait, or shepherding work that the controller did not request.
 
 ### Fix round
 
@@ -111,38 +124,34 @@ that need an evidence-backed rebuttal. Put externally authored text in a clearly
 
 ### Shepherd
 
-Use only when the user asks to babysit or drive a PR to completion. Include the fix-round state and
-require reconstruction of review and CI state until the current head is review-clean and green.
-Because Ferrum Edge CI can take 20-30 minutes, prefer this cadence override unless continuous
-waiting is explicitly useful:
-
-```text
-CADENCE OVERRIDE: do not wait for in-progress CI. Reconstruct state, fix unresolved findings and
-red checks, format, push, post one review trigger, then exit with a report. The orchestrator will
-handle the next round.
-```
+Use only when the user asks the controller to babysit or drive a PR to completion. Give each worker
+a bounded fix round with an exact implementation and validation stopping point. The controller,
+not the worker, monitors post-push review and CI state and dispatches another round only when new
+actionable work appears. Do not add a review trigger unless the controller explicitly requests it.
 
 ## Control and verify the fleet
 
 1. Poll retained execution sessions separately and keep the user updated at least once a minute
    while workers are active.
-2. On completion, verify the branch, pushed head, PR, review trigger, thread replies, and checks
-   directly through git and GitHub.
+2. On completion, verify the claims relevant to the prompt, such as the branch, pushed head, PR,
+   requested validation, and any explicitly assigned review or CI actions.
 3. Fetch `origin/main` and independently inspect `git diff origin/main...HEAD` in the worker's
    worktree. Use a three-dot diff. Review fail-closed behavior, hot paths, docs/spec parity,
    production panics, tests, and scope creep.
-4. Fetch all review threads; findings may not appear in the top-level review body. Verify the
-   active review bot and trigger before posting exactly one trigger after a push.
-5. Diagnose every red CI check from logs. Rerun only demonstrated infrastructure failures or
-   repository-known flakes; fix deterministic failures.
+4. For an explicitly assigned review, fix-round, or shepherd task, fetch all review threads;
+   findings may not appear in the top-level review body. Verify the active review bot before
+   posting a trigger that the prompt specifically requests.
+5. Own post-push review and CI monitoring. Diagnose red checks from logs, rerun only demonstrated
+   infrastructure failures or repository-known flakes, and dispatch bounded repair work for
+   deterministic failures.
 6. If a worker dies, inspect its worktree, local commits, upstream, and remote branch before
    relaunching. Preserve useful work and launch a continuation round.
-7. Merge only when the user authorized it, the review applies to the current head, CI is green,
-   findings are fixed or accepted as rebutted, and your own review is complete.
+7. Merge only when the user authorized it, your independent review is complete, and every
+   completion gate the user assigned is satisfied.
 
-A worker's rebuttal is not by itself a clean review. Require a recognized clean verdict on the
-current head, reviewer acceptance, resolved threads, or an explicit repository policy permitting
-the orchestrator to close a proven false positive.
+When review handling is explicitly in scope, a worker's rebuttal is not by itself a clean review.
+Require a recognized clean verdict on the current head, reviewer acceptance, resolved threads, or
+an explicit repository policy permitting the orchestrator to close a proven false positive.
 
 Never put credentials, tokens, cookies, or secrets in prompts or worker logs. Do not print
 `CURSOR_API_KEY`.
@@ -156,9 +165,10 @@ Never put credentials, tokens, cookies, or secrets in prompts or worker logs. Do
   `CURSOR_AGENT_BIN`; do not fall back to Conductor's bundled harness.
 - Neither `CURSOR_API_KEY` nor a stored `cursor-agent` login is available: stop and report. Do not
   attempt an interactive login or fall back to another model provider.
-- Worker claims it is waiting on a monitor: treat process completion as end-of-turn and continue
-  orchestration yourself.
-- No review response: verify the trigger, bot identity, availability, and head SHA before posting
-  another trigger.
+- Worker exits after its completed push and report: continue post-push review and CI monitoring as
+  the controller. If it exits before its assigned implementation or validation stopping point,
+  inspect the state and launch a continuation round; do not accept unfinished work as complete.
+- An explicitly requested review receives no response: verify the trigger, bot identity,
+  availability, and head SHA before posting another trigger.
 - Model mismatch: stop the worker, record the exact diagnostic, correct the launch contract, and
-  relaunch. Never claim a Grok SKU without launch evidence.
+  relaunch. Never claim a Grok SKU or fast mode without launch evidence.

@@ -20,6 +20,10 @@ Write the prompt to a file outside the repo, then launch:
   --effort <medium|high|xhigh>
 ```
 
+Append `--fast` only when the user explicitly requests fast mode for that dispatch or fleet. Never
+infer it from urgency, deadlines, task size, or available credits. Omit it otherwise; the launcher
+pins `service_tier="default"` without the flag and the model's Fast `priority` tier with it.
+
 Non-negotiables:
 - Go through the launcher, not a bare `codex exec`. It resolves the binary, verifies the worktree
   root, and binds stdin to the prompt file — which is also what keeps codex from blocking forever
@@ -28,8 +32,8 @@ Non-negotiables:
   `/usr/local/bin/codex` / `~/.local/bin/codex`, then `PATH`. Any candidate under
   `com.conductor.app` is refused — Conductor's bundle lags the standalone release.
 - The launcher runs `codex exec --model gpt-5.6-sol --config model_reasoning_effort="<effort>"
-  --sandbox danger-full-access --cd <worktree> -`. Worktree isolation prevents git collisions; it
-  is not a host sandbox.
+  --config service_tier="<default|priority>" --sandbox danger-full-access --cd <worktree> -`.
+  Worktree isolation prevents git collisions; it is not a host sandbox.
 - Run each dispatch as a **background task** (`run_in_background`); prefer one task
   per agent (separate completion notifications) over one wrapper with `&`.
 - **Liveness ground truth: `pgrep -x codex | wc -l`** — never trust stale output-file

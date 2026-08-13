@@ -6,16 +6,18 @@ usage() {
   printf '%s\n' \
     'Usage: dispatch-agent.sh --worktree ABS_PATH --prompt-file ABS_PATH' \
     '                         [--effort low|medium|high|xhigh|max]' \
+    '                         [--fast]' \
     '                         [--name NAME]' \
     '' \
-    'Runs the standalone `cursor-agent` CLI in print mode against a non-Fast' \
-    'Cursor Grok 4.6 SKU. --effort selects the SKU (default high); Cursor exposes' \
+    'Runs the standalone `cursor-agent` CLI in print mode against a Cursor Grok' \
+    '4.6 SKU. --effort selects the SKU (default high); Cursor exposes' \
     'low/medium/high/xhigh, so max resolves to xhigh.' >&2
 }
 
 worktree=''
 prompt_file=''
 effort='high'
+fast='false'
 name=''
 
 while (($#)); do
@@ -47,6 +49,10 @@ while (($#)); do
       effort=${2-}
       shift 2
       ;;
+    --fast)
+      fast='true'
+      shift
+      ;;
     --name)
       if (($# < 2)); then
         printf 'Missing value for --name\n' >&2
@@ -68,9 +74,9 @@ while (($#)); do
   esac
 done
 
-# Non-Fast SKUs only: the `-fast` variants bill fast credits. Cursor publishes
-# four Grok 4.6 reasoning tiers, so max clamps to xhigh rather than
-# silently pretending a higher tier was applied.
+# Cursor publishes standard and Fast variants for four Grok 4.6 reasoning
+# tiers, so max clamps to xhigh rather than silently pretending a higher tier
+# was applied. Fast selection happens only after the effort mapping.
 case "$effort" in
   low) model='cursor-grok-4.6-low' ;;
   medium) model='cursor-grok-4.6-medium' ;;
@@ -87,6 +93,10 @@ case "$effort" in
     exit 2
     ;;
 esac
+
+if [[ "$fast" == 'true' ]]; then
+  model="${model}-fast"
+fi
 
 if [[ "$worktree" != /* || ! -d "$worktree" ]]; then
   printf 'Worktree must be an existing absolute directory: %s\n' "${worktree:-<empty>}" >&2
@@ -131,8 +141,8 @@ fi
 
 cd "$physical_worktree"
 
-printf '[grok-agents] dispatch model=%s effort=%s worktree=%s bin=%s auth=%s%s\n' \
-  "$model" "$effort" "$physical_worktree" "$cursor_bin" "$auth_source" \
+printf '[grok-agents] dispatch model=%s effort=%s fast=%s worktree=%s bin=%s auth=%s%s\n' \
+  "$model" "$effort" "$fast" "$physical_worktree" "$cursor_bin" "$auth_source" \
   "${name:+ name=$name}" >&2
 
 # --print: non-interactive, full tool access (read, write, shell).
