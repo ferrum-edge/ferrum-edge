@@ -6,8 +6,8 @@ name: Launch Readiness
 #
 # Private advisories: the Actions GITHUB_TOKEN cannot list repository security
 # advisories (that is a separate GitHub permission, NOT `security-events`), so
-# trusted runs may use an explicitly provisioned read-only advisory token and
-# every other run falls back to externally maintained repository variables that
+# default-branch runs may use an explicitly provisioned read-only advisory token
+# and every other run falls back to externally maintained repository variables that
 # carry only a redacted count and an audit timestamp. A pull request can read
 # those variables but cannot change them. See docs/launch-readiness.md.
 
@@ -61,7 +61,7 @@ jobs:
           # Externally maintained, redacted, and read-only from a pull request.
           LAUNCH_PRIVATE_BLOCKER_COUNT: ${{ vars.LAUNCH_PRIVATE_BLOCKER_COUNT }}
           LAUNCH_PRIVATE_ADVISORY_AS_OF: ${{ vars.LAUNCH_PRIVATE_ADVISORY_AS_OF }}
-          # Never expose a privileged advisory token to pull-request or
-          # merge-group code; those runs use the redacted variables above.
-          LAUNCH_ADVISORY_READ_TOKEN: ${{ (github.event_name != 'pull_request' && github.event_name != 'merge_group') && secrets.LAUNCH_ADVISORY_READ_TOKEN || '' }}
+          # Only default-branch code may receive the privileged advisory token.
+          # In particular, a v* tag can point at attacker-controlled code.
+          LAUNCH_ADVISORY_READ_TOKEN: ${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && secrets.LAUNCH_ADVISORY_READ_TOKEN || '' }}
         run: python3 -I scripts/check_launch_readiness.py --verify --verify-checkout

@@ -103,7 +103,7 @@
     "live_api": {
       "token_env": "LAUNCH_ADVISORY_READ_TOKEN",
       "actions_security_events_permission_is_insufficient": true,
-      "notes": "Repository security advisories are a separate GitHub permission. The Actions GITHUB_TOKEN is refused (403) even with security-events: read, so the live listing needs an explicitly provisioned read-only advisory token supplied only to trusted (non-pull-request, non-merge-group) runs."
+      "notes": "Repository security advisories are a separate GitHub permission. The Actions GITHUB_TOKEN is refused (403) even with security-events: read, so the live listing needs an explicitly provisioned read-only advisory token supplied only to default-branch runs; pull-request, merge-group, tag, and release runs use the redacted fallback."
     },
     "trusted_fallback": {
       "count_variable": "LAUNCH_PRIVATE_BLOCKER_COUNT",

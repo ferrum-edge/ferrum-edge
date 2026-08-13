@@ -82,10 +82,11 @@ Two supported sources, in order:
 
 1. **Live API (preferred).** Provision a read-only credential that can list this
    repository's security advisories and store it as the repository secret
-   `LAUNCH_ADVISORY_READ_TOKEN`. It is exposed **only** to trusted executions
-   (`push` to `main`, tags, `schedule`, `workflow_dispatch`, and the release
-   workflow). Pull-request and merge-group runs are given an empty value by
-   construction, so untrusted code never sees a privileged advisory token. Any
+   `LAUNCH_ADVISORY_READ_TOKEN`. It is exposed **only** to executions of
+   default-branch code (`push` to `main`, `schedule`, and `workflow_dispatch`
+   on `main`). Pull-request, merge-group, tag, and release runs are given an
+   empty value by construction, so code selected by an untrusted ref never sees
+   a privileged advisory token. Any
    live failure — denial, rate limit, transport, pagination, or schema — is
    `UNKNOWN`; it never falls back to a weaker source.
 2. **Externally maintained redacted variables.** When no advisory token is
