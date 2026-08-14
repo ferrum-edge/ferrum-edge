@@ -3139,13 +3139,15 @@ where
     };
     let need_lookup_after_retract = current_uid.is_none();
 
-    if let Err(error) = retract_registry_sync() {
+    let registry_sync_retraction_failed = if let Err(error) = retract_registry_sync() {
         warn!(
             %error,
-            "could not retract the Ambient UDP registry proof before a node identity lookup or change; keeping capture mutations and readiness fenced"
+            "could not retract the Ambient UDP registry proof before a node identity lookup or change; retracting node identity and keeping capture mutations and readiness fenced"
         );
-        return NodeIdentityRefresh::Fenced { uid: None };
-    }
+        true
+    } else {
+        false
+    };
     if let Err(error) = retract_identity() {
         error!(
             %error,
@@ -3154,6 +3156,9 @@ where
              UDP registry proof on this incarnation, because a surviving stale publication names \
              a node UID this agent cannot vouch for"
         );
+        return NodeIdentityRefresh::Fenced { uid: None };
+    }
+    if registry_sync_retraction_failed {
         return NodeIdentityRefresh::Fenced { uid: None };
     }
 

@@ -146,21 +146,50 @@ async fn stable_uid_revalidation_does_not_retract_registry_sync() {
 }
 
 #[tokio::test]
-async fn registry_sync_retraction_failure_fences_and_drops_the_uid() {
+async fn registry_sync_retraction_failure_still_retracts_identity_before_fencing() {
     let journal = IdentityJournal::new();
+    let lookups = AtomicUsize::new(0);
     let (_shutdown_tx, mut shutdown) = tokio::sync::watch::channel(false);
 
     let refresh = refresh_node_identity_binding_for_test(
-        Some(NODE_A),
+        None,
         &mut shutdown,
-        || async { Ok(NODE_B.to_string()) },
+        || {
+            lookups.fetch_add(1, Ordering::SeqCst);
+            async { Ok(NODE_B.to_string()) }
+        },
         || Err("registry marker is immutable".to_string()),
         || journal.retract_identity(),
         |uid| journal.publish(uid),
     )
     .await;
     assert_eq!(refresh, NodeIdentityRefreshForTest::Fenced { uid: None });
-    assert_eq!(journal.identity_retracts.load(Ordering::SeqCst), 0);
+    assert_eq!(journal.identity_retracts.load(Ordering::SeqCst), 1);
+    assert_eq!(lookups.load(Ordering::SeqCst), 0);
+    assert!(journal.publishes.lock().expect("journal").is_empty());
+}
+
+#[tokio::test]
+async fn registry_sync_retraction_failure_on_uid_change_still_retracts_identity_before_fencing() {
+    let journal = IdentityJournal::new();
+    let lookups = AtomicUsize::new(0);
+    let (_shutdown_tx, mut shutdown) = tokio::sync::watch::channel(false);
+
+    let refresh = refresh_node_identity_binding_for_test(
+        Some(NODE_A),
+        &mut shutdown,
+        || {
+            lookups.fetch_add(1, Ordering::SeqCst);
+            async { Ok(NODE_B.to_string()) }
+        },
+        || Err("registry marker is immutable".to_string()),
+        || journal.retract_identity(),
+        |uid| journal.publish(uid),
+    )
+    .await;
+    assert_eq!(refresh, NodeIdentityRefreshForTest::Fenced { uid: None });
+    assert_eq!(journal.identity_retracts.load(Ordering::SeqCst), 1);
+    assert_eq!(lookups.load(Ordering::SeqCst), 1);
     assert!(journal.publishes.lock().expect("journal").is_empty());
 }
 
