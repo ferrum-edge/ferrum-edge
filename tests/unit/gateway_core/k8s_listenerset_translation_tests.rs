@@ -127,6 +127,26 @@ fn http_route(name: &str, parent_refs: Value, hostname: &str, path: &str) -> K8s
     )
 }
 
+fn grpc_route(name: &str, parent_refs: Value, hostname: &str) -> K8sObject {
+    object(
+        "GRPCRoute",
+        name,
+        json!({
+            "parentRefs": parent_refs,
+            "hostnames": [hostname],
+            "rules": [{
+                "matches": [{
+                    "method": {
+                        "service": "secure.example.Echo",
+                        "method": "Tls"
+                    }
+                }],
+                "backendRefs": [{ "name": "backend", "port": 8080 }]
+            }]
+        }),
+    )
+}
+
 fn service(name: &str) -> K8sObject {
     let mut svc = object(
         "Service",
@@ -1401,6 +1421,15 @@ fn secure_http_and_udp_gateway_listeners_fail_closed_on_quic_port() {
                     "secure.example.com",
                     "/tls",
                 ));
+            } else {
+                objects.push(grpc_route(
+                    "secure-grpc",
+                    json!([{
+                        "name": "edge",
+                        "sectionName": "secure-http"
+                    }]),
+                    "secure.example.com",
+                ));
             }
             let translation = translate_k8s_objects(&objects, options()).expect("translate");
 
@@ -1434,9 +1463,48 @@ fn secure_http_and_udp_gateway_listeners_fail_closed_on_quic_port() {
                 !conflict.message.contains("secure-http")
                     && !conflict.message.contains("edge-cert")
                     && !conflict.message.contains("secure.example.com")
-                    && !conflict.message.contains("secure-api"),
+                    && !conflict.message.contains("secure-api")
+                    && !conflict.message.contains("secure-grpc"),
                 "ProtocolConflict must not leak object identifiers: {}",
                 conflict.message
+            );
+            let mesh_services = translation
+                .config
+                .mesh
+                .as_ref()
+                .map(|mesh| mesh.services.as_slice())
+                .unwrap_or(&[]);
+            let expected_secure = gateway_api_listener_mesh_service_name(
+                GatewayApiListenerParentKind::Gateway,
+                "edge",
+                "secure-http",
+            );
+            let expected_udp = gateway_api_listener_mesh_service_name(
+                GatewayApiListenerParentKind::Gateway,
+                "edge",
+                "udp",
+            );
+            assert!(
+                mesh_services
+                    .iter()
+                    .any(|service| service.name == expected_secure),
+                "{secure_protocol}+UDP order {:?} must materialize secure-http: {:?}",
+                listener_order,
+                mesh_services
+                    .iter()
+                    .map(|service| service.name.as_str())
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                !mesh_services
+                    .iter()
+                    .any(|service| service.name == expected_udp),
+                "{secure_protocol}+UDP order {:?} must not materialize UDP: {:?}",
+                listener_order,
+                mesh_services
+                    .iter()
+                    .map(|service| service.name.as_str())
+                    .collect::<Vec<_>>()
             );
             if secure_protocol == "HTTPS" {
                 assert!(
@@ -1453,6 +1521,21 @@ fn secure_http_and_udp_gateway_listeners_fail_closed_on_quic_port() {
                         .proxies
                         .iter()
                         .map(|proxy| (&proxy.hosts, &proxy.listen_path, proxy.listen_port))
+                        .collect::<Vec<_>>()
+                );
+            } else {
+                assert!(
+                    translation.config.proxies.iter().any(|proxy| {
+                        proxy.hosts.iter().any(|host| host == "secure.example.com")
+                            && proxy.listen_port == Some(9443)
+                            && proxy.backend_port == 8080
+                    }),
+                    "GRPCS+UDP must preserve the GRPCRoute: {:?}",
+                    translation
+                        .config
+                        .proxies
+                        .iter()
+                        .map(|proxy| (&proxy.hosts, proxy.listen_port, proxy.backend_port))
                         .collect::<Vec<_>>()
                 );
             }
@@ -1524,6 +1607,42 @@ fn delegated_udp_listenerset_cannot_withdraw_parent_secure_http_listener() {
             .get(&udp_key)
             .map(|conflict| conflict.reason),
         Some("ProtocolConflict")
+    );
+    let mesh_services = translation
+        .config
+        .mesh
+        .as_ref()
+        .map(|mesh| mesh.services.as_slice())
+        .unwrap_or(&[]);
+    let expected_https = gateway_api_listener_mesh_service_name(
+        GatewayApiListenerParentKind::Gateway,
+        "edge",
+        "https",
+    );
+    let expected_udp = gateway_api_listener_mesh_service_name(
+        GatewayApiListenerParentKind::ListenerSet,
+        "tenant-udp",
+        "udp",
+    );
+    assert!(
+        mesh_services
+            .iter()
+            .any(|service| service.namespace == "platform" && service.name == expected_https),
+        "parent HTTPS must remain materialized: {:?}",
+        mesh_services
+            .iter()
+            .map(|service| (service.namespace.as_str(), service.name.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !mesh_services
+            .iter()
+            .any(|service| service.namespace == "tenant" && service.name == expected_udp),
+        "delegated UDP must not materialize: {:?}",
+        mesh_services
+            .iter()
+            .map(|service| (service.namespace.as_str(), service.name.as_str()))
+            .collect::<Vec<_>>()
     );
 }
 
