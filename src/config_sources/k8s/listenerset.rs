@@ -348,21 +348,26 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
             });
     }
 
-    let mut conflicted: HashMap<GatewayApiListenerKey, &'static str> = HashMap::new();
+    let mut conflicted: HashMap<GatewayApiListenerKey, ListenerConflictReason> = HashMap::new();
 
     // ProtocolConflict is physical and process-wide: socket ownership is not
     // parent-Gateway-scoped (`GatewayListenerPlan::from_config` builds one
     // global stream_ports set). For each numeric TCP port across every eligible
     // managed Gateway and attached ListenerSet claim in this accumulator, if any
     // eligible HTTP-family claim coexists with any eligible raw TCP/TLS-stream
-    // claim, every eligible claim in those two families is refused. TCP and UDP
-    // are independent socket namespaces, so a UDP/DTLS claim on the same
-    // numeric port is not a translation ProtocolConflict. Runtime admission
-    // (`GatewayListenerPlan::quic_refused`) refuses only the optional QUIC/H3
-    // half while both the HTTPS TCP listener and the UDP/DTLS stream remain
-    // materialized. A sequential accept/remove walk is wrong for 3+ claims
-    // (HTTP, TCP, HTTP): removing the first pair from `accepted` would let a
-    // later same-family sibling survive depending on listener/name order.
+    // claim, every eligible claim in those two families is refused. TLS-class
+    // Secure HTTP (HTTPS/GRPCS with admitted frontend TLS) is the same QUIC
+    // eligibility the runtime uses: HTTP/3 binds a UDP socket on that numeric
+    // port. Translation does not observe `FERRUM_ENABLE_HTTP3`, so a
+    // materializable Secure HTTP claim takes precedence over a UDP stream on
+    // that port. Refusing only the UDP claim preserves the independent HTTPS
+    // TCP socket (and prevents a delegated ListenerSet from withdrawing it).
+    // Plain HTTP/GRPC is not QUIC-capable and still
+    // coexists with UDP. Unresolved HTTPS/GRPCS (no TLS material) never
+    // become Tls-class listeners, so they do not reserve the UDP port. A
+    // sequential accept/remove walk is wrong for 3+ claims (HTTP, TCP, HTTP):
+    // removing the first pair from `accepted` would let a later same-family
+    // sibling survive depending on listener/name order.
     let mut candidates_by_port: BTreeMap<u64, Vec<&ConflictCandidate>> = BTreeMap::new();
     for candidates in by_gateway.values() {
         for candidate in candidates.iter() {
@@ -379,14 +384,51 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
     }
     for port_candidates in candidates_by_port.values() {
         let has_http = port_candidates.iter().any(|candidate| {
-            listener_port_family(candidate.protocol.as_str()) == Some(ListenerPortFamily::Http)
+            matches!(
+                listener_port_family(candidate.protocol.as_str()),
+                Some(ListenerPortFamily::Http | ListenerPortFamily::SecureHttp)
+            )
         });
         let has_tcp_stream = port_candidates.iter().any(|candidate| {
             listener_port_family(candidate.protocol.as_str()) == Some(ListenerPortFamily::TcpStream)
         });
-        if has_http && has_tcp_stream {
-            for candidate in port_candidates {
-                conflicted.insert(candidate.key.clone(), "ProtocolConflict");
+        let has_secure_http = port_candidates.iter().any(|candidate| {
+            listener_port_family(candidate.protocol.as_str())
+                == Some(ListenerPortFamily::SecureHttp)
+        });
+        let has_udp = port_candidates.iter().any(|candidate| {
+            listener_port_family(candidate.protocol.as_str()) == Some(ListenerPortFamily::Udp)
+        });
+        // HTTPS/GRPCS stay HTTP-family for TCP/TLS stream refusal and for
+        // hostname / route attachment elsewhere. UDP arbitration is the only
+        // extra SecureHttp rule, and it is gated on eligible (TLS-materializable)
+        // claims so it cannot outrun the runtime QUIC collision.
+        let quic_udp_conflict = has_secure_http && has_udp;
+        for candidate in port_candidates {
+            let family = listener_port_family(candidate.protocol.as_str());
+            let tcp_conflict = has_http
+                && has_tcp_stream
+                && matches!(
+                    family,
+                    Some(
+                        ListenerPortFamily::Http
+                            | ListenerPortFamily::SecureHttp
+                            | ListenerPortFamily::TcpStream
+                    )
+                );
+            let quic_conflict = quic_udp_conflict && family == Some(ListenerPortFamily::Udp);
+            if tcp_conflict {
+                conflicted.insert(
+                    candidate.key.clone(),
+                    ListenerConflictReason::ProtocolConflict(
+                        ListenerProtocolConflictKind::TcpFamily,
+                    ),
+                );
+            } else if quic_conflict {
+                conflicted.insert(
+                    candidate.key.clone(),
+                    ListenerConflictReason::ProtocolConflict(ListenerProtocolConflictKind::QuicUdp),
+                );
             }
         }
     }
@@ -427,20 +469,24 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
             // Process-wide HTTP-family vs raw TCP/TLS ProtocolConflict was
             // already decided above; this walk applies only same-protocol
             // HostnameConflict.
-            if let Some(reason) = conflict_against_accepted(candidate, &accepted) {
-                conflicted.insert(candidate.key.clone(), reason);
+            if let Some(_reason) = conflict_against_accepted(candidate, &accepted) {
+                conflicted.insert(
+                    candidate.key.clone(),
+                    ListenerConflictReason::HostnameConflict,
+                );
                 continue;
             }
             accepted.push(candidate);
         }
     }
 
-    for (key, reason) in &conflicted {
+    for (key, conflict) in &conflicted {
+        let reason = conflict.reason_code();
         {
             let Some(policy) = acc.gateway_api_listener_policies.get_mut(key) else {
                 continue;
             };
-            policy.conflict_reason = Some(*reason);
+            policy.conflict_reason = Some(reason);
             policy.materializable = false;
             policy.routes_materializable = false;
         }
@@ -454,8 +500,8 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
         // Gateway.status.listeners[] reads only `gateway_api_listener_conflicts`.
         // Withdrawal without an entry leaves Conflicted=False / Accepted=True
         // while no traffic materializes.
-        let message = match *reason {
-            "ProtocolConflict" => {
+        let message = match *conflict {
+            ListenerConflictReason::ProtocolConflict(kind) => {
                 let port = acc
                     .gateway_api_listener_policies
                     .get(key)
@@ -463,17 +509,24 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
                     .unwrap_or(0);
                 // Deterministic bounded wording: numeric port + families only.
                 // Never echo object/listener/hostname names (cross-tenant risk).
-                format!(
-                    "Port {port} is claimed by incompatible protocol families on the same TCP \
-                     transport (HTTP-family vs raw stream), so every conflicting claim on this \
-                     port is refused (Conflicted)."
-                )
+                // Classify per candidate at arbitration time so coexisting TCP-
+                // family and QUIC/UDP rules on one port stay accurate.
+                match kind {
+                    ListenerProtocolConflictKind::QuicUdp => format!(
+                        "Port {port} is claimed by secure HTTP/QUIC and a UDP stream, so the UDP \
+                         claim is refused (Conflicted)."
+                    ),
+                    ListenerProtocolConflictKind::TcpFamily => format!(
+                        "Port {port} is claimed by incompatible protocol families on the same TCP \
+                         transport (HTTP-family vs raw stream), so every conflicting claim on this \
+                         port is refused (Conflicted)."
+                    ),
+                }
             }
-            "HostnameConflict" => {
+            ListenerConflictReason::HostnameConflict => {
                 "Listener hostname conflicts with a higher-precedence listener on the same port."
                     .to_string()
             }
-            other => format!("Gateway API listener rejected: {other}"),
         };
         acc.gateway_api_listener_conflicts
             .insert(key.clone(), GatewayApiListenerConflict { reason, message });
@@ -708,23 +761,52 @@ fn conflict_against_accepted(
 /// OS/datapath family for Gateway API listener protocol conflict arbitration.
 ///
 /// TCP and UDP may ordinarily share a numeric port (different transports).
-/// UDP is omitted here so ProtocolConflict covers only HTTP-family vs raw
-/// TCP/TLS stream on the same numeric TCP port. Optional QUIC/H3 collision
-/// with a UDP/DTLS stream is owned by runtime
-/// `GatewayListenerPlan::quic_refused`. Compatible HTTP-family siblings and
-/// opaque TCP/TLS stream siblings are not ProtocolConflict here —
-/// plaintext-vs-TLS HTTP shapes are refused by
+/// `SecureHttp` is HTTP-family for TCP/TLS stream refusal, hostname
+/// distinctness, and route attachment; it is distinct only for UDP because a
+/// TLS-materializable HTTPS/GRPCS listener is QUIC-capable (the same Tls-class
+/// contract `GatewayListenerPlan` uses). Within TCP, HTTP-family accept loops
+/// cannot share a socket with raw TCP / TLS-passthrough stream listeners.
+/// Compatible HTTP-family siblings and opaque TCP/TLS stream siblings are not
+/// ProtocolConflict here — plaintext-vs-TLS HTTP shapes are refused by
 /// [`super::gateway_api::refuse_incompatible_same_port_listeners`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ListenerPortFamily {
     Http,
+    SecureHttp,
     TcpStream,
+    Udp,
+}
+
+/// Per-candidate ProtocolConflict classification for bounded status wording.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListenerProtocolConflictKind {
+    /// HTTP-family vs raw TCP/TLS stream on the same numeric TCP port.
+    TcpFamily,
+    /// Materializable SecureHttp vs UDP on the same numeric port (QUIC/UDP).
+    QuicUdp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListenerConflictReason {
+    ProtocolConflict(ListenerProtocolConflictKind),
+    HostnameConflict,
+}
+
+impl ListenerConflictReason {
+    fn reason_code(self) -> &'static str {
+        match self {
+            Self::ProtocolConflict(_) => "ProtocolConflict",
+            Self::HostnameConflict => "HostnameConflict",
+        }
+    }
 }
 
 fn listener_port_family(protocol: &str) -> Option<ListenerPortFamily> {
     match protocol.to_ascii_uppercase().as_str() {
-        "HTTP" | "GRPC" | "HTTPS" | "GRPCS" => Some(ListenerPortFamily::Http),
+        "HTTP" | "GRPC" => Some(ListenerPortFamily::Http),
+        "HTTPS" | "GRPCS" => Some(ListenerPortFamily::SecureHttp),
         "TCP" | "TLS" => Some(ListenerPortFamily::TcpStream),
+        "UDP" => Some(ListenerPortFamily::Udp),
         _ => None,
     }
 }

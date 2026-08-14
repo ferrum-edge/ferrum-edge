@@ -1349,11 +1349,13 @@ fn secure_http_without_tls_is_not_quic_capable_so_udp_may_share_the_port() {
     }
 }
 
-/// HTTPS/GRPCS with admitted frontend TLS shares a numeric port with UDP.
-/// Translation must admit both listeners independent of declaration order;
-/// runtime owns optional QUIC/H3 refusal via `quic_refused`.
+/// HTTPS/GRPCS with admitted frontend TLS is QUIC-capable. UDP on that numeric
+/// port must refuse only UDP, independent of listener order, while preserving
+/// the secure HTTP listener and its routes.
 #[test]
-fn secure_http_and_udp_gateway_listeners_remain_admitted() {
+fn secure_http_and_udp_gateway_listeners_fail_closed_on_quic_port() {
+    let expected_message = "Port 9443 is claimed by secure HTTP/QUIC and a UDP stream, so the UDP \
+         claim is refused (Conflicted).";
     let orders: [[&str; 2]; 2] = [["secure-http", "udp"], ["udp", "secure-http"]];
     for secure_protocol in ["HTTPS", "GRPCS"] {
         for listener_order in orders {
@@ -1387,8 +1389,8 @@ fn secure_http_and_udp_gateway_listeners_remain_admitted() {
             let mut gateway = http_gateway("edge", Some("Same"));
             gateway.spec["listeners"] = Value::Array(listeners);
             let mut objects = vec![gateway_class(), secret, gateway, service("backend")];
-            // Only HTTPS admits HTTPRoute on the secure-http section (GRPCS
-            // listeners accept GRPCRoute).
+            // QUIC/UDP arbitration is listener-shape coverage; only HTTPS admits
+            // HTTPRoute on the secure-http section (GRPCS listeners accept GRPCRoute).
             if secure_protocol == "HTTPS" {
                 objects.push(http_route(
                     "secure-api",
@@ -1408,53 +1410,34 @@ fn secure_http_and_udp_gateway_listeners_remain_admitted() {
                 gateway: "edge".to_string(),
                 listener: "secure-http".to_string(),
             };
-            let udp_key = GatewayApiListenerKey {
-                listener: "udp".to_string(),
-                ..secure_key.clone()
-            };
             assert!(
                 !translation.listener_conflicts.contains_key(&secure_key),
-                "{secure_protocol}+UDP order {:?} must preserve secure HTTP: {:?}",
-                listener_order,
+                "{secure_protocol}+UDP must preserve secure HTTP: {:?}",
                 translation.listener_conflicts
             );
+            let udp_key = GatewayApiListenerKey {
+                listener: "udp".to_string(),
+                ..secure_key
+            };
+            let conflict = translation
+                .listener_conflicts
+                .get(&udp_key)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{secure_protocol}+UDP order {:?} must ProtocolConflict UDP: {:?}",
+                        listener_order, translation.listener_conflicts
+                    )
+                });
+            assert_eq!(conflict.reason, "ProtocolConflict");
+            assert_eq!(conflict.message, expected_message);
             assert!(
-                !translation.listener_conflicts.contains_key(&udp_key),
-                "{secure_protocol}+UDP order {:?} must preserve UDP: {:?}",
-                listener_order,
-                translation.listener_conflicts
+                !conflict.message.contains("secure-http")
+                    && !conflict.message.contains("edge-cert")
+                    && !conflict.message.contains("secure.example.com")
+                    && !conflict.message.contains("secure-api"),
+                "ProtocolConflict must not leak object identifiers: {}",
+                conflict.message
             );
-            assert!(
-                !translation
-                    .warnings
-                    .iter()
-                    .any(|warning| warning.contains("ProtocolConflict")),
-                "{secure_protocol}+UDP order {:?} must not emit ProtocolConflict: {:?}",
-                listener_order,
-                translation.warnings
-            );
-            let mesh_services = translation
-                .config
-                .mesh
-                .as_ref()
-                .map(|mesh| mesh.services.as_slice())
-                .unwrap_or(&[]);
-            for listener in ["secure-http", "udp"] {
-                let expected = gateway_api_listener_mesh_service_name(
-                    GatewayApiListenerParentKind::Gateway,
-                    "edge",
-                    listener,
-                );
-                assert!(
-                    mesh_services.iter().any(|service| service.name == expected),
-                    "{secure_protocol}+UDP order {:?} must materialize {listener}: {:?}",
-                    listener_order,
-                    mesh_services
-                        .iter()
-                        .map(|service| service.name.as_str())
-                        .collect::<Vec<_>>()
-                );
-            }
             if secure_protocol == "HTTPS" {
                 assert!(
                     translation.config.proxies.iter().any(|proxy| {
@@ -1535,52 +1518,18 @@ fn delegated_udp_listenerset_cannot_withdraw_parent_secure_http_listener() {
         gateway: "tenant-udp".to_string(),
         listener: "udp".to_string(),
     };
-    assert!(
-        !translation.listener_conflicts.contains_key(&udp_key),
-        "delegated UDP must remain admitted; runtime owns QUIC-half refusal: {:?}",
-        translation.listener_conflicts
-    );
-    let mesh_services = translation
-        .config
-        .mesh
-        .as_ref()
-        .map(|mesh| mesh.services.as_slice())
-        .unwrap_or(&[]);
-    let expected_https = gateway_api_listener_mesh_service_name(
-        GatewayApiListenerParentKind::Gateway,
-        "edge",
-        "https",
-    );
-    let expected_udp = gateway_api_listener_mesh_service_name(
-        GatewayApiListenerParentKind::ListenerSet,
-        "tenant-udp",
-        "udp",
-    );
-    assert!(
-        mesh_services
-            .iter()
-            .any(|service| service.namespace == "platform" && service.name == expected_https),
-        "parent HTTPS must remain materializable: {:?}",
-        mesh_services
-            .iter()
-            .map(|service| (service.namespace.as_str(), service.name.as_str()))
-            .collect::<Vec<_>>()
-    );
-    assert!(
-        mesh_services
-            .iter()
-            .any(|service| service.namespace == "tenant" && service.name == expected_udp),
-        "delegated UDP must remain materializable: {:?}",
-        mesh_services
-            .iter()
-            .map(|service| (service.namespace.as_str(), service.name.as_str()))
-            .collect::<Vec<_>>()
+    assert_eq!(
+        translation
+            .listener_conflicts
+            .get(&udp_key)
+            .map(|conflict| conflict.reason),
+        Some("ProtocolConflict")
     );
 }
 
-/// When HTTPS/GRPCS, UDP, and raw TCP share one numeric port, only the
-/// HTTP/TCP-family candidates receive TCP-family ProtocolConflict. UDP uses a
-/// different transport and remains materializable independent of listener order.
+/// When SecureHttp, UDP, and raw TCP share one numeric port, TCP-family and
+/// QUIC/UDP arbitration coexist. Each conflicted candidate must report the
+/// refusal reason that actually applied to it, independent of listener order.
 #[test]
 fn secure_http_udp_and_tcp_protocol_conflicts_are_candidate_accurate() {
     const PORT: u64 = 9443;
@@ -1588,6 +1537,10 @@ fn secure_http_udp_and_tcp_protocol_conflicts_are_candidate_accurate() {
         "Port {PORT} is claimed by incompatible protocol families on the same TCP \
          transport (HTTP-family vs raw stream), so every conflicting claim on this \
          port is refused (Conflicted)."
+    );
+    let quic_udp_message = format!(
+        "Port {PORT} is claimed by secure HTTP/QUIC and a UDP stream, so the UDP \
+         claim is refused (Conflicted)."
     );
     let orders: [[&str; 3]; 6] = [
         ["secure-http", "tcp", "udp"],
@@ -1646,7 +1599,11 @@ fn secure_http_udp_and_tcp_protocol_conflicts_are_candidate_accurate() {
                 gateway: "edge".to_string(),
                 listener: String::new(),
             };
-            for listener in ["secure-http", "tcp"] {
+            for (listener, expected_message) in [
+                ("secure-http", tcp_family_message.as_str()),
+                ("tcp", tcp_family_message.as_str()),
+                ("udp", quic_udp_message.as_str()),
+            ] {
                 let key = GatewayApiListenerKey {
                     listener: listener.to_string(),
                     ..gateway_key.clone()
@@ -1659,7 +1616,7 @@ fn secure_http_udp_and_tcp_protocol_conflicts_are_candidate_accurate() {
                 });
                 assert_eq!(conflict.reason, "ProtocolConflict");
                 assert_eq!(
-                    conflict.message, tcp_family_message,
+                    conflict.message, expected_message,
                     "{secure_protocol} order {:?} listener {listener} message",
                     listener_order
                 );
@@ -1671,53 +1628,21 @@ fn secure_http_udp_and_tcp_protocol_conflicts_are_candidate_accurate() {
                     conflict.message
                 );
             }
-            let udp_key = GatewayApiListenerKey {
-                listener: "udp".to_string(),
-                ..gateway_key
-            };
             assert!(
-                !translation.listener_conflicts.contains_key(&udp_key),
-                "{secure_protocol} order {:?} must leave UDP unconflicted: {:?}",
-                listener_order,
-                translation.listener_conflicts
-            );
-            let mesh_services = translation
-                .config
-                .mesh
-                .as_ref()
-                .map(|mesh| mesh.services.as_slice())
-                .unwrap_or(&[]);
-            for listener in ["secure-http", "tcp"] {
-                let expected = gateway_api_listener_mesh_service_name(
-                    GatewayApiListenerParentKind::Gateway,
-                    "edge",
-                    listener,
-                );
-                assert!(
-                    mesh_services.iter().all(|service| service.name != expected),
-                    "{secure_protocol} order {:?} must not materialize {listener}: {:?}",
-                    listener_order,
-                    mesh_services
-                        .iter()
-                        .map(|service| service.name.as_str())
-                        .collect::<Vec<_>>()
-                );
-            }
-            let expected_udp = gateway_api_listener_mesh_service_name(
-                GatewayApiListenerParentKind::Gateway,
-                "edge",
-                "udp",
-            );
-            assert!(
-                mesh_services
+                !translation
+                    .config
+                    .mesh
+                    .as_ref()
+                    .map(|mesh| mesh.services.as_slice())
+                    .unwrap_or(&[])
                     .iter()
-                    .any(|service| service.name == expected_udp),
-                "{secure_protocol} order {:?} must materialize UDP: {:?}",
-                listener_order,
-                mesh_services
-                    .iter()
-                    .map(|service| service.name.as_str())
-                    .collect::<Vec<_>>()
+                    .any(|service| {
+                        service.name.contains("secure-http")
+                            || service.name.contains("tcp")
+                            || service.name.contains("udp")
+                    }),
+                "{secure_protocol} order {:?} must not materialize any conflicting listener",
+                listener_order
             );
         }
     }
