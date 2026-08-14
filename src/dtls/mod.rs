@@ -107,6 +107,398 @@ async fn fail_pending_app_sends(driver_app_rx: &mut mpsc::Receiver<PendingAppSen
     }
 }
 
+/// Terminating-frontend application payload waiting for encrypt + UDP write.
+///
+/// Unlike [`PendingAppSend`] (backend/client-role), this carries the admitted
+/// absolute authorization deadline and a cancel receiver held by the proxy-side
+/// send future. Dropping that future closes `cancel` so a request already in
+/// the channel cannot be encrypted or written later.
+struct FrontendAppSend {
+    data: Vec<u8>,
+    completion: oneshot::Sender<Result<(), String>>,
+    cancel: oneshot::Receiver<()>,
+    deadline: Option<tokio::time::Instant>,
+}
+
+struct InFlightFrontendAppSend {
+    completion: oneshot::Sender<Result<(), String>>,
+    cancel: oneshot::Receiver<()>,
+    deadline: Option<tokio::time::Instant>,
+}
+
+/// Why a terminating-frontend application send must not encrypt or `send_to`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrontendAppSendReject {
+    /// The admitted absolute authorization deadline has elapsed. Exact ties
+    /// (`now >= deadline`) fail closed.
+    Expired,
+    /// The proxy-side send future was dropped, so this queued request must not
+    /// be encrypted or written.
+    Cancelled,
+    /// Driver shutdown or connection close. Never used to flush a still-
+    /// authorized leftover as a successful wire commit.
+    Closed,
+}
+
+impl FrontendAppSendReject {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Expired => "DTLS application send expired",
+            Self::Cancelled => "DTLS application send cancelled",
+            Self::Closed => "DTLS server connection closed",
+        }
+    }
+}
+
+/// Admission verdict for one queued or in-flight frontend application send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrontendAppSendAdmit {
+    Proceed,
+    Reject(FrontendAppSendReject),
+}
+
+/// Decide whether a frontend application send may encrypt or poll `send_to`.
+///
+/// An already-elapsed deadline is checked first and never proceeds, so the
+/// application send future is not polled. Exact ties fail closed. Cancellation
+/// is independent: dropping the proxy send future must discard the request
+/// even if the deadline has not elapsed.
+pub(crate) fn admit_frontend_app_send(
+    cancelled: bool,
+    deadline: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> FrontendAppSendAdmit {
+    if let Some(at) = deadline
+        && now >= at
+    {
+        return FrontendAppSendAdmit::Reject(FrontendAppSendReject::Expired);
+    }
+    if cancelled {
+        return FrontendAppSendAdmit::Reject(FrontendAppSendReject::Cancelled);
+    }
+    FrontendAppSendAdmit::Proceed
+}
+
+/// Shutdown never encrypts queued application replies. Expired and cancelled
+/// requests keep that reason; a still-authorized leftover is closed rather
+/// than flushed after the sender was dropped.
+pub(crate) fn shutdown_queued_frontend_app_send(
+    cancelled: bool,
+    deadline: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> FrontendAppSendReject {
+    match admit_frontend_app_send(cancelled, deadline, now) {
+        FrontendAppSendAdmit::Reject(reason) => reason,
+        FrontendAppSendAdmit::Proceed => FrontendAppSendReject::Closed,
+    }
+}
+
+/// Lock-free, monotonically-earliest admitted authorization deadline for one
+/// terminating frontend DTLS session. Unset reads as `None` (unauthenticated).
+/// Publication only tightens; a later instant can never extend the bound.
+struct FrontendSessionAuthDeadline {
+    anchor: tokio::time::Instant,
+    earliest_ns: AtomicU64,
+}
+
+const FRONTEND_SESSION_AUTH_DEADLINE_UNSET: u64 = u64::MAX;
+const FRONTEND_SESSION_AUTH_DEADLINE_MAX_ENCODED: u64 = FRONTEND_SESSION_AUTH_DEADLINE_UNSET - 1;
+
+fn encode_frontend_session_auth_deadline_offset(offset_nanos: u128) -> u64 {
+    match u64::try_from(offset_nanos) {
+        Ok(encoded) if encoded < FRONTEND_SESSION_AUTH_DEADLINE_UNSET => encoded,
+        _ => FRONTEND_SESSION_AUTH_DEADLINE_MAX_ENCODED,
+    }
+}
+
+fn encode_frontend_session_auth_deadline(
+    anchor: tokio::time::Instant,
+    at: tokio::time::Instant,
+) -> u64 {
+    encode_frontend_session_auth_deadline_offset(at.saturating_duration_since(anchor).as_nanos())
+}
+
+fn reconstruct_frontend_session_auth_deadline_from_duration(
+    anchor: tokio::time::Instant,
+    offset: Duration,
+) -> tokio::time::Instant {
+    anchor.checked_add(offset).unwrap_or(anchor)
+}
+
+fn reconstruct_frontend_session_auth_deadline(
+    anchor: tokio::time::Instant,
+    encoded: u64,
+) -> tokio::time::Instant {
+    reconstruct_frontend_session_auth_deadline_from_duration(anchor, Duration::from_nanos(encoded))
+}
+
+impl FrontendSessionAuthDeadline {
+    fn new() -> Self {
+        Self {
+            anchor: tokio::time::Instant::now(),
+            earliest_ns: AtomicU64::new(FRONTEND_SESSION_AUTH_DEADLINE_UNSET),
+        }
+    }
+
+    fn publish(&self, at: tokio::time::Instant) {
+        let encoded = encode_frontend_session_auth_deadline(self.anchor, at);
+        let mut current = self.earliest_ns.load(Ordering::Acquire);
+        loop {
+            if current != FRONTEND_SESSION_AUTH_DEADLINE_UNSET && encoded >= current {
+                return;
+            }
+            match self.earliest_ns.compare_exchange_weak(
+                current,
+                encoded,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn get(&self) -> Option<tokio::time::Instant> {
+        let encoded = self.earliest_ns.load(Ordering::Acquire);
+        if encoded == FRONTEND_SESSION_AUTH_DEADLINE_UNSET {
+            None
+        } else {
+            Some(reconstruct_frontend_session_auth_deadline(
+                self.anchor,
+                encoded,
+            ))
+        }
+    }
+}
+
+/// Combine a per-call application-send deadline with the session's admitted
+/// authorization deadline. `None` only when both inputs are absent; otherwise
+/// the earliest instant governs so a later per-call value cannot extend
+/// authorization.
+fn earliest_frontend_app_send_deadline(
+    per_call: Option<tokio::time::Instant>,
+    session: Option<tokio::time::Instant>,
+) -> Option<tokio::time::Instant> {
+    match (per_call, session) {
+        (None, None) => None,
+        (Some(at), None) | (None, Some(at)) => Some(at),
+        (Some(per_call), Some(session)) => Some(per_call.min(session)),
+    }
+}
+
+fn frontend_app_send_cancel_fired(cancel: &mut oneshot::Receiver<()>) -> bool {
+    match cancel.try_recv() {
+        Ok(()) | Err(oneshot::error::TryRecvError::Closed) => true,
+        Err(oneshot::error::TryRecvError::Empty) => false,
+    }
+}
+
+/// Race one application-ciphertext `send_to` (or a test double) against the
+/// admitted deadline and the proxy-side cancel receiver.
+///
+/// An already-elapsed deadline never polls `send`. Exact-deadline ties fail
+/// closed (`biased`, expiry arm first). If expiry or cancellation wins, `send`
+/// is dropped so it cannot complete afterwards. Unauthenticated sends
+/// (`deadline == None`) await `send` with no timer.
+pub(crate) async fn frontend_app_ciphertext_send_until_expiry<F>(
+    deadline: Option<tokio::time::Instant>,
+    mut cancel: Option<&mut oneshot::Receiver<()>>,
+    send: F,
+) -> Result<F::Output, FrontendAppSendReject>
+where
+    F: std::future::Future,
+{
+    let cancelled = match cancel.as_mut() {
+        Some(cancel) => frontend_app_send_cancel_fired(cancel),
+        None => false,
+    };
+    match admit_frontend_app_send(cancelled, deadline, tokio::time::Instant::now()) {
+        FrontendAppSendAdmit::Reject(reason) => return Err(reason),
+        FrontendAppSendAdmit::Proceed => {}
+    }
+    match (deadline, cancel) {
+        (None, None) => Ok(send.await),
+        (None, Some(cancel)) => tokio::select! {
+            biased;
+            _ = cancel => Err(FrontendAppSendReject::Cancelled),
+            result = send => Ok(result),
+        },
+        (Some(at), None) => tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(at) => Err(FrontendAppSendReject::Expired),
+            result = send => Ok(result),
+        },
+        (Some(at), Some(cancel)) => tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(at) => Err(FrontendAppSendReject::Expired),
+            _ = cancel => Err(FrontendAppSendReject::Cancelled),
+            result = send => Ok(result),
+        },
+    }
+}
+
+fn fail_queued_frontend_app_sends(
+    app_in_rx: &mut mpsc::Receiver<FrontendAppSend>,
+    session_deadline: Option<tokio::time::Instant>,
+) {
+    let now = tokio::time::Instant::now();
+    while let Ok(mut pending) = app_in_rx.try_recv() {
+        let cancelled = frontend_app_send_cancel_fired(&mut pending.cancel);
+        let deadline = earliest_frontend_app_send_deadline(pending.deadline, session_deadline);
+        let reason = shutdown_queued_frontend_app_send(cancelled, deadline, now);
+        let _ = pending.completion.send(Err(reason.as_str().to_string()));
+    }
+}
+
+fn session_authorization_elapsed(auth_deadline: &FrontendSessionAuthDeadline) -> bool {
+    auth_deadline
+        .get()
+        .is_some_and(|at| tokio::time::Instant::now() >= at)
+}
+
+async fn write_connected_frontend_record(
+    socket: &UdpSocket,
+    data: &[u8],
+    peer: SocketAddr,
+    in_flight: Option<&mut InFlightFrontendAppSend>,
+    session_deadline: Option<tokio::time::Instant>,
+) -> Result<(), FrontendAppSendReject> {
+    if let Some(inflight) = in_flight {
+        let deadline = earliest_frontend_app_send_deadline(inflight.deadline, session_deadline);
+        match frontend_app_ciphertext_send_until_expiry(
+            deadline,
+            Some(&mut inflight.cancel),
+            socket.send_to(data, peer),
+        )
+        .await
+        {
+            Ok(Ok(written)) if written == data.len() => Ok(()),
+            Ok(_) => Err(FrontendAppSendReject::Closed),
+            Err(reject) => Err(reject),
+        }
+    } else {
+        match frontend_app_ciphertext_send_until_expiry(
+            session_deadline,
+            None,
+            socket.send_to(data, peer),
+        )
+        .await
+        {
+            Ok(Ok(written)) if written == data.len() => Ok(()),
+            Ok(_) => Err(FrontendAppSendReject::Closed),
+            Err(reject) => Err(reject),
+        }
+    }
+}
+
+/// Pin earliest-deadline composition for external hosted tests.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn earliest_frontend_app_send_deadline_for_test(
+    per_call: Option<tokio::time::Instant>,
+    session: Option<tokio::time::Instant>,
+) -> Option<tokio::time::Instant> {
+    earliest_frontend_app_send_deadline(per_call, session)
+}
+
+/// Pin frontend application-send admission for external hosted tests.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn admit_frontend_app_send_for_test(
+    cancelled: bool,
+    deadline: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> FrontendAppSendAdmit {
+    admit_frontend_app_send(cancelled, deadline, now)
+}
+
+/// Pin shutdown's refuse-to-flush decision for external hosted tests.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn shutdown_queued_frontend_app_send_for_test(
+    cancelled: bool,
+    deadline: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> FrontendAppSendReject {
+    shutdown_queued_frontend_app_send(cancelled, deadline, now)
+}
+
+/// Pin cancel-receiver closed/fired detection for external hosted tests.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn frontend_app_send_cancel_fired_for_test(cancel: &mut oneshot::Receiver<()>) -> bool {
+    frontend_app_send_cancel_fired(cancel)
+}
+
+/// Pin the ciphertext `send_to` race for external hosted tests.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) async fn frontend_app_ciphertext_send_until_expiry_for_test<F>(
+    deadline: Option<tokio::time::Instant>,
+    cancel: Option<&mut oneshot::Receiver<()>>,
+    send: F,
+) -> Result<F::Output, FrontendAppSendReject>
+where
+    F: std::future::Future,
+{
+    frontend_app_ciphertext_send_until_expiry(deadline, cancel, send).await
+}
+
+/// Pin the bounded, credential-free reject strings.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn frontend_app_send_reject_as_str_for_test(
+    reject: FrontendAppSendReject,
+) -> &'static str {
+    reject.as_str()
+}
+
+/// Opaque handle for external hosted tests of the session authorization slot.
+#[doc(hidden)]
+pub struct FrontendSessionAuthDeadlineForTest(Arc<FrontendSessionAuthDeadline>);
+
+/// Allocate a lock-free frontend session authorization deadline for tests.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn frontend_session_auth_deadline_for_test() -> FrontendSessionAuthDeadlineForTest {
+    FrontendSessionAuthDeadlineForTest(Arc::new(FrontendSessionAuthDeadline::new()))
+}
+
+/// Publish one admitted authorization instant into the session deadline slot.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn publish_frontend_session_auth_deadline_for_test(
+    auth_deadline: &FrontendSessionAuthDeadlineForTest,
+    at: tokio::time::Instant,
+) {
+    auth_deadline.0.publish(at);
+}
+
+/// Read the current monotonically-earliest session authorization deadline.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn read_frontend_session_auth_deadline_for_test(
+    auth_deadline: &FrontendSessionAuthDeadlineForTest,
+) -> Option<tokio::time::Instant> {
+    auth_deadline.0.get()
+}
+
+/// Encode a nanosecond offset from the session anchor for external tests.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn encode_frontend_session_auth_deadline_offset_for_test(offset_nanos: u128) -> u64 {
+    encode_frontend_session_auth_deadline_offset(offset_nanos)
+}
+
+/// Reconstruct a deadline instant from anchor + encoded offset for external tests.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn reconstruct_frontend_session_auth_deadline_for_test(
+    anchor: tokio::time::Instant,
+    encoded: u64,
+) -> tokio::time::Instant {
+    reconstruct_frontend_session_auth_deadline(anchor, encoded)
+}
+
+/// Reconstruct a deadline instant from anchor + duration offset for external tests.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn reconstruct_frontend_session_auth_deadline_from_duration_for_test(
+    anchor: tokio::time::Instant,
+    offset: Duration,
+) -> tokio::time::Instant {
+    reconstruct_frontend_session_auth_deadline_from_duration(anchor, offset)
+}
+
 // ============================================================================
 // Configuration Builders
 // ============================================================================
@@ -1070,12 +1462,17 @@ impl Drop for SessionGuard {
 /// The send side is cloneable (via `clone_sender()`) so bidirectional forwarding
 /// tasks can each hold a sender.
 pub struct DtlsServerConn {
-    /// Send application data to the DTLS engine for encryption.
-    app_tx: mpsc::Sender<Vec<u8>>,
+    /// Send application data to the DTLS engine for encryption + UDP write.
+    app_tx: mpsc::Sender<FrontendAppSend>,
     /// Receive decrypted application data.
     app_rx: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
     /// Signal this connection's driver task to shut down.
     shutdown_tx: mpsc::Sender<()>,
+    /// Admitted absolute authorization deadline, published monotonically
+    /// earliest into the per-client driver so every application ciphertext
+    /// `send_to` is owned by that bound. Unauthenticated sessions never set
+    /// this.
+    auth_deadline: Arc<FrontendSessionAuthDeadline>,
     /// DER-encoded client leaf certificate from the DTLS handshake.
     /// Populated when the client presents a certificate during mutual DTLS authentication.
     pub tls_client_cert_der: Option<Arc<Vec<u8>>>,
@@ -1095,17 +1492,36 @@ pub struct DtlsServerConn {
 /// the DTLS client from a separate task (e.g., backend→client forwarding).
 #[derive(Clone)]
 pub struct DtlsServerSender {
-    app_tx: mpsc::Sender<Vec<u8>>,
+    app_tx: mpsc::Sender<FrontendAppSend>,
     shutdown_tx: mpsc::Sender<()>,
+    auth_deadline: Arc<FrontendSessionAuthDeadline>,
 }
 
 impl DtlsServerSender {
-    /// Send application data through the DTLS tunnel to this client.
-    pub async fn send(&self, data: &[u8]) -> Result<(), anyhow::Error> {
-        self.app_tx
-            .send(data.to_vec())
-            .await
-            .map_err(|_| anyhow::anyhow!("DTLS server connection closed"))
+    /// Publish the admitted absolute authorization deadline into the per-client
+    /// driver. Only tightens the session bound; a later instant is ignored.
+    /// Handshake/control writes that already completed are unaffected; every
+    /// later application ciphertext `send_to` is owned by the earliest bound.
+    /// Unauthenticated sessions must not call this.
+    pub fn bind_authorization_deadline(&self, at: tokio::time::Instant) {
+        self.auth_deadline.publish(at);
+    }
+
+    /// Send application data through the DTLS tunnel, completing only after
+    /// every ciphertext datagram produced for this plaintext is accepted by
+    /// the UDP socket.
+    ///
+    /// `deadline` is the admitted absolute authorization instant (`None` for
+    /// unauthenticated sessions). An already-elapsed deadline never enqueues
+    /// or polls a socket write. Dropping this future marks the queued request
+    /// cancelled so the driver cannot encrypt or send it later. Exact-deadline
+    /// ties fail closed.
+    pub async fn send_committed(
+        &self,
+        data: &[u8],
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<(), anyhow::Error> {
+        send_frontend_app_committed(&self.app_tx, &self.auth_deadline, data, deadline).await
     }
 
     /// Close this client's DTLS connection.
@@ -1118,10 +1534,17 @@ impl DtlsServerConn {
     /// Send application data through the DTLS tunnel to this client.
     #[allow(dead_code)]
     pub async fn send(&self, data: &[u8]) -> Result<(), anyhow::Error> {
-        self.app_tx
-            .send(data.to_vec())
-            .await
-            .map_err(|_| anyhow::anyhow!("DTLS server connection closed"))
+        self.send_committed(data, None).await
+    }
+
+    /// Deadline-aware actual-commit send. See [`DtlsServerSender::send_committed`].
+    #[allow(dead_code)]
+    pub async fn send_committed(
+        &self,
+        data: &[u8],
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<(), anyhow::Error> {
+        send_frontend_app_committed(&self.app_tx, &self.auth_deadline, data, deadline).await
     }
 
     /// Receive decrypted application data from this client.
@@ -1138,12 +1561,51 @@ impl DtlsServerConn {
         DtlsServerSender {
             app_tx: self.app_tx.clone(),
             shutdown_tx: self.shutdown_tx.clone(),
+            auth_deadline: self.auth_deadline.clone(),
         }
     }
 
     /// Close this client's DTLS connection.
     pub async fn close(&self) {
         let _ = self.shutdown_tx.try_send(());
+    }
+}
+
+async fn send_frontend_app_committed(
+    app_tx: &mpsc::Sender<FrontendAppSend>,
+    auth_deadline: &FrontendSessionAuthDeadline,
+    data: &[u8],
+    deadline: Option<tokio::time::Instant>,
+) -> Result<(), anyhow::Error> {
+    if let Some(at) = deadline {
+        auth_deadline.publish(at);
+    }
+    let effective = earliest_frontend_app_send_deadline(deadline, auth_deadline.get());
+    if matches!(
+        admit_frontend_app_send(false, effective, tokio::time::Instant::now()),
+        FrontendAppSendAdmit::Reject(FrontendAppSendReject::Expired)
+    ) {
+        return Err(anyhow::anyhow!(FrontendAppSendReject::Expired.as_str()));
+    }
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    let (completion_tx, completion_rx) = oneshot::channel();
+    app_tx
+        .send(FrontendAppSend {
+            data: data.to_vec(),
+            completion: completion_tx,
+            cancel: cancel_rx,
+            deadline,
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("DTLS server connection closed"))?;
+    // Held for the whole wait: dropping this future (expiry in the proxy
+    // race) closes `cancel` so a request already in the channel cannot be
+    // encrypted or written later.
+    let _cancel_tx = cancel_tx;
+    match completion_rx.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(anyhow::anyhow!(error)),
+        Err(_) => Err(anyhow::anyhow!("DTLS server connection closed")),
     }
 }
 
@@ -1487,8 +1949,9 @@ impl DtlsServer {
         let (incoming_tx, mut incoming_rx) = mpsc::channel::<Vec<u8>>(256);
         let (app_out_tx, app_out_rx) = mpsc::channel::<Vec<u8>>(256);
         let mut app_out_rx = Some(app_out_rx);
-        let (app_in_tx, mut app_in_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (app_in_tx, mut app_in_rx) = mpsc::channel::<FrontendAppSend>(256);
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+        let auth_deadline = Arc::new(FrontendSessionAuthDeadline::new());
         let generation = self.next_session_generation.fetch_add(1, Ordering::Relaxed);
         // Terminating DTLS: this is best-effort SNI for the session's identity /
         // logging field only — dimpl runs the real handshake and rejects malformed
@@ -1612,34 +2075,70 @@ impl DtlsServer {
                     .map(|t| t.saturating_duration_since(Instant::now()))
                     .unwrap_or(Duration::from_secs(60));
 
+                let mut in_flight: Option<InFlightFrontendAppSend> = None;
+
                 tokio::select! {
-                    // Application data to send back to this client
-                    Some(data) = app_in_rx.recv(), if connected => {
-                        if data.len() > dtls_buf_config().max_plaintext {
-                            warn!(
-                                client = %peer_addr,
-                                "DTLS dropping oversized datagram ({} bytes, max {})",
-                                data.len(),
-                                dtls_buf_config().max_plaintext,
-                            );
-                            continue;
-                        }
-                        if let Err(e) = dtls.send_application_data(&data) {
-                            trace!(client = %peer_addr, "DTLS send error: {}", e);
-                            break;
-                        }
-                    }
-                    // Shutdown signal — drain any queued replies before
-                    // exiting so a final reply pushed right before
-                    // `DtlsServerConn::Drop` is not lost.
-                    _ = shutdown_rx.recv() => {
-                        while let Ok(data) = app_in_rx.try_recv() {
-                            if connected
-                                && data.len() <= dtls_buf_config().max_plaintext
-                            {
-                                let _ = dtls.send_application_data(&data);
+                    // Application data to send back to this client. Success is
+                    // reported only after every produced ciphertext datagram is
+                    // accepted by the UDP socket, not at channel enqueue.
+                    Some(pending) = app_in_rx.recv(), if connected => {
+                        let FrontendAppSend {
+                            data,
+                            completion,
+                            mut cancel,
+                            deadline,
+                        } = pending;
+                        let session_deadline = auth_deadline.get();
+                        let cancelled = frontend_app_send_cancel_fired(&mut cancel);
+                        let effective = earliest_frontend_app_send_deadline(
+                            deadline,
+                            session_deadline,
+                        );
+                        match admit_frontend_app_send(
+                            cancelled,
+                            effective,
+                            tokio::time::Instant::now(),
+                        ) {
+                            FrontendAppSendAdmit::Reject(reason) => {
+                                let _ = completion.send(Err(reason.as_str().to_string()));
+                            }
+                            FrontendAppSendAdmit::Proceed => {
+                                if data.len() > dtls_buf_config().max_plaintext {
+                                    warn!(
+                                        client = %peer_addr,
+                                        "DTLS dropping oversized datagram ({} bytes, max {})",
+                                        data.len(),
+                                        dtls_buf_config().max_plaintext,
+                                    );
+                                    let _ = completion.send(Err(format!(
+                                        "DTLS plaintext exceeds max_plaintext ({} bytes, got {})",
+                                        dtls_buf_config().max_plaintext,
+                                        data.len()
+                                    )));
+                                } else if let Err(e) = dtls.send_application_data(&data) {
+                                    trace!(client = %peer_addr, "DTLS send error: {}", e);
+                                    let _ = completion.send(Err(format!(
+                                        "DTLS send_application_data error: {e}"
+                                    )));
+                                    break;
+                                } else {
+                                    in_flight = Some(InFlightFrontendAppSend {
+                                        completion,
+                                        cancel,
+                                        deadline: effective,
+                                    });
+                                }
                             }
                         }
+                    }
+                    // Shutdown signal — never encrypt or emit expired/cancelled
+                    // queued application replies. Handshake/control records
+                    // still drain after the loop.
+                    _ = shutdown_rx.recv() => {
+                        fail_queued_frontend_app_sends(
+                            &mut app_in_rx,
+                            auth_deadline.get(),
+                        );
                         break;
                     }
                     // Incoming UDP packet from this client (demuxed by the server)
@@ -1671,90 +2170,173 @@ impl DtlsServer {
 
                 // Drain all pending outputs. After Connected, skip one Timeout
                 // to capture final flight packets (dimpl emits Connected before
-                // flushing CCS+Finished).
+                // flushing CCS+Finished). Application ciphertext `send_to` is
+                // owned by the admitted deadline / cancel receiver.
                 let mut just_connected = false;
-                for _ in 0..MAX_OUTPUTS_PER_DRAIN {
-                    match dtls.poll_output(&mut out_buf) {
-                        Output::Packet(data) => {
-                            let _ = socket.send_to(data, peer_addr).await;
-                        }
-                        Output::Timeout(t) => {
-                            next_timeout = Some(t);
-                            if just_connected {
-                                just_connected = false;
-                                continue;
+                let mut wrote_ciphertext_datagram = false;
+                let mut discard_app_ciphertext = false;
+                loop {
+                    let mut drain_round_exhausted = true;
+                    for _ in 0..MAX_OUTPUTS_PER_DRAIN {
+                        match dtls.poll_output(&mut out_buf) {
+                            Output::Packet(data) => {
+                                if discard_app_ciphertext {
+                                    continue;
+                                }
+                                if !connected {
+                                    let _ = socket.send_to(data, peer_addr).await;
+                                    drain_round_exhausted = false;
+                                    continue;
+                                }
+                                match write_connected_frontend_record(
+                                    &socket,
+                                    data,
+                                    peer_addr,
+                                    in_flight.as_mut(),
+                                    auth_deadline.get(),
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        wrote_ciphertext_datagram = true;
+                                    }
+                                    Err(reject) => {
+                                        discard_app_ciphertext = true;
+                                        if let Some(inflight) = in_flight.take() {
+                                            let _ = inflight
+                                                .completion
+                                                .send(Err(reject.as_str().to_string()));
+                                        }
+                                    }
+                                }
                             }
-                            break;
-                        }
-                        Output::Connected => {
-                            just_connected = true;
-                            connected = true;
-                            // Enforce client-certificate authentication as a hard
-                            // requirement. dimpl completes the handshake even when
-                            // the client returns an empty Certificate, so without
-                            // this gate an unauthenticated peer would be delivered
-                            // with `tls_client_cert_der = None`, bypassing DTLS
-                            // frontend mTLS. Refuse to deliver such a session.
-                            if client_cert_verifier.is_some() && !verified_peer_cert {
-                                warn!(
-                                    client = %peer_addr,
-                                    "DTLS frontend mTLS required but client presented no verified certificate; dropping session"
-                                );
-                                return;
+                            Output::Timeout(t) => {
+                                next_timeout = Some(t);
+                                drain_round_exhausted = false;
+                                if just_connected {
+                                    just_connected = false;
+                                    continue;
+                                }
+                                break;
                             }
-                            // Deliver accepted connection (take app_out_rx — only happens once)
-                            let Some(rx) = app_out_rx.take() else {
-                                continue; // Already connected — should not happen
-                            };
-                            let conn = DtlsServerConn {
-                                app_tx: app_in_tx.clone(),
-                                app_rx: tokio::sync::Mutex::new(rx),
-                                shutdown_tx: shutdown_tx.clone(),
-                                tls_client_cert_der: peer_cert_der.clone(),
-                                tls_client_cert_chain_der: peer_cert_chain_der.clone(),
-                                sni_hostname: sni_hostname.clone(),
-                                forwarded_client_addr: forwarded_client,
-                            };
-                            if accept_tx.send((conn, peer_addr)).await.is_err() {
-                                return;
-                            }
-                        }
-                        Output::PeerCert(der) => {
-                            // Preserve leaf-only fingerprint semantics for
-                            // existing plugin consumers.
-                            peer_cert_der = Some(Arc::new(der.to_vec()));
-                        }
-                        Output::PeerCertChain(chain) => {
-                            if let Some(verifier) = client_cert_verifier.as_deref() {
-                                if let Err(e) = validate_client_cert(&chain, verifier) {
-                                    warn!(client = %peer_addr, "Client cert validation failed: {}", e);
+                            Output::Connected => {
+                                just_connected = true;
+                                connected = true;
+                                // Enforce client-certificate authentication as a hard
+                                // requirement. dimpl completes the handshake even when
+                                // the client returns an empty Certificate, so without
+                                // this gate an unauthenticated peer would be delivered
+                                // with `tls_client_cert_der = None`, bypassing DTLS
+                                // frontend mTLS. Refuse to deliver such a session.
+                                if client_cert_verifier.is_some() && !verified_peer_cert {
+                                    warn!(
+                                        client = %peer_addr,
+                                        "DTLS frontend mTLS required but client presented no verified certificate; dropping session"
+                                    );
+                                    fail_queued_frontend_app_sends(
+                                        &mut app_in_rx,
+                                        auth_deadline.get(),
+                                    );
                                     return;
                                 }
-                                // A client certificate was presented and verified
-                                // against the configured client CA.
-                                verified_peer_cert = true;
+                                // Deliver accepted connection (take app_out_rx — only happens once)
+                                let Some(rx) = app_out_rx.take() else {
+                                    continue; // Already connected — should not happen
+                                };
+                                let conn = DtlsServerConn {
+                                    app_tx: app_in_tx.clone(),
+                                    app_rx: tokio::sync::Mutex::new(rx),
+                                    shutdown_tx: shutdown_tx.clone(),
+                                    auth_deadline: auth_deadline.clone(),
+                                    tls_client_cert_der: peer_cert_der.clone(),
+                                    tls_client_cert_chain_der: peer_cert_chain_der.clone(),
+                                    sni_hostname: sni_hostname.clone(),
+                                    forwarded_client_addr: forwarded_client,
+                                };
+                                if accept_tx.send((conn, peer_addr)).await.is_err() {
+                                    fail_queued_frontend_app_sends(
+                                        &mut app_in_rx,
+                                        auth_deadline.get(),
+                                    );
+                                    return;
+                                }
                             }
-                            peer_cert_chain_der =
-                                (chain.len() > 1).then(|| Arc::new(chain[1..].to_vec()));
+                            Output::PeerCert(der) => {
+                                // Preserve leaf-only fingerprint semantics for
+                                // existing plugin consumers.
+                                peer_cert_der = Some(Arc::new(der.to_vec()));
+                            }
+                            Output::PeerCertChain(chain) => {
+                                if let Some(verifier) = client_cert_verifier.as_deref() {
+                                    if let Err(e) = validate_client_cert(&chain, verifier) {
+                                        warn!(client = %peer_addr, "Client cert validation failed: {}", e);
+                                        fail_queued_frontend_app_sends(
+                                            &mut app_in_rx,
+                                            auth_deadline.get(),
+                                        );
+                                        return;
+                                    }
+                                    // A client certificate was presented and verified
+                                    // against the configured client CA.
+                                    verified_peer_cert = true;
+                                }
+                                peer_cert_chain_der =
+                                    (chain.len() > 1).then(|| Arc::new(chain[1..].to_vec()));
+                            }
+                            Output::ApplicationData(data)
+                                if app_out_tx.send(data.to_vec()).await.is_err() =>
+                            {
+                                if let Some(inflight) = in_flight.take() {
+                                    let _ = inflight.completion.send(Err(
+                                        FrontendAppSendReject::Closed.as_str().to_string(),
+                                    ));
+                                }
+                                fail_queued_frontend_app_sends(&mut app_in_rx, auth_deadline.get());
+                                return;
+                            }
+                            _ => {
+                                drain_round_exhausted = false;
+                                break;
+                            }
                         }
-                        Output::ApplicationData(data)
-                            if app_out_tx.send(data.to_vec()).await.is_err() =>
-                        {
-                            // Application receiver dropped
-                            break;
-                        }
-                        _ => {
-                            // KeyingMaterial or future variants — continue draining
-                        }
+                    }
+
+                    if client_send_output_drain_needs_another_round(
+                        in_flight.is_some(),
+                        wrote_ciphertext_datagram,
+                        false,
+                        false,
+                        drain_round_exhausted,
+                    ) {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    break;
+                }
+
+                if let Some(inflight) = in_flight.take() {
+                    if !wrote_ciphertext_datagram {
+                        let _ =
+                            inflight
+                                .completion
+                                .send(Err("DTLS application send produced no ciphertext datagram"
+                                    .to_string()));
+                    } else {
+                        let _ = inflight.completion.send(Ok(()));
                     }
                 }
             }
 
-            // Flush any DTLS-buffered data produced by the shutdown
-            // handler's reply drain so it reaches the wire.
+            fail_queued_frontend_app_sends(&mut app_in_rx, auth_deadline.get());
+            // Protocol/handshake records may still be flushed. Application
+            // ciphertext whose authorization expired is discarded, not written.
+            let discard_expired = session_authorization_elapsed(&auth_deadline);
             for _ in 0..MAX_OUTPUTS_PER_DRAIN {
                 match dtls.poll_output(&mut out_buf) {
                     Output::Packet(data) => {
+                        if discard_expired {
+                            continue;
+                        }
                         let _ = socket.send_to(data, peer_addr).await;
                     }
                     _ => break,

@@ -195,3 +195,33 @@ fn drain_to_sendmmsg_partial_drain_leaves_residual() {
     );
     assert!(buf.is_empty());
 }
+
+#[test]
+fn discard_drops_queued_datagrams_without_flushing() {
+    let mut buf = GsoBatchBuf::new(1024);
+    assert!(buf.push(&[1u8; 50]));
+    assert!(buf.push(&[2u8; 50]));
+    assert!(!buf.is_empty());
+
+    buf.discard();
+    assert!(
+        buf.is_empty(),
+        "discard must drop queued GSO datagrams rather than leave them for flush"
+    );
+
+    // A subsequent flush is a no-op: discarded payloads must not be sent.
+    let storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let sent = buf
+        .flush_to(-1, &storage, 0, None)
+        .expect("flush of an empty discarded buffer is a no-op");
+    assert_eq!(
+        sent, 0,
+        "discarded GSO payloads must not be counted as sent"
+    );
+
+    // Capacity is retained: a later push reuses the buffer (allocation-free).
+    assert!(buf.push(&[3u8; 40]));
+    assert!(!buf.is_empty());
+    buf.discard();
+    assert!(buf.is_empty());
+}

@@ -127,7 +127,19 @@ pub enum GrpcBody {
     /// observe `bytes_seen` from another task after `into_reqwest_body()`
     /// moves ownership — `GrpcBody` has no such cross-task read path.
     Streaming {
-        incoming: Incoming,
+        /// The client body, or — for an AUTHENTICATED request — a bounded
+        /// bridge fed by a gateway-owned pump task (issue #3815).
+        ///
+        /// Native gRPC keeps its full-duplex semantics: the pump is a
+        /// capacity-1 bridge, not a buffer-first collect, so a bidirectional
+        /// RPC still commits each request message as it arrives. What it adds
+        /// is an absolute authorization bound owned by a task the GATEWAY
+        /// schedules, so it fires even while hyper's HTTP/2 pipe is parked on
+        /// backend send capacity and is polling nothing. On expiry the client
+        /// body is dropped and this body ends in an ERROR, so hyper emits
+        /// RST_STREAM — never a clean END_STREAM the backend could mistake for
+        /// a complete request stream.
+        incoming: crate::proxy::body::UploadSource,
         bytes_seen: usize,
         max_bytes: usize,
         exceeded: Arc<AtomicBool>,
@@ -233,7 +245,7 @@ impl http_body::Body for GrpcBody {
                 grpc_messages,
                 grpc_scanner,
                 ..
-            } => match Pin::new(incoming).poll_frame(cx) {
+            } => match incoming.poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => {
                     if let Some(data) = frame.data_ref() {
                         if *max_bytes > 0 {
@@ -258,7 +270,7 @@ impl http_body::Body for GrpcBody {
                     }
                     Poll::Ready(Some(Ok(frame)))
                 }
-                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(Box::new(e)))),
+                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
                 Poll::Ready(None) => Poll::Ready(None),
                 Poll::Pending => Poll::Pending,
             },
@@ -1504,13 +1516,25 @@ pub(crate) enum GrpcRequestBodyCollectError {
     Proxy(GrpcProxyError),
     TimedOut,
     DeadlineExceeded,
+    /// The admitted stream's authorization lifetime elapsed while the gateway was
+    /// still collecting the buffered client upload (issue #3815). Already latched
+    /// and counted exactly once for the request; the caller emits the fixed
+    /// pre-commitment gRPC terminal.
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
 }
 
-fn map_request_body_wait_error(error: super::RequestBodyWaitError) -> GrpcRequestBodyCollectError {
+fn map_authorized_upload_wait_error(
+    error: super::AuthorizedUploadWaitError,
+) -> GrpcRequestBodyCollectError {
     match error {
-        super::RequestBodyWaitError::TimedOut => GrpcRequestBodyCollectError::TimedOut,
-        super::RequestBodyWaitError::DeadlineExceeded => {
+        super::AuthorizedUploadWaitError::Wait(super::RequestBodyWaitError::TimedOut) => {
+            GrpcRequestBodyCollectError::TimedOut
+        }
+        super::AuthorizedUploadWaitError::Wait(super::RequestBodyWaitError::DeadlineExceeded) => {
             GrpcRequestBodyCollectError::DeadlineExceeded
+        }
+        super::AuthorizedUploadWaitError::AuthorizationExpired(termination) => {
+            GrpcRequestBodyCollectError::AuthorizationExpired(termination)
         }
     }
 }
@@ -3772,6 +3796,7 @@ pub async fn proxy_grpc_request_streaming(
     grpc_deadline_at: Option<tokio::time::Instant>,
     held_frontend_upload: &mut Option<GrpcBody>,
     grpc_request_messages: Option<Arc<AtomicU64>>,
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     let (parts, body) = req.into_parts();
     let (grpc_messages, grpc_scanner) = match grpc_request_messages {
@@ -3781,6 +3806,13 @@ pub async fn proxy_grpc_request_streaming(
         ),
         None => (None, None),
     };
+    // Authorization lifetime for the fully-streamed native-gRPC upload (issue
+    // #3815). The join point is released rather than awaited: this dispatch
+    // returns while the RPC's response side is still streaming, so the upload's
+    // lifetime is the transport body's — `UploadPumpSource`'s abort guard ends
+    // the task when hyper drops that body, and the pump self-terminates at the
+    // deadline regardless of what the backend is doing.
+    let (body, _upload_pump) = crate::proxy::body::UploadSource::for_streaming_upload(body, auth);
     let grpc_body = GrpcBody::Streaming {
         incoming: body,
         bytes_seen: 0,
@@ -4159,22 +4191,29 @@ async fn proxy_grpc_streaming_dispatch(
 /// This is used when plugins or retry replay require request body buffering for
 /// gRPC proxies. The body bytes, method, and headers are returned so the caller
 /// can run plugin hooks before dispatching via `proxy_grpc_request_core`.
+///
+/// `auth` is the admitted stream's authorization-lifetime plan (issue #3815).
+/// A buffered gRPC upload never reaches the streaming upload adapters, so this
+/// collect is the only seam that can stop a continuously active client-streaming
+/// RPC on a buffering route from outliving the credential that admitted it.
 pub(crate) async fn collect_grpc_request_body(
     req: Request<Incoming>,
     max_grpc_recv_size_bytes: usize,
     request_body_read_timeout_ms: u64,
     grpc_deadline_at: Option<tokio::time::Instant>,
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
 ) -> Result<(hyper::Method, hyper::HeaderMap, Bytes), GrpcRequestBodyCollectError> {
     let (parts, body) = req.into_parts();
     let body_bytes = if max_grpc_recv_size_bytes > 0 {
         let limited = http_body_util::Limited::new(body, max_grpc_recv_size_bytes);
-        let collected = super::collect_request_body_with_deadline(
+        let collected = super::collect_request_body_under_authorization(
             BodyExt::collect(limited),
             grpc_deadline_at,
             request_body_read_timeout_ms,
+            auth,
         )
         .await
-        .map_err(map_request_body_wait_error)?;
+        .map_err(map_authorized_upload_wait_error)?;
         match collected {
             Ok(collected) => collected.to_bytes(),
             Err(e) => {
@@ -4192,13 +4231,14 @@ pub(crate) async fn collect_grpc_request_body(
             }
         }
     } else {
-        super::collect_request_body_with_deadline(
+        super::collect_request_body_under_authorization(
             BodyExt::collect(body),
             grpc_deadline_at,
             request_body_read_timeout_ms,
+            auth,
         )
         .await
-        .map_err(map_request_body_wait_error)?
+        .map_err(map_authorized_upload_wait_error)?
         .map_err(|e| {
             GrpcRequestBodyCollectError::Proxy(GrpcProxyError::Internal(format!(
                 "Failed to read request body: {}",

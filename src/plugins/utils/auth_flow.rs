@@ -176,16 +176,48 @@ fn credential_deadline_from_unix_seconds_at(
     now_unix: u64,
     now_mono: tokio::time::Instant,
 ) -> tokio::time::Instant {
-    let valid_until = expires_at_unix
-        .checked_add(i64::try_from(leeway_seconds).unwrap_or(i64::MAX))
-        .unwrap_or(i64::MAX);
-    let Ok(valid_until) = u64::try_from(valid_until) else {
-        return now_mono;
-    };
+    try_credential_deadline_from_unix_seconds_at(
+        expires_at_unix,
+        leeway_seconds,
+        now_unix,
+        now_mono,
+    )
+    .unwrap_or(now_mono)
+}
+
+/// Fallible conversion used by providers that must fail closed when the
+/// expiry cannot be represented as a monotonic instant (issue #3816).
+///
+/// `None` covers a clock before the Unix epoch, a negative expiry, arithmetic
+/// overflow, and an `Instant` that cannot hold the remaining duration. Callers
+/// must treat `None` as rejection, never as "no deadline".
+pub fn try_credential_deadline_from_unix_seconds(
+    expires_at_unix: i64,
+    leeway_seconds: u64,
+) -> Option<tokio::time::Instant> {
+    let now_mono = tokio::time::Instant::now();
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .ok()?;
+    try_credential_deadline_from_unix_seconds_at(
+        expires_at_unix,
+        leeway_seconds,
+        now_unix,
+        now_mono,
+    )
+}
+
+pub(crate) fn try_credential_deadline_from_unix_seconds_at(
+    expires_at_unix: i64,
+    leeway_seconds: u64,
+    now_unix: u64,
+    now_mono: tokio::time::Instant,
+) -> Option<tokio::time::Instant> {
+    let valid_until = expires_at_unix.checked_add(i64::try_from(leeway_seconds).ok()?)?;
+    let valid_until = u64::try_from(valid_until).ok()?;
     let remaining = valid_until.saturating_sub(now_unix);
-    now_mono
-        .checked_add(Duration::from_secs(remaining))
-        .unwrap_or(now_mono)
+    now_mono.checked_add(Duration::from_secs(remaining))
 }
 
 /// Extract an authoritative numeric `exp` from already-validated claims.

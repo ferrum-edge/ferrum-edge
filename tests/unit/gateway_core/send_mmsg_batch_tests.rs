@@ -179,3 +179,48 @@ fn with_slot_size_honors_custom_bound() {
         SendMmsgPushResult::Oversized
     );
 }
+
+#[test]
+fn discard_drops_queued_datagrams_without_flushing() {
+    let mut batch = SendMmsgBatch::new(4);
+    assert_eq!(
+        batch.push_with_local(b"abc", dest(), None),
+        SendMmsgPushResult::Queued
+    );
+    assert_eq!(
+        batch.push_with_local(b"de", dest(), None),
+        SendMmsgPushResult::Queued
+    );
+    let queued = batch.pending_stats();
+    assert_eq!(queued.datagrams, 2);
+    assert_eq!(queued.bytes, 5);
+    assert!(!batch.is_empty());
+
+    let allocated = batch.datagram_buffer_capacity_bytes();
+    batch.discard();
+    assert!(batch.is_empty());
+    let stats = batch.pending_stats();
+    assert_eq!(stats.datagrams, 0);
+    assert_eq!(stats.bytes, 0);
+    assert_eq!(
+        batch.datagram_buffer_capacity_bytes(),
+        allocated,
+        "discard must be allocation-free: slot buffers are retained for reuse"
+    );
+
+    // A subsequent flush is a no-op (count == 0 returns without a syscall),
+    // so discarded payloads cannot be counted as sent.
+    let flushed = batch
+        .flush(-1)
+        .expect("flush of an empty discarded batch is a no-op");
+    assert_eq!(flushed.datagrams, 0);
+    assert_eq!(flushed.bytes, 0);
+
+    assert_eq!(
+        batch.push_with_local(b"fg", dest(), None),
+        SendMmsgPushResult::Queued
+    );
+    assert_eq!(batch.pending_stats().datagrams, 1);
+    batch.discard();
+    assert!(batch.is_empty());
+}

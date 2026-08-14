@@ -309,9 +309,96 @@ struct UdpSession {
     /// Dedicated cancellation wake for an in-flight datagram hook. Unlike
     /// `stop_notify`, this is not shared with the backend reply task.
     hook_ingress_stop_notify: Arc<tokio::sync::Notify>,
+    /// Absolute authorization lifetime of the credential that admitted this
+    /// plain-UDP session, plus the once-only settlement latch shared with the
+    /// post-admission setup stages (issue #3816).
+    ///
+    /// `None` for an unauthenticated session — no principal was admitted, so
+    /// there is no authorization lifetime to bound, and every datagram path
+    /// below short-circuits without reading a clock.
+    authorization: Option<UdpSessionAuthorization>,
+}
+
+/// The admitted plain-UDP session's absolute authorization plan and its
+/// once-only settlement latch.
+///
+/// The plan is anchored at session admission and NEVER refreshed by relayed
+/// datagrams: continuous traffic cannot extend an admitted credential's
+/// authorized lifetime. The latch is shared (an `Arc` internally) with the
+/// post-admission setup stages, so exactly one termination is counted and
+/// exactly one bounded class is stamped no matter which phase — setup, the
+/// client→backend direction, or the backend reply task — observed the expiry
+/// first.
+#[derive(Debug, Clone)]
+struct UdpSessionAuthorization {
+    plan: crate::proxy::auth_lifetime::StreamAuthDeadline,
+    latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
 }
 
 impl UdpSession {
+    /// The bounded termination class when this session's authorization
+    /// lifetime has elapsed, WITHOUT settling anything.
+    ///
+    /// One monotonic instant comparison for an authenticated session and a
+    /// single `Option` discriminant test for an unauthenticated one, so the
+    /// unauthenticated plain-UDP datagram path never consults a clock and is
+    /// byte-for-byte what it was.
+    #[inline]
+    fn authorization_expired_now(
+        &self,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        let authorization = self.authorization.as_ref();
+        udp_reply_expired_at_commit(authorization.map(|authorization| authorization.plan))
+    }
+
+    /// Settle this session's authorization expiry exactly once.
+    ///
+    /// Returns `true` for the FIRST caller only — the one that recorded the
+    /// fixed-cardinality `stream_udp` counter and stamped the bounded class
+    /// into the session metadata that `build_udp_stream_summary` reads. Every
+    /// later caller pays only the latch's compare-exchange, so a datagram
+    /// burst arriving between expiry and teardown never takes the metadata
+    /// mutex.
+    fn settle_authorization_expiry(
+        &self,
+        termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+    ) -> bool {
+        let Some(authorization) = self.authorization.as_ref() else {
+            return false;
+        };
+        settle_stream_udp_auth_expiry(termination, &authorization.latch, &self.metadata)
+    }
+
+    /// The bounded class this session was terminated with, if the
+    /// authorization contract ended it. Read at reply-task exit so the
+    /// disconnect summary reports the security decision whichever direction
+    /// observed it.
+    fn observed_authorization_termination(
+        &self,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        self.authorization.as_ref()?.latch.observed()
+    }
+
+    /// Hot-path authorization gate for one client→backend datagram.
+    ///
+    /// Returns the bounded termination class when this datagram must be
+    /// refused. The FIRST observer also wakes the backend reply task, which
+    /// owns the single teardown (map removal, socket/task/channel close,
+    /// overload + active-session release, disconnect summary) — so an elapsed
+    /// deadline drops the datagram immediately instead of waiting for a timer
+    /// task to be scheduled.
+    fn refuse_if_authorization_expired(
+        &self,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        let termination = self.authorization_expired_now()?;
+        if self.settle_authorization_expiry(termination) {
+            // Permit-storing wake: the reply task may be parked in `recv` with
+            // no backend datagram coming, and teardown must not wait for one.
+            signal_udp_reply_task_stop(&self.stop_reply_task, self.stop_notify.as_ref());
+        }
+        Some(termination)
+    }
+
     fn release_overload_guard(&self) {
         let mut guard = self
             .overload_guard
@@ -525,6 +612,15 @@ fn enqueue_session_hook_datagram(
     data: &[u8],
     metrics: &UdpProxyMetrics,
 ) -> bool {
+    // Authorization-lifetime gate for the hook-ingress direction (issue
+    // #3816). An expired session must not queue a payload, run a datagram
+    // hook, or retain bytes against the ingress budget. This is a policy
+    // refusal, not a queue-overload drop, so it deliberately does NOT move
+    // `hook_ingress_drops` — that counter measures gateway backpressure.
+    if session.refuse_if_authorization_expired().is_some() {
+        return false;
+    }
+
     let tx = {
         let guard = session
             .hook_ingress_tx
@@ -1427,13 +1523,19 @@ fn flush_gso_batch(
 /// `UdpSocket::send_to` here would bypass pktinfo and let the kernel pick the
 /// source IP, so replies from a wildcard-bound listener could leave with the
 /// wrong source address and be discarded by the client.
+///
+/// Every asynchronous wait (`send_to`, `writable`) is owned by the admitted
+/// absolute authorization plan. After `writable()` reports readiness the plan
+/// is re-read immediately before the pktinfo syscall so expiry wins over send
+/// readiness at that boundary too.
 #[cfg(target_os = "linux")]
 async fn direct_send_to_client(
     frontend: &Arc<UdpSocket>,
     data: &[u8],
     client_addr: SocketAddr,
     local: Option<crate::socket_opts::PktinfoLocal>,
-) -> std::io::Result<usize> {
+    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+) -> UdpFrontendSendOutcome<std::io::Result<usize>> {
     use std::os::unix::io::AsRawFd;
     // Only honor the local source when its address family matches the
     // destination — mirrors `flush_gso_batch` / `SendMmsgBatch::push_with_local`.
@@ -1444,10 +1546,14 @@ async fn direct_send_to_client(
         _ => None,
     };
     let Some(local) = effective_local else {
-        return frontend.send_to(data, client_addr).await;
+        return udp_frontend_send_until_expiry(authorization, frontend.send_to(data, client_addr))
+            .await;
     };
     let (dest, dest_len) = super::udp_batch::std_to_sockaddr_storage(client_addr);
     loop {
+        if let Some(termination) = udp_reply_expired_at_commit(authorization) {
+            return UdpFrontendSendOutcome::AuthorizationExpired(termination);
+        }
         match crate::socket_opts::send_with_pktinfo(
             frontend.as_raw_fd(),
             data,
@@ -1457,9 +1563,17 @@ async fn direct_send_to_client(
             None,
         ) {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                frontend.writable().await?;
+                match udp_frontend_writable_until_expiry(authorization, frontend.writable()).await {
+                    UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
+                        return UdpFrontendSendOutcome::AuthorizationExpired(termination);
+                    }
+                    UdpFrontendSendOutcome::Sent(Err(e)) => {
+                        return UdpFrontendSendOutcome::Sent(Err(e));
+                    }
+                    UdpFrontendSendOutcome::Sent(Ok(())) => {}
+                }
             }
-            other => return other,
+            other => return UdpFrontendSendOutcome::Sent(other),
         }
     }
 }
@@ -1502,7 +1616,14 @@ fn flush_sendmmsg_best_effort(
 
 /// Direct-send a reply datagram that the batched paths cannot represent
 /// (GSO-incompatible, sendmmsg-oversized, or post-flush refusal).
+///
+/// Rechecks the admitted absolute authorization plan immediately before the
+/// client send so a prior `await` (hook, batch flush) cannot even enter the
+/// escape hatch after expiry. The send itself is then owned by the same plan
+/// (`send_to` / `writable` cannot emit after the deadline). Returns the
+/// bounded termination when the send must not happen.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 async fn direct_send_reply_or_drop(
     frontend: &Arc<UdpSocket>,
     data: &[u8],
@@ -1511,7 +1632,11 @@ async fn direct_send_reply_or_drop(
     proxy_id: &str,
     reason: &str,
     send_drops: &mut UdpReplySendDrops,
-) {
+    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+    if let Some(termination) = udp_reply_expired_at_commit(authorization) {
+        return Some(termination);
+    }
     debug!(
         proxy_id = %proxy_id,
         client = %udp_client_log_addr(client_addr),
@@ -1519,22 +1644,32 @@ async fn direct_send_reply_or_drop(
         reason,
         "UDP reply using direct-send escape hatch"
     );
-    if let Err(e) = direct_send_to_client(frontend, data, client_addr, local_ip).await {
-        send_drops.record_datagram(data.len());
-        warn!(
-            proxy_id = %proxy_id,
-            client = %udp_client_log_addr(client_addr),
-            size = data.len(),
-            error = %e,
-            "UDP fallback direct-send failed; datagram lost"
-        );
+    match direct_send_to_client(frontend, data, client_addr, local_ip, authorization).await {
+        UdpFrontendSendOutcome::AuthorizationExpired(termination) => Some(termination),
+        UdpFrontendSendOutcome::Sent(Err(e)) => {
+            send_drops.record_datagram(data.len());
+            warn!(
+                proxy_id = %proxy_id,
+                client = %udp_client_log_addr(client_addr),
+                size = data.len(),
+                error = %e,
+                "UDP fallback direct-send failed; datagram lost"
+            );
+            None
+        }
+        UdpFrontendSendOutcome::Sent(Ok(_)) => None,
     }
 }
 
 /// Queue into `send_batch`, flushing once on `Full` and direct-sending on
 /// `Oversized` (datagram larger than the lazy sendmmsg slot) or a stubborn
 /// post-flush `Full`.
+///
+/// Rechecks the admitted absolute plan immediately before every flush or
+/// fallback send. Returns the bounded termination when queued payloads must
+/// be discarded rather than sent.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 async fn enqueue_sendmmsg_or_direct(
     send_batch: &mut super::udp_batch::SendMmsgBatch,
     frontend: &Arc<UdpSocket>,
@@ -1543,16 +1678,24 @@ async fn enqueue_sendmmsg_or_direct(
     local_ip: Option<crate::socket_opts::PktinfoLocal>,
     proxy_id: &str,
     send_drops: &mut UdpReplySendDrops,
-) {
+    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
     use super::udp_batch::SendMmsgPushResult;
     use std::os::unix::io::AsRawFd;
 
+    if let Some(termination) = udp_reply_expired_at_commit(authorization) {
+        return Some(termination);
+    }
+
     match send_batch.push_with_local(data, client_addr, local_ip) {
-        SendMmsgPushResult::Queued => {}
+        SendMmsgPushResult::Queued => None,
         SendMmsgPushResult::Oversized => {
             // Preserve backend reply order: an oversized direct send must not
             // overtake ordinary datagrams already queued in sendmmsg.
             while !send_batch.is_empty() {
+                if let Some(termination) = udp_reply_expired_at_commit(authorization) {
+                    return Some(termination);
+                }
                 if flush_sendmmsg_best_effort(send_batch, frontend.as_raw_fd(), send_drops).is_err()
                 {
                     break;
@@ -1566,13 +1709,17 @@ async fn enqueue_sendmmsg_or_direct(
                 proxy_id,
                 "sendmmsg_oversized",
                 send_drops,
+                authorization,
             )
-            .await;
+            .await
         }
         SendMmsgPushResult::Full => {
+            if let Some(termination) = udp_reply_expired_at_commit(authorization) {
+                return Some(termination);
+            }
             let _ = flush_sendmmsg_best_effort(send_batch, frontend.as_raw_fd(), send_drops);
             match send_batch.push_with_local(data, client_addr, local_ip) {
-                SendMmsgPushResult::Queued => {}
+                SendMmsgPushResult::Queued => None,
                 SendMmsgPushResult::Oversized => {
                     direct_send_reply_or_drop(
                         frontend,
@@ -1582,8 +1729,9 @@ async fn enqueue_sendmmsg_or_direct(
                         proxy_id,
                         "sendmmsg_oversized",
                         send_drops,
+                        authorization,
                     )
-                    .await;
+                    .await
                 }
                 SendMmsgPushResult::Full => {
                     // Still full after flush (socket likely congested / flush
@@ -1596,8 +1744,9 @@ async fn enqueue_sendmmsg_or_direct(
                         proxy_id,
                         "sendmmsg_post_flush_full",
                         send_drops,
+                        authorization,
                     )
-                    .await;
+                    .await
                 }
             }
         }
@@ -1607,6 +1756,7 @@ async fn enqueue_sendmmsg_or_direct(
 /// Drain a GSO buffer into sendmmsg, flushing when the batch fills and
 /// direct-sending when a segment exceeds the sendmmsg slot size.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 async fn drain_gso_to_sendmmsg_or_direct(
     gso_batch: &mut super::udp_batch::GsoBatchBuf,
     send_batch: &mut super::udp_batch::SendMmsgBatch,
@@ -1615,20 +1765,22 @@ async fn drain_gso_to_sendmmsg_or_direct(
     local_ip: Option<crate::socket_opts::PktinfoLocal>,
     proxy_id: &str,
     send_drops: &mut UdpReplySendDrops,
-) {
+    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
     use std::os::unix::io::AsRawFd;
 
     loop {
+        if let Some(termination) = udp_reply_expired_at_commit(authorization) {
+            return Some(termination);
+        }
         gso_batch.drain_to_sendmmsg(send_batch, client_addr, local_ip);
         if gso_batch.is_empty() {
-            break;
+            return None;
         }
         if send_batch.is_empty() {
             // Stuck on an oversized front segment — escape via direct-send.
-            let Some(dgram) = gso_batch.take_front_datagram() else {
-                break;
-            };
-            direct_send_reply_or_drop(
+            let dgram = gso_batch.take_front_datagram()?;
+            if let Some(termination) = direct_send_reply_or_drop(
                 frontend,
                 &dgram,
                 client_addr,
@@ -1636,9 +1788,16 @@ async fn drain_gso_to_sendmmsg_or_direct(
                 proxy_id,
                 "gso_drain_sendmmsg_oversized",
                 send_drops,
+                authorization,
             )
-            .await;
+            .await
+            {
+                return Some(termination);
+            }
             continue;
+        }
+        if let Some(termination) = udp_reply_expired_at_commit(authorization) {
+            return Some(termination);
         }
         let _ = flush_sendmmsg_best_effort(send_batch, frontend.as_raw_fd(), send_drops);
     }
@@ -1656,6 +1815,11 @@ async fn drain_gso_to_sendmmsg_or_direct(
 /// `gso_failed` is set to `true` if we have to abandon GSO for this session.
 /// The caller must stop calling this helper after that and drive `send_batch`
 /// directly.
+///
+/// Rechecks the admitted absolute plan immediately before every flush or
+/// fallback send so a payload queued before expiry is discarded rather than
+/// flushed afterwards. Returns the bounded termination when the caller must
+/// abandon the reply loop.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 async fn try_gso_send_or_fallback(
@@ -1668,11 +1832,18 @@ async fn try_gso_send_or_fallback(
     proxy_id: &str,
     local_ip: Option<crate::socket_opts::PktinfoLocal>,
     send_drops: &mut UdpReplySendDrops,
-) {
+    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+    if let Some(termination) = udp_reply_expired_at_commit(authorization) {
+        return Some(termination);
+    }
     if gso_batch.push(data) {
-        return;
+        return None;
     }
     // Batch full or size-mismatch — flush current batch and try once more.
+    if let Some(termination) = udp_reply_expired_at_commit(authorization) {
+        return Some(termination);
+    }
     match flush_gso_batch(gso_batch, frontend, client_addr, local_ip) {
         Ok(_) => {
             if !gso_batch.push(data) {
@@ -1680,7 +1851,7 @@ async fn try_gso_send_or_fallback(
                 // >max_bytes — GSO cannot represent either). Send it directly
                 // as a single datagram through the pktinfo-aware path so the
                 // reply still leaves with the captured source address.
-                direct_send_reply_or_drop(
+                return direct_send_reply_or_drop(
                     frontend,
                     data,
                     client_addr,
@@ -1688,9 +1859,11 @@ async fn try_gso_send_or_fallback(
                     proxy_id,
                     "gso_post_flush_refused",
                     send_drops,
+                    authorization,
                 )
                 .await;
             }
+            None
         }
         Err(e) => {
             // GSO sendmsg itself failed — abandon GSO for this session.
@@ -1701,7 +1874,7 @@ async fn try_gso_send_or_fallback(
                 e
             );
             *gso_failed = true;
-            drain_gso_to_sendmmsg_or_direct(
+            if let Some(termination) = drain_gso_to_sendmmsg_or_direct(
                 gso_batch,
                 send_batch,
                 frontend,
@@ -1709,8 +1882,12 @@ async fn try_gso_send_or_fallback(
                 local_ip,
                 proxy_id,
                 send_drops,
+                authorization,
             )
-            .await;
+            .await
+            {
+                return Some(termination);
+            }
             // Now push the current datagram (or direct-send if oversized/full).
             enqueue_sendmmsg_or_direct(
                 send_batch,
@@ -1720,8 +1897,9 @@ async fn try_gso_send_or_fallback(
                 local_ip,
                 proxy_id,
                 send_drops,
+                authorization,
             )
-            .await;
+            .await
         }
     }
 }
@@ -2902,6 +3080,18 @@ async fn process_new_session_datagram(
         return Ok(());
     }
 
+    // Anchor the finite authenticated-stream fallback maximum ONCE, here: the
+    // instant this source's first datagram entered session admission, before
+    // the epoch resolve, the mesh egress decision, and the `on_stream_connect`
+    // chain (issue #3816). Anchoring after that chain — the shape the DTLS
+    // accept path uses, where the accept itself is the admission instant —
+    // would let a deliberately slow stream-connect plugin buy the admitted
+    // session extra authorized lifetime. The published maximum is read once on
+    // the same seam so a mid-setup reload cannot move this session's bound.
+    let auth_anchor = tokio::time::Instant::now();
+    let auth_max_lifetime_seconds =
+        crate::proxy::auth_lifetime::authenticated_stream_max_lifetime_seconds();
+
     let epoch = request_epoch.load();
     let view = resolve_udp_session_epoch_view(
         proxy_id,
@@ -2962,6 +3152,26 @@ async fn process_new_session_datagram(
     // ultimately reject them.
     let stream_ctx = admit_plain_udp_stream(&epoch, &view, identity, listen_port).await?;
 
+    // Effective authorization lifetime for the admitted plain-UDP session
+    // (issue #3816). `on_stream_connect` runs once, at admission, and is never
+    // repeated — an `on_stream_connect` plugin that identified a consumer or
+    // an external identity (including a custom or future stream-auth plugin)
+    // would otherwise create an indefinitely authorized UDP session. Earliest
+    // of the accepted credential's own deadline and the finite
+    // authenticated-stream maximum, anchored above and never refreshed by
+    // relayed datagrams. `None` for an unauthenticated session, which this
+    // contract does not bound and whose behavior is unchanged.
+    let auth_deadline = crate::proxy::auth_lifetime::effective_stream_auth_deadline(
+        stream_ctx.is_authenticated(),
+        stream_ctx.credential_deadline_at(),
+        auth_anchor,
+        auth_max_lifetime_seconds,
+    );
+    // Once-only settlement shared by every phase below and by the established
+    // session's two directions, so a session is counted and stamped exactly
+    // once whichever phase observes the expiry first.
+    let auth_latch = crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default();
+
     // Bind the flow's datagram hooks to the decisions the admission chain just
     // memoized. Evaluated once here; every datagram of this session — starting
     // with this one — consumes the resulting list without re-evaluating a
@@ -2973,23 +3183,36 @@ async fn process_new_session_datagram(
 
     let first_datagram_metadata =
         std::sync::Mutex::new(std::collections::HashMap::<String, String>::new());
-    if !udp_datagram_allowed(
-        &admitted_datagram_plugins,
-        udp_session_client_ip(identity.resolved()),
-        Arc::from(view.proxy.id.as_str()),
-        view.proxy.name.as_deref().map(Arc::from),
-        listen_port,
-        &data,
-        if view.proxy.passthrough {
-            StreamBytesKind::EncryptedWire
-        } else {
-            StreamBytesKind::PlaintextWire
+    // The first-datagram policy hooks are post-admission awaitable setup: a
+    // deliberately slow `on_udp_datagram` hook must not carry this session past
+    // the credential that admitted it. No circuit-breaker probe has been
+    // claimed yet, so there is nothing to release on expiry.
+    let first_datagram_allowed = stream_udp_setup_stage_under_authorization(
+        auth_deadline,
+        &auth_latch,
+        &first_datagram_metadata,
+        UDP_SESSION_SETUP_CONTEXT,
+        || {},
+        || {
+            udp_datagram_allowed(
+                &admitted_datagram_plugins,
+                udp_session_client_ip(identity.resolved()),
+                Arc::from(view.proxy.id.as_str()),
+                view.proxy.name.as_deref().map(Arc::from),
+                listen_port,
+                &data,
+                if view.proxy.passthrough {
+                    StreamBytesKind::EncryptedWire
+                } else {
+                    StreamBytesKind::PlaintextWire
+                },
+                UdpDatagramDirection::ClientToBackend,
+                Some(UdpMetadataSink::new(&first_datagram_metadata)),
+            )
         },
-        UdpDatagramDirection::ClientToBackend,
-        Some(UdpMetadataSink::new(&first_datagram_metadata)),
     )
-    .await
-    {
+    .await?;
+    if !first_datagram_allowed {
         return Ok(());
     }
 
@@ -3019,6 +3242,9 @@ async fn process_new_session_datagram(
         preselected_backend_target,
         admitted_datagram_plugins,
         stream_ctx,
+        auth_deadline,
+        &auth_latch,
+        &first_datagram_metadata,
     )
     .await?;
     reservation.disarm();
@@ -3050,8 +3276,19 @@ async fn process_new_session_datagram(
     // order, then atomically remove the pending gate. Each drained datagram
     // goes through the same per-datagram plugin hooks and debug-level
     // packet-error handling as the established-session path.
-    while let Some(batch) = take_pending_datagrams(pending_sessions, client_addr) {
+    'drain: while let Some(batch) = take_pending_datagrams(pending_sessions, client_addr) {
         for dgram in batch {
+            // Stop the drain the moment the admitted credential stops
+            // authorizing this session: no further hook runs and no further
+            // backend datagram is produced for this source. The forward below
+            // would refuse anyway; breaking here also keeps a slow
+            // `on_udp_datagram` hook from running post-expiry. The gate entry
+            // was already removed under the shard lock by
+            // `take_pending_datagrams`, so `gate.disarm()` below is still
+            // correct on this path.
+            if session.refuse_if_authorization_expired().is_some() {
+                break 'drain;
+            }
             if !udp_datagram_allowed(
                 &session.datagram_plugins,
                 Arc::clone(&session.datagram_client_ip),
@@ -3093,6 +3330,60 @@ async fn forward_client_datagram_to_backend(
     session: &Arc<UdpSession>,
     data: &[u8],
 ) -> Result<(), anyhow::Error> {
+    let send = async {
+        if let Some(ref dtls) = session.dtls_conn {
+            dtls.send(data)
+                .await
+                .map(|()| data.len())
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        } else if let Some(ref sock) = session.backend_socket {
+            sock.send(data).await
+        } else {
+            Err(std::io::Error::other("no backend socket available"))
+        }
+    };
+    forward_client_datagram_commit(session, data, send).await
+}
+
+/// Authorization-aware client→backend datagram commit (issue #3816 / #3820).
+///
+/// The pre-send `refuse_if_authorization_expired` check still refuses an
+/// already-elapsed plan before any amplification budget is published. The
+/// gateway-owned send itself is then raced through
+/// [`udp_frontend_send_until_expiry`]: a socket parked on writability cannot
+/// commit after the absolute deadline, an already-elapsed plan never polls
+/// `send`, and an exact-deadline tie is expiry-first. Settlement goes through
+/// the session latch and reply-task wake exactly once — never as hook-ingress
+/// overload or a backend health failure.
+///
+/// Unauthenticated sessions (`authorization == None`) take the `Option`
+/// discriminant only: no extra clock read, lock, allocation, or timer beyond
+/// that existing gate.
+///
+/// `send` is the production backend send, or a parked test future that stands
+/// in for a socket waiting on writability.
+async fn forward_client_datagram_commit<F>(
+    session: &Arc<UdpSession>,
+    data: &[u8],
+    send: F,
+) -> Result<(), anyhow::Error>
+where
+    F: std::future::Future<Output = Result<usize, std::io::Error>>,
+{
+    // Authorization-lifetime gate for the client→backend direction (issue
+    // #3816). Placed ahead of the amplification-budget publish and the backend
+    // send so an expired credential moves no gateway state and produces no
+    // backend datagram. An already-elapsed deadline refuses THIS datagram
+    // immediately rather than waiting for the reply task's timer arm to be
+    // scheduled.
+    //
+    // Cost on the datagram hot path: one `Option` discriminant test for an
+    // unauthenticated session (no clock read, no lock, no allocation, no timer)
+    // and one additional monotonic instant comparison for an authenticated one.
+    if session.refuse_if_authorization_expired().is_some() {
+        return Err(udp_authorization_expired_error());
+    }
+
     // Publish the response budget before the send. In particular, a loopback
     // backend can receive and answer between the send syscall and this task
     // being polled again; publishing only after send completion lets that first
@@ -3100,19 +3391,19 @@ async fn forward_client_datagram_to_backend(
     // conservative budget based on bytes accepted from the client.
     publish_session_request_budget(session, data.len() as u64);
 
-    let send_result = if let Some(ref dtls) = session.dtls_conn {
-        dtls.send(data)
-            .await
-            .map(|()| data.len())
-            .map_err(|e| std::io::Error::other(e.to_string()))
-    } else if let Some(ref sock) = session.backend_socket {
-        sock.send(data).await
-    } else {
-        return Err(anyhow::anyhow!("no backend socket available"));
-    };
-
-    match send_result {
-        Ok(_) => {
+    let plan = session
+        .authorization
+        .as_ref()
+        .map(|authorization| authorization.plan);
+    match udp_frontend_send_until_expiry(plan, send).await {
+        UdpFrontendSendOutcome::AuthorizationExpired(_) => {
+            // Settle through the existing session latch and wake the reply task
+            // exactly once. A parked send that lost the race is dropped, so it
+            // cannot complete afterwards.
+            let _ = session.refuse_if_authorization_expired();
+            Err(udp_authorization_expired_error())
+        }
+        UdpFrontendSendOutcome::Sent(Ok(_)) => {
             session
                 .last_activity
                 .store(coarse_epoch_millis(), Ordering::Relaxed);
@@ -3121,7 +3412,12 @@ async fn forward_client_datagram_to_backend(
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
             Ok(())
         }
-        Err(e) => Err(anyhow::anyhow!("send to backend failed: {}", e)),
+        UdpFrontendSendOutcome::Sent(Err(e)) if e.to_string() == "no backend socket available" => {
+            Err(anyhow::anyhow!("no backend socket available"))
+        }
+        UdpFrontendSendOutcome::Sent(Err(e)) => {
+            Err(anyhow::anyhow!("send to backend failed: {}", e))
+        }
     }
 }
 
@@ -3592,6 +3888,24 @@ async fn start_dtls_frontend_listener(
                         Default::default()
                     };
 
+                    // Authorization lifetime for the admitted DTLS session
+                    // (issue #3816). `on_stream_connect` ran once at admission
+                    // and is never repeated, so the session would otherwise
+                    // outlive the certificate that admitted it. Earliest of the
+                    // accepted credential's own deadline and the finite
+                    // authenticated-stream maximum, anchored here and never
+                    // refreshed by relayed datagrams. `None` for an
+                    // unauthenticated session.
+                    let handler_auth_max_lifetime =
+                        crate::proxy::auth_lifetime::authenticated_stream_max_lifetime_seconds();
+                    let handler_auth_deadline =
+                        crate::proxy::auth_lifetime::effective_stream_auth_deadline(
+                            stream_ctx.is_authenticated(),
+                            stream_ctx.credential_deadline_at(),
+                            tokio::time::Instant::now(),
+                            handler_auth_max_lifetime,
+                        );
+
                     let result = handle_dtls_client(
                         client_conn,
                         identity,
@@ -3609,6 +3923,7 @@ async fn start_dtls_frontend_listener(
                         port,
                         &handler_crls,
                         &handler_dtls_cache,
+                        handler_auth_deadline,
                     )
                     .await;
                     let (err_msg, error_class, disconnect_cause, disconnect_direction) =
@@ -3627,11 +3942,7 @@ async fn start_dtls_frontend_listener(
                                     e
                                 );
                                 let error_message = e.to_string();
-                                let err_class = if is_udp_dtls_idle_timeout(e) {
-                                    crate::retry::ErrorClass::ReadWriteTimeout
-                                } else {
-                                    crate::retry::classify_boxed_error(e.as_ref())
-                                };
+                                let err_class = dtls_error_class(e);
                                 // handle_dtls_client_inner can fail on
                                 // backend-side setup (DNS, backend UDP bind,
                                 // backend DTLS handshake) as well as
@@ -3774,6 +4085,7 @@ async fn handle_dtls_client(
     listen_port: u16,
     crls: &crate::tls::CrlList,
     backend_dtls_config_cache: &BackendDtlsConfigCache,
+    auth_deadline: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
 ) -> DtlsHandlerResult {
     let mut backend_info = DtlsBackendInfo {
         backend_target: String::new(),
@@ -3810,6 +4122,7 @@ async fn handle_dtls_client(
         listen_port,
         crls,
         backend_dtls_config_cache,
+        auth_deadline,
     )
     .await;
     DtlsHandlerResult {
@@ -3832,6 +4145,23 @@ async fn handle_dtls_client(
 /// typed error wrapper. See [`crate::proxy::stream_error`] for the rationale.
 pub(crate) const STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED: &str = "Backend DTLS handshake failed";
 
+/// Error class for a DTLS session failure.
+///
+/// Typed markers first: the idle watchdog and the authorization-lifetime
+/// terminator are both explicit types, so neither is inferred from message
+/// text. Everything else falls back to the shared boxed-error classifier.
+pub(crate) fn dtls_error_class(error: &anyhow::Error) -> crate::retry::ErrorClass {
+    if is_udp_dtls_idle_timeout(error) {
+        return crate::retry::ErrorClass::ReadWriteTimeout;
+    }
+    if is_dtls_authorization_expired(error) {
+        // The same class the typed setup-phase `AuthorizationExpired` kind maps
+        // to, so a policy expiry never reads as a transport or backend fault.
+        return crate::retry::ErrorClass::RequestError;
+    }
+    crate::retry::classify_boxed_error(error.as_ref())
+}
+
 /// Map a DTLS session failure to a `DisconnectCause`.
 ///
 /// **Typed-kind first.** When the chain carries a [`StreamSetupError`] (the
@@ -3845,7 +4175,7 @@ pub(crate) const STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED: &str = "Backend DTLS 
 /// `BackendError` so DTLS `stream_disconnects` metrics don't collapse every
 /// failure into `recv_error`. Generic decrypt errors remain client-side
 /// (`RecvError`).
-fn dtls_disconnect_cause(
+pub(crate) fn dtls_disconnect_cause(
     error: &anyhow::Error,
     class: &crate::retry::ErrorClass,
 ) -> crate::plugins::DisconnectCause {
@@ -3854,6 +4184,14 @@ fn dtls_disconnect_cause(
 
     if is_udp_dtls_idle_timeout(error) {
         return DisconnectCause::IdleTimeout;
+    }
+
+    // A relay-phase authorization expiry is a gateway-policy decision about the
+    // client's own credential, so it is attributed client-side exactly like the
+    // setup-phase `StreamSetupKind::AuthorizationExpired` below, and never as a
+    // backend fault.
+    if is_dtls_authorization_expired(error) {
+        return DisconnectCause::RecvError;
     }
 
     if let Some(setup_err) = find_stream_setup_error(error) {
@@ -3888,10 +4226,17 @@ fn dtls_disconnect_cause(
 /// — historically `None`, now derived from the typed kind (when present) or
 /// inferred from the error class so operators can tell whether the client or
 /// the backend tore down the session.
-fn dtls_disconnect_direction(error: &anyhow::Error, class: &crate::retry::ErrorClass) -> Direction {
+pub(crate) fn dtls_disconnect_direction(
+    error: &anyhow::Error,
+    class: &crate::retry::ErrorClass,
+) -> Direction {
     use crate::retry::ErrorClass;
     if is_udp_dtls_idle_timeout(error) {
         return Direction::Unknown;
+    }
+    // Same client-side attribution as the setup-phase typed kind.
+    if is_dtls_authorization_expired(error) {
+        return Direction::ClientToBackend;
     }
     if let Some(setup_err) = find_stream_setup_error(error) {
         return setup_err.kind.direction();
@@ -3929,6 +4274,490 @@ async fn dtls_shared_idle_watchdog(
     }
 }
 
+/// A DTLS session terminated because the authorization lifetime of the
+/// credential that admitted it elapsed while the relay was running (issue
+/// #3816).
+///
+/// Typed rather than a bare `anyhow!` so the disconnect cause, direction, and
+/// error class are derived from the type instead of inferred from message text.
+/// Its `Display` is a compiled-in literal: it names the contract, never the
+/// credential, its subject, its provider, its expiry instant, or the client.
+#[derive(Debug)]
+pub(crate) struct DtlsAuthorizationExpired;
+
+impl std::fmt::Display for DtlsAuthorizationExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("authenticated DTLS session terminated: authorization lifetime reached")
+    }
+}
+
+impl std::error::Error for DtlsAuthorizationExpired {}
+
+/// `true` when this DTLS session failure is the relay-phase authorization
+/// expiry above. Health-neutral and client-side: it is a gateway-policy
+/// decision about the client's own credential, not a backend fault.
+pub(crate) fn is_dtls_authorization_expired(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<DtlsAuthorizationExpired>().is_some()
+}
+
+/// Settle a UDP/DTLS stream-session authorization expiry exactly once, in any
+/// phase.
+///
+/// The shared latch records the fixed-cardinality `stream_udp` termination
+/// counter for the FIRST caller only, and only that caller stamps the bounded
+/// class into the session metadata map; the return value reports whether THIS
+/// call owned the settlement. `handle_dtls_client` drains that map into
+/// `DtlsHandlerResult::metadata`, which the accept loop merges into the
+/// `StreamTransactionSummary` and delivers to `on_stream_disconnect`; the
+/// plain-UDP session writes the same key straight into `UdpSession::metadata`,
+/// which `build_udp_stream_summary` reads. Either way the setup phase and the
+/// relay phase reach the summary through the ordinary lifecycle. Only the
+/// bounded class string is published: no identity, certificate field, expiry
+/// instant, provider detail, or client address.
+pub(crate) fn settle_stream_udp_auth_expiry(
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+    latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    session_metadata: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+) -> bool {
+    let won = latch.record_once(
+        termination,
+        crate::proxy::auth_lifetime::StreamAuthProtocolFamily::StreamUdp,
+    );
+    if won {
+        session_metadata
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                crate::proxy::auth_lifetime::STREAM_AUTH_TERMINATION_METADATA_KEY.to_string(),
+                termination.as_str().to_string(),
+            );
+    }
+    won
+}
+
+/// DTLS-named alias retained for the DTLS relay/setup call sites and their
+/// external coverage. The implementation is protocol-neutral because plain UDP
+/// and DTLS share one `stream_udp` counter family and one metadata key.
+pub(crate) fn settle_dtls_auth_expiry(
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+    latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    session_metadata: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+) {
+    let _settled = settle_stream_udp_auth_expiry(termination, latch, session_metadata);
+}
+
+/// Fixed suffix identifying the plain-UDP session lifecycle in the typed
+/// authorization setup error. Names the contract, never the credential.
+pub(crate) const UDP_SESSION_SETUP_CONTEXT: &str = "(UDP session)";
+/// Fixed suffix identifying the DTLS session lifecycle in the same error.
+pub(crate) const DTLS_SESSION_SETUP_CONTEXT: &str = "(DTLS session)";
+
+/// The typed, client-side, health-neutral error returned when authorization
+/// elapsed during post-admission DTLS setup, before any backend or application
+/// datagram was forwarded. Fixed redacted wording.
+pub(crate) fn dtls_authorization_setup_error() -> anyhow::Error {
+    StreamSetupError::new(
+        StreamSetupKind::AuthorizationExpired,
+        DTLS_SESSION_SETUP_CONTEXT,
+    )
+    .into()
+}
+
+/// The typed, client-side, health-neutral error returned when a plain-UDP
+/// session's authorization lifetime elapsed — during post-admission setup
+/// (before any backend datagram was sent) or on an established session's
+/// client→backend forward.
+///
+/// `StreamSetupKind::AuthorizationExpired` is client-side, so
+/// `is_client_or_policy_udp_setup_drop` logs it at `debug!` and no backend
+/// health, circuit-breaker, or load-balancer state moves. Its wording is a
+/// compiled-in literal that names the contract, never the credential, its
+/// subject, its provider, its expiry instant, or the client address.
+pub(crate) fn udp_authorization_expired_error() -> anyhow::Error {
+    StreamSetupError::new(
+        StreamSetupKind::AuthorizationExpired,
+        UDP_SESSION_SETUP_CONTEXT,
+    )
+    .into()
+}
+
+/// Fixed `StreamTransactionSummary::connection_error` for a plain-UDP session
+/// the authorization contract terminated. A compiled-in literal, redacted the
+/// same way [`DtlsAuthorizationExpired`]'s `Display` is.
+pub(crate) const UDP_AUTHORIZATION_EXPIRED_MESSAGE: &str =
+    "authenticated UDP session terminated: authorization lifetime reached";
+
+/// Disconnect attribution for a plain-UDP session ended by the authorization
+/// contract.
+///
+/// Client-side and backend-health-neutral by construction, matching
+/// [`dtls_error_class`] / [`dtls_disconnect_cause`] / [`dtls_disconnect_direction`]
+/// for the DTLS equivalent: this is a gateway policy decision about the
+/// CLIENT's own credential, so `stream_disconnects` must not read it as a
+/// backend outage and no upstream is scored for it.
+pub(crate) fn udp_authorization_disconnect_classification() -> (
+    String,
+    crate::retry::ErrorClass,
+    crate::plugins::DisconnectCause,
+    Direction,
+) {
+    (
+        UDP_AUTHORIZATION_EXPIRED_MESSAGE.to_string(),
+        crate::retry::ErrorClass::RequestError,
+        crate::plugins::DisconnectCause::RecvError,
+        Direction::ClientToBackend,
+    )
+}
+
+/// Outcome of one authorization-bounded backend-reply receive.
+#[derive(Debug)]
+pub(crate) enum UdpReplyRecvOutcome<T> {
+    /// A backend datagram (or a backend receive error) arrived first.
+    Received(T),
+    /// Per-session stop, listener shutdown, or global shutdown won.
+    Stopped,
+    /// The admitted session's authorization lifetime elapsed.
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+}
+
+/// Outcome of one backend→client datagram after the awaitable hook chain is
+/// raced against the admitted absolute authorization plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UdpReplyDatagramCommit {
+    /// The datagram may be sent or enqueued for the client.
+    Commit,
+    /// A plugin dropped it while the session was still authorized; continue
+    /// receiving.
+    Drop,
+    /// The absolute plan elapsed while a hook was pending, or was already
+    /// elapsed before the chain was polled. The still-pending hook future is
+    /// dropped. The datagram must not be sent or enqueued, and the reply task
+    /// must tear down.
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+}
+
+/// Recheck the admitted absolute authorization plan at a backend→client
+/// post-receive commitment boundary (issue #3816).
+///
+/// Unauthenticated sessions (`None`) take the `Option` miss only — no clock,
+/// timer, lock, or allocation. Authenticated sessions pay one monotonic
+/// comparison against the SAME absolute plan armed outside the receive loop.
+/// Relayed datagrams never refresh it.
+///
+/// This predicate is the synchronous gate used before enqueue, flush, and the
+/// post-`writable()` syscall. It cannot own an asynchronous client send: a
+/// check followed by `send_to`/`writable().await` can stay pending across the
+/// deadline and still emit. Those awaits go through
+/// [`udp_frontend_send_until_expiry`] / [`udp_frontend_writable_until_expiry`].
+#[inline]
+pub(crate) fn udp_reply_expired_at_commit(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+    let plan = plan?;
+    (tokio::time::Instant::now() >= plan.at).then_some(plan.termination)
+}
+
+/// Outcome of racing one client-facing UDP/DTLS frontend send (or writable
+/// wait) against the admitted absolute authorization plan.
+#[derive(Debug)]
+pub(crate) enum UdpFrontendSendOutcome<T> {
+    /// The send or writable wait completed while the session was still
+    /// authorized. The inner value is the operation's own result.
+    Sent(T),
+    /// The absolute plan elapsed before the operation was allowed to emit.
+    /// The send/writable future was dropped, so it cannot complete afterwards.
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+}
+
+/// Race one client-facing send against the admitted absolute authorization
+/// plan (issue #3816 / #3820).
+///
+/// A pre-send `udp_reply_expired_at_commit` check is not enough: `send_to`
+/// can remain pending across the deadline and still emit a client-facing
+/// packet. This helper owns the send future for the whole wait.
+///
+/// Authenticated sessions: an already-elapsed plan never polls `send`.
+/// Otherwise the expiry arm is `biased` FIRST so an exact-deadline tie fails
+/// closed (expiry wins over send readiness). `timeout_at` is refused here
+/// because it polls the inner future before the timer. The plan is never
+/// refreshed. The send future is dropped when expiry wins — it is not
+/// detached and cannot outlive the race. For terminating frontend DTLS the
+/// raced future is `DtlsServerSender::send_committed`: dropping it also
+/// cancels the queued driver request so ciphertext cannot be encrypted or
+/// written after the bound.
+///
+/// Unauthenticated sessions (`None`) await `send` with no timer, lock, or
+/// clock read — the previous fast path.
+pub(crate) async fn udp_frontend_send_until_expiry<F>(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    send: F,
+) -> UdpFrontendSendOutcome<F::Output>
+where
+    F: std::future::Future,
+{
+    let Some(plan) = plan else {
+        return UdpFrontendSendOutcome::Sent(send.await);
+    };
+    if tokio::time::Instant::now() >= plan.at {
+        return UdpFrontendSendOutcome::AuthorizationExpired(plan.termination);
+    }
+    tokio::select! {
+        biased;
+        () = tokio::time::sleep_until(plan.at) => {
+            UdpFrontendSendOutcome::AuthorizationExpired(plan.termination)
+        }
+        result = send => UdpFrontendSendOutcome::Sent(result),
+    }
+}
+
+/// Race one DTLS client→backend stage — receive, an awaited hook, or the
+/// backend application-datagram commit — against the admitted absolute
+/// authorization plan (issue #3816 / #3820).
+///
+/// The client-to-backend task owns this boundary: the outer relay select is
+/// not sufficient, because abort is scheduled after the inner task may already
+/// have committed. An already-elapsed plan never polls `stage`. An exact
+/// deadline tie is expiry-first. Settlement goes through the shared session
+/// latch exactly once and is not counted as hook-ingress overload or a backend
+/// health failure.
+///
+/// Unauthenticated sessions (`None`) await `stage` with no timer, lock, or
+/// clock read.
+pub(crate) async fn dtls_c2b_until_expiry<F>(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    session_metadata: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+    stage: F,
+) -> Result<F::Output, crate::proxy::auth_lifetime::StreamAuthTermination>
+where
+    F: std::future::Future,
+{
+    match udp_frontend_send_until_expiry(plan, stage).await {
+        UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
+            settle_dtls_auth_expiry(termination, latch, session_metadata);
+            Err(termination)
+        }
+        UdpFrontendSendOutcome::Sent(value) => Ok(value),
+    }
+}
+
+/// Race a client-facing `writable()` wait against the same absolute plan,
+/// then re-read the plan after readiness and before the caller may issue
+/// the send syscall.
+///
+/// `writable()` becoming ready is not permission to emit. Exact-deadline
+/// ties fail closed in the race, and the post-ready recheck catches a clock
+/// that has already reached `plan.at` even if the Sleep arm was not the one
+/// `select!` observed. Unauthenticated sessions skip both the timer and the
+/// clock read.
+pub(crate) async fn udp_frontend_writable_until_expiry<W>(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    writable: W,
+) -> UdpFrontendSendOutcome<W::Output>
+where
+    W: std::future::Future,
+{
+    match udp_frontend_send_until_expiry(plan, writable).await {
+        UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
+            UdpFrontendSendOutcome::AuthorizationExpired(termination)
+        }
+        UdpFrontendSendOutcome::Sent(ready) => {
+            if let Some(termination) = udp_reply_expired_at_commit(plan) {
+                UdpFrontendSendOutcome::AuthorizationExpired(termination)
+            } else {
+                UdpFrontendSendOutcome::Sent(ready)
+            }
+        }
+    }
+}
+
+/// Run the backend→client `on_udp_datagram` chain raced against the admitted
+/// absolute authorization plan (issue #3816 / #3820).
+///
+/// A post-hook clock recheck is not enough: if a hook stays pending, the
+/// reply task no longer polls the session deadline and the authenticated
+/// session, backend socket, guards, retained payload, and hook future can
+/// survive indefinitely. This helper owns the hook-chain future for the whole
+/// wait. When expiry wins, that future is dropped immediately — it is not
+/// detached and cannot complete afterwards.
+///
+/// Authenticated sessions: an already-elapsed plan never polls a hook.
+/// Otherwise the chain is raced with the SAME absolute `StreamAuthDeadline`
+/// (never refreshed per hook or datagram) through
+/// [`udp_frontend_send_until_expiry`], so an exact-deadline tie is expiry-first
+/// (`biased`). A plugin `Drop` is honored only when it becomes ready strictly
+/// before expiry; if expiry and Drop are ready together, expiry wins.
+///
+/// Unauthenticated sessions (`plan == None`) await the chain with no timer,
+/// lock, or clock read — the previous fast path.
+pub(crate) async fn udp_reply_commit_after_backend_hooks(
+    datagram_plugins: &[Arc<dyn Plugin>],
+    ctx: &UdpDatagramContext<'_>,
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+) -> UdpReplyDatagramCommit {
+    let chain = async {
+        for plugin in datagram_plugins {
+            if matches!(plugin.on_udp_datagram(ctx).await, UdpDatagramVerdict::Drop) {
+                return UdpReplyDatagramCommit::Drop;
+            }
+        }
+        UdpReplyDatagramCommit::Commit
+    };
+    match udp_frontend_send_until_expiry(plan, chain).await {
+        UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
+            UdpReplyDatagramCommit::AuthorizationExpired(termination)
+        }
+        UdpFrontendSendOutcome::Sent(commit) => commit,
+    }
+}
+
+/// Race one backend-reply receive against the session's absolute authorization
+/// deadline, the per-session stop signal, and listener/global shutdown.
+///
+/// The authorization arm is `biased` FIRST, and an ALREADY-elapsed plan settles
+/// without polling `recv` at all: a backend datagram that is already readable
+/// must not be delivered to a client whose credential has stopped authorizing
+/// the session, and the decision must not depend on `select!`'s scheduling.
+///
+/// `authorization_deadline` is armed ONCE by the caller, outside its receive
+/// loop, so no per-datagram timer is registered. An unauthenticated session
+/// passes `None` and takes the previous code path exactly, with no timer arm.
+pub(crate) async fn udp_reply_recv_until_stop_or_expiry<F, C, T>(
+    stop_flag: &std::sync::atomic::AtomicBool,
+    stop_notify: &tokio::sync::Notify,
+    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    authorization_deadline: &mut std::pin::Pin<Box<tokio::time::Sleep>>,
+    recv: F,
+    cancel: C,
+) -> UdpReplyRecvOutcome<T>
+where
+    F: std::future::Future<Output = T>,
+    C: std::future::Future<Output = ()>,
+{
+    let Some(plan) = authorization else {
+        return match udp_reply_recv_until_stop(stop_flag, stop_notify, recv, cancel).await {
+            Some(value) => UdpReplyRecvOutcome::Received(value),
+            None => UdpReplyRecvOutcome::Stopped,
+        };
+    };
+    if tokio::time::Instant::now() >= plan.at {
+        return UdpReplyRecvOutcome::AuthorizationExpired(plan.termination);
+    }
+    tokio::select! {
+        biased;
+        () = authorization_deadline.as_mut() => {
+            UdpReplyRecvOutcome::AuthorizationExpired(plan.termination)
+        }
+        inner = udp_reply_recv_until_stop(stop_flag, stop_notify, recv, cancel) => match inner {
+            Some(value) => UdpReplyRecvOutcome::Received(value),
+            None => UdpReplyRecvOutcome::Stopped,
+        },
+    }
+}
+
+/// Whether an admitted DTLS session may still be handed to the relay tasks.
+///
+/// Setup between two await points is synchronous work the deadline arms cannot
+/// observe, so the absolute plan is re-checked immediately before backend
+/// success accounting and relay task creation. Returns the bounded termination
+/// class when the session may no longer be admitted. `None` (unauthenticated)
+/// is always admissible.
+pub(crate) fn dtls_authorization_expired_before_relay(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    now: tokio::time::Instant,
+) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+    plan.filter(|plan| now >= plan.at)
+        .map(|plan| plan.termination)
+}
+
+/// Whether an admitted plain-UDP session may still be COMMITTED: inserted into
+/// the session map, counted as a backend success, handed a reply task, and
+/// given its first backend send.
+///
+/// Identical contract to [`dtls_authorization_expired_before_relay`] — the
+/// synchronous work between two `await` points is invisible to the deadline
+/// arms, so the absolute plan is re-read immediately before commitment. `None`
+/// (unauthenticated) is always committable.
+pub(crate) fn udp_authorization_expired_before_commit(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    now: tokio::time::Instant,
+) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+    dtls_authorization_expired_before_relay(plan, now)
+}
+
+/// Run one awaitable post-admission UDP/DTLS stream-setup stage — the
+/// first-datagram policy hooks, DNS resolution, backend UDP/DTLS connect and
+/// handshake — under the admitted credential's absolute authorization deadline
+/// (issue #3816).
+///
+/// The deadline is anchored at admission and never refreshed, so composing it
+/// over a stage cannot extend it. An already-elapsed plan never builds or polls
+/// the stage at all, so an expired session runs no hook, resolves no name and
+/// dials no backend; a stage that started earlier has its future DROPPED at the
+/// deadline, so a partially completed connect or DTLS handshake is abandoned
+/// rather than finished.
+///
+/// On expiry `release_probe` runs first — the caller uses it to release a
+/// claimed HALF_OPEN circuit-breaker probe slot NEUTRALLY, because this is a
+/// gateway security decision and must record neither backend success nor
+/// backend failure — then the termination is settled once and the typed
+/// client-side setup error is returned, carrying `context` as its fixed,
+/// credential-free suffix.
+///
+/// `None` (an unauthenticated UDP/DTLS session) runs the stage unbounded, with
+/// no timer registered at all.
+pub(crate) async fn stream_udp_setup_stage_under_authorization<S, F>(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    session_metadata: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+    context: &'static str,
+    release_probe: impl FnOnce(),
+    stage: S,
+) -> Result<F::Output, anyhow::Error>
+where
+    S: FnOnce() -> F,
+    F: std::future::Future,
+{
+    if let Some(termination) =
+        dtls_authorization_expired_before_relay(plan, tokio::time::Instant::now())
+    {
+        release_probe();
+        settle_stream_udp_auth_expiry(termination, latch, session_metadata);
+        return Err(StreamSetupError::new(StreamSetupKind::AuthorizationExpired, context).into());
+    }
+    match crate::proxy::tcp_proxy::within_stream_auth_deadline(plan, stage()).await {
+        Ok(output) => Ok(output),
+        Err(termination) => {
+            release_probe();
+            settle_stream_udp_auth_expiry(termination, latch, session_metadata);
+            Err(StreamSetupError::new(StreamSetupKind::AuthorizationExpired, context).into())
+        }
+    }
+}
+
+/// DTLS projection of [`stream_udp_setup_stage_under_authorization`].
+pub(crate) async fn dtls_setup_stage_under_authorization<S, F>(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    session_metadata: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+    release_probe: impl FnOnce(),
+    stage: S,
+) -> Result<F::Output, anyhow::Error>
+where
+    S: FnOnce() -> F,
+    F: std::future::Future,
+{
+    stream_udp_setup_stage_under_authorization(
+        plan,
+        latch,
+        session_metadata,
+        DTLS_SESSION_SETUP_CONTEXT,
+        release_probe,
+        stage,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_dtls_client_inner(
     client_conn: crate::dtls::DtlsServerConn,
@@ -3953,6 +4782,7 @@ async fn handle_dtls_client_inner(
     listen_port: u16,
     crls: &crate::tls::CrlList,
     backend_dtls_config_cache: &BackendDtlsConfigCache,
+    auth_deadline: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
 ) -> Result<(), anyhow::Error> {
     // Look up proxy config
     let proxy = epoch
@@ -4008,13 +4838,41 @@ async fn handle_dtls_client_inner(
         }
     }
 
-    let candidates = match dns_cache
-        .resolve_candidates(
-            &backend_host,
-            proxy.dns_override.as_deref(),
-            proxy.dns_cache_ttl_seconds,
-        )
-        .await
+    // Once-only settlement for this session's authorization lifetime, shared by
+    // the setup-phase stages below and the relay-phase deadline arm, so a
+    // session is counted and stamped exactly once no matter which phase ended
+    // it (issue #3816).
+    let auth_termination_latch = crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default();
+    // Release a claimed HALF_OPEN probe slot NEUTRALLY on an authorization
+    // expiry: the gateway dialed nothing on behalf of this credential, so the
+    // breaker must record neither success nor failure, and the slot must not
+    // leak or the breaker could never recover.
+    let release_half_open_probe = || {
+        if let Some(ref cb_config) = proxy.circuit_breaker {
+            let cb = circuit_breaker_cache.get_or_create(
+                &proxy.namespace,
+                proxy_id,
+                cb_target_key.as_deref(),
+                cb_config,
+            );
+            cb.record_neutral(cb_is_half_open_probe);
+        }
+    };
+
+    let candidates = match dtls_setup_stage_under_authorization(
+        auth_deadline,
+        &auth_termination_latch,
+        &datagram_metadata,
+        &release_half_open_probe,
+        || {
+            dns_cache.resolve_candidates(
+                &backend_host,
+                proxy.dns_override.as_deref(),
+                proxy.dns_cache_ttl_seconds,
+            )
+        },
+    )
+    .await?
     {
         Ok(addresses) => addresses,
         Err(e) => {
@@ -4056,13 +4914,14 @@ async fn handle_dtls_client_inner(
         })
         .transpose()?;
     let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
-    let (connected, backend_addr) = match connect_udp_backend_candidates(
-        &candidates,
-        backend_port,
-        connect_timeout,
-        dtls_params,
+    let (connected, backend_addr) = match dtls_setup_stage_under_authorization(
+        auth_deadline,
+        &auth_termination_latch,
+        &datagram_metadata,
+        &release_half_open_probe,
+        || connect_udp_backend_candidates(&candidates, backend_port, connect_timeout, dtls_params),
     )
-    .await
+    .await?
     {
         Ok(connected) => connected,
         Err(error) => {
@@ -4083,6 +4942,20 @@ async fn handle_dtls_client_inner(
         ConnectedUdpBackend::Plain(socket) => (Some(Arc::new(socket)), None),
         ConnectedUdpBackend::Dtls(connection) => (None, Some(Arc::new(connection))),
     };
+
+    // Synchronous work between the await points above is invisible to the
+    // deadline arms, so re-check the absolute plan before ANY backend success is
+    // recorded and before either relay task exists (issue #3816). The backend
+    // socket / DTLS connection just established is dropped on return, so an
+    // expired session forwards no application datagram and leaves no detached
+    // producer.
+    if let Some(termination) =
+        dtls_authorization_expired_before_relay(auth_deadline, tokio::time::Instant::now())
+    {
+        release_half_open_probe();
+        settle_dtls_auth_expiry(termination, &auth_termination_latch, &datagram_metadata);
+        return Err(dtls_authorization_setup_error());
+    }
 
     // Record circuit breaker success — backend connection established.
     if let Some(ref cb_config) = proxy.circuit_breaker {
@@ -4106,6 +4979,9 @@ async fn handle_dtls_client_inner(
     // Bidirectional forwarding: client (DTLS) ↔ backend (UDP or DTLS)
     // Clone a sender for the backend→client direction before moving client_conn.
     let client_sender = client_conn.clone_sender();
+    if let Some(plan) = auth_deadline {
+        client_sender.bind_authorization_deadline(plan.at);
+    }
     let client_close = client_sender.clone();
     let backend_dtls_write = backend_dtls.clone();
     let backend_udp_write = backend_udp.clone();
@@ -4141,10 +5017,24 @@ async fn handle_dtls_client_inner(
     // (parity with plain UDP). Decrypt/receive alone must not refresh the
     // watchdog — otherwise rate-rejected application datagrams pin the session.
     let activity_fwd = Arc::clone(&shared_activity_ms);
+    // The client→backend task owns the absolute authorization boundary around
+    // receive, every awaited hook, and the backend application-datagram commit.
+    // The outer select abort is scheduled after this task may already commit,
+    // so a parked recv/hook/send must race the plan itself (issue #3816 / #3820).
+    let c2b_auth_plan = auth_deadline;
+    let c2b_auth_latch = auth_termination_latch.clone();
     let client_to_backend = tokio::spawn(async move {
-        loop {
-            let data = match client_conn.recv().await {
-                Ok(d) => d,
+        'c2b: loop {
+            let data = match dtls_c2b_until_expiry(
+                c2b_auth_plan,
+                &c2b_auth_latch,
+                dgram_metadata_fwd.as_ref(),
+                client_conn.recv(),
+            )
+            .await
+            {
+                Ok(Ok(d)) => d,
+                Ok(Err(_)) => break,
                 Err(_) => break,
             };
             let len = data.len();
@@ -4154,7 +5044,9 @@ async fn handle_dtls_client_inner(
                 .bytes_in
                 .fetch_add(len as u64, Ordering::Relaxed);
 
-            // Run per-datagram plugins before forwarding.
+            // Run per-datagram plugins before forwarding. Each awaited hook is
+            // itself an authorization boundary: a blocked plugin cannot commit
+            // an application datagram after the credential expires.
             if !dgram_plugins.is_empty() {
                 let ctx = UdpDatagramContext {
                     client_ip: Arc::clone(&dgram_client_ip),
@@ -4170,9 +5062,20 @@ async fn handle_dtls_client_inner(
                 };
                 let mut dropped = false;
                 for plugin in dgram_plugins.iter() {
-                    if matches!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop) {
-                        dropped = true;
-                        break;
+                    match dtls_c2b_until_expiry(
+                        c2b_auth_plan,
+                        &c2b_auth_latch,
+                        dgram_metadata_fwd.as_ref(),
+                        plugin.on_udp_datagram(&ctx),
+                    )
+                    .await
+                    {
+                        Ok(UdpDatagramVerdict::Drop) => {
+                            dropped = true;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break 'c2b,
                     }
                 }
                 if dropped {
@@ -4192,23 +5095,37 @@ async fn handle_dtls_client_inner(
                     factor,
                 );
             }
-            let send_ok = if let Some(ref dtls) = backend_dtls_write {
-                dtls.send(&data).await.map_err(|e| e.to_string())
-            } else if let Some(ref sock) = backend_udp_write {
-                sock.send(&data)
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
-            } else {
-                break;
+            let send = async {
+                if let Some(ref dtls) = backend_dtls_write {
+                    dtls.send(&data).await.map_err(|e| e.to_string())
+                } else if let Some(ref sock) = backend_udp_write {
+                    sock.send(&data)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                } else {
+                    Err("no backend socket available".to_string())
+                }
             };
-
-            if let Err(e) = send_ok {
-                debug!(
-                    proxy_id = %proxy_id_fwd,
-                    "DTLS client→backend send failed: {}", e
-                );
-                break;
+            match dtls_c2b_until_expiry(
+                c2b_auth_plan,
+                &c2b_auth_latch,
+                dgram_metadata_fwd.as_ref(),
+                send,
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if e != "no backend socket available" {
+                        debug!(
+                            proxy_id = %proxy_id_fwd,
+                            "DTLS client→backend send failed: {}", e
+                        );
+                    }
+                    break;
+                }
+                Err(_) => break,
             }
 
             metrics_fwd.datagrams_out.fetch_add(1, Ordering::Relaxed);
@@ -4232,6 +5149,11 @@ async fn handle_dtls_client_inner(
     // Backend → Client (plain UDP or backend-DTLS): refresh idle only after
     // amplification/plugin admission and successful client delivery.
     let activity_rev = Arc::clone(&shared_activity_ms);
+    // The reply task owns client-facing DTLS sends against the same absolute
+    // plan the outer deadline arm uses. Clone the latch so expiry on a pending
+    // send settles exactly once even if this task exits before that arm fires.
+    let reply_auth_plan = auth_deadline;
+    let reply_auth_latch = auth_termination_latch.clone();
     let backend_to_client = tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
         loop {
@@ -4267,7 +5189,9 @@ async fn handle_dtls_client_inner(
                 continue; // Drop oversized / over-budget response
             }
 
-            // Backend→client plugin hooks for DTLS path
+            // Backend→client plugin hooks share the raced helper: a pending
+            // hook is cancelled at the absolute plan, and settlement goes
+            // through the shared latch exactly once.
             if !dgram_plugins_rev.is_empty() {
                 let ctx = UdpDatagramContext {
                     client_ip: dgram_client_ip_rev.clone(),
@@ -4281,24 +5205,56 @@ async fn handle_dtls_client_inner(
                     payload_kind: StreamBytesKind::DecryptedApp,
                     metadata_sink: Some(UdpMetadataSink::new(dgram_metadata_rev.as_ref())),
                 };
-                let mut drop = false;
-                for plugin in dgram_plugins_rev.iter() {
-                    if matches!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop) {
-                        drop = true;
+                match udp_reply_commit_after_backend_hooks(
+                    dgram_plugins_rev.as_ref(),
+                    &ctx,
+                    reply_auth_plan,
+                )
+                .await
+                {
+                    UdpReplyDatagramCommit::Drop => continue,
+                    UdpReplyDatagramCommit::AuthorizationExpired(termination) => {
+                        settle_dtls_auth_expiry(
+                            termination,
+                            &reply_auth_latch,
+                            dgram_metadata_rev.as_ref(),
+                        );
                         break;
                     }
-                }
-                if drop {
-                    continue;
+                    UdpReplyDatagramCommit::Commit => {}
                 }
             }
 
-            if client_sender.send(&data).await.is_err() {
-                debug!(
-                    proxy_id = %proxy_id_rev,
-                    "DTLS backend→client send failed"
-                );
-                break;
+            match udp_frontend_send_until_expiry(
+                reply_auth_plan,
+                client_sender.send_committed(&data, reply_auth_plan.map(|plan| plan.at)),
+            )
+            .await
+            {
+                UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
+                    settle_dtls_auth_expiry(
+                        termination,
+                        &reply_auth_latch,
+                        dgram_metadata_rev.as_ref(),
+                    );
+                    break;
+                }
+                UdpFrontendSendOutcome::Sent(Err(_)) => {
+                    if let Some(termination) = udp_reply_expired_at_commit(reply_auth_plan) {
+                        settle_dtls_auth_expiry(
+                            termination,
+                            &reply_auth_latch,
+                            dgram_metadata_rev.as_ref(),
+                        );
+                        break;
+                    }
+                    debug!(
+                        proxy_id = %proxy_id_rev,
+                        "DTLS backend→client send failed"
+                    );
+                    break;
+                }
+                UdpFrontendSendOutcome::Sent(Ok(())) => {}
             }
 
             metrics_rev.datagrams_out.fetch_add(1, Ordering::Relaxed);
@@ -4313,11 +5269,43 @@ async fn handle_dtls_client_inner(
     let mut client_to_backend = client_to_backend;
     let mut backend_to_client = backend_to_client;
     let mut idle_watchdog = Box::pin(dtls_shared_idle_watchdog(shared_activity_ms, idle_timeout));
+    // Absolute authorization deadline for the admitted session. Armed once and
+    // never refreshed by relayed datagrams, unlike the idle watchdog beside it.
+    // An unauthenticated session (or one whose plan is absent) leaves the arm
+    // permanently pending, so the relay behaves exactly as before.
+    let authorization_deadline_active = auth_deadline.is_some();
+    let mut authorization_deadline = Box::pin(tokio::time::sleep_until(
+        auth_deadline
+            .map(|plan| plan.at)
+            .unwrap_or_else(tokio::time::Instant::now),
+    ));
     let outcome = tokio::select! {
+        biased;
+        _ = &mut authorization_deadline, if authorization_deadline_active => {
+            // Fixed-cardinality termination class, recorded once through the
+            // same latch the setup phase uses, and stamped into the session
+            // metadata so the bounded class reaches the stream transaction
+            // summary and `on_stream_disconnect` (issue #3816). Authorization
+            // is first so an exact tie with a relay task completing (or the
+            // idle watchdog) is attributed to the security bound.
+            if let Some(plan) = auth_deadline {
+                settle_dtls_auth_expiry(
+                    plan.termination,
+                    &auth_termination_latch,
+                    &datagram_metadata,
+                );
+            }
+            // Typed and health-neutral: no expiry value, identity, or
+            // certificate detail reaches the message.
+            Err(DtlsAuthorizationExpired.into())
+        }
         _ = &mut client_to_backend => Ok(()),
         _ = &mut backend_to_client => Ok(()),
         result = &mut idle_watchdog => result,
     };
+    // Both relay directions and the backend connection are torn down on every
+    // exit path below, including the authorization deadline, so no detached
+    // producer remains and the disconnect/accounting runs exactly once.
     client_to_backend.abort();
     backend_to_client.abort();
 
@@ -4326,7 +5314,15 @@ async fn handle_dtls_client_inner(
         dtls.close().await;
     }
 
-    outcome
+    // A pending client-facing send that lost the authorization race settles
+    // the latch and exits the reply task. That completion can win this select
+    // before the deadline arm, so re-read the latch: teardown above still
+    // runs exactly once, and the close reason stays the typed expiry.
+    if outcome.is_ok() && auth_termination_latch.observed().is_some() {
+        Err(DtlsAuthorizationExpired.into())
+    } else {
+        outcome
+    }
 }
 
 /// Create a new UDP session for a client (plain UDP frontend path).
@@ -4398,6 +5394,9 @@ async fn create_session(
     preselected_backend_target: Option<(String, u16)>,
     admitted_datagram_plugins: Arc<[Arc<dyn Plugin>]>,
     mut stream_ctx: StreamConnectionContext,
+    auth_deadline: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    auth_latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    setup_metadata: &std::sync::Mutex<std::collections::HashMap<String, String>>,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
     let UdpSessionEpochView {
         proxy,
@@ -4462,14 +5461,39 @@ async fn create_session(
         }
     }
 
-    // DNS resolve
-    let candidates = match dns_cache
-        .resolve_candidates(
-            &backend_host,
-            proxy.dns_override.as_deref(),
-            proxy.dns_cache_ttl_seconds,
-        )
-        .await
+    // Release a claimed HALF_OPEN probe slot NEUTRALLY on an authorization
+    // expiry: the gateway dialed nothing on behalf of this credential, so the
+    // breaker must record neither success nor failure, and the slot must not
+    // leak or the breaker could never recover.
+    let release_half_open_probe = || {
+        if let Some(ref cb_config) = proxy.circuit_breaker {
+            let cb = circuit_breaker_cache.get_or_create(
+                &proxy.namespace,
+                proxy_id,
+                cb_target_key.as_deref(),
+                cb_config,
+            );
+            cb.record_neutral(cb_is_half_open_probe);
+        }
+    };
+
+    // DNS resolve, bounded by the admitted credential's absolute authorization
+    // deadline (issue #3816). An already-elapsed plan resolves no name at all.
+    let candidates = match stream_udp_setup_stage_under_authorization(
+        auth_deadline,
+        auth_latch,
+        setup_metadata,
+        UDP_SESSION_SETUP_CONTEXT,
+        &release_half_open_probe,
+        || {
+            dns_cache.resolve_candidates(
+                &backend_host,
+                proxy.dns_override.as_deref(),
+                proxy.dns_cache_ttl_seconds,
+            )
+        },
+    )
+    .await?
     {
         Ok(addresses) => addresses,
         Err(e) => {
@@ -4512,13 +5536,19 @@ async fn create_session(
         })
         .transpose()?;
     let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
-    let (connected, backend_addr) = match connect_udp_backend_candidates(
-        &candidates,
-        backend_port,
-        connect_timeout,
-        dtls_params,
+    // Backend bind/connect (and backend DTLS handshake) under the same absolute
+    // deadline: a stage that started earlier has its future DROPPED at expiry,
+    // so a partially completed connect or handshake is abandoned rather than
+    // finished on behalf of a credential that is no longer authorizing.
+    let (connected, backend_addr) = match stream_udp_setup_stage_under_authorization(
+        auth_deadline,
+        auth_latch,
+        setup_metadata,
+        UDP_SESSION_SETUP_CONTEXT,
+        &release_half_open_probe,
+        || connect_udp_backend_candidates(&candidates, backend_port, connect_timeout, dtls_params),
     )
-    .await
+    .await?
     {
         Ok(connected) => connected,
         Err(error) => {
@@ -4539,6 +5569,27 @@ async fn create_session(
         ConnectedUdpBackend::Plain(socket) => (Some(Arc::new(socket)), None),
         ConnectedUdpBackend::Dtls(connection) => (None, Some(Arc::new(connection))),
     };
+
+    // Synchronous work between the await points above is invisible to the
+    // deadline arms, so re-read the absolute plan before ANY backend success is
+    // recorded and before this session is COMMITTED — inserted into the session
+    // map, given a reply task, or handed its first backend send (issue #3816).
+    // Returning here releases everything this setup claimed: the HALF_OPEN
+    // probe slot goes back NEUTRALLY, the caller's session-slot reservation is
+    // released by its own guard (it is disarmed only on success), no overload
+    // `ConnectionGuard` was taken yet, and the backend socket / DTLS connection
+    // just established is closed and dropped — so no detached producer remains
+    // and no application datagram is ever forwarded.
+    if let Some(termination) =
+        udp_authorization_expired_before_commit(auth_deadline, tokio::time::Instant::now())
+    {
+        release_half_open_probe();
+        settle_stream_udp_auth_expiry(termination, auth_latch, setup_metadata);
+        if let Some(ref dtls) = dtls_conn {
+            dtls.close().await;
+        }
+        return Err(udp_authorization_expired_error());
+    }
 
     // Record circuit breaker success — backend socket established.
     if let Some(ref cb_config) = proxy.circuit_breaker {
@@ -4632,6 +5683,13 @@ async fn create_session(
         hook_ingress_tx: std::sync::Mutex::new(hook_ingress_tx),
         hook_ingress_queued_bytes,
         hook_ingress_stop_notify: Arc::new(tokio::sync::Notify::new()),
+        // The SAME latch the setup stages above used, so the setup phase, the
+        // client→backend direction, and the backend reply task settle exactly
+        // one termination between them.
+        authorization: auth_deadline.map(|plan| UdpSessionAuthorization {
+            plan,
+            latch: auth_latch.clone(),
+        }),
     });
 
     if let Some(rx) = hook_ingress_rx {
@@ -4674,6 +5732,12 @@ async fn create_session(
     let reply_dgram_proxy_name = datagram_proxy_name;
     let reply_listen_port = listen_port;
     let reply_stop_notify = Arc::clone(&session.stop_notify);
+    // Absolute authorization plan for the backend→client direction. Armed once
+    // below, never refreshed by relayed datagrams.
+    let reply_authorization_plan = session
+        .authorization
+        .as_ref()
+        .map(|authorization| authorization.plan);
     let mut reply_listener_shutdown = listener_shutdown.clone();
     let mut reply_global_shutdown = global_shutdown.cloned();
     let is_dtls = reply_dtls.is_some();
@@ -4683,6 +5747,16 @@ async fn create_session(
     let _ = udp_gso_enabled;
     tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
+
+        // Authorization arm for the backend→client direction, armed ONCE here
+        // rather than per receive, so no per-datagram timer is registered
+        // (issue #3816). An unauthenticated session leaves the arm unpolled:
+        // `reply_authorization_plan` is `None`, so
+        // `udp_reply_recv_until_stop_or_expiry` takes the previous code path
+        // verbatim. Boxed to keep the spawned task's frame small.
+        let mut reply_authorization_deadline = Box::pin(tokio::time::sleep_until(
+            reply_authorization_plan.map_or_else(tokio::time::Instant::now, |plan| plan.at),
+        ));
 
         // Third tuple element carries the DisconnectCause so the final
         // metric-emitting branch preserves client-side vs backend-side
@@ -4705,7 +5779,7 @@ async fn create_session(
         // Track whether GSO send has failed, to avoid retrying on kernels that don't support it.
         #[cfg(target_os = "linux")]
         let mut gso_failed = false;
-        loop {
+        'reply: loop {
             // Listener/global shutdown may already be set; borrow() also
             // advances each watch "seen" version so the cancel future's
             // changed() waits for a subsequent change.
@@ -4724,9 +5798,11 @@ async fn create_session(
             let (data_slice, data_vec);
             let len;
             if let Some(ref dtls) = reply_dtls {
-                let recv_result = udp_reply_recv_until_stop(
+                let recv_result = udp_reply_recv_until_stop_or_expiry(
                     &reply_session.stop_reply_task,
                     reply_stop_notify.as_ref(),
+                    reply_authorization_plan,
+                    &mut reply_authorization_deadline,
                     dtls.recv(),
                     udp_reply_shutdown_cancel(
                         &mut reply_listener_shutdown,
@@ -4735,13 +5811,28 @@ async fn create_session(
                 )
                 .await;
                 match recv_result {
-                    None => break,
-                    Some(Ok(d)) => {
+                    UdpReplyRecvOutcome::Stopped => break,
+                    UdpReplyRecvOutcome::AuthorizationExpired(termination) => {
+                        // Settle once, discard any payload that never reached
+                        // the client, then fall through to the shared exit
+                        // path: it closes the backend connection, marks this
+                        // generation expired, closes the hook-ingress channel,
+                        // removes only this exact generation, and releases the
+                        // overload guard and active-session count.
+                        reply_session.settle_authorization_expiry(termination);
+                        #[cfg(target_os = "linux")]
+                        {
+                            gso_batch.discard();
+                            send_batch.discard();
+                        }
+                        break 'reply;
+                    }
+                    UdpReplyRecvOutcome::Received(Ok(d)) => {
                         len = d.len();
                         data_vec = Some(d);
                         data_slice = None;
                     }
-                    Some(Err(e)) => {
+                    UdpReplyRecvOutcome::Received(Err(e)) => {
                         debug!(
                             proxy_id = %reply_proxy_id,
                             client = %udp_client_log_addr(client_addr),
@@ -4761,9 +5852,11 @@ async fn create_session(
                     }
                 }
             } else if let Some(ref sock) = backend_socket {
-                let recv_result = udp_reply_recv_until_stop(
+                let recv_result = udp_reply_recv_until_stop_or_expiry(
                     &reply_session.stop_reply_task,
                     reply_stop_notify.as_ref(),
+                    reply_authorization_plan,
+                    &mut reply_authorization_deadline,
                     sock.recv(&mut buf),
                     udp_reply_shutdown_cancel(
                         &mut reply_listener_shutdown,
@@ -4772,13 +5865,23 @@ async fn create_session(
                 )
                 .await;
                 match recv_result {
-                    None => break,
-                    Some(Ok(n)) => {
+                    UdpReplyRecvOutcome::Stopped => break,
+                    UdpReplyRecvOutcome::AuthorizationExpired(termination) => {
+                        // Same shared exit path as the DTLS-backend arm above.
+                        reply_session.settle_authorization_expiry(termination);
+                        #[cfg(target_os = "linux")]
+                        {
+                            gso_batch.discard();
+                            send_batch.discard();
+                        }
+                        break 'reply;
+                    }
+                    UdpReplyRecvOutcome::Received(Ok(n)) => {
                         len = n;
                         data_vec = None;
                         data_slice = Some(&buf[..n]);
                     }
-                    Some(Err(e)) => {
+                    UdpReplyRecvOutcome::Received(Err(e)) => {
                         debug!(
                             proxy_id = %reply_proxy_id,
                             client = %udp_client_log_addr(client_addr),
@@ -4809,6 +5912,20 @@ async fn create_session(
                 break;
             };
 
+            // Recheck immediately after the receive returns, before any
+            // processing or client send: a datagram that won the receive race
+            // just before expiry must not be forwarded once the credential no
+            // longer authorizes the session.
+            if let Some(termination) = udp_reply_expired_at_commit(reply_authorization_plan) {
+                reply_session.settle_authorization_expiry(termination);
+                #[cfg(target_os = "linux")]
+                {
+                    gso_batch.discard();
+                    send_batch.discard();
+                }
+                break 'reply;
+            }
+
             // Amplification factor check: drop backend responses that exceed
             // the remaining per-request byte budget (cumulative across replies).
             if !admit_udp_response(
@@ -4821,7 +5938,9 @@ async fn create_session(
                 continue; // Drop this response datagram, continue receiving
             }
 
-            // Run backend→client per-datagram plugin hooks.
+            // Run backend→client per-datagram plugin hooks raced against the
+            // same absolute plan. A hook that stays pending past the deadline
+            // is cancelled immediately; the payload is not delivered.
             if !reply_datagram_plugins.is_empty() {
                 let ctx = UdpDatagramContext {
                     client_ip: reply_dgram_client_ip.clone(),
@@ -4834,16 +5953,34 @@ async fn create_session(
                     payload_kind: reply_session.datagram_payload_kind,
                     metadata_sink: Some(UdpMetadataSink::new(&reply_session.metadata)),
                 };
-                let mut drop = false;
-                for plugin in reply_datagram_plugins.iter() {
-                    if matches!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop) {
-                        drop = true;
-                        break;
+                match udp_reply_commit_after_backend_hooks(
+                    reply_datagram_plugins.as_ref(),
+                    &ctx,
+                    reply_authorization_plan,
+                )
+                .await
+                {
+                    UdpReplyDatagramCommit::Drop => continue, // Silent drop
+                    UdpReplyDatagramCommit::AuthorizationExpired(termination) => {
+                        reply_session.settle_authorization_expiry(termination);
+                        #[cfg(target_os = "linux")]
+                        {
+                            gso_batch.discard();
+                            send_batch.discard();
+                        }
+                        break 'reply;
                     }
+                    UdpReplyDatagramCommit::Commit => {}
                 }
-                if drop {
-                    continue; // Silent drop
+            } else if let Some(termination) = udp_reply_expired_at_commit(reply_authorization_plan)
+            {
+                reply_session.settle_authorization_expiry(termination);
+                #[cfg(target_os = "linux")]
+                {
+                    gso_batch.discard();
+                    send_batch.discard();
                 }
+                break 'reply;
             }
 
             // Batch-local counters for this recv burst.
@@ -4875,7 +6012,7 @@ async fn create_session(
                 #[cfg(target_os = "linux")]
                 {
                     if reply_udp_gso && !gso_failed {
-                        try_gso_send_or_fallback(
+                        if let Some(termination) = try_gso_send_or_fallback(
                             &mut gso_batch,
                             &mut send_batch,
                             &frontend,
@@ -4885,38 +6022,75 @@ async fn create_session(
                             &reply_proxy_id,
                             session_local_ip,
                             &mut send_drops,
+                            reply_authorization_plan,
                         )
-                        .await;
-                    } else {
-                        enqueue_sendmmsg_or_direct(
-                            &mut send_batch,
-                            &frontend,
-                            client_addr,
-                            send_data,
-                            session_local_ip,
-                            &reply_proxy_id,
-                            &mut send_drops,
-                        )
-                        .await;
+                        .await
+                        {
+                            reply_session.settle_authorization_expiry(termination);
+                            gso_batch.discard();
+                            send_batch.discard();
+                            break 'reply;
+                        }
+                    } else if let Some(termination) = enqueue_sendmmsg_or_direct(
+                        &mut send_batch,
+                        &frontend,
+                        client_addr,
+                        send_data,
+                        session_local_ip,
+                        &reply_proxy_id,
+                        &mut send_drops,
+                        reply_authorization_plan,
+                    )
+                    .await
+                    {
+                        reply_session.settle_authorization_expiry(termination);
+                        gso_batch.discard();
+                        send_batch.discard();
+                        break 'reply;
                     }
                 }
-            } else if let Err(e) = frontend.send_to(send_data, client_addr).await {
-                debug!(
-                    proxy_id = %reply_proxy_id,
-                    client = %udp_client_log_addr(client_addr),
-                    "UDP send to client failed: {}",
-                    e
-                );
-                let error_message = e.to_string();
-                // Client-facing send failure — the backend is healthy, so
-                // attribute the session teardown to the client recv path.
-                disconnect_error = Some((
-                    error_message.clone(),
-                    crate::retry::classify_boxed_error(anyhow::anyhow!(error_message).as_ref()),
-                    crate::plugins::DisconnectCause::RecvError,
-                    crate::plugins::Direction::BackendToClient,
-                ));
-                break;
+            } else {
+                // Non-batched path: Linux DTLS-backend replies, and every
+                // non-Linux frontend send. The send future is owned by the
+                // same absolute plan — a pre-send check cannot cover a
+                // pending `send_to`.
+                match udp_frontend_send_until_expiry(
+                    reply_authorization_plan,
+                    frontend.send_to(send_data, client_addr),
+                )
+                .await
+                {
+                    UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
+                        reply_session.settle_authorization_expiry(termination);
+                        #[cfg(target_os = "linux")]
+                        {
+                            gso_batch.discard();
+                            send_batch.discard();
+                        }
+                        break 'reply;
+                    }
+                    UdpFrontendSendOutcome::Sent(Err(e)) => {
+                        debug!(
+                            proxy_id = %reply_proxy_id,
+                            client = %udp_client_log_addr(client_addr),
+                            "UDP send to client failed: {}",
+                            e
+                        );
+                        let error_message = e.to_string();
+                        // Client-facing send failure — the backend is healthy, so
+                        // attribute the session teardown to the client recv path.
+                        disconnect_error = Some((
+                            error_message.clone(),
+                            crate::retry::classify_boxed_error(
+                                anyhow::anyhow!(error_message).as_ref(),
+                            ),
+                            crate::plugins::DisconnectCause::RecvError,
+                            crate::plugins::Direction::BackendToClient,
+                        ));
+                        break;
+                    }
+                    UdpFrontendSendOutcome::Sent(Ok(_)) => {}
+                }
             }
 
             // For plain UDP, drain additional pending replies without yielding.
@@ -4928,6 +6102,19 @@ async fn create_session(
                 let batch_limit =
                     reply_adaptive_buffer.get_batch_limit(&reply_proxy_namespace, &reply_proxy_id);
                 for _ in 0..batch_limit {
+                    // Expiry during/among try_recv processing must stop accepting
+                    // further backend payloads; already-queued client datagrams
+                    // are discarded rather than flushed.
+                    if let Some(termination) = udp_reply_expired_at_commit(reply_authorization_plan)
+                    {
+                        reply_session.settle_authorization_expiry(termination);
+                        #[cfg(target_os = "linux")]
+                        {
+                            gso_batch.discard();
+                            send_batch.discard();
+                        }
+                        break 'reply;
+                    }
                     match sock.try_recv(&mut buf) {
                         Ok(len2) => {
                             // Amplification check on batched response datagram
@@ -4940,7 +6127,8 @@ async fn create_session(
                             ) {
                                 continue; // Drop oversized / over-budget response
                             }
-                            // Backend→client plugin hooks on batched datagram
+                            // Backend→client plugin hooks on batched datagram,
+                            // raced against the same absolute plan.
                             if !reply_datagram_plugins.is_empty() {
                                 let ctx = UdpDatagramContext {
                                     client_ip: reply_dgram_client_ip.clone(),
@@ -4955,19 +6143,35 @@ async fn create_session(
                                         &reply_session.metadata,
                                     )),
                                 };
-                                let mut drop = false;
-                                for plugin in reply_datagram_plugins.iter() {
-                                    if matches!(
-                                        plugin.on_udp_datagram(&ctx).await,
-                                        UdpDatagramVerdict::Drop
-                                    ) {
-                                        drop = true;
-                                        break;
+                                match udp_reply_commit_after_backend_hooks(
+                                    reply_datagram_plugins.as_ref(),
+                                    &ctx,
+                                    reply_authorization_plan,
+                                )
+                                .await
+                                {
+                                    UdpReplyDatagramCommit::Drop => continue,
+                                    UdpReplyDatagramCommit::AuthorizationExpired(termination) => {
+                                        reply_session.settle_authorization_expiry(termination);
+                                        #[cfg(target_os = "linux")]
+                                        {
+                                            gso_batch.discard();
+                                            send_batch.discard();
+                                        }
+                                        break 'reply;
                                     }
+                                    UdpReplyDatagramCommit::Commit => {}
                                 }
-                                if drop {
-                                    continue;
+                            } else if let Some(termination) =
+                                udp_reply_expired_at_commit(reply_authorization_plan)
+                            {
+                                reply_session.settle_authorization_expiry(termination);
+                                #[cfg(target_os = "linux")]
+                                {
+                                    gso_batch.discard();
+                                    send_batch.discard();
                                 }
+                                break 'reply;
                             }
 
                             batch_dgrams += 1;
@@ -4978,7 +6182,7 @@ async fn create_session(
                                 #[cfg(target_os = "linux")]
                                 {
                                     if reply_udp_gso && !gso_failed {
-                                        try_gso_send_or_fallback(
+                                        if let Some(termination) = try_gso_send_or_fallback(
                                             &mut gso_batch,
                                             &mut send_batch,
                                             &frontend,
@@ -4988,94 +6192,128 @@ async fn create_session(
                                             &reply_proxy_id,
                                             session_local_ip,
                                             &mut send_drops,
+                                            reply_authorization_plan,
                                         )
-                                        .await;
-                                    } else {
-                                        enqueue_sendmmsg_or_direct(
-                                            &mut send_batch,
-                                            &frontend,
-                                            client_addr,
-                                            &buf[..len2],
-                                            session_local_ip,
-                                            &reply_proxy_id,
-                                            &mut send_drops,
-                                        )
-                                        .await;
+                                        .await
+                                        {
+                                            reply_session.settle_authorization_expiry(termination);
+                                            gso_batch.discard();
+                                            send_batch.discard();
+                                            break 'reply;
+                                        }
+                                    } else if let Some(termination) = enqueue_sendmmsg_or_direct(
+                                        &mut send_batch,
+                                        &frontend,
+                                        client_addr,
+                                        &buf[..len2],
+                                        session_local_ip,
+                                        &reply_proxy_id,
+                                        &mut send_drops,
+                                        reply_authorization_plan,
+                                    )
+                                    .await
+                                    {
+                                        reply_session.settle_authorization_expiry(termination);
+                                        gso_batch.discard();
+                                        send_batch.discard();
+                                        break 'reply;
                                     }
                                 }
-                            } else if let Err(e) = frontend.send_to(&buf[..len2], client_addr).await
-                            {
-                                debug!(
-                                    proxy_id = %reply_proxy_id,
-                                    client = %udp_client_log_addr(client_addr),
-                                    "UDP send to client failed: {}",
-                                    e
-                                );
-                                reply_session.last_activity.store(now, Ordering::Relaxed);
-                                reply_session
-                                    .bytes_received
-                                    .fetch_add(batch_bytes_received, Ordering::Relaxed);
-                                reply_metrics
-                                    .datagrams_out
-                                    .fetch_add(batch_dgrams, Ordering::Relaxed);
-                                reply_metrics
-                                    .bytes_out
-                                    .fetch_add(batch_bytes, Ordering::Relaxed);
-                                if let Some(ref dtls) = reply_dtls {
-                                    dtls.close().await;
-                                }
-                                // Mark expired BEFORE removal so the recv-loop's
-                                // `last_client` fast-path cache (which checks only
-                                // this flag) stops forwarding through the dead
-                                // session and re-creates one — otherwise a
-                                // single-client listener is blackholed: datagrams
-                                // keep flowing into a session whose reply task is
-                                // gone and which the idle cleaner can no longer
-                                // see (it is out of the map).
-                                reply_session
-                                    .expired
-                                    .store(true, std::sync::atomic::Ordering::Release);
-                                reply_session.close_hook_ingress();
-                                if reply_sessions
-                                    .remove_if(&client_addr, |_, v| Arc::ptr_eq(v, &reply_session))
-                                    .is_some()
+                            } else {
+                                match udp_frontend_send_until_expiry(
+                                    reply_authorization_plan,
+                                    frontend.send_to(&buf[..len2], client_addr),
+                                )
+                                .await
                                 {
-                                    reply_session.release_overload_guard();
-                                    reply_metrics
-                                        .active_sessions
-                                        .fetch_sub(1, Ordering::Relaxed);
-                                    let error_message = e.to_string();
-                                    emit_udp_stream_disconnect(
-                                        &reply_plugins,
-                                        UdpDisconnectContext {
-                                            namespace: &reply_proxy_namespace,
-                                            proxy_id: &reply_proxy_id,
-                                            proxy_name: reply_proxy_name.as_deref(),
-                                            session: &reply_session,
-                                            backend_scheme: reply_backend_scheme,
-                                            listen_port: reply_listen_port,
-                                            disconnected_ms: now,
-                                            disconnected_wall_at: chrono::Utc::now(),
-                                            connection_error: Some(error_message.clone()),
-                                            error_class: Some(crate::retry::classify_boxed_error(
-                                                anyhow::anyhow!(error_message).as_ref(),
-                                            )),
-                                            disconnect_direction: Some(
-                                                crate::plugins::Direction::BackendToClient,
-                                            ),
-                                            // frontend.send_to failure is a
-                                            // client-facing write — the backend
-                                            // is healthy, so label the cause as
-                                            // a client-side (RecvError) event
-                                            // rather than a backend outage.
-                                            disconnect_cause: Some(
-                                                crate::plugins::DisconnectCause::RecvError,
-                                            ),
-                                        },
-                                    )
-                                    .await;
+                                    UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
+                                        reply_session.settle_authorization_expiry(termination);
+                                        #[cfg(target_os = "linux")]
+                                        {
+                                            gso_batch.discard();
+                                            send_batch.discard();
+                                        }
+                                        break 'reply;
+                                    }
+                                    UdpFrontendSendOutcome::Sent(Ok(_)) => {}
+                                    UdpFrontendSendOutcome::Sent(Err(e)) => {
+                                        debug!(
+                                            proxy_id = %reply_proxy_id,
+                                            client = %udp_client_log_addr(client_addr),
+                                            "UDP send to client failed: {}",
+                                            e
+                                        );
+                                        reply_session.last_activity.store(now, Ordering::Relaxed);
+                                        reply_session
+                                            .bytes_received
+                                            .fetch_add(batch_bytes_received, Ordering::Relaxed);
+                                        reply_metrics
+                                            .datagrams_out
+                                            .fetch_add(batch_dgrams, Ordering::Relaxed);
+                                        reply_metrics
+                                            .bytes_out
+                                            .fetch_add(batch_bytes, Ordering::Relaxed);
+                                        if let Some(ref dtls) = reply_dtls {
+                                            dtls.close().await;
+                                        }
+                                        // Mark expired BEFORE removal so the recv-loop's
+                                        // `last_client` fast-path cache (which checks only
+                                        // this flag) stops forwarding through the dead
+                                        // session and re-creates one — otherwise a
+                                        // single-client listener is blackholed: datagrams
+                                        // keep flowing into a session whose reply task is
+                                        // gone and which the idle cleaner can no longer
+                                        // see (it is out of the map).
+                                        reply_session
+                                            .expired
+                                            .store(true, std::sync::atomic::Ordering::Release);
+                                        reply_session.close_hook_ingress();
+                                        if reply_sessions
+                                            .remove_if(&client_addr, |_, v| {
+                                                Arc::ptr_eq(v, &reply_session)
+                                            })
+                                            .is_some()
+                                        {
+                                            reply_session.release_overload_guard();
+                                            reply_metrics
+                                                .active_sessions
+                                                .fetch_sub(1, Ordering::Relaxed);
+                                            let error_message = e.to_string();
+                                            emit_udp_stream_disconnect(
+                                                &reply_plugins,
+                                                UdpDisconnectContext {
+                                                    namespace: &reply_proxy_namespace,
+                                                    proxy_id: &reply_proxy_id,
+                                                    proxy_name: reply_proxy_name.as_deref(),
+                                                    session: &reply_session,
+                                                    backend_scheme: reply_backend_scheme,
+                                                    listen_port: reply_listen_port,
+                                                    disconnected_ms: now,
+                                                    disconnected_wall_at: chrono::Utc::now(),
+                                                    connection_error: Some(error_message.clone()),
+                                                    error_class: Some(
+                                                        crate::retry::classify_boxed_error(
+                                                            anyhow::anyhow!(error_message).as_ref(),
+                                                        ),
+                                                    ),
+                                                    disconnect_direction: Some(
+                                                        crate::plugins::Direction::BackendToClient,
+                                                    ),
+                                                    // frontend.send_to failure is a
+                                                    // client-facing write — the backend
+                                                    // is healthy, so label the cause as
+                                                    // a client-side (RecvError) event
+                                                    // rather than a backend outage.
+                                                    disconnect_cause: Some(
+                                                        crate::plugins::DisconnectCause::RecvError,
+                                                    ),
+                                                },
+                                            )
+                                            .await;
+                                        }
+                                        return;
+                                    }
                                 }
-                                return;
                             }
                         }
                         Err(_) => break, // WouldBlock — socket drained
@@ -5086,6 +6324,14 @@ async fn create_session(
             // Flush batched sends after draining all pending replies.
             #[cfg(target_os = "linux")]
             if send_batched {
+                // Recheck immediately before any GSO/sendmmsg flush so a payload
+                // queued before expiry is discarded rather than sent.
+                if let Some(termination) = udp_reply_expired_at_commit(reply_authorization_plan) {
+                    reply_session.settle_authorization_expiry(termination);
+                    gso_batch.discard();
+                    send_batch.discard();
+                    break 'reply;
+                }
                 // Flush GSO batch first (if used).
                 if reply_udp_gso && !gso_failed && !gso_batch.is_empty() {
                     let flush_result =
@@ -5100,7 +6346,7 @@ async fn create_session(
                         gso_failed = true;
                         // Replay all buffered datagrams through sendmmsg /
                         // direct-send for segments that exceed the slot size.
-                        drain_gso_to_sendmmsg_or_direct(
+                        if let Some(termination) = drain_gso_to_sendmmsg_or_direct(
                             &mut gso_batch,
                             &mut send_batch,
                             &frontend,
@@ -5108,15 +6354,37 @@ async fn create_session(
                             session_local_ip,
                             &reply_proxy_id,
                             &mut send_drops,
+                            reply_authorization_plan,
                         )
-                        .await;
+                        .await
+                        {
+                            reply_session.settle_authorization_expiry(termination);
+                            gso_batch.discard();
+                            send_batch.discard();
+                            break 'reply;
+                        }
                     }
                 }
                 // Flush sendmmsg batch (used when GSO is disabled/failed, or GSO drain).
                 if !send_batch.is_empty() {
+                    if let Some(termination) = udp_reply_expired_at_commit(reply_authorization_plan)
+                    {
+                        reply_session.settle_authorization_expiry(termination);
+                        gso_batch.discard();
+                        send_batch.discard();
+                        break 'reply;
+                    }
                     use std::os::unix::io::AsRawFd;
                     let fd = frontend.as_raw_fd();
                     loop {
+                        if let Some(termination) =
+                            udp_reply_expired_at_commit(reply_authorization_plan)
+                        {
+                            reply_session.settle_authorization_expiry(termination);
+                            gso_batch.discard();
+                            send_batch.discard();
+                            break 'reply;
+                        }
                         match flush_sendmmsg_best_effort(&mut send_batch, fd, &mut send_drops) {
                             Ok(_) if send_batch.is_empty() => break,
                             Ok(_) => continue, // partial send — retry remaining
@@ -5166,7 +6434,22 @@ async fn create_session(
                 .bytes_out
                 .fetch_add(batch_bytes, Ordering::Relaxed);
         }
-        // Session's backend receiver exited — remove session
+        // Session's backend receiver exited — remove session.
+        //
+        // Authorization attribution is taken from the session's own settlement
+        // LATCH rather than from which select arm broke the loop (issue
+        // #3816): the client→backend direction and the hook-ingress worker can
+        // both observe the expiry first and then wake this task through the
+        // ordinary stop signal, which is indistinguishable from an idle-cleanup
+        // stop at this point. The latch IS the record of the decision, so the
+        // summary reports it whichever direction saw it. A genuine backend or
+        // client-write failure that already broke the loop keeps its own
+        // attribution — that failure really is what ended the session.
+        if disconnect_error.is_none()
+            && reply_session.observed_authorization_termination().is_some()
+        {
+            disconnect_error = Some(udp_authorization_disconnect_classification());
+        }
         // Close DTLS connection if active
         if let Some(ref dtls) = reply_dtls {
             dtls.close().await;
@@ -5448,6 +6731,365 @@ fn mono_millis_precise() -> u64 {
     crate::socket_opts::monotonic_now_ms()
 }
 
+/// External-test seam for the plain-UDP authorization lifetime (issue #3816).
+///
+/// Builds a REAL [`UdpSession`] — the same struct the listener creates — with a
+/// real connected backend socket, a real [`crate::overload::ConnectionGuard`],
+/// and a real hook-ingress channel, and drives the production datagram paths
+/// (`forward_client_datagram_to_backend`, `enqueue_session_hook_datagram`,
+/// `spawn_session_hook_ingress_worker`) rather than a restatement of them. It
+/// exists so the coverage under `tests/` can be external instead of inline.
+#[allow(dead_code)] // Library test seam; the separately compiled binary never builds one.
+pub struct UdpAuthorizationSessionProbe {
+    session: Arc<UdpSession>,
+    metrics: Arc<UdpProxyMetrics>,
+    overload: Arc<crate::overload::OverloadState>,
+    sessions: SessionMap,
+    client_addr: SocketAddr,
+    hook_ingress_rx: std::sync::Mutex<Option<mpsc::Receiver<Bytes>>>,
+    /// The peer the session's backend socket is connected to. Kept bound so
+    /// "no datagram was forwarded after expiry" is observable, not inferred.
+    backend_peer: Arc<UdpSocket>,
+}
+
+#[allow(dead_code)] // Library test seam; see the type-level note.
+impl UdpAuthorizationSessionProbe {
+    /// Build one probe session. `plan`/`latch` mirror exactly what
+    /// `create_session` stores; `with_datagram_hooks` decides whether the
+    /// bounded hook-ingress channel exists (the inline-forward path has none).
+    pub async fn new(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        with_datagram_hooks: bool,
+    ) -> Result<Self, String> {
+        Self::assemble(latch, with_datagram_hooks, || plan).await
+    }
+
+    /// Bind the probe sockets, then anchor `remaining` from that instant.
+    ///
+    /// Loopback bind/connect are real awaits. Under a paused test clock the
+    /// hosted coverage scheduler can auto-advance to a plan captured *before*
+    /// those awaits, so the first production forward already sees an elapsed
+    /// lifetime. Setup-expiry is covered by the dedicated setup-stage tests;
+    /// this constructor is for post-commit relay contracts that need a live
+    /// remaining budget that starts after fixture I/O has finished.
+    pub async fn with_lifetime_after_setup(
+        remaining: Duration,
+        termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+        latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        with_datagram_hooks: bool,
+    ) -> Result<Self, String> {
+        Self::assemble(latch, with_datagram_hooks, || {
+            Some(crate::proxy::auth_lifetime::StreamAuthDeadline {
+                at: tokio::time::Instant::now() + remaining,
+                termination,
+            })
+        })
+        .await
+    }
+
+    async fn assemble(
+        latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        with_datagram_hooks: bool,
+        plan: impl FnOnce() -> Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    ) -> Result<Self, String> {
+        let backend_peer = Arc::new(
+            UdpSocket::bind("127.0.0.1:0")
+                .await
+                .map_err(|e| format!("probe backend bind failed: {e}"))?,
+        );
+        let backend_addr = backend_peer
+            .local_addr()
+            .map_err(|e| format!("probe backend addr failed: {e}"))?;
+        let backend_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| format!("probe session socket bind failed: {e}"))?;
+        backend_socket
+            .connect(backend_addr)
+            .await
+            .map_err(|e| format!("probe session socket connect failed: {e}"))?;
+
+        let metrics = Arc::new(UdpProxyMetrics::default());
+        let overload = Arc::new(crate::overload::OverloadState::default());
+        let (hook_ingress_tx, hook_ingress_rx) = if with_datagram_hooks {
+            let (tx, rx) = mpsc::channel(SESSION_HOOK_INGRESS_MAX_DATAGRAMS);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let now = coarse_epoch_millis();
+        let client_addr: SocketAddr = "127.0.0.1:34567"
+            .parse()
+            .map_err(|e| format!("probe client addr: {e}"))?;
+        let session = Arc::new(UdpSession {
+            backend_socket: Some(Arc::new(backend_socket)),
+            dtls_conn: None,
+            last_activity: AtomicU64::new(now),
+            created_at: AtomicU64::new(now),
+            connected_wall_at: chrono::Utc::now(),
+            expired: std::sync::atomic::AtomicBool::new(false),
+            bytes_sent: AtomicU64::new(0),
+            bytes_received: AtomicU64::new(0),
+            last_request_size: AtomicU64::new(0),
+            response_budget_remaining: AtomicU64::new(0),
+            amplification_factor: None,
+            backend_target: backend_addr.to_string(),
+            backend_resolved_ip: backend_addr.ip().to_string(),
+            sni_hostname: None,
+            consumer_username: Some("probe-consumer".to_string()),
+            auth_method: Some("key_auth"),
+            metadata: std::sync::Mutex::new(std::collections::HashMap::new()),
+            plugin_trigger_decisions: Default::default(),
+            correlation_ids: Default::default(),
+            local_addr: std::sync::OnceLock::new(),
+            plugins: Arc::new(Vec::new()),
+            datagram_plugins: Arc::from([]),
+            datagram_client_ip: Arc::from("127.0.0.1"),
+            forwarded_client: None,
+            datagram_proxy_id: Arc::from("udp-proxy"),
+            datagram_proxy_name: Some(Arc::from("UDP Proxy")),
+            datagram_payload_kind: StreamBytesKind::PlaintextWire,
+            proxy_id: "udp-proxy".to_string(),
+            proxy_name: Some("UDP Proxy".to_string()),
+            proxy_lifecycle_generation: None,
+            proxy_namespace: "ferrum".to_string(),
+            backend_scheme: BackendScheme::Udp,
+            listen_port: 5300,
+            idle_timeout_ms: 60_000,
+            stop_reply_task: std::sync::atomic::AtomicBool::new(false),
+            stop_notify: Arc::new(tokio::sync::Notify::new()),
+            overload_guard: std::sync::Mutex::new(Some(crate::overload::ConnectionGuard::new(
+                &overload,
+            ))),
+            hook_ingress_tx: std::sync::Mutex::new(hook_ingress_tx),
+            hook_ingress_queued_bytes: Arc::new(AtomicUsize::new(0)),
+            hook_ingress_stop_notify: Arc::new(tokio::sync::Notify::new()),
+            authorization: plan().map(|plan| UdpSessionAuthorization { plan, latch }),
+        });
+        let sessions: SessionMap = Arc::new(DashMap::with_hasher_and_shard_amount(
+            ahash::RandomState::new(),
+            udp_session_shard_amount(0),
+        ));
+        sessions.insert(client_addr, Arc::clone(&session));
+        metrics.active_sessions.fetch_add(1, Ordering::Relaxed);
+        Ok(Self {
+            session,
+            metrics,
+            overload,
+            sessions,
+            client_addr,
+            hook_ingress_rx: std::sync::Mutex::new(hook_ingress_rx),
+            backend_peer,
+        })
+    }
+
+    /// Drive the production client→backend forward for one datagram.
+    pub async fn forward(&self, data: &[u8]) -> Result<(), String> {
+        forward_client_datagram_to_backend(&self.session, data)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Drive the production client→backend commit with a caller-owned send
+    /// future in place of the socket syscall. Used to park the send on
+    /// writability without sleeping: expiry must drop the future before it
+    /// can emit a backend datagram.
+    pub async fn forward_commit_with<F>(&self, data: &[u8], send: F) -> Result<(), String>
+    where
+        F: std::future::Future<Output = Result<usize, std::io::Error>>,
+    {
+        forward_client_datagram_commit(&self.session, data, send)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Drive the production bounded hook-ingress admission for one datagram.
+    pub fn enqueue_hook_datagram(&self, data: &[u8]) -> bool {
+        enqueue_session_hook_datagram(&self.session, data, &self.metrics)
+    }
+
+    /// Spawn the real per-session hook-ingress worker. Returns `false` when the
+    /// probe was built without hooks, or when the worker was already spawned.
+    pub fn spawn_hook_ingress_worker(&self) -> bool {
+        let rx = self
+            .hook_ingress_rx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(rx) = rx else {
+            return false;
+        };
+        spawn_session_hook_ingress_worker(
+            Arc::clone(&self.session),
+            rx,
+            Arc::clone(&self.metrics),
+            self.client_addr,
+        );
+        true
+    }
+
+    /// Await one datagram at the backend peer. Used only where the caller has
+    /// already established that a datagram was sent.
+    pub async fn backend_recv(&self) -> Result<Vec<u8>, String> {
+        let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
+        let n = self
+            .backend_peer
+            .recv(&mut buf)
+            .await
+            .map_err(|e| format!("probe backend recv failed: {e}"))?;
+        Ok(buf[..n].to_vec())
+    }
+
+    /// Non-blocking read of whatever actually reached the backend peer.
+    pub fn backend_received(&self) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
+        match self.backend_peer.try_recv(&mut buf) {
+            Ok(n) => Some(buf[..n].to_vec()),
+            Err(_) => None,
+        }
+    }
+
+    /// The bounded class settled for this session, if any.
+    pub fn observed_termination(
+        &self,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        self.session.observed_authorization_termination()
+    }
+
+    /// The session metadata the disconnect summary is built from.
+    pub fn metadata(&self) -> std::collections::HashMap<String, String> {
+        self.session
+            .metadata
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Whether the bounded hook-ingress sender is still installed. Teardown
+    /// takes it (`close_hook_ingress`), which is the per-session worker's
+    /// cancellation / idle-wake path.
+    pub fn hook_ingress_sender_present(&self) -> bool {
+        self.session
+            .hook_ingress_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    /// Whether the backend reply task has been asked to stop.
+    pub fn reply_task_stop_requested(&self) -> bool {
+        let flag = &self.session.stop_reply_task;
+        flag.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether the recv-loop `last_client` cache still resolves this exact
+    /// generation, using the production cache helper.
+    ///
+    /// Returns `(resolved_a_live_generation, cache_entry_retained)`; the two
+    /// must agree, which is what the external coverage asserts.
+    pub fn cached_generation_is_live(&self) -> (bool, bool) {
+        let mut cache = Some((self.client_addr, Arc::clone(&self.session)));
+        let live = take_udp_last_client_if_live(&mut cache, self.client_addr, |cached| {
+            cached.expired.load(std::sync::atomic::Ordering::Acquire)
+        })
+        .is_some();
+        (live, cache.is_some())
+    }
+
+    /// Run the production teardown the backend reply task performs at exit:
+    /// authorization attribution from the latch, mark expired, close the
+    /// hook-ingress channel, identity-aware removal of ONLY this generation,
+    /// and a single overload / active-session release. Returns the disconnect
+    /// summary when this call owned the removal.
+    pub fn run_reply_task_exit_teardown(&self) -> Option<crate::plugins::StreamTransactionSummary> {
+        let terminated = self.session.observed_authorization_termination().is_some();
+        self.session
+            .expired
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.session.close_hook_ingress();
+        let removed = self
+            .sessions
+            .remove_if(&self.client_addr, |_, v| Arc::ptr_eq(v, &self.session))
+            .is_some();
+        if !removed {
+            return None;
+        }
+        self.session.release_overload_guard();
+        self.metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
+        let mut connection_error = None;
+        let mut error_class = None;
+        let mut disconnect_cause = None;
+        let mut disconnect_direction = None;
+        if terminated {
+            let (message, class, cause, direction) = udp_authorization_disconnect_classification();
+            connection_error = Some(message);
+            error_class = Some(class);
+            disconnect_cause = Some(cause);
+            disconnect_direction = Some(direction);
+        }
+        Some(build_udp_stream_summary(UdpDisconnectContext {
+            namespace: &self.session.proxy_namespace,
+            proxy_id: &self.session.proxy_id,
+            proxy_name: self.session.proxy_name.as_deref(),
+            session: &self.session,
+            backend_scheme: self.session.backend_scheme,
+            listen_port: self.session.listen_port,
+            disconnected_ms: coarse_epoch_millis(),
+            disconnected_wall_at: chrono::Utc::now(),
+            connection_error,
+            error_class,
+            disconnect_direction,
+            disconnect_cause,
+        }))
+    }
+
+    /// Remove this generation the way the idle-cleanup task does, so a
+    /// simultaneous idle expiry and authorization expiry can be raced.
+    pub fn run_idle_cleanup_removal(&self) -> bool {
+        let Some((_, session)) = self
+            .sessions
+            .remove_if(&self.client_addr, |_, v| Arc::ptr_eq(v, &self.session))
+        else {
+            return false;
+        };
+        session
+            .expired
+            .store(true, std::sync::atomic::Ordering::Release);
+        signal_udp_reply_task_stop(&session.stop_reply_task, session.stop_notify.as_ref());
+        session.close_hook_ingress();
+        session.release_overload_guard();
+        self.metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Live `OverloadState.active_connections` this session contributes to.
+    pub fn overload_active_connections(&self) -> u64 {
+        let counter = &self.overload.active_connections;
+        counter.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Live listener `active_sessions` gauge.
+    pub fn active_sessions(&self) -> u64 {
+        self.metrics.active_sessions.load(Ordering::Relaxed)
+    }
+
+    /// Client→backend bytes actually accounted to this session.
+    pub fn bytes_sent(&self) -> u64 {
+        self.session.bytes_sent.load(Ordering::Relaxed)
+    }
+
+    /// Hook-ingress drops (gateway backpressure), which a policy refusal must
+    /// never move.
+    pub fn hook_ingress_drops(&self) -> u64 {
+        self.metrics.hook_ingress_drops.load(Ordering::Relaxed)
+    }
+
+    /// Whether the session is still resolvable in the listener session map.
+    pub fn session_map_contains(&self) -> bool {
+        self.sessions.contains_key(&self.client_addr)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -5524,6 +7166,9 @@ mod tests {
             hook_ingress_tx: std::sync::Mutex::new(None),
             hook_ingress_queued_bytes: Arc::new(AtomicUsize::new(0)),
             hook_ingress_stop_notify: Arc::new(tokio::sync::Notify::new()),
+            // Unauthenticated by default: the authorization contract does not
+            // bound a session that admitted no principal.
+            authorization: None,
         }
     }
 
@@ -6803,6 +8448,9 @@ backend_tls_verify_server_cert: false
             hook_ingress_tx: std::sync::Mutex::new(None),
             hook_ingress_queued_bytes: Arc::new(AtomicUsize::new(0)),
             hook_ingress_stop_notify: Arc::new(tokio::sync::Notify::new()),
+            // Unauthenticated by default: the authorization contract does not
+            // bound a session that admitted no principal.
+            authorization: None,
         }
     }
 

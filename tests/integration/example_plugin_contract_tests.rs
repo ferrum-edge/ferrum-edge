@@ -76,11 +76,19 @@ fn h1_h2_buffered_terminal_logging_precedes_response_construction() {
         PROXY_SOURCE,
         "H1/H2 buffered terminal path",
         &[
+            // The authoritative authorization gate runs first, so the ONE
+            // terminal summary is built from post-gate state and describes the
+            // response the client actually receives (issue #3815).
+            "let final_precommit_authorization_terminal = apply_precommit_authorization_terminal(",
             "let deferred_logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>> =",
+            "let summary = TransactionSummary {",
             "if body_will_stream {",
             "DeferredTransactionLogger::new_with_start_time(",
             "} else {",
-            "crate::plugins::log_with_mirror_before_buffered_response(&plugins, summary, &ctx)",
+            // Authenticated: dispatched to bounded detached delivery, not
+            // awaited. Unauthenticated: the historical awaited contract.
+            "crate::plugins::spawn_bounded_terminal_summary_log(",
+            "crate::plugins::log_with_mirror_before_buffered_response(",
             "record_request(&state, response_status);",
             "// Build final response",
             "let mut resp_builder = Response::builder()",
@@ -180,6 +188,11 @@ fn deadline_bearing_buffered_logging_uses_owned_bounded_cleanup() {
     assert!(helper.contains("let ctx = ctx.clone();"));
     assert!(helper.contains("crate::observability_delivery::spawn_deadline_cleanup(async move"));
     assert!(helper.contains("std::time::Duration::from_secs(5)"));
+    // The detached delivery is one shared, named surface: the buffered
+    // authorization-commitment path uses it directly so it never awaits a
+    // logging plugin after the final gate (issue #3815).
+    assert!(helper.contains("spawn_bounded_terminal_summary_log(plugins, summary, ctx);"));
+    assert!(helper.contains("pub fn spawn_bounded_terminal_summary_log("));
 }
 
 #[test]

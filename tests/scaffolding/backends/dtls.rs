@@ -312,7 +312,7 @@ async fn run_dtls_script(
                 }
             }
             UdpStep::Reply(bytes) => {
-                if let Err(e) = sender.send(&bytes).await {
+                if let Err(e) = sender.send_committed(&bytes, None).await {
                     state
                         .step_errors
                         .lock()
@@ -327,7 +327,7 @@ async fn run_dtls_script(
             }
             UdpStep::ReplyN { payload, count } => {
                 for _ in 0..count {
-                    if let Err(e) = sender.send(&payload).await {
+                    if let Err(e) = sender.send_committed(&payload, None).await {
                         state
                             .step_errors
                             .lock()

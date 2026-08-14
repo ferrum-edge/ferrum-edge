@@ -313,7 +313,7 @@ fn h3_early_phases_gate_fresh_drains_on_missing_prebuffer_and_halt_on_cancel() {
             .find(phase)
             .unwrap_or_else(|| panic!("missing H3 upload phase {phase}"));
         let deadline_branch_idx = source[..phase_idx]
-            .rfind("Err(H3RequestBodyReadError::DeadlineExceeded) => {")
+            .rfind("Err(H3RequestBodyReadError::DeadlineExceeded(authorization_expiry)) => {")
             .unwrap_or_else(|| panic!("missing deadline branch for H3 upload phase {phase}"));
         let branch_end = source[phase_idx..]
             .find("\n            }")
@@ -388,7 +388,7 @@ fn h3_cross_protocol_bridge_halts_cancelled_buffered_uploads() {
         .split("Err(super::server::H3RequestBodyReadError::TimedOut) => {")
         .nth(1)
         .expect("timed-out bridge arm")
-        .split("Err(super::server::H3RequestBodyReadError::DeadlineExceeded) => {")
+        .split("Err(super::server::H3RequestBodyReadError::DeadlineExceeded(_)) => {")
         .next()
         .expect("bounded timed-out bridge arm");
     assert!(
@@ -405,7 +405,7 @@ fn h3_cross_protocol_bridge_halts_cancelled_buffered_uploads() {
         "timed-out bridge arm must bound the terminal write with the shared grace"
     );
     let deadline = bridge
-        .split("Err(super::server::H3RequestBodyReadError::DeadlineExceeded) => {")
+        .split("Err(super::server::H3RequestBodyReadError::DeadlineExceeded(_)) => {")
         .nth(1)
         .expect("deadline bridge arm");
     assert!(

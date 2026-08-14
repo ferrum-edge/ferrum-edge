@@ -57,8 +57,12 @@ fn h3_plain_bridge_dispatches_mesh_through_shared_pools() {
         "the shared per-attempt policy gate must refuse Unix targets, not all mesh tags"
     );
     assert!(
-        plain.contains("proxy_h3_plain_http_mesh_buffered("),
-        "mesh-tagged plain attempts must dial through the shared mesh helper"
+        plain.contains("boxed_proxy_h3_plain_http_mesh_buffered("),
+        "mesh-tagged plain attempts must dial through the boxed shared mesh helper"
+    );
+    assert!(
+        !plain.contains("crate::proxy::proxy_h3_plain_http_mesh_buffered("),
+        "H3 plain mesh dispatch must not materialize the helper in the bridge poll frame"
     );
     assert!(
         plain.contains("select_next_cross_protocol_retry_target("),
@@ -105,8 +109,16 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
     let mesh_collection = &mesh_block[..mesh_block_end];
 
     assert!(
-        mesh_collection.contains("collect_h3_request_body_with_deadline("),
-        "mesh uploads must force-collect via collect_h3_request_body_with_deadline"
+        mesh_collection.contains("collect_h3_request_body_under_authorization("),
+        "mesh uploads must force-collect via collect_h3_request_body_under_authorization"
+    );
+    assert!(
+        mesh_collection.contains("plain_write_bound"),
+        "mesh force-buffer must drain under the composed authorization bound"
+    );
+    assert!(
+        !mesh_collection.contains("grpc_web_deadline_at"),
+        "mesh force-buffer must not drain under the client RPC deadline wrapper"
     );
     assert_eq!(
         mesh_collection
@@ -134,22 +146,53 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
         "Ok(None) must release probe before terminal write"
     );
 
-    let deadline = mesh_collection
-        .split("H3RequestBodyReadError::DeadlineExceeded")
-        .nth(1)
-        .expect("missing mesh collection branch: DeadlineExceeded")
+    // Bind the exact force-buffer DeadlineExceeded arm, including the typed
+    // capture, then compare ordering in one whitespace-normalized slice so a
+    // rustfmt wrap cannot point the test at a comment or a nested-arm offset.
+    let deadline_start = mesh_collection
+        .find("H3RequestBodyReadError::DeadlineExceeded")
+        .expect("missing mesh collection branch: DeadlineExceeded");
+    let deadline = mesh_collection[deadline_start..]
         .split("H3RequestBodyReadError::TimedOut")
         .next()
         .expect("bounded mesh collection DeadlineExceeded branch");
-    let deadline_release = deadline
+    let deadline_compact: String = deadline.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        deadline_compact.contains("DeadlineExceeded(authorization_expiry)")
+            || deadline_compact.contains("DeadlineExceeded(authorization_expiry,)"),
+        "the mesh force-buffer must bind the captured winner rather than a unit variant"
+    );
+    let deadline_release = deadline_compact
         .find("release_cross_protocol_circuit_breaker_probe_on_admission_reject(")
         .expect("DeadlineExceeded must release HALF_OPEN probe");
-    let deadline_write = deadline
+    let auth_record = deadline_compact
+        .find("record_authorization_termination_once(")
+        .expect("Some(termination) must record the bounded class");
+    let auth_write = deadline_compact
+        .find("write_plain_authorization_expired_terminal(")
+        .expect("Some(termination) must write the grace-bounded 401");
+    assert!(
+        deadline_compact.contains("StreamAuthProtocolFamily::Http"),
+        "mesh force-buffer authorization expiry is the HTTP family"
+    );
+    assert!(
+        !deadline_compact.contains("write_plain_gateway_error("),
+        "mesh force-buffer authorization expiry must not use the unbounded reject writer"
+    );
+    let deadline_write = deadline_compact
         .find("write_plain_grpc_web_client_deadline(")
-        .expect("DeadlineExceeded must write gRPC-Web deadline response");
+        .expect("DeadlineExceeded(None) must keep the gRPC-Web/client deadline response");
+    assert!(
+        deadline_release < auth_record,
+        "DeadlineExceeded must release the probe before recording authorization expiry"
+    );
+    assert!(
+        auth_record < auth_write,
+        "fixed-cardinality authorization termination must be recorded before the 401 write"
+    );
     assert!(
         deadline_release < deadline_write,
-        "DeadlineExceeded must release probe before terminal write"
+        "DeadlineExceeded(None) must release the probe before the client-deadline terminal"
     );
 
     let timeout = mesh_collection
@@ -353,7 +396,7 @@ fn h3_terminal_body_read_failures_commit_dedup_cleanup_once() {
         .split("let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();")
         .next()
         .expect("H3 terminal provider dispatch must remain bounded");
-    assert!(terminal_dispatch.contains("collect_h3_request_body_with_deadline("));
+    assert!(terminal_dispatch.contains("collect_h3_request_body_under_authorization("));
     assert!(terminal_dispatch.contains("drain_h3_request_body("));
     // Ok(None): idle recv after a completed oversize drain — the flavor-aware
     // writer already halts after HEADERS; do not duplicate STOP_SENDING.
@@ -732,12 +775,17 @@ fn native_h3_client_deadlines_remain_health_neutral() {
          terminal grpc-status (it would train the adaptive-concurrency limiter)"
     );
 
+    // Trailer-wait timeout is expiry-first `await_deadline_first` → `Err(())`
+    // → `expired_authorization()`. Client-owned gRPC deadline completion is
+    // the `None if trailer_timeout_is_deadline` arm; the following `None =>`
+    // arm is a backend read-timeout and must stay out of this health-neutral
+    // region.
     let trailer_deadline = source
-        .find("Err(_) if trailer_timeout_is_deadline =>")
+        .find("None if trailer_timeout_is_deadline =>")
         .expect("native H3 trailer deadline branch must remain present");
     let trailer_deadline = &source[trailer_deadline..];
     let trailer_end = trailer_deadline
-        .find("Err(_) =>")
+        .find("None =>")
         .expect("native H3 trailer deadline branch must remain bounded");
     let trailer_deadline = &trailer_deadline[..trailer_end];
     assert_h3_arm_health_neutral(trailer_deadline, 3, "native H3 gRPC trailer-deadline arm");
@@ -779,8 +827,9 @@ fn h3_cross_protocol_streaming_grpc_consumes_deadline_and_read_bounds() {
         relay
             .matches("grpc_deadline_can_send_terminal_status(")
             .count(),
-        2,
-        "write-bound and select-loop deadlines must both use client-visible DATA"
+        3,
+        "write-bound client expiry plus the authorization and client select arms must all use \
+         client-visible DATA"
     );
     assert!(relay.contains("abort_response_stream(stream)"));
     assert!(relay.contains("_ = &mut read_deadline"));
@@ -1108,8 +1157,9 @@ fn h3_request_plugin_deadlines_mark_and_bound_terminal_rejections() {
 }
 
 /// The native H3 aggregate MCP SSE writer is a long-lived pump rather than a
-/// buffered representation, so its framing decision, its hard listener bound,
-/// and its listener-slot release order are the properties worth freezing.
+/// buffered representation, so its framing decision, its composed
+/// listener/authorization bound, its fail-closed terminals, and its
+/// listener-slot release order are the properties worth freezing.
 #[test]
 fn h3_aggregate_sse_writer_streams_under_a_hard_listener_bound() {
     let server = include_str!("../../../src/http3/server.rs");
@@ -1137,28 +1187,102 @@ fn h3_aggregate_sse_writer_streams_under_a_hard_listener_bound() {
         "an SSE stream has no exact body length to publish"
     );
 
-    // Both the header write and the DATA pump sit inside the same hard listener
-    // lifetime: `send_response`/`send_data` await QUIC flow control, and a
-    // parked task never polls the body's own timer.
-    assert_eq!(
-        sse_writer
-            .matches("tokio::time::timeout_at(deadline,")
-            .count(),
-        2,
-        "the header write and the DATA pump must share one hard listener bound"
+    // The listener lifetime is composed with the captured authorization plan;
+    // the plan is taken once from the request and never recomputed from activity.
+    assert!(
+        sse_writer.contains("effective_request_auth_deadline("),
+        "the H3 SSE writer must capture the accepted request's authorization plan"
     );
     assert!(
-        sse_writer.contains("let deadline = body.deadline();"),
-        "the hard bound must come from the broker-owned listener lifetime"
+        sse_writer.contains("compose_aggregate_sse_bound(body.deadline(), auth_plan)"),
+        "the H3 SSE writer must compose the listener lifetime with that captured plan"
+    );
+    assert!(
+        sse_writer.contains("await_authorized_headers_write("),
+        "the H3 SSE HEADERS write must race the composed bound"
+    );
+    assert!(
+        sse_writer.contains("await_response_write_before_deadline("),
+        "every flow-control-blocked DATA/FIN write must race the composed bound"
+    );
+    assert!(
+        sse_writer.contains("tokio::time::timeout_at(deadline, pump)"),
+        "waiting for the next event must also sit inside the composed bound"
+    );
+
+    // Authorization before commitment uses the fixed redacted terminal under
+    // grace, otherwise resets. After commitment it resets rather than finishing.
+    assert!(
+        sse_writer.contains("authorization_expired_pre_commitment_response("),
+        "pre-commit authorization expiry must use the fixed redacted terminal"
+    );
+    assert!(
+        sse_writer.contains("await_post_deadline_terminal_response_write("),
+        "the pre-commit authorization terminal must be written under the bounded grace"
+    );
+    assert!(
+        sse_writer.contains("record_authorization_termination_once("),
+        "post-commit authorization expiry must record through the shared once-only latch"
+    );
+    assert!(
+        sse_writer.contains("StreamAuthProtocolFamily::Http"),
+        "aggregate SSE is the HTTP family, not an unbounded label"
+    );
+    assert!(
+        sse_writer.contains("latch_authorization_termination("),
+        "the bounded class must be latched into request/transaction metadata"
+    );
+    let auth_abort = sse_writer
+        .find("if let Some(termination) = aggregate_sse_bound.expired_authorization()")
+        .expect("post-commit authorization attribution");
+    let auth_abort_reset = sse_writer[auth_abort..]
+        .find("abort_response_stream(stream)")
+        .map(|offset| auth_abort + offset)
+        .expect("post-commit authorization expiry must reset");
+    let listener_grace = sse_writer[auth_abort..]
+        .find("await_post_deadline_terminal_response_write(")
+        .map(|offset| auth_abort + offset)
+        .expect("listener-lifetime expiry must finish under the bounded terminal grace");
+    assert!(
+        auth_abort_reset < listener_grace,
+        "authorization after commitment must reset before the listener-lifetime finish arm"
+    );
+    let listener_else = sse_writer[auth_abort..]
+        .split("} else {")
+        .nth(1)
+        .expect("listener-lifetime else arm")
+        .split("    } else {")
+        .next()
+        .expect("listener-lifetime else arm bounded");
+    assert!(
+        listener_else.contains("await_post_deadline_terminal_response_write("),
+        "listener-lifetime expiry must bound the clean-FIN attempt"
+    );
+    assert!(
+        listener_else.contains("abort_response_stream(stream)"),
+        "listener-lifetime FIN blocked past grace must reset the response stream"
+    );
+    assert!(
+        !listener_else.contains("record_authorization_termination_once("),
+        "listener-lifetime expiry must not increment authorization accounting"
+    );
+    assert!(
+        !listener_else.contains("let _ = stream.finish().await"),
+        "listener-lifetime expiry must not await finish unbounded"
+    );
+    assert_eq!(
+        sse_writer
+            .matches("await_post_deadline_terminal_response_write(")
+            .count(),
+        2,
+        "pre-commit authorization terminal and listener-lifetime FIN must both use the bounded grace"
     );
 
     // Dropping the body is what returns the session's single-listener slot, so
-    // every exit — the header-write timeout and the ordinary end of the pump —
-    // must release it, and the ordinary path must release it BEFORE the QUIC
-    // stream teardown a reconnecting client races.
-    assert_eq!(
-        sse_writer.matches("drop(body);").count(),
-        2,
+    // every exit must release it, and the ordinary path must release it BEFORE
+    // the QUIC stream teardown a reconnecting client races.
+    assert!(
+        sse_writer.matches("drop(body);").count() >= 4,
         "every H3 SSE exit must release the listener slot"
     );
     let release = sse_writer
@@ -1170,6 +1294,10 @@ fn h3_aggregate_sse_writer_streams_under_a_hard_listener_bound() {
     assert!(
         release < finish,
         "the listener slot must be released before the QUIC stream teardown"
+    );
+    assert!(
+        sse_writer.contains("halt_request_body(stream)"),
+        "every H3 SSE exit must preserve receive-half teardown"
     );
 
     // Nothing here may collect the stream: a buffered SSE body is unbounded.
@@ -1217,16 +1345,23 @@ fn buffered_http3_backend_upload_honors_client_grpc_deadline() {
         .expect("HTTP/3 backend request buffering must remain bounded");
     assert_eq!(
         buffering
-            .matches("collect_request_body_with_deadline(")
+            .matches("collect_request_body_under_authorization(")
             .count(),
         2,
         "limited and unlimited HTTP/3 upload buffering must share the deadline-aware collector"
     );
     assert_eq!(
         buffering
-            .matches("Err(RequestBodyWaitError::DeadlineExceeded)")
+            .matches("RequestBodyWaitError::DeadlineExceeded")
             .count(),
         2
+    );
+    assert_eq!(
+        buffering
+            .matches("AuthorizedUploadWaitError::AuthorizationExpired(")
+            .count(),
+        2,
+        "both buffering branches must also carry the admitted stream's authorization bound"
     );
     assert_eq!(
         buffering
@@ -1348,7 +1483,8 @@ async fn ready_h3_post_deadline_terminal_write_completes_within_grace() {
     assert!(
         ferrum_edge::_test_support::ready_h3_post_deadline_terminal_write_completes_for_test()
             .await,
-        "an immediately-ready post-deadline rejection write must complete within the grace"
+        "an immediately-ready post-deadline rejection write, including the \
+         post-authorization 401, must complete within the grace"
     );
 }
 
@@ -1363,7 +1499,8 @@ async fn stalled_h3_post_deadline_terminal_write_expires_grace() {
     tokio::task::yield_now().await;
     assert!(
         task.await.expect("join"),
-        "a flow-control-blocked post-deadline rejection write must not outlive the grace"
+        "a flow-control-blocked post-deadline rejection write, including the \
+         post-authorization 401, must not outlive the grace"
     );
 }
 
@@ -1376,6 +1513,128 @@ fn h3_post_deadline_terminal_write_grace_is_fixed_one_second() {
     let util = include_str!("../../../src/http3/stream_util.rs");
     assert!(util.contains("H3_POST_DEADLINE_TERMINAL_WRITE_GRACE"));
     assert!(util.contains("await_post_deadline_terminal_response_write"));
+}
+
+#[test]
+fn cross_protocol_plain_authorization_expired_terminal_uses_post_deadline_grace() {
+    let cross = include_str!("../../../src/http3/cross_protocol.rs");
+    let dispatch = cross
+        .split("async fn dispatch_plain<S>(")
+        .nth(1)
+        .expect("cross-protocol plain dispatcher")
+        .split("async fn dispatch_grpc<S>(")
+        .next()
+        .expect("bounded cross-protocol plain dispatcher");
+    assert_eq!(
+        dispatch
+            .matches("write_plain_authorization_expired_terminal(")
+            .count(),
+        10,
+        "mesh force-buffer upload, buffered client acquisition, buffered header-wait, \
+         mesh retry-delay, two reqwest retry-delays, streaming client acquisition, \
+         streaming upload, and both pre-commitment response-header expiry arms \
+         must share the bounded 401 writer"
+    );
+    assert!(
+        !dispatch.contains("StatusCode::UNAUTHORIZED"),
+        "dispatch_plain must not emit the fixed 401 through the unbounded reject writer"
+    );
+    assert!(
+        !dispatch.contains(r#"{"error":"Unauthorized"}"#),
+        "the compiled-in 401 body must live only in the bounded authorization terminal helper"
+    );
+
+    let helper = cross
+        .split("async fn write_plain_authorization_expired_terminal<S>(")
+        .nth(1)
+        .expect("bounded plain authorization-expiry terminal writer")
+        .split("async fn write_reject_with_headers<S>(")
+        .next()
+        .expect("bounded plain authorization-expiry terminal writer body");
+    assert!(helper.contains("await_post_deadline_terminal_response_write(write)"));
+    assert!(
+        !helper.contains("await_terminal_response_write_before_deadline("),
+        "the already-expired authorization instant must not race the selected 401"
+    );
+    assert!(
+        !helper.contains("await_response_write_before_deadline("),
+        "the selected 401 must not reuse the ordinary in-lifetime write bound"
+    );
+    assert!(helper.contains("StatusCode::UNAUTHORIZED"));
+    assert!(helper.contains(r#"{"error":"Unauthorized"}"#));
+    assert!(
+        helper.contains("write_plain_gateway_reject_with_recv_halt("),
+        "plain HTTP must keep the compiled-in 401 rather than a fabricated gRPC status"
+    );
+    let inner_write = helper
+        .split("write_plain_gateway_reject_with_recv_halt(")
+        .nth(1)
+        .expect("inner send-only 401 writer")
+        .split(");")
+        .next()
+        .expect("bounded inner send-only 401 writer");
+    assert!(
+        inner_write.contains("false,"),
+        "the inner 401 writer must defer STOP_SENDING until the bounded write settles"
+    );
+    assert_eq!(
+        helper.matches("abort_response_stream(stream)").count(),
+        2,
+        "a blocked or failed post-authorization terminal must reset the response send half"
+    );
+    assert!(helper.contains("H3ResponseWriteError::Write(_)"));
+    assert!(helper.contains("H3ResponseWriteError::DeadlineExceeded"));
+    assert!(helper.contains("terminal_deadline_write_aborted_outcome("));
+    let write_fail = helper
+        .split("H3ResponseWriteError::Write(_)")
+        .nth(1)
+        .expect("client-reset post-authorization arm")
+        .split("H3ResponseWriteError::DeadlineExceeded")
+        .next()
+        .expect("bounded client-reset post-authorization arm");
+    assert!(
+        write_fail.contains("true,"),
+        "a client-reset post-authorization write must report client_disconnected"
+    );
+    let grace_expire = helper
+        .split("H3ResponseWriteError::DeadlineExceeded")
+        .nth(1)
+        .expect("grace-expired post-authorization arm");
+    assert!(
+        grace_expire.contains("false,"),
+        "a grace-expired post-authorization write must not claim a client disconnect"
+    );
+    let grace_write = helper
+        .find("await_post_deadline_terminal_response_write(write)")
+        .expect("post-authorization 401 must use the shared grace");
+    let halt_after_grace = helper
+        .find("halt_request_body(stream)")
+        .expect("post-authorization 401 must halt the receive half after the bounded write");
+    assert!(
+        grace_write < halt_after_grace,
+        "STOP_SENDING must follow the bounded 401 write, not precede response settlement"
+    );
+    assert_eq!(
+        helper.matches("halt_request_body(stream)").count(),
+        1,
+        "the receive half must halt exactly once after the bounded write settles"
+    );
+    assert!(
+        !helper[..halt_after_grace].contains("halt_request_body(stream)"),
+        "halt_request_body must not run until await_post_deadline_terminal_response_write returns"
+    );
+
+    let ordinary = cross
+        .split("async fn write_plain_gateway_error<S>(")
+        .nth(1)
+        .expect("ordinary plain gateway error writer")
+        .split("async fn write_plain_gateway_reject<S>(")
+        .next()
+        .expect("bounded ordinary plain gateway error writer");
+    assert!(
+        !ordinary.contains("await_post_deadline_terminal_response_write("),
+        "ordinary non-authorization rejects must keep the unbounded writer"
+    );
 }
 
 #[test]
@@ -1441,7 +1700,7 @@ fn h3_native_and_cross_protocol_cancel_writers_use_post_deadline_grace() {
         .split("Err(super::server::H3RequestBodyReadError::TimedOut) => {")
         .nth(1)
         .expect("cross-protocol timed-out bridge arm")
-        .split("Err(super::server::H3RequestBodyReadError::DeadlineExceeded) => {")
+        .split("Err(super::server::H3RequestBodyReadError::DeadlineExceeded(_)) => {")
         .next()
         .expect("bounded timed-out bridge arm");
     assert!(timed_out.contains("await_post_deadline_terminal_response_write("));
@@ -1532,24 +1791,51 @@ fn streaming_h3_grpc_web_dispatch_is_bounded_before_response_headers() {
         .split("async fn dispatch_grpc<S>(")
         .next()
         .expect("bounded cross-protocol plain dispatcher");
+    // The streaming upload/backend-response race runs under the COMPOSED bound
+    // `plain_write_bound` — the client's optional gRPC-Web deadline together
+    // with the admitted credential's authorization lifetime (issue #3815) — so
+    // a plain HTTP client with no RPC deadline is bounded too.
     let bridge = dispatch
-        .split("let send_result = {")
+        .split("let send_result = if plain_write_bound")
         .nth(1)
         .expect("streaming upload/backend response race");
+    // An ALREADY-elapsed composed bound must not poll the race at all: the
+    // backend send and the frontend reader are both dropped, and the owner is
+    // read from the captured composition rather than from a second clock read.
+    let refusal = bridge
+        .split("} else {")
+        .next()
+        .expect("bounded already-elapsed refusal arm");
+    assert!(
+        refusal.contains("tokio::time::Instant::now() >= at"),
+        "an already-elapsed composed bound must refuse before polling the race"
+    );
+    assert!(
+        refusal.contains("plain_write_bound.expired_authorization()"),
+        "the refusal must attribute from the captured composition"
+    );
     let deadline = bridge
-        .find("_ = &mut grpc_web_deadline")
-        .expect("absolute gRPC-Web deadline arm");
+        .find("_ = &mut upload_deadline, if upload_deadline_active =>")
+        .expect("composed authorization/deadline arm");
     let response = bridge
         .find("result = &mut send_future")
         .expect("backend response-header arm");
     assert!(bridge[..deadline].contains("biased;"));
     assert!(
         deadline < response,
-        "a simultaneous backend response must not outlive the RPC deadline"
+        "a simultaneous backend response must not outlive the composed bound"
+    );
+    assert!(
+        bridge[deadline..response].contains("plain_write_bound.expired_authorization()"),
+        "the winning owner must be captured before the race breaks"
     );
     assert!(bridge[deadline..response].contains("drop(pending_slot.take());"));
     assert!(bridge[deadline..response].contains("break None;"));
     assert!(bridge.contains("halt_request_body(stream);"));
+    // No response header was committed, so an authorization expiry takes the
+    // fixed `401` pre-commitment terminal while the client's own gRPC-Web
+    // deadline keeps its own.
+    assert!(bridge.contains("write_plain_authorization_expired_terminal("));
     assert!(bridge.contains("record_plain_grpc_web_client_deadline("));
     assert!(bridge.contains("write_plain_grpc_web_client_deadline("));
 }
@@ -1592,15 +1878,23 @@ fn h3_plain_grpc_web_client_acquisition_is_deadline_bounded() {
     );
     assert_eq!(
         dispatch
-            .matches("let client_result = match crate::plugins::await_grpc_deadline(")
+            .matches("let client_result = match crate::plugins::await_deadline_first(")
             .count(),
         2,
-        "both client acquisitions must use the absolute RPC deadline"
+        "both client acquisitions must use the composed expiry-first bound"
+    );
+    assert!(
+        dispatch.contains("plain_write_bound.deadline()"),
+        "client acquisition must wait under the captured composed bound, not the client deadline alone"
     );
     assert!(dispatch.contains("drop(pending_slot);"));
     assert!(dispatch.contains("halt_request_body(stream);"));
     assert!(dispatch.contains("record_plain_grpc_web_client_deadline("));
     assert!(dispatch.contains("write_plain_grpc_web_client_deadline("));
+    assert!(
+        dispatch.contains("write_plain_authorization_expired_terminal("),
+        "an authorization-owned acquisition expiry must stay on the fixed 401, not the client-deadline writer"
+    );
 }
 
 #[test]
@@ -2600,6 +2894,29 @@ fn h3_plain_header_wait_races_per_stream_stop_sending_not_only_connection_close(
         helper.contains("H3BackendOrPeer::Deadline"),
         "the gRPC-Web absolute deadline race must be preserved: {helper}"
     );
+    assert!(
+        helper.contains("if let Some(deadline) = deadline")
+            && helper.contains("tokio::time::Instant::now() >= deadline"),
+        "an already-elapsed composed bound must refuse before polling the backend: {helper}"
+    );
+    let bounded = helper
+        .split("Some(deadline) => {")
+        .nth(1)
+        .expect("bounded deadline select")
+        .split("}\n        }")
+        .next()
+        .expect("bounded deadline select body");
+    let biased_at = bounded
+        .find("biased;")
+        .expect("deadline-first biased select");
+    let sleep_at = bounded.find("sleep_until(deadline)").expect("deadline arm");
+    let ready_at = bounded
+        .find("value = &mut future")
+        .expect("backend-ready arm");
+    assert!(
+        biased_at < sleep_at && sleep_at < ready_at,
+        "the composed bound must beat a simultaneously ready backend: {bounded}"
+    );
 
     let dispatch = src
         .split("async fn dispatch_plain<S>(")
@@ -3109,18 +3426,46 @@ fn native_h3_grpc_upload_pump_source() -> &'static str {
         .expect("bounded native H3 gRPC upload pump")
 }
 
+fn native_h3_grpc_upload_await_helper_source() -> &'static str {
+    let src = include_str!("../../../src/http3/server.rs");
+    // Match the helper by name, then take the item through the next type
+    // boundary. The signature may be generic (`<F>(...)`) or not (`(...)`);
+    // pinning `name(` would miss a generic declaration the way `name<` would
+    // miss a non-generic one.
+    let Some(name_at) = src.find("fn h3_grpc_upload_await_until_authorization") else {
+        panic!("native H3 gRPC upload-pump authorization helper");
+    };
+    src[name_at..]
+        .split("impl H3UploadPumpExit")
+        .next()
+        .expect("bounded native H3 gRPC upload-pump authorization helper")
+}
+
 #[test]
 fn h3_native_grpc_upload_pump_awaits_are_all_cancellable() {
     let pump = native_h3_grpc_upload_pump_source();
+    let helper = native_h3_grpc_upload_await_helper_source();
 
-    // Every await the pump performs must sit in a `select!` against shutdown:
-    // frontend DATA, backend DATA, frontend trailers, backend trailers, and the
-    // backend FIN. Otherwise a bidi server that finished its response could not
-    // retire a pump parked on a flow-control-blocked write.
+    // Every await the pump performs races shutdown and the admitted
+    // authorization plan through the shared helper: frontend DATA, backend
+    // DATA, frontend trailers, backend trailers, and the backend FIN.
     assert_eq!(
-        pump.matches("shutdown.notified()").count(),
+        pump.matches("h3_grpc_upload_await_until_authorization(")
+            .count(),
         5,
-        "each pump await must race the shutdown signal"
+        "each pump await must race shutdown and the authorization plan"
+    );
+    assert!(
+        helper.contains("shutdown.notified()"),
+        "the helper must remain cancellable through the pump shutdown signal"
+    );
+    assert!(
+        helper.contains("biased;") && helper.contains("tokio::time::sleep_until(plan.at)"),
+        "the helper must race authorization first so an exact-deadline tie fails closed"
+    );
+    assert!(
+        helper.contains("if tokio::time::Instant::now() >= plan.at"),
+        "an already-elapsed plan must never poll the inner receive or commit"
     );
     for awaited in [
         "frontend_recv.recv_data()",
@@ -3153,6 +3498,10 @@ fn h3_native_grpc_upload_pump_awaits_are_all_cancellable() {
     assert!(
         pump.contains("max_request_body_size"),
         "the pump must enforce the effective gRPC receive ceiling incrementally"
+    );
+    assert!(
+        pump.contains("H3GrpcUploadFault::AuthorizationExpired("),
+        "authorization expiry must publish a typed fault rather than a clean backend FIN"
     );
 }
 
@@ -3218,8 +3567,8 @@ fn h3_native_grpc_upload_pump_publishes_only_backend_blocked_state() {
             .find(backend_await)
             .unwrap_or_else(|| panic!("pump must forward {backend_await}"));
         let arm_start = pump[..at]
-            .rfind("tokio::select! {")
-            .unwrap_or_else(|| panic!("{backend_await} must sit in a shutdown select"));
+            .rfind("h3_grpc_upload_await_until_authorization(")
+            .unwrap_or_else(|| panic!("{backend_await} must sit in the authorization helper"));
         let prefix = &pump[..arm_start];
         let last_true = prefix
             .rfind("upload.set_blocked_on_backend(true);")
@@ -3323,6 +3672,81 @@ fn h3_native_grpc_trailer_wait_stays_in_the_upload_cancellation_domain() {
     );
 }
 
+/// Isolate the two non-authorization upload-fault terminal writers. A broad
+/// trailer-phase substring for `downstream_write_bound.deadline()` is satisfied
+/// by the neighboring authorization and backend-trailer FIN calls, so a
+/// regression that rebinds either of these gateway-authored trailer/FIN writes
+/// to the optional client `grpc_deadline_at` would otherwise stay green.
+#[test]
+fn h3_native_grpc_non_auth_upload_fault_terminals_use_the_composed_write_bound() {
+    let relay = native_h3_grpc_relay_source();
+
+    let response_loop = relay
+        .split("'outer: loop")
+        .nth(1)
+        .expect("native response loop");
+    let select = response_loop
+        .split("tokio::select! {")
+        .nth(1)
+        .expect("native response select");
+    let fault = select
+        .find("fault = &mut upload_fault_wait")
+        .expect("terminating upload-fault arm");
+    let data = select
+        .find("backend_recv.recv_data()")
+        .expect("backend DATA arm");
+    let mid_response_non_auth = select[fault..data]
+        .split("let (fault_status, fault_message) = fault.grpc_signal();")
+        .nth(1)
+        .expect("mid-response non-authorization upload-fault branch");
+    assert_non_auth_upload_fault_terminal_uses_composed_bound(
+        mid_response_non_auth,
+        "mid-response non-authorization upload-fault terminal",
+    );
+
+    let trailer_wait_non_auth = relay
+        .split("let trailers_result = match trailer_wait_result {")
+        .nth(1)
+        .expect("terminal trailer wait outcome")
+        .split("match trailers_result {")
+        .next()
+        .expect("bounded terminal trailer upload-fault arm")
+        .split("Err(fault) => {")
+        .nth(1)
+        .expect("trailer-wait non-authorization upload-fault branch");
+    assert_non_auth_upload_fault_terminal_uses_composed_bound(
+        trailer_wait_non_auth,
+        "trailer-wait non-authorization upload-fault terminal",
+    );
+}
+
+fn assert_non_auth_upload_fault_terminal_uses_composed_bound(arm: &str, context: &str) {
+    assert!(
+        arm.contains("fault_status") && arm.contains("fault_message"),
+        "{context} must be the gateway-authored non-authorization fault writer"
+    );
+    assert_eq!(
+        arm.matches("send_h3_grpc_terminal_trailers(").count(),
+        1,
+        "{context} must have exactly one terminal trailer/FIN writer"
+    );
+    let call = arm
+        .split("send_h3_grpc_terminal_trailers(")
+        .nth(1)
+        .expect("terminal trailer call")
+        .split(".await")
+        .next()
+        .expect("awaited terminal trailer write");
+    assert!(
+        call.contains("downstream_write_bound.deadline()"),
+        "{context} must bound send_trailers/finish by the composed downstream write bound"
+    );
+    assert!(
+        !call.contains("grpc_deadline_at"),
+        "{context} must not regress to the optional client grpc-timeout as the sole bound"
+    );
+}
+
 /// Every native-H3 gRPC failure/reject path writes the client's response BEFORE
 /// it tears anything down.
 ///
@@ -3345,19 +3769,32 @@ fn h3_native_grpc_failure_paths_write_the_response_before_tearing_down() {
         .split("// ── Phase 2")
         .next()
         .expect("bounded pre-split failure arm");
-    let send_at = pre_split
-        .find("send_failed_h3_grpc_dispatch_error(&dispatch_env, &mut stream, error)")
-        .expect("pre-split failure must write the trailers-only gRPC error");
-    let halt_at = pre_split
-        .find("halt_request_body(&mut stream)")
-        .expect("pre-split failure must halt the unsplit receive half gracefully");
-    let record_at = pre_split
-        .find("record_failed_h3_grpc_dispatch(")
-        .expect("pre-split failure must record the outcome");
-    assert!(
-        send_at < halt_at && halt_at < record_at,
-        "pre-split ordering must be response -> STOP_SENDING(H3_NO_ERROR) -> record"
-    );
+    // Two pre-split arms reach a client-visible terminal: the authorization
+    // terminal and the ordinary dispatch failure. Each is bounded by the
+    // `return Ok(());` that closes it, so an arm's ordering is checked against
+    // its OWN halt and record rather than against the first one in the block.
+    for write in [
+        "send_h3_grpc_authorization_expired_terminal(",
+        "send_failed_h3_grpc_dispatch_error(&dispatch_env, &mut stream, error)",
+    ] {
+        let arm = pre_split
+            .split_inclusive("return Ok(());")
+            .find(|arm| arm.contains(write))
+            .unwrap_or_else(|| panic!("pre-split arm writing `{write}` must remain present"));
+        let send_at = arm
+            .find(write)
+            .expect("pre-split failure must write the trailers-only gRPC error");
+        let halt_at = arm
+            .find("halt_request_body(&mut stream)")
+            .expect("pre-split failure must halt the unsplit receive half gracefully");
+        let record_at = arm
+            .find("record_failed_h3_grpc_dispatch(")
+            .expect("pre-split failure must record the outcome");
+        assert!(
+            send_at < halt_at && halt_at < record_at,
+            "pre-split ordering must be response -> STOP_SENDING(H3_NO_ERROR) -> record"
+        );
+    }
 
     // Post-split: each ordinary failure/reject arm writes, then retires. Arms
     // are bounded by the `return Ok(());` that closes the previous one, so a
@@ -3422,8 +3859,9 @@ fn h3_native_grpc_terminal_writes_cannot_pin_the_upload_pump() {
         relay
             .matches("await_h3_grpc_terminal_write_with_grace(")
             .count(),
-        2,
-        "oversized-response and after_proxy terminal writes must both be bounded before pump retirement"
+        3,
+        "the oversized-response, after_proxy and authorization-expiry terminal writes must all \
+         be bounded before pump retirement"
     );
     assert!(
         relay
@@ -3483,11 +3921,17 @@ fn h3_native_grpc_upload_fault_signalling_matches_the_h2_bridge() {
         h3_grpc_upload_fault_signal_for_test(H3GrpcUploadFaultKind::ClientAbort),
         Some((14, "Service unavailable")),
     );
+    assert_eq!(
+        h3_grpc_upload_fault_signal_for_test(H3GrpcUploadFaultKind::AuthorizationExpired),
+        Some((16, "credential expired")),
+        "an expired upload-pump authorization lifetime is UNAUTHENTICATED"
+    );
 
     for terminating in [
         H3GrpcUploadFaultKind::ClientAbort,
         H3GrpcUploadFaultKind::MalformedTrailers,
         H3GrpcUploadFaultKind::Oversize,
+        H3GrpcUploadFaultKind::AuthorizationExpired,
     ] {
         assert!(
             h3_grpc_upload_fault_terminates_rpc_for_test(terminating),
@@ -3560,6 +4004,14 @@ async fn h3_native_grpc_terminating_upload_fault_wakes_the_relay() {
         "a fault latched while the relay waits must wake it"
     );
     assert!(
+        h3_grpc_upload_fault_wakes_relay_for_test(
+            H3GrpcUploadFaultKind::AuthorizationExpired,
+            true
+        )
+        .await,
+        "an authorization-expired upload fault must wake the response relay"
+    );
+    assert!(
         !h3_grpc_upload_fault_wakes_relay_for_test(
             H3GrpcUploadFaultKind::BackendUploadHalted,
             true
@@ -3625,6 +4077,7 @@ fn h3_native_grpc_header_wait_expiry_blames_the_party_it_waited_on() {
         H3GrpcUploadFaultKind::ClientAbort,
         H3GrpcUploadFaultKind::MalformedTrailers,
         H3GrpcUploadFaultKind::Oversize,
+        H3GrpcUploadFaultKind::AuthorizationExpired,
     ] {
         assert!(
             !blames_backend(H3GrpcHeaderWaitScenario {
@@ -3647,10 +4100,10 @@ fn h3_native_grpc_header_wait_does_not_trust_client_progress() {
         "client-controlled historical progress must not drive backend health attribution"
     );
     let expiry = relay
-        .split("tokio::time::timeout_at(at, header_fut)")
+        .split("await_deadline_first(dispatch_deadline_at, header_fut)")
         .nth(1)
         .expect("header-wait expiry arm")
-        .split("None => header_fut.await")
+        .split("let h3_resp = match head_result")
         .next()
         .expect("bounded header-wait expiry arm");
     assert!(
@@ -3661,5 +4114,254 @@ fn h3_native_grpc_header_wait_does_not_trust_client_progress() {
         !expiry.contains("upload.is_complete()"),
         "the dispatch arm must use the centralized classifier rather than \
          re-implementing upload ownership ad hoc"
+    );
+}
+
+#[test]
+fn h3_native_grpc_trailer_phase_composes_the_authorization_plan() {
+    let relay = native_h3_grpc_relay_source();
+    let trailer = relay
+        .split("if stream_done {")
+        .nth(1)
+        .expect("native H3 gRPC trailer phase")
+        .split("pump_guard.retire().await")
+        .next()
+        .expect("bounded native H3 gRPC trailer phase");
+    assert!(
+        trailer.contains(
+            "let trailer_bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose("
+        ),
+        "the trailer wait must compose the captured authorization plan"
+    );
+    assert!(
+        trailer.contains("trailer_bound.expired_authorization()"),
+        "a withheld trailer must be attributed from the captured composition"
+    );
+    assert!(
+        trailer.contains("await_deadline_first(trailer_wait_at, trailer_fut)"),
+        "the trailer wait must refuse an already-elapsed composed bound before polling"
+    );
+    assert!(
+        !trailer.contains("timeout_at(at, trailer_fut)"),
+        "timeout_at polls the trailer future first"
+    );
+    assert!(
+        trailer.contains("downstream_write_bound.deadline()"),
+        "trailer and FIN writes must race the composed downstream bound"
+    );
+    assert!(
+        trailer.contains("H3GrpcResponseFinish::DeadlineExceeded"),
+        "parked trailer/FIN writes must remain observable as DeadlineExceeded"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_parked_h3_grpc_upload_commit_is_dropped_at_the_authorization_deadline() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use ferrum_edge::_test_support::{
+        H3GrpcUploadAwaitOutcomeForTest, h3_grpc_upload_await_until_authorization_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::{StreamAuthDeadline, StreamAuthTermination};
+
+    async fn gated_commit(
+        release: tokio::sync::oneshot::Receiver<()>,
+        emitted: Arc<AtomicBool>,
+    ) -> &'static [u8] {
+        let _ = release.await;
+        emitted.store(true, Ordering::SeqCst);
+        b"late"
+    }
+
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let emitted = Arc::new(AtomicBool::new(false));
+    let emitted_commit = Arc::clone(&emitted);
+    let plan = StreamAuthDeadline {
+        at: tokio::time::Instant::now() + Duration::from_millis(20),
+        termination: StreamAuthTermination::CredentialExpired,
+    };
+    let shutdown = tokio::sync::Notify::new();
+    let raced = tokio::spawn(async move {
+        h3_grpc_upload_await_until_authorization_for_test(
+            Some(plan),
+            &shutdown,
+            gated_commit(release_rx, emitted_commit),
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(20)).await;
+    let _ = release_tx.send(());
+    assert_eq!(
+        raced.await.expect("join"),
+        H3GrpcUploadAwaitOutcomeForTest::AuthorizationExpired(
+            StreamAuthTermination::CredentialExpired
+        )
+    );
+    assert!(
+        !emitted.load(Ordering::SeqCst),
+        "a parked backend DATA/trailer/FIN commit must not run after expiry"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_already_elapsed_h3_grpc_upload_commit_never_polls() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use ferrum_edge::_test_support::{
+        H3GrpcUploadAwaitOutcomeForTest, h3_grpc_upload_await_until_authorization_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::{StreamAuthDeadline, StreamAuthTermination};
+
+    let plan = StreamAuthDeadline {
+        at: tokio::time::Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(tokio::time::Instant::now),
+        termination: StreamAuthTermination::CredentialExpired,
+    };
+    let polled = Arc::new(AtomicBool::new(false));
+    let polled_commit = Arc::clone(&polled);
+    let shutdown = tokio::sync::Notify::new();
+    let outcome = h3_grpc_upload_await_until_authorization_for_test(
+        Some(plan),
+        &shutdown,
+        std::future::poll_fn(move |_| {
+            polled_commit.store(true, Ordering::SeqCst);
+            std::task::Poll::Ready(b"late")
+        }),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        H3GrpcUploadAwaitOutcomeForTest::AuthorizationExpired(
+            StreamAuthTermination::CredentialExpired
+        )
+    );
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "an already-elapsed plan must not poll a ready backend commit"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_exact_tie_on_a_ready_h3_grpc_upload_commit_is_expiry_first() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use ferrum_edge::_test_support::{
+        H3GrpcUploadAwaitOutcomeForTest, h3_grpc_upload_await_until_authorization_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::{StreamAuthDeadline, StreamAuthTermination};
+
+    let plan = StreamAuthDeadline {
+        at: tokio::time::Instant::now() + Duration::from_millis(0),
+        termination: StreamAuthTermination::CredentialExpired,
+    };
+    let polled = Arc::new(AtomicBool::new(false));
+    let polled_commit = Arc::clone(&polled);
+    let shutdown = tokio::sync::Notify::new();
+    let outcome = h3_grpc_upload_await_until_authorization_for_test(
+        Some(plan),
+        &shutdown,
+        std::future::poll_fn(move |_| {
+            polled_commit.store(true, Ordering::SeqCst);
+            std::task::Poll::Ready(b"tie")
+        }),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        H3GrpcUploadAwaitOutcomeForTest::AuthorizationExpired(
+            StreamAuthTermination::CredentialExpired
+        )
+    );
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "an exact-deadline tie must not commit a simultaneously-ready backend byte"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_withheld_h3_grpc_trailer_beyond_authorization_is_attributed_to_auth() {
+    use std::time::Duration;
+
+    use ferrum_edge::proxy::auth_lifetime::{
+        ComposedAuthBound, StreamAuthDeadline, StreamAuthTermination,
+    };
+
+    let plan = StreamAuthDeadline {
+        at: tokio::time::Instant::now() + Duration::from_millis(20),
+        termination: StreamAuthTermination::CredentialExpired,
+    };
+    let bound = ComposedAuthBound::compose(None, Some(plan));
+    tokio::time::advance(Duration::from_millis(20)).await;
+    assert_eq!(
+        bound.expired_authorization(),
+        Some(StreamAuthTermination::CredentialExpired),
+        "a withheld trailer with no protocol bound belongs to authorization"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_parked_h3_grpc_trailer_write_expires_under_authorization() {
+    use std::time::Duration;
+
+    use ferrum_edge::proxy::auth_lifetime::{
+        ComposedAuthBound, StreamAuthDeadline, StreamAuthTermination,
+    };
+
+    let plan = StreamAuthDeadline {
+        at: tokio::time::Instant::now() + Duration::from_millis(20),
+        termination: StreamAuthTermination::CredentialExpired,
+    };
+    let bound = ComposedAuthBound::compose(None, Some(plan));
+    let deadline = bound
+        .deadline()
+        .expect("authorization supplies the write bound");
+    let task = tokio::spawn(async move {
+        ferrum_edge::_test_support::stalled_h3_response_write_expires_for_test(deadline).await
+    });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(20)).await;
+    assert!(
+        task.await.expect("join"),
+        "a parked trailer/FIN write must not commit after authorization expiry"
+    );
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert_eq!(
+        bound.expired_authorization(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+}
+
+#[test]
+fn h3_native_grpc_zero_data_trailer_uses_the_message_safe_rule() {
+    let util = include_str!("../../../src/http3/stream_util.rs");
+    let helper = util
+        .split("fn grpc_deadline_can_send_terminal_status")
+        .nth(1)
+        .expect("shared message-safe rule helper must remain present")
+        .split("\npub(crate) async fn await_response_write_before_deadline")
+        .next()
+        .expect("bounded message-safe rule helper");
+    assert!(
+        helper.contains("bytes_streamed == 0"),
+        "zero-DATA vs post-DATA trailer termination stays on the shared message-safe rule"
+    );
+    let relay = native_h3_grpc_relay_source();
+    let trailer = relay
+        .split("if stream_done {")
+        .nth(1)
+        .expect("native H3 gRPC trailer phase");
+    assert!(
+        trailer.contains("grpc_deadline_can_send_terminal_status("),
+        "authorization trailer expiry must keep the zero-DATA vs post-DATA message-safe split"
     );
 }

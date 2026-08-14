@@ -225,6 +225,10 @@ pub struct MeshMtlsSender {
 /// stripped on the way out of the pool.
 pub(crate) type MeshMtlsTransport = MeshMtlsSender;
 
+type BoxedCreateSenderFuture<'a> = Pin<
+    Box<dyn std::future::Future<Output = Result<MeshMtlsTransport, HbonePoolError>> + Send + 'a>,
+>;
+
 impl std::fmt::Debug for MeshMtlsSender {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1396,25 +1400,25 @@ impl MeshMtlsConnectionPool {
             .and_then(|m| m.get(&app_policy_port))
             .and_then(|o| o.tcp_keepalive.as_ref());
         let pooled_conn_admission = self.conn_admission(proxy, target_host, app_policy_port);
-        let transport = match tokio::time::timeout(
+        // Constructed out of line so the TLS + hyper HTTP/2 handshake is not a
+        // frame slot in `get_or_create_sender`. An H3 plain Sidecar attempt
+        // already sits on a deep unoptimized poll stack; boxing here keeps
+        // that handshake off the checkout coroutine.
+        let create = self.boxed_create_sender(
+            proxy,
+            target_host,
+            mtls_port,
+            expected_peer,
+            expected_trust_domain,
+            sni_override,
+            pool_config,
+            keepalive_override,
             remaining,
-            self.create_sender(
-                proxy,
-                target_host,
-                mtls_port,
-                expected_peer,
-                expected_trust_domain,
-                sni_override,
-                pool_config,
-                keepalive_override,
-                remaining,
-                effective_connect_timeout_ms,
-                crls_before_dial.clone(),
-                pooled_conn_admission.as_ref(),
-            ),
-        )
-        .await
-        {
+            effective_connect_timeout_ms,
+            crls_before_dial.clone(),
+            pooled_conn_admission.as_ref(),
+        );
+        let transport = match tokio::time::timeout(remaining, create).await {
             Ok(Ok(transport)) => {
                 crate::runtime_metrics::global_ref()
                     .record_pool_handshake(crate::runtime_metrics::PoolKind::MeshMtls);
@@ -1566,6 +1570,39 @@ impl MeshMtlsConnectionPool {
         self.creation_locks.retain(|key, lock| {
             self.entries.contains_key(key.as_str()) || Arc::strong_count(lock) > 1
         });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn boxed_create_sender<'a>(
+        &'a self,
+        proxy: &'a Proxy,
+        target_host: &'a str,
+        mtls_port: u16,
+        expected_peer: Option<&'a SpiffeId>,
+        expected_trust_domain: Option<&'a TrustDomain>,
+        sni_override: Option<&'a str>,
+        pool_config: &'a PoolConfig,
+        keepalive_override: Option<&'a crate::config::types::TcpKeepaliveCfg>,
+        connect_budget: Duration,
+        effective_connect_timeout_ms: u64,
+        crls: crate::tls::CrlList,
+        conn_admission: Option<&'a crate::backend_conn_limit::PooledConnectionAdmission<'_>>,
+    ) -> BoxedCreateSenderFuture<'a> {
+        Box::pin(self.create_sender(
+            proxy,
+            target_host,
+            mtls_port,
+            expected_peer,
+            expected_trust_domain,
+            sni_override,
+            pool_config,
+            keepalive_override,
+            connect_budget,
+            effective_connect_timeout_ms,
+            crls,
+            conn_admission,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -57,7 +57,7 @@ on_final_response_body()        ── can reject (post-transform validation)
 on_response_committed()         ── observe-only final buffered status/body
   │
   ▼
-log()                           ── awaited sequentially on buffered responses
+log()                           ── sequential; see transaction log hook timing
   │
   ▼
 Buffered response returned to the embedded HTTP server, then sent to the client
@@ -340,9 +340,14 @@ response body:
   terminal paths normally await every `log()` hook before the handler returns
   the response. Direct endpoint or filesystem I/O in the hook therefore adds
   latency, and multiple slow hooks add that latency serially. Buffered H1/H2
-  requests with an active absolute gRPC deadline are the exception: Ferrum
-  moves their owned terminal log state to a five-second detached cleanup task
-  so a blocked sink cannot delay the terminal RPC response.
+  requests are the exception in two cases: an active absolute gRPC deadline, and
+  an authenticated request carrying an authorization-lifetime plan. In both,
+  Ferrum moves the owned terminal log state to a five-second detached cleanup
+  task — so a blocked sink can neither delay the terminal RPC response nor hold
+  the request task past the credential's expiry once the authoritative
+  authorization gate has already chosen the client-visible response. The hooks
+  still run sequentially, in the same order, over the single summary that
+  describes that response.
 - Hyper-owned streamed H1/H2 and gRPC bodies return from the handler before the
   body is complete. At terminal body completion, Ferrum spawns one task that
   awaits `on_response_stream_terminated()` and then all `log()` hooks in

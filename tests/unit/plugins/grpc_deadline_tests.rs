@@ -1465,7 +1465,7 @@ impl Plugin for CompletingRejectDecorator {
 /// session cookie onto the backend's existing `Set-Cookie`, only the
 /// gateway-authored cookie line may cross a terminal deadline rebuild; the
 /// backend cookie must be stripped.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn deadline_replacement_strips_backend_cookie_when_gateway_appends_session() {
     use ferrum_edge::_test_support::{
         run_after_proxy_hooks_reject_for_test, set_grpc_deadline_budget_for_test,
@@ -1479,7 +1479,14 @@ async fn deadline_replacement_strips_backend_cookie_when_gateway_appends_session
     ];
 
     let mut ctx = create_grpc_context_with_timeout(None);
-    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    // The window must still be OPEN when the chain starts: each `after_proxy`
+    // hook is awaited expiry-first, so an already-elapsed budget refuses the
+    // very first hook without polling it and no decoration exists to preserve.
+    // The appending decorator completes synchronously; the stalled hook after it
+    // is what exhausts the deadline, which is the transition under test. Paused
+    // time auto-advances to the timer once the stalled hook parks, so this is
+    // deterministic rather than a wall-clock wait.
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
 
     let mut headers = HashMap::from([
         ("content-type".to_string(), "application/grpc".to_string()),
@@ -2256,7 +2263,7 @@ async fn deadline_replacement_keeps_exact_value_response_transformer_writes() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn buffered_after_proxy_deadline_preserves_completed_decorators_on_rejection() {
     use ferrum_edge::_test_support::{
         run_after_proxy_hooks_reject_for_test, set_grpc_deadline_budget_for_test,
@@ -2283,7 +2290,13 @@ async fn buffered_after_proxy_deadline_preserves_completed_decorators_on_rejecti
     ctx.headers
         .insert("x-request-id".to_string(), "client-request-id".to_string());
     assert_continue(correlation.on_request_received(&mut ctx).await);
-    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    // The window must still be OPEN when the chain starts: each `after_proxy`
+    // hook is awaited expiry-first, so an already-elapsed budget refuses the
+    // very first hook without polling it and there is no completed decorator
+    // left to preserve. The two decorators complete synchronously; the stalled
+    // hook after them is what exhausts the deadline. Paused time auto-advances
+    // to the timer once that hook parks, so this stays deterministic.
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
 
     let mut headers = HashMap::from([
         ("content-type".to_string(), "application/grpc".to_string()),

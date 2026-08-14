@@ -805,6 +805,15 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         }
     };
 
+    // Publish the process-wide stream settings from the ACCEPTED configuration,
+    // before mode dispatch binds any listener. `EnvConfig::validate` is pure
+    // with respect to these globals on purpose: a candidate that clears one
+    // field's range check can still be rejected by a later check, and
+    // `ferrum-edge validate` must not mutate a live process at all. This is the
+    // one publication point, and it is on the serving path only — the `validate`
+    // subcommand returns from `cli::execute_validate` and never reaches here.
+    env_config.publish_process_wide_stream_settings();
+
     // Publish discovery body ceilings before any mode can start Kubernetes /
     // Consul pollers, so the process OnceLock matches the accepted EnvConfig
     // snapshot rather than being pinned by an earlier parse/validate call.

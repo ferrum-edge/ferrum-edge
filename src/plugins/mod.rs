@@ -2203,6 +2203,45 @@ pub struct RequestContext {
     /// Monotonic validity deadline supplied by the accepted authentication
     /// attempt. Contains no token, claim set, subject, or issuer material.
     pub(crate) credential_deadline_at: Option<tokio::time::Instant>,
+    /// Bounded authorization-lifetime termination class latched by the relay
+    /// that actually terminated this request's stream because the accepted
+    /// credential's deadline (or the finite authenticated-stream maximum)
+    /// elapsed (issue #3815).
+    ///
+    /// Used by the native-H3 and H3 cross-protocol relays, which own the QUIC
+    /// request/response halves directly and therefore cannot go through the
+    /// `ProxyBody` wrapper that carries this class on the H1/H2 funnel. Private
+    /// and latch-once: the first terminating relay wins, so a later completion
+    /// site cannot restate or overwrite it. A compiled-in literal from a closed
+    /// set — never a token, claim, identity, provider name, or absolute expiry.
+    authorization_termination: Option<crate::proxy::auth_lifetime::StreamAuthTermination>,
+    /// Shared once-only authorization-lifetime termination latch for this
+    /// request (issue #3815).
+    ///
+    /// Unlike `authorization_termination` (which the request path owns and
+    /// mutates), this handle is cloned into detached body adapters — the
+    /// client request-body upload and the client-visible response body — that
+    /// can both be racing the same absolute plan on a bidirectional stream.
+    /// The first to fire records the single fixed-cardinality termination; the
+    /// request path reads it back to decide the pre-commitment terminal.
+    /// Carries the bounded class only, never credential material.
+    pub(crate) authorization_termination_latch:
+        crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    /// Transport-level close signal for the client connection this request
+    /// arrived on (issue #3815).
+    ///
+    /// Captured with the accepted connection, exactly like
+    /// `websocket_shutdown_rx`. The response-body watchdog uses it as the last
+    /// resort when the downstream refuses to drain the authorization terminal:
+    /// hyper does not poll a response body while its HTTP/2 pipe is parked on
+    /// send capacity or its HTTP/1.1 connection is parked on socket
+    /// writability, so without a lever on the transport the request/session
+    /// accounting `ProxyBody` holds could not be released at all.
+    ///
+    /// `None` on frontends that own their own downstream writes and bound each
+    /// one directly (the native HTTP/3 relays). Carries no credential material.
+    pub(crate) authorization_connection_closer:
+        Option<crate::proxy::auth_lifetime::AuthorizationConnectionCloser>,
     /// Listener-scoped shutdown signal captured with the accepted connection.
     /// WebSocket takeover retains it so listener replacement/drain terminates
     /// upgraded sessions instead of only stopping new accepts.
@@ -3236,6 +3275,10 @@ impl RequestContext {
             backend_geo_country: None,
             auth_method: None,
             credential_deadline_at: None,
+            authorization_termination: None,
+            authorization_termination_latch:
+                crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default(),
+            authorization_connection_closer: None,
             websocket_shutdown_rx: None,
             soap_ws_security_authenticated_body_digest: None,
             timestamp_received: Utc::now(),
@@ -3490,6 +3533,99 @@ impl RequestContext {
     /// from the relative `grpc-timeout` header on later backend attempts.
     pub fn grpc_deadline_at(&self) -> Option<tokio::time::Instant> {
         self.grpc_deadline_at
+    }
+
+    /// Latch the bounded authorization-lifetime termination class for this
+    /// request. First writer wins, so exactly one relay owns the classification
+    /// even when several completion sites run afterwards.
+    pub(crate) fn latch_authorization_termination(
+        &mut self,
+        termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+    ) {
+        if self.authorization_termination.is_none() {
+            self.authorization_termination = Some(termination);
+            self.metadata.insert(
+                crate::proxy::auth_lifetime::STREAM_AUTH_TERMINATION_METADATA_KEY.to_string(),
+                termination.as_str().to_string(),
+            );
+        }
+    }
+
+    /// The composed bound for one pre-commitment response phase, captured
+    /// together with the authorization plan that a later expiry must be
+    /// attributed against (issue #3815).
+    ///
+    /// Every awaited response phase between backend convergence and the
+    /// client-visible response head — `after_proxy`, the buffered
+    /// normalize/inspect/transform hooks, the final client-visible body and
+    /// header policies, and the response-committed hook — runs while nothing has
+    /// been written downstream. Bounding them only by `grpc_deadline_at()` left
+    /// them completely unbounded for an ordinary HTTP request, so a slow hook
+    /// could carry an admitted credential past its own expiry and then commit a
+    /// PROTECTED response head. Composing the authorization deadline here means
+    /// the phase is cancelled instead, and the authoritative gate that runs
+    /// after the last pre-commitment await — and before the terminal summary is
+    /// built — turns that into the fixed pre-commitment terminal.
+    ///
+    /// The bound carries the authorization PLAN, not just the earliest instant:
+    /// a phase that kept only `deadline()` could not tell an authorization
+    /// expiry from the client's own RPC deadline. Taken BEFORE the phase future
+    /// borrows this context, because attributing the expiry afterwards needs
+    /// `&mut self` again.
+    ///
+    /// The maximum comes from the process-wide value the accepted serving
+    /// configuration publishes (`EnvConfig::publish_process_wide_stream_settings`,
+    /// called from the startup/run gateway publication seam after
+    /// `EnvConfig::from_env()` succeeds). `EnvConfig::validate` only range-checks
+    /// `1..=86400`; it does not publish, so a rejected or `ferrum-edge validate`
+    /// candidate cannot mutate the live scalar. This needs no config handle and
+    /// cannot read an unvalidated number.
+    ///
+    /// `None` for an unauthenticated request with no RPC deadline — byte for
+    /// byte the previous behavior.
+    pub(crate) fn precommit_response_phase_bound(&self) -> PrecommitResponsePhaseBound {
+        let authorization = crate::proxy::auth_lifetime::effective_request_auth_deadline(
+            self,
+            crate::proxy::auth_lifetime::authenticated_stream_max_lifetime_seconds(),
+        );
+        PrecommitResponsePhaseBound::compose(self.grpc_deadline_at(), authorization)
+    }
+
+    /// Record ONE authorization-lifetime termination for this request: the
+    /// fixed-cardinality counter through the shared latch (first writer only)
+    /// and the bounded class into the transaction summary.
+    ///
+    /// This is the single entry point for every termination arm — the
+    /// pre-commitment gates, the blocked-write seam, the idle/mid-body relay
+    /// arms, and the body adapters — so concurrent upload, response, and
+    /// terminal paths on one stream cannot double count. Returns `true` when
+    /// this call owned the termination.
+    pub(crate) fn record_authorization_termination_once(
+        &mut self,
+        termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+        family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+    ) -> bool {
+        let won = self
+            .authorization_termination_latch
+            .record_once(termination, family);
+        self.latch_authorization_termination(termination);
+        won
+    }
+
+    /// Clone this request's shared authorization-lifetime termination latch for
+    /// a detached body adapter (request upload or response body).
+    pub(crate) fn authorization_termination_latch(
+        &self,
+    ) -> crate::proxy::auth_lifetime::StreamAuthTerminationLatch {
+        self.authorization_termination_latch.clone()
+    }
+
+    /// The latched authorization-lifetime termination class, if this request's
+    /// stream was ended by that contract.
+    pub(crate) fn authorization_termination(
+        &self,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        self.authorization_termination
     }
 
     pub(crate) fn mark_gateway_deadline_response_selected(&mut self) {
@@ -4301,6 +4437,11 @@ impl RequestContext {
             backend_geo_country: self.backend_geo_country,
             auth_method: self.auth_method,
             credential_deadline_at: self.credential_deadline_at,
+            authorization_termination: self.authorization_termination,
+            // Same request, same latch: a cloned context must not be able to
+            // record a second termination for the stream it describes.
+            authorization_termination_latch: self.authorization_termination_latch.clone(),
+            authorization_connection_closer: self.authorization_connection_closer.clone(),
             websocket_shutdown_rx: self.websocket_shutdown_rx.clone(),
             soap_ws_security_authenticated_body_digest: self
                 .soap_ws_security_authenticated_body_digest,
@@ -5717,6 +5858,151 @@ impl RequestPluginDeadlineResult {
     }
 }
 
+/// The composed absolute bound for one PRE-COMMITMENT response phase, captured
+/// together with the authorization plan an expiry must be attributed against
+/// (issue #3815).
+///
+/// Two very different owners can drive the same instant: the client's own
+/// `grpc-timeout` (an RPC bound the client chose) and the admitted credential's
+/// authorization lifetime (a gateway security decision). Collapsing them into
+/// one `Option<Instant>` is what made every bounded phase synthesize
+/// `grpc-status: 4 DEADLINE_EXCEEDED`, mark gateway/RPC deadline provenance,
+/// and run ordinary rejection handling — blaming the plugin or the backend for
+/// the gateway's own expiry, and letting a protected response head continue
+/// toward commitment.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PrecommitResponsePhaseBound {
+    bound: crate::proxy::auth_lifetime::ComposedAuthBound,
+}
+
+impl PrecommitResponsePhaseBound {
+    /// Compose one pre-commitment phase bound, deciding the winning owner where
+    /// both instants are known.
+    pub(crate) fn compose(
+        protocol_deadline_at: Option<tokio::time::Instant>,
+        authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    ) -> Self {
+        Self {
+            bound: crate::proxy::auth_lifetime::ComposedAuthBound::compose(
+                protocol_deadline_at,
+                authorization,
+            ),
+        }
+    }
+
+    /// The instant the awaited phase runs under: the earliest of the two.
+    pub(crate) fn deadline(self) -> Option<tokio::time::Instant> {
+        self.bound.deadline()
+    }
+
+    /// The admitted credential's absolute authorization deadline, whether or
+    /// not it is the winning bound. This is what bounds work that a phase
+    /// legitimately DETACHES at the client's own earlier RPC deadline, which
+    /// would otherwise keep holding the cloned request context and the
+    /// protected response body past the credential's lifetime.
+    pub(crate) fn authorization_deadline_at(self) -> Option<tokio::time::Instant> {
+        self.bound.authorization_deadline_at()
+    }
+
+    /// The winning bound, once the composed deadline has elapsed. `Some` only
+    /// when the authorization lifetime is the bound that established it and
+    /// that instant has actually elapsed.
+    ///
+    /// Attribution comes from the CAPTURED composition, never from re-reading
+    /// the clock: a strictly earlier client `grpc-timeout` stays attributed to
+    /// the client even when the phase was not polled again until after the
+    /// later authorization deadline had also passed. A genuine tie still goes
+    /// to authorization, matching the biased select-arm ordering every relay
+    /// uses.
+    pub(crate) fn expired_authorization(
+        self,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        self.bound.expired_authorization()
+    }
+}
+
+/// Outcome of one awaited PRE-COMMITMENT response phase.
+pub(crate) enum PrecommitPhaseResult<T> {
+    /// The phase produced its own result inside the bound.
+    Completed(T),
+    /// The bound elapsed and the phase was CANCELLED. `Some` names the
+    /// authorization termination class when the credential's lifetime is the
+    /// winning bound; `None` means only the client's own RPC deadline elapsed.
+    Expired(Option<crate::proxy::auth_lifetime::StreamAuthTermination>),
+}
+
+/// Await `future` under an optional absolute deadline, refusing to poll it
+/// once that deadline has elapsed.
+///
+/// `tokio::time::timeout_at` (Tokio 1.52.3) polls its inner future before the
+/// timer, so an already-elapsed bound still runs immediately-ready protected
+/// work. This helper refuses first: an elapsed bound returns `Err` without
+/// polling `future`, and a biased `sleep_until` arm wins an exact-deadline
+/// tie. No deadline keeps the no-timer hot path.
+///
+/// Ownership of a fired bound is NOT decided here. The caller already captured
+/// a typed composition and attributes from that; this returns only completion
+/// vs bound-fired.
+pub(crate) async fn await_deadline_first<F, T>(
+    deadline: Option<tokio::time::Instant>,
+    future: F,
+) -> Result<T, ()>
+where
+    F: std::future::Future<Output = T>,
+{
+    let Some(deadline) = deadline else {
+        return Ok(future.await);
+    };
+    if tokio::time::Instant::now() >= deadline {
+        return Err(());
+    }
+    tokio::select! {
+        biased;
+        () = tokio::time::sleep_until(deadline) => Err(()),
+        result = future => Ok(result),
+    }
+}
+
+/// Await one pre-commitment response phase under its composed bound, keeping
+/// the provenance of an expiry.
+pub(crate) async fn await_precommit_response_phase<F, T>(
+    bound: PrecommitResponsePhaseBound,
+    future: F,
+) -> PrecommitPhaseResult<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    match await_deadline_first(bound.deadline(), future).await {
+        Ok(value) => PrecommitPhaseResult::Completed(value),
+        Err(()) => PrecommitPhaseResult::Expired(bound.expired_authorization()),
+    }
+}
+
+impl PrecommitPhaseResult<PluginResult> {
+    /// Resolve an awaited plugin phase into the result the caller must act on.
+    ///
+    /// * Completed — unchanged.
+    /// * Client RPC deadline — unchanged: gateway deadline provenance is marked
+    ///   and the canonical `grpc-status: 4` terminal is selected, so client
+    ///   `grpc-timeout` behavior is byte for byte what it was.
+    /// * Authorization lifetime — the request's shared termination latch is
+    ///   recorded exactly once, NO gateway/RPC deadline provenance is marked
+    ///   (the plugin and the backend are blameless), and the only terminal
+    ///   selectable is the fixed pre-commitment authorization one.
+    pub(crate) fn into_plugin_result(self, ctx: &mut RequestContext) -> PluginResult {
+        match self {
+            Self::Completed(result) => result,
+            Self::Expired(Some(termination)) => {
+                crate::proxy::settle_precommit_authorization_expiry(ctx, termination)
+            }
+            Self::Expired(None) => {
+                ctx.mark_gateway_deadline_response_selected();
+                grpc_deadline_exceeded_plugin_result()
+            }
+        }
+    }
+}
+
 /// Await one request-phase plugin hook under the RPC's absolute deadline while
 /// preserving typed deadline provenance for protocol-specific finalizers.
 pub(crate) async fn await_request_plugin_deadline_with_provenance<F>(
@@ -5745,6 +6031,42 @@ where
     tokio::time::timeout_at(deadline, future)
         .await
         .map_err(|_| ())
+}
+
+/// Canonical, fixed terminal for an admitted request whose authorization
+/// lifetime elapsed BEFORE any response header was committed (issue #3815).
+///
+/// Every field is a compiled-in literal: no expiry value, claim, subject,
+/// certificate field, issuer, or provider error can reach the client. gRPC
+/// keeps its own semantics (`grpc-status: 16` UNAUTHENTICATED over an HTTP 200
+/// trailers-only response); everything else gets the plain redacted `401`.
+pub(crate) fn authorization_expired_plugin_result(
+    is_grpc: bool,
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+) -> PluginResult {
+    if is_grpc {
+        return PluginResult::Reject {
+            status_code: 200,
+            body: String::new(),
+            headers: HashMap::from([
+                ("content-type".to_string(), "application/grpc".to_string()),
+                (
+                    "grpc-status".to_string(),
+                    crate::proxy::auth_lifetime::AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER
+                        .to_string(),
+                ),
+                (
+                    "grpc-message".to_string(),
+                    termination.grpc_message().to_string(),
+                ),
+            ]),
+        };
+    }
+    PluginResult::Reject {
+        status_code: 401,
+        body: r#"{"error":"Unauthorized"}"#.to_string(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+    }
 }
 
 pub(crate) fn grpc_deadline_exceeded_plugin_result() -> PluginResult {
@@ -7268,6 +7590,14 @@ pub async fn log_with_mirror(
 /// response owns the deadline and logging continues on cloned state under a
 /// finite cleanup bound. This keeps audit delivery best-effort without letting
 /// a blocked sink suppress the terminal response.
+///
+/// The main buffered terminal path of `handle_proxy_request_inner` reaches this
+/// only for a request with NO authorization plan — an unauthenticated request,
+/// whose credential cannot expire behind the wait. An authenticated request goes
+/// through [`spawn_bounded_terminal_summary_log`] directly instead, because
+/// awaiting any logging plugin AFTER that path's authoritative authorization
+/// gate would let the credential expire once earlier plugins had already
+/// recorded the protected outcome (issue #3815).
 pub async fn log_with_mirror_before_buffered_response(
     plugins: &[Arc<dyn Plugin>],
     summary: TransactionSummary,
@@ -7277,7 +7607,30 @@ pub async fn log_with_mirror_before_buffered_response(
         log_with_mirror(plugins, &summary, ctx).await;
         return;
     }
+    spawn_bounded_terminal_summary_log(plugins, summary, ctx);
+}
 
+/// Hand ONE terminal transaction summary to bounded, detached observability
+/// delivery instead of awaiting it (issue #3815).
+///
+/// Every applicable logging plugin still receives exactly this summary, exactly
+/// once, in configured order; the ordering happens inside the single spawned
+/// task rather than on the request task. Nothing is awaited on the caller's
+/// side, so no time passes — and therefore no credential can expire — between an
+/// authorization commitment gate and the client-visible response that gate
+/// selected. The summary handed in is the one that describes that response, so
+/// the audit record and the client-visible security decision cannot disagree.
+///
+/// Delivery is admitted through the shared observability-delivery lifecycle, so
+/// the task counts against `FERRUM_LOG_DELIVERY_MAX_TASKS`, is drained at
+/// shutdown, and is capped by a finite cleanup timeout: nothing detached here is
+/// unbounded. A rejected admission drops the record rather than spawning further
+/// work to report it.
+pub fn spawn_bounded_terminal_summary_log(
+    plugins: &[Arc<dyn Plugin>],
+    summary: TransactionSummary,
+    ctx: &RequestContext,
+) {
     let plugins = plugins.to_vec();
     let ctx = ctx.clone();
     let _ = crate::observability_delivery::spawn_deadline_cleanup(async move {
@@ -7409,6 +7762,16 @@ pub struct StreamConnectionContext {
     /// Authentication mechanism that succeeded for this stream connection.
     /// Mirrors `RequestContext::auth_method`.
     pub auth_method: Option<&'static str>,
+    /// Monotonic authorization deadline supplied by the accepted stream
+    /// credential — for `mtls_auth`, the leaf certificate's `notAfter`.
+    /// Mirrors `RequestContext::credential_deadline_at`.
+    ///
+    /// Private so a later hook cannot LENGTHEN a bound an earlier admitting
+    /// mechanism already established; use [`Self::observe_credential_deadline`]
+    /// (earliest wins) to contribute one and
+    /// [`Self::credential_deadline_at`] to read it. Contains no certificate,
+    /// DN, SAN, serial, fingerprint, or absolute expiry.
+    credential_deadline_at: Option<tokio::time::Instant>,
     /// Plugin metadata. Lazily allocated on first write to avoid a HashMap allocation
     /// for stream connections that have no metadata-writing plugins configured.
     pub metadata: Option<HashMap<String, String>>,
@@ -7528,6 +7891,7 @@ impl StreamConnectionContext {
             identified_consumer: None,
             authenticated_identity: None,
             auth_method: None,
+            credential_deadline_at: None,
             metadata: None,
             admission_permits: Vec::new(),
             tls_client_cert_der: None,
@@ -7612,6 +7976,35 @@ impl StreamConnectionContext {
             .as_ref()
             .map(|consumer| consumer.username.as_str())
             .or_else(|| meaningful_identity(self.authenticated_identity.as_deref()))
+    }
+
+    /// Contribute an authorization deadline observed by an admitting stream
+    /// authentication mechanism (issue #3816).
+    ///
+    /// Earliest wins and the bound is monotonic: a later hook can only tighten
+    /// it, never lengthen it, and `None` is a no-op rather than a reset. That
+    /// makes the field safe to expose to the plugin chain while keeping a
+    /// second, longer-lived credential from widening a bound already
+    /// established by a short-lived one.
+    pub fn observe_credential_deadline(&mut self, deadline: Option<tokio::time::Instant>) {
+        let Some(deadline) = deadline else {
+            return;
+        };
+        self.credential_deadline_at = Some(match self.credential_deadline_at {
+            Some(existing) => existing.min(deadline),
+            None => deadline,
+        });
+    }
+
+    /// The accepted stream credential's authorization deadline, if any.
+    pub fn credential_deadline_at(&self) -> Option<tokio::time::Instant> {
+        self.credential_deadline_at
+    }
+
+    /// Whether this connection admitted an authenticated principal. Mirrors the
+    /// HTTP-side predicate in `proxy::auth_lifetime::request_is_authenticated`.
+    pub fn is_authenticated(&self) -> bool {
+        self.identified_consumer.is_some() || self.authenticated_identity.is_some()
     }
 
     /// Insert a metadata value, lazily allocating the map on first write.
@@ -9954,10 +10347,16 @@ pub trait Plugin: Send + Sync {
     /// Called for transaction logging.
     ///
     /// Buffered HTTP-family handlers normally await each plugin's hook
-    /// sequentially before returning the response. When an absolute gRPC
-    /// deadline is active, buffered H1/H2 handlers instead move logging to a
-    /// bounded detached cleanup task so a blocked sink cannot suppress the
-    /// terminal RPC response. Native H3 awaits the hooks after it has
+    /// sequentially before returning the response. Buffered H1/H2 handlers
+    /// instead move logging to a bounded detached cleanup task when an absolute
+    /// gRPC deadline is active, so a blocked sink cannot suppress the terminal
+    /// RPC response, and when the request carries an authorization plan, so a
+    /// blocked sink cannot hold the request task past the credential's expiry
+    /// after the authoritative authorization gate has already chosen the
+    /// client-visible response (issue #3815). Either way the hooks still run
+    /// sequentially, in configured order, over exactly one summary — the one
+    /// that describes the response the client receives. Native H3 awaits the
+    /// hooks after it has
     /// synchronously driven the response body to completion. Hyper-owned
     /// streamed H1/H2/gRPC bodies spawn terminal hooks and logging when the body
     /// completes; spawned work can be lost if no runtime remains during
@@ -10081,6 +10480,30 @@ pub trait Plugin: Send + Sync {
     /// which is carried through to `on_stream_disconnect`.
     async fn on_stream_connect(&self, _ctx: &mut StreamConnectionContext) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Whether this plugin's [`Plugin::on_stream_connect`] hook can admit an
+    /// authenticated principal — a mapped consumer, a permitted external
+    /// identity, or an authorization deadline contributed through
+    /// [`StreamConnectionContext::observe_credential_deadline`] (issue #3816).
+    ///
+    /// Read BEFORE the frontend TLS handshake starts, to decide whether a
+    /// TLS-terminating TCP listener may hand its socket to kernel TLS. A kTLS
+    /// leg is relayed by `splice(2)`: the kernel owns both sockets and the relay
+    /// cannot be wrapped by the authorization-deadline stream that bounds an
+    /// admitted session. A listener that can admit such a principal therefore
+    /// has to stay on the buffered userspace rustls path, and that decision must
+    /// be taken while the socket is still pristine — after
+    /// `dangerous_into_kernel_connection` there is no safe reverse conversion.
+    ///
+    /// Defaults to `false`. A plugin that populates
+    /// `StreamConnectionContext::identified_consumer`,
+    /// `StreamConnectionContext::authenticated_identity`, or
+    /// `StreamConnectionContext::observe_credential_deadline` MUST override it
+    /// to `true`; `tests/unit/plugins/mtls_auth_certificate_lifetime_tests.rs`
+    /// pins the built-in inventory of such plugins so the two cannot drift.
+    fn admits_authenticated_stream_principal(&self) -> bool {
+        false
     }
 
     /// Called when a stream connection (TCP/UDP session) is completed.

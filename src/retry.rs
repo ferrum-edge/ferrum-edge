@@ -313,7 +313,11 @@ fn classify_stream_setup_kind(kind: crate::proxy::stream_error::StreamSetupKind)
         | StreamSetupKind::NoHealthyTargets
         | StreamSetupKind::CircuitBreakerOpen
         | StreamSetupKind::BackendMaxConnectionsExceeded
-        | StreamSetupKind::UnsupportedStreamPolicy => ErrorClass::RequestError,
+        | StreamSetupKind::UnsupportedStreamPolicy
+        // An elapsed authorization lifetime is a gateway-side security
+        // decision about the client's own credential — never a transport
+        // failure and never a backend fault.
+        | StreamSetupKind::AuthorizationExpired => ErrorClass::RequestError,
     }
 }
 

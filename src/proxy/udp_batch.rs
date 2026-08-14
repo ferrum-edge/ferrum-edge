@@ -490,6 +490,16 @@ impl SendMmsgBatch {
         self.count == 0
     }
 
+    /// Drop every queued datagram without sending.
+    ///
+    /// Allocation-free: lazily allocated slot buffers keep their capacity for
+    /// reuse. After discard, [`Self::pending_stats`] is zero and a subsequent
+    /// [`Self::flush`] is a no-op — discarded payloads must not be counted as
+    /// sent.
+    pub fn discard(&mut self) {
+        self.count = 0;
+    }
+
     /// Return the queued datagram and byte counts that would be lost if a
     /// final best-effort flush fails and the caller drops the remainder.
     pub fn pending_stats(&self) -> SendMmsgFlush {
@@ -775,6 +785,12 @@ impl SendMmsgBatch {
     pub fn datagram_buffer_capacity_bytes(&self) -> usize {
         0
     }
+
+    pub fn is_empty(&self) -> bool {
+        true
+    }
+
+    pub fn discard(&mut self) {}
 }
 
 /// GSO batch buffer for sending multiple same-size datagrams in a single `sendmsg()`
@@ -820,6 +836,17 @@ impl GsoBatchBuf {
     /// Whether the buffer is empty.
     pub fn is_empty(&self) -> bool {
         self.count == 0
+    }
+
+    /// Drop every queued datagram without sending.
+    ///
+    /// Allocation-free: the concatenated buffer keeps its capacity for reuse.
+    /// After discard the buffer is empty, so a subsequent [`Self::flush_to`]
+    /// is a no-op — discarded payloads must not be counted as sent.
+    pub fn discard(&mut self) {
+        self.buf.clear();
+        self.count = 0;
+        self.segment_size = 0;
     }
 
     /// Try to append a datagram. Returns `false` if the datagram has a different
@@ -974,4 +1001,10 @@ impl GsoBatchBuf {
     pub fn new(_max_bytes: usize) -> Self {
         Self
     }
+
+    pub fn is_empty(&self) -> bool {
+        true
+    }
+
+    pub fn discard(&mut self) {}
 }

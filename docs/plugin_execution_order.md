@@ -1755,10 +1755,15 @@ transaction hook sequentially:
 - Buffered H1/H2/gRPC responses, synchronous rejection/error paths, and other
   buffered terminal paths normally await all log hooks before the response is
   returned. Direct network or filesystem I/O therefore adds client-visible
-  handler latency, with multiple hooks adding that latency serially. When an
-  absolute gRPC deadline is active, Ferrum moves the owned summary, context, and
-  plugin list to a five-second detached cleanup task so a blocked log sink
-  cannot delay the terminal RPC response.
+  handler latency, with multiple hooks adding that latency serially. Ferrum
+  moves the owned summary, context, and plugin list to a five-second detached
+  cleanup task in two cases: when an absolute gRPC deadline is active, so a
+  blocked log sink cannot delay the terminal RPC response; and when the request
+  carries an authorization-lifetime plan, so a blocked sink cannot hold the
+  request task past the credential's expiry after the authoritative
+  authorization gate has already chosen the client-visible response (issue
+  #3815). The hooks still run sequentially, in the same order, over the single
+  summary that describes that response.
 - Hyper-owned streamed H1/H2 and gRPC bodies return from the handler first.
   Body completion fires a spawned task that awaits streaming terminal hooks and
   then log hooks sequentially. The task can be lost when no Tokio runtime is

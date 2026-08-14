@@ -2164,8 +2164,8 @@ async fn test_bidirectional_copy_does_not_reclassify_read_side_error_after_eof()
 /// Verify the reclassification preserves accurate per-direction byte
 /// counters. The successful first-chunk write in each direction must be
 /// reflected; the failed second-chunk write in b2c must NOT bump the
-/// counter (per `copy_one_direction`'s post-write `fetch_add` which only
-/// runs after a successful write).
+/// counter (`poll_copy_direction` credits each successful `poll_write` and
+/// therefore not a write that returns `Err`).
 #[tokio::test]
 async fn test_bidirectional_copy_graceful_reclassification_preserves_byte_counts() {
     let request: &[u8] = b"REQUEST-7B";

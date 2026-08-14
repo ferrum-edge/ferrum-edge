@@ -34,6 +34,7 @@
 //! - **Streaming by default**: Response bodies are streamed unless a plugin requires buffering
 //! - **Atomic config reload**: `update_config()` and `apply_incremental()` swap config atomically
 
+pub mod auth_lifetime;
 pub mod backend_capabilities;
 pub mod backend_dispatch;
 pub mod body;
@@ -105,6 +106,7 @@ pub(crate) mod node_waypoint_ingress_capture;
 pub mod owned_shell;
 pub mod proxy_protocol;
 pub(crate) mod response_buffer_budget;
+pub mod response_watchdog;
 pub mod sni;
 pub mod stream_error;
 pub mod stream_listener;
@@ -116,6 +118,7 @@ pub mod udp_placement_migration;
 pub mod udp_proxy;
 pub mod unix_backend;
 pub mod unix_backend_pool;
+pub mod upload_pump;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -3523,6 +3526,44 @@ where
         .map_err(|_| RequestBodyWaitError::TimedOut)
 }
 
+/// Wait for a buffered client request body against an ALREADY-COMPOSED early
+/// upload bound.
+///
+/// This is the single wait/attribution seam for buffered collects, so a caller
+/// that must also REASON about the bound (comparing it against the admitted
+/// stream's authorization deadline) composes exactly once and hands the same
+/// `(Instant, EarlyUploadBoundKind)` here. Recomposing at wait time would
+/// rebase the fresh operator window onto a later `Instant::now()`, so the
+/// instant that was compared and the instant that is actually awaited could
+/// differ (issue #3815).
+///
+/// `request_body_read_timeout_ms` is used only for the unbounded arm, where
+/// composition produced no absolute instant at all: it preserves the relative
+/// operator stall guard for the overflow case (`Instant::now() + timeout` is
+/// unrepresentable) and the plain "no bound configured" pass-through.
+pub(crate) async fn collect_request_body_with_composed_bound<F, T, E>(
+    collect: F,
+    composed_bound: Option<(tokio::time::Instant, EarlyUploadBoundKind)>,
+    request_body_read_timeout_ms: u64,
+) -> Result<Result<T, E>, RequestBodyWaitError>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    match composed_bound {
+        Some((effective_deadline, EarlyUploadBoundKind::OperatorTimeout)) => {
+            tokio::time::timeout_at(effective_deadline, collect)
+                .await
+                .map_err(|_| RequestBodyWaitError::TimedOut)
+        }
+        Some((effective_deadline, EarlyUploadBoundKind::RpcDeadline)) => {
+            tokio::time::timeout_at(effective_deadline, collect)
+                .await
+                .map_err(|_| RequestBodyWaitError::DeadlineExceeded)
+        }
+        None => collect_request_body_with_timeout(collect, request_body_read_timeout_ms).await,
+    }
+}
+
 pub(crate) async fn collect_request_body_with_deadline<F, T, E>(
     collect: F,
     deadline: Option<tokio::time::Instant>,
@@ -3535,18 +3576,137 @@ where
     // timeout remains the operator's client-upload stall guard. Keep both by
     // waiting only until the earlier instant; a very large grpc-timeout must
     // not disable the operator bound.
-    match compose_early_upload_bound(deadline, request_body_read_timeout_ms) {
-        Some((effective_deadline, EarlyUploadBoundKind::OperatorTimeout)) => {
-            tokio::time::timeout_at(effective_deadline, collect)
-                .await
-                .map_err(|_| RequestBodyWaitError::TimedOut)
+    //
+    // Composition happens exactly once, here, and the resulting instant is what
+    // is awaited — callers that need the composed bound for their own decision
+    // must call `collect_request_body_with_composed_bound` directly rather than
+    // composing a second time.
+    collect_request_body_with_composed_bound(
+        collect,
+        compose_early_upload_bound(deadline, request_body_read_timeout_ms),
+        request_body_read_timeout_ms,
+    )
+    .await
+}
+
+/// Outcome of waiting for a BUFFERED client request body under the admitted
+/// stream's authorization lifetime (issue #3815).
+///
+/// Kept separate from [`RequestBodyWaitError`] rather than adding a variant to
+/// it: the pre-authentication prebuffer (`buffer_request_body_for_before_proxy`)
+/// runs before any principal is admitted, so it can never produce an
+/// authorization expiry, and widening the shared enum would force every one of
+/// its consumers to invent a meaning for a state they cannot reach.
+pub(crate) enum AuthorizedUploadWaitError {
+    /// The phase's own client RPC deadline or operator stall timeout elapsed.
+    Wait(RequestBodyWaitError),
+    /// The accepted credential's authorization lifetime elapsed while the
+    /// gateway was still collecting the client upload. Already latched and
+    /// counted once for the request.
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+}
+
+/// Collect a BUFFERED client request body under the earliest of the client RPC
+/// deadline, the operator whole-upload stall timeout, and the admitted stream's
+/// absolute authorization deadline (issue #3815).
+///
+/// A body the gateway must buffer before dispatch — because a request-body
+/// plugin, a gRPC-Web translation, or retry replay needs it — never reaches the
+/// streaming `SizeLimitedIncoming`/`CountingIncoming` adapters, so the upload
+/// wrapper cannot bound it. Without this seam a client that uploads
+/// CONTINUOUSLY into a buffering route keeps an admitted stream alive past the
+/// expiry of the credential that admitted it: the collect future makes progress
+/// on every poll, so neither the RPC deadline (often absent) nor the per-read
+/// operator timeout (refreshed by progress) ever fires.
+///
+/// The authorization arm is biased first, so a plan that has ALREADY elapsed
+/// fails closed without polling the collect at all, and a tie between the two
+/// bounds is attributed to the security decision — the same ordering every
+/// relay and every H3 write seam uses.
+///
+/// Attribution is decided from the COMPOSED BOUNDS, not from the biased arm
+/// alone (issue #3815). When the phase's own client RPC deadline / operator
+/// stall timeout resolves to an ABSOLUTE instant that is strictly earlier than
+/// the credential's, the authorization arm is not armed at all: otherwise a
+/// task that is not scheduled until after BOTH instants have passed would take
+/// the biased arm and report a security expiry for a phase the protocol bound
+/// actually ended. The arm is still armed whenever the protocol side resolves
+/// to NO absolute instant at all (`grpc-timeout` unset and
+/// `backend_read_timeout_ms = 0`), which is exactly the unbounded case this
+/// seam exists for.
+///
+/// SINGLE-COMPOSITION INVARIANT: the protocol bound is composed exactly ONCE
+/// per authorized collect and the SAME `(Instant, EarlyUploadBoundKind)` drives
+/// both the arm-selection comparison and the actual wait/error attribution. A
+/// second composition would rebase the fresh operator window onto a later
+/// `Instant::now()`, so an authorization deadline falling in that gap could be
+/// judged "later than the protocol bound" (disarming the security arm) while
+/// the instant actually awaited lands AFTER it — a fail-closed race that also
+/// makes the reported terminal disagree with the instant that produced it.
+pub(crate) async fn collect_request_body_under_authorization<F, T, E>(
+    collect: F,
+    deadline: Option<tokio::time::Instant>,
+    request_body_read_timeout_ms: u64,
+    auth: Option<&RequestAuthLifetimePlan>,
+) -> Result<Result<T, E>, AuthorizedUploadWaitError>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    collect_request_body_under_authorization_with_bound(
+        collect,
+        compose_early_upload_bound(deadline, request_body_read_timeout_ms),
+        request_body_read_timeout_ms,
+        auth,
+    )
+    .await
+}
+
+/// [`collect_request_body_under_authorization`] over an ALREADY-COMPOSED
+/// protocol bound. Splitting composition from the wait is what makes the
+/// single-composition invariant testable: a caller (or a test) can compose,
+/// let arbitrary time pass, and still observe the arm selection and the wait
+/// agree on one instant.
+pub(crate) async fn collect_request_body_under_authorization_with_bound<F, T, E>(
+    collect: F,
+    protocol_bound: Option<(tokio::time::Instant, EarlyUploadBoundKind)>,
+    request_body_read_timeout_ms: u64,
+    auth: Option<&RequestAuthLifetimePlan>,
+) -> Result<Result<T, E>, AuthorizedUploadWaitError>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    let Some((plan, family, latch)) = auth else {
+        return collect_request_body_with_composed_bound(
+            collect,
+            protocol_bound,
+            request_body_read_timeout_ms,
+        )
+        .await
+        .map_err(AuthorizedUploadWaitError::Wait);
+    };
+    // Authenticated collects are expiry-first against the captured earliest
+    // bound. `timeout_at` would still poll an immediately-ready upload after
+    // that instant elapsed; a strictly earlier protocol bound keeps its own
+    // terminal even when authorization has also passed by the time we wake.
+    match protocol_bound {
+        Some((at, kind)) if at < plan.at => {
+            match crate::plugins::await_deadline_first(Some(at), collect).await {
+                Ok(result) => Ok(result),
+                Err(()) => Err(AuthorizedUploadWaitError::Wait(match kind {
+                    EarlyUploadBoundKind::OperatorTimeout => RequestBodyWaitError::TimedOut,
+                    EarlyUploadBoundKind::RpcDeadline => RequestBodyWaitError::DeadlineExceeded,
+                })),
+            }
         }
-        Some((effective_deadline, EarlyUploadBoundKind::RpcDeadline)) => {
-            tokio::time::timeout_at(effective_deadline, collect)
-                .await
-                .map_err(|_| RequestBodyWaitError::DeadlineExceeded)
-        }
-        None => collect_request_body_with_timeout(collect, request_body_read_timeout_ms).await,
+        _ => match crate::plugins::await_deadline_first(Some(plan.at), collect).await {
+            Ok(result) => Ok(result),
+            Err(()) => {
+                latch.record_once(plan.termination, *family);
+                Err(AuthorizedUploadWaitError::AuthorizationExpired(
+                    plan.termination,
+                ))
+            }
+        },
     }
 }
 
@@ -6316,6 +6476,12 @@ struct RequestConnectionMetadata {
     peer_spiffe_extraction_cache:
         Option<Arc<crate::plugins::mesh::spiffe_identity::SpiffeIdentityConnectionCache>>,
     websocket_shutdown_rx: Option<watch::Receiver<bool>>,
+    /// Transport-level authorization close signal for this accepted connection
+    /// (issue #3815). Populated by the HTTP connection handlers, which select on
+    /// it beside the hyper connection future; `None` on frontends that own their
+    /// own downstream writes (native HTTP/3).
+    authorization_connection_closer:
+        Option<crate::proxy::auth_lifetime::AuthorizationConnectionCloser>,
 }
 
 fn empty_svid_bundle_slot() -> SharedSvidBundle {
@@ -12885,6 +13051,13 @@ async fn handle_connection(
     // WebSocket requests flow through handle_proxy_request so that authentication
     // and authorization plugins execute before the upgrade handshake.
     let websocket_shutdown_rx = shutdown_rx.clone();
+    // Transport-level lever for the authorization contract (issue #3815). hyper
+    // does not poll a response body while its HTTP/2 pipe is parked on send
+    // capacity or its HTTP/1.1 connection is parked on socket writability, both
+    // of which the client controls, so the response watchdog needs a way to
+    // reach this connection when the downstream refuses to drain the terminal.
+    let authorization_closer = crate::proxy::auth_lifetime::AuthorizationConnectionCloser::new();
+    let mut authorization_close_rx = authorization_closer.subscribe();
     let svc = service_fn(move |req: Request<Incoming>| {
         let state = Arc::clone(&state);
         let addr = remote_addr;
@@ -12900,6 +13073,7 @@ async fn handle_connection(
             // Plaintext connections carry no client certificate.
             peer_spiffe_extraction_cache: None,
             websocket_shutdown_rx: Some(websocket_shutdown_rx.clone()),
+            authorization_connection_closer: Some(authorization_closer.clone()),
         };
         async move {
             handle_proxy_request_on_frontend_port(
@@ -12930,6 +13104,31 @@ async fn handle_connection(
             conn.as_mut().graceful_shutdown();
             conn.as_mut().await
         }
+        () = crate::proxy::auth_lifetime::authorization_close_requested(
+            &mut authorization_close_rx,
+        ) => {
+            // An admitted authenticated stream on this connection outlived the
+            // credential that admitted it, the gateway already released the
+            // upstream, and the client still did not drain the terminal. Closing
+            // is what releases the request guard, per-IP guard, admission
+            // permits, load-balancer accounting, and deferred logger that
+            // `ProxyBody` holds — exactly once, through its ordinary `Drop`.
+            //
+            // GOAWAY first, then a BOUNDED settle so sibling HTTP/2 streams can
+            // still finish; the connection future is dropped when this `select!`
+            // returns, and that drop is the hard close.
+            debug!(
+                remote_addr = %remote_addr.ip(),
+                tls = false,
+                "Closing client connection: an admitted authenticated stream reached its \
+                 authorization lifetime and the client did not drain the terminal"
+            );
+            conn.as_mut().graceful_shutdown();
+            match tokio::time::timeout(AUTHORIZATION_TRANSPORT_CLOSE_SETTLE, conn.as_mut()).await {
+                Ok(result) => result,
+                Err(_) => Ok(()),
+            }
+        }
     };
 
     if let Err(e) = result {
@@ -12954,6 +13153,18 @@ async fn handle_connection(
 
     Ok(())
 }
+
+/// Bounded settle window granted to a client connection the authorization
+/// contract is closing (issue #3815).
+///
+/// The close is reached only when an admitted authenticated stream's deadline
+/// elapsed AND the downstream did not drain the protocol-correct terminal
+/// within the response watchdog's own grace. `graceful_shutdown` runs first, so
+/// this window is what lets sibling HTTP/2 streams on the same connection still
+/// finish before the hard close; HTTP/1.1 has no sibling to protect and simply
+/// ends the in-flight chunked/SSE body without its terminating chunk, which is
+/// exactly the "not a complete response" signal the contract requires.
+const AUTHORIZATION_TRANSPORT_CLOSE_SETTLE: Duration = Duration::from_secs(2);
 
 /// Check if a hyper connection error indicates a client disconnect.
 fn is_client_disconnect_error(err: &str) -> bool {
@@ -20244,6 +20455,10 @@ async fn handle_tls_connection(
     // WebSocket requests flow through handle_proxy_request so that authentication
     // and authorization plugins execute before the upgrade handshake.
     let websocket_shutdown_rx = shutdown_rx.clone();
+    // See the plaintext handler: the response watchdog's last-resort lever over
+    // a downstream that will not drain an expired stream's terminal.
+    let authorization_closer = crate::proxy::auth_lifetime::AuthorizationConnectionCloser::new();
+    let mut authorization_close_rx = authorization_closer.subscribe();
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         let state = Arc::clone(&state);
         let addr = remote_addr;
@@ -20263,6 +20478,7 @@ async fn handle_tls_connection(
                 .mesh_inbound_pre_handshake_app_port,
             peer_spiffe_extraction_cache: peer_spiffe_extraction_cache.clone(),
             websocket_shutdown_rx: Some(websocket_shutdown_rx.clone()),
+            authorization_connection_closer: Some(authorization_closer.clone()),
         };
         async move {
             handle_proxy_request_on_frontend_port(
@@ -20290,6 +20506,23 @@ async fn handle_tls_connection(
             // in-flight requests to complete on this connection.
             conn.as_mut().graceful_shutdown();
             conn.as_mut().await
+        }
+        () = crate::proxy::auth_lifetime::authorization_close_requested(
+            &mut authorization_close_rx,
+        ) => {
+            // Same contract as the plaintext handler: GOAWAY, a bounded settle
+            // for sibling streams, then the drop that hard-closes the socket.
+            debug!(
+                remote_addr = %remote_addr.ip(),
+                tls = true,
+                "Closing client connection: an admitted authenticated stream reached its \
+                 authorization lifetime and the client did not drain the terminal"
+            );
+            conn.as_mut().graceful_shutdown();
+            match tokio::time::timeout(AUTHORIZATION_TRANSPORT_CLOSE_SETTLE, conn.as_mut()).await {
+                Ok(result) => result,
+                Err(_) => Ok(()),
+            }
         }
     };
 
@@ -20495,6 +20728,59 @@ async fn log_rejected_request_with_path_and_backend_state(
     crate::plugins::log_with_mirror_before_buffered_response(plugins, summary, ctx).await;
 }
 
+/// Replace an uncommitted rejection with the fixed PRE-COMMITMENT
+/// authorization terminal (issue #3815).
+///
+/// The rejection-path analogue of
+/// [`replace_buffered_response_with_authorization_terminal`], built from the
+/// same provenance-aware header retention as
+/// [`replace_rejection_with_gateway_deadline`] so the two cannot drift. It
+/// records the request's shared authorization latch exactly once and never
+/// marks the client RPC deadline provenance.
+fn replace_rejection_with_authorization_terminal(
+    ctx: &mut RequestContext,
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+    status_code: &mut u16,
+    response_body: Option<&mut Bytes>,
+    response_headers: &mut HashMap<String, String>,
+) {
+    let family = request_upload_auth_family(ctx);
+    ctx.record_authorization_termination_once(termination, family);
+    ctx.retain_deadline_response_gateway_headers(response_headers);
+    let native_grpc = is_native_grpc_request(ctx);
+    let (status, headers, body) =
+        authorization_expired_pre_commitment_response(ctx, termination, native_grpc);
+    *status_code = status;
+    if let Some(response_body) = response_body {
+        // Drop any retained shared capacity; do not clear-in-place.
+        *response_body = match body {
+            ResponseBody::Buffered(bytes) => bytes,
+            // Unreachable: the pre-commitment terminal is always buffered.
+            // Fail closed with an empty body rather than publishing anything
+            // else.
+            _ => Bytes::new(),
+        };
+    }
+    if native_grpc {
+        // Keep the gateway decorations the retention step preserved and layer
+        // the terminal metadata over them, exactly as the deadline path does.
+        grpc_proxy::finalize_grpc_error_response_headers(
+            response_headers,
+            grpc_proxy::grpc_status::UNAUTHENTICATED,
+            termination.grpc_message(),
+            &[],
+        );
+    } else {
+        response_headers.extend(headers);
+    }
+    ctx.sync_deadline_response_terminal_headers(response_headers);
+    insert_grpc_error_metadata(
+        &mut ctx.metadata,
+        grpc_proxy::grpc_status::UNAUTHENTICATED,
+        termination.grpc_message(),
+    );
+}
+
 fn replace_rejection_with_gateway_deadline(
     ctx: &mut RequestContext,
     status_code: &mut u16,
@@ -20516,7 +20802,7 @@ fn replace_rejection_with_gateway_deadline(
     ctx.sync_deadline_response_terminal_headers(response_headers);
 }
 
-const DETACHED_REJECTION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const DETACHED_REJECTION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct OwnedRejectionHookResult {
     ctx: RequestContext,
@@ -22234,7 +22520,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
                 continue;
             }
             let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
-            let Some(pending_hook) = run_response_committed_hook_until_deadline(
+            let (pending_hook, detached_bound) = match run_response_committed_hook_until_deadline(
                 Arc::clone(plugin),
                 ctx,
                 normalized.http_status.as_u16(),
@@ -22243,8 +22529,23 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
                 terminal_gateway_deadline,
             )
             .await
-            else {
-                continue;
+            {
+                ResponseCommittedHookOutcome::Completed => continue,
+                ResponseCommittedHookOutcome::Detach(hook, bound) => (hook, bound),
+                // Authorization expiry: the pending observer is already
+                // dropped, every remaining observer is skipped, and the fixed
+                // authorization terminal replaces the response. Nothing is
+                // detached, so no protected data outlives the credential.
+                ResponseCommittedHookOutcome::AuthorizationExpired(termination) => {
+                    replace_rejection_with_authorization_terminal(
+                        ctx,
+                        termination,
+                        status,
+                        Some(body),
+                        headers,
+                    );
+                    break;
+                }
             };
             if !terminal_gateway_deadline {
                 ctx.mark_gateway_deadline_response_selected();
@@ -22256,6 +22557,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
                 *status,
                 Arc::new(headers.clone()),
                 body.clone(),
+                detached_bound,
             );
             break;
         }
@@ -22392,19 +22694,13 @@ pub(crate) async fn run_after_proxy_hooks(
             ctx.metadata.remove(LATER_STRONG_ETAG_RESPONSE_METADATA_KEY);
         }
 
-        let deadline = ctx.grpc_deadline_at();
-        let result = match crate::plugins::await_grpc_deadline(
-            deadline,
+        let bound = ctx.precommit_response_phase_bound();
+        let result = crate::plugins::await_precommit_response_phase(
+            bound,
             plugin.after_proxy(ctx, response_status, response_headers),
         )
         .await
-        {
-            Ok(result) => result,
-            Err(()) => {
-                ctx.mark_gateway_deadline_response_selected();
-                crate::plugins::grpc_deadline_exceeded_plugin_result()
-            }
-        };
+        .into_plugin_result(ctx);
         match result {
             PluginResult::Continue => {
                 // After the last eligible response_transformer static-rule pass,
@@ -23598,6 +23894,85 @@ fn finalize_grpc_web_error_response_headers_with_policy_source(
     );
 }
 
+/// Replace an uncommitted buffered response with the fixed PRE-COMMITMENT
+/// authorization terminal (issue #3815).
+///
+/// Built from exactly the same three-branch machinery as
+/// [`replace_buffered_grpc_response_with_deadline`] — provenance-aware header
+/// retention, gRPC-Web body-framed terminal metadata, native-gRPC terminal
+/// header finalization — so the two cannot drift in protocol shape. The
+/// differences are the ones that must differ:
+///
+/// * the status is `grpc-status: 16` (`UNAUTHENTICATED`), not `4`;
+/// * the request's shared authorization latch is recorded exactly once instead
+///   of `mark_gateway_deadline_response_selected`, because this is the
+///   gateway's own security decision and not the client's chosen RPC deadline —
+///   marking that provenance would drive `grpc-status: 4` terminal write bias
+///   in the protocol writers and blame the RPC deadline;
+/// * a non-gRPC flavor gets the fixed redacted `401`, which the deadline
+///   terminal has no equivalent of.
+///
+/// Returns the client-visible HTTP status.
+pub(crate) fn replace_buffered_response_with_authorization_terminal(
+    ctx: &mut RequestContext,
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+    grpc_web_response_content_type: Option<&str>,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Bytes,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> u16 {
+    let family = request_upload_auth_family(ctx);
+    ctx.record_authorization_termination_once(termination, family);
+    ctx.retain_deadline_response_gateway_headers(response_headers);
+    let status = if let Some(content_type) = grpc_web_response_content_type {
+        let mut response = crate::plugins::grpc_web::error_response_for_content_type(
+            content_type,
+            grpc_proxy::grpc_status::UNAUTHENTICATED,
+            termination.grpc_message(),
+        );
+        response.headers.extend(response_headers.drain());
+        finalize_grpc_web_error_response_headers(
+            &mut response,
+            initial_response_header_policy_plugins,
+            None,
+        );
+        *response_headers = response.headers;
+        *response_body = Bytes::from(response.body);
+        StatusCode::OK.as_u16()
+    } else if is_native_grpc_request(ctx) {
+        grpc_proxy::finalize_grpc_error_response_headers(
+            response_headers,
+            grpc_proxy::grpc_status::UNAUTHENTICATED,
+            termination.grpc_message(),
+            initial_response_header_policy_plugins,
+        );
+        *response_body = Bytes::new();
+        StatusCode::OK.as_u16()
+    } else {
+        // No gRPC terminal metadata exists for an ordinary HTTP response, so
+        // the fixed redacted `401` is the terminal. Nothing here echoes an
+        // expiry instant, claim, subject, or provider.
+        let (status, headers, body) =
+            authorization_expired_pre_commitment_response(ctx, termination, false);
+        *response_headers = headers;
+        *response_body = match body {
+            ResponseBody::Buffered(bytes) => bytes,
+            // Unreachable: the pre-commitment terminal is always buffered.
+            // Fail closed with an empty body rather than publishing anything
+            // else.
+            _ => Bytes::new(),
+        };
+        status
+    };
+    ctx.sync_deadline_response_terminal_headers(response_headers);
+    insert_grpc_error_metadata(
+        &mut ctx.metadata,
+        grpc_proxy::grpc_status::UNAUTHENTICATED,
+        termination.grpc_message(),
+    );
+    status
+}
+
 /// Replace an uncommitted buffered native gRPC or gRPC-Web response with the
 /// canonical gateway deadline result. All buffered frontends use this helper
 /// so the terminal status, browser framing, CORS exposure, and initial-header
@@ -24236,9 +24611,9 @@ async fn run_final_client_visible_response_body_policy(
         if !plugin.enforces_final_client_visible_response_body(ctx) {
             continue;
         }
-        let deadline = ctx.grpc_deadline_at();
-        let result = crate::plugins::await_request_plugin_deadline_with_provenance(
-            deadline,
+        let bound = ctx.precommit_response_phase_bound();
+        let result = crate::plugins::await_precommit_response_phase(
+            bound,
             plugin.finalize_client_visible_response_body(
                 ctx,
                 *response_status,
@@ -24613,9 +24988,9 @@ async fn evaluate_final_client_visible_response_header_policy(
         if !plugin.enforces_final_client_visible_response_headers(ctx) {
             continue;
         }
-        let deadline = ctx.grpc_deadline_at();
-        let result = crate::plugins::await_request_plugin_deadline_with_provenance(
-            deadline,
+        let bound = ctx.precommit_response_phase_bound();
+        let result = crate::plugins::await_precommit_response_phase(
+            bound,
             plugin.finalize_client_visible_response_headers(ctx, response_status, response_headers),
         )
         .await
@@ -25065,8 +25440,8 @@ async fn transform_buffered_response_body_with_deadline_inner(
                 );
                 return (true, body_transformed);
             }
-            let transformed = match crate::plugins::await_grpc_deadline(
-                ctx.grpc_deadline_at(),
+            let transformed = match crate::plugins::await_precommit_response_phase(
+                ctx.precommit_response_phase_bound(),
                 plugin.transform_response_body_with_context(
                     ctx,
                     response_body,
@@ -25076,8 +25451,26 @@ async fn transform_buffered_response_body_with_deadline_inner(
             )
             .await
             {
-                Ok(transformed) => transformed,
-                Err(()) => {
+                crate::plugins::PrecommitPhaseResult::Completed(transformed) => transformed,
+                // The admitted credential's authorization lifetime is the
+                // winning bound. The transform was cancelled, nothing it was
+                // producing can be published, and the only selectable terminal
+                // is the fixed pre-commitment authorization one — never the
+                // client `grpc-timeout` terminal, which would blame the RPC
+                // deadline for the gateway's own security decision.
+                crate::plugins::PrecommitPhaseResult::Expired(Some(termination)) => {
+                    let _ = ctx.take_buffered_response_capacity_refusal_pending();
+                    *response_status = replace_buffered_response_with_authorization_terminal(
+                        ctx,
+                        termination,
+                        grpc_web_response_content_type,
+                        response_headers,
+                        response_body,
+                        initial_response_header_policy_plugins,
+                    );
+                    return (true, body_transformed);
+                }
+                crate::plugins::PrecommitPhaseResult::Expired(None) => {
                     // An elapsed authoritative deadline owns the outcome; discard any
                     // pending transform capacity signal so it cannot leak.
                     let _ = ctx.take_buffered_response_capacity_refusal_pending();
@@ -25227,10 +25620,41 @@ fn owned_response_committed_hook_future(
     })
 }
 
+/// What happened to one committed-response observer that could not finish
+/// inside the phase's absolute bound.
+pub(crate) enum ResponseCommittedHookOutcome {
+    /// The observer ran to completion; its owned context was folded back in.
+    Completed,
+    /// The CLIENT's own RPC deadline is the winning bound. Legacy semantics:
+    /// the pending invocation moves to bounded, owned post-response cleanup so
+    /// it can finish without borrowing the response writer.
+    ///
+    /// The carried bound is the admitted credential's ABSOLUTE authorization
+    /// deadline (issue #3815). The client's RPC deadline winning does not make
+    /// the credential's lifetime irrelevant: the detached invocation still owns
+    /// a clone of the request context and the protected response body, and the
+    /// fixed five-second cleanup timeout alone would let it keep processing
+    /// them past that instant.
+    Detach(
+        OwnedResponseCommittedHookFuture,
+        DetachedResponseCommittedBound,
+    ),
+    /// The admitted credential's authorization lifetime is the winning bound
+    /// (issue #3815). The pending invocation was DROPPED here — together with
+    /// the cloned request context and the protected response body it owned —
+    /// and every remaining observer must be skipped. Nothing is detached,
+    /// because a detached future is exactly a protected-data side effect
+    /// running after the credential is no longer authorized.
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+}
+
 /// Await a committed observer only while it can still affect the synchronous
 /// terminal lifecycle. Once the client deadline is selected, give an
 /// immediately-ready observer one poll; a pending observer is returned with
 /// owned state so cleanup can continue without borrowing the response writer.
+///
+/// An authorization expiry is deliberately NOT detachable — see
+/// [`ResponseCommittedHookOutcome::AuthorizationExpired`].
 pub(crate) async fn run_response_committed_hook_until_deadline(
     plugin: Arc<dyn Plugin>,
     ctx: &mut RequestContext,
@@ -25238,8 +25662,12 @@ pub(crate) async fn run_response_committed_hook_until_deadline(
     response_headers: &HashMap<String, String>,
     response_body: Bytes,
     terminal_gateway_deadline: bool,
-) -> Option<OwnedResponseCommittedHookFuture> {
-    let deadline = ctx.grpc_deadline_at();
+) -> ResponseCommittedHookOutcome {
+    let bound = ctx.precommit_response_phase_bound();
+    let deadline = bound.deadline();
+    let detached_bound = DetachedResponseCommittedBound {
+        authorization_at: bound.authorization_deadline_at(),
+    };
     if !terminal_gateway_deadline && deadline.is_none() {
         plugin
             .on_response_committed(
@@ -25249,7 +25677,16 @@ pub(crate) async fn run_response_committed_hook_until_deadline(
                 response_body.as_ref(),
             )
             .await;
-        return None;
+        return ResponseCommittedHookOutcome::Completed;
+    }
+    // An already-elapsed authorization bound is decided BEFORE the observer is
+    // constructed, so a credential that is no longer authorized never gets even
+    // the single courtesy poll, and no clone of the request context or the
+    // protected body is handed to a future that could outlive this frame.
+    if let Some(termination) = bound.expired_authorization() {
+        let family = request_upload_auth_family(ctx);
+        ctx.record_authorization_termination_once(termination, family);
+        return ResponseCommittedHookOutcome::AuthorizationExpired(termination);
     }
     let mut hook = owned_response_committed_hook_future(
         plugin,
@@ -25268,33 +25705,109 @@ pub(crate) async fn run_response_committed_hook_until_deadline(
         .await;
         if let Some(completed) = completed {
             *ctx = completed;
-            return None;
+            return ResponseCommittedHookOutcome::Completed;
         }
-        return Some(hook);
+        return ResponseCommittedHookOutcome::Detach(hook, detached_bound);
     }
     let Some(deadline) = deadline else {
-        return Some(hook);
+        return ResponseCommittedHookOutcome::Detach(hook, detached_bound);
     };
     let deadline_sleep = tokio::time::sleep_until(deadline);
     tokio::pin!(deadline_sleep);
-    tokio::select! {
+    let completed = tokio::select! {
         biased;
-        () = &mut deadline_sleep => Some(hook),
-        completed = &mut hook => {
-            *ctx = completed;
-            None
-        },
-    }
+        () = &mut deadline_sleep => None,
+        completed = &mut hook => Some(completed),
+    };
+    let Some(completed) = completed else {
+        // The bound elapsed with the observer still pending. Which owner it
+        // belongs to decides whether the pending work may survive this frame.
+        return match bound.expired_authorization() {
+            Some(termination) => {
+                // Drop the hook — and with it the cloned request context and
+                // the protected response body — before anything else runs.
+                drop(hook);
+                let family = request_upload_auth_family(ctx);
+                ctx.record_authorization_termination_once(termination, family);
+                ResponseCommittedHookOutcome::AuthorizationExpired(termination)
+            }
+            None => ResponseCommittedHookOutcome::Detach(hook, detached_bound),
+        };
+    };
+    *ctx = completed;
+    ResponseCommittedHookOutcome::Completed
 }
 
+/// The absolute authorization bound a DETACHED committed-response cleanup runs
+/// under (issue #3815).
+///
+/// Produced by [`run_response_committed_hook_until_deadline`] from the SAME
+/// composed pre-commitment bound the synchronous phase used, and consumed by
+/// [`spawn_detached_response_committed_hooks`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DetachedResponseCommittedBound {
+    /// The admitted credential's absolute authorization deadline, when this
+    /// request carried one. `None` for an unauthenticated request, which this
+    /// contract does not bound at all — its cleanup keeps exactly the fixed
+    /// post-response timeout it always had.
+    pub(crate) authorization_at: Option<tokio::time::Instant>,
+}
+
+/// Continue a committed-response observer chain off the response frame, bounded
+/// by the EARLIEST of the fixed post-response cleanup timeout and the admitted
+/// credential's absolute authorization deadline.
+///
+/// The client's own RPC deadline can be strictly earlier than the credential's
+/// lifetime, so this cleanup is entered while the credential is still
+/// authorized. Bounding it by the five-second timeout alone let the pending
+/// hook and every remaining observer keep holding and processing the cloned
+/// request context and the protected response body after that lifetime elapsed.
+///
+/// # Why not `timeout_at`
+///
+/// `tokio::time::timeout_at` polls its INNER future before it observes the
+/// timer, so a chain whose pending observer and remaining hooks are all ready
+/// on their first poll runs to completion even when the bound elapsed before
+/// this task was ever scheduled. Spawning is not running: between the spawn and
+/// the first poll an unbounded amount of time can pass on a loaded runtime, and
+/// that window is exactly where an expired credential must not be able to
+/// execute one more protected side effect. The bound is therefore enforced
+/// twice — an explicit past-deadline REFUSAL that polls nothing at all, and a
+/// deadline-biased race whose clock gate re-checks the same instant before
+/// every resumption — so the chain is never first-polled, and never resumed,
+/// at/after the authorization bound.
+///
+/// The response the client already received is untouched: this is post-terminal
+/// observer work, the RPC terminal was decided by the client deadline, and
+/// nothing here records an authorization termination — counting one would
+/// double-count a stream that was already ended by another bound.
 pub(crate) fn spawn_detached_response_committed_hooks(
     pending_hook: OwnedResponseCommittedHookFuture,
     remaining_plugins: Vec<Arc<dyn Plugin>>,
     response_status: u16,
     response_headers: Arc<HashMap<String, String>>,
     response_body: Bytes,
+    bound: DetachedResponseCommittedBound,
 ) {
     std::mem::drop(tokio::spawn(async move {
+        let started_at = tokio::time::Instant::now();
+        let cleanup_at = started_at + DETACHED_REJECTION_CLEANUP_TIMEOUT;
+        let authorization_at = bound.authorization_at.filter(|at| *at < cleanup_at);
+        // PAST-DEADLINE REFUSAL. Returning here drops the pending observer, the
+        // remaining observers, the cloned request context, and the protected
+        // response body without polling any of them.
+        if let Some(at) = authorization_at
+            && started_at >= at
+        {
+            // A compiled-in literal: no expiry instant, claim, subject,
+            // certificate field, or provider detail.
+            debug!(
+                "detached committed-response cleanup was refused: the admitted stream's \
+                 authorization lifetime had already elapsed when it was scheduled"
+            );
+            return;
+        }
+        let deadline = authorization_at.unwrap_or(cleanup_at);
         let cleanup = async move {
             let mut ctx = pending_hook.await;
             for plugin in remaining_plugins {
@@ -25311,14 +25824,42 @@ pub(crate) fn spawn_detached_response_committed_hooks(
                     .await;
             }
         };
-        if tokio::time::timeout(DETACHED_REJECTION_CLEANUP_TIMEOUT, cleanup)
-            .await
-            .is_err()
-        {
-            warn!(
-                timeout_seconds = DETACHED_REJECTION_CLEANUP_TIMEOUT.as_secs(),
-                "detached committed-response cleanup exceeded its post-response bound"
-            );
+        let mut cleanup = Box::pin(cleanup);
+        // Per-poll clock gate: an authorization bound is re-checked before the
+        // chain is resumed, so a wake-up that lands at/after it cannot run one
+        // more observer just because a tokio timer had not fired yet.
+        let mut guarded = std::future::poll_fn(move |cx| {
+            if let Some(at) = authorization_at
+                && tokio::time::Instant::now() >= at
+            {
+                return Poll::Ready(false);
+            }
+            std::future::Future::poll(cleanup.as_mut(), cx).map(|()| true)
+        });
+        let deadline_sleep = tokio::time::sleep_until(deadline);
+        tokio::pin!(deadline_sleep);
+        // Deadline-biased: the bound is polled FIRST, so a chain that becomes
+        // ready in the same wake-up as the bound loses to it. The fixed
+        // post-response timeout is unchanged for unauthenticated work — with no
+        // authorization bound the gate above is inert and this is exactly the
+        // five-second cancellation it always was.
+        let completed = tokio::select! {
+            biased;
+            () = &mut deadline_sleep => false,
+            completed = &mut guarded => completed,
+        };
+        if !completed {
+            if authorization_at.is_some() {
+                debug!(
+                    "detached committed-response cleanup was cancelled at the admitted stream's \
+                     authorization lifetime"
+                );
+            } else {
+                warn!(
+                    timeout_seconds = DETACHED_REJECTION_CLEANUP_TIMEOUT.as_secs(),
+                    "detached committed-response cleanup exceeded its post-response bound"
+                );
+            }
         }
     }));
 }
@@ -25342,7 +25883,7 @@ pub(crate) async fn run_deadline_bounded_response_committed_hooks(
             continue;
         }
         let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
-        let Some(pending_hook) = run_response_committed_hook_until_deadline(
+        let (pending_hook, detached_bound) = match run_response_committed_hook_until_deadline(
             Arc::clone(plugin),
             ctx,
             *response_status,
@@ -25351,8 +25892,36 @@ pub(crate) async fn run_deadline_bounded_response_committed_hooks(
             terminal_gateway_deadline,
         )
         .await
-        else {
-            continue;
+        {
+            ResponseCommittedHookOutcome::Completed => continue,
+            ResponseCommittedHookOutcome::Detach(hook, bound) => (hook, bound),
+            // Authorization expiry: the observer is already dropped and every
+            // remaining observer is skipped. The fixed authorization terminal
+            // replaces the buffered response; nothing protected is detached.
+            ResponseCommittedHookOutcome::AuthorizationExpired(termination) => {
+                let owned_grpc_web_response_content_type =
+                    crate::plugins::grpc_web::retained_response_content_type(ctx)
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            response_headers
+                                .get("content-type")
+                                .filter(|content_type| {
+                                    crate::plugins::grpc_web::is_grpc_web_content_type(content_type)
+                                })
+                                .map(|content_type| {
+                                    crate::plugins::grpc_web::response_content_type(content_type)
+                                })
+                        });
+                *response_status = replace_buffered_response_with_authorization_terminal(
+                    ctx,
+                    termination,
+                    owned_grpc_web_response_content_type.as_deref(),
+                    response_headers,
+                    response_body,
+                    initial_response_header_policy_plugins,
+                );
+                return true;
+            }
         };
 
         let owned_grpc_web_response_content_type =
@@ -25383,6 +25952,7 @@ pub(crate) async fn run_deadline_bounded_response_committed_hooks(
             *response_status,
             Arc::new(response_headers.clone()),
             response_body.clone(),
+            detached_bound,
         );
         return true;
     }
@@ -25457,7 +26027,7 @@ async fn build_grpc_web_reject_response(
                 continue;
             }
             let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
-            let Some(pending_hook) = run_response_committed_hook_until_deadline(
+            let (pending_hook, detached_bound) = match run_response_committed_hook_until_deadline(
                 Arc::clone(plugin),
                 ctx,
                 StatusCode::OK.as_u16(),
@@ -25466,8 +26036,37 @@ async fn build_grpc_web_reject_response(
                 terminal_gateway_deadline,
             )
             .await
-            else {
-                continue;
+            {
+                ResponseCommittedHookOutcome::Completed => continue,
+                ResponseCommittedHookOutcome::Detach(hook, bound) => (hook, bound),
+                // Authorization expiry: the observer is already dropped, every
+                // remaining observer is skipped, and the gRPC-Web terminal
+                // becomes the fixed body-framed `UNAUTHENTICATED` one. Nothing
+                // protected is detached.
+                ResponseCommittedHookOutcome::AuthorizationExpired(termination) => {
+                    let family = request_upload_auth_family(ctx);
+                    ctx.record_authorization_termination_once(termination, family);
+                    grpc_status = grpc_proxy::grpc_status::UNAUTHENTICATED;
+                    message = termination.grpc_message().to_string();
+                    translated = crate::plugins::grpc_web::error_response_for_content_type(
+                        content_type,
+                        grpc_status,
+                        &message,
+                    );
+                    let mut terminal_headers = reject.headers.clone();
+                    terminal_headers.retain(|name, _| {
+                        !["grpc-status", "grpc-message", "grpc-status-details-bin"]
+                            .iter()
+                            .any(|terminal| name.eq_ignore_ascii_case(terminal))
+                    });
+                    finalize_grpc_web_error_response_headers(
+                        &mut translated,
+                        &[],
+                        Some(&terminal_headers),
+                    );
+                    insert_grpc_error_metadata(&mut ctx.metadata, grpc_status, &message);
+                    break;
+                }
             };
             if !terminal_gateway_deadline {
                 ctx.mark_gateway_deadline_response_selected();
@@ -25497,6 +26096,7 @@ async fn build_grpc_web_reject_response(
                 StatusCode::OK.as_u16(),
                 Arc::new(translated.headers.clone()),
                 Bytes::from(translated.body.clone()),
+                detached_bound,
             );
             break;
         }
@@ -25859,6 +26459,340 @@ fn release_circuit_breaker_probe_on_admission_reject(
         );
         cb.record_neutral(true);
     }
+}
+
+/// Fixed trailers-only gRPC terminal for an admitted stream whose authorization
+/// lifetime elapsed before any response head was committed (issue #3815).
+///
+/// `grpc-status: 16` (`UNAUTHENTICATED`) with a compiled-in `grpc-message`. No
+/// token, claim, subject, certificate field, provider detail, or absolute expiry
+/// reaches the wire.
+fn normalized_authorization_expired(
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+) -> NormalizedRejectResponse {
+    normalize_reject_response(
+        StatusCode::OK,
+        Bytes::new(),
+        &HashMap::from([
+            ("content-type".to_string(), "application/grpc".to_string()),
+            (
+                "grpc-status".to_string(),
+                crate::proxy::auth_lifetime::AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER.to_string(),
+            ),
+            (
+                "grpc-message".to_string(),
+                termination.grpc_message().to_string(),
+            ),
+        ]),
+        true,
+    )
+}
+
+/// Build the client-visible pre-commitment terminal for a native-gRPC or
+/// gRPC-Web request whose buffered upload was ended by the authorization
+/// lifetime (issue #3815). Mirrors
+/// [`build_finalized_upload_deadline_response`], including the single gRPC-Web
+/// translation pass.
+pub(crate) async fn build_finalized_authorization_expired_response(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+    grpc_web_response_content_type: Option<&str>,
+) -> (Response<ProxyBody>, u16) {
+    let expired = normalized_authorization_expired(termination);
+    let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+        plugins,
+        ctx,
+        expired.http_status,
+        expired.body.clone(),
+        expired.headers,
+        true,
+        grpc_web_response_content_type.is_none(),
+    )
+    .await;
+    apply_grpc_reject_metadata(ctx, &reject);
+    let grpc_web_response =
+        build_grpc_web_reject_response(plugins, ctx, grpc_web_response_content_type, &reject).await;
+    let log_status = reject.http_status.as_u16();
+    let response =
+        grpc_web_response.unwrap_or_else(|| build_response_from_normalized_reject(reject));
+    (response, log_status)
+}
+
+/// Finalize, log, and record a native-gRPC / gRPC-Web request rejected because
+/// the admitted stream's authorization lifetime elapsed during a buffered
+/// upload (issue #3815). The bounded termination class is stamped into the
+/// transaction summary alongside the gRPC status.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_authorization_expired_rejection(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    state: &ProxyState,
+    start_time: Instant,
+    rejection_phase: &str,
+    plugin_execution_ns: u64,
+    original_request_path: Option<&str>,
+    grpc_web_response_content_type: Option<&str>,
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+) -> Response<ProxyBody> {
+    ctx.latch_authorization_termination(termination);
+    let (response, log_status) = build_finalized_authorization_expired_response(
+        plugins,
+        ctx,
+        termination,
+        grpc_web_response_content_type,
+    )
+    .await;
+    log_rejected_request_with_path(
+        plugins,
+        ctx,
+        log_status,
+        start_time,
+        rejection_phase,
+        plugin_execution_ns,
+        original_request_path,
+    )
+    .await;
+    record_request(state, log_status);
+    response
+}
+
+/// One rejection-pipeline future, heap-allocated so it is not a frame slot in
+/// the caller. See [`boxed_finalize_authorization_expired_rejection`].
+type BoxedRejectionResponseFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Response<ProxyBody>> + Send + 'a>>;
+
+/// The authorization-expired rejection future, CONSTRUCTED OUT OF LINE and
+/// returned boxed.
+///
+/// This indirection is a stack-budget invariant, not a style choice (the same
+/// one issue #3764 established for `boxed_proxy_to_backend_unix`).
+/// `handle_proxy_request_inner` is THE generic request future every HTTP request
+/// the gateway serves is polled through, and in an unoptimized build (the
+/// coverage profile) every future it awaits inline is a FIXED `alloca` in that
+/// one poll frame — charged to every request, including ones that can never
+/// reach the branch. `finalize_authorization_expired_rejection` awaits the whole
+/// rejection pipeline (after-proxy hooks, the commit-policy pass, the gRPC-Web
+/// translation, and the rejection logger), so materializing it inline at the two
+/// buffered-gRPC upload arms added a large permanent slot twice over, on a path
+/// only an expired credential during a buffered gRPC upload ever executes.
+///
+/// Building the future in a separate, `#[inline(never)]` frame that RETURNS
+/// before anything is awaited keeps that temporary off the deep poll stack
+/// entirely: the caller stores only a pointer. The cost is one allocation, and
+/// only when a credential has actually expired mid-upload. Do not fold this back
+/// into the call sites without re-measuring the generic future's stack frame.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_finalize_authorization_expired_rejection<'a>(
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a mut RequestContext,
+    state: &'a ProxyState,
+    start_time: Instant,
+    rejection_phase: &'a str,
+    plugin_execution_ns: u64,
+    original_request_path: Option<&'a str>,
+    grpc_web_response_content_type: Option<&'a str>,
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+) -> BoxedRejectionResponseFuture<'a> {
+    Box::pin(finalize_authorization_expired_rejection(
+        plugins,
+        ctx,
+        state,
+        start_time,
+        rejection_phase,
+        plugin_execution_ns,
+        original_request_path,
+        grpc_web_response_content_type,
+        termination,
+    ))
+}
+
+/// One normalized-reject future, heap-allocated so it is not a frame slot in
+/// the caller. See [`boxed_finalize_reject_response`].
+type BoxedNormalizedRejectFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = NormalizedRejectResponse> + Send + 'a>>;
+
+/// The shared reject finalizer, CONSTRUCTED OUT OF LINE and returned boxed.
+///
+/// Same stack-budget invariant as [`boxed_finalize_authorization_expired_rejection`]
+/// and `boxed_proxy_to_backend_unix` (issue #3764), applied to the term that
+/// dominates it. `handle_proxy_request_inner` is THE generic request future
+/// every HTTP request the gateway serves is polled through, and an unoptimized
+/// build (the coverage profile, and `dev` too) gives EVERY future it awaits
+/// inline a fixed `alloca` in that one poll frame — charged to every request,
+/// branch taken or not, with no stack colouring to reclaim it. This finalizer
+/// awaits the whole reject pipeline (the `after_proxy` + synthetic-body hook
+/// pass and the commit-policy pass), and `handle_proxy_request_inner` reaches it
+/// from a dozen mutually exclusive rejection arms, so inline construction
+/// charged a plain proxied request for a dozen copies of a pipeline it can never
+/// execute.
+///
+/// Building each one in a separate `#[inline(never)]` frame that RETURNS before
+/// anything is awaited keeps those temporaries off the deep poll stack: the
+/// request future stores only a pointer. The cost is one allocation, and only on
+/// a request that is actually being rejected. Do not fold these back into the
+/// call sites without re-measuring the generic future's stack frame.
+#[inline(never)]
+fn boxed_finalize_reject_response<'a>(
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a mut RequestContext,
+    status: StatusCode,
+    body: Bytes,
+    headers: HashMap<String, String>,
+    is_grpc_request: bool,
+    invoke_response_committed: bool,
+) -> BoxedNormalizedRejectFuture<'a> {
+    Box::pin(
+        finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+            plugins,
+            ctx,
+            status,
+            body,
+            headers,
+            is_grpc_request,
+            invoke_response_committed,
+        ),
+    )
+}
+
+/// The client-RPC-deadline upload rejection future, constructed out of line and
+/// returned boxed, for exactly the reason documented on
+/// [`boxed_finalize_reject_response`].
+///
+/// Reached from seven upload-buffering arms of `handle_proxy_request_inner`, and
+/// it awaits the same reject pipeline plus the rejection logger.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_finalize_upload_deadline_rejection<'a>(
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a mut RequestContext,
+    state: &'a ProxyState,
+    start_time: Instant,
+    rejection_phase: &'a str,
+    plugin_execution_ns: u64,
+    original_request_path: Option<&'a str>,
+    grpc_web_response_content_type: Option<&'a str>,
+) -> BoxedRejectionResponseFuture<'a> {
+    Box::pin(finalize_upload_deadline_rejection(
+        plugins,
+        ctx,
+        state,
+        start_time,
+        rejection_phase,
+        plugin_execution_ns,
+        original_request_path,
+        grpc_web_response_content_type,
+    ))
+}
+
+/// The backend-admission rejection future, constructed out of line and returned
+/// boxed, for exactly the reason documented on
+/// [`boxed_finalize_reject_response`].
+///
+/// Reached from eight admission arms of `handle_proxy_request_inner`, and it
+/// awaits the reject pipeline, the gRPC-Web translation, and the rejection
+/// logger in turn.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_handle_backend_admission_rejection<'a>(
+    rejection: backend_dispatch::BackendAdmissionRejection,
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a mut RequestContext,
+    state: &'a ProxyState,
+    start_time: Instant,
+    plugin_execution_ns: u64,
+    original_request_path: Option<&'a str>,
+    is_grpc_request: bool,
+    grpc_web_error_content_type: Option<&'a str>,
+) -> BoxedRejectionResponseFuture<'a> {
+    Box::pin(handle_backend_admission_rejection(
+        rejection,
+        plugins,
+        ctx,
+        state,
+        start_time,
+        plugin_execution_ns,
+        original_request_path,
+        is_grpc_request,
+        grpc_web_error_content_type,
+    ))
+}
+
+/// One gRPC-Web reject-translation future, heap-allocated so it is not a frame
+/// slot in the caller. See [`boxed_finalize_reject_response`].
+type BoxedGrpcWebRejectFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<Response<ProxyBody>>> + Send + 'a>>;
+
+/// One rejection-logging future, heap-allocated so it is not a frame slot in
+/// the caller. See [`boxed_finalize_reject_response`].
+type BoxedRejectionLogFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+
+/// The gRPC-Web reject translation, constructed out of line and returned boxed,
+/// for exactly the reason documented on [`boxed_finalize_reject_response`]: it
+/// pairs with that finalizer at every rejection arm of
+/// `handle_proxy_request_inner`, so an inline construction is charged the same
+/// dozen permanent frame slots.
+#[inline(never)]
+fn boxed_build_grpc_web_reject_response<'a>(
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a mut RequestContext,
+    response_content_type: Option<&'a str>,
+    reject: &'a NormalizedRejectResponse,
+) -> BoxedGrpcWebRejectFuture<'a> {
+    Box::pin(build_grpc_web_reject_response(
+        plugins,
+        ctx,
+        response_content_type,
+        reject,
+    ))
+}
+
+/// The rejection logger, constructed out of line and returned boxed, for
+/// exactly the reason documented on [`boxed_finalize_reject_response`]. It
+/// builds a whole transaction summary and awaits the configured sinks, and
+/// `handle_proxy_request_inner` reaches it from every rejection arm.
+#[inline(never)]
+fn boxed_log_rejected_request<'a>(
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a RequestContext,
+    status_code: u16,
+    start_time: Instant,
+    rejection_phase: &'a str,
+    plugin_execution_ns: u64,
+) -> BoxedRejectionLogFuture<'a> {
+    Box::pin(log_rejected_request(
+        plugins,
+        ctx,
+        status_code,
+        start_time,
+        rejection_phase,
+        plugin_execution_ns,
+    ))
+}
+
+/// [`boxed_log_rejected_request`] for the path-overriding variant.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_log_rejected_request_with_path<'a>(
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a RequestContext,
+    status_code: u16,
+    start_time: Instant,
+    rejection_phase: &'a str,
+    plugin_execution_ns: u64,
+    request_path_override: Option<&'a str>,
+) -> BoxedRejectionLogFuture<'a> {
+    Box::pin(log_rejected_request_with_path(
+        plugins,
+        ctx,
+        status_code,
+        start_time,
+        rejection_phase,
+        plugin_execution_ns,
+        request_path_override,
+    ))
 }
 
 pub fn request_is_authenticated(ctx: &RequestContext) -> bool {
@@ -26840,6 +27774,7 @@ async fn handle_proxy_request_inner(
     ctx.mtls_auth_connection_cache = mtls_auth_connection_cache;
     ctx.peer_spiffe_extraction_cache = connection_metadata.peer_spiffe_extraction_cache;
     ctx.websocket_shutdown_rx = connection_metadata.websocket_shutdown_rx;
+    ctx.authorization_connection_closer = connection_metadata.authorization_connection_closer;
     if let Some(identity) = connection_metadata.node_waypoint_identity {
         // In node-waypoint topology, the node-agent/eBPF cookie-derived pod
         // identity is the authenticated source workload for policy. It
@@ -27910,7 +28845,7 @@ async fn handle_proxy_request_inner(
                     r#"{"error":"Internal error"}"#,
                 ));
             };
-            let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+            let reject = boxed_finalize_reject_response(
                 &plugins,
                 &mut ctx,
                 StatusCode::from_u16(plugin_reject.status_code).unwrap_or(StatusCode::BAD_REQUEST),
@@ -27921,14 +28856,14 @@ async fn handle_proxy_request_inner(
             )
             .await;
             apply_grpc_reject_metadata(&mut ctx, &reject);
-            let grpc_web_response = build_grpc_web_reject_response(
+            let grpc_web_response = boxed_build_grpc_web_reject_response(
                 &plugins,
                 &mut ctx,
                 grpc_web_response_content_type,
                 &reject,
             )
             .await;
-            log_rejected_request(
+            boxed_log_rejected_request(
                 &plugins,
                 &ctx,
                 reject.http_status.as_u16(),
@@ -27975,7 +28910,7 @@ async fn handle_proxy_request_inner(
                         .expect("reject result should convert to rejection parts");
                     let status_code = plugin_reject.status_code;
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                    let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                    let reject = boxed_finalize_reject_response(
                         &plugins,
                         &mut ctx,
                         StatusCode::from_u16(status_code)
@@ -27987,14 +28922,14 @@ async fn handle_proxy_request_inner(
                     )
                     .await;
                     apply_grpc_reject_metadata(&mut ctx, &reject);
-                    let grpc_web_response = build_grpc_web_reject_response(
+                    let grpc_web_response = boxed_build_grpc_web_reject_response(
                         &plugins,
                         &mut ctx,
                         grpc_web_response_content_type,
                         &reject,
                     )
                     .await;
-                    log_rejected_request(
+                    boxed_log_rejected_request(
                         &plugins,
                         &ctx,
                         reject.http_status.as_u16(),
@@ -28136,7 +29071,7 @@ async fn handle_proxy_request_inner(
                         return Ok(response);
                     }
                     Err(RequestBodyBufferError::DeadlineExceeded) => {
-                        let response = finalize_upload_deadline_rejection(
+                        let response = boxed_finalize_upload_deadline_rejection(
                             &plugins,
                             &mut ctx,
                             &state,
@@ -28169,7 +29104,7 @@ async fn handle_proxy_request_inner(
         .await
         {
             plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
-            let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+            let reject = boxed_finalize_reject_response(
                 &plugins,
                 &mut ctx,
                 StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED),
@@ -28180,14 +29115,14 @@ async fn handle_proxy_request_inner(
             )
             .await;
             apply_grpc_reject_metadata(&mut ctx, &reject);
-            let grpc_web_response = build_grpc_web_reject_response(
+            let grpc_web_response = boxed_build_grpc_web_reject_response(
                 &plugins,
                 &mut ctx,
                 grpc_web_response_content_type,
                 &reject,
             )
             .await;
-            log_rejected_request(
+            boxed_log_rejected_request(
                 &plugins,
                 &ctx,
                 reject.http_status.as_u16(),
@@ -28294,7 +29229,7 @@ async fn handle_proxy_request_inner(
                         return Ok(response);
                     }
                     Err(RequestBodyBufferError::DeadlineExceeded) => {
-                        let response = finalize_upload_deadline_rejection(
+                        let response = boxed_finalize_upload_deadline_rejection(
                             &plugins,
                             &mut ctx,
                             &state,
@@ -28353,7 +29288,7 @@ async fn handle_proxy_request_inner(
                         .expect("reject result should convert to rejection parts");
                     let status_code = plugin_reject.status_code;
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                    let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                    let reject = boxed_finalize_reject_response(
                         &plugins,
                         &mut ctx,
                         StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN),
@@ -28364,14 +29299,14 @@ async fn handle_proxy_request_inner(
                     )
                     .await;
                     apply_grpc_reject_metadata(&mut ctx, &reject);
-                    let grpc_web_response = build_grpc_web_reject_response(
+                    let grpc_web_response = boxed_build_grpc_web_reject_response(
                         &plugins,
                         &mut ctx,
                         grpc_web_response_content_type,
                         &reject,
                     )
                     .await;
-                    log_rejected_request(
+                    boxed_log_rejected_request(
                         &plugins,
                         &ctx,
                         reject.http_status.as_u16(),
@@ -28512,7 +29447,7 @@ async fn handle_proxy_request_inner(
                         return Ok(response);
                     }
                     Err(RequestBodyBufferError::DeadlineExceeded) => {
-                        let response = finalize_upload_deadline_rejection(
+                        let response = boxed_finalize_upload_deadline_rejection(
                             &plugins,
                             &mut ctx,
                             &state,
@@ -28632,7 +29567,7 @@ async fn handle_proxy_request_inner(
             };
             let status_code = plugin_reject.status_code;
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-            let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+            let reject = boxed_finalize_reject_response(
                 &plugins,
                 &mut ctx,
                 StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -28643,14 +29578,14 @@ async fn handle_proxy_request_inner(
             )
             .await;
             apply_grpc_reject_metadata(&mut ctx, &reject);
-            let grpc_web_response = build_grpc_web_reject_response(
+            let grpc_web_response = boxed_build_grpc_web_reject_response(
                 &plugins,
                 &mut ctx,
                 grpc_web_response_content_type,
                 &reject,
             )
             .await;
-            log_rejected_request(
+            boxed_log_rejected_request(
                 &plugins,
                 &ctx,
                 reject.http_status.as_u16(),
@@ -28711,7 +29646,7 @@ async fn handle_proxy_request_inner(
                 };
                 let status_code = plugin_reject.status_code;
                 plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                let reject = boxed_finalize_reject_response(
                     &plugins,
                     &mut ctx,
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -28722,14 +29657,14 @@ async fn handle_proxy_request_inner(
                 )
                 .await;
                 apply_grpc_reject_metadata(&mut ctx, &reject);
-                let grpc_web_response = build_grpc_web_reject_response(
+                let grpc_web_response = boxed_build_grpc_web_reject_response(
                     &plugins,
                     &mut ctx,
                     grpc_web_response_content_type,
                     &reject,
                 )
                 .await;
-                log_rejected_request(
+                boxed_log_rejected_request(
                     &plugins,
                     &ctx,
                     reject.http_status.as_u16(),
@@ -28776,7 +29711,7 @@ async fn handle_proxy_request_inner(
                 let status_code = plugin_reject.status_code;
                 plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 ctx.headers = tmp_headers;
-                let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                let reject = boxed_finalize_reject_response(
                     &plugins,
                     &mut ctx,
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -28787,14 +29722,14 @@ async fn handle_proxy_request_inner(
                 )
                 .await;
                 apply_grpc_reject_metadata(&mut ctx, &reject);
-                let grpc_web_response = build_grpc_web_reject_response(
+                let grpc_web_response = boxed_build_grpc_web_reject_response(
                     &plugins,
                     &mut ctx,
                     grpc_web_response_content_type,
                     &reject,
                 )
                 .await;
-                log_rejected_request(
+                boxed_log_rejected_request(
                     &plugins,
                     &ctx,
                     reject.http_status.as_u16(),
@@ -29155,7 +30090,7 @@ async fn handle_proxy_request_inner(
                 };
                 let status = StatusCode::from_u16(plugin_reject.status_code)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                let reject = boxed_finalize_reject_response(
                     &plugins,
                     &mut ctx,
                     status,
@@ -29166,14 +30101,14 @@ async fn handle_proxy_request_inner(
                 )
                 .await;
                 apply_grpc_reject_metadata(&mut ctx, &reject);
-                let grpc_web_response = build_grpc_web_reject_response(
+                let grpc_web_response = boxed_build_grpc_web_reject_response(
                     &plugins,
                     &mut ctx,
                     grpc_web_response_content_type,
                     &reject,
                 )
                 .await;
-                log_rejected_request_with_path(
+                boxed_log_rejected_request_with_path(
                     &plugins,
                     &ctx,
                     reject.http_status.as_u16(),
@@ -29388,7 +30323,7 @@ async fn handle_proxy_request_inner(
                             RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY.to_string(),
                             "true".to_string(),
                         );
-                        return Ok(finalize_upload_deadline_rejection(
+                        return Ok(boxed_finalize_upload_deadline_rejection(
                             &plugins,
                             &mut ctx,
                             &state,
@@ -29500,26 +30435,25 @@ async fn handle_proxy_request_inner(
                         };
                         let status = StatusCode::from_u16(reject.status_code)
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                        let normalized =
-                            finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
-                                &plugins,
-                                &mut ctx,
-                                status,
-                                reject.body.clone(),
-                                reject.headers,
-                                is_grpc_request,
-                                grpc_web_response_content_type.is_none(),
-                            )
-                            .await;
+                        let normalized = boxed_finalize_reject_response(
+                            &plugins,
+                            &mut ctx,
+                            status,
+                            reject.body.clone(),
+                            reject.headers,
+                            is_grpc_request,
+                            grpc_web_response_content_type.is_none(),
+                        )
+                        .await;
                         apply_grpc_reject_metadata(&mut ctx, &normalized);
-                        let grpc_web_response = build_grpc_web_reject_response(
+                        let grpc_web_response = boxed_build_grpc_web_reject_response(
                             &plugins,
                             &mut ctx,
                             grpc_web_response_content_type,
                             &normalized,
                         )
                         .await;
-                        log_rejected_request_with_path(
+                        boxed_log_rejected_request_with_path(
                             &plugins,
                             &ctx,
                             normalized.http_status.as_u16(),
@@ -29598,7 +30532,7 @@ async fn handle_proxy_request_inner(
                 };
                 let status = StatusCode::from_u16(reject.status_code)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                let normalized = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                let normalized = boxed_finalize_reject_response(
                     &plugins,
                     &mut ctx,
                     status,
@@ -29609,14 +30543,14 @@ async fn handle_proxy_request_inner(
                 )
                 .await;
                 apply_grpc_reject_metadata(&mut ctx, &normalized);
-                let grpc_web_response = build_grpc_web_reject_response(
+                let grpc_web_response = boxed_build_grpc_web_reject_response(
                     &plugins,
                     &mut ctx,
                     grpc_web_response_content_type,
                     &normalized,
                 )
                 .await;
-                log_rejected_request_with_path(
+                boxed_log_rejected_request_with_path(
                     &plugins,
                     &ctx,
                     normalized.http_status.as_u16(),
@@ -29687,7 +30621,7 @@ async fn handle_proxy_request_inner(
                 // Use `original_request_path` so the log records the path the
                 // client actually requested, not the VirtualService-rewritten
                 // backend path stored in `ctx.path` after the rewrite above.
-                log_rejected_request_with_path(
+                boxed_log_rejected_request_with_path(
                     &plugins,
                     &ctx,
                     reject.http_status.as_u16(),
@@ -29749,7 +30683,7 @@ async fn handle_proxy_request_inner(
                         cb_target_key.as_deref(),
                         cb_is_half_open_probe,
                     );
-                    return Ok(handle_backend_admission_rejection(
+                    return Ok(boxed_handle_backend_admission_rejection(
                         rejection,
                         &plugins,
                         &mut ctx,
@@ -29838,7 +30772,7 @@ async fn handle_proxy_request_inner(
                             cb_is_half_open_probe,
                         );
                         drop(preacquired_backend_admission.take_if_acquired());
-                        let response = finalize_upload_deadline_rejection(
+                        let response = boxed_finalize_upload_deadline_rejection(
                             &plugins,
                             &mut ctx,
                             &state,
@@ -29954,26 +30888,25 @@ async fn handle_proxy_request_inner(
                         };
                         let status = StatusCode::from_u16(reject.status_code)
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                        let normalized =
-                            finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
-                                &plugins,
-                                &mut ctx,
-                                status,
-                                reject.body.clone(),
-                                reject.headers,
-                                is_grpc_request,
-                                grpc_web_response_content_type.is_none(),
-                            )
-                            .await;
+                        let normalized = boxed_finalize_reject_response(
+                            &plugins,
+                            &mut ctx,
+                            status,
+                            reject.body.clone(),
+                            reject.headers,
+                            is_grpc_request,
+                            grpc_web_response_content_type.is_none(),
+                        )
+                        .await;
                         apply_grpc_reject_metadata(&mut ctx, &normalized);
-                        let grpc_web_response = build_grpc_web_reject_response(
+                        let grpc_web_response = boxed_build_grpc_web_reject_response(
                             &plugins,
                             &mut ctx,
                             grpc_web_response_content_type,
                             &normalized,
                         )
                         .await;
-                        log_rejected_request_with_path(
+                        boxed_log_rejected_request_with_path(
                             &plugins,
                             &ctx,
                             normalized.http_status.as_u16(),
@@ -30561,6 +31494,16 @@ async fn handle_proxy_request_inner(
         // only when a retry policy exists so the clone is never paid for
         // otherwise.
         let mut grpc_replay_headers = hyper::HeaderMap::new();
+        // Authorization lifetime for the native-gRPC / gRPC-Web upload (#3815).
+        // A client-streaming RPC makes progress on every poll, so neither the
+        // client `grpc-timeout` (often absent) nor the operator stall timeout
+        // bounds it; this plan does. The buffered arms apply it to their
+        // bounded collect; the fully-streamed arm hands it to the gateway-owned
+        // upload pump, which keeps bidirectional streaming intact.
+        let grpc_buffered_upload_auth_deadline = request_upload_auth_deadline(
+            Some(&ctx),
+            state.env_config.authenticated_stream_max_lifetime_seconds,
+        );
         let (mut grpc_result, grpc_body_bytes) = if grpc_needs_request_body_hooks {
             // Split path: collect body → run plugin hooks → dispatch
             let (grpc_method, grpc_headers, grpc_req_body) = match client_request_body {
@@ -30570,6 +31513,7 @@ async fn handle_proxy_request_inner(
                         effective_max_grpc_recv_size_bytes,
                         proxy.backend_read_timeout_ms,
                         ctx.grpc_deadline_at(),
+                        grpc_buffered_upload_auth_deadline.as_ref(),
                     )
                     .await
                     {
@@ -30599,7 +31543,7 @@ async fn handle_proxy_request_inner(
                                 grpc_cb_probe_slot,
                             );
                             drop(preacquired_backend_admission.take_if_acquired());
-                            return Ok(finalize_upload_deadline_rejection(
+                            return Ok(boxed_finalize_upload_deadline_rejection(
                                 &plugins,
                                 &mut ctx,
                                 &state,
@@ -30608,6 +31552,39 @@ async fn handle_proxy_request_inner(
                                 plugin_execution_ns,
                                 Some(&original_request_path),
                                 grpc_web_response_content_type,
+                            )
+                            .await);
+                        }
+                        Err(grpc_proxy::GrpcRequestBodyCollectError::AuthorizationExpired(
+                            termination,
+                        )) => {
+                            // Same cleanup ordering as the RPC-deadline arm: the
+                            // HALF_OPEN probe and any body-phase preacquisition
+                            // are released neutrally before the rejection
+                            // pipeline, which may await external sinks. No
+                            // backend was dialed, so this is health-neutral.
+                            grpc_probe_guard.disarm();
+                            release_circuit_breaker_probe_on_admission_reject(
+                                &state,
+                                &proxy,
+                                cb_target_key.as_deref(),
+                                grpc_cb_probe_slot,
+                            );
+                            drop(preacquired_backend_admission.take_if_acquired());
+                            // Constructed out of line and boxed so this cold arm
+                            // is not a permanent frame slot in the generic
+                            // request future; see
+                            // `boxed_finalize_authorization_expired_rejection`.
+                            return Ok(boxed_finalize_authorization_expired_rejection(
+                                &plugins,
+                                &mut ctx,
+                                &state,
+                                start_time,
+                                "authorization_expired_buffered_grpc_upload",
+                                plugin_execution_ns,
+                                Some(&original_request_path),
+                                grpc_web_response_content_type,
+                                termination,
                             )
                             .await);
                         }
@@ -30785,26 +31762,25 @@ async fn handle_proxy_request_inner(
                     };
                     let status = StatusCode::from_u16(reject.status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    let normalized =
-                        finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
-                            &plugins,
-                            &mut ctx,
-                            status,
-                            reject.body.clone(),
-                            reject.headers,
-                            true,
-                            grpc_web_response_content_type.is_none(),
-                        )
-                        .await;
+                    let normalized = boxed_finalize_reject_response(
+                        &plugins,
+                        &mut ctx,
+                        status,
+                        reject.body.clone(),
+                        reject.headers,
+                        true,
+                        grpc_web_response_content_type.is_none(),
+                    )
+                    .await;
                     apply_grpc_reject_metadata(&mut ctx, &normalized);
-                    let grpc_web_response = build_grpc_web_reject_response(
+                    let grpc_web_response = boxed_build_grpc_web_reject_response(
                         &plugins,
                         &mut ctx,
                         grpc_web_response_content_type,
                         &normalized,
                     )
                     .await;
-                    log_rejected_request_with_path(
+                    boxed_log_rejected_request_with_path(
                         &plugins,
                         &ctx,
                         normalized.http_status.as_u16(),
@@ -30858,7 +31834,7 @@ async fn handle_proxy_request_inner(
                         cb_target_key.as_deref(),
                         grpc_cb_probe_slot,
                     );
-                    return Ok(handle_backend_admission_rejection(
+                    return Ok(boxed_handle_backend_admission_rejection(
                         rejection,
                         &plugins,
                         &mut ctx,
@@ -31026,7 +32002,7 @@ async fn handle_proxy_request_inner(
                             cb_target_key.as_deref(),
                             grpc_cb_probe_slot,
                         );
-                        return Ok(handle_backend_admission_rejection(
+                        return Ok(boxed_handle_backend_admission_rejection(
                             rejection,
                             &plugins,
                             &mut ctx,
@@ -31062,6 +32038,10 @@ async fn handle_proxy_request_inner(
                     ctx.grpc_deadline_at(),
                     &mut held_frontend_grpc_upload,
                     Some(Arc::clone(&ctx.grpc_request_messages_observed)),
+                    // Same absolute plan the buffered gRPC arms use (#3815);
+                    // the fully-streamed upload gets the gateway-owned pump
+                    // instead of a bounded collect.
+                    grpc_buffered_upload_auth_deadline.as_ref(),
                 )
                 .await;
                 (result, Bytes::new())
@@ -31077,6 +32057,7 @@ async fn handle_proxy_request_inner(
                             effective_max_grpc_recv_size_bytes,
                             proxy.backend_read_timeout_ms,
                             ctx.grpc_deadline_at(),
+                            grpc_buffered_upload_auth_deadline.as_ref(),
                         )
                         .await
                     }
@@ -31139,7 +32120,7 @@ async fn handle_proxy_request_inner(
                                         cb_target_key.as_deref(),
                                         grpc_cb_probe_slot,
                                     );
-                                    return Ok(handle_backend_admission_rejection(
+                                    return Ok(boxed_handle_backend_admission_rejection(
                                         rejection,
                                         &plugins,
                                         &mut ctx,
@@ -31203,7 +32184,7 @@ async fn handle_proxy_request_inner(
                             grpc_cb_probe_slot,
                         );
                         drop(preacquired_backend_admission.take_if_acquired());
-                        return Ok(finalize_upload_deadline_rejection(
+                        return Ok(boxed_finalize_upload_deadline_rejection(
                             &plugins,
                             &mut ctx,
                             &state,
@@ -31212,6 +32193,32 @@ async fn handle_proxy_request_inner(
                             plugin_execution_ns,
                             Some(&original_request_path),
                             grpc_web_response_content_type,
+                        )
+                        .await);
+                    }
+                    Err(grpc_proxy::GrpcRequestBodyCollectError::AuthorizationExpired(
+                        termination,
+                    )) => {
+                        grpc_probe_guard.disarm();
+                        release_circuit_breaker_probe_on_admission_reject(
+                            &state,
+                            &proxy,
+                            cb_target_key.as_deref(),
+                            grpc_cb_probe_slot,
+                        );
+                        drop(preacquired_backend_admission.take_if_acquired());
+                        // Boxed out of line for the same stack-budget reason as
+                        // the split-path arm above.
+                        return Ok(boxed_finalize_authorization_expired_rejection(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            "authorization_expired_buffered_grpc_upload",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                            grpc_web_response_content_type,
+                            termination,
                         )
                         .await);
                     }
@@ -31606,7 +32613,7 @@ async fn handle_proxy_request_inner(
                             grpc_current_cb_key.as_deref(),
                             grpc_cb_probe_slot,
                         );
-                        return Ok(handle_backend_admission_rejection(
+                        return Ok(boxed_handle_backend_admission_rejection(
                             rejection,
                             &plugins,
                             &mut ctx,
@@ -32067,7 +33074,7 @@ async fn handle_proxy_request_inner(
                         // Use `original_request_path` so the log records the
                         // path the client actually requested, not the
                         // VirtualService-rewritten backend path in `ctx.path`.
-                        log_rejected_request_with_path(
+                        boxed_log_rejected_request_with_path(
                             &plugins,
                             &ctx,
                             normalized.http_status.as_u16(),
@@ -32552,6 +33559,26 @@ async fn handle_proxy_request_inner(
                         &ctx.grpc_response_messages_observed,
                     ));
                 }
+                // Authorization lifetime (#3815) for native gRPC server-,
+                // client-, and bidirectional streaming. Bounded by the EARLIEST
+                // of the accepted credential's authoritative deadline and the
+                // finite authenticated-stream maximum, and stacked outside the
+                // client `grpc-timeout` deadline already installed inside the
+                // streaming body above, so whichever is earlier wins without a
+                // second completion. Attached before the gRPC-Web adapter so a
+                // translated stream terminates with the equivalent bounded
+                // trailer frame rather than native trailers.
+                //
+                // Installed out of line so the `ProxyBody` moves are not
+                // permanent frame slots here; see
+                // `install_response_authorization_deadline`.
+                body = install_response_authorization_deadline(
+                    body,
+                    &ctx,
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
+                    grpc_web_streaming_content_type,
+                    true,
+                );
                 if let Some(content_type) = grpc_web_streaming_content_type {
                     body = body.into_grpc_web_streaming(
                         content_type,
@@ -33872,7 +34899,9 @@ async fn handle_proxy_request_inner(
     // backend served this response, so the sticky-affinity reissue below must
     // not pin the client to it.
     let mut sticky_dispatch_refused = false;
-    let (backend_resp, final_cb_target_key, final_upstream_target) = if let Some(retry_config) =
+    // `mut`: the pre-commitment authorization terminal below neutralizes the
+    // health inputs of a dispatch the gateway itself cancelled (#3815).
+    let (mut backend_resp, final_cb_target_key, final_upstream_target) = if let Some(retry_config) =
         retry_config
     {
         let mut attempt = 0u32;
@@ -33963,7 +34992,7 @@ async fn handle_proxy_request_inner(
                 // direct gRPC branch passes `true` unconditionally to
                 // `normalize_reject_response`, which renders a Trailers-Only
                 // gRPC reject instead of HTTP/JSON.
-                return Ok(handle_backend_admission_rejection(
+                return Ok(boxed_handle_backend_admission_rejection(
                     rejection,
                     &plugins,
                     &mut ctx,
@@ -34444,7 +35473,7 @@ async fn handle_proxy_request_inner(
                     );
                     // Codex r2-2 finding 3: keep the gRPC rejection shape for
                     // gRPC-flavored requests (see the initial-dispatch arm).
-                    return Ok(handle_backend_admission_rejection(
+                    return Ok(boxed_handle_backend_admission_rejection(
                         rejection,
                         &plugins,
                         &mut ctx,
@@ -34662,7 +35691,7 @@ async fn handle_proxy_request_inner(
                 );
                 // Codex r2-2 finding 3: keep the gRPC rejection shape for
                 // gRPC-flavored requests (see the initial-dispatch arm).
-                return Ok(handle_backend_admission_rejection(
+                return Ok(boxed_handle_backend_admission_rejection(
                     rejection,
                     &plugins,
                     &mut ctx,
@@ -34701,6 +35730,43 @@ async fn handle_proxy_request_inner(
     let mut response_status = backend_resp.status_code;
     let mut response_body = backend_resp.body;
     let mut response_headers = backend_resp.headers;
+    // Pre-commitment authorization terminal (#3815). The H1/H2 request-upload
+    // seam bounds a streaming/bidirectional upload by the accepted credential's
+    // absolute deadline; when it fires it errors the upload, which resets the
+    // backend stream and aborts the dispatch. That aborted dispatch surfaces
+    // here as an ordinary transport failure, and NOTHING has been written
+    // downstream yet — so this is the last point at which the fixed
+    // pre-commitment terminal is still possible, and the first at which every
+    // H1/H2 dispatch path (reqwest, direct-H2, mesh mTLS, HBONE, Unix socket)
+    // has converged.
+    //
+    // The whole outcome is health-neutral: the rewritten status is the one
+    // `recorded_backend_status` feeds to the circuit breaker, passive health,
+    // and the adaptive limiter, and the connection-error/error-class inputs are
+    // neutralized alongside it, so the gateway's own security decision can
+    // never be charged to the upstream.
+    //
+    // Two ways to get here: the upload seam already latched a termination, or
+    // the credential elapsed while the backend was still withholding its
+    // response head (a request with no body to bound). Both are pre-commitment,
+    // so both take the same fixed terminal; the second case is the response-head
+    // race, resolved at the point the head actually becomes available.
+    //
+    // Decided, recorded, and applied out of line so this cold terminal is not a
+    // permanent frame slot in the generic request future; see
+    // `apply_precommit_authorization_terminal`.
+    let precommit_authorization_terminal = apply_precommit_authorization_terminal(
+        &mut ctx,
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+        request_uses_grpc_content_type,
+        &mut response_status,
+        &mut response_headers,
+        &mut response_body,
+    );
+    if precommit_authorization_terminal.is_some() {
+        backend_resp.connection_error = false;
+        backend_resp.error_class = Some(retry::ErrorClass::ClientDisconnect);
+    }
     // Authoritative gRPC response messages for a buffered backend body are
     // counted here, from the backend's native length-prefixed representation and
     // before the response-body pipeline can re-frame it (a gRPC-Web transform
@@ -35046,7 +36112,7 @@ async fn handle_proxy_request_inner(
     let backend_admission_connection_error = backend_resp.connection_error;
     let backend_admission_error_class = backend_error_class;
     let backend_admission_elapsed = final_backend_dispatch_elapsed;
-    let is_streaming_response = matches!(
+    let mut is_streaming_response = matches!(
         &response_body,
         ResponseBody::Streaming { .. }
             | ResponseBody::StreamingH2(_)
@@ -35225,9 +36291,9 @@ async fn handle_proxy_request_inner(
         let phase_start = Instant::now();
         let mut response_body_reject = None;
         for plugin in plugins.iter() {
-            let deadline = ctx.grpc_deadline_at();
-            let result = crate::plugins::await_request_plugin_deadline_with_provenance(
-                deadline,
+            let bound = ctx.precommit_response_phase_bound();
+            let result = crate::plugins::await_precommit_response_phase(
+                bound,
                 plugin.on_response_body(&mut ctx, response_status, &mut response_headers, data),
             )
             .await
@@ -35386,9 +36452,9 @@ async fn handle_proxy_request_inner(
             if plugin.enforces_final_client_visible_response_body(&ctx) {
                 continue;
             }
-            let deadline = ctx.grpc_deadline_at();
-            let result = crate::plugins::await_request_plugin_deadline_with_provenance(
-                deadline,
+            let bound = ctx.precommit_response_phase_bound();
+            let result = crate::plugins::await_precommit_response_phase(
+                bound,
                 plugin.on_final_response_body(&mut ctx, response_status, &response_headers, data),
             )
             .await
@@ -35482,6 +36548,65 @@ async fn handle_proxy_request_inner(
         .await;
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
+
+    // ── Pre-log authorization gate (#3815) ──────────────────────────────────
+    //
+    // The earlier pre-commitment check ran where backend dispatch converged.
+    // Every awaited response phase since then — `after_proxy`, the buffered
+    // normalize / inspect / transform hooks, the final client-visible body and
+    // header policies, and the response-committed hook — is now bounded by the
+    // same absolute plan, but each may legitimately consume time right up to
+    // it, and a buffered response collection may itself have ended at the
+    // deadline.
+    //
+    // This is the AUTHORITATIVE final authorization decision for this request.
+    // It runs BEFORE the transaction summary is built, before `body_will_stream`
+    // is computed, and before any terminal logging, so an already-expired
+    // credential cannot be logged, deferred, or committed as a
+    // protected/streaming response. Nothing after it awaits on a request that
+    // carries an authorization plan (see the buffered terminal arm below), so
+    // there is no window between this decision and the client-visible response.
+    // Three failures it closes:
+    //
+    // * a PROTECTED response head committed on a credential that expired while
+    //   the response phases were running;
+    // * a STREAMING head committed and then immediately terminal-errored by the
+    //   body adapter, when the fixed pre-commitment terminal — a clean `401`, or
+    //   trailers-only `grpc-status: 16` — was still available;
+    // * an audit record that disagrees with the client-visible security
+    //   decision. Because the gate latches the bounded termination class into
+    //   `ctx.metadata` and rewrites the status/body HERE, the single terminal
+    //   summary built below from post-gate state carries the terminal status,
+    //   the buffered (non-streamed) classification, and the bounded
+    //   `authorization.termination_reason`.
+    //
+    // Idempotent: when the earlier gate already replaced the response, the
+    // latch is already set and the same fixed terminal is re-selected. An
+    // unauthenticated request has no plan and is untouched.
+    //
+    // Same out-of-line application as the earlier gate.
+    let final_precommit_authorization_terminal = apply_precommit_authorization_terminal(
+        &mut ctx,
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+        request_uses_grpc_content_type,
+        &mut response_status,
+        &mut response_headers,
+        &mut response_body,
+    );
+    if final_precommit_authorization_terminal.is_some() {
+        // The terminal is fully buffered, so the summary and the latency
+        // derivation below must not describe this as a streamed response.
+        is_streaming_response = false;
+    }
+    // Whether the gate above could ever have fired for this request. The
+    // buffered terminal-log arm below uses this to decide whether it may await
+    // a logging plugin; the predicate is the gate's OWN, so the two can never
+    // disagree about which requests carry an authorization decision to protect.
+    let has_authorization_plan = crate::proxy::auth_lifetime::effective_request_auth_deadline(
+        &ctx,
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    )
+    .is_some();
 
     let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
     let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
@@ -35643,8 +36768,41 @@ async fn handle_proxy_request_inner(
                     ),
                 )
             } else {
-                crate::plugins::log_with_mirror_before_buffered_response(&plugins, summary, &ctx)
+                // ── Buffered commitment / audit boundary (#3815) ─────────────
+                //
+                // The pre-log gate above is the authoritative authorization
+                // decision for this response, and this arm must not reopen a
+                // window after it.
+                //
+                // `summary` was built from POST-GATE state, so it is the one
+                // terminal summary of this exchange: the status the client will
+                // see, the buffered (non-streamed) classification, and — when
+                // the gate fired — the bounded `credential_expired` /
+                // max-lifetime class the gate latched into the metadata.
+                //
+                // An authenticated request therefore does NOT await terminal
+                // logging. Awaiting it would let the credential expire while one
+                // logging plugin blocks, after earlier plugins had already
+                // recorded the still-protected outcome; a later gate could
+                // repair the response, but nothing can retract an audit record
+                // that has already been emitted. Instead the single summary is
+                // handed to the same bounded observability-delivery cleanup the
+                // client-deadline path uses, which delivers it to every
+                // applicable plugin, in configured order, exactly once, inside
+                // one finite-budget task. Nothing is awaited here, so no time
+                // passes between the gate and the client-visible response.
+                //
+                // A request with NO authorization plan cannot expire here, so it
+                // keeps the historical sequential awaited contract byte for
+                // byte.
+                if has_authorization_plan {
+                    crate::plugins::spawn_bounded_terminal_summary_log(&plugins, summary, &ctx);
+                } else {
+                    crate::plugins::log_with_mirror_before_buffered_response(
+                        &plugins, summary, &ctx,
+                    )
                     .await;
+                }
                 None
             }
         } else {
@@ -36408,6 +37566,29 @@ async fn handle_proxy_request_inner(
     {
         body = body.with_grpc_message_counter(Arc::clone(&ctx.grpc_response_messages_observed));
     }
+    // Authorization lifetime (#3815). Bound this admitted stream by the
+    // EARLIEST of the accepted credential's authoritative deadline and the
+    // finite `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` fallback. This
+    // is the shared H1/H2/H3-downstream funnel, so generic chunked responses,
+    // SSE, translated gRPC-Web streams, and the inspected/tracked streaming
+    // bodies all inherit it from one place.
+    //
+    // Attached AFTER the client `grpc-timeout` wrapper and BEFORE the gRPC-Web
+    // adapter, exactly like that wrapper: whichever deadline is earlier fires
+    // first, cancels the inner body, and marks the stream done, so the two can
+    // never both complete. Unauthenticated requests get `None` here and are
+    // completely unaffected. A buffered body is already fully committed and is
+    // returned unchanged.
+    //
+    // Installed out of line for the same stack-budget reason as the native-gRPC
+    // funnel above; see `install_response_authorization_deadline`.
+    body = install_response_authorization_deadline(
+        body,
+        &ctx,
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+        grpc_web_response_content_type,
+        flavor == HttpFlavor::Grpc,
+    );
     let body = if let Some((content_type, initial_terminal_metadata)) = grpc_web_streaming_adapter {
         body.into_grpc_web_streaming(
             &content_type,
@@ -37585,14 +38766,26 @@ pub(crate) async fn proxy_to_backend_retry(
 
     let mut reqwest_backend_guard =
         Some(crate::runtime_metrics::global_ref().reqwest_backend_request_guard());
-    let send_result = match crate::plugins::await_grpc_deadline(
+    // Authorization lifetime for this retry attempt's response-header wait
+    // (#3815). The plan is absolute and receipt-anchored, so a retry cannot
+    // re-arm it; a later attempt simply gets less remaining lifetime.
+    let send_auth_deadline = request_upload_auth_deadline(
+        Some(request_ctx),
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    );
+    let send_bound = compose_dispatch_phase_auth_bound(
         request_ctx.grpc_deadline_at(),
-        req_builder.send(),
-    )
-    .await
-    {
+        send_auth_deadline.as_ref(),
+    );
+    let send_future = crate::plugins::await_deadline_first(send_bound.at, req_builder.send());
+    let send_result = match send_future.await {
         Ok(result) => result,
         Err(()) => {
+            if dispatch_phase_authorization_expiry(send_bound, send_auth_deadline.as_ref())
+                .is_some()
+            {
+                return authorization_expired_dispatch_placeholder(resolved_ip);
+            }
             return client_grpc_deadline_exceeded_response_for_request(
                 request_ctx,
                 headers,
@@ -37687,8 +38880,14 @@ pub(crate) async fn proxy_to_backend_retry(
                     let retained_ceiling = response_buffer_budget::buffered_response_body_ceiling(
                         effective_max_response_body_size_bytes,
                     );
-                    let collected = match crate::plugins::await_grpc_deadline(
+                    // Bounded by the admitted stream's authorization lifetime
+                    // as well as the client RPC deadline (#3815): a retained
+                    // collect has no downstream body adapter to fall back on,
+                    // and its only other bound is the PER-FRAME
+                    // `backend_read_timeout_ms`, which `0` disables outright.
+                    let collected = match collect_response_under_authorization(
                         request_ctx.grpc_deadline_at(),
+                        send_auth_deadline.as_ref(),
                         eager_collect_charged_backend_body(
                             response,
                             retained_ceiling,
@@ -37698,12 +38897,18 @@ pub(crate) async fn proxy_to_backend_retry(
                     .await
                     {
                         Ok(result) => result,
-                        Err(()) => {
+                        Err(ResponseCollectBound::RpcDeadline) => {
                             return client_grpc_deadline_exceeded_response_for_request(
                                 request_ctx,
                                 headers,
                                 resolved_ip,
                             );
+                        }
+                        // Health-neutral and already latched/counted once. The
+                        // partially collected buffer and its charged budget
+                        // reservation drop with the cancelled future.
+                        Err(ResponseCollectBound::AuthorizationExpired) => {
+                            return authorization_expired_dispatch_placeholder(resolved_ip);
                         }
                     };
                     buffered_backend_response_from_eager_collect(
@@ -37741,19 +38946,23 @@ pub(crate) async fn proxy_to_backend_retry(
                     let max_size = response_buffer_budget::buffered_response_body_ceiling(
                         effective_max_response_body_size_bytes,
                     );
-                    let collected = match crate::plugins::await_grpc_deadline(
+                    let collected = match collect_response_under_authorization(
                         request_ctx.grpc_deadline_at(),
+                        send_auth_deadline.as_ref(),
                         collect_response_with_limit(response, max_size),
                     )
                     .await
                     {
                         Ok(result) => result,
-                        Err(()) => {
+                        Err(ResponseCollectBound::RpcDeadline) => {
                             return client_grpc_deadline_exceeded_response_for_request(
                                 request_ctx,
                                 headers,
                                 resolved_ip,
                             );
+                        }
+                        Err(ResponseCollectBound::AuthorizationExpired) => {
+                            return authorization_expired_dispatch_placeholder(resolved_ip);
                         }
                     };
                     match collected {
@@ -37951,8 +39160,12 @@ async fn proxy_to_backend_mesh_retry(
     };
     let route_request_body_limit = request_ctx.route_request_body_limit();
     let route_response_body_limit = request_ctx.route_response_body_limit();
-    let (response, _, request_body_exceeded) = if dispatch_hbone {
-        proxy_to_backend_hbone(
+    // Constructed out of line and boxed — see `boxed_proxy_to_backend_hbone`
+    // / `boxed_proxy_to_backend_mesh_mtls`. A `mesh.unix_socket` target is
+    // refused before any retry dispatch, so the Sidecar arm never carries a
+    // Unix path here.
+    let mesh_dispatch = if dispatch_hbone {
+        boxed_proxy_to_backend_hbone(
             state,
             proxy,
             backend_url,
@@ -37972,9 +39185,8 @@ async fn proxy_to_backend_mesh_retry(
             route_request_body_limit,
             route_response_body_limit,
         )
-        .await
     } else {
-        proxy_to_backend_mesh_mtls(
+        boxed_proxy_to_backend_mesh_mtls(
             state,
             proxy,
             backend_url,
@@ -37993,13 +39205,10 @@ async fn proxy_to_backend_mesh_retry(
             ctx_bytes_sent_observed,
             route_request_body_limit,
             route_response_body_limit,
-            // Mesh transport only: this helper is reached exclusively for
-            // `mesh.hbone`/`mesh.mtls` targets. A `mesh.unix_socket` target is
-            // refused before any retry dispatch.
             None,
         )
-        .await
     };
+    let (response, _, request_body_exceeded) = mesh_dispatch.await;
     (
         response,
         request_body_exceeded,
@@ -38052,18 +39261,226 @@ type MeshRetryDispatchOutcome = (
 type BoxedMeshRetryDispatchFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = MeshRetryDispatchOutcome> + Send + 'a>>;
 
-/// The H3 plain mesh dispatch future, constructed out of line and returned
-/// boxed so its shared HBONE / Sidecar mesh-mTLS retry future is not an inline
-/// frame slot in the H3 bridge.
+/// One HBONE / Sidecar mesh-mTLS child future, heap-allocated so it is not a
+/// frame slot in [`proxy_to_backend_mesh_retry`]. See
+/// [`boxed_proxy_to_backend_hbone`].
+type BoxedMeshTransportDispatchFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = BackendDispatchOutcome> + Send + 'a>>;
+
+/// The HBONE dispatch future, constructed out of line and returned boxed so it
+/// is not an inline frame slot in [`proxy_to_backend_mesh_retry`].
 ///
 /// This is the same stack-budget invariant as [`boxed_proxy_to_backend_unix`].
-/// In an unoptimized hosted functional-test build, materializing
-/// `proxy_to_backend_mesh_retry` inside `proxy_h3_plain_http_mesh_buffered`
-/// nests both large mesh transport futures beneath the already-large H3 plain
-/// bridge poll frame. A healthy transport reaches that deep poll chain and can
-/// exhaust Tokio's worker stack; early Unix and identity refusals return before
-/// it and are unaffected. Building the future in this `#[inline(never)]`
-/// factory lets the H3 helper retain only a boxed pointer. The allocation is
+/// `proxy_to_backend_mesh_retry` is the shared HBONE / Sidecar retry helper:
+/// H1/H2 awaits it directly, and the H3 plain bridge awaits it through
+/// [`boxed_proxy_to_backend_mesh_retry`]. In an unoptimized hosted
+/// functional-test build (`opt-level = 0`), awaiting `proxy_to_backend_hbone`
+/// and `proxy_to_backend_mesh_mtls` inline in that helper materializes both
+/// large transport futures as poll/construction slots in one coroutine. A
+/// healthy H3 plain mesh attempt then stacks those slots under the already-large
+/// H3 request / `dispatch_plain` frames and overflows a Tokio worker;
+/// early Unix and identity refusals return before it and are unaffected.
+/// Building each child in a separate `#[inline(never)]` factory that RETURNS
+/// before anything is awaited keeps the helper's frame to a boxed pointer.
+/// The allocation is confined to a mesh retry that has already selected HBONE.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_proxy_to_backend_hbone<'a>(
+    state: &'a ProxyState,
+    proxy: &'a Proxy,
+    backend_url: &'a str,
+    method: &'a str,
+    headers: &'a HashMap<String, String>,
+    client_request_body: MeshClientRequestBody,
+    upstream_target: Option<&'a UpstreamTarget>,
+    plugins: &'a [Arc<dyn Plugin>],
+    source_identity_ctx: Option<&'a RequestContext>,
+    ctx: Option<&'a RequestContext>,
+    stream_response: bool,
+    client_ip: &'a str,
+    xff_append_ip: &'a str,
+    request_is_secure: bool,
+    resolved_ip: Option<String>,
+    ctx_bytes_sent_observed: &'a Arc<std::sync::atomic::AtomicU64>,
+    route_request_body_limit: Option<usize>,
+    route_response_body_limit: Option<usize>,
+) -> BoxedMeshTransportDispatchFuture<'a> {
+    Box::pin(proxy_to_backend_hbone(
+        state,
+        proxy,
+        backend_url,
+        method,
+        headers,
+        client_request_body,
+        upstream_target,
+        plugins,
+        source_identity_ctx,
+        ctx,
+        stream_response,
+        client_ip,
+        xff_append_ip,
+        request_is_secure,
+        resolved_ip,
+        ctx_bytes_sent_observed,
+        route_request_body_limit,
+        route_response_body_limit,
+    ))
+}
+
+/// The Sidecar mesh-mTLS dispatch future, constructed out of line and returned
+/// boxed so it is not an inline frame slot in [`proxy_to_backend_mesh_retry`].
+///
+/// Same stack-budget invariant as [`boxed_proxy_to_backend_hbone`], for the
+/// other child of the shared retry helper. This is the non-Unix Sidecar arm;
+/// Unix h2c ingress keeps [`boxed_proxy_to_backend_unix_h2c`]. The allocation
+/// is confined to a mesh retry that has already selected Sidecar mTLS.
+///
+/// A bare `Box::pin(proxy_to_backend_mesh_mtls(..))` still materializes the
+/// Sidecar future as a stack temporary in this factory. Under the H3 plain
+/// bridge that factory already sits on a deep `opt-level = 0` poll stack, so
+/// constructing the concrete Sidecar state machine there overflows a Tokio
+/// worker before the first await. The thin `async move` trampoline is what
+/// this factory boxes: its frame is only the captured arguments. The Sidecar
+/// future is built later, when that heap-resident trampoline is polled, after
+/// the H3 helper frames have returned through their boxed seams. Handshake
+/// and post-ready dispatch are themselves boxed out of
+/// [`proxy_to_backend_mesh_mtls`] so that poll frame stays comparable to
+/// HBONE.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_proxy_to_backend_mesh_mtls<'a>(
+    state: &'a ProxyState,
+    proxy: &'a Proxy,
+    backend_url: &'a str,
+    method: &'a str,
+    headers: &'a HashMap<String, String>,
+    client_request_body: MeshClientRequestBody,
+    upstream_target: Option<&'a UpstreamTarget>,
+    plugins: &'a [Arc<dyn Plugin>],
+    request_ctx: &'a RequestContext,
+    response_decision_ctx: Option<&'a RequestContext>,
+    stream_response: bool,
+    client_ip: &'a str,
+    xff_append_ip: &'a str,
+    request_is_secure: bool,
+    resolved_ip: Option<String>,
+    ctx_bytes_sent_observed: &'a Arc<std::sync::atomic::AtomicU64>,
+    route_request_body_limit: Option<usize>,
+    route_response_body_limit: Option<usize>,
+    unix_socket_path: Option<&'a str>,
+) -> BoxedMeshTransportDispatchFuture<'a> {
+    Box::pin(async move {
+        proxy_to_backend_mesh_mtls(
+            state,
+            proxy,
+            backend_url,
+            method,
+            headers,
+            client_request_body,
+            upstream_target,
+            plugins,
+            request_ctx,
+            response_decision_ctx,
+            stream_response,
+            client_ip,
+            xff_append_ip,
+            request_is_secure,
+            resolved_ip,
+            ctx_bytes_sent_observed,
+            route_request_body_limit,
+            route_response_body_limit,
+            unix_socket_path,
+        )
+        .await
+    })
+}
+
+type BoxedMeshMtlsGetSenderFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<mesh_mtls_pool::MeshMtlsSender, hbone_pool::HbonePoolError>,
+            > + Send
+            + 'a,
+    >,
+>;
+
+/// Sidecar pool checkout, constructed out of line so the TLS + hyper HTTP/2
+/// handshake is not a frame slot in [`proxy_to_backend_mesh_mtls`].
+///
+/// Unix h2c already boxed `checkout_h2c` for this reason. The mTLS arm was
+/// still awaiting `get_sender` inline, so an unoptimized H3 plain Sidecar
+/// attempt stacked that handshake under `handle_h3_request` /
+/// `dispatch_plain` and overflowed. Building it in this `#[inline(never)]`
+/// factory keeps the large temporary off the Sidecar poll frame.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_mesh_mtls_pool_get_sender<'a>(
+    state: &'a ProxyState,
+    proxy: &'a Proxy,
+    target_host: &'a str,
+    app_port: u16,
+    app_policy_port: u16,
+    mtls_port: u16,
+    expected_peer: Option<&'a crate::identity::SpiffeId>,
+    expected_trust_domain: Option<&'a crate::identity::spiffe::TrustDomain>,
+    sni_override: Option<&'a str>,
+) -> BoxedMeshMtlsGetSenderFuture<'a> {
+    Box::pin(state.mesh_mtls_pool.get_sender(
+        proxy,
+        target_host,
+        app_port,
+        app_policy_port,
+        mtls_port,
+        expected_peer,
+        expected_trust_domain,
+        sni_override,
+    ))
+}
+
+type BoxedUnixH2cCheckoutFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<mesh_mtls_pool::MeshMtlsSender, unix_backend::UnixBackendError>,
+            > + Send
+            + 'a,
+    >,
+>;
+
+/// Unix h2c checkout, constructed out of line so `connect(2)` + h2c handshake
+/// is not a frame slot in [`proxy_to_backend_mesh_mtls`].
+///
+/// `Box::pin(checkout_h2c(..))` written in that coroutine still materializes
+/// the handshake as a temporary in its `opt-level = 0` poll frame — charged
+/// to Sidecar mTLS attempts that never take the Unix branch. This factory
+/// keeps that alloca in a never-inlined leaf.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_unix_backend_checkout_h2c<'a>(
+    state: &'a ProxyState,
+    proxy: &'a Proxy,
+    socket_path: &'a str,
+    connect_timeout_ms: u64,
+    allowed_roots: &'a [String],
+    allowed_uids: &'a [u32],
+) -> BoxedUnixH2cCheckoutFuture<'a> {
+    Box::pin(state.unix_backend_pool.checkout_h2c(
+        proxy,
+        socket_path,
+        connect_timeout_ms,
+        allowed_roots,
+        allowed_uids,
+    ))
+}
+
+/// The shared mesh-retry future, constructed out of line and returned boxed so
+/// it is not an inline frame slot in [`proxy_h3_plain_http_mesh_buffered`].
+///
+/// Same stack-budget invariant as [`boxed_proxy_to_backend_unix`]. HBONE /
+/// Sidecar children are themselves boxed out of the retry helper
+/// ([`boxed_proxy_to_backend_hbone`] / [`boxed_proxy_to_backend_mesh_mtls`]).
+/// This factory keeps the helper's remaining retry future off the H3 plain
+/// helper frame; [`boxed_proxy_h3_plain_http_mesh_buffered`] then keeps that
+/// helper off `dispatch_plain` / `handle_h3_request`. The allocation is
 /// confined to H3 plain requests that already require a secured mesh bridge.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
@@ -38196,6 +39613,59 @@ pub(crate) async fn proxy_h3_plain_http_mesh_buffered(
         request_body_exceeded,
         streaming_h2_read_timeout_ms,
     )
+}
+
+/// One H3 plain mesh helper future, heap-allocated so it is not a frame slot
+/// in the H3 bridge. See [`boxed_proxy_h3_plain_http_mesh_buffered`].
+pub(crate) type BoxedH3PlainHttpMeshBufferedFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = retry::BackendResponse> + Send + 'a>>;
+
+/// The H3 plain mesh helper, CONSTRUCTED OUT OF LINE and returned boxed.
+///
+/// Same stack-budget invariant as [`boxed_proxy_to_backend_unix`] (issue
+/// #3764). `dispatch_plain` and the native-H3 buffered retry loop in
+/// `handle_h3_request` are the H3 poll frames every plain mesh attempt walks
+/// through. A bare `.await` of [`proxy_h3_plain_http_mesh_buffered`] at those
+/// call sites still materializes the helper into a temporary belonging to
+/// that parent poll frame. In an unoptimized hosted functional-test build
+/// that parent is already large, and a healthy HBONE / Sidecar attempt
+/// reaches the helper; boxing AT the call site is not enough.
+///
+/// Building the future in this `#[inline(never)]` factory that RETURNS before
+/// anything is awaited keeps the large temporary off the deep H3 poll stack:
+/// each call site stores only a pointer. The cost is one allocation, and only
+/// when an H3 plain attempt has already selected secured mesh egress. Do not
+/// fold this back into the call sites without re-measuring those frames.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+pub(crate) fn boxed_proxy_h3_plain_http_mesh_buffered<'a>(
+    state: &'a ProxyState,
+    proxy: &'a Proxy,
+    backend_url: &'a str,
+    method: &'a str,
+    headers: &'a HashMap<String, String>,
+    body: Bytes,
+    upstream_target: &'a UpstreamTarget,
+    plugins: &'a [Arc<dyn Plugin>],
+    request_ctx: &'a RequestContext,
+    client_ip: &'a str,
+    xff_append_ip: &'a str,
+    request_is_secure: bool,
+) -> BoxedH3PlainHttpMeshBufferedFuture<'a> {
+    Box::pin(proxy_h3_plain_http_mesh_buffered(
+        state,
+        proxy,
+        backend_url,
+        method,
+        headers,
+        body,
+        upstream_target,
+        plugins,
+        request_ctx,
+        client_ip,
+        xff_append_ip,
+        request_is_secure,
+    ))
 }
 
 /// Fold the mesh-retry side channel into the buffered H3 response.
@@ -40409,12 +41879,36 @@ async fn proxy_to_backend(
                 // body adapter writes byte counts directly into the context that
                 // summary builders read — no separate handle-capture needed.
                 let incoming = (*original_req).into_body();
+                // Authorization lifetime for the UPLOAD direction (#3815). A
+                // client-streaming or bidirectional upload whose backend
+                // withholds response headers has no response body to bound, so
+                // this is the only seam that can stop it from outliving the
+                // credential that admitted it. Absolute and armed once:
+                // relayed request DATA never refreshes it.
+                let upload_auth_deadline = request_upload_auth_deadline(
+                    Some(request_ctx),
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
+                );
                 if effective_max_request_body_size_bytes > 0 {
                     let limited = body::SizeLimitedIncoming::new_with_counter(
                         incoming,
                         effective_max_request_body_size_bytes,
                         Arc::clone(&body_size_exceeded),
                         Arc::clone(ctx_bytes_sent_observed),
+                    );
+                    // Adapter deadline PLUS a gateway-owned pump. Reqwest may
+                    // negotiate HTTP/2, in which case its connection task parks
+                    // on stream send capacity exactly like the direct-H2 pipe
+                    // and stops polling the body; the pump's deadline is not
+                    // subject to that. The join point is deliberately released
+                    // here rather than awaited: this dispatcher returns while
+                    // the response still streams, so the upload's lifetime is
+                    // the transport body's, and `UploadPumpSource`'s abort
+                    // guard ends the task when reqwest drops that body. The
+                    // pump self-terminates at the deadline regardless.
+                    let (limited, _upload_pump) = install_streaming_upload_authorization(
+                        limited,
+                        upload_auth_deadline.as_ref(),
                     );
                     let limited =
                         if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
@@ -40437,6 +41931,12 @@ async fn proxy_to_backend(
                         incoming,
                         Arc::clone(ctx_bytes_sent_observed),
                     );
+                    // Same pairing as the size-limited arm above; see there for
+                    // why the join point is released rather than awaited.
+                    let (counting, _upload_pump) = install_counting_upload_authorization(
+                        counting,
+                        upload_auth_deadline.as_ref(),
+                    );
                     let counting =
                         if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
                             &request_ctx.metadata,
@@ -40453,15 +41953,26 @@ async fn proxy_to_backend(
             ClientRequestBody::Streaming(original_req) => {
                 // Buffered path: collect body into memory for plugin transformation.
                 // Pre-transform length is recorded below after collect completes.
+                //
+                // Authorization lifetime for a BUFFERED upload (#3815). This body
+                // never reaches the streaming upload adapters, so the collect
+                // itself must carry the bound: a continuously active upload into
+                // a buffering route makes progress on every poll and would
+                // otherwise outlive the credential that admitted it.
+                let buffered_upload_auth_deadline = request_upload_auth_deadline(
+                    Some(request_ctx),
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
+                );
                 let body_bytes = if effective_max_request_body_size_bytes > 0 {
                     let limited = http_body_util::Limited::new(
                         (*original_req).into_body(),
                         effective_max_request_body_size_bytes,
                     );
-                    match collect_request_body_with_deadline(
+                    match collect_request_body_under_authorization(
                         limited.collect(),
                         request_ctx.grpc_deadline_at(),
                         proxy.backend_read_timeout_ms,
+                        buffered_upload_auth_deadline.as_ref(),
                     )
                     .await
                     {
@@ -40485,7 +41996,9 @@ async fn proxy_to_backend(
                                 None,
                             );
                         }
-                        Err(RequestBodyWaitError::DeadlineExceeded) => {
+                        Err(AuthorizedUploadWaitError::Wait(
+                            RequestBodyWaitError::DeadlineExceeded,
+                        )) => {
                             let response = client_grpc_deadline_exceeded_response_for_request(
                                 request_ctx,
                                 headers,
@@ -40493,17 +42006,29 @@ async fn proxy_to_backend(
                             );
                             return backend_dispatch_response(response, None, None);
                         }
-                        Err(RequestBodyWaitError::TimedOut) => {
+                        Err(AuthorizedUploadWaitError::Wait(RequestBodyWaitError::TimedOut)) => {
                             let response =
                                 request_body_timeout_backend_response(resolved_ip.clone());
                             return backend_dispatch_response(response, None, None);
                         }
+                        // Already latched and counted once. No backend was
+                        // dialed and nothing was committed downstream, so the
+                        // pre-commitment terminal in `handle_proxy_request_inner`
+                        // decides the client-visible shape.
+                        Err(AuthorizedUploadWaitError::AuthorizationExpired(_)) => {
+                            return authorization_expired_backend_dispatch(
+                                resolved_ip.clone(),
+                                None,
+                                None,
+                            );
+                        }
                     }
                 } else {
-                    match collect_request_body_with_deadline(
+                    match collect_request_body_under_authorization(
                         (*original_req).into_body().collect(),
                         request_ctx.grpc_deadline_at(),
                         proxy.backend_read_timeout_ms,
+                        buffered_upload_auth_deadline.as_ref(),
                     )
                     .await
                     {
@@ -40531,7 +42056,9 @@ async fn proxy_to_backend(
                                 None,
                             );
                         }
-                        Err(RequestBodyWaitError::DeadlineExceeded) => {
+                        Err(AuthorizedUploadWaitError::Wait(
+                            RequestBodyWaitError::DeadlineExceeded,
+                        )) => {
                             let response = client_grpc_deadline_exceeded_response_for_request(
                                 request_ctx,
                                 headers,
@@ -40539,10 +42066,19 @@ async fn proxy_to_backend(
                             );
                             return backend_dispatch_response(response, None, None);
                         }
-                        Err(RequestBodyWaitError::TimedOut) => {
+                        Err(AuthorizedUploadWaitError::Wait(RequestBodyWaitError::TimedOut)) => {
                             let response =
                                 request_body_timeout_backend_response(resolved_ip.clone());
                             return backend_dispatch_response(response, None, None);
+                        }
+                        // See the size-limited arm above: latched once, no
+                        // backend dialed, terminal decided pre-commitment.
+                        Err(AuthorizedUploadWaitError::AuthorizationExpired(_)) => {
+                            return authorization_expired_backend_dispatch(
+                                resolved_ip.clone(),
+                                None,
+                                None,
+                            );
                         }
                     }
                 };
@@ -40759,14 +42295,36 @@ async fn proxy_to_backend(
     // Send
     let mut reqwest_backend_guard =
         Some(crate::runtime_metrics::global_ref().reqwest_backend_request_guard());
-    let send_result = match crate::plugins::await_grpc_deadline(
+    // Authorization lifetime for the RESPONSE-HEADER wait (#3815). `send()`
+    // resolves when response headers arrive, and the upload adapter installed
+    // above can only fire while reqwest is polling the request body — a request
+    // with no body, or one whose body already ended, leaves this wait as the
+    // only seam. Composed, so an earlier client RPC deadline still wins.
+    let send_auth_deadline = request_upload_auth_deadline(
+        Some(request_ctx),
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    );
+    let send_bound = compose_dispatch_phase_auth_bound(
         request_ctx.grpc_deadline_at(),
-        req_builder.send(),
-    )
-    .await
-    {
+        send_auth_deadline.as_ref(),
+    );
+    let send_future = crate::plugins::await_deadline_first(send_bound.at, req_builder.send());
+    let send_result = match send_future.await {
         Ok(result) => result,
         Err(()) => {
+            // Attribute the fired bound. An authorization expiry cancels the
+            // reqwest request (dropping the send future aborts it, releasing the
+            // client upload it was reading) and is health-neutral; the
+            // pre-commitment terminal decides the client-visible shape.
+            if dispatch_phase_authorization_expiry(send_bound, send_auth_deadline.as_ref())
+                .is_some()
+            {
+                return authorization_expired_backend_dispatch(
+                    resolved_ip,
+                    retained_body,
+                    backend_admission_permits,
+                );
+            }
             return backend_dispatch_response(
                 client_grpc_deadline_exceeded_response_for_request(
                     request_ctx,
@@ -40906,8 +42464,11 @@ async fn proxy_to_backend(
                             response_buffer_budget::buffered_response_body_ceiling(
                                 effective_max_response_body_size_bytes,
                             );
-                        let collected = match crate::plugins::await_grpc_deadline(
+                        // Bounded by the admitted stream's authorization
+                        // lifetime as well as the client RPC deadline (#3815).
+                        let collected = match collect_response_under_authorization(
                             request_ctx.grpc_deadline_at(),
+                            send_auth_deadline.as_ref(),
                             eager_collect_charged_backend_body(
                                 response,
                                 retained_ceiling,
@@ -40917,13 +42478,24 @@ async fn proxy_to_backend(
                         .await
                         {
                             Ok(result) => result,
-                            Err(()) => {
+                            Err(ResponseCollectBound::RpcDeadline) => {
                                 return backend_dispatch_response(
                                     client_grpc_deadline_exceeded_response_for_request(
                                         request_ctx,
                                         headers,
                                         resolved_ip.clone(),
                                     ),
+                                    retained_body,
+                                    backend_admission_permits,
+                                );
+                            }
+                            Err(ResponseCollectBound::AuthorizationExpired) => {
+                                // Health-neutral and already latched/counted
+                                // once. The partially collected buffer and its
+                                // charged budget reservation drop with the
+                                // cancelled future.
+                                return authorization_expired_backend_dispatch(
+                                    resolved_ip.clone(),
                                     retained_body,
                                     backend_admission_permits,
                                 );
@@ -40986,20 +42558,28 @@ async fn proxy_to_backend(
                 let max_size = response_buffer_budget::buffered_response_body_ceiling(
                     effective_max_response_body_size_bytes,
                 );
-                let collected = match crate::plugins::await_grpc_deadline(
+                let collected = match collect_response_under_authorization(
                     request_ctx.grpc_deadline_at(),
+                    send_auth_deadline.as_ref(),
                     collect_response_with_limit(response, max_size),
                 )
                 .await
                 {
                     Ok(result) => result,
-                    Err(()) => {
+                    Err(ResponseCollectBound::RpcDeadline) => {
                         return backend_dispatch_response(
                             client_grpc_deadline_exceeded_response_for_request(
                                 request_ctx,
                                 headers,
                                 resolved_ip.clone(),
                             ),
+                            retained_body,
+                            backend_admission_permits,
+                        );
+                    }
+                    Err(ResponseCollectBound::AuthorizationExpired) => {
+                        return authorization_expired_backend_dispatch(
+                            resolved_ip.clone(),
                             retained_body,
                             backend_admission_permits,
                         );
@@ -41044,8 +42624,9 @@ async fn proxy_to_backend(
                     // resident memory" (GHSA-pwcm-6rh8-f2gh).
                     let retained_ceiling =
                         response_buffer_budget::buffered_response_body_ceiling(0);
-                    let collected = match crate::plugins::await_grpc_deadline(
+                    let collected = match collect_response_under_authorization(
                         request_ctx.grpc_deadline_at(),
+                        send_auth_deadline.as_ref(),
                         eager_collect_charged_backend_body(
                             response,
                             retained_ceiling,
@@ -41055,13 +42636,20 @@ async fn proxy_to_backend(
                     .await
                     {
                         Ok(result) => result,
-                        Err(()) => {
+                        Err(ResponseCollectBound::RpcDeadline) => {
                             return backend_dispatch_response(
                                 client_grpc_deadline_exceeded_response_for_request(
                                     request_ctx,
                                     headers,
                                     resolved_ip.clone(),
                                 ),
+                                retained_body,
+                                backend_admission_permits,
+                            );
+                        }
+                        Err(ResponseCollectBound::AuthorizationExpired) => {
+                            return authorization_expired_backend_dispatch(
+                                resolved_ip.clone(),
                                 retained_body,
                                 backend_admission_permits,
                             );
@@ -41098,20 +42686,28 @@ async fn proxy_to_backend(
                 let max_size = response_buffer_budget::buffered_response_body_ceiling(
                     effective_max_response_body_size_bytes,
                 );
-                let collected = match crate::plugins::await_grpc_deadline(
+                let collected = match collect_response_under_authorization(
                     request_ctx.grpc_deadline_at(),
+                    send_auth_deadline.as_ref(),
                     collect_response_with_limit(response, max_size),
                 )
                 .await
                 {
                     Ok(result) => result,
-                    Err(()) => {
+                    Err(ResponseCollectBound::RpcDeadline) => {
                         return backend_dispatch_response(
                             client_grpc_deadline_exceeded_response_for_request(
                                 request_ctx,
                                 headers,
                                 resolved_ip.clone(),
                             ),
+                            retained_body,
+                            backend_admission_permits,
+                        );
+                    }
+                    Err(ResponseCollectBound::AuthorizationExpired) => {
+                        return authorization_expired_backend_dispatch(
+                            resolved_ip.clone(),
                             retained_body,
                             backend_admission_permits,
                         );
@@ -42894,6 +44490,571 @@ fn client_grpc_deadline_exceeded_response_for_optional_request(
     }
 }
 
+/// One admitted request's authorization-lifetime plan: the absolute deadline,
+/// the bounded protocol family its termination counter carries, and the shared
+/// once-only termination latch every seam records through.
+pub(crate) type RequestAuthLifetimePlan = (
+    crate::proxy::auth_lifetime::StreamAuthDeadline,
+    crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+    crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+);
+
+/// Authorization-lifetime plan for a CLIENT REQUEST BODY upload, together with
+/// the request's shared once-only termination latch (issue #3815).
+///
+/// `None` for an unauthenticated request (no principal was admitted, so there
+/// is no authorization lifetime to bound) and for dispatch paths that carry no
+/// request context. Every H1/H2 streaming-upload adapter installs the result,
+/// so the seam is protocol-neutral: reqwest H1/H2, direct-H2, mesh mTLS, HBONE,
+/// and Unix-socket dispatch all bound the upload direction from one place, in
+/// parity with the response-body funnels and the H3 relays.
+pub(crate) fn request_upload_auth_deadline(
+    ctx: Option<&RequestContext>,
+    max_lifetime_seconds: u64,
+) -> Option<RequestAuthLifetimePlan> {
+    let ctx = ctx?;
+    let plan =
+        crate::proxy::auth_lifetime::effective_request_auth_deadline(ctx, max_lifetime_seconds)?;
+    Some((
+        plan,
+        request_upload_auth_family(ctx),
+        ctx.authorization_termination_latch(),
+    ))
+}
+
+/// Install the FULL upload lifecycle on a size-limited streaming client body
+/// (issue #3815 / #3816).
+///
+/// Two mechanisms, armed from the same absolute plan and recording through the
+/// same once-only latch, because neither is sufficient alone:
+///
+/// * The adapter's own deadline (`with_authorization_deadline`) refuses to hand
+///   the transport another client byte after expiry. It only runs when the
+///   transport polls the body.
+/// * The gateway-owned pump (`with_gateway_upload_pump`) owns the inbound
+///   `Incoming` in a task the GATEWAY schedules. Its deadline fires while
+///   hyper's HTTP/2 pipe is parked on send capacity — or an HTTP/1.1 connection
+///   task is parked on socket writability — which is precisely when the adapter
+///   cannot run. On expiry it drops the client body, discards anything still
+///   queued in the bounded bridge, and terminates the transport body with an
+///   error so the backend resets the stream instead of accepting a truncated
+///   upload as complete.
+///
+/// The returned join point is how a dispatcher proves the upload is over:
+/// `cancel_and_join()` resolves only after the pump published its outcome,
+/// which it does after dropping the client body.
+///
+/// Unauthenticated requests get neither (`auth` is `None`), so the no-auth-plan
+/// hot path is byte-for-byte the previous one: no task, no channel, no timer.
+pub(crate) fn install_streaming_upload_authorization(
+    body: body::SizeLimitedIncoming,
+    auth: Option<&RequestAuthLifetimePlan>,
+) -> (
+    body::SizeLimitedIncoming,
+    Option<upload_pump::UploadPumpJoin>,
+) {
+    let Some(plan) = auth else {
+        return (body, None);
+    };
+    let (deadline, family, latch) = plan;
+    body.with_authorization_deadline(*deadline, *family, latch.clone())
+        .with_gateway_upload_pump(plan)
+}
+
+/// [`install_streaming_upload_authorization`] for the unlimited-size streaming
+/// upload adapter (reqwest with request-body limits disabled).
+pub(crate) fn install_counting_upload_authorization(
+    body: body::CountingIncoming,
+    auth: Option<&RequestAuthLifetimePlan>,
+) -> (body::CountingIncoming, Option<upload_pump::UploadPumpJoin>) {
+    let Some(plan) = auth else {
+        return (body, None);
+    };
+    let (deadline, family, latch) = plan;
+    body.with_authorization_deadline(*deadline, *family, latch.clone())
+        .with_gateway_upload_pump(plan)
+}
+
+/// Compose the admitted request's absolute authorization deadline over the
+/// bound a DISPATCH PHASE already had (issue #3815).
+///
+/// A dispatch phase is any wait between admission and the client-visible
+/// response head: a buffered request-body collect, the response-header wait,
+/// and the early-response upload join. Each of those already composes a client
+/// RPC deadline with an operator stall timeout, and each of those bounds can be
+/// absent (`0` = disabled) or far later than the credential's own expiry. Body
+/// adapters cannot cover them: a request with no body — or one whose consumer is
+/// not currently polling it — leaves nothing for the upload wrapper to fire on.
+///
+/// Returns the EARLIEST of the two, so the phase can never outlive the
+/// credential that admitted the stream and an earlier protocol bound still wins.
+///
+/// The WINNING SOURCE is part of the result, not re-derived after the fact.
+/// Deriving it later — "the timeout fired, is the authorization deadline in the
+/// past?" — is a scheduling race: a task that is not polled until after the
+/// LATER of the two deadlines sees both as elapsed and would report the
+/// security decision even though the client RPC deadline or the operator stall
+/// timeout is what actually bounded the phase. Attribution is decided here,
+/// where both instants are known, and survives arbitrary observation delay.
+#[inline]
+pub(crate) fn compose_dispatch_phase_auth_bound(
+    phase_bound: Option<tokio::time::Instant>,
+    auth: Option<&RequestAuthLifetimePlan>,
+) -> DispatchPhaseBound {
+    match (phase_bound, auth.map(|(plan, _, _)| plan.at)) {
+        // Authorization wins only when it is genuinely the earliest bound. A
+        // tie goes to authorization, matching the biased select-arm ordering
+        // every relay and H3 write seam uses.
+        (Some(protocol), Some(authorization)) if authorization <= protocol => DispatchPhaseBound {
+            at: Some(authorization),
+            authorization_wins: true,
+        },
+        (Some(protocol), _) => DispatchPhaseBound {
+            at: Some(protocol),
+            authorization_wins: false,
+        },
+        (None, Some(authorization)) => DispatchPhaseBound {
+            at: Some(authorization),
+            authorization_wins: true,
+        },
+        (None, None) => DispatchPhaseBound {
+            at: None,
+            authorization_wins: false,
+        },
+    }
+}
+
+/// A dispatch-phase wait bound together with the source that established it
+/// (issue #3815).
+///
+/// Produced by [`compose_dispatch_phase_auth_bound`]; consumed by
+/// [`dispatch_phase_authorization_expiry`]. Carrying the source is what makes
+/// attribution independent of WHEN the timeout is observed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DispatchPhaseBound {
+    /// The earliest absolute bound, or `None` when neither side established
+    /// one.
+    pub(crate) at: Option<tokio::time::Instant>,
+    /// Whether the admitted stream's authorization deadline is the bound `at`
+    /// came from.
+    pub(crate) authorization_wins: bool,
+}
+
+impl DispatchPhaseBound {
+    /// A bound whose winning source has ALREADY been decided as the admitted
+    /// stream's authorization lifetime by a typed composer
+    /// ([`authorization_bounded_header_deadline`],
+    /// [`direct_h2_upload_join_bound`]).
+    ///
+    /// Those composers keep the source in their own enum, so they do not need
+    /// to re-derive it either; this adapts their decision to the shared
+    /// attribution helper rather than letting the helper guess from the clock.
+    pub(crate) const fn authorization(at: tokio::time::Instant) -> Self {
+        Self {
+            at: Some(at),
+            authorization_wins: true,
+        }
+    }
+}
+
+/// Which bound ended a buffered RESPONSE-body collection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResponseCollectBound {
+    /// The client's own RPC deadline (`grpc-timeout`) elapsed. Keeps its
+    /// existing `DEADLINE_EXCEEDED` terminal.
+    RpcDeadline,
+    /// The admitted stream's authorization lifetime elapsed. Already latched and
+    /// counted exactly once for the request; the caller returns the
+    /// health-neutral dispatch placeholder and the pre-commitment terminal in
+    /// `handle_proxy_request_inner` owns the client-visible shape.
+    AuthorizationExpired,
+}
+
+/// Bound a BUFFERED response-body collection by the earliest of the client RPC
+/// deadline and the admitted stream's absolute authorization deadline
+/// (issue #3815).
+///
+/// A buffered collect is the one response phase with no downstream body adapter
+/// to bound it: the bytes are being retained, not relayed, so nothing exists yet
+/// that a `ProxyBody` deadline could cancel. Its only other bounds are the
+/// PER-FRAME `backend_read_timeout_ms` — disabled entirely at `0` — and the
+/// response ceiling, so a backend that trickles frames indefinitely under a
+/// disabled read timeout keeps an authenticated request collecting long past the
+/// credential that admitted it.
+///
+/// Cancelling at the deadline drops the partially collected buffer, which
+/// releases its charged reservation against the process-wide retained-body
+/// budget on the same path every other failure uses.
+///
+/// Attribution comes from the COMPOSED bound, never from re-reading the clock
+/// after the fact, so a collect that was simply not polled until after both
+/// instants had passed still reports the bound that actually ended it.
+pub(crate) async fn collect_response_under_authorization<F>(
+    grpc_deadline_at: Option<tokio::time::Instant>,
+    auth: Option<&RequestAuthLifetimePlan>,
+    collect: F,
+) -> Result<F::Output, ResponseCollectBound>
+where
+    F: std::future::Future,
+{
+    let bound = compose_dispatch_phase_auth_bound(grpc_deadline_at, auth);
+    match crate::plugins::await_deadline_first(bound.at, collect).await {
+        Ok(output) => Ok(output),
+        Err(()) => match dispatch_phase_authorization_expiry(bound, auth) {
+            Some(_) => Err(ResponseCollectBound::AuthorizationExpired),
+            None => Err(ResponseCollectBound::RpcDeadline),
+        },
+    }
+}
+
+/// Attribute an already-fired composed dispatch-phase bound (issue #3815).
+///
+/// `Some` when the authorization deadline is the bound that elapsed, in which
+/// case the bounded class is latched for the request — first writer wins, so an
+/// upload adapter that already fired keeps its classification and the
+/// fixed-cardinality counter is still incremented exactly once. `None` when the
+/// phase's own client/operator bound is what bounded it, which keeps its
+/// existing terminal.
+///
+/// The decision comes from the COMPOSED BOUND, not from re-reading the clock:
+/// an earlier protocol bound stays attributed to the protocol even when the
+/// task was not scheduled until after the later authorization deadline had also
+/// elapsed. The clock is still consulted for the authorization case, so a
+/// composed bound that fired for some other reason cannot fabricate an expiry.
+pub(crate) fn dispatch_phase_authorization_expiry(
+    bound: DispatchPhaseBound,
+    auth: Option<&RequestAuthLifetimePlan>,
+) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+    if !bound.authorization_wins {
+        return None;
+    }
+    let (plan, family, latch) = auth?;
+    let termination = crate::proxy::auth_lifetime::expired_authorization(Some(*plan))?;
+    latch.record_once(termination, *family);
+    Some(termination)
+}
+
+/// Health-neutral dispatch outcome for a phase the gateway itself cancelled
+/// because the admitted stream's authorization lifetime elapsed (issue #3815).
+///
+/// Nothing has been committed downstream at this point, so the client-visible
+/// shape is not decided here: `handle_proxy_request_inner`'s pre-commitment
+/// terminal owns it and replaces this placeholder authoritatively from the
+/// latched class (native gRPC trailers-only `grpc-status: 16`, the equivalent
+/// gRPC-Web frame, or a fixed `401`). The class carried here is what keeps the
+/// gateway's own security decision off the upstream's ledger: `ClientDisconnect`
+/// is never retried and is backend-health neutral, and `connection_error` is
+/// false because no connect failure occurred.
+pub(crate) fn authorization_expired_dispatch_placeholder(
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    let mut headers = HashMap::with_capacity(1);
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    retry::BackendResponse {
+        status_code: StatusCode::UNAUTHORIZED.as_u16(),
+        body: ResponseBody::buffered(r#"{"error":"Unauthorized"}"#.as_bytes().to_vec()),
+        headers,
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::ClientDisconnect),
+    }
+}
+
+/// Settle a PRE-COMMITMENT response phase that the admitted credential's
+/// authorization lifetime cancelled (issue #3815).
+///
+/// The phase future has already been dropped by the composed bound, so nothing
+/// it was producing can reach the client. This records the request's shared
+/// termination latch exactly once — the counter, the bounded class in the
+/// transaction summary — and returns the ONLY terminal selectable from here:
+/// the fixed, redacted pre-commitment response for this request's flavor.
+///
+/// Deliberately does NOT call `mark_gateway_deadline_response_selected`: that
+/// provenance means "the client's own RPC deadline chose this response" and
+/// drives `grpc-status: 4` terminal write bias in the protocol writers. An
+/// authorization expiry is the gateway's decision, is `grpc-status: 16`, and
+/// must not be charged to the plugin that was running or the backend that
+/// answered.
+pub(crate) fn settle_precommit_authorization_expiry(
+    ctx: &mut RequestContext,
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+) -> PluginResult {
+    let family = request_upload_auth_family(ctx);
+    ctx.record_authorization_termination_once(termination, family);
+    let (status_code, headers, body) = authorization_expired_pre_commitment_response(
+        ctx,
+        termination,
+        is_native_grpc_request(ctx),
+    );
+    let body = match body {
+        ResponseBody::Buffered(bytes) => bytes,
+        // Unreachable: the pre-commitment terminal is always buffered. Fail
+        // closed with an empty body rather than publishing anything else.
+        _ => Bytes::new(),
+    };
+    PluginResult::RejectBinary {
+        status_code,
+        body,
+        headers,
+    }
+}
+
+/// Whether this request is native gRPC (not gRPC-Web, which
+/// [`authorization_expired_pre_commitment_response`] frames for itself).
+fn is_native_grpc_request(ctx: &RequestContext) -> bool {
+    matches!(
+        request_upload_auth_family(ctx),
+        crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc
+    )
+}
+
+/// Bounded protocol family for a request-upload termination counter. Derived
+/// from the request's own declared flavor, so an upload and its response body
+/// report the same closed-set family.
+fn request_upload_auth_family(
+    ctx: &RequestContext,
+) -> crate::proxy::auth_lifetime::StreamAuthProtocolFamily {
+    use crate::proxy::auth_lifetime::StreamAuthProtocolFamily;
+    if crate::plugins::grpc_web::request_is_grpc_web_translated(ctx) {
+        return StreamAuthProtocolFamily::GrpcWeb;
+    }
+    match ctx.headers.get("content-type") {
+        Some(content_type) if crate::plugins::grpc_web::is_grpc_web_content_type(content_type) => {
+            StreamAuthProtocolFamily::GrpcWeb
+        }
+        Some(content_type) if content_type.trim_start().starts_with("application/grpc") => {
+            StreamAuthProtocolFamily::Grpc
+        }
+        _ => StreamAuthProtocolFamily::Http,
+    }
+}
+
+/// Fixed, redacted PRE-COMMITMENT terminal for a request whose authorization
+/// lifetime elapsed before any response head reached the client (issue #3815).
+///
+/// Reached when the H1/H2 request-upload seam terminated a streaming upload:
+/// the backend dispatch was cancelled, so whatever transport error it produced
+/// describes the gateway's own cancellation, not a backend fault. Nothing has
+/// been committed downstream yet, so the client-visible terminal is a fixed
+/// one:
+///
+/// * native gRPC — HTTP 200 with trailers-only `grpc-status: 16`
+///   (`UNAUTHENTICATED`), the legal terminal for that flavor;
+/// * gRPC-Web — the equivalent bounded terminal through the shared
+///   `grpc_web` translation;
+/// * everything else (plain HTTP, SSE, chunked) — a fixed `401` with the
+///   compiled-in `{"error":"Unauthorized"}` body.
+///
+/// Every client-visible string is a compiled-in literal. No token, claim,
+/// subject, certificate field, provider detail, or absolute expiry reaches the
+/// status line, the headers, or the body.
+pub(crate) fn authorization_expired_pre_commitment_response(
+    request_ctx: &RequestContext,
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+    request_is_native_grpc: bool,
+) -> (u16, HashMap<String, String>, ResponseBody) {
+    if request_is_native_grpc {
+        let mut headers = HashMap::with_capacity(3);
+        headers.insert("content-type".to_string(), "application/grpc".to_string());
+        headers.insert(
+            "grpc-status".to_string(),
+            crate::proxy::auth_lifetime::AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER.to_string(),
+        );
+        headers.insert(
+            "grpc-message".to_string(),
+            termination.grpc_message().to_string(),
+        );
+        // gRPC errors ride HTTP 200 with the status in trailing metadata.
+        return (
+            StatusCode::OK.as_u16(),
+            headers,
+            ResponseBody::buffered(Vec::new()),
+        );
+    }
+    // A translated gRPC-Web request keeps its internal response native so the
+    // `grpc_web` response hook performs exactly one encoding pass; a
+    // pass-through gRPC-Web request has no translation marker, so its client
+    // wire shape is synthesized here. Mirrors
+    // `client_grpc_deadline_exceeded_response_for_request`.
+    if crate::plugins::grpc_web::request_is_grpc_web_translated(request_ctx) {
+        let mut headers = HashMap::with_capacity(3);
+        headers.insert("content-type".to_string(), "application/grpc".to_string());
+        headers.insert(
+            "grpc-status".to_string(),
+            crate::proxy::auth_lifetime::AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER.to_string(),
+        );
+        headers.insert(
+            "grpc-message".to_string(),
+            termination.grpc_message().to_string(),
+        );
+        return (
+            StatusCode::OK.as_u16(),
+            headers,
+            ResponseBody::buffered(Vec::new()),
+        );
+    }
+    if let Some(content_type) = request_ctx
+        .headers
+        .get("content-type")
+        .filter(|content_type| crate::plugins::grpc_web::is_grpc_web_content_type(content_type))
+    {
+        let response_content_type =
+            crate::plugins::grpc_web::retained_response_content_type(request_ctx)
+                .map(str::to_owned)
+                .unwrap_or_else(|| crate::plugins::grpc_web::response_content_type(content_type));
+        let translated = crate::plugins::grpc_web::error_response_for_content_type(
+            &response_content_type,
+            grpc_proxy::grpc_status::UNAUTHENTICATED,
+            termination.grpc_message(),
+        );
+        return (
+            StatusCode::OK.as_u16(),
+            translated.headers,
+            ResponseBody::buffered(translated.body),
+        );
+    }
+    let mut headers = HashMap::with_capacity(1);
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    (
+        StatusCode::UNAUTHORIZED.as_u16(),
+        headers,
+        ResponseBody::buffered(r#"{"error":"Unauthorized"}"#.as_bytes().to_vec()),
+    )
+}
+
+/// Decide, record, and APPLY the fixed pre-commitment authorization terminal —
+/// entirely out of line (issues #3815 / #3764).
+///
+/// `handle_proxy_request_inner` runs every pre-commitment gate through this one
+/// function for a stack-budget reason, not a stylistic one. At the coverage
+/// profile's `opt-level = 0` every temporary in that coroutine's `poll` body is
+/// a fixed frame slot allocated on entry, whether or not the branch that needs
+/// it ever runs — so writing the gate inline charged EVERY request (including an
+/// unauthenticated non-gRPC fall-through with no plan at all) for two
+/// `(status, HeaderMap, ResponseBody)` terminals plus their moves, in the
+/// deepest frame the proxy has. Building and applying the terminal in a
+/// `#[inline(never)]` leaf frame that returns before anything is awaited keeps
+/// those slots out of the request future, exactly as
+/// `boxed_finalize_authorization_expired_rejection` and
+/// `boxed_proxy_to_backend_unix` do for their futures.
+///
+/// Behaviour is unchanged and still fail-closed: the shared latch is consulted
+/// first, an unlatched-but-elapsed plan is recorded exactly once through it, an
+/// unauthenticated request returns `None` and is not touched, and the terminal
+/// written back is the same fixed, redacted one
+/// [`authorization_expired_pre_commitment_response`] selects.
+#[inline(never)]
+pub(crate) fn apply_precommit_authorization_terminal(
+    ctx: &mut RequestContext,
+    max_lifetime_seconds: u64,
+    request_uses_grpc_content_type: bool,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut ResponseBody,
+) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+    use crate::proxy::auth_lifetime::{effective_request_auth_deadline, expired_authorization};
+
+    let termination = match ctx.authorization_termination_latch.observed() {
+        Some(termination) => termination,
+        None => {
+            let plan = effective_request_auth_deadline(ctx, max_lifetime_seconds);
+            let elapsed = expired_authorization(plan)?;
+            // Record through the shared latch so this counts exactly once for
+            // the request even though no body wrapper fired.
+            let family = request_upload_auth_family(ctx);
+            ctx.authorization_termination_latch
+                .record_once(elapsed, family);
+            elapsed
+        }
+    };
+    let (terminal_status, terminal_headers, terminal_body) =
+        authorization_expired_pre_commitment_response(
+            ctx,
+            termination,
+            request_uses_grpc_content_type,
+        );
+    *response_status = terminal_status;
+    *response_headers = terminal_headers;
+    *response_body = terminal_body;
+    // Bounded class into the transaction summary through the ordinary latch.
+    // First writer wins, so a relay that already classified this request keeps
+    // its classification.
+    ctx.latch_authorization_termination(termination);
+    Some(termination)
+}
+
+/// Install the admitted stream's authorization lifetime on a CLIENT-VISIBLE
+/// response body, out of line (issues #3815 / #3764).
+///
+/// Same stack-budget contract as [`apply_precommit_authorization_terminal`]:
+/// `ProxyBody` is a wide struct, and rebinding it through the
+/// `with_authorization_deadline` builder inline costs the enclosing coroutine two
+/// permanent frame slots per site — the argument move and the return move. Both
+/// response funnels — the native-gRPC streaming branch and the shared
+/// H1/H2/H3-downstream funnel — go through here instead, so those moves live in a
+/// leaf frame.
+///
+/// Ordering, family selection, and the closer are unchanged: attached AFTER the
+/// client `grpc-timeout` wrapper and BEFORE the gRPC-Web adapter, so whichever
+/// deadline is earlier fires first and the two can never both complete. An
+/// unauthenticated request (no plan) is returned untouched.
+#[inline(never)]
+fn install_response_authorization_deadline(
+    body: ProxyBody,
+    ctx: &RequestContext,
+    max_lifetime_seconds: u64,
+    grpc_web_response_content_type: Option<&str>,
+    request_is_native_grpc: bool,
+) -> ProxyBody {
+    use crate::proxy::auth_lifetime::{StreamAuthProtocolFamily, effective_request_auth_deadline};
+
+    let Some(auth_deadline) = effective_request_auth_deadline(ctx, max_lifetime_seconds) else {
+        return body;
+    };
+    let auth_family = if grpc_web_response_content_type.is_some() {
+        StreamAuthProtocolFamily::GrpcWeb
+    } else if request_is_native_grpc {
+        StreamAuthProtocolFamily::Grpc
+    } else {
+        StreamAuthProtocolFamily::Http
+    };
+    body.with_authorization_deadline(
+        auth_deadline,
+        grpc_web_response_content_type,
+        auth_family,
+        // Shared with the request-upload seam: on a bidirectional stream both
+        // directions race the same absolute plan, and exactly one termination is
+        // counted.
+        Some(ctx.authorization_termination_latch()),
+        // Last-resort transport lever for a client that stops granting HTTP/2
+        // flow-control credit (or stops reading an HTTP/1.1 socket) and
+        // therefore never lets hyper poll the terminal above.
+        ctx.authorization_connection_closer.clone(),
+    )
+}
+
+/// The health-neutral dispatch outcome for a phase the gateway itself cancelled
+/// on an authorization expiry, built out of line (issues #3815 / #3764).
+///
+/// `proxy_to_backend` reaches this from seven cold arms. Constructing the
+/// `retry::BackendResponse` inline at each of them charged that coroutine's
+/// `poll` frame seven fixed slots — for a plain unauthenticated request that can
+/// never take any of them. One `#[inline(never)]` leaf frame builds it instead.
+/// The value is the same health-neutral placeholder wrapped in the same dispatch
+/// result; only where the temporaries live changes.
+#[inline(never)]
+fn authorization_expired_backend_dispatch(
+    resolved_ip: Option<String>,
+    retained_body: Option<Bytes>,
+    backend_admission_permits: Option<BackendAdmissionPermitSet>,
+) -> BackendDispatchResult {
+    backend_dispatch_response(
+        authorization_expired_dispatch_placeholder(resolved_ip),
+        retained_body,
+        backend_admission_permits,
+    )
+}
+
 fn mesh_grpc_response_body_too_large_response(
     proxy: &Proxy,
     resolved_ip: Option<String>,
@@ -43355,6 +45516,21 @@ async fn proxy_to_backend_hbone(
                 Arc::clone(&body_size_exceeded),
                 Arc::clone(ctx_bytes_sent_observed),
             );
+            // Full upload lifecycle for the UPLOAD direction (#3815): the
+            // adapter deadline plus a gateway-owned pump, so the bound still
+            // fires while this pooled connection task is parked and not
+            // polling the body. The join point is released here — the response
+            // streams past this dispatcher, so the upload's lifetime is the
+            // transport body's, bounded by `UploadPumpSource`'s abort guard —
+            // and the pump self-terminates at the deadline regardless.
+            let (body, _upload_pump) = install_streaming_upload_authorization(
+                body,
+                request_upload_auth_deadline(
+                    ctx,
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
+                )
+                .as_ref(),
+            );
             let body = match ctx {
                 Some(c)
                     if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
@@ -43486,9 +45662,23 @@ async fn proxy_to_backend_hbone(
 
     let backend_req = Request::from_parts(parts, body);
     let send_fut = sender.send_request(backend_req);
-    let response = if proxy.backend_read_timeout_ms > 0 {
-        let timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
-        match tokio::time::timeout(timeout, send_fut).await {
+    // Authorization lifetime for the response-header wait (#3815). With
+    // `backend_read_timeout_ms = 0` this wait is otherwise unbounded, and the
+    // upload adapter installed above has nothing to fire on for a bodyless or
+    // already-ended request.
+    let send_auth_deadline = request_upload_auth_deadline(
+        ctx,
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    );
+    let read_deadline = if proxy.backend_read_timeout_ms > 0 {
+        tokio::time::Instant::now()
+            .checked_add(Duration::from_millis(proxy.backend_read_timeout_ms))
+    } else {
+        None
+    };
+    let send_bound = compose_dispatch_phase_auth_bound(read_deadline, send_auth_deadline.as_ref());
+    let response = if let Some(send_deadline) = send_bound.at {
+        match crate::plugins::await_deadline_first(Some(send_deadline), send_fut).await {
             Ok(Ok(response)) => response,
             Ok(Err(err)) => {
                 if body_size_exceeded.load(Ordering::Acquire) {
@@ -43518,6 +45708,17 @@ async fn proxy_to_backend_hbone(
                             None,
                             effective_request_body_size_limit,
                         ),
+                        None,
+                        None,
+                    );
+                }
+                // The gateway's own security decision; health-neutral, and the
+                // pre-commitment terminal owns the client-visible shape.
+                if dispatch_phase_authorization_expiry(send_bound, send_auth_deadline.as_ref())
+                    .is_some()
+                {
+                    return (
+                        authorization_expired_dispatch_placeholder(resolved_ip),
                         None,
                         None,
                     );
@@ -43613,13 +45814,43 @@ async fn proxy_to_backend_hbone(
             Some(body_size_exceeded),
         )
     } else {
-        let body_bytes = match collect_hyper_body_with_limit(
-            response.into_body(),
-            effective_max_response_body_size_bytes,
-            proxy.backend_read_timeout_ms,
+        // Composed with the admitted stream's authorization lifetime (#3815):
+        // a retained collect has no downstream body adapter, and its only other
+        // bound is the PER-FRAME `backend_read_timeout_ms`, which `0` disables.
+        let collected = match collect_response_under_authorization(
+            ctx.and_then(RequestContext::grpc_deadline_at),
+            send_auth_deadline.as_ref(),
+            collect_hyper_body_with_limit(
+                response.into_body(),
+                effective_max_response_body_size_bytes,
+                proxy.backend_read_timeout_ms,
+            ),
         )
         .await
         {
+            Ok(result) => result,
+            Err(ResponseCollectBound::RpcDeadline) => {
+                return (
+                    client_grpc_deadline_exceeded_response_for_optional_request(
+                        ctx,
+                        headers,
+                        resolved_ip,
+                    ),
+                    None,
+                    None,
+                );
+            }
+            // Health-neutral and already latched/counted once; the
+            // pre-commitment terminal owns the client-visible shape.
+            Err(ResponseCollectBound::AuthorizationExpired) => {
+                return (
+                    authorization_expired_dispatch_placeholder(resolved_ip),
+                    None,
+                    None,
+                );
+            }
+        };
+        let body_bytes = match collected {
             Ok(body_bytes) => body_bytes,
             Err(HyperBodyCollectError::TooLarge) => {
                 return (
@@ -43998,6 +46229,21 @@ async fn proxy_to_backend_unix(
                 Arc::clone(&body_size_exceeded),
                 Arc::clone(ctx_bytes_sent_observed),
             );
+            // Full upload lifecycle for the UPLOAD direction (#3815): the
+            // adapter deadline plus a gateway-owned pump, so the bound still
+            // fires while this pooled connection task is parked and not
+            // polling the body. The join point is released here — the response
+            // streams past this dispatcher, so the upload's lifetime is the
+            // transport body's, bounded by `UploadPumpSource`'s abort guard —
+            // and the pump self-terminates at the deadline regardless.
+            let (body, _upload_pump) = install_streaming_upload_authorization(
+                body,
+                request_upload_auth_deadline(
+                    ctx,
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
+                )
+                .as_ref(),
+            );
             let body = match ctx {
                 Some(c)
                     if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
@@ -44137,12 +46383,25 @@ async fn proxy_to_backend_unix(
     // non-idempotent request.
     let mut backend_req = Request::from_parts(parts, body);
     let mut replayed_idle_race = false;
+    // Authorization lifetime for the response-header wait (#3815). Absolute, so
+    // the at-most-one idle-race replay below cannot re-arm it.
+    let send_auth_deadline = request_upload_auth_deadline(
+        ctx,
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    );
     let response = loop {
         let send_result = {
             let send_fut = checkout.sender.try_send_request(backend_req);
-            if proxy.backend_read_timeout_ms > 0 {
-                let timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
-                match tokio::time::timeout(timeout, send_fut).await {
+            let read_deadline = if proxy.backend_read_timeout_ms > 0 {
+                tokio::time::Instant::now()
+                    .checked_add(Duration::from_millis(proxy.backend_read_timeout_ms))
+            } else {
+                None
+            };
+            let send_bound =
+                compose_dispatch_phase_auth_bound(read_deadline, send_auth_deadline.as_ref());
+            if let Some(send_deadline) = send_bound.at {
+                match crate::plugins::await_deadline_first(Some(send_deadline), send_fut).await {
                     Ok(result) => result,
                     Err(_) => {
                         if body_size_exceeded.load(Ordering::Acquire) {
@@ -44152,6 +46411,21 @@ async fn proxy_to_backend_unix(
                                     resolved_ip,
                                     effective_request_body_size_limit,
                                 ),
+                                None,
+                                None,
+                            );
+                        }
+                        // The gateway's own security decision; health-neutral,
+                        // and the lease is still dropped without check-in
+                        // because the framing state is unknown.
+                        if dispatch_phase_authorization_expiry(
+                            send_bound,
+                            send_auth_deadline.as_ref(),
+                        )
+                        .is_some()
+                        {
+                            return (
+                                authorization_expired_dispatch_placeholder(resolved_ip),
                                 None,
                                 None,
                             );
@@ -44355,13 +46629,43 @@ async fn proxy_to_backend_unix(
             Some(body_size_exceeded),
         )
     } else {
-        let body_bytes = match collect_hyper_body_with_limit(
-            response.into_body(),
-            effective_max_response_body_size_bytes,
-            proxy.backend_read_timeout_ms,
+        // Composed with the admitted stream's authorization lifetime (#3815):
+        // a retained collect has no downstream body adapter, and its only other
+        // bound is the PER-FRAME `backend_read_timeout_ms`, which `0` disables.
+        let collected = match collect_response_under_authorization(
+            ctx.and_then(RequestContext::grpc_deadline_at),
+            send_auth_deadline.as_ref(),
+            collect_hyper_body_with_limit(
+                response.into_body(),
+                effective_max_response_body_size_bytes,
+                proxy.backend_read_timeout_ms,
+            ),
         )
         .await
         {
+            Ok(result) => result,
+            Err(ResponseCollectBound::RpcDeadline) => {
+                return (
+                    client_grpc_deadline_exceeded_response_for_optional_request(
+                        ctx,
+                        headers,
+                        resolved_ip,
+                    ),
+                    None,
+                    None,
+                );
+            }
+            // Health-neutral and already latched/counted once; the
+            // pre-commitment terminal owns the client-visible shape.
+            Err(ResponseCollectBound::AuthorizationExpired) => {
+                return (
+                    authorization_expired_dispatch_placeholder(resolved_ip),
+                    None,
+                    None,
+                );
+            }
+        };
+        let body_bytes = match collected {
             Ok(body_bytes) => body_bytes,
             Err(HyperBodyCollectError::TooLarge) => {
                 return (
@@ -44926,20 +47230,18 @@ async fn proxy_to_backend_mesh_mtls(
         // `proxy`, so the shared mesh-mTLS body is unchanged for non-Unix
         // targets.
         let unix_conn_proxy = resolve_backend_connection_proxy_for_target(proxy, Some(target));
-        // Boxed for the same stack-budget reason as the Unix dispatch in
-        // `proxy_to_backend` (issue #3764): `proxy_to_backend_mesh_mtls` is
-        // awaited inline from THREE sites reachable from the generic
-        // `handle_proxy_request_inner` future, so this pooled checkout (creation
-        // lock + admission gate + `connect(2)` + h2c handshake) would be stored
-        // inline three times over in the future every request is polled through.
-        // One allocation, only on the Unix h2c branch.
-        let dial = Box::pin(state.unix_backend_pool.checkout_h2c(
+        // Constructed out of line — see `boxed_unix_backend_checkout_h2c`.
+        // A bare `Box::pin(checkout_h2c(..))` here still materializes the
+        // handshake in this coroutine's `opt-level = 0` poll frame, including
+        // on Sidecar mTLS attempts that never take this branch.
+        let dial = boxed_unix_backend_checkout_h2c(
+            state,
             unix_conn_proxy.as_ref(),
             socket_path,
             proxy.backend_connect_timeout_ms,
             &state.env_config.mesh_unix_socket_allowed_roots,
             &state.env_config.mesh_unix_socket_allowed_uids,
-        ));
+        );
         // The client's end-to-end RPC deadline caps the dial exactly as it caps
         // the pooled sender acquisition below: a wedged local app must not
         // outlive the deadline the caller already committed to.
@@ -44973,7 +47275,11 @@ async fn proxy_to_backend_mesh_mtls(
         }
     } else {
         let mtls_port = mesh_mtls_pool::target_mesh_mtls_port(target);
-        let get_sender = state.mesh_mtls_pool.get_sender(
+        // Constructed out of line — see `boxed_mesh_mtls_pool_get_sender`.
+        // Awaiting `get_sender` inline kept the TLS + hyper HTTP/2 handshake
+        // in this coroutine, which overflowed the H3 plain Sidecar path.
+        let get_sender = boxed_mesh_mtls_pool_get_sender(
+            state,
             proxy,
             &target.host,
             target.port,
@@ -45156,6 +47462,135 @@ async fn proxy_to_backend_mesh_mtls(
         }
     }
 
+    // Handshake / checkout complete. The send + collect states are a second
+    // large coroutine; box them out of this acquire frame so an unoptimized
+    // H3 plain Sidecar attempt does not hold handshake and dispatch poll
+    // slots at once. See `boxed_proxy_to_backend_mesh_mtls_after_ready`.
+    boxed_proxy_to_backend_mesh_mtls_after_ready(
+        state,
+        proxy,
+        backend_url,
+        method,
+        headers,
+        client_request_body,
+        target,
+        plugins,
+        request_ctx,
+        response_decision_ctx,
+        stream_response,
+        client_ip,
+        xff_append_ip,
+        request_is_secure,
+        resolved_ip,
+        ctx_bytes_sent_observed,
+        unix_socket_path,
+        sender,
+        is_grpc_flavored,
+        is_grpc_web_translated,
+        is_native_grpc,
+        request_body_limit,
+        effective_max_response_body_size_bytes,
+        client_grpc_deadline_at,
+    )
+    .await
+}
+
+/// Post-ready Sidecar dispatch, constructed out of line so send/collect is
+/// not a frame slot in [`proxy_to_backend_mesh_mtls`].
+///
+/// Pool acquisition and `sender.ready()` stay in the acquire coroutine.
+/// Buffering, trailer forwarding, and the authorization-composed read window
+/// are unchanged; only the poll-frame boundary moves.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_proxy_to_backend_mesh_mtls_after_ready<'a>(
+    state: &'a ProxyState,
+    proxy: &'a Proxy,
+    backend_url: &'a str,
+    method: &'a str,
+    headers: &'a HashMap<String, String>,
+    client_request_body: MeshClientRequestBody,
+    target: &'a UpstreamTarget,
+    plugins: &'a [Arc<dyn crate::plugins::Plugin>],
+    request_ctx: &'a RequestContext,
+    response_decision_ctx: Option<&'a RequestContext>,
+    stream_response: bool,
+    client_ip: &'a str,
+    xff_append_ip: &'a str,
+    request_is_secure: bool,
+    resolved_ip: Option<String>,
+    ctx_bytes_sent_observed: &'a Arc<std::sync::atomic::AtomicU64>,
+    unix_socket_path: Option<&'a str>,
+    sender: mesh_mtls_pool::MeshMtlsSender,
+    is_grpc_flavored: bool,
+    is_grpc_web_translated: bool,
+    is_native_grpc: bool,
+    request_body_limit: usize,
+    effective_max_response_body_size_bytes: usize,
+    client_grpc_deadline_at: Option<tokio::time::Instant>,
+) -> BoxedMeshTransportDispatchFuture<'a> {
+    Box::pin(async move {
+        proxy_to_backend_mesh_mtls_after_ready(
+            state,
+            proxy,
+            backend_url,
+            method,
+            headers,
+            client_request_body,
+            target,
+            plugins,
+            request_ctx,
+            response_decision_ctx,
+            stream_response,
+            client_ip,
+            xff_append_ip,
+            request_is_secure,
+            resolved_ip,
+            ctx_bytes_sent_observed,
+            unix_socket_path,
+            sender,
+            is_grpc_flavored,
+            is_grpc_web_translated,
+            is_native_grpc,
+            request_body_limit,
+            effective_max_response_body_size_bytes,
+            client_grpc_deadline_at,
+        )
+        .await
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn proxy_to_backend_mesh_mtls_after_ready(
+    state: &ProxyState,
+    proxy: &Proxy,
+    backend_url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+    client_request_body: MeshClientRequestBody,
+    target: &UpstreamTarget,
+    plugins: &[Arc<dyn crate::plugins::Plugin>],
+    request_ctx: &RequestContext,
+    response_decision_ctx: Option<&RequestContext>,
+    stream_response: bool,
+    client_ip: &str,
+    xff_append_ip: &str,
+    request_is_secure: bool,
+    resolved_ip: Option<String>,
+    ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
+    unix_socket_path: Option<&str>,
+    mut sender: mesh_mtls_pool::MeshMtlsSender,
+    is_grpc_flavored: bool,
+    is_grpc_web_translated: bool,
+    is_native_grpc: bool,
+    request_body_limit: usize,
+    effective_max_response_body_size_bytes: usize,
+    client_grpc_deadline_at: Option<tokio::time::Instant>,
+) -> (
+    retry::BackendResponse,
+    Option<Bytes>,
+    Option<Arc<std::sync::atomic::AtomicBool>>,
+) {
     // Pool acquisition and sender readiness are connect work. Arm the
     // operator response-read window only after both complete; the client RPC
     // deadline remains receipt-anchored and therefore still caps the entire
@@ -45287,6 +47722,21 @@ async fn proxy_to_backend_mesh_mtls(
                 max_request_body_size,
                 Arc::clone(&body_size_exceeded),
                 Arc::clone(ctx_bytes_sent_observed),
+            );
+            // Full upload lifecycle for the UPLOAD direction (#3815): the
+            // adapter deadline plus a gateway-owned pump, so the bound still
+            // fires while this pooled connection task is parked and not
+            // polling the body. The join point is released here — the response
+            // streams past this dispatcher, so the upload's lifetime is the
+            // transport body's, bounded by `UploadPumpSource`'s abort guard —
+            // and the pump self-terminates at the deadline regardless.
+            let (body, _upload_pump) = install_streaming_upload_authorization(
+                body,
+                request_upload_auth_deadline(
+                    Some(request_ctx),
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
+                )
+                .as_ref(),
             );
             let body = if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
                 &request_ctx.metadata,
@@ -45447,13 +47897,23 @@ async fn proxy_to_backend_mesh_mtls(
     // `send_request` covers upload plus the response-header wait. The same
     // absolute RPC instant is reused; retries and earlier gateway work cannot
     // re-arm it by rewriting a relative header.
-    let send_deadline = if is_grpc_flavored {
-        grpc_send_deadline
-    } else {
-        backend_read_deadline
-    };
-    let send_result = if let Some(deadline) = send_deadline {
-        match tokio::time::timeout_at(deadline, send_fut).await {
+    // Composed with the admitted stream's authorization lifetime (#3815): the
+    // native-gRPC regime leaves the client deadline UNCAPPED and both regimes
+    // allow no bound at all, neither of which may outlive the credential.
+    let send_auth_deadline = request_upload_auth_deadline(
+        Some(request_ctx),
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    );
+    let send_bound = compose_dispatch_phase_auth_bound(
+        if is_grpc_flavored {
+            grpc_send_deadline
+        } else {
+            backend_read_deadline
+        },
+        send_auth_deadline.as_ref(),
+    );
+    let send_result = if let Some(deadline) = send_bound.at {
+        match crate::plugins::await_deadline_first(Some(deadline), send_fut).await {
             Ok(result) => result,
             Err(_) => {
                 if body_size_exceeded.load(Ordering::Acquire) {
@@ -45468,9 +47928,23 @@ async fn proxy_to_backend_mesh_mtls(
                         None,
                     );
                 }
+                // The gateway's own security decision; health-neutral, and the
+                // pre-commitment terminal owns the client-visible shape (native
+                // gRPC gets trailers-only `grpc-status: 16` there, not a
+                // DEADLINE_EXCEEDED).
+                if dispatch_phase_authorization_expiry(send_bound, send_auth_deadline.as_ref())
+                    .is_some()
+                {
+                    return (
+                        authorization_expired_dispatch_placeholder(resolved_ip),
+                        None,
+                        None,
+                    );
+                }
                 warn!(
                     proxy_id = %proxy.id,
-                    timeout_ms = send_deadline
+                    timeout_ms = send_bound
+                        .at
                         .map(|deadline| {
                             deadline
                                 .saturating_duration_since(read_started_at)
@@ -45663,36 +48137,51 @@ async fn proxy_to_backend_mesh_mtls(
                 proxy.backend_read_timeout_ms
             },
         );
-        let collect_result = if let Some(deadline) = buffered_grpc_shared_deadline {
-            match tokio::time::timeout_at(deadline, collect_fut).await {
-                Ok(result) => result,
-                Err(_) => {
-                    warn!(
-                        proxy_id = %proxy.id,
-                        deadline_source = if buffered_grpc_shared_deadline_is_client {
-                            "client"
-                        } else {
-                            "backend_read_policy"
-                        },
-                        "sidecar mTLS gRPC-Web response body collection exceeded its shared deadline"
-                    );
-                    return (
-                        if buffered_grpc_shared_deadline_is_client {
-                            client_grpc_deadline_exceeded_response_for_request(
-                                request_ctx,
-                                headers,
-                                resolved_ip,
-                            )
-                        } else {
-                            mesh_grpc_deadline_exceeded_response(resolved_ip)
-                        },
-                        None,
-                        None,
-                    );
-                }
+        // The shared gRPC-Web collection deadline (client `grpc-timeout` or the
+        // backend read policy) is now composed with the admitted stream's
+        // authorization lifetime (#3815). Both of the former can be absent, and
+        // a retained collect has no downstream body adapter to fall back on.
+        let collect_result = match collect_response_under_authorization(
+            buffered_grpc_shared_deadline,
+            send_auth_deadline.as_ref(),
+            collect_fut,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(ResponseCollectBound::RpcDeadline) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    deadline_source = if buffered_grpc_shared_deadline_is_client {
+                        "client"
+                    } else {
+                        "backend_read_policy"
+                    },
+                    "sidecar mTLS gRPC-Web response body collection exceeded its shared deadline"
+                );
+                return (
+                    if buffered_grpc_shared_deadline_is_client {
+                        client_grpc_deadline_exceeded_response_for_request(
+                            request_ctx,
+                            headers,
+                            resolved_ip,
+                        )
+                    } else {
+                        mesh_grpc_deadline_exceeded_response(resolved_ip)
+                    },
+                    None,
+                    None,
+                );
             }
-        } else {
-            collect_fut.await
+            // Health-neutral and already latched/counted once; the
+            // pre-commitment terminal owns the client-visible shape.
+            Err(ResponseCollectBound::AuthorizationExpired) => {
+                return (
+                    authorization_expired_dispatch_placeholder(resolved_ip),
+                    None,
+                    None,
+                );
+            }
         };
         let (body_bytes, backend_trailers) = match collect_result {
             Ok(collected) => collected,
@@ -45844,6 +48333,71 @@ async fn proxy_to_backend_mesh_mtls(
 pub(crate) enum ResponseHeaderDeadlineSource {
     Client,
     Operator,
+    /// The admitted stream's authorization lifetime elapsed while the backend
+    /// was still withholding its response head (issue #3815). Composed on top
+    /// of the client/operator bounds by
+    /// [`authorization_bounded_header_deadline`], never produced by
+    /// [`response_header_deadline`] itself.
+    Authorization,
+}
+
+/// Which bound the direct-H2 early-response upload join is waiting on.
+///
+/// The client RPC deadline and the operator whole-upload stall timeout keep
+/// their existing terminals; the authorization lifetime is a gateway-side
+/// security decision with a health-neutral pre-commitment terminal of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DirectH2UploadJoinBound {
+    Protocol(EarlyUploadBoundKind),
+    /// The admitted stream's authorization lifetime (issue #3815).
+    Authorization,
+}
+
+/// Compose the admitted stream's authorization lifetime over the direct-H2
+/// early-response upload join bound (issue #3815).
+///
+/// `compose_early_upload_bound` returns `None` when the client set no RPC
+/// deadline and `backend_read_timeout_ms` is `0`, and can return an instant far
+/// later than the credential's expiry. Neither state may let an authenticated
+/// upload keep running against an already-committed backend response, so the
+/// authorization deadline composes over it and wins a tie.
+pub(crate) fn direct_h2_upload_join_bound(
+    protocol_bound: Option<(tokio::time::Instant, EarlyUploadBoundKind)>,
+    authorization_at: Option<tokio::time::Instant>,
+) -> Option<(tokio::time::Instant, DirectH2UploadJoinBound)> {
+    match (protocol_bound, authorization_at) {
+        (Some((deadline, kind)), Some(authorization)) if deadline < authorization => {
+            Some((deadline, DirectH2UploadJoinBound::Protocol(kind)))
+        }
+        (_, Some(authorization)) => Some((authorization, DirectH2UploadJoinBound::Authorization)),
+        (Some((deadline, kind)), None) => Some((deadline, DirectH2UploadJoinBound::Protocol(kind))),
+        (None, None) => None,
+    }
+}
+
+/// Compose the admitted stream's absolute authorization deadline over an
+/// already-resolved response-header wait (issue #3815).
+///
+/// The client/operator bounds can both be absent (`grpc-timeout` unset and
+/// `backend_read_timeout_ms = 0`), in which case a backend that withholds its
+/// response head holds the request open indefinitely. The upload adapter cannot
+/// cover that: a bodyless request, or one whose body already ended, gives it
+/// nothing to fire on. Authorization wins a tie so the security decision is the
+/// one reported.
+pub(crate) fn authorization_bounded_header_deadline(
+    header_deadline: Option<(tokio::time::Instant, ResponseHeaderDeadlineSource)>,
+    auth: Option<&RequestAuthLifetimePlan>,
+) -> Option<(tokio::time::Instant, ResponseHeaderDeadlineSource)> {
+    let Some(authorization_at) = auth.map(|(plan, _, _)| plan.at) else {
+        return header_deadline;
+    };
+    match header_deadline {
+        Some((existing, _)) if existing < authorization_at => header_deadline,
+        _ => Some((
+            authorization_at,
+            ResponseHeaderDeadlineSource::Authorization,
+        )),
+    }
 }
 
 pub(crate) fn response_header_deadline(
@@ -45955,7 +48509,36 @@ async fn proxy_to_backend_http2(
         crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&c.metadata)
             .then(|| Arc::clone(&c.grpc_request_messages_observed))
     });
-    let (body, body_completion_rx) = if effective_max_request_body_size_bytes > 0 {
+    // Authorization lifetime for the UPLOAD direction (#3815); see
+    // `request_upload_auth_deadline`. Direct-H2 hands the body to hyper's
+    // detached pipe task, so an expiry error from the adapter is also what
+    // resets the backend stream and releases that task.
+    let upload_auth_deadline = request_upload_auth_deadline(
+        ctx,
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    );
+    // The upload-completion gate is installed whenever a request-size limit is
+    // configured OR this request carries an authorization lifetime (#3815).
+    //
+    // The size-limit reason is PR #3176's: an early backend response must not be
+    // exposed before the streaming upload's size decision is authoritative. The
+    // authorization reason is the lifecycle join: without the channel, an early
+    // backend response returns while the upload is still detached inside hyper's
+    // HTTP/2 pipe task, and this handler has no join point at which to observe
+    // the upload's terminal state. With it, the early-response outcome WAITS for
+    // that terminal state under a bound that includes the credential's own
+    // deadline, so an authenticated upload can no longer be forwarded — or left
+    // running against a committed response — past expiry.
+    //
+    // The cost is the same interleaving the size-limit gate already gives up:
+    // a genuinely full-duplex non-gRPC direct-H2 app on a route with request
+    // limits DISABLED now also sees response headers withheld until its upload
+    // terminates, but only while an authenticated principal is admitted. Native
+    // gRPC never reaches this dispatcher (it rides `grpc_proxy`), so
+    // bidirectional RPC streaming is unaffected.
+    let needs_upload_completion_gate =
+        effective_max_request_body_size_bytes > 0 || upload_auth_deadline.is_some();
+    let (body, body_completion_rx, mut upload_pump) = if needs_upload_completion_gate {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         let mut body = body::SizeLimitedIncoming::new_with_counter_and_completion(
             body,
@@ -45968,7 +48551,21 @@ async fn proxy_to_backend_http2(
         if let Some(messages) = observe_grpc.clone() {
             body = body.with_grpc_message_counter(messages);
         }
-        (body, Some(completion_rx))
+        // Full upload lifecycle (#3815). Direct-H2 is the one H1/H2 dispatcher
+        // whose upload is scoped to the handler — the completion gate below
+        // already waits for the upload's terminal state before any early
+        // backend response is exposed — so its join point is ARMED for
+        // cancel-on-drop and explicitly `cancel_and_join()`ed at every bounded
+        // exit. Once that join returns, the pump task has published its
+        // outcome, which it does after dropping the inbound client body: no
+        // gateway-owned upload survives this function.
+        let (body, upload_pump) =
+            install_streaming_upload_authorization(body, upload_auth_deadline.as_ref());
+        (
+            body,
+            Some(completion_rx),
+            upload_pump.map(crate::proxy::upload_pump::UploadPumpJoin::cancel_on_drop),
+        )
     } else {
         let mut body = body::SizeLimitedIncoming::new_with_counter(
             body,
@@ -45980,7 +48577,11 @@ async fn proxy_to_backend_http2(
         if let Some(messages) = observe_grpc {
             body = body.with_grpc_message_counter(messages);
         }
-        (body, None)
+        // Unreachable with an authorization plan present
+        // (`needs_upload_completion_gate` is true whenever
+        // `upload_auth_deadline.is_some()`), so this arm is the unauthenticated
+        // hot path and installs neither timer nor pump.
+        (body, None, None)
     };
 
     // Set the URI
@@ -46183,32 +48784,64 @@ async fn proxy_to_backend_http2(
         }
     };
     let read_started_at = tokio::time::Instant::now();
-    let header_deadline = response_header_deadline(
-        grpc_deadline_at,
-        proxy.backend_read_timeout_ms,
-        read_started_at,
+    // Composed with the admitted stream's authorization lifetime (#3815) so a
+    // backend that withholds its response head cannot hold an authenticated
+    // request past credential expiry when neither a client `grpc-timeout` nor an
+    // operator read timeout is configured.
+    let header_deadline = authorization_bounded_header_deadline(
+        response_header_deadline(
+            grpc_deadline_at,
+            proxy.backend_read_timeout_ms,
+            read_started_at,
+        ),
+        upload_auth_deadline.as_ref(),
     );
     let response = if let Some((deadline, deadline_source)) = header_deadline {
-        match tokio::time::timeout_at(deadline, h2_send_fut).await {
+        match crate::plugins::await_deadline_first(Some(deadline), h2_send_fut).await {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => return map_h2_err(e),
             Err(_) => {
                 // The request body already moved into hyper's detached HTTP/2
                 // pipe task when `send_request` was called, so returning here
-                // does not stop the upload. Wake the adapter so it yields an
-                // error, resetting the backend stream and releasing the inbound
-                // client body instead of streaming it into a request whose
-                // response we have already abandoned. Best-effort: the signal
-                // only lands the next time hyper polls the body, so a pipe
-                // parked on backend send capacity tears down later (see the
-                // `cancel` field docs on `SizeLimitedIncoming`).
+                // does not by itself stop the upload. Two things do.
+                //
+                // The adapter cancel below makes hyper reset the backend stream
+                // the next time it polls the body — best-effort, because a pipe
+                // parked on backend send capacity is not polling at all.
+                //
+                // The pump join is the strong half: it drops the inbound client
+                // body and terminates the transport body with an error, and it
+                // resolves only after the pump task has actually finished. From
+                // that point the gateway neither owns nor polls any part of the
+                // client upload, whatever the backend's flow-control window is
+                // doing. Bytes already handed to hyper before this point may
+                // still be transport-buffered; those are not ours to recall.
                 if let Some(cancel_tx) = body_cancel_tx.take() {
                     let _ = cancel_tx.send(());
+                }
+                if let Some(pump) = upload_pump.take() {
+                    pump.cancel_and_join().await;
                 }
                 if body_size_exceeded.load(std::sync::atomic::Ordering::Acquire) {
                     return request_body_too_large();
                 }
                 match deadline_source {
+                    // The gateway's own security decision: the cancel signal
+                    // above resets the backend stream as soon as hyper's pipe
+                    // polls the body again, and nothing has been committed
+                    // downstream, so the pre-commitment terminal in
+                    // `handle_proxy_request_inner` owns the client-visible shape.
+                    // Latched and counted exactly once for the request.
+                    ResponseHeaderDeadlineSource::Authorization => {
+                        let _ = dispatch_phase_authorization_expiry(
+                            DispatchPhaseBound::authorization(deadline),
+                            upload_auth_deadline.as_ref(),
+                        );
+                        return (
+                            authorization_expired_dispatch_placeholder(resolved_ip),
+                            None,
+                        );
+                    }
                     ResponseHeaderDeadlineSource::Client => {
                         return (
                             client_grpc_deadline_exceeded_response_for_optional_request(
@@ -46255,43 +48888,96 @@ async fn proxy_to_backend_http2(
     // has consumed the upload. Do not expose that response until the request
     // body adapter has made the configured size-limit decision authoritative.
     //
-    // The channel is installed only when `max_request_body_size_bytes > 0`.
-    // Ordinary and SNI direct-H2 routes both enforce nonzero request limits
-    // in-path, so the gate — and the interleaving it gives up, a genuinely
-    // full-duplex non-gRPC H2 app now sees response headers withheld until
-    // its upload terminates — applies whenever a request-size limit is set.
+    // The channel is installed when `max_request_body_size_bytes > 0` OR when
+    // this request carries an authorization lifetime (#3815) — see
+    // `needs_upload_completion_gate` above. Ordinary and SNI direct-H2 routes
+    // both enforce nonzero request limits in-path, so the gate — and the
+    // interleaving it gives up, a genuinely full-duplex non-gRPC H2 app now sees
+    // response headers withheld until its upload terminates — applies whenever a
+    // request-size limit is set, and additionally for any authenticated request.
     if let Some(body_completion_rx) = body_completion_rx {
         // The header phase has already spent its own deadline, so the upload
         // phase reuses the operator whole-upload stall guard composed with any
         // client RPC deadline. Without it a backend that answers early and then
         // stops reading the upload — or a client that stalls mid-body — would
         // pin this request open indefinitely.
-        let upload_bound =
-            compose_early_upload_bound(grpc_deadline_at, proxy.backend_read_timeout_ms);
+        //
+        // The admitted stream's authorization lifetime composes over both, so an
+        // early backend response can neither be forwarded nor left waiting on an
+        // authenticated upload past credential expiry.
+        let upload_bound = direct_h2_upload_join_bound(
+            compose_early_upload_bound(grpc_deadline_at, proxy.backend_read_timeout_ms),
+            upload_auth_deadline.as_ref().map(|(plan, _, _)| plan.at),
+        );
         let outcome = match upload_bound {
             Some((upload_deadline, bound_kind)) => {
-                match tokio::time::timeout_at(upload_deadline, body_completion_rx).await {
+                match crate::plugins::await_deadline_first(
+                    Some(upload_deadline),
+                    body_completion_rx,
+                )
+                .await
+                {
                     Ok(received) => received.ok(),
                     Err(_) => {
-                        // `send_request` has already yielded response headers,
-                        // so hyper moved the request body into a detached H2
-                        // pipe task. Dropping this handler or the response does
-                        // not cancel that upload: the pipe task holds its own
-                        // `h2` stream reference, so the stream is not reset
-                        // while it lives. Wake the adapter explicitly; its
-                        // terminal error resets the backend stream and releases
-                        // the inbound client body. Best-effort — a pipe parked
-                        // on backend send capacity is not polling the body and
-                        // tears down only once credit, a reset, or connection
-                        // close arrives (see `SizeLimitedIncoming::cancel`).
+                        // `send_request` has already yielded response headers, so
+                        // hyper moved the request body into a detached H2 pipe
+                        // task. Dropping this handler or the response does not
+                        // cancel that upload: the pipe task holds its own `h2`
+                        // stream reference, and h2 resets a stream only once
+                        // EVERY reference is gone. hyper's own cancellation
+                        // channel is closed as soon as the response head
+                        // resolves, so it is unavailable to us here. Wake the
+                        // adapter explicitly; its terminal error resets the
+                        // backend stream and releases the inbound client body.
+                        //
+                        // The gateway-owned pump is what makes this a real
+                        // lifecycle join rather than a hint: `cancel_and_join`
+                        // resolves only after the pump task has dropped the
+                        // inbound client body and published its outcome, and the
+                        // pump's own waits are all `select!`ed with the
+                        // cancellation arm, so a backend that never grants
+                        // another byte of send capacity cannot delay it.
+                        //
+                        // What is guaranteed once this returns: the gateway owns
+                        // and polls no part of the client upload; nothing further
+                        // is handed to the transport; anything still queued in
+                        // the bounded bridge is discarded; the transport body
+                        // ends in an error, so the backend resets the stream
+                        // instead of reading a truncated upload as complete; and
+                        // this handler returns without committing the backend
+                        // response, so no response byte reaches the client under
+                        // an expired credential. What is NOT claimed: bytes
+                        // handed to hyper BEFORE this point may already sit in
+                        // its transport buffers and may still reach the wire.
                         if let Some(cancel_tx) = body_cancel_tx.take() {
                             let _ = cancel_tx.send(());
+                        }
+                        if let Some(pump) = upload_pump.take() {
+                            pump.cancel_and_join().await;
                         }
                         if body_size_exceeded.load(std::sync::atomic::Ordering::Acquire) {
                             return request_body_too_large();
                         }
                         return match bound_kind {
-                            EarlyUploadBoundKind::RpcDeadline => (
+                            // Latched and counted exactly once. The response
+                            // head arrived but was never committed downstream —
+                            // this dispatcher returns before the client sees it —
+                            // so the pre-commitment terminal replaces it, and the
+                            // outcome is health-neutral because the gateway, not
+                            // the upstream, ended the exchange.
+                            DirectH2UploadJoinBound::Authorization => {
+                                let _ = dispatch_phase_authorization_expiry(
+                                    DispatchPhaseBound::authorization(upload_deadline),
+                                    upload_auth_deadline.as_ref(),
+                                );
+                                (
+                                    authorization_expired_dispatch_placeholder(resolved_ip),
+                                    None,
+                                )
+                            }
+                            DirectH2UploadJoinBound::Protocol(
+                                EarlyUploadBoundKind::RpcDeadline,
+                            ) => (
                                 client_grpc_deadline_exceeded_response_for_optional_request(
                                     ctx,
                                     headers,
@@ -46299,7 +48985,9 @@ async fn proxy_to_backend_http2(
                                 ),
                                 None,
                             ),
-                            EarlyUploadBoundKind::OperatorTimeout => {
+                            DirectH2UploadJoinBound::Protocol(
+                                EarlyUploadBoundKind::OperatorTimeout,
+                            ) => {
                                 warn!(
                                     proxy_id = %proxy.id,
                                     "HTTP/2: client upload did not finish within the whole-upload bound ({}ms) after backend response headers",
@@ -46324,10 +49012,33 @@ async fn proxy_to_backend_http2(
         // Normal completion: dropping the sender makes the adapter stop
         // polling the cancellation channel without changing its outcome.
         drop(body_cancel_tx.take());
+        // Join the upload before this handler proceeds to the response, so no
+        // gateway-owned upload task can outlive the request whose accounting it
+        // belongs to. A pump that already finished resolves immediately; one
+        // whose adapter reported a terminal state without the pump having
+        // observed it yet (an authorization expiry seen first on the adapter
+        // side) is stopped here.
+        if let Some(pump) = upload_pump.take() {
+            pump.cancel_and_join().await;
+        }
         match classify_direct_h2_upload_outcome(outcome) {
             DirectH2UploadGate::Forward => {}
             DirectH2UploadGate::RequestBodyTooLarge => return request_body_too_large(),
             DirectH2UploadGate::FailClosed => {
+                // An upload the AUTHORIZATION deadline ended reports `Abandoned`
+                // too, but it is the gateway's own security decision rather than
+                // an indeterminate size outcome. Report it as such — health-neutral
+                // and already latched/counted by the adapter — instead of a 502.
+                if upload_auth_deadline
+                    .as_ref()
+                    .and_then(|(_, _, latch)| latch.observed())
+                    .is_some()
+                {
+                    return (
+                        authorization_expired_dispatch_placeholder(resolved_ip),
+                        None,
+                    );
+                }
                 error!(
                     proxy_id = %proxy.id,
                     outcome = ?outcome,
@@ -46414,20 +49125,36 @@ async fn proxy_to_backend_http2(
             effective_max_response_body_size_bytes,
             proxy.backend_read_timeout_ms,
         );
-        let collect_result =
-            match crate::plugins::await_grpc_deadline(grpc_deadline_at, collect).await {
-                Ok(result) => result,
-                Err(()) => {
-                    return (
-                        client_grpc_deadline_exceeded_response_for_optional_request(
-                            ctx,
-                            headers,
-                            resolved_ip,
-                        ),
-                        None,
-                    );
-                }
-            };
+        // Composed with the admitted stream's authorization lifetime (#3815):
+        // a retained collect has no downstream body adapter, and its only other
+        // bound is the PER-FRAME `backend_read_timeout_ms`, which `0` disables.
+        let collect_result = match collect_response_under_authorization(
+            grpc_deadline_at,
+            upload_auth_deadline.as_ref(),
+            collect,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(ResponseCollectBound::RpcDeadline) => {
+                return (
+                    client_grpc_deadline_exceeded_response_for_optional_request(
+                        ctx,
+                        headers,
+                        resolved_ip,
+                    ),
+                    None,
+                );
+            }
+            // Health-neutral and already latched/counted once; the
+            // pre-commitment terminal owns the client-visible shape.
+            Err(ResponseCollectBound::AuthorizationExpired) => {
+                return (
+                    authorization_expired_dispatch_placeholder(resolved_ip),
+                    None,
+                );
+            }
+        };
         let body_bytes = match collect_result {
             Ok(collected) => collected,
             Err(HyperBodyCollectError::TooLarge) => {
@@ -46980,6 +49707,14 @@ async fn proxy_to_backend_http3(
         client_request_body
     };
 
+    // Authorization lifetime for a BUFFERED upload on the H3-backend bridge
+    // (#3815). Same contract as the reqwest and direct-H2 buffered arms: a
+    // continuously active client upload that the gateway must collect before
+    // dispatch cannot outlive the credential that admitted the stream.
+    let buffered_upload_auth_deadline = request_upload_auth_deadline(
+        response_decision_ctx.or(ctx.as_deref()),
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    );
     let request_body = match client_request_body {
         ClientRequestBody::Buffered(buffered) => buffered.body,
         ClientRequestBody::Streaming(original_req) => {
@@ -47007,10 +49742,11 @@ async fn proxy_to_backend_http3(
                 }
                 let limited =
                     http_body_util::Limited::new(body, effective_max_request_body_size_bytes);
-                match collect_request_body_with_deadline(
+                match collect_request_body_under_authorization(
                     limited.collect(),
                     grpc_deadline_at,
                     proxy.backend_read_timeout_ms,
+                    buffered_upload_auth_deadline.as_ref(),
                 )
                 .await
                 {
@@ -47032,10 +49768,12 @@ async fn proxy_to_backend_http3(
                             None,
                         );
                     }
-                    Err(RequestBodyWaitError::TimedOut) => {
+                    Err(AuthorizedUploadWaitError::Wait(RequestBodyWaitError::TimedOut)) => {
                         return (request_body_timeout_backend_response(resolved_ip), None);
                     }
-                    Err(RequestBodyWaitError::DeadlineExceeded) => {
+                    Err(AuthorizedUploadWaitError::Wait(
+                        RequestBodyWaitError::DeadlineExceeded,
+                    )) => {
                         return (
                             client_grpc_deadline_exceeded_response_for_optional_request(
                                 ctx.as_deref(),
@@ -47045,12 +49783,21 @@ async fn proxy_to_backend_http3(
                             None,
                         );
                     }
+                    // Latched and counted once; no H3 backend was dialed and
+                    // nothing was committed downstream.
+                    Err(AuthorizedUploadWaitError::AuthorizationExpired(_)) => {
+                        return (
+                            authorization_expired_dispatch_placeholder(resolved_ip),
+                            None,
+                        );
+                    }
                 }
             } else {
-                match collect_request_body_with_deadline(
+                match collect_request_body_under_authorization(
                     body.collect(),
                     grpc_deadline_at,
                     proxy.backend_read_timeout_ms,
+                    buffered_upload_auth_deadline.as_ref(),
                 )
                 .await
                 {
@@ -47077,16 +49824,25 @@ async fn proxy_to_backend_http3(
                             None,
                         );
                     }
-                    Err(RequestBodyWaitError::TimedOut) => {
+                    Err(AuthorizedUploadWaitError::Wait(RequestBodyWaitError::TimedOut)) => {
                         return (request_body_timeout_backend_response(resolved_ip), None);
                     }
-                    Err(RequestBodyWaitError::DeadlineExceeded) => {
+                    Err(AuthorizedUploadWaitError::Wait(
+                        RequestBodyWaitError::DeadlineExceeded,
+                    )) => {
                         return (
                             client_grpc_deadline_exceeded_response_for_optional_request(
                                 ctx.as_deref(),
                                 headers,
                                 resolved_ip,
                             ),
+                            None,
+                        );
+                    }
+                    // See the size-limited arm above.
+                    Err(AuthorizedUploadWaitError::AuthorizationExpired(_)) => {
+                        return (
+                            authorization_expired_dispatch_placeholder(resolved_ip),
                             None,
                         );
                     }

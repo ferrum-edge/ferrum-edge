@@ -74,3 +74,59 @@ impl Drop for EnvGuard {
         }
     }
 }
+
+/// Poison-tolerant RAII guard for tests that write the process-wide validated
+/// `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` scalar
+/// (`proxy::auth_lifetime`).
+///
+/// It owns THE SAME [`ENV_LOCK`], deliberately — not a second mutex. The
+/// scalar's only production writer is the accepted startup configuration, so
+/// the tests that write it are exactly the tests that also drive `EnvConfig`,
+/// and a second lock domain would either leave the two racing or introduce a
+/// lock-ordering hazard between them. One domain, no ordering to get wrong.
+///
+/// The previous value is restored on drop, so a test that changes the maximum
+/// cannot contaminate any later test in the binary — including the ones that
+/// assert the documented `3600` default.
+pub struct StreamAuthMaxLifetimeGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    saved: u64,
+}
+
+impl StreamAuthMaxLifetimeGuard {
+    pub fn new() -> Self {
+        let lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved =
+            ferrum_edge::_test_support::authenticated_stream_max_lifetime_seconds_for_test();
+        Self { _lock: lock, saved }
+    }
+
+    /// Publish a value for the duration of this guard.
+    pub fn publish(&self, seconds: u64) {
+        ferrum_edge::_test_support::publish_authenticated_stream_max_lifetime_seconds_for_test(
+            seconds,
+        );
+    }
+
+    /// The currently published value.
+    pub fn published(&self) -> u64 {
+        ferrum_edge::_test_support::authenticated_stream_max_lifetime_seconds_for_test()
+    }
+}
+
+impl Default for StreamAuthMaxLifetimeGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for StreamAuthMaxLifetimeGuard {
+    fn drop(&mut self) {
+        // Runs while `_lock` is still alive, so restoration stays serialized.
+        ferrum_edge::_test_support::publish_authenticated_stream_max_lifetime_seconds_for_test(
+            self.saved,
+        );
+    }
+}

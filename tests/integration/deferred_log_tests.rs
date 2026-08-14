@@ -32,10 +32,14 @@ use ferrum_edge::plugins::prometheus_metrics::{ClientDisconnectKey, MetricsRegis
 use ferrum_edge::plugins::{
     Plugin, RequestContext, ResponseStreamAction, ResponseStreamInspector, TransactionSummary,
     create_plugin, create_response_stream_inspector, log_with_mirror_before_buffered_response,
+    spawn_bounded_terminal_summary_log,
 };
 use ferrum_edge::proxy::ProxyBody;
 use ferrum_edge::proxy::deferred_log::{BodyOutcome, DeferredTransactionLogger};
 use ferrum_edge::retry::ErrorClass;
+
+/// Bounded authorization-termination class carried in summary metadata.
+const TERMINATION_REASON_KEY: &str = "authorization.termination_reason";
 
 /// Test plugin that captures every `TransactionSummary` passed to `log()`.
 struct CapturingPlugin {
@@ -305,6 +309,66 @@ async fn deadline_buffered_logging_does_not_await_a_blocked_sink() {
         wait_for_events(&events, 2).await.as_slice(),
         ["deadline-log-started", "first-finished"]
     );
+}
+
+/// An authenticated buffered response delivers ONE terminal summary — the
+/// post-gate one — to every applicable plugin, without the request task ever
+/// awaiting a logging plugin (issue #3815).
+///
+/// The buffered path runs its authoritative authorization gate before building
+/// the summary, so this is the only summary the exchange produces. Awaiting the
+/// chain here would let the credential expire while one sink blocked, after
+/// earlier sinks had already emitted the still-protected outcome; a later gate
+/// can repair the response but cannot retract an emitted audit record. This
+/// delivery is therefore synchronous to the caller — that it is not an `async
+/// fn` is the structural half of the proof — and orders the plugins inside the
+/// single detached, finitely bounded task instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_authenticated_buffered_terminal_summary_is_delivered_once_and_never_awaited() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (capturing, captured) = CapturingPlugin::new();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(OrderedLogPlugin {
+            label: "blocked-sink",
+            events: Arc::clone(&events),
+            started: Some(Arc::clone(&started)),
+            release: Some(Arc::clone(&release)),
+        }),
+        Arc::new(capturing),
+    ];
+
+    // The one terminal summary the buffered path builds from post-gate state:
+    // the fixed 401, buffered rather than streamed, carrying the bounded class
+    // the gate latched into the request metadata.
+    let mut summary = make_summary_with_status(401);
+    summary.response_streamed = false;
+    summary.metadata.insert(
+        TERMINATION_REASON_KEY.to_string(),
+        "credential_expired".to_string(),
+    );
+    let mut ctx = make_ctx();
+    ctx.authenticated_identity = Some("spiffe://example/sa/api".to_string());
+
+    spawn_bounded_terminal_summary_log(&plugins, summary, &ctx);
+
+    // Configured plugin order is preserved inside the detached task: the second
+    // sink does not run until the blocked one finishes.
+    started.notified().await;
+    assert_eq!(events.lock().unwrap().as_slice(), ["blocked-sink"]);
+    assert!(captured.lock().unwrap().is_empty());
+
+    release.notify_one();
+    let delivered = wait_for_captures(&captured, 1).await;
+    // Each applicable plugin receives at most one summary for the exchange, and
+    // it describes the terminal the client received rather than the protected
+    // status the backend produced.
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].response_status_code, 401);
+    assert!(!delivered[0].response_streamed);
+    let reason = delivered[0].metadata.get(TERMINATION_REASON_KEY);
+    assert_eq!(reason.map(String::as_str), Some("credential_expired"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

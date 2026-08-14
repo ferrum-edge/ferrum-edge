@@ -14033,7 +14033,7 @@ components:
     # ── Runtime metrics ─────────────────────────────────────────────
     RuntimeMetricsSnapshot:
       type: object
-      required: [timestamp, uptime_seconds, mode, ferrum_version, system, http, errors, dns, connections, logs, plugin_triggers, overload]
+      required: [timestamp, uptime_seconds, mode, ferrum_version, system, http, errors, dns, connections, logs, plugin_triggers, authorization_lifetime, overload]
       properties:
         timestamp:
           type: string
@@ -14060,8 +14060,43 @@ components:
           $ref: "#/components/schemas/RuntimeLogsSnapshot"
         plugin_triggers:
           $ref: "#/components/schemas/RuntimePluginTriggerSnapshot"
+        authorization_lifetime:
+          $ref: "#/components/schemas/RuntimeAuthorizationLifetimeSnapshot"
         overload:
           $ref: "#/components/schemas/OverloadSnapshot"
+
+    RuntimeAuthorizationLifetimeSnapshot:
+      type: object
+      description: |
+        Fixed-cardinality counters for authenticated streams terminated by the
+        authorization-lifetime contract. Each map is keyed by a closed
+        compile-time protocol family (`http`, `grpc`, `grpc_web`, `stream_tcp`,
+        `stream_udp`) and every family is always present. WebSocket is
+        deliberately absent: WebSocket sessions are bounded by their own
+        `FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS` policy and reported through
+        `websocket.termination_reason`, not by this contract. No route,
+        consumer, identity, token, claim, certificate field, provider, or
+        absolute expiry is ever recorded. Monotonic for the process lifetime.
+      required: [credential_expired, authenticated_stream_max_lifetime]
+      properties:
+        credential_expired:
+          type: object
+          description: |
+            Streams terminated because the accepted credential's own
+            authoritative deadline elapsed, by protocol family.
+          additionalProperties:
+            type: integer
+            format: uint64
+        authenticated_stream_max_lifetime:
+          type: object
+          description: |
+            Streams terminated because the finite
+            `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` fallback maximum
+            elapsed (the accepted credential carried no earlier authoritative
+            expiry), by protocol family.
+          additionalProperties:
+            type: integer
+            format: uint64
 
     RuntimePluginTriggerSnapshot:
       type: object

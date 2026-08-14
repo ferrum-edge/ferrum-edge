@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Authenticated UDP/DTLS client-facing sends no longer emit after the
+  authorization deadline (issues #3815, #3816, #3820). A pre-send commitment
+  check then `send_to`/`writable().await` could stay pending across the bound
+  and still deliver a packet. Direct and non-batched frontend sends —
+  including the Linux pktinfo writable retry — now race the send/writable
+  future against the same absolute plan, with expiry winning exact-deadline
+  ties. Terminating frontend DTLS application replies complete only after
+  the produced ciphertext datagrams are accepted by the UDP socket: the
+  per-client driver owns every pending application `send_to` against the
+  admitted deadline, dropping that wait on expiry or cancellation so queued
+  plaintext cannot be encrypted or flushed afterwards. Dropping the
+  proxy-side send future cancels the queued request. Shutdown does not drain
+  expired or cancelled application replies. Unauthenticated sessions keep
+  the no-timer path. Batching/GSO/sendmmsg discard semantics are unchanged.
+
 - Sidecar inbound now treats one pod selected by multiple Services as the same
   local identity only when those workload records share a SPIFFE and the same
   non-empty pod UID, and materializes one inbound Host route per Service.
@@ -31,6 +46,183 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (issue #3244) (issue #3317).
 
 ### Added
+
+- Authorization lifetime for admitted streams and request uploads (issues
+  #3815, #3816). An authenticated stream is bounded by the earliest of the
+  accepted credential's own deadline and the finite
+  `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` fallback; application
+  activity never extends it, and unauthenticated traffic is unaffected.
+  Enforcement covers H1/H2/H3 response bodies, TCP/TLS and UDP/DTLS stream
+  sessions, buffered uploads, buffered response collections, every awaited
+  pre-commitment response phase, and every dispatch-phase wait between admission
+  and the client-visible response head — including the native-HTTP/3 gRPC
+  backend open and its upload-versus-response-head race, where both protocol
+  bounds can be absent at once. (WebSocket keeps its own pre-existing
+  `FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS` policy and its own
+  `websocket.termination_reason` reporting, and is deliberately not a family of
+  the new counters.) Streaming H1/H2 request
+  uploads additionally get a **gateway-owned upload pump**: the inbound client
+  body moves into a task the gateway schedules, so the deadline fires — and the
+  body is released — even while the backend transport is parked on flow control
+  and is polling nothing. On expiry the gateway polls no further client body,
+  discards anything still queued in its bounded one-frame bridge, and ends the
+  transport body with an error so the backend resets rather than accepting a
+  truncated upload as complete; bytes already handed to the transport before
+  expiry are not recalled. Direct-H2 joins the pump before returning. The
+  client-visible terminal is chosen once, before commitment: a fixed `401` for
+  plain HTTP/SSE, trailers-only `grpc-status: 16` for native gRPC, and the
+  equivalent bounded frame for gRPC-Web. Terminations are health-neutral and are
+  counted through one per-request latch on a fixed-cardinality
+  (class × protocol family) counter that carries no route, identity, or expiry
+  detail.
+
+  Client-visible response bodies additionally get a **gateway-owned response
+  pump**, for the same reason the upload direction needs one: hyper does not
+  poll a response body while its HTTP/2 pipe is parked on stream send capacity
+  (a client advertising `SETTINGS_INITIAL_WINDOW_SIZE: 0`) or its HTTP/1.1
+  connection is parked flushing a socket the client stopped reading, so a
+  body-only deadline is not enforceable. The backend body moves into ONE
+  gateway-scheduled task that is its sole owner and sole poller and delivers
+  frames through a one-slot channel, so there is no lock on the response path.
+  The pump and the protocol adapter wrapped around it settle ONE shared
+  compare-and-swap over `{Open, InnerCompletion, AuthorizationExpiry}` carrying
+  the single absolute deadline instant, so which of the two independently
+  scheduled observers settles the response never depends on the runtime's
+  scheduling order: either may claim the bound the moment the clock reaches it,
+  the upstream's own terminal is claimable only while the clock is still before
+  the deadline, and the first claim is final. A response that reached its own
+  terminal before the deadline is never counted or closed; a protected frame
+  queued before the bound is never delivered after it; at the exact deadline the
+  security bound wins deterministically; a full channel delays delivery but
+  never enforcement.
+  Frames, trailers, and errors keep their order, an upstream error is never
+  collapsed into a clean end of stream, and cancelling or dropping the response
+  body terminates the pump and releases the upstream so no detached producer
+  survives. At the deadline the pump releases the backend body — cancelling the
+  upstream stream, its pooled connection, and every guard rooted in it — and, if
+  the downstream still has not drained the protocol-correct terminal a bounded
+  grace later, closes that client connection so the request guard, per-IP guard,
+  admission permits, and load-balancer accounting the response body holds are
+  released exactly once. HTTP/2 gives a server no way to reset one stream from
+  outside hyper, so that close is connection-scoped and is preceded by `GOAWAY`
+  plus a bounded settle window; it is only ever reached for a connection that is
+  demonstrably refusing to drain an already-expired authenticated stream.
+
+  Every awaited pre-commitment response phase now carries the authorization
+  **plan** beside the composed instant, so an elapsed bound is attributed to its
+  real owner. A client `grpc-timeout` keeps its existing behavior byte for byte;
+  an authorization expiry cancels the phase, records the request's shared latch
+  exactly once, marks no RPC-deadline provenance (the plugin and the backend are
+  blameless), and can select only the fixed pre-commitment terminal. The
+  committed-response observer is no longer detached on that outcome: the pending
+  hook owns a clone of the request context plus the protected response body, so
+  it — and every remaining observer — is dropped instead of being spawned after
+  the credential stopped being authorized. Legacy detach survives for the
+  client-owned RPC deadline only, and that detached cleanup is bounded by the
+  earliest of the fixed five-second post-response timeout and the credential's
+  own deadline — enforced by an explicit past-deadline refusal that polls
+  nothing plus a deadline-biased race with a per-poll clock gate, rather than by
+  `timeout_at`, which polls its inner future before it observes the timer and so
+  would let a chain that is ready on its first poll execute once after the bound
+  had already elapsed.
+
+  A final authoritative gate immediately before response-head commitment turns a
+  credential that expired while the response phases were running into the fixed
+  pre-commitment terminal, rather than committing a protected head (or
+  committing a streaming head only to terminal-error it immediately afterwards).
+  On the buffered H1/H2 path that gate is also the **audit** boundary. The one
+  terminal transaction summary is built from post-gate state, so it records the
+  status the client actually receives and the bounded
+  `authorization.termination_reason` class, and terminal transaction logging is
+  no longer awaited for a request carrying an authorization plan: awaiting it
+  let the credential expire while one logging plugin blocked, after earlier
+  plugins had already emitted the still-protected outcome, and an emitted audit
+  record cannot be retracted. That single summary now goes to the same bounded
+  observability-delivery cleanup the client RPC-deadline path already used —
+  every applicable plugin still receives it, in configured order, exactly once,
+  inside one finite-budget task — so the request task awaits nothing between the
+  gate and the response it hands to hyper. A request with no authorization plan
+  cannot expire there and keeps the historical sequential awaited contract.
+  Native HTTP/3 gRPC gets the same gate on its own writer: once before the first
+  client-visible terminal it can produce (the declared-size refusal) and once
+  after every response-header hook and policy, immediately before the response
+  HEADERS. Either produces the fixed trailers-only `grpc-status: 16` through the
+  bounded write-grace path, retires the gateway-owned upload pump, releases the
+  admission permits exactly once, and stays circuit-breaker, passive-health, and
+  adaptive-concurrency neutral. The response-header write itself is bounded by
+  the earliest of the client RPC deadline and the authorization deadline, and a
+  downstream that cannot accept the HEADERS by expiry is reset rather than
+  waited on again or misreported as `DEADLINE_EXCEEDED`. Every composed HTTP/3
+  dispatch and write seam carries that bound as a TYPED composition rather than
+  a bare instant — the native-H3 gRPC backend open and response-head race, the
+  buffered and streaming native-H3 downstream writes, and the cross-protocol
+  plain, terminal, and streaming writes — so a task that is not observed again
+  until after the LATER of the two instants still attributes the phase to the
+  bound that actually owned it instead of reporting a strictly earlier client
+  `grpc-timeout` as a security decision. Every HTTP/3
+  authorization exit — pre-commitment, blocked write, idle, and mid-body — now
+  records through the request's shared latch, so concurrent upload, response,
+  and terminal paths cannot double count one stream.
+
+- **Plain UDP** sessions are bounded by the same authorization lifetime as
+  DTLS ones (issue #3816). A plain-UDP listener runs the full
+  `on_stream_connect` admission chain, so it can admit a Consumer, an external
+  identity, and a credential deadline exactly like the DTLS frontend — and
+  because `on_stream_connect` runs once and is never repeated, an admitted
+  plain-UDP session was previously authorized indefinitely, which also left any
+  custom or future stream-auth plugin able to create one. The fallback maximum
+  is anchored at **first-datagram session admission**, before the epoch resolve,
+  the mesh egress decision, and the admission chain, so slow admission work
+  consumes the session's own lifetime instead of extending it. Every awaitable
+  post-admission setup stage runs under the bound (first-datagram
+  `on_udp_datagram` policy hooks, DNS resolution, backend bind/connect, backend
+  DTLS handshake), and the plan is re-read before the session is committed —
+  before any backend success is recorded, before the session map insert, before
+  the reply task exists, and before the first backend send. Both directions are
+  enforced afterwards: the client→backend forward (inline path, `last_client`
+  fast path, and the bounded hook-ingress worker) and the backend reply task's
+  arm, which is armed once outside its receive loop. An already-elapsed deadline
+  refuses the datagram inline rather than waiting for that timer to be
+  scheduled. At expiry the generation is marked expired before any cache or map
+  reuse, only that exact generation is removed, sockets/tasks/channels are
+  closed (cancelling an in-flight datagram hook), and the overload guard,
+  active-session slot, and any claimed HALF_OPEN circuit-breaker probe are
+  released exactly once and health-neutrally. The bounded class is settled once
+  through one shared latch onto the fixed-cardinality `stream_udp` counters and
+  the transaction summary, whose cause/direction identify a client-side,
+  backend-health-neutral decision carrying no identity, credential, certificate
+  field, expiry instant, or source address. Unauthenticated UDP is unchanged:
+  no plan exists, so the datagram path reads no clock, takes no lock, and
+  registers no timer.
+
+- Ordinary authorization-lifetime expiry is logged at `debug!` rather than
+  `warn!`. Expiry is expected lifecycle and is client-triggerable — a client
+  holding a short-TTL credential can produce one on every stream it opens, and
+  a single request can reach several such sites across the HTTP/3 relays, the
+  cross-protocol relays, and detached committed-response cleanup — so
+  warning-level logging was a log-amplification lever with no diagnostic value
+  the fixed-cardinality counters and the bounded
+  `authorization.termination_reason` metadata do not already carry. Every
+  message stays compiled in and redacted; `warn!`/`error!` is retained for
+  genuinely anomalous cleanup, write, and invariant failures.
+
+- `EnvConfig::validate()` no longer publishes the process-wide
+  `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` scalar. Validation ran that
+  publication immediately after the field's own range check, ahead of a dozen
+  later checks that can still reject the candidate, so a **rejected** parse
+  could re-bound every authenticated stream in a running process — and the
+  non-serving `ferrum-edge validate` command did the same. Validation is now
+  pure with respect to that global; the accepted startup configuration publishes
+  it exactly once, before any serving mode or listener can start, and the stored
+  value is always inside `1..=86400`.
+
+- TCP/TLS stream connect-**retry backoff** is bounded by the admitted session's
+  authorization lifetime (issue #3816). `retry_delay` grows with the attempt
+  number, so a chain of failing candidates could hold an admitted authenticated
+  session far past the credential that admitted it; unlike DNS, connect, and the
+  handshake, a raw sleep had no bound of its own. Expiry is settled exactly once,
+  no HALF_OPEN probe slot or in-flight state is leaked, no byte is forwarded, and
+  unauthenticated sessions are unaffected.
 
 - Live data-path coverage for the stock Envoy / third-party Istio xDS
   interoperability profile `FERRUM_MESH_CONFIG_PROTOCOL=stock_xds` (issue

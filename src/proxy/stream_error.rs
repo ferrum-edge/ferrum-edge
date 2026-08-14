@@ -96,6 +96,16 @@ pub enum StreamSetupKind {
     /// apply it correctly yet. Backend-side: the gateway is refusing to route
     /// with different semantics than the operator configured.
     UnsupportedStreamPolicy,
+    /// The authorization lifetime of the credential that admitted this stream
+    /// elapsed during post-admission setup (DNS, retry backoff, backend
+    /// connect/handshake, outbound PROXY framing, inspected-prefix forwarding),
+    /// before any backend or application byte was written (issue #3816).
+    ///
+    /// Client-side: like [`Self::RejectedByPlugin`], this is a gateway-policy
+    /// decision applied to the client's own credential, not a backend fault, so
+    /// it must stay health-neutral — it never records a circuit-breaker or
+    /// passive-health failure against the upstream.
+    AuthorizationExpired,
 }
 
 impl StreamSetupKind {
@@ -114,7 +124,8 @@ impl StreamSetupKind {
             | Self::NoHealthyTargets
             | Self::CircuitBreakerOpen
             | Self::BackendMaxConnectionsExceeded
-            | Self::UnsupportedStreamPolicy => None,
+            | Self::UnsupportedStreamPolicy
+            | Self::AuthorizationExpired => None,
         }
     }
 
@@ -135,7 +146,9 @@ impl StreamSetupKind {
         }
         matches!(
             self,
-            Self::RejectedByPlugin | Self::ClientDisconnectedDuringAdmission
+            Self::RejectedByPlugin
+                | Self::ClientDisconnectedDuringAdmission
+                | Self::AuthorizationExpired
         )
     }
 
@@ -184,6 +197,7 @@ impl StreamSetupKind {
             Self::UnsupportedStreamPolicy => {
                 crate::proxy::tcp_proxy::STREAM_ERR_UNSUPPORTED_STREAM_POLICY
             }
+            Self::AuthorizationExpired => crate::proxy::tcp_proxy::STREAM_ERR_AUTHORIZATION_EXPIRED,
         }
     }
 }

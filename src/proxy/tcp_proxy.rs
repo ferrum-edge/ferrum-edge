@@ -357,6 +357,221 @@ pub(crate) const STREAM_ERR_NO_HEALTHY_TARGETS: &str = "No healthy targets";
 pub(crate) const STREAM_ERR_CIRCUIT_BREAKER_OPEN: &str = "circuit breaker open";
 pub(crate) const STREAM_ERR_BACKEND_MAX_CONNECTIONS: &str = "Backend maxConnections reached";
 pub(crate) const STREAM_ERR_UNSUPPORTED_STREAM_POLICY: &str = "Unsupported stream policy";
+/// The authorization lifetime of the credential that admitted this stream
+/// elapsed during post-admission setup, before any backend or application byte
+/// was written. A compiled-in literal: it names the contract, never the
+/// credential, its subject, or its expiry instant.
+pub(crate) const STREAM_ERR_AUTHORIZATION_EXPIRED: &str =
+    "Authenticated stream authorization lifetime elapsed during setup";
+
+/// Run one post-admission setup stage under the admitted stream's absolute
+/// authorization deadline (issue #3816).
+///
+/// The deadline is anchored at admission and never refreshed, so wrapping a
+/// stage cannot extend it: a stage that started before the deadline is
+/// cancelled at the deadline, and a stage entered after it never runs. Dropping
+/// the stage future is what guarantees no backend or application byte is
+/// written on behalf of an expired credential — a partially completed connect,
+/// handshake, or write is abandoned rather than finished.
+///
+/// `None` (an unauthenticated stream session) runs the stage unbounded, with no
+/// timer registered at all.
+pub(crate) async fn within_stream_auth_deadline<F>(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    stage: F,
+) -> Result<F::Output, crate::proxy::auth_lifetime::StreamAuthTermination>
+where
+    F: std::future::Future,
+{
+    match plan {
+        Some(plan) => {
+            // `timeout_at` polls the wrapped future ONCE before it consults the
+            // deadline, so an already-elapsed plan — or a late wake after both
+            // the stage and the deadline are ready — would still enter the
+            // stage and let it write a backend byte (DNS lookup, connect,
+            // handshake, outbound PROXY v2 header) on a credential that is no
+            // longer authorizing this session. The shared expiry-first wait
+            // drops the stage unpolled.
+            match crate::plugins::await_deadline_first(Some(plan.at), stage).await {
+                Ok(output) => Ok(output),
+                Err(()) => Err(plan.termination),
+            }
+        }
+        None => Ok(stage.await),
+    }
+}
+
+/// Wait out one connect-retry backoff under the admitted stream's absolute
+/// authorization deadline (issue #3816).
+///
+/// A retry backoff is a post-admission setup wait like any other: `retry_delay`
+/// grows with the attempt number, so a chain of failing candidates can hold an
+/// admitted authenticated session for far longer than the credential that
+/// admitted it — and unlike DNS, connect, or the handshake, a raw
+/// `tokio::time::sleep` has no bound of its own at all.
+///
+/// Exact-deadline equality settles as EXPIRY rather than as a completed wait:
+/// a credential whose deadline is exactly now is no longer authorizing this
+/// session, so the backoff is never entered. That also makes the check correct
+/// for a zero-length delay, which would otherwise resolve on its first poll
+/// before any timer arm could be consulted.
+///
+/// `None` (an unauthenticated stream session) sleeps unbounded, with no timer
+/// registered beyond the backoff itself — the previous behavior byte for byte.
+pub(crate) async fn retry_backoff_within_stream_auth_deadline(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    delay: std::time::Duration,
+) -> Result<(), crate::proxy::auth_lifetime::StreamAuthTermination> {
+    let Some(plan) = plan else {
+        tokio::time::sleep(delay).await;
+        return Ok(());
+    };
+    match crate::plugins::await_deadline_first(Some(plan.at), tokio::time::sleep(delay)).await {
+        Ok(()) => Ok(()),
+        Err(()) => Err(plan.termination),
+    }
+}
+
+/// Settle a post-admission setup-phase authorization expiry.
+///
+/// Records the fixed-cardinality termination counter exactly once for this
+/// session (the shared flag is the same one the relay-phase wrapper latches, so
+/// a session can only be counted once no matter which phase terminated it),
+/// stamps the bounded class into the stream metadata so `on_stream_disconnect`
+/// and the stream transaction summary observe it through the ordinary
+/// lifecycle, and returns the typed client-side setup error.
+///
+/// The returned kind is health-neutral: `StreamSetupKind::AuthorizationExpired`
+/// is client-side, so no circuit-breaker or passive-health failure is recorded
+/// against the upstream. Callers that hold a claimed HALF_OPEN probe slot must
+/// still release it neutrally before returning this error.
+fn settle_stream_auth_setup_expiry(
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+    stream_ctx: &mut StreamConnectionContext,
+    expired: &AtomicBool,
+) -> anyhow::Error {
+    if !expired.swap(true, Ordering::AcqRel) {
+        crate::proxy::auth_lifetime::record_termination(
+            termination,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily::StreamTcp,
+        );
+        stream_ctx.insert_metadata(
+            crate::proxy::auth_lifetime::STREAM_AUTH_TERMINATION_METADATA_KEY.to_string(),
+            termination.as_str().to_string(),
+        );
+    }
+    StreamSetupError::new(
+        StreamSetupKind::AuthorizationExpired,
+        // Fixed suffix: the contract, never the credential, its subject, or
+        // its absolute expiry.
+        "before any backend byte was written".to_string(),
+    )
+    .into()
+}
+
+/// Effective authorization plan for an admitted TCP stream session, computed
+/// from the post-hook `StreamConnectionContext` (issue #3816).
+///
+/// `on_stream_connect` can admit a principal through a built-in, custom, or
+/// future plugin; this uses that actual authenticated state rather than
+/// assuming only TLS-terminating `mtls_auth`. Unauthenticated sessions return
+/// `None` and keep the previous splice/IORING/userspace fast paths.
+pub(crate) fn admitted_stream_auth_deadline(
+    stream_ctx: &StreamConnectionContext,
+    start: Instant,
+) -> Option<crate::proxy::auth_lifetime::StreamAuthDeadline> {
+    crate::proxy::auth_lifetime::effective_stream_auth_deadline(
+        stream_ctx.is_authenticated(),
+        stream_ctx.credential_deadline_at(),
+        tokio::time::Instant::from_std(start),
+        crate::proxy::auth_lifetime::authenticated_stream_max_lifetime_seconds(),
+    )
+}
+
+/// Kernel splice/IORING is only legal for an unauthenticated plain-to-plain
+/// TCP session. An admitted principal's authorization deadline cannot be
+/// enforced on sockets the kernel owns, so a `Some` plan always takes the
+/// userspace deadline-aware relay (issue #3816).
+#[inline]
+pub(crate) fn tcp_plain_splice_eligible(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+) -> bool {
+    plan.is_none()
+}
+
+/// Publish the bounded TCP authorization-lifetime termination class exactly
+/// once for this session after the relay returns. Fixed-cardinality: one class
+/// plus one protocol family, never an identity, certificate field, or absolute
+/// expiry.
+fn publish_stream_tcp_auth_termination(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    expired: &AtomicBool,
+    stream_ctx: &mut StreamConnectionContext,
+) {
+    if let Some(plan) = plan
+        && expired.load(Ordering::Acquire)
+    {
+        crate::proxy::auth_lifetime::record_termination(
+            plan.termination,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily::StreamTcp,
+        );
+        stream_ctx.insert_metadata(
+            crate::proxy::auth_lifetime::STREAM_AUTH_TERMINATION_METADATA_KEY.to_string(),
+            plan.termination.as_str().to_string(),
+        );
+    }
+}
+
+/// Copy timeouts, buffer size, and the admitted session's authorization
+/// deadline for [`bidirectional_copy_with_stream_auth`].
+struct StreamAuthCopyParams {
+    idle_timeout: Option<Duration>,
+    half_close_cap: Option<Duration>,
+    backend_read_timeout: Option<Duration>,
+    backend_write_timeout: Option<Duration>,
+    buf_size: usize,
+    plan: crate::proxy::auth_lifetime::StreamAuthDeadline,
+    expired: Arc<AtomicBool>,
+}
+
+/// Userspace TCP relay wrapped with the admitted session's authorization
+/// deadline. Used whenever [`tcp_plain_splice_eligible`] is false — both the
+/// terminating plaintext path and authenticated passthrough.
+async fn bidirectional_copy_with_stream_auth<C, B>(
+    client: C,
+    backend: B,
+    params: StreamAuthCopyParams,
+) -> StreamCopyResult
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let StreamAuthCopyParams {
+        idle_timeout,
+        half_close_cap,
+        backend_read_timeout,
+        backend_write_timeout,
+        buf_size,
+        plan,
+        expired,
+    } = params;
+    let bound = AuthorizationCopyBound {
+        at: plan.at,
+        expired: Arc::clone(&expired),
+    };
+    let client = AuthorizationDeadlineStream::new(client, plan.at, expired);
+    bidirectional_copy(
+        client,
+        backend,
+        idle_timeout,
+        half_close_cap,
+        backend_read_timeout,
+        backend_write_timeout,
+        buf_size,
+        Some(bound),
+    )
+    .await
+}
 
 /// Sentinel prefix used by the Linux splice paths
 /// (`io_uring_splice_direction`, `libc_splice_loop`) to signal that the
@@ -449,6 +664,27 @@ pub struct StreamCopyResult {
     pub bytes_client_to_backend: u64,
     pub bytes_backend_to_client: u64,
     pub first_failure: Option<StreamFirstFailure>,
+}
+
+/// Fail-closed relay result when a kernel-TLS frontend leg would carry an
+/// authenticated stream authorization deadline. The kernel splice relay cannot
+/// be bounded by the accepted credential's lifetime.
+#[cfg(target_os = "linux")]
+pub(crate) fn authenticated_ktls_relay_fail_closed() -> StreamCopyResult {
+    let error = anyhow::anyhow!(
+        "kTLS client leg cannot carry an authenticated stream authorization deadline: \
+         the kernel splice relay cannot be bounded by the accepted credential's lifetime"
+    );
+    StreamCopyResult {
+        bytes_client_to_backend: 0,
+        bytes_backend_to_client: 0,
+        first_failure: Some((
+            Direction::Unknown,
+            classify_stream_error(&error),
+            None,
+            error.to_string(),
+        )),
+    }
 }
 
 /// Combine a failure's direction and IO side into the front-end / back-end
@@ -650,6 +886,191 @@ fn pre_copy_disconnect_direction(error: &anyhow::Error, class: &ErrorClass) -> D
     }
 }
 
+/// Whether this TLS-terminating TCP listener may hand its socket to kernel TLS.
+///
+/// Decided BEFORE `accept_frontend_tls`, while the socket is still pristine:
+/// once `dangerous_into_kernel_connection` has installed kTLS there is no safe
+/// reverse conversion back to a userspace rustls session, so a connection that
+/// turns out to need an authorization deadline could only be refused outright.
+///
+/// The four terms:
+///
+/// * `ktls_enabled` — the operator opt-in.
+/// * `!is_backend_tls` — `splice(2)` needs both ends raw.
+/// * `!scan_first_bytes_decrypted` — a decrypted first-bytes read has already
+///   taken plaintext out of the TLS session.
+/// * no configured stream plugin declares
+///   [`Plugin::admits_authenticated_stream_principal`] — a kTLS leg is relayed
+///   by the kernel and cannot be wrapped by [`AuthorizationDeadlineStream`], so
+///   a listener that can admit a principal whose session must be bounded by an
+///   authorization deadline (issue #3816) stays on the buffered userspace path
+///   and keeps a usable, deadline-aware relay. This is the conservative
+///   direction: the cost of a false positive is losing an optional fast path,
+///   whereas a false negative would relay an authenticated session with no
+///   authorization bound at all.
+///
+/// Everything else that can refuse — kernel/cipher probes, TLS 1.3,
+/// confidentiality policy — is decided inside `try_ktls_accept`, which falls
+/// back to the buffered accept with the socket untouched.
+pub(crate) fn ktls_handoff_eligible(
+    ktls_enabled: bool,
+    is_backend_tls: bool,
+    scan_first_bytes_decrypted: bool,
+    plugins: &[Arc<dyn Plugin>],
+) -> bool {
+    ktls_enabled
+        && !is_backend_tls
+        && !scan_first_bytes_decrypted
+        && !plugins
+            .iter()
+            .any(|plugin| plugin.admits_authenticated_stream_principal())
+}
+
+/// Frontend leg handed to the userspace relay, with or without an
+/// authorization-lifetime bound. A concrete enum rather than a boxed trait
+/// object so the unbounded (and overwhelmingly common) case keeps the exact
+/// monomorphised `bidirectional_copy` it had before.
+enum StreamClientLeg<S> {
+    Plain(S),
+    Deadline(AuthorizationDeadlineStream<S>),
+}
+
+/// Frontend stream wrapper that terminates an admitted session at the accepted
+/// credential's authorization deadline (issue #3816).
+///
+/// The deadline is absolute and armed once at admission: relayed bytes in
+/// either direction never reset it. When it fires, both the read and the write
+/// half of the client leg start reporting `TimedOut`, which the relay's own
+/// Phase 1 / Phase 2 machinery treats exactly like any other client-side
+/// transport failure — so byte counters, first-failure attribution, adaptive
+/// buffer sampling, circuit-breaker classification, `on_stream_disconnect`, and
+/// the `StreamTransactionSummary` all complete exactly once through their
+/// existing paths, and the opposite direction is torn down with a bounded grace
+/// window rather than being left as a detached producer.
+///
+/// Wrapping the frontend leg (rather than racing the whole relay future in a
+/// `select!`) is what preserves that accounting: cancelling the relay future
+/// would drop its stack-local byte counters.
+///
+/// The wrapper alone is not sufficient. `bidirectional_copy` parks a direction
+/// on the *opposite* endpoint's `poll_write` / `poll_read` once a chunk is
+/// buffered, so neither half may poll this client leg — and tokio's
+/// `copy_bidirectional_with_sizes` fast path has the same gap. Production
+/// therefore also passes the same instant into [`bidirectional_copy`] as
+/// `auth_deadline`, which races the deadline as a top-level bound in both
+/// relay phases and refuses that fast path.
+///
+/// Carries no credential material — only a monotonic instant.
+pub struct AuthorizationDeadlineStream<S> {
+    inner: S,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    expired: Arc<AtomicBool>,
+}
+
+impl<S> AuthorizationDeadlineStream<S> {
+    pub fn new(inner: S, deadline_at: tokio::time::Instant, expired: Arc<AtomicBool>) -> Self {
+        Self {
+            inner,
+            deadline: Box::pin(tokio::time::sleep_until(deadline_at)),
+            expired,
+        }
+    }
+
+    /// Poll the absolute deadline. Returns `true` once it has elapsed. Latches:
+    /// after the first `true` the timer is not consulted again.
+    fn expired(&mut self, cx: &mut std::task::Context<'_>) -> bool {
+        if self.expired.load(Ordering::Acquire) {
+            return true;
+        }
+        if std::future::Future::poll(self.deadline.as_mut(), cx).is_ready() {
+            self.expired.store(true, Ordering::Release);
+            return true;
+        }
+        false
+    }
+}
+
+fn authorization_expired_io_error() -> std::io::Error {
+    // Fixed message: no expiry value, identity, certificate field, or provider
+    // detail. This never reaches the client as a payload — a raw stream has no
+    // error channel — but it does reach the relay's error classifier and the
+    // connection-scoped debug log.
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "authenticated stream terminated: authorization lifetime reached",
+    )
+}
+
+/// Absolute authorization bound raced at the top of [`bidirectional_copy`] so
+/// a stalled opposite endpoint cannot starve the deadline that
+/// [`AuthorizationDeadlineStream`] can only observe while the client leg is
+/// itself being polled.
+struct AuthorizationCopyBound {
+    at: tokio::time::Instant,
+    expired: Arc<AtomicBool>,
+}
+
+fn authorization_expired_first_failure() -> StreamFirstFailure {
+    let err = authorization_expired_io_error();
+    let msg = err.to_string();
+    let classified = anyhow::Error::new(err);
+    (
+        Direction::ClientToBackend,
+        classify_stream_error(&classified),
+        Some(StreamIoSide::Read),
+        msg,
+    )
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for AuthorizationDeadlineStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.expired(cx) {
+            return Poll::Ready(Err(authorization_expired_io_error()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for AuthorizationDeadlineStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if this.expired(cx) {
+            return Poll::Ready(Err(authorization_expired_io_error()));
+        }
+        Pin::new(&mut this.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.expired(cx) {
+            return Poll::Ready(Err(authorization_expired_io_error()));
+        }
+        Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // Shutdown must always be allowed through: it is the teardown the
+        // deadline itself is trying to reach, and refusing it would leave the
+        // socket half-open after expiry.
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 /// Crate-visible bounded bidirectional relay used by TCP-family paths that
 /// need the same idle and half-close watchdogs as the dedicated TCP proxy.
 #[allow(clippy::too_many_arguments)]
@@ -674,6 +1095,7 @@ where
         backend_read_timeout,
         backend_write_timeout,
         buf_size,
+        None,
     )
     .await
 }
@@ -735,6 +1157,43 @@ where
         backend_read_timeout,
         backend_write_timeout,
         buf_size,
+        None,
+    )
+    .await
+}
+
+/// Crate-visible entry point that wraps the client leg and races the
+/// authorization deadline as a top-level bound of [`bidirectional_copy`],
+/// matching the production TLS userspace path (issue #3816). All ordinary
+/// relay timeouts are disabled so the test can prove the authorization
+/// bound is not starved by a stalled opposite endpoint and does not take
+/// the `copy_bidirectional_with_sizes` fast path.
+#[allow(dead_code)]
+pub(crate) async fn bidirectional_copy_with_authorization_for_test<C, B>(
+    client: C,
+    backend: B,
+    deadline_at: tokio::time::Instant,
+    expired: Arc<AtomicBool>,
+    buf_size: usize,
+) -> StreamCopyResult
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let bound = AuthorizationCopyBound {
+        at: deadline_at,
+        expired: Arc::clone(&expired),
+    };
+    let client = AuthorizationDeadlineStream::new(client, deadline_at, expired);
+    bidirectional_copy(
+        client,
+        backend,
+        None,
+        None,
+        None,
+        None,
+        buf_size,
+        Some(bound),
     )
     .await
 }
@@ -2971,6 +3430,24 @@ async fn handle_tcp_connection_inner(
             .await?;
         }
 
+        // Authorization lifetime for the admitted passthrough session (issue
+        // #3816). Computed HERE — immediately after `on_stream_connect` — so
+        // DNS, connection admission, connect, outbound PROXY write, and the
+        // raw relay cannot outlive the credential that admitted an
+        // external/custom/mesh principal on passthrough encrypted bytes/SNI.
+        // Unauthenticated passthrough keeps `None` and the splice/IORING path.
+        let stream_auth_deadline = admitted_stream_auth_deadline(stream_ctx, start);
+        let stream_auth_expired = Arc::new(AtomicBool::new(false));
+        if let Some(termination) =
+            crate::proxy::auth_lifetime::expired_authorization(stream_auth_deadline)
+        {
+            return Err(settle_stream_auth_setup_expiry(
+                termination,
+                stream_ctx,
+                &stream_auth_expired,
+            ));
+        }
+
         // Resolve outbound PROXY framing before breaker admission — matching the
         // terminating TCP path. Client/config identity failures must fail closed
         // without claiming a half-open probe or charging backend health.
@@ -3035,12 +3512,11 @@ async fn handle_tcp_connection_inner(
         } else {
             None
         };
-        // Linux passthrough is always plain-to-plain raw TCP, so the splice
-        // path always runs. Backend directional timeouts are enforced inside
-        // the splice loops via per-direction watermarks — there is no longer
-        // a userspace-copy fallback for this branch.
+        // Linux unauthenticated passthrough is always plain-to-plain raw TCP, so
+        // the splice path runs. An authenticated passthrough session never
+        // splices: the kernel cannot carry the admitted authorization deadline.
         #[cfg(target_os = "linux")]
-        let splice_used = true;
+        let splice_used = tcp_plain_splice_eligible(stream_auth_deadline);
         #[cfg(not(target_os = "linux"))]
         let splice_used = false;
 
@@ -3050,16 +3526,34 @@ async fn handle_tcp_connection_inner(
         // half-open probe slot claimed by can_execute above is released —
         // otherwise an unresolvable passthrough hostname wedges HALF_OPEN
         // until reload.
-        let candidates = match dns_cache
-            .resolve_candidates(
+        let resolved_candidates = within_stream_auth_deadline(
+            stream_auth_deadline,
+            dns_cache.resolve_candidates(
                 &params.backend_host,
                 params.dns_override.as_deref(),
                 params.dns_cache_ttl_seconds,
-            )
-            .await
-        {
-            Ok(addresses) => addresses,
-            Err(e) => {
+            ),
+        )
+        .await;
+        let candidates = match resolved_candidates {
+            Err(termination) => {
+                if let Some(ref cb_config) = cb_info.cb_config {
+                    let cb = circuit_breaker_cache.get_or_create(
+                        &cb_info.namespace,
+                        proxy_id,
+                        cb_info.cb_target_key.as_deref(),
+                        cb_config,
+                    );
+                    cb.record_neutral(cb_info.is_half_open_probe);
+                }
+                return Err(settle_stream_auth_setup_expiry(
+                    termination,
+                    stream_ctx,
+                    &stream_auth_expired,
+                ));
+            }
+            Ok(Ok(addresses)) => addresses,
+            Ok(Err(e)) => {
                 if let Some(ref cb_config) = cb_info.cb_config {
                     let cb = circuit_breaker_cache.get_or_create(
                         &cb_info.namespace,
@@ -3131,34 +3625,54 @@ async fn handle_tcp_connection_inner(
 
         // Connect plain TCP to backend (no TLS origination — the client's encrypted
         // stream passes through directly to the backend which terminates TLS).
-        let (mut backend_stream, addr) = crate::dns::connect_candidates(
+        let connect_attempt = crate::dns::connect_candidates(
             &candidates,
             params.backend_port,
             connect_timeout,
             |addr| {
                 connect_backend_plain(addr, connect_timeout, params.tcp_fastopen_enabled, overload)
             },
-        )
-        .await
-        .map_err(|error| match error {
-            crate::dns::CandidateConnectError::TimedOut { last_addr } => anyhow::anyhow!(
-                "Backend TCP connect budget exhausted after {}ms (last={})",
-                params.backend_connect_timeout_ms,
-                last_addr
-            ),
-            crate::dns::CandidateConnectError::Failed { source, .. } => source,
-        })
-        .inspect_err(|_| {
-            if let Some(ref cb_config) = cb_info.cb_config {
-                let cb = circuit_breaker_cache.get_or_create(
-                    &cb_info.namespace,
-                    proxy_id,
-                    cb_info.cb_target_key.as_deref(),
-                    cb_config,
-                );
-                cb.record_failure(502, true, cb_info.is_half_open_probe);
+        );
+        let bounded_connect =
+            within_stream_auth_deadline(stream_auth_deadline, connect_attempt).await;
+        let (mut backend_stream, addr) = match bounded_connect {
+            Err(termination) => {
+                if let Some(ref cb_config) = cb_info.cb_config {
+                    let cb = circuit_breaker_cache.get_or_create(
+                        &cb_info.namespace,
+                        proxy_id,
+                        cb_info.cb_target_key.as_deref(),
+                        cb_config,
+                    );
+                    cb.record_neutral(cb_info.is_half_open_probe);
+                }
+                return Err(settle_stream_auth_setup_expiry(
+                    termination,
+                    stream_ctx,
+                    &stream_auth_expired,
+                ));
             }
-        })?;
+            Ok(result) => result
+                .map_err(|error| match error {
+                    crate::dns::CandidateConnectError::TimedOut { last_addr } => anyhow::anyhow!(
+                        "Backend TCP connect budget exhausted after {}ms (last={})",
+                        params.backend_connect_timeout_ms,
+                        last_addr
+                    ),
+                    crate::dns::CandidateConnectError::Failed { source, .. } => source,
+                })
+                .inspect_err(|_| {
+                    if let Some(ref cb_config) = cb_info.cb_config {
+                        let cb = circuit_breaker_cache.get_or_create(
+                            &cb_info.namespace,
+                            proxy_id,
+                            cb_info.cb_target_key.as_deref(),
+                            cb_config,
+                        );
+                        cb.record_failure(502, true, cb_info.is_half_open_probe);
+                    }
+                })?,
+        };
         backend_info.backend_resolved_ip = Some(addr.ip().to_string());
 
         // Apply DR `connectionPool.tcp.tcpKeepalive` on the freshly connected
@@ -3177,60 +3691,117 @@ async fn handle_tcp_connection_inner(
         // still fail here, and that I/O failure must release the admitted probe
         // on the already-selected breaker (once) before we return.
         if let Some(ref header) = outbound_proxy_v2_header {
-            write_outbound_proxy_v2_header(&mut backend_stream, header)
-                .await
-                .inspect_err(|_| {
-                    record_admitted_cb_proxy_v2_write_failure(
-                        admitted_cb.as_deref(),
-                        cb_info.is_half_open_probe,
-                    );
-                })?;
+            let write_res = match within_stream_auth_deadline(
+                stream_auth_deadline,
+                write_outbound_proxy_v2_header(&mut backend_stream, header),
+            )
+            .await
+            {
+                Err(termination) => {
+                    if let Some(cb) = admitted_cb.as_deref() {
+                        cb.record_neutral(cb_info.is_half_open_probe);
+                    }
+                    return Err(settle_stream_auth_setup_expiry(
+                        termination,
+                        stream_ctx,
+                        &stream_auth_expired,
+                    ));
+                }
+                Ok(write_res) => write_res,
+            };
+            write_res.inspect_err(|_| {
+                record_admitted_cb_proxy_v2_write_failure(
+                    admitted_cb.as_deref(),
+                    cb_info.is_half_open_probe,
+                );
+            })?;
         }
 
         let _backend_session_guard = TcpBackendSessionGuard::new(metrics);
         let buf_size = adaptive_buffer.get_buffer_size(&proxy.namespace, proxy_id);
 
-        // On Linux, use splice(2) for zero-copy relay between raw TCP sockets.
-        // Passthrough mode is always plain-to-plain (no TLS termination/origination).
-        // When io_uring is enabled, use IORING_OP_SPLICE on dedicated blocking threads.
-        // Both splice paths enforce backend_{read,write}_timeout_ms via per-direction
-        // watermarks inside their loops, so we no longer fall back to bidirectional_copy.
-        #[cfg(target_os = "linux")]
-        let copy_result = if io_uring_splice_enabled {
-            bidirectional_splice_io_uring_bounded_or_async(
+        if let Some(termination) =
+            crate::proxy::auth_lifetime::expired_authorization(stream_auth_deadline)
+        {
+            if let Some(cb) = admitted_cb.as_deref() {
+                cb.record_neutral(cb_info.is_half_open_probe);
+            }
+            return Err(settle_stream_auth_setup_expiry(
+                termination,
+                stream_ctx,
+                &stream_auth_expired,
+            ));
+        }
+
+        // Authenticated passthrough uses the userspace deadline-aware relay.
+        // Unauthenticated Linux passthrough keeps splice/IORING byte-for-byte.
+        let copy_result = if let Some(plan) = stream_auth_deadline {
+            bidirectional_copy_with_stream_auth(
                 client_stream,
                 backend_stream,
-                idle_timeout,
-                half_close_cap,
-                backend_read_timeout,
-                backend_write_timeout,
-                buf_size,
+                StreamAuthCopyParams {
+                    idle_timeout,
+                    half_close_cap,
+                    backend_read_timeout,
+                    backend_write_timeout,
+                    buf_size,
+                    plan,
+                    expired: Arc::clone(&stream_auth_expired),
+                },
             )
             .await
         } else {
-            bidirectional_splice(
-                client_stream,
-                backend_stream,
-                idle_timeout,
-                half_close_cap,
-                backend_read_timeout,
-                backend_write_timeout,
-                buf_size,
-                None,
-            )
-            .await
+            // On Linux, use splice(2) for zero-copy relay between raw TCP sockets.
+            // Unauthenticated passthrough is always plain-to-plain (no TLS
+            // termination/origination). When io_uring is enabled, use
+            // IORING_OP_SPLICE on dedicated blocking threads. Both splice paths
+            // enforce backend_{read,write}_timeout_ms via per-direction
+            // watermarks inside their loops, so we no longer fall back to
+            // bidirectional_copy.
+            #[cfg(target_os = "linux")]
+            {
+                if io_uring_splice_enabled {
+                    bidirectional_splice_io_uring_bounded_or_async(
+                        client_stream,
+                        backend_stream,
+                        idle_timeout,
+                        half_close_cap,
+                        backend_read_timeout,
+                        backend_write_timeout,
+                        buf_size,
+                    )
+                    .await
+                } else {
+                    bidirectional_splice(
+                        client_stream,
+                        backend_stream,
+                        idle_timeout,
+                        half_close_cap,
+                        backend_read_timeout,
+                        backend_write_timeout,
+                        buf_size,
+                        None,
+                    )
+                    .await
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                bidirectional_copy(
+                    client_stream,
+                    backend_stream,
+                    idle_timeout,
+                    half_close_cap,
+                    backend_read_timeout,
+                    backend_write_timeout,
+                    buf_size,
+                    None,
+                )
+                .await
+            }
         };
-        #[cfg(not(target_os = "linux"))]
-        let copy_result = bidirectional_copy(
-            client_stream,
-            backend_stream,
-            idle_timeout,
-            half_close_cap,
-            backend_read_timeout,
-            backend_write_timeout,
-            buf_size,
-        )
-        .await;
+
+        publish_stream_tcp_auth_termination(stream_auth_deadline, &stream_auth_expired, stream_ctx);
 
         // Only feed SUCCESSFUL relay sizes into the adaptive buffer tracker.
         // Failed relays (connect error, TLS failure, mid-stream RST) contribute
@@ -3341,7 +3912,12 @@ async fn handle_tcp_connection_inner(
         // refuse — kernel/cipher probes, TLS 1.3, secret-extraction opt-in —
         // is decided inside `try_ktls_accept` while the socket is still
         // pristine, so a refusal costs nothing but a ClientHello peek.
-        let ktls_eligible = ktls_enabled && !is_backend_tls && !scan_first_bytes_decrypted;
+        let ktls_eligible = ktls_handoff_eligible(
+            ktls_enabled,
+            is_backend_tls,
+            scan_first_bytes_decrypted,
+            plugins.as_ref(),
+        );
 
         // Frontend TLS failures return before any backend dispatch — no backend
         // circuit-breaker, pool, or socket interaction.
@@ -3489,6 +4065,26 @@ async fn handle_tcp_connection_inner(
         ClientRelayStream::Tls(Box::new(tls_stream))
     };
 
+    // Authorization lifetime for the admitted stream session (issue #3816).
+    //
+    // Computed HERE — immediately after `on_stream_connect` admission, before
+    // any post-admission async work — rather than just before the relay. Every
+    // stage between admission and the first relayed byte (DNS resolution, retry
+    // backoff, backend connect, backend TLS handshake, outbound PROXY framing,
+    // and forwarding the inspected client prefix) is asynchronous and can
+    // outlast the credential; computing the plan late would let those stages
+    // write application bytes to a backend on behalf of an expired credential.
+    //
+    // `on_stream_connect` ran once at admission and is never repeated, so
+    // without this the session would outlive the certificate that admitted it.
+    // The bound is the EARLIEST of the accepted credential's own deadline (for
+    // `mtls_auth`, the leaf `notAfter`) and the finite authenticated-stream
+    // maximum, anchored at admission and never refreshed by relayed bytes,
+    // retries, or backoff sleeps.
+    // Unauthenticated stream connections get `None` and are unaffected.
+    let stream_auth_deadline = admitted_stream_auth_deadline(stream_ctx, start);
+    let stream_auth_expired = Arc::new(AtomicBool::new(false));
+
     // Helper: record circuit breaker failure for the current target.
     let record_cb_failure =
         |cb_cache: &CircuitBreakerCache, proxy_id: &str, cb_info: &TcpConnCbInfo| {
@@ -3546,6 +4142,23 @@ async fn handle_tcp_connection_inner(
 
     let mut attempt = 0u32;
     let backend_addr = loop {
+        // Authorization lifetime (#3816): re-check at the top of EVERY attempt.
+        // Retries, backoff sleeps, and target rotation must not buy an admitted
+        // stream any additional authorized lifetime, so a credential that
+        // elapsed during the previous attempt refuses the next one before a
+        // circuit-breaker probe slot is claimed, a target is selected, or a
+        // socket is dialed. No probe slot is outstanding at this point (each
+        // attempt settles its own before `continue`), so nothing has to be
+        // released here.
+        if let Some(termination) =
+            crate::proxy::auth_lifetime::expired_authorization(stream_auth_deadline)
+        {
+            return Err(settle_stream_auth_setup_expiry(
+                termination,
+                stream_ctx,
+                &stream_auth_expired,
+            ));
+        }
         // Circuit breaker check — reject before attempting backend connection if open.
         // When admitted, capture whether this is a half-open probe so downstream
         // record_failure/record_success calls only decrement the in-flight counter
@@ -3611,17 +4224,36 @@ async fn handle_tcp_connection_inner(
             }
         }
 
-        // Resolve backend IP via DNS
-        let candidates = match dns_cache
-            .resolve_candidates(
+        // Resolve backend IP via DNS, bounded by the admitted stream's
+        // authorization lifetime: a resolver that stalls (or a chain of
+        // resolver retries) must not carry an expired credential into a
+        // backend dial.
+        // Awaited in its own statement so the resolver future (which borrows the
+        // current target) is dropped before the retry arms below rotate it.
+        let resolved_candidates = within_stream_auth_deadline(
+            stream_auth_deadline,
+            dns_cache.resolve_candidates(
                 &current_host,
                 params.dns_override.as_deref(),
                 params.dns_cache_ttl_seconds,
-            )
-            .await
-        {
-            Ok(addresses) => addresses,
-            Err(e) => {
+            ),
+        )
+        .await;
+        let candidates = match resolved_candidates {
+            Err(termination) => {
+                // A HALF_OPEN probe slot claimed by `can_execute` above is
+                // released NEUTRALLY: an expired client credential is not a
+                // backend outcome, and leaking the slot would wedge the
+                // breaker in HALF_OPEN.
+                record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
+                return Err(settle_stream_auth_setup_expiry(
+                    termination,
+                    stream_ctx,
+                    &stream_auth_expired,
+                ));
+            }
+            Ok(Ok(addresses)) => addresses,
+            Ok(Err(e)) => {
                 // A backend-egress-policy denial means no backend was dialed, so
                 // keep circuit-breaker accounting neutral (a denied literal/rebound
                 // target must not trip the breaker as a connect failure). Genuine
@@ -3675,8 +4307,26 @@ async fn handle_tcp_connection_inner(
                     backend_info.backend_resolved_ip = None;
                     last_connect_err = Some(anyhow::anyhow!(err_msg));
                     attempt += 1;
+                    // The backoff is part of the admitted session's setup, so
+                    // it is bounded by the same absolute plan every other setup
+                    // stage uses. No circuit-breaker settlement is owed here:
+                    // this attempt's outcome was already recorded above and
+                    // `current_cb_info.is_half_open_probe` was cleared for the
+                    // next target, so no HALF_OPEN probe slot is held across
+                    // the wait. Nothing has been written to a backend, so the
+                    // expiry is settled exactly once and returned.
                     if let Some(ref retry_config) = params.retry {
-                        tokio::time::sleep(crate::retry::retry_delay(retry_config, attempt)).await;
+                        let backoff = crate::retry::retry_delay(retry_config, attempt);
+                        if let Err(termination) =
+                            retry_backoff_within_stream_auth_deadline(stream_auth_deadline, backoff)
+                                .await
+                        {
+                            return Err(settle_stream_auth_setup_expiry(
+                                termination,
+                                stream_ctx,
+                                &stream_auth_expired,
+                            ));
+                        }
                     }
                     continue;
                 }
@@ -3756,8 +4406,26 @@ async fn handle_tcp_connection_inner(
                         .into(),
                     );
                     attempt += 1;
+                    // The backoff is part of the admitted session's setup, so
+                    // it is bounded by the same absolute plan every other setup
+                    // stage uses. No circuit-breaker settlement is owed here:
+                    // this attempt's outcome was already recorded above and
+                    // `current_cb_info.is_half_open_probe` was cleared for the
+                    // next target, so no HALF_OPEN probe slot is held across
+                    // the wait. Nothing has been written to a backend, so the
+                    // expiry is settled exactly once and returned.
                     if let Some(ref retry_config) = params.retry {
-                        tokio::time::sleep(crate::retry::retry_delay(retry_config, attempt)).await;
+                        let backoff = crate::retry::retry_delay(retry_config, attempt);
+                        if let Err(termination) =
+                            retry_backoff_within_stream_auth_deadline(stream_auth_deadline, backoff)
+                                .await
+                        {
+                            return Err(settle_stream_auth_setup_expiry(
+                                termination,
+                                stream_ctx,
+                                &stream_auth_expired,
+                            ));
+                        }
                     }
                     continue;
                 }
@@ -3774,7 +4442,7 @@ async fn handle_tcp_connection_inner(
         let current_host_ref = current_host.as_str();
         let params_ref = &params;
         let outbound_pp = outbound_proxy_v2_header.as_deref();
-        let connect_result = crate::dns::connect_candidates(
+        let connect_attempt = crate::dns::connect_candidates(
             &candidates,
             current_port,
             connect_timeout,
@@ -3814,16 +4482,38 @@ async fn handle_tcp_connection_inner(
                     Ok(BackendStream::Plain(stream))
                 }
             },
-        )
-        .await
-        .map_err(|error| match error {
-            crate::dns::CandidateConnectError::TimedOut { last_addr } => anyhow::anyhow!(
-                "Backend TCP connect budget exhausted after {}ms (last={})",
-                params.backend_connect_timeout_ms,
-                last_addr
-            ),
-            crate::dns::CandidateConnectError::Failed { source, .. } => source,
-        });
+        );
+        // Bound the whole dial — TCP connect across every candidate, the
+        // backend TLS handshake, and the outbound PROXY v2 header write — by
+        // the admitted stream's authorization lifetime. Cancelling the future
+        // at the deadline is what keeps the outbound PROXY header (the first
+        // backend-visible byte on a plain backend) from being written on behalf
+        // of an expired credential; a half-completed dial is dropped, closing
+        // the socket, rather than finished.
+        let bounded_connect =
+            within_stream_auth_deadline(stream_auth_deadline, connect_attempt).await;
+        let connect_result = match bounded_connect {
+            Err(termination) => {
+                // Health-neutral: release the HALF_OPEN probe slot without
+                // recording a backend outcome. `backend_inflight_guard_attempt`
+                // is dropped by this return, so the per-target inflight slot is
+                // released too.
+                record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
+                return Err(settle_stream_auth_setup_expiry(
+                    termination,
+                    stream_ctx,
+                    &stream_auth_expired,
+                ));
+            }
+            Ok(result) => result.map_err(|error| match error {
+                crate::dns::CandidateConnectError::TimedOut { last_addr } => anyhow::anyhow!(
+                    "Backend TCP connect budget exhausted after {}ms (last={})",
+                    params.backend_connect_timeout_ms,
+                    last_addr
+                ),
+                crate::dns::CandidateConnectError::Failed { source, .. } => source,
+            }),
+        };
 
         match connect_result {
             Ok((_stream, addr)) => {
@@ -3875,8 +4565,26 @@ async fn handle_tcp_connection_inner(
                     backend_info.backend_resolved_ip = None;
                     last_connect_err = Some(e);
                     attempt += 1;
+                    // The backoff is part of the admitted session's setup, so
+                    // it is bounded by the same absolute plan every other setup
+                    // stage uses. No circuit-breaker settlement is owed here:
+                    // this attempt's outcome was already recorded above and
+                    // `current_cb_info.is_half_open_probe` was cleared for the
+                    // next target, so no HALF_OPEN probe slot is held across
+                    // the wait. Nothing has been written to a backend, so the
+                    // expiry is settled exactly once and returned.
                     if let Some(ref retry_config) = params.retry {
-                        tokio::time::sleep(crate::retry::retry_delay(retry_config, attempt)).await;
+                        let backoff = crate::retry::retry_delay(retry_config, attempt);
+                        if let Err(termination) =
+                            retry_backoff_within_stream_auth_deadline(stream_auth_deadline, backoff)
+                                .await
+                        {
+                            return Err(settle_stream_auth_setup_expiry(
+                                termination,
+                                stream_ctx,
+                                &stream_auth_expired,
+                            ));
+                        }
                     }
                     continue;
                 }
@@ -3896,9 +4604,33 @@ async fn handle_tcp_connection_inner(
     let forwarded_prefix_len = match client_first_bytes_forward.as_deref() {
         Some(prefix) if !prefix.is_empty() => {
             use tokio::io::AsyncWriteExt;
-            let write_res = match &mut backend_stream {
-                BackendStream::Tls(bs) => bs.write_all(prefix).await,
-                BackendStream::Plain(bs) => bs.write_all(prefix).await,
+            // These are APPLICATION bytes from the client. They are the last
+            // thing written before the relay starts, so the authorization
+            // lifetime is enforced around the write itself: an already-elapsed
+            // credential never forwards them, and a write that parks on a
+            // non-reading backend is cancelled at the deadline.
+            let write_res = match within_stream_auth_deadline(stream_auth_deadline, async {
+                match &mut backend_stream {
+                    BackendStream::Tls(bs) => bs.write_all(prefix).await,
+                    BackendStream::Plain(bs) => bs.write_all(prefix).await,
+                }
+            })
+            .await
+            {
+                Err(termination) => {
+                    // Settle the HALF_OPEN probe slot claimed for the connect
+                    // that succeeded above. Neutral: an expired client
+                    // credential is not a backend outcome, so the breaker,
+                    // passive health, and the adaptive buffer tracker are all
+                    // left untouched.
+                    record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
+                    return Err(settle_stream_auth_setup_expiry(
+                        termination,
+                        stream_ctx,
+                        &stream_auth_expired,
+                    ));
+                }
+                Ok(write_res) => write_res,
             };
             write_res.map_err(|e| {
                 anyhow::anyhow!("failed forwarding inspected first bytes to backend: {e}")
@@ -3908,9 +4640,42 @@ async fn handle_tcp_connection_inner(
         _ => 0,
     };
 
+    // Final pre-relay gate. The dial, handshake, and prefix forward are each
+    // bounded above; this catches an authorization lifetime that elapsed in the
+    // gap between them (or one that was already elapsed when a stream with no
+    // inspected prefix reached here) before the relay moves a single byte.
+    if let Some(termination) =
+        crate::proxy::auth_lifetime::expired_authorization(stream_auth_deadline)
+    {
+        record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
+        return Err(settle_stream_auth_setup_expiry(
+            termination,
+            stream_ctx,
+            &stream_auth_expired,
+        ));
+    }
+
     // Start bidirectional copy. From here, no retries — bytes may be exchanged.
     let mut used_splice = false;
     let copy_result = match client_stream {
+        // Defensive invariant, not a live path. A kernel-TLS frontend leg is
+        // relayed by `splice(2)`, which owns the sockets and cannot be wrapped
+        // by `AuthorizationDeadlineStream`. `ktls_handoff_eligible` therefore
+        // refuses the handoff BEFORE the handshake for any listener carrying a
+        // plugin that can admit an authenticated principal, so such a
+        // connection reaches the `ClientRelayStream::Tls` arm below on the
+        // buffered userspace path and is relayed normally with its deadline.
+        //
+        // Reaching here would mean a plugin admitted a principal without
+        // declaring `admits_authenticated_stream_principal`. That is a
+        // composition bug, and the only safe response is to fail closed rather
+        // than relay an authenticated session with no authorization bound: the
+        // session cannot be converted back to userspace TLS at this point.
+        #[cfg(target_os = "linux")]
+        ClientRelayStream::Ktls(..) if stream_auth_deadline.is_some() => {
+            used_splice = false;
+            authenticated_ktls_relay_fail_closed()
+        }
         ClientRelayStream::Tls(tls_stream) => {
             // Userspace rustls relay. This is the fallback for every kTLS
             // refusal (non-Linux, TLS 1.3, unsupported/unprobed cipher, kernel
@@ -3919,28 +4684,77 @@ async fn handle_tcp_connection_inner(
             // kernel does not own.
             let tls_stream = *tls_stream;
             let buf_size = adaptive_buffer.get_buffer_size(&proxy.namespace, proxy_id);
-            match backend_stream {
-                BackendStream::Tls(bs) => {
+            // Wrap the frontend leg when the session carries an authorization
+            // deadline. Expiry surfaces to the relay as an ordinary client-side
+            // transport failure, so byte counters, first-failure attribution,
+            // circuit-breaker classification, `on_stream_disconnect`, and the
+            // stream transaction summary all run exactly once through their
+            // existing paths and the backend direction is drained under the
+            // relay's own bounded grace window.
+            let client_leg = match stream_auth_deadline {
+                Some(plan) => StreamClientLeg::Deadline(AuthorizationDeadlineStream::new(
+                    tls_stream,
+                    plan.at,
+                    Arc::clone(&stream_auth_expired),
+                )),
+                None => StreamClientLeg::Plain(tls_stream),
+            };
+            match (client_leg, backend_stream) {
+                (StreamClientLeg::Plain(cs), BackendStream::Tls(bs)) => {
                     bidirectional_copy(
-                        tls_stream,
+                        cs,
                         bs,
                         idle_timeout,
                         half_close_cap,
                         backend_read_timeout,
                         backend_write_timeout,
                         buf_size,
+                        None,
                     )
                     .await
                 }
-                BackendStream::Plain(bs) => {
+                (StreamClientLeg::Plain(cs), BackendStream::Plain(bs)) => {
                     bidirectional_copy(
-                        tls_stream,
+                        cs,
                         bs,
                         idle_timeout,
                         half_close_cap,
                         backend_read_timeout,
                         backend_write_timeout,
                         buf_size,
+                        None,
+                    )
+                    .await
+                }
+                (StreamClientLeg::Deadline(cs), BackendStream::Tls(bs)) => {
+                    bidirectional_copy(
+                        cs,
+                        bs,
+                        idle_timeout,
+                        half_close_cap,
+                        backend_read_timeout,
+                        backend_write_timeout,
+                        buf_size,
+                        stream_auth_deadline.map(|plan| AuthorizationCopyBound {
+                            at: plan.at,
+                            expired: Arc::clone(&stream_auth_expired),
+                        }),
+                    )
+                    .await
+                }
+                (StreamClientLeg::Deadline(cs), BackendStream::Plain(bs)) => {
+                    bidirectional_copy(
+                        cs,
+                        bs,
+                        idle_timeout,
+                        half_close_cap,
+                        backend_read_timeout,
+                        backend_write_timeout,
+                        buf_size,
+                        stream_auth_deadline.map(|plan| AuthorizationCopyBound {
+                            at: plan.at,
+                            expired: Arc::clone(&stream_auth_expired),
+                        }),
                     )
                     .await
                 }
@@ -3996,8 +4810,45 @@ async fn handle_tcp_connection_inner(
         }
         ClientRelayStream::Plain(client_stream) => {
             let buf_size = adaptive_buffer.get_buffer_size(&proxy.namespace, proxy_id);
-            match backend_stream {
-                BackendStream::Tls(bs) => {
+            match (stream_auth_deadline, backend_stream) {
+                (Some(plan), BackendStream::Tls(bs)) => {
+                    used_splice = false;
+                    bidirectional_copy_with_stream_auth(
+                        client_stream,
+                        bs,
+                        StreamAuthCopyParams {
+                            idle_timeout,
+                            half_close_cap,
+                            backend_read_timeout,
+                            backend_write_timeout,
+                            buf_size,
+                            plan,
+                            expired: Arc::clone(&stream_auth_expired),
+                        },
+                    )
+                    .await
+                }
+                (Some(plan), BackendStream::Plain(bs)) => {
+                    // An admitted plaintext identity never takes splice/IORING:
+                    // the kernel owns the sockets and cannot carry the session's
+                    // authorization deadline (issue #3816).
+                    used_splice = false;
+                    bidirectional_copy_with_stream_auth(
+                        client_stream,
+                        bs,
+                        StreamAuthCopyParams {
+                            idle_timeout,
+                            half_close_cap,
+                            backend_read_timeout,
+                            backend_write_timeout,
+                            buf_size,
+                            plan,
+                            expired: Arc::clone(&stream_auth_expired),
+                        },
+                    )
+                    .await
+                }
+                (None, BackendStream::Tls(bs)) => {
                     used_splice = false;
                     bidirectional_copy(
                         client_stream,
@@ -4007,15 +4858,18 @@ async fn handle_tcp_connection_inner(
                         backend_read_timeout,
                         backend_write_timeout,
                         buf_size,
+                        None,
                     )
                     .await
                 }
-                BackendStream::Plain(bs) => {
+                (None, BackendStream::Plain(bs)) => {
                     // On Linux, use splice(2) for zero-copy relay when both sides
-                    // are raw TCP (no frontend TLS, no backend TLS). When io_uring
-                    // is enabled, use IORING_OP_SPLICE on blocking threads. Both
-                    // splice paths enforce backend_{read,write}_timeout_ms via
-                    // per-direction watermarks inside their loops.
+                    // are raw TCP (no frontend TLS, no backend TLS) AND the
+                    // session is unauthenticated. When io_uring is enabled, use
+                    // IORING_OP_SPLICE on blocking threads. Both splice paths
+                    // enforce backend_{read,write}_timeout_ms via per-direction
+                    // watermarks inside their loops.
+                    debug_assert!(tcp_plain_splice_eligible(stream_auth_deadline));
                     #[cfg(target_os = "linux")]
                     {
                         used_splice = true;
@@ -4055,6 +4909,7 @@ async fn handle_tcp_connection_inner(
                             backend_read_timeout,
                             backend_write_timeout,
                             buf_size,
+                            None,
                         )
                         .await
                     }
@@ -4062,6 +4917,8 @@ async fn handle_tcp_connection_inner(
             }
         }
     };
+
+    publish_stream_tcp_auth_termination(stream_auth_deadline, &stream_auth_expired, stream_ctx);
 
     // Record adaptive buffer stats for the TLS/non-passthrough path.
     // Only feed SUCCESSFUL relay sizes into the adaptive buffer tracker — see
@@ -6628,6 +7485,13 @@ where
                         }
                         Poll::Ready(Ok(nw)) => {
                             state.pos += nw;
+                            // Count as soon as the destination accepts bytes,
+                            // matching splice. Waiting until the whole chunk
+                            // lands would report zero when a stalled write is
+                            // cut by the authorization deadline — the same
+                            // shape as the unbounded fast path, which this
+                            // direction-tracking path exists to avoid.
+                            bytes.fetch_add(nw as u64, Ordering::Relaxed);
                             if let Some(wm) = write_watermark {
                                 wm.store(coarse_now_ms(), Ordering::Relaxed);
                             }
@@ -6639,7 +7503,6 @@ where
                     }
                 }
 
-                bytes.fetch_add(state.cap as u64, Ordering::Relaxed);
                 state.pos = 0;
                 state.cap = 0;
                 state.phase = CopyPhase::Reading;
@@ -6794,18 +7657,22 @@ fn poll_ready_watchdog_ticks(
 /// if no data is received on either side for the given duration.
 ///
 /// **Fast path**: When `idle_timeout`, `half_close_cap`,
-/// `backend_read_timeout`, and `backend_write_timeout` are all `None` or zero,
-/// the function delegates to `tokio::io::copy_bidirectional_with_sizes`,
-/// skipping the Phase 1/Phase 2 machinery. This restores the historical
-/// zero-overhead behaviour for deployments that explicitly disable all relay
-/// bounds. The trade-off: on error the fast path loses `first_failure`
-/// direction attribution (reports `Direction::Unknown`) and reports zero
-/// per-direction byte counts — tokio's bidirectional copy does not expose
-/// partial totals on `Err`. That zero-on-error shape is intentional and
-/// reachable only when the operator sets idle timeout, half-close cap, and
-/// both backend inactivity timeouts to `0`; any non-zero bound opts into
-/// the direction-tracking path which preserves counters. Clean completion
-/// preserves per-direction byte counts.
+/// `backend_read_timeout`, and `backend_write_timeout` are all `None` or zero
+/// *and* no authorization bound is armed, the function delegates to
+/// `tokio::io::copy_bidirectional_with_sizes`, skipping the Phase 1/Phase 2
+/// machinery. This restores the historical zero-overhead behaviour for
+/// deployments that explicitly disable all relay bounds. The trade-off: on
+/// error the fast path loses `first_failure` direction attribution (reports
+/// `Direction::Unknown`) and reports zero per-direction byte counts — tokio's
+/// bidirectional copy does not expose partial totals on `Err`. That
+/// zero-on-error shape is intentional and reachable only when the operator
+/// sets idle timeout, half-close cap, and both backend inactivity timeouts
+/// to `0`; any non-zero bound opts into the direction-tracking path which
+/// preserves counters. An authorization-bound stream never takes this fast
+/// path: tokio's copy can park both halves on the opposite endpoint and
+/// starve the client-leg wrapper. Clean completion preserves per-direction
+/// byte counts.
+#[allow(clippy::too_many_arguments)]
 async fn bidirectional_copy<C, B>(
     mut client: C,
     mut backend: B,
@@ -6814,6 +7681,7 @@ async fn bidirectional_copy<C, B>(
     backend_read_timeout: Option<Duration>,
     backend_write_timeout: Option<Duration>,
     buf_size: usize,
+    auth_deadline: Option<AuthorizationCopyBound>,
 ) -> StreamCopyResult
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -6829,12 +7697,19 @@ where
     // `backend_read_timeout` / `backend_write_timeout` inherently require the
     // direction-tracking path — they wrap individual `read`/`write` polls,
     // which tokio's bidirectional copy does not expose. Any non-zero timeout
-    // here opts out of the fast path.
+    // here opts out of the fast path. An authorization bound also opts out:
+    // the fast path can park both halves on the opposite endpoint and never
+    // poll the wrapped client leg.
     let idle_disabled = idle_timeout.is_none_or(|d| d.is_zero());
     let cap_disabled = half_close_cap.is_none_or(|d| d.is_zero());
     let read_to_disabled = backend_read_timeout.is_none_or(|d| d.is_zero());
     let write_to_disabled = backend_write_timeout.is_none_or(|d| d.is_zero());
-    if idle_disabled && cap_disabled && read_to_disabled && write_to_disabled {
+    if idle_disabled
+        && cap_disabled
+        && read_to_disabled
+        && write_to_disabled
+        && auth_deadline.is_none()
+    {
         return match tokio::io::copy_bidirectional_with_sizes(
             &mut client,
             &mut backend,
@@ -6930,6 +7805,13 @@ where
             backend_write_timeout,
         ]))
     });
+    // Top-level authorization timer: polled even when both copy halves are
+    // parked on the opposite endpoint, so a stalled backend cannot starve
+    // the admitted credential's deadline. Direct Instant race, not a
+    // periodic watchdog tick.
+    let mut auth_deadline_sleep = auth_deadline
+        .as_ref()
+        .map(|bound| Box::pin(tokio::time::sleep_until(bound.at)));
 
     // Phase 1: race the two directions (plus optional idle check).
     let mut first_failure: Option<(Direction, ErrorClass, Option<StreamIoSide>, String)> = None;
@@ -6949,6 +7831,19 @@ where
     let phase1_outcome = poll_fn(|cx| {
         // Fairness invariant: each live direction is polled exactly once per
         // poll_fn invocation; the first-polled direction alternates each call.
+        // The authorization deadline is polled FIRST so a simultaneously ready
+        // write cannot escape after the credential has expired.
+        if let Some(sleep) = auth_deadline_sleep.as_mut()
+            && std::future::Future::poll(sleep.as_mut(), cx).is_ready()
+        {
+            if let Some(bound) = auth_deadline.as_ref() {
+                bound.expired.store(true, Ordering::Release);
+            }
+            return Poll::Ready(Phase1Outcome::Watchdog(
+                authorization_expired_first_failure(),
+            ));
+        }
+
         let poll_c2b_this_turn = poll_c2b_first;
         poll_c2b_first = !poll_c2b_first;
 
@@ -7064,20 +7959,24 @@ where
     let clean_eof = first_failure.is_none();
     if !c2b_done {
         if clean_eof {
-            first_failure = drain_half_close_direction(
-                &mut client,
-                &mut backend,
-                &mut c2b_state,
-                &c2b_bytes,
-                last_activity,
-                idle_timeout,
-                timeout_ms,
-                half_close_cap,
-                Direction::ClientToBackend,
-                c2b_write_watermark,
-                backend_write_timeout_ms,
-                &c2b_bytes,
-                &b2c_bytes,
+            first_failure = drain_remaining_or_authorization_expire(
+                auth_deadline.as_ref(),
+                auth_deadline_sleep.as_mut(),
+                drain_half_close_direction(
+                    &mut client,
+                    &mut backend,
+                    &mut c2b_state,
+                    &c2b_bytes,
+                    last_activity,
+                    idle_timeout,
+                    timeout_ms,
+                    half_close_cap,
+                    Direction::ClientToBackend,
+                    c2b_write_watermark,
+                    backend_write_timeout_ms,
+                    &c2b_bytes,
+                    &b2c_bytes,
+                ),
             )
             .await;
         } else {
@@ -7126,20 +8025,24 @@ where
     }
     if !b2c_done {
         if clean_eof {
-            first_failure = drain_half_close_direction(
-                &mut backend,
-                &mut client,
-                &mut b2c_state,
-                &b2c_bytes,
-                last_activity,
-                idle_timeout,
-                timeout_ms,
-                half_close_cap,
-                Direction::BackendToClient,
-                b2c_read_watermark,
-                backend_read_timeout_ms,
-                &c2b_bytes,
-                &b2c_bytes,
+            first_failure = drain_remaining_or_authorization_expire(
+                auth_deadline.as_ref(),
+                auth_deadline_sleep.as_mut(),
+                drain_half_close_direction(
+                    &mut backend,
+                    &mut client,
+                    &mut b2c_state,
+                    &b2c_bytes,
+                    last_activity,
+                    idle_timeout,
+                    timeout_ms,
+                    half_close_cap,
+                    Direction::BackendToClient,
+                    b2c_read_watermark,
+                    backend_read_timeout_ms,
+                    &c2b_bytes,
+                    &b2c_bytes,
+                ),
             )
             .await;
         } else {
@@ -7181,6 +8084,31 @@ where
         bytes_client_to_backend: c2b_bytes.load(Ordering::Relaxed),
         bytes_backend_to_client: b2c_bytes.load(Ordering::Relaxed),
         first_failure,
+    }
+}
+
+/// Race a Phase-2 half-close drain against the remaining authorization
+/// deadline. When no bound is armed this is exactly `drain.await`.
+async fn drain_remaining_or_authorization_expire<F>(
+    bound: Option<&AuthorizationCopyBound>,
+    sleep: Option<&mut Pin<Box<tokio::time::Sleep>>>,
+    drain: F,
+) -> Option<StreamFirstFailure>
+where
+    F: std::future::Future<Output = Option<StreamFirstFailure>>,
+{
+    let Some(sleep) = sleep else {
+        return drain.await;
+    };
+    tokio::select! {
+        biased;
+        () = sleep.as_mut() => {
+            if let Some(bound) = bound {
+                bound.expired.store(true, Ordering::Release);
+            }
+            Some(authorization_expired_first_failure())
+        }
+        result = drain => result,
     }
 }
 

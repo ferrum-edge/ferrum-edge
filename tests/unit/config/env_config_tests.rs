@@ -3458,6 +3458,133 @@ fn test_env_config_websocket_max_lifetime_rejects_unbounded_values() {
     }
 }
 
+#[test]
+fn test_env_config_authenticated_stream_max_lifetime_is_finite_and_configurable() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS");
+            assert_eq!(
+                EnvConfig::from_env()
+                    .unwrap()
+                    .authenticated_stream_max_lifetime_seconds,
+                3_600
+            );
+        },
+    );
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS", "120"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.authenticated_stream_max_lifetime_seconds, 120);
+        },
+    );
+}
+
+/// A configuration REJECTED by a later validation must not mutate the live
+/// process-wide authenticated-stream maximum.
+///
+/// `validate()` used to publish this scalar immediately after its own range
+/// check, before a dozen later checks that can still return `Err`. A candidate
+/// that cleared `1..=86400` and then failed anything after it silently
+/// re-bounded every authenticated stream in a running process — and
+/// `ferrum-edge validate`, which is not supposed to touch a live process at
+/// all, did the same. Validation is now pure with respect to this global;
+/// publication happens once, from the accepted startup configuration.
+#[test]
+fn test_rejected_env_config_does_not_mutate_the_process_wide_stream_lifetime() {
+    // Serializes against every other writer of this process-wide scalar (and
+    // against the env-var mutators) through the ONE shared test lock, and
+    // restores the prior value on drop.
+    let lifetime_guard = crate::unit::env_lock::StreamAuthMaxLifetimeGuard::new();
+    lifetime_guard.publish(3_600);
+
+    // Valid for THIS field's range check, but the configuration is rejected by
+    // a later check inside the same `validate()` call.
+    // SAFETY: `lifetime_guard` owns the process-wide environment lock.
+    unsafe {
+        std::env::set_var("FERRUM_MODE", "file");
+        std::env::set_var("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml");
+        std::env::set_var("FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS", "120");
+        std::env::set_var("FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS", "1000000");
+    }
+    let error = EnvConfig::from_env().expect_err("the later check must reject this configuration");
+    assert!(
+        error.contains("FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS"),
+        "expected the LATER validation to be the rejection reason, got: {error}"
+    );
+    assert_eq!(
+        lifetime_guard.published(),
+        3_600,
+        "a rejected configuration must not publish its authenticated-stream maximum"
+    );
+
+    // The same configuration, now accepted, DOES publish — from the accepted
+    // startup seam `main.rs` calls before any listener binds.
+    // SAFETY: `lifetime_guard` owns the process-wide environment lock.
+    unsafe {
+        std::env::remove_var("FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS");
+    }
+    let accepted = EnvConfig::from_env().expect("now a valid configuration");
+    assert_eq!(accepted.authenticated_stream_max_lifetime_seconds, 120);
+    assert_eq!(
+        lifetime_guard.published(),
+        3_600,
+        "parsing an accepted configuration is still not publication"
+    );
+    ferrum_edge::_test_support::publish_accepted_startup_env_config_for_test(&accepted);
+    assert_eq!(
+        lifetime_guard.published(),
+        120,
+        "the accepted startup configuration publishes exactly once, at the startup seam"
+    );
+
+    // SAFETY: `lifetime_guard` owns the process-wide environment lock.
+    unsafe {
+        std::env::remove_var("FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS");
+        std::env::remove_var("FERRUM_FILE_CONFIG_PATH");
+        std::env::remove_var("FERRUM_MODE");
+    }
+}
+
+/// The stored value is always inside the validated range, whatever a caller
+/// passes. Validation still rejects out-of-range configurations outright — this
+/// is the stored-invariant backstop, not a second policy.
+#[test]
+fn test_published_stream_lifetime_is_always_inside_the_validated_range() {
+    let lifetime_guard = crate::unit::env_lock::StreamAuthMaxLifetimeGuard::new();
+    for (published, expected) in [(0u64, 1u64), (u64::MAX, 86_400), (120, 120)] {
+        lifetime_guard.publish(published);
+        assert_eq!(lifetime_guard.published(), expected);
+    }
+}
+
+#[test]
+fn test_env_config_authenticated_stream_max_lifetime_rejects_unbounded_values() {
+    // A credential accepted without an authoritative expiry must still receive
+    // a finite bound, so there is deliberately no "0 disables" escape hatch.
+    for value in ["0", "86401"] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS", value),
+            ],
+            || {
+                let error = EnvConfig::from_env().unwrap_err();
+                assert!(error.contains("FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS"));
+            },
+        );
+    }
+}
+
 // ============================================================================
 // HTTP Header Read Timeout Tests
 // ============================================================================
@@ -7077,5 +7204,60 @@ fn unix_ingress_max_connections_rejects_an_unreachable_ceiling() {
                 "the error must name the setting, got {err}"
             );
         },
+    );
+}
+
+/// Validation must stay PURE with respect to the process-wide
+/// authenticated-stream maximum, and the accepted startup configuration must be
+/// the one and only publisher — before any mode can bind a listener.
+///
+/// This is a source contract because the failure it prevents is invisible at
+/// runtime in the common case: publishing from `validate` is only wrong when a
+/// LATER check rejects the same candidate, or when the non-serving `validate`
+/// subcommand runs against a live process.
+#[test]
+fn test_stream_lifetime_is_published_only_from_the_accepted_startup_config() {
+    const ENV_CONFIG_SOURCE: &str = include_str!("../../../src/config/env_config.rs");
+    const MAIN_SOURCE: &str = include_str!("../../../src/main.rs");
+    const PUBLISH_CALL: &str = "publish_authenticated_stream_max_lifetime_seconds(";
+
+    let validate = ENV_CONFIG_SOURCE
+        .split("fn validate(&mut self) -> Result<(), String> {")
+        .nth(1)
+        .expect("EnvConfig::validate");
+    assert!(
+        !validate.contains(PUBLISH_CALL),
+        "EnvConfig::validate must not publish the process-wide authenticated-stream maximum: \
+         a candidate that clears this field's range check can still be rejected by a later \
+         check, and `ferrum-edge validate` must not mutate a live process"
+    );
+
+    // Exactly one publisher, and it is the accepted-startup seam.
+    assert_eq!(
+        ENV_CONFIG_SOURCE.matches(PUBLISH_CALL).count(),
+        1,
+        "the accepted-startup seam is the only caller in env_config.rs"
+    );
+    let publisher = ENV_CONFIG_SOURCE
+        .split("pub(crate) fn publish_process_wide_stream_settings(&self) {")
+        .nth(1)
+        .expect("the accepted-startup publication seam");
+    assert!(publisher.contains(PUBLISH_CALL));
+
+    // `main.rs` calls it on the serving path, after `EnvConfig::from_env()`
+    // succeeded and before mode dispatch.
+    let accepted_at = MAIN_SOURCE
+        .find("env_config.publish_process_wide_stream_settings();")
+        .expect("main.rs must publish the accepted startup stream settings");
+    let from_env_at = MAIN_SOURCE
+        .find("let env_config = match EnvConfig::from_env() {")
+        .expect("the accepted startup configuration");
+    let dispatch_at = MAIN_SOURCE
+        .find("let result = match env_config.mode {")
+        .expect("mode dispatch");
+    assert!(
+        from_env_at < accepted_at && accepted_at < dispatch_at,
+        "publication must sit between the accepted configuration and mode dispatch, so no \
+         listener can start against an unpublished or rejected value"
     );
 }

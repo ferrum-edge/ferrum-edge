@@ -46,6 +46,12 @@ pub struct BodyOutcome {
     /// separate from the HTTP response status because gRPC application
     /// failures normally complete under HTTP 200.
     pub grpc_status: Option<u32>,
+    /// Bounded authorization-lifetime termination class when the body ended
+    /// because the accepted credential's deadline (or the finite
+    /// authenticated-stream maximum) elapsed. A compiled-in literal from
+    /// `auth_lifetime::StreamAuthTermination`; never a token, claim, identity,
+    /// provider name, or absolute expiry.
+    pub authorization_termination: Option<&'static str>,
 }
 
 impl BodyOutcome {
@@ -57,6 +63,7 @@ impl BodyOutcome {
             bytes_streamed,
             client_disconnected: false,
             grpc_status: None,
+            authorization_termination: None,
         }
     }
 
@@ -69,6 +76,7 @@ impl BodyOutcome {
             bytes_streamed,
             client_disconnected,
             grpc_status: None,
+            authorization_termination: None,
         }
     }
 
@@ -81,11 +89,23 @@ impl BodyOutcome {
             bytes_streamed,
             client_disconnected: true,
             grpc_status: None,
+            authorization_termination: None,
         }
     }
 
     pub fn with_grpc_status(mut self, grpc_status: Option<u32>) -> Self {
         self.grpc_status = grpc_status;
+        self
+    }
+
+    /// Record the bounded authorization-lifetime termination class for a body
+    /// that ended because the accepted credential's deadline elapsed.
+    pub fn with_authorization_termination(
+        mut self,
+        termination: Option<crate::proxy::auth_lifetime::StreamAuthTermination>,
+    ) -> Self {
+        self.authorization_termination =
+            termination.map(crate::proxy::auth_lifetime::StreamAuthTermination::as_str);
         self
     }
 }
@@ -272,6 +292,15 @@ impl DeferredTransactionLogger {
             .grpc_response_messages_observed
             .load(Ordering::Acquire)
             .max(summary.grpc_response_messages);
+        // Bounded, fixed-cardinality termination class so a policy expiry stays
+        // distinguishable from a backend or transport fault in every log sink.
+        // Stamped inside the single-fire `fire()` guard, so exactly once.
+        if let Some(termination) = outcome.authorization_termination {
+            ctx.metadata.insert(
+                crate::proxy::auth_lifetime::STREAM_AUTH_TERMINATION_METADATA_KEY.to_string(),
+                termination.to_string(),
+            );
+        }
         if let Some(grpc_status) = outcome.grpc_status {
             ctx.metadata
                 .insert("grpc_status".to_string(), grpc_status.to_string());

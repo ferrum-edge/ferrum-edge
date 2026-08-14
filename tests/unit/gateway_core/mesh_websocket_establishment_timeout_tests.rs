@@ -13,7 +13,8 @@ use std::time::Duration;
 async fn elapsed_deadline_rejects_immediately_ready_success() {
     let deadline = tokio::time::Instant::now();
     tokio::time::advance(Duration::from_millis(1)).await;
-    let outcome = await_deadline_first_for_test(deadline, std::future::ready("success")).await;
+    let outcome =
+        await_deadline_first_for_test(Some(deadline), std::future::ready("success")).await;
     assert_eq!(
         outcome,
         Err(()),
@@ -27,7 +28,8 @@ async fn elapsed_deadline_rejects_immediately_ready_success() {
 async fn exact_tie_expires_rather_than_accepting_success() {
     let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
     tokio::time::advance(Duration::from_millis(10)).await;
-    let outcome = await_deadline_first_for_test(deadline, std::future::ready("success")).await;
+    let outcome =
+        await_deadline_first_for_test(Some(deadline), std::future::ready("success")).await;
     assert_eq!(
         outcome,
         Err(()),
@@ -39,7 +41,8 @@ async fn exact_tie_expires_rather_than_accepting_success() {
 #[tokio::test(start_paused = true)]
 async fn live_budget_accepts_immediately_ready_success() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let outcome = await_deadline_first_for_test(deadline, std::future::ready("success")).await;
+    let outcome =
+        await_deadline_first_for_test(Some(deadline), std::future::ready("success")).await;
     assert_eq!(
         outcome,
         Ok("success"),

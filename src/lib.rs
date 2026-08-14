@@ -6179,6 +6179,7 @@ pub mod _test_support {
         MalformedTrailers,
         Oversize,
         BackendUploadHalted,
+        AuthorizationExpired,
     }
 
     fn h3_grpc_upload_fault_for_test(
@@ -6194,6 +6195,11 @@ pub mod _test_support {
             H3GrpcUploadFaultKind::Oversize => crate::http3::server::H3GrpcUploadFault::Oversize,
             H3GrpcUploadFaultKind::BackendUploadHalted => {
                 crate::http3::server::H3GrpcUploadFault::BackendUploadHalted
+            }
+            H3GrpcUploadFaultKind::AuthorizationExpired => {
+                crate::http3::server::H3GrpcUploadFault::AuthorizationExpired(
+                    crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired,
+                )
             }
         }
     }
@@ -6264,6 +6270,9 @@ pub mod _test_support {
             Some(crate::http3::server::H3GrpcUploadFault::BackendUploadHalted) => {
                 H3GrpcUploadFaultKind::BackendUploadHalted
             }
+            Some(crate::http3::server::H3GrpcUploadFault::AuthorizationExpired(_)) => {
+                H3GrpcUploadFaultKind::AuthorizationExpired
+            }
             None => unreachable!("a published fault must latch"),
         }
     }
@@ -6314,6 +6323,41 @@ pub mod _test_support {
                 .await,
             Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded)
         )
+    }
+
+    /// Outcome of racing one native-H3 gRPC upload-pump await against shutdown
+    /// and the admitted authorization plan.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum H3GrpcUploadAwaitOutcomeForTest<T> {
+        Ready(T),
+        Cancelled,
+        AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+    }
+
+    /// Race one native-H3 gRPC upload-pump receive or commit against the
+    /// admitted authorization plan — the exact seam `run_h3_grpc_upload_pump`
+    /// uses for frontend DATA, backend DATA, trailers, and FIN.
+    pub async fn h3_grpc_upload_await_until_authorization_for_test<F>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        shutdown: &tokio::sync::Notify,
+        fut: F,
+    ) -> H3GrpcUploadAwaitOutcomeForTest<F::Output>
+    where
+        F: std::future::Future,
+    {
+        match crate::http3::server::h3_grpc_upload_await_until_authorization(plan, shutdown, fut)
+            .await
+        {
+            crate::http3::server::H3GrpcUploadAwaitOutcome::Ready(value) => {
+                H3GrpcUploadAwaitOutcomeForTest::Ready(value)
+            }
+            crate::http3::server::H3GrpcUploadAwaitOutcome::Cancelled => {
+                H3GrpcUploadAwaitOutcomeForTest::Cancelled
+            }
+            crate::http3::server::H3GrpcUploadAwaitOutcome::AuthorizationExpired(termination) => {
+                H3GrpcUploadAwaitOutcomeForTest::AuthorizationExpired(termination)
+            }
+        }
     }
 
     /// Return true when a terminal H3 status that is immediately writable can
@@ -7206,6 +7250,50 @@ pub mod _test_support {
             .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
     }
 
+    /// The accepted request credential's monotonic deadline Instant, if any.
+    /// Used to prove cache hits return the identical captured Instant rather
+    /// than a freshly converted later value (issue #3816).
+    pub fn request_credential_deadline_at(
+        ctx: &crate::plugins::RequestContext,
+    ) -> Option<tokio::time::Instant> {
+        ctx.credential_deadline_at
+    }
+
+    /// Fallible Unix-to-monotonic conversion with injected clocks, so external
+    /// tests can prove a wall-clock rollback would extend a *fresh* conversion
+    /// and that unrepresentable inputs fail closed.
+    pub fn try_credential_deadline_from_unix_seconds_at_for_test(
+        expires_at_unix: i64,
+        leeway_seconds: u64,
+        now_unix: u64,
+        now_mono: tokio::time::Instant,
+    ) -> Option<tokio::time::Instant> {
+        crate::plugins::utils::auth_flow::try_credential_deadline_from_unix_seconds_at(
+            expires_at_unix,
+            leeway_seconds,
+            now_unix,
+            now_mono,
+        )
+    }
+
+    /// Set a request's credential deadline directly so external tests can drive
+    /// the protocol-neutral authorization-lifetime arbiter without minting a
+    /// real token. Carries no credential material.
+    pub fn set_request_credential_deadline_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        deadline: Option<tokio::time::Instant>,
+    ) {
+        ctx.credential_deadline_at = deadline;
+    }
+
+    /// Monotonic instant the request was received. The authenticated-stream
+    /// maximum is anchored here, not at response-build time.
+    pub fn request_received_at_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> tokio::time::Instant {
+        ctx.grpc_deadline_received_at
+    }
+
     /// Construct a streaming `ProxyBody` for use in unit/integration tests.
     /// Delegates to the crate-private `ProxyBody::streaming` constructor,
     /// keeping that constructor internal while still letting tests exercise
@@ -7220,6 +7308,1417 @@ pub mod _test_support {
         >,
     ) -> crate::proxy::ProxyBody {
         crate::proxy::body::ProxyBody::streaming(body)
+    }
+
+    /// Apply the protocol-neutral authorization-lifetime bound to a
+    /// `ProxyBody`, exactly as the H1/H2 and native-gRPC response funnels do.
+    /// Inputs are fixed test controls and carry no credential material.
+    pub fn proxy_body_with_authorization_deadline_for_test(
+        body: crate::proxy::ProxyBody,
+        deadline: crate::proxy::auth_lifetime::StreamAuthDeadline,
+        grpc_web_response_content_type: Option<&str>,
+        family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+        auth_latch: Option<crate::proxy::auth_lifetime::StreamAuthTerminationLatch>,
+    ) -> crate::proxy::ProxyBody {
+        body.with_authorization_deadline(
+            deadline,
+            grpc_web_response_content_type,
+            family,
+            auth_latch,
+            None,
+        )
+    }
+
+    /// [`proxy_body_with_authorization_deadline_for_test`] WITH the
+    /// transport-level close signal the connection handlers install, so an
+    /// external test can prove the gateway-owned watchdog releases the upstream
+    /// and then closes a downstream that never polls the body (issue #3815).
+    pub fn proxy_body_with_authorization_deadline_and_closer_for_test(
+        body: crate::proxy::ProxyBody,
+        deadline: crate::proxy::auth_lifetime::StreamAuthDeadline,
+        family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+        auth_latch: Option<crate::proxy::auth_lifetime::StreamAuthTerminationLatch>,
+        closer: crate::proxy::auth_lifetime::AuthorizationConnectionCloser,
+    ) -> crate::proxy::ProxyBody {
+        body.with_authorization_deadline(deadline, None, family, auth_latch, Some(closer))
+    }
+
+    /// The bounded grace the response watchdog waits after the authorization
+    /// deadline before asking the connection task to close the client
+    /// connection.
+    #[must_use]
+    pub fn authorization_transport_close_grace() -> std::time::Duration {
+        crate::proxy::response_watchdog::TRANSPORT_CLOSE_GRACE
+    }
+
+    /// Move one body into the gateway-owned response pump, as
+    /// `ProxyBody::with_authorization_deadline` does, so an external test can
+    /// observe the upstream release without going through `ProxyBody`
+    /// (issue #3815).
+    pub fn authorization_cancellable_body_for_test(
+        inner: crate::proxy::ProxyBody,
+        deadline: crate::proxy::auth_lifetime::StreamAuthDeadline,
+        family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+        latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        closer: Option<crate::proxy::auth_lifetime::AuthorizationConnectionCloser>,
+    ) -> crate::proxy::response_watchdog::AuthorizationCancellableBody {
+        crate::proxy::response_watchdog::AuthorizationCancellableBody::new(
+            inner, deadline, family, latch, fired, closer,
+        )
+    }
+
+    /// Which owner settled one authenticated streaming response (issue #3815).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum AuthorizationTerminalOwnershipForTest {
+        Open,
+        InnerCompletion,
+        AuthorizationExpiry,
+    }
+
+    fn ownership_for_test(
+        ownership: crate::proxy::response_watchdog::AuthorizationTerminalOwnership,
+    ) -> AuthorizationTerminalOwnershipForTest {
+        use crate::proxy::response_watchdog::AuthorizationTerminalOwnership as Inner;
+        match ownership {
+            Inner::Open => AuthorizationTerminalOwnershipForTest::Open,
+            Inner::InnerCompletion => AuthorizationTerminalOwnershipForTest::InnerCompletion,
+            Inner::AuthorizationExpiry => {
+                AuthorizationTerminalOwnershipForTest::AuthorizationExpiry
+            }
+        }
+    }
+
+    /// The ONE terminal owner the gateway-owned response pump and the protocol
+    /// adapter that wraps it both settle (issue #3815), so a test can drive the
+    /// interleaving directly instead of racing two scheduled tasks.
+    #[derive(Clone, Debug)]
+    pub struct AuthorizationTerminalOwnerForTest(
+        crate::proxy::response_watchdog::AuthorizationTerminalOwner,
+    );
+
+    impl AuthorizationTerminalOwnerForTest {
+        #[must_use]
+        pub fn new(deadline_at: tokio::time::Instant) -> Self {
+            use crate::proxy::response_watchdog::AuthorizationTerminalOwner;
+            Self(AuthorizationTerminalOwner::new(deadline_at))
+        }
+
+        /// The hot-path gate every response poll takes: claims the bound itself
+        /// when this call lands at/after the deadline.
+        #[must_use]
+        pub fn observe(&self) -> AuthorizationTerminalOwnershipForTest {
+            ownership_for_test(self.0.observe())
+        }
+
+        /// Whether the bound has ALREADY been claimed, without consulting the
+        /// clock — the re-check a poll takes after its inner body returns.
+        #[must_use]
+        pub fn expiry_claimed(&self) -> bool {
+            self.0.expiry_claimed()
+        }
+
+        /// The pump claiming the upstream's OWN terminal. `false` when refused.
+        pub fn claim_inner_completion(&self) -> bool {
+            self.0.claim_inner_completion()
+        }
+
+        /// The pump's deadline arm claiming the authorization bound.
+        pub fn claim_authorization_expiry(&self) -> AuthorizationTerminalOwnershipForTest {
+            ownership_for_test(self.0.claim_authorization_expiry())
+        }
+    }
+
+    /// Which bound ended a buffered response-body collection, as
+    /// [`collect_response_under_authorization_for_test`] reports it.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum ResponseCollectBoundForTest {
+        Completed,
+        RpcDeadline,
+        AuthorizationExpired,
+    }
+
+    /// Await `future` under an optional absolute deadline using the shared
+    /// expiry-first primitive every composed authorization wait now goes
+    /// through. Ambient HBONE WebSocket establishment (issue #3620) uses
+    /// the same race: an already-elapsed deadline and an exact timer/result
+    /// tie expire rather than accepting a ready success. `Err(())` means
+    /// the bound fired without polling a ready future; `Ok` is completion.
+    /// Ownership is not decided here.
+    pub async fn await_deadline_first_for_test<F, T>(
+        deadline: Option<tokio::time::Instant>,
+        future: F,
+    ) -> Result<T, ()>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        crate::plugins::await_deadline_first(deadline, future).await
+    }
+
+    /// Outcome of one pre-commitment response-phase wait, as
+    /// [`await_precommit_response_phase_for_test`] reports it.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum PrecommitPhaseOutcomeForTest<T> {
+        Completed(T),
+        ExpiredAuthorization(crate::proxy::auth_lifetime::StreamAuthTermination),
+        ExpiredProtocol,
+    }
+
+    /// Await one pre-commitment response phase under an already-composed bound,
+    /// so a test can prove an elapsed bound never polls protected work.
+    pub async fn await_precommit_response_phase_for_test<F, T>(
+        bound: PrecommitResponsePhaseBoundForTest,
+        future: F,
+    ) -> PrecommitPhaseOutcomeForTest<T>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        match crate::plugins::await_precommit_response_phase(bound.0, future).await {
+            crate::plugins::PrecommitPhaseResult::Completed(value) => {
+                PrecommitPhaseOutcomeForTest::Completed(value)
+            }
+            crate::plugins::PrecommitPhaseResult::Expired(Some(termination)) => {
+                PrecommitPhaseOutcomeForTest::ExpiredAuthorization(termination)
+            }
+            crate::plugins::PrecommitPhaseResult::Expired(None) => {
+                PrecommitPhaseOutcomeForTest::ExpiredProtocol
+            }
+        }
+    }
+
+    /// Race a backend wait against an optional absolute deadline the same way
+    /// the H3→plain header wait does, without a peer-cancel signal, so a test
+    /// can prove an elapsed composed bound never polls a ready backend.
+    pub async fn await_h3_backend_or_peer_for_test<F, T>(
+        deadline: Option<tokio::time::Instant>,
+        future: F,
+    ) -> H3BackendOrPeerForTest<T>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        match crate::http3::cross_protocol::await_h3_backend_or_peer(
+            deadline,
+            None,
+            std::future::pending::<()>(),
+            future,
+        )
+        .await
+        {
+            crate::http3::cross_protocol::H3BackendOrPeer::Ready(value) => {
+                H3BackendOrPeerForTest::Ready(value)
+            }
+            crate::http3::cross_protocol::H3BackendOrPeer::Deadline => {
+                H3BackendOrPeerForTest::Deadline
+            }
+            crate::http3::cross_protocol::H3BackendOrPeer::PeerGone => {
+                H3BackendOrPeerForTest::PeerGone
+            }
+        }
+    }
+
+    /// Outcome of [`await_h3_backend_or_peer_for_test`].
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum H3BackendOrPeerForTest<T> {
+        Ready(T),
+        Deadline,
+        PeerGone,
+    }
+
+    /// Collect a buffered RESPONSE body under the composed bound every buffered
+    /// dispatch arm now installs — the earliest of the client RPC deadline and
+    /// the admitted stream's authorization deadline (issue #3815).
+    pub async fn collect_response_under_authorization_for_test<F>(
+        collect: F,
+        grpc_deadline_at: Option<tokio::time::Instant>,
+        auth: Option<&(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+    ) -> ResponseCollectBoundForTest
+    where
+        F: std::future::Future,
+    {
+        match crate::proxy::collect_response_under_authorization(grpc_deadline_at, auth, collect)
+            .await
+        {
+            Ok(_) => ResponseCollectBoundForTest::Completed,
+            Err(crate::proxy::ResponseCollectBound::RpcDeadline) => {
+                ResponseCollectBoundForTest::RpcDeadline
+            }
+            Err(crate::proxy::ResponseCollectBound::AuthorizationExpired) => {
+                ResponseCollectBoundForTest::AuthorizationExpired
+            }
+        }
+    }
+
+    /// The absolute bound every awaited PRE-COMMITMENT response phase runs
+    /// under (`after_proxy`, the buffered body hooks, the final client-visible
+    /// body/header policies, and the response-committed hook).
+    pub fn precommit_response_phase_deadline_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> Option<tokio::time::Instant> {
+        ctx.precommit_response_phase_bound().deadline()
+    }
+
+    /// A composed PRE-COMMITMENT response-phase bound, carried from composition
+    /// time to attribution time so a test can put arbitrary scheduling delay
+    /// between the two (issue #3815).
+    #[derive(Clone, Copy, Debug)]
+    pub struct PrecommitResponsePhaseBoundForTest(crate::plugins::PrecommitResponsePhaseBound);
+
+    impl PrecommitResponsePhaseBoundForTest {
+        /// The instant the awaited phase runs under: the earliest of the two.
+        #[must_use]
+        pub fn deadline(&self) -> Option<tokio::time::Instant> {
+            self.0.deadline()
+        }
+
+        /// The admitted credential's own absolute authorization deadline,
+        /// whether or not it is the winning bound.
+        #[must_use]
+        pub fn authorization_deadline_at(&self) -> Option<tokio::time::Instant> {
+            self.0.authorization_deadline_at()
+        }
+
+        /// Attribute an already-fired bound from the CAPTURED composition.
+        #[must_use]
+        pub fn expired_authorization(
+            &self,
+        ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+            self.0.expired_authorization()
+        }
+    }
+
+    /// Compose one pre-commitment response-phase bound from the two absolute
+    /// instants, exactly as `RequestContext::precommit_response_phase_bound`
+    /// does (issue #3815).
+    #[must_use]
+    pub fn compose_precommit_response_phase_bound_for_test(
+        protocol_deadline_at: Option<tokio::time::Instant>,
+        authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    ) -> PrecommitResponsePhaseBoundForTest {
+        PrecommitResponsePhaseBoundForTest(crate::plugins::PrecommitResponsePhaseBound::compose(
+            protocol_deadline_at,
+            authorization,
+        ))
+    }
+
+    /// The absolute authorization bound a DETACHED committed-response cleanup
+    /// inherits from one request's composed pre-commitment bound (issue #3815).
+    ///
+    /// This is `Some` even when the client's own earlier RPC deadline owns the
+    /// phase, which is exactly the case the detached lifecycle must still be
+    /// bounded by.
+    #[must_use]
+    pub fn detached_response_committed_authorization_bound_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> Option<tokio::time::Instant> {
+        ctx.precommit_response_phase_bound()
+            .authorization_deadline_at()
+    }
+
+    /// Detach one committed-response observer chain exactly as the reject and
+    /// client-deadline lifecycles do, with a caller-owned pending hook so an
+    /// external test can observe WHEN the detached work is dropped
+    /// (issue #3815).
+    ///
+    /// `authorization_at` is the admitted credential's absolute authorization
+    /// deadline; `None` reproduces an unauthenticated request, whose cleanup
+    /// keeps only the fixed post-response timeout.
+    pub fn spawn_detached_response_committed_hook_for_test(
+        pending_hook: std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::plugins::RequestContext> + Send + 'static>,
+        >,
+        authorization_at: Option<tokio::time::Instant>,
+    ) {
+        crate::proxy::spawn_detached_response_committed_hooks(
+            pending_hook,
+            Vec::new(),
+            200,
+            std::sync::Arc::new(HashMap::new()),
+            bytes::Bytes::new(),
+            crate::proxy::DetachedResponseCommittedBound { authorization_at },
+        );
+    }
+
+    /// The fixed post-response cleanup timeout a detached committed-response
+    /// chain falls back to when no authorization bound is earlier.
+    #[must_use]
+    pub fn detached_response_committed_cleanup_timeout() -> std::time::Duration {
+        crate::proxy::DETACHED_REJECTION_CLEANUP_TIMEOUT
+    }
+
+    /// Publish the validated authenticated-stream maximum directly, so a test
+    /// can control the process-wide value
+    /// [`precommit_response_phase_deadline_for_test`] reads.
+    ///
+    /// Callers MUST hold the shared test lock (`unit::env_lock`) and restore
+    /// the previous value: this scalar is process-wide, and the unit-test
+    /// binary runs in parallel.
+    pub fn publish_authenticated_stream_max_lifetime_seconds_for_test(seconds: u64) {
+        crate::proxy::auth_lifetime::publish_authenticated_stream_max_lifetime_seconds(seconds);
+    }
+
+    /// Read the published process-wide authenticated-stream maximum.
+    #[must_use]
+    pub fn authenticated_stream_max_lifetime_seconds_for_test() -> u64 {
+        crate::proxy::auth_lifetime::authenticated_stream_max_lifetime_seconds()
+    }
+
+    /// Publish the process-wide stream settings from an ACCEPTED startup
+    /// configuration — the exact seam `main.rs` calls once after
+    /// `EnvConfig::from_env()` succeeds and before any listener binds.
+    ///
+    /// `EnvConfig::validate` deliberately does NOT do this, so a candidate
+    /// configuration rejected by a later check cannot mutate the live scalar.
+    pub fn publish_accepted_startup_env_config_for_test(env_config: &crate::config::EnvConfig) {
+        env_config.publish_process_wide_stream_settings();
+    }
+
+    /// Run one post-admission TCP setup stage under the admitted stream's
+    /// absolute authorization deadline, exactly as `handle_tcp_connection_inner`
+    /// bounds DNS resolution, the backend dial/handshake, and the inspected
+    /// first-bytes forward (issue #3816).
+    pub async fn within_stream_auth_deadline_for_test<F>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        stage: F,
+    ) -> Result<F::Output, crate::proxy::auth_lifetime::StreamAuthTermination>
+    where
+        F: std::future::Future,
+    {
+        crate::proxy::tcp_proxy::within_stream_auth_deadline(plan, stage).await
+    }
+
+    /// Kernel splice/IORING is legal only for an unauthenticated plain TCP
+    /// session. An admitted principal always takes the userspace deadline-aware
+    /// relay (issue #3816).
+    pub fn tcp_plain_splice_eligible_for_test(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    ) -> bool {
+        crate::proxy::tcp_proxy::tcp_plain_splice_eligible(plan)
+    }
+
+    /// Observable fail-closed result for the defensive authenticated-kTLS relay
+    /// path (issue #3816). Only available on Linux.
+    #[cfg(target_os = "linux")]
+    pub fn authenticated_ktls_relay_fail_closed_for_test()
+    -> crate::proxy::tcp_proxy::StreamCopyResult {
+        crate::proxy::tcp_proxy::authenticated_ktls_relay_fail_closed()
+    }
+
+    /// Observable settlement of a DTLS authorization expiry (issue #3816),
+    /// captured from the production helpers so a test never restates them.
+    #[derive(Debug, Clone)]
+    pub struct DtlsAuthorizationExpiryForTest {
+        /// How many times the caller-supplied HALF_OPEN circuit-breaker probe
+        /// release ran. The production call sites pass a NEUTRAL release, so a
+        /// gateway security decision records no backend success or failure.
+        pub probe_releases: usize,
+        /// The session metadata map `handle_dtls_client` drains into
+        /// `DtlsHandlerResult::metadata`, which the accept loop merges into the
+        /// `StreamTransactionSummary` and delivers to `on_stream_disconnect`.
+        pub metadata: HashMap<String, String>,
+        /// `Display` of the returned typed error.
+        pub error: String,
+        /// The typed setup kind, when the error carries one.
+        pub setup_kind: Option<crate::proxy::stream_error::StreamSetupKind>,
+        /// The class / cause / direction the DTLS disconnect summary derives.
+        pub error_class: crate::retry::ErrorClass,
+        pub disconnect_cause: crate::plugins::DisconnectCause,
+        pub disconnect_direction: crate::plugins::Direction,
+    }
+
+    fn classify_dtls_session_failure_for_test(
+        error: &anyhow::Error,
+        probe_releases: usize,
+        metadata: HashMap<String, String>,
+    ) -> DtlsAuthorizationExpiryForTest {
+        let error_class = crate::proxy::udp_proxy::dtls_error_class(error);
+        DtlsAuthorizationExpiryForTest {
+            probe_releases,
+            metadata,
+            error: error.to_string(),
+            setup_kind: crate::proxy::stream_error::find_stream_setup_error(error)
+                .map(|setup| setup.kind),
+            disconnect_cause: crate::proxy::udp_proxy::dtls_disconnect_cause(error, &error_class),
+            disconnect_direction: crate::proxy::udp_proxy::dtls_disconnect_direction(
+                error,
+                &error_class,
+            ),
+            error_class,
+        }
+    }
+
+    /// Run one awaitable post-admission DTLS setup stage (DNS resolution,
+    /// backend UDP/DTLS connect and handshake) under the admitted session's
+    /// absolute authorization deadline, exactly as `handle_dtls_client_inner`
+    /// bounds them (issue #3816).
+    pub async fn dtls_setup_stage_under_authorization_for_test<S, F>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        stage: S,
+    ) -> Result<F::Output, DtlsAuthorizationExpiryForTest>
+    where
+        S: FnOnce() -> F,
+        F: std::future::Future,
+    {
+        let latch = crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default();
+        let metadata = std::sync::Mutex::new(HashMap::new());
+        let releases = std::sync::atomic::AtomicUsize::new(0);
+        let outcome = crate::proxy::udp_proxy::dtls_setup_stage_under_authorization(
+            plan,
+            &latch,
+            &metadata,
+            || {
+                releases.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            },
+            stage,
+        )
+        .await;
+        match outcome {
+            Ok(output) => Ok(output),
+            Err(error) => Err(classify_dtls_session_failure_for_test(
+                &error,
+                releases.load(std::sync::atomic::Ordering::Relaxed),
+                metadata
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            )),
+        }
+    }
+
+    /// Settle a RELAY-phase DTLS authorization expiry exactly as the session
+    /// relay's deadline arm does: record the bounded class once through the
+    /// session's shared latch, stamp it into the session metadata that reaches
+    /// the transaction summary, and return the typed health-neutral error
+    /// (issue #3816). Pass the same latch twice to prove once-only accounting.
+    pub fn settle_dtls_relay_authorization_expiry_for_test(
+        termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+        latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        session_metadata: &std::sync::Mutex<HashMap<String, String>>,
+    ) -> DtlsAuthorizationExpiryForTest {
+        crate::proxy::udp_proxy::settle_dtls_auth_expiry(termination, latch, session_metadata);
+        let error: anyhow::Error = crate::proxy::udp_proxy::DtlsAuthorizationExpired.into();
+        classify_dtls_session_failure_for_test(
+            &error,
+            0,
+            session_metadata
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        )
+    }
+
+    /// Whether an admitted DTLS session may still be handed to its relay tasks,
+    /// re-checked after the synchronous setup work the deadline arms cannot
+    /// observe (issue #3816).
+    pub fn dtls_authorization_expired_before_relay_for_test(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        now: tokio::time::Instant,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        crate::proxy::udp_proxy::dtls_authorization_expired_before_relay(plan, now)
+    }
+
+    // ── Plain-UDP authorization lifetime (issue #3816) ──────────────────
+
+    /// Whether an admitted plain-UDP session may still be COMMITTED — inserted
+    /// into the session map, counted as a backend success, given a reply task,
+    /// and handed its first backend send (issue #3816).
+    #[must_use]
+    pub fn udp_authorization_expired_before_commit_for_test(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        now: tokio::time::Instant,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        crate::proxy::udp_proxy::udp_authorization_expired_before_commit(plan, now)
+    }
+
+    /// Run one awaitable post-admission PLAIN-UDP setup stage (first-datagram
+    /// policy hooks, DNS resolution, backend connect) under the admitted
+    /// session's absolute authorization deadline, exactly as
+    /// `process_new_session_datagram` / `create_session` bound them.
+    pub async fn udp_setup_stage_under_authorization_for_test<S, F>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        stage: S,
+    ) -> Result<F::Output, DtlsAuthorizationExpiryForTest>
+    where
+        S: FnOnce() -> F,
+        F: std::future::Future,
+    {
+        let latch = crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default();
+        let metadata = std::sync::Mutex::new(HashMap::new());
+        let releases = std::sync::atomic::AtomicUsize::new(0);
+        let outcome = crate::proxy::udp_proxy::stream_udp_setup_stage_under_authorization(
+            plan,
+            &latch,
+            &metadata,
+            crate::proxy::udp_proxy::UDP_SESSION_SETUP_CONTEXT,
+            || {
+                releases.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            },
+            stage,
+        )
+        .await;
+        match outcome {
+            Ok(output) => Ok(output),
+            Err(error) => Err(classify_dtls_session_failure_for_test(
+                &error,
+                releases.load(std::sync::atomic::Ordering::Relaxed),
+                metadata
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            )),
+        }
+    }
+
+    /// Fixed disconnect attribution for a plain-UDP session the authorization
+    /// contract terminated: `(connection_error, error_class, cause, direction)`.
+    #[must_use]
+    pub fn udp_authorization_disconnect_classification_for_test() -> (
+        String,
+        crate::retry::ErrorClass,
+        crate::plugins::DisconnectCause,
+        crate::plugins::Direction,
+    ) {
+        crate::proxy::udp_proxy::udp_authorization_disconnect_classification()
+    }
+
+    /// Outcome of one authorization-bounded backend-reply receive.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum UdpReplyRecvOutcomeForTest<T> {
+        Received(T),
+        Stopped,
+        AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+    }
+
+    /// Race a backend-reply receive against the session's absolute
+    /// authorization deadline, the per-session stop signal, and shutdown —
+    /// the exact seam the plain-UDP reply task uses.
+    pub async fn udp_reply_recv_until_stop_or_expiry_for_test<F, C, T>(
+        stop_flag: &std::sync::atomic::AtomicBool,
+        stop_notify: &tokio::sync::Notify,
+        authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        recv: F,
+        cancel: C,
+    ) -> UdpReplyRecvOutcomeForTest<T>
+    where
+        F: std::future::Future<Output = T>,
+        C: std::future::Future<Output = ()>,
+    {
+        // Armed once by the production caller outside its receive loop; the
+        // instant is irrelevant when `authorization` is `None`.
+        let mut deadline = Box::pin(tokio::time::sleep_until(
+            authorization.map_or_else(tokio::time::Instant::now, |plan| plan.at),
+        ));
+        match crate::proxy::udp_proxy::udp_reply_recv_until_stop_or_expiry(
+            stop_flag,
+            stop_notify,
+            authorization,
+            &mut deadline,
+            recv,
+            cancel,
+        )
+        .await
+        {
+            crate::proxy::udp_proxy::UdpReplyRecvOutcome::Received(value) => {
+                UdpReplyRecvOutcomeForTest::Received(value)
+            }
+            crate::proxy::udp_proxy::UdpReplyRecvOutcome::Stopped => {
+                UdpReplyRecvOutcomeForTest::Stopped
+            }
+            crate::proxy::udp_proxy::UdpReplyRecvOutcome::AuthorizationExpired(termination) => {
+                UdpReplyRecvOutcomeForTest::AuthorizationExpired(termination)
+            }
+        }
+    }
+
+    /// Recheck the admitted absolute authorization plan at a backend→client
+    /// post-receive commitment boundary — the exact predicate the reply task
+    /// uses after recv, after hooks, at the top of `try_recv` drain, and
+    /// immediately before GSO/sendmmsg flush. Asynchronous client sends are
+    /// owned by [`udp_frontend_send_until_expiry_for_test`] instead.
+    #[must_use]
+    pub fn udp_reply_expired_at_commit_for_test(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        crate::proxy::udp_proxy::udp_reply_expired_at_commit(plan)
+    }
+
+    /// Outcome of racing a client-facing UDP/DTLS frontend send or writable
+    /// wait against the admitted absolute authorization plan.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum UdpFrontendSendOutcomeForTest<T> {
+        Sent(T),
+        AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+    }
+
+    fn map_udp_frontend_send_outcome_for_test<T>(
+        outcome: crate::proxy::udp_proxy::UdpFrontendSendOutcome<T>,
+    ) -> UdpFrontendSendOutcomeForTest<T> {
+        match outcome {
+            crate::proxy::udp_proxy::UdpFrontendSendOutcome::Sent(value) => {
+                UdpFrontendSendOutcomeForTest::Sent(value)
+            }
+            crate::proxy::udp_proxy::UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
+                UdpFrontendSendOutcomeForTest::AuthorizationExpired(termination)
+            }
+        }
+    }
+
+    /// Race a client-facing send against the admitted absolute plan — the
+    /// exact seam the non-batched `send_to` path and the DTLS frontend send
+    /// use. Unauthenticated `None` awaits `send` with no timer.
+    pub async fn udp_frontend_send_until_expiry_for_test<F>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        send: F,
+    ) -> UdpFrontendSendOutcomeForTest<F::Output>
+    where
+        F: std::future::Future,
+    {
+        map_udp_frontend_send_outcome_for_test(
+            crate::proxy::udp_proxy::udp_frontend_send_until_expiry(plan, send).await,
+        )
+    }
+
+    /// Race one DTLS client→backend stage against the admitted absolute plan
+    /// — the exact seam `handle_dtls_client_inner` uses around receive, each
+    /// awaited hook, and the backend application-datagram commit.
+    pub async fn dtls_c2b_until_expiry_for_test<F>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        stage: F,
+    ) -> Result<F::Output, crate::proxy::auth_lifetime::StreamAuthTermination>
+    where
+        F: std::future::Future,
+    {
+        let metadata = std::sync::Mutex::new(std::collections::HashMap::new());
+        crate::proxy::udp_proxy::dtls_c2b_until_expiry(plan, latch, &metadata, stage).await
+    }
+
+    /// Race a client-facing `writable()` wait against the same plan, then
+    /// re-read the plan after readiness before the caller may issue the
+    /// send syscall — the exact seam the Linux pktinfo retry loop uses.
+    pub async fn udp_frontend_writable_until_expiry_for_test<W>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        writable: W,
+    ) -> UdpFrontendSendOutcomeForTest<W::Output>
+    where
+        W: std::future::Future,
+    {
+        map_udp_frontend_send_outcome_for_test(
+            crate::proxy::udp_proxy::udp_frontend_writable_until_expiry(plan, writable).await,
+        )
+    }
+
+    /// Outcome of one backend→client datagram after the awaitable hook chain
+    /// raced against the admitted absolute authorization plan.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum UdpReplyDatagramCommitForTest {
+        Commit,
+        Drop,
+        AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+    }
+
+    /// Run the production backend→client hook chain raced against the absolute
+    /// authorization plan. A still-pending hook is dropped when expiry wins.
+    pub async fn udp_reply_commit_after_backend_hooks_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        payload: &[u8],
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    ) -> UdpReplyDatagramCommitForTest {
+        let ctx = crate::plugins::UdpDatagramContext {
+            client_ip: Arc::from("127.0.0.1"),
+            proxy_id: Arc::from("udp-proxy"),
+            proxy_name: None,
+            listen_port: 5300,
+            datagram_size: payload.len(),
+            direction: crate::plugins::UdpDatagramDirection::BackendToClient,
+            payload,
+            payload_kind: crate::plugins::StreamBytesKind::PlaintextWire,
+            metadata_sink: None,
+        };
+        match crate::proxy::udp_proxy::udp_reply_commit_after_backend_hooks(plugins, &ctx, plan)
+            .await
+        {
+            crate::proxy::udp_proxy::UdpReplyDatagramCommit::Commit => {
+                UdpReplyDatagramCommitForTest::Commit
+            }
+            crate::proxy::udp_proxy::UdpReplyDatagramCommit::Drop => {
+                UdpReplyDatagramCommitForTest::Drop
+            }
+            crate::proxy::udp_proxy::UdpReplyDatagramCommit::AuthorizationExpired(termination) => {
+                UdpReplyDatagramCommitForTest::AuthorizationExpired(termination)
+            }
+        }
+    }
+
+    /// A real plain-UDP session (real backend socket, real overload guard, real
+    /// hook-ingress channel) that external coverage drives through the
+    /// production datagram paths.
+    pub use crate::proxy::udp_proxy::UdpAuthorizationSessionProbe;
+
+    /// The fixed PRE-COMMITMENT terminal the H1/H2 dispatch funnel substitutes
+    /// when a request-upload authorization expiry cancelled the backend
+    /// dispatch before any response head reached the client (issue #3815).
+    /// Returns `(status, headers, body_bytes)`.
+    pub fn authorization_expired_pre_commitment_response_for_test(
+        ctx: &crate::plugins::RequestContext,
+        termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+        request_is_native_grpc: bool,
+    ) -> (u16, std::collections::HashMap<String, String>, Vec<u8>) {
+        let (status, headers, body) = crate::proxy::authorization_expired_pre_commitment_response(
+            ctx,
+            termination,
+            request_is_native_grpc,
+        );
+        let bytes = match body {
+            crate::retry::ResponseBody::Buffered(bytes) => bytes.to_vec(),
+            _ => panic!("the pre-commitment terminal is always a buffered body"),
+        };
+        (status, headers, bytes)
+    }
+
+    /// Post-gate state the ONE buffered terminal transaction summary is built
+    /// from (issue #3815).
+    pub struct PrecommitAuthorizationGateForTest {
+        /// The bounded termination class, when the gate fired. `None` when the
+        /// request has no authorization plan, or its plan has not elapsed.
+        pub termination: Option<crate::proxy::auth_lifetime::StreamAuthTermination>,
+        /// The status the client will see and the summary will record.
+        pub status: u16,
+        /// The client-visible response headers after the gate.
+        pub headers: HashMap<String, String>,
+        /// The client-visible buffered response body after the gate.
+        pub body: Vec<u8>,
+        /// Exactly what `TransactionSummary::metadata` receives, including the
+        /// bounded `authorization.termination_reason` the gate latched.
+        pub log_metadata: HashMap<String, String>,
+    }
+
+    /// Apply the AUTHORITATIVE pre-commitment authorization gate the buffered
+    /// H1/H2 terminal path runs immediately before it builds its ONE terminal
+    /// transaction summary (issue #3815).
+    ///
+    /// This is the production gate, applied to a caller-owned context, reporting
+    /// the state the summary is then built from. It exists so an external test
+    /// can prove that the summary describes the TERMINAL response — not the
+    /// protected one the backend produced — and that it carries the bounded
+    /// termination class before any logging plugin can observe it.
+    pub fn precommit_authorization_gate_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        max_lifetime_seconds: u64,
+        request_uses_grpc_content_type: bool,
+        protected_status: u16,
+        protected_body: &[u8],
+    ) -> PrecommitAuthorizationGateForTest {
+        let mut status = protected_status;
+        let mut headers = HashMap::new();
+        let mut body = crate::retry::ResponseBody::buffered(protected_body.to_vec());
+        let termination = crate::proxy::apply_precommit_authorization_terminal(
+            ctx,
+            max_lifetime_seconds,
+            request_uses_grpc_content_type,
+            &mut status,
+            &mut headers,
+            &mut body,
+        );
+        let body = match body {
+            crate::retry::ResponseBody::Buffered(bytes) => bytes.to_vec(),
+            _ => Vec::new(),
+        };
+        PrecommitAuthorizationGateForTest {
+            termination,
+            status,
+            headers,
+            body,
+            log_metadata: crate::proxy::clone_log_metadata(ctx),
+        }
+    }
+
+    /// The authorization-lifetime plan and bounded protocol family every H1/H2
+    /// streaming request-upload adapter installs (issue #3815), plus the shared
+    /// once-only termination latch it records through. `None` for an
+    /// unauthenticated request, which this contract does not bound.
+    pub fn request_upload_auth_deadline_for_test(
+        ctx: &crate::plugins::RequestContext,
+        max_lifetime_seconds: u64,
+    ) -> Option<(
+        crate::proxy::auth_lifetime::StreamAuthDeadline,
+        crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+        crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    )> {
+        crate::proxy::request_upload_auth_deadline(Some(ctx), max_lifetime_seconds)
+    }
+
+    /// Which bound ended a BUFFERED client request-body collect (issue #3815).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum BufferedUploadWaitOutcomeForTest {
+        Collected,
+        ClientError,
+        TimedOut,
+        DeadlineExceeded,
+        AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+    }
+
+    /// Run one buffered client request-body collect under the earliest of the
+    /// client RPC deadline, the operator whole-upload stall timeout, and the
+    /// admitted stream's authorization lifetime, exactly as every post-admission
+    /// buffered upload arm does (issue #3815).
+    pub async fn collect_buffered_upload_under_authorization_for_test<F>(
+        collect: F,
+        deadline: Option<tokio::time::Instant>,
+        request_body_read_timeout_ms: u64,
+        auth: Option<(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+    ) -> BufferedUploadWaitOutcomeForTest
+    where
+        F: std::future::Future<Output = Result<(), ()>>,
+    {
+        match crate::proxy::collect_request_body_under_authorization(
+            collect,
+            deadline,
+            request_body_read_timeout_ms,
+            auth.as_ref(),
+        )
+        .await
+        {
+            Ok(Ok(())) => BufferedUploadWaitOutcomeForTest::Collected,
+            Ok(Err(())) => BufferedUploadWaitOutcomeForTest::ClientError,
+            Err(crate::proxy::AuthorizedUploadWaitError::Wait(
+                crate::proxy::RequestBodyWaitError::TimedOut,
+            )) => BufferedUploadWaitOutcomeForTest::TimedOut,
+            Err(crate::proxy::AuthorizedUploadWaitError::Wait(
+                crate::proxy::RequestBodyWaitError::DeadlineExceeded,
+            )) => BufferedUploadWaitOutcomeForTest::DeadlineExceeded,
+            Err(crate::proxy::AuthorizedUploadWaitError::AuthorizationExpired(termination)) => {
+                BufferedUploadWaitOutcomeForTest::AuthorizationExpired(termination)
+            }
+        }
+    }
+
+    /// A composed early-upload protocol bound (client RPC deadline vs operator
+    /// whole-upload stall timeout), carried from composition time to wait time
+    /// so a test can put arbitrary scheduling delay between the two and prove
+    /// the buffered collect never recomposes it (issue #3815).
+    #[derive(Clone, Copy, Debug)]
+    pub struct ComposedEarlyUploadBoundForTest(
+        Option<(tokio::time::Instant, crate::proxy::EarlyUploadBoundKind)>,
+    );
+
+    impl ComposedEarlyUploadBoundForTest {
+        /// The absolute instant composition settled on, if any.
+        pub fn at(&self) -> Option<tokio::time::Instant> {
+            self.0.map(|(at, _)| at)
+        }
+
+        /// Which ceiling won composition.
+        pub fn kind(&self) -> Option<EarlyUploadBoundKind> {
+            self.0.map(|(_, kind)| match kind {
+                crate::proxy::EarlyUploadBoundKind::OperatorTimeout => {
+                    EarlyUploadBoundKind::OperatorTimeout
+                }
+                crate::proxy::EarlyUploadBoundKind::RpcDeadline => {
+                    EarlyUploadBoundKind::RpcDeadline
+                }
+            })
+        }
+    }
+
+    /// Compose the early-upload protocol bound exactly once, the way an
+    /// authorized buffered collect does (issue #3815).
+    pub fn compose_buffered_upload_bound_for_test(
+        deadline: Option<tokio::time::Instant>,
+        request_body_read_timeout_ms: u64,
+    ) -> ComposedEarlyUploadBoundForTest {
+        ComposedEarlyUploadBoundForTest(crate::proxy::compose_early_upload_bound(
+            deadline,
+            request_body_read_timeout_ms,
+        ))
+    }
+
+    /// Run one buffered client request-body collect against an ALREADY-COMPOSED
+    /// protocol bound (issue #3815).
+    ///
+    /// This is the seam the production entry point delegates to, so a test can
+    /// compose, advance time, and then observe that arm selection and the wait
+    /// itself agree on the SAME instant — no second, rebased operator window.
+    pub async fn collect_buffered_upload_under_composed_bound_for_test<F>(
+        collect: F,
+        bound: ComposedEarlyUploadBoundForTest,
+        request_body_read_timeout_ms: u64,
+        auth: Option<(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+    ) -> BufferedUploadWaitOutcomeForTest
+    where
+        F: std::future::Future<Output = Result<(), ()>>,
+    {
+        match crate::proxy::collect_request_body_under_authorization_with_bound(
+            collect,
+            bound.0,
+            request_body_read_timeout_ms,
+            auth.as_ref(),
+        )
+        .await
+        {
+            Ok(Ok(())) => BufferedUploadWaitOutcomeForTest::Collected,
+            Ok(Err(())) => BufferedUploadWaitOutcomeForTest::ClientError,
+            Err(crate::proxy::AuthorizedUploadWaitError::Wait(
+                crate::proxy::RequestBodyWaitError::TimedOut,
+            )) => BufferedUploadWaitOutcomeForTest::TimedOut,
+            Err(crate::proxy::AuthorizedUploadWaitError::Wait(
+                crate::proxy::RequestBodyWaitError::DeadlineExceeded,
+            )) => BufferedUploadWaitOutcomeForTest::DeadlineExceeded,
+            Err(crate::proxy::AuthorizedUploadWaitError::AuthorizationExpired(termination)) => {
+                BufferedUploadWaitOutcomeForTest::AuthorizationExpired(termination)
+            }
+        }
+    }
+
+    /// A composed dispatch-phase wait bound, carried from composition time to
+    /// attribution time so a test can put arbitrary scheduling delay between
+    /// the two (issue #3815).
+    #[derive(Clone, Copy, Debug)]
+    pub struct ComposedDispatchPhaseBoundForTest(crate::proxy::DispatchPhaseBound);
+
+    impl ComposedDispatchPhaseBoundForTest {
+        /// Whether the admitted stream's authorization deadline is the bound
+        /// that won composition.
+        pub fn authorization_wins(&self) -> bool {
+            self.0.authorization_wins
+        }
+
+        /// Whether composition produced any bound at all.
+        pub fn is_bounded(&self) -> bool {
+            self.0.at.is_some()
+        }
+    }
+
+    /// Compose a dispatch-phase wait bound with the admitted stream's
+    /// authorization lifetime (issue #3815).
+    ///
+    /// `phase_bound_after_ms` is the phase's own client/operator absolute
+    /// bound, relative to now; `None` means it established none.
+    pub fn compose_dispatch_phase_bound_for_test(
+        phase_bound_after_ms: Option<u64>,
+        auth: Option<&(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+    ) -> ComposedDispatchPhaseBoundForTest {
+        let phase_bound = phase_bound_after_ms.and_then(|millis| {
+            tokio::time::Instant::now().checked_add(std::time::Duration::from_millis(millis))
+        });
+        ComposedDispatchPhaseBoundForTest(crate::proxy::compose_dispatch_phase_auth_bound(
+            phase_bound,
+            auth,
+        ))
+    }
+
+    /// Attribute an already-composed dispatch-phase bound (issue #3815).
+    pub fn attribute_dispatch_phase_bound_for_test(
+        bound: &ComposedDispatchPhaseBoundForTest,
+        auth: Option<&(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        crate::proxy::dispatch_phase_authorization_expiry(bound.0, auth)
+    }
+
+    /// Attribute an ALREADY-COMPOSED dispatch-phase bound whose winning source
+    /// is the admitted stream's authorization lifetime (issue #3815). This is
+    /// the shape the typed composers (`authorization_bounded_header_deadline`,
+    /// `direct_h2_upload_join_bound`) hand to the shared helper.
+    pub fn dispatch_phase_authorization_expiry_for_test(
+        auth: Option<&(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        let bound = match auth {
+            Some((plan, _, _)) => crate::proxy::DispatchPhaseBound::authorization(plan.at),
+            None => crate::proxy::compose_dispatch_phase_auth_bound(None, None),
+        };
+        crate::proxy::dispatch_phase_authorization_expiry(bound, auth)
+    }
+
+    /// A fixed authorization-lifetime plan for a dispatch-phase test. The class
+    /// and family are incidental to the composition being proven.
+    fn header_wait_authorization_plan_for_test(
+        at: tokio::time::Instant,
+    ) -> (
+        crate::proxy::auth_lifetime::StreamAuthDeadline,
+        crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+        crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    ) {
+        use crate::proxy::auth_lifetime::{
+            StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination,
+            StreamAuthTerminationLatch,
+        };
+        (
+            StreamAuthDeadline {
+                at,
+                termination: StreamAuthTermination::CredentialExpired,
+            },
+            StreamAuthProtocolFamily::Http,
+            StreamAuthTerminationLatch::default(),
+        )
+    }
+
+    /// What one poll of the transport side of an upload pump observed.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum ProbeTransportPoll {
+        Pending,
+        Data(usize),
+        Ended,
+        Errored(String),
+    }
+
+    /// Terminal state of a probed upload pump.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ProbePumpOutcome {
+        Completed,
+        SourceError,
+        Cancelled,
+        AuthorizationExpired,
+        ConsumerGone,
+        /// The join point resolved without an outcome (task aborted).
+        Aborted,
+    }
+
+    /// A client request body that yields only what the test feeds it and stays
+    /// `Pending` otherwise, recording the instant the gateway drops it.
+    pub struct ProbeClientBody {
+        receiver: tokio::sync::mpsc::UnboundedReceiver<bytes::Bytes>,
+        released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for ProbeClientBody {
+        fn drop(&mut self) {
+            self.released
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    impl http_body::Body for ProbeClientBody {
+        type Data = bytes::Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<bytes::Bytes>, Self::Error>>> {
+            match self.receiver.poll_recv(cx) {
+                std::task::Poll::Ready(Some(data)) => {
+                    std::task::Poll::Ready(Some(Ok(http_body::Frame::data(data))))
+                }
+                // The feed channel is kept open by the probe, so this arm only
+                // fires once the probe itself is gone.
+                std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        }
+    }
+
+    /// One gateway-owned upload pump under test, with its transport side held
+    /// and DELIBERATELY NOT POLLED — the shape of a hyper HTTP/2 pipe parked on
+    /// backend send capacity, which is exactly the state a body-adapter-only
+    /// bound cannot escape (issue #3815).
+    pub struct UploadPumpProbe {
+        feed: Option<tokio::sync::mpsc::UnboundedSender<bytes::Bytes>>,
+        source: Option<crate::proxy::upload_pump::UploadPumpSource>,
+        join: Option<crate::proxy::upload_pump::UploadPumpJoin>,
+        released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl UploadPumpProbe {
+        /// Start a pump over a stalled client body under `plan`.
+        pub fn start(
+            plan: &(
+                crate::proxy::auth_lifetime::StreamAuthDeadline,
+                crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+                crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+            ),
+        ) -> Self {
+            let (feed, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let body = ProbeClientBody {
+                receiver,
+                released: std::sync::Arc::clone(&released),
+            };
+            let (source, join) = crate::proxy::upload_pump::spawn_upload_pump(body, plan);
+            Self {
+                feed: Some(feed),
+                source: Some(source),
+                join: Some(join),
+                released,
+            }
+        }
+
+        /// Whether the pump has dropped the inbound client body.
+        pub fn client_body_released(&self) -> bool {
+            self.released.load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        /// Hand the client body one DATA frame.
+        pub fn feed(&self, data: &'static str) -> bool {
+            self.feed.as_ref().is_some_and(|feed| {
+                feed.send(bytes::Bytes::from_static(data.as_bytes()))
+                    .is_ok()
+            })
+        }
+
+        /// The bounded bridge's in-flight frame budget.
+        pub fn channel_capacity() -> usize {
+            crate::proxy::upload_pump::upload_pump_channel_capacity()
+        }
+
+        /// Poll the transport side exactly once with a no-op waker.
+        pub fn poll_transport_once(&mut self) -> ProbeTransportPoll {
+            let Some(source) = self.source.as_mut() else {
+                return ProbeTransportPoll::Ended;
+            };
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            match source.poll_frame(&mut cx) {
+                std::task::Poll::Pending => ProbeTransportPoll::Pending,
+                std::task::Poll::Ready(None) => ProbeTransportPoll::Ended,
+                std::task::Poll::Ready(Some(Ok(frame))) => {
+                    ProbeTransportPoll::Data(frame.data_ref().map_or(0, bytes::Bytes::len))
+                }
+                std::task::Poll::Ready(Some(Err(e))) => ProbeTransportPoll::Errored(e.to_string()),
+            }
+        }
+
+        /// Wait for the pump to finish on its own — no cancellation — which is
+        /// what an authorization expiry must produce even though the transport
+        /// side is never polled.
+        pub async fn join(&mut self) -> ProbePumpOutcome {
+            map_probe_outcome(match self.join.take() {
+                Some(join) => join.join().await,
+                None => None,
+            })
+        }
+
+        /// Cancel the pump and wait for it to finish.
+        pub async fn cancel_and_join(&mut self) -> ProbePumpOutcome {
+            map_probe_outcome(match self.join.take() {
+                Some(join) => join.cancel_and_join().await,
+                None => None,
+            })
+        }
+
+        /// Drop the transport side, modelling hyper releasing the request body.
+        pub fn drop_transport(&mut self) {
+            self.source = None;
+        }
+    }
+
+    fn map_probe_outcome(
+        outcome: Option<crate::proxy::upload_pump::UploadPumpOutcome>,
+    ) -> ProbePumpOutcome {
+        use crate::proxy::upload_pump::UploadPumpOutcome;
+        match outcome {
+            Some(UploadPumpOutcome::Completed) => ProbePumpOutcome::Completed,
+            Some(UploadPumpOutcome::SourceError) => ProbePumpOutcome::SourceError,
+            Some(UploadPumpOutcome::Cancelled) => ProbePumpOutcome::Cancelled,
+            Some(UploadPumpOutcome::AuthorizationExpired) => ProbePumpOutcome::AuthorizationExpired,
+            Some(UploadPumpOutcome::ConsumerGone) => ProbePumpOutcome::ConsumerGone,
+            None => ProbePumpOutcome::Aborted,
+        }
+    }
+
+    /// Which bound wins the direct-H2 response-header wait once the admitted
+    /// stream's authorization lifetime composes over the client/operator bounds
+    /// (issue #3815). Returns `(millis_from_now, source_label)`.
+    pub fn authorization_bounded_header_deadline_for_test(
+        client_deadline_after_ms: Option<u64>,
+        backend_read_timeout_ms: u64,
+        authorization_after_ms: Option<u64>,
+    ) -> Option<(u128, &'static str)> {
+        let read_started_at = tokio::time::Instant::now();
+        let client_deadline = client_deadline_after_ms.and_then(|millis| {
+            read_started_at.checked_add(std::time::Duration::from_millis(millis))
+        });
+        let authorization = authorization_after_ms.and_then(|millis| {
+            read_started_at
+                .checked_add(std::time::Duration::from_millis(millis))
+                .map(header_wait_authorization_plan_for_test)
+        });
+        crate::proxy::authorization_bounded_header_deadline(
+            crate::proxy::response_header_deadline(
+                client_deadline,
+                backend_read_timeout_ms,
+                read_started_at,
+            ),
+            authorization.as_ref(),
+        )
+        .map(|(deadline, source)| {
+            let label = match source {
+                crate::proxy::ResponseHeaderDeadlineSource::Client => "client",
+                crate::proxy::ResponseHeaderDeadlineSource::Operator => "operator",
+                crate::proxy::ResponseHeaderDeadlineSource::Authorization => "authorization",
+            };
+            (
+                deadline
+                    .saturating_duration_since(read_started_at)
+                    .as_millis(),
+                label,
+            )
+        })
+    }
+
+    /// Which bound wins the direct-H2 early-response upload join once the
+    /// admitted stream's authorization lifetime composes over the client RPC
+    /// deadline and the operator whole-upload stall timeout (issue #3815).
+    /// Returns `(millis_from_now, source_label)`.
+    pub fn direct_h2_upload_join_bound_for_test(
+        rpc_deadline_after_ms: Option<u64>,
+        operator_timeout_ms: u64,
+        authorization_after_ms: Option<u64>,
+    ) -> Option<(u128, &'static str)> {
+        let now = tokio::time::Instant::now();
+        let rpc_deadline = rpc_deadline_after_ms
+            .and_then(|millis| now.checked_add(std::time::Duration::from_millis(millis)));
+        let authorization = authorization_after_ms
+            .and_then(|millis| now.checked_add(std::time::Duration::from_millis(millis)));
+        crate::proxy::direct_h2_upload_join_bound(
+            crate::proxy::compose_early_upload_bound(rpc_deadline, operator_timeout_ms),
+            authorization,
+        )
+        .map(|(deadline, bound)| {
+            let label = match bound {
+                crate::proxy::DirectH2UploadJoinBound::Authorization => "authorization",
+                crate::proxy::DirectH2UploadJoinBound::Protocol(
+                    crate::proxy::EarlyUploadBoundKind::RpcDeadline,
+                ) => "rpc_deadline",
+                crate::proxy::DirectH2UploadJoinBound::Protocol(
+                    crate::proxy::EarlyUploadBoundKind::OperatorTimeout,
+                ) => "operator_timeout",
+            };
+            (deadline.saturating_duration_since(now).as_millis(), label)
+        })
+    }
+
+    /// The health-neutral dispatch outcome every H1/H2 dispatch phase returns
+    /// when the admitted stream's authorization lifetime cancelled it
+    /// (issue #3815). Returns
+    /// `(status, body_bytes, connection_error, error_class_label)`.
+    pub fn authorization_expired_dispatch_placeholder_for_test()
+    -> (u16, Vec<u8>, bool, Option<&'static str>) {
+        let response =
+            crate::proxy::authorization_expired_dispatch_placeholder(Some("10.0.0.9".to_string()));
+        let bytes = match &response.body {
+            crate::retry::ResponseBody::Buffered(bytes) => bytes.to_vec(),
+            _ => panic!("the authorization placeholder is always a buffered body"),
+        };
+        (
+            response.status_code,
+            bytes,
+            response.connection_error,
+            response.error_class.map(crate::retry::error_class_log_kind),
+        )
+    }
+
+    /// Whether a TLS-terminating TCP listener may hand its socket to kernel
+    /// TLS, exactly as `handle_tcp_connection_inner` decides it before the
+    /// frontend handshake. Exposed so external tests can prove that a listener
+    /// carrying a stream-authenticating plugin (`mtls_auth`) stays on the
+    /// buffered userspace path where the authorization deadline can be
+    /// enforced (issue #3816).
+    pub fn ktls_handoff_eligible_for_test(
+        ktls_enabled: bool,
+        is_backend_tls: bool,
+        scan_first_bytes_decrypted: bool,
+        plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+    ) -> bool {
+        crate::proxy::tcp_proxy::ktls_handoff_eligible(
+            ktls_enabled,
+            is_backend_tls,
+            scan_first_bytes_decrypted,
+            plugins,
+        )
+    }
+
+    /// Wrap a frontend stream leg with the authorization-lifetime bound the
+    /// TCP/TLS relay installs, so external tests can prove that the deadline
+    /// terminates BOTH directions under continuous traffic without refreshing
+    /// on relayed bytes.
+    pub fn authorization_deadline_stream_for_test<S>(
+        inner: S,
+        deadline_at: tokio::time::Instant,
+        expired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> crate::proxy::tcp_proxy::AuthorizationDeadlineStream<S> {
+        crate::proxy::tcp_proxy::AuthorizationDeadlineStream::new(inner, deadline_at, expired)
+    }
+
+    /// Production TCP/TLS userspace relay under an authorization deadline with
+    /// every ordinary relay timeout disabled, so tests can prove a stalled
+    /// opposite endpoint cannot starve the bound (issue #3816).
+    pub async fn bidirectional_copy_with_authorization_for_test<C, B>(
+        client: C,
+        backend: B,
+        deadline_at: tokio::time::Instant,
+        expired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        buf_size: usize,
+    ) -> crate::proxy::tcp_proxy::StreamCopyResult
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        crate::proxy::tcp_proxy::bidirectional_copy_with_authorization_for_test(
+            client,
+            backend,
+            deadline_at,
+            expired,
+            buf_size,
+        )
+        .await
+    }
+
+    /// Race one H3 streaming response HEADERS write against a composed
+    /// authorization bound, matching the native-H3 streaming relays.
+    pub use crate::http3::stream_util::H3AuthorizedHeadersWrite;
+
+    pub async fn await_authorized_headers_write_for_test<F, T, E>(
+        bound: crate::proxy::auth_lifetime::ComposedAuthBound,
+        family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+        latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        write: F,
+    ) -> H3AuthorizedHeadersWrite
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        crate::http3::stream_util::await_authorized_headers_write(bound, family, latch, write).await
+    }
+
+    /// Compose the aggregate MCP SSE listener lifetime with a captured
+    /// authorization plan, matching the native-H3 aggregate SSE writer.
+    pub fn compose_aggregate_sse_bound_for_test(
+        listener_deadline: tokio::time::Instant,
+        auth_plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    ) -> crate::proxy::auth_lifetime::ComposedAuthBound {
+        crate::http3::stream_util::compose_aggregate_sse_bound(listener_deadline, auth_plan)
+    }
+
+    /// Wait out one connect-retry backoff exactly as the TCP setup loop does,
+    /// so an external test can prove the backoff is bounded by the admitted
+    /// stream's authorization deadline (issue #3816). Returns the bounded
+    /// termination class on expiry.
+    pub async fn tcp_retry_backoff_under_authorization_for_test(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        delay: std::time::Duration,
+    ) -> Result<(), crate::proxy::auth_lifetime::StreamAuthTermination> {
+        crate::proxy::tcp_proxy::retry_backoff_within_stream_auth_deadline(plan, delay).await
     }
 
     pub fn proxy_body_with_client_grpc_deadline_for_test(
@@ -7518,6 +9017,166 @@ pub mod _test_support {
         crate::dtls::dtls_stale_session_removal_preserves_newer_generation_for_test()
     }
 
+    /// Admission verdict for one terminating-frontend DTLS application send.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum FrontendAppSendAdmitForTest {
+        Proceed,
+        Expired,
+        Cancelled,
+    }
+
+    /// Shutdown / reject reason for a queued frontend DTLS application send.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum FrontendAppSendRejectForTest {
+        Expired,
+        Cancelled,
+        Closed,
+    }
+
+    fn map_frontend_app_send_admit_for_test(
+        admit: crate::dtls::FrontendAppSendAdmit,
+    ) -> FrontendAppSendAdmitForTest {
+        match admit {
+            crate::dtls::FrontendAppSendAdmit::Proceed => FrontendAppSendAdmitForTest::Proceed,
+            crate::dtls::FrontendAppSendAdmit::Reject(
+                crate::dtls::FrontendAppSendReject::Expired,
+            ) => FrontendAppSendAdmitForTest::Expired,
+            crate::dtls::FrontendAppSendAdmit::Reject(
+                crate::dtls::FrontendAppSendReject::Cancelled
+                | crate::dtls::FrontendAppSendReject::Closed,
+            ) => FrontendAppSendAdmitForTest::Cancelled,
+        }
+    }
+
+    fn map_frontend_app_send_reject_for_test(
+        reject: crate::dtls::FrontendAppSendReject,
+    ) -> FrontendAppSendRejectForTest {
+        match reject {
+            crate::dtls::FrontendAppSendReject::Expired => FrontendAppSendRejectForTest::Expired,
+            crate::dtls::FrontendAppSendReject::Cancelled => {
+                FrontendAppSendRejectForTest::Cancelled
+            }
+            crate::dtls::FrontendAppSendReject::Closed => FrontendAppSendRejectForTest::Closed,
+        }
+    }
+
+    /// Compose a per-call frontend application-send deadline with the session's
+    /// admitted authorization deadline. `None` only when both inputs are absent;
+    /// otherwise the earliest instant governs.
+    pub fn earliest_frontend_app_send_deadline_for_test(
+        per_call: Option<tokio::time::Instant>,
+        session: Option<tokio::time::Instant>,
+    ) -> Option<tokio::time::Instant> {
+        crate::dtls::earliest_frontend_app_send_deadline_for_test(per_call, session)
+    }
+
+    /// Pin whether a queued frontend DTLS application send may encrypt or
+    /// poll `socket.send_to`. An already-elapsed deadline never proceeds;
+    /// exact ties fail closed.
+    pub fn admit_frontend_app_send_for_test(
+        cancelled: bool,
+        deadline: Option<tokio::time::Instant>,
+        now: tokio::time::Instant,
+    ) -> FrontendAppSendAdmitForTest {
+        map_frontend_app_send_admit_for_test(crate::dtls::admit_frontend_app_send_for_test(
+            cancelled, deadline, now,
+        ))
+    }
+
+    /// Pin shutdown's refuse-to-flush decision: expired/cancelled keep that
+    /// reason; a still-authorized leftover is closed rather than emitted.
+    pub fn shutdown_queued_frontend_app_send_for_test(
+        cancelled: bool,
+        deadline: Option<tokio::time::Instant>,
+        now: tokio::time::Instant,
+    ) -> FrontendAppSendRejectForTest {
+        map_frontend_app_send_reject_for_test(
+            crate::dtls::shutdown_queued_frontend_app_send_for_test(cancelled, deadline, now),
+        )
+    }
+
+    /// Pin cancel-receiver closed detection used when the proxy send future
+    /// is dropped after channel enqueue.
+    pub fn frontend_app_send_cancel_fired_for_test(
+        cancel: &mut tokio::sync::oneshot::Receiver<()>,
+    ) -> bool {
+        crate::dtls::frontend_app_send_cancel_fired_for_test(cancel)
+    }
+
+    /// Race one application-ciphertext send (or a test double) against the
+    /// admitted deadline and cancel receiver — the exact driver `send_to`
+    /// seam.
+    pub async fn frontend_app_ciphertext_send_until_expiry_for_test<F>(
+        deadline: Option<tokio::time::Instant>,
+        cancel: Option<&mut tokio::sync::oneshot::Receiver<()>>,
+        send: F,
+    ) -> Result<F::Output, FrontendAppSendRejectForTest>
+    where
+        F: std::future::Future,
+    {
+        crate::dtls::frontend_app_ciphertext_send_until_expiry_for_test(deadline, cancel, send)
+            .await
+            .map_err(map_frontend_app_send_reject_for_test)
+    }
+
+    /// Bounded, credential-free reject strings. Must not contain identity,
+    /// certificate, or absolute expiry values.
+    pub fn frontend_app_send_reject_as_str_for_test(
+        reject: FrontendAppSendRejectForTest,
+    ) -> &'static str {
+        crate::dtls::frontend_app_send_reject_as_str_for_test(match reject {
+            FrontendAppSendRejectForTest::Expired => crate::dtls::FrontendAppSendReject::Expired,
+            FrontendAppSendRejectForTest::Cancelled => {
+                crate::dtls::FrontendAppSendReject::Cancelled
+            }
+            FrontendAppSendRejectForTest::Closed => crate::dtls::FrontendAppSendReject::Closed,
+        })
+    }
+
+    /// Allocate a lock-free frontend session authorization deadline for tests.
+    pub fn frontend_session_auth_deadline_for_test()
+    -> crate::dtls::FrontendSessionAuthDeadlineForTest {
+        crate::dtls::frontend_session_auth_deadline_for_test()
+    }
+
+    /// Publish one admitted authorization instant into the session deadline slot.
+    pub fn publish_frontend_session_auth_deadline_for_test(
+        auth_deadline: &crate::dtls::FrontendSessionAuthDeadlineForTest,
+        at: tokio::time::Instant,
+    ) {
+        crate::dtls::publish_frontend_session_auth_deadline_for_test(auth_deadline, at);
+    }
+
+    /// Read the current monotonically-earliest session authorization deadline.
+    pub fn read_frontend_session_auth_deadline_for_test(
+        auth_deadline: &crate::dtls::FrontendSessionAuthDeadlineForTest,
+    ) -> Option<tokio::time::Instant> {
+        crate::dtls::read_frontend_session_auth_deadline_for_test(auth_deadline)
+    }
+
+    /// Encode a nanosecond offset from the session anchor for external tests.
+    pub fn encode_frontend_session_auth_deadline_offset_for_test(offset_nanos: u128) -> u64 {
+        crate::dtls::encode_frontend_session_auth_deadline_offset_for_test(offset_nanos)
+    }
+
+    /// Reconstruct a deadline instant from anchor + encoded offset for external tests.
+    pub fn reconstruct_frontend_session_auth_deadline_for_test(
+        anchor: tokio::time::Instant,
+        encoded: u64,
+    ) -> tokio::time::Instant {
+        crate::dtls::reconstruct_frontend_session_auth_deadline_for_test(anchor, encoded)
+    }
+
+    /// Reconstruct a deadline instant from anchor + duration offset for external tests.
+    pub fn reconstruct_frontend_session_auth_deadline_from_duration_for_test(
+        anchor: tokio::time::Instant,
+        offset: Duration,
+    ) -> tokio::time::Instant {
+        crate::dtls::reconstruct_frontend_session_auth_deadline_from_duration_for_test(
+            anchor, offset,
+        )
+    }
+
     /// External coverage for the DTLS client-address metadata refusal
     /// diagnostic (issue #3289): drops are counted per refusal while the
     /// warning is rate-limited. See
@@ -7801,20 +9460,6 @@ pub mod _test_support {
             mesh_egress_required,
             reqwest_dispatch_is_http1_only,
         )
-    }
-
-    /// Expiration-first deadline race used by Ambient HBONE WebSocket
-    /// establishment (issue #3620). Unlike `tokio::time::timeout_at`, an
-    /// already-elapsed deadline and an exact timer/result tie expire
-    /// rather than accepting a ready success.
-    pub async fn await_deadline_first_for_test<F, T>(
-        deadline: tokio::time::Instant,
-        fut: F,
-    ) -> Result<T, ()>
-    where
-        F: std::future::Future<Output = T>,
-    {
-        crate::proxy::await_deadline_first(deadline, fut).await
     }
 
     /// Whether the inbound request declared a request body on the wire, as the
@@ -8587,11 +10232,74 @@ pub mod _test_support {
             Err(crate::http3::server::H3RequestBodyReadError::TimedOut) => {
                 Err(EarlyUploadWaitError::TimedOut)
             }
-            Err(crate::http3::server::H3RequestBodyReadError::DeadlineExceeded) => {
+            Err(crate::http3::server::H3RequestBodyReadError::DeadlineExceeded(_)) => {
                 Err(EarlyUploadWaitError::DeadlineExceeded)
             }
             Err(crate::http3::server::H3RequestBodyReadError::Read(_)) => {
                 Err(EarlyUploadWaitError::Read)
+            }
+        }
+    }
+
+    /// Which bound ended a NATIVE-H3 buffered request-upload drain, and — when
+    /// the composed absolute bound is what fired — which of its two owners was
+    /// captured at composition time (issue #3815).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum H3UploadWaitOutcomeForTest {
+        Collected,
+        ClientError,
+        /// The operator whole-upload stall guard fired. It composes on top of
+        /// the absolute bound and never carries an authorization attribution.
+        TimedOut,
+        /// The composed absolute bound fired and the CLIENT's own RPC deadline
+        /// is the captured winner.
+        DeadlineExceeded,
+        /// The composed absolute bound fired and the admitted credential's
+        /// authorization lifetime is the captured winner.
+        AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+    }
+
+    /// Compose the native-H3 buffered-upload bound exactly as all seven
+    /// native-H3 upload sites do: the client's optional RPC deadline against
+    /// the admitted request's authorization plan, keeping the winning owner.
+    pub fn compose_h3_upload_bound_for_test(
+        ctx: &crate::plugins::RequestContext,
+        max_lifetime_seconds: u64,
+    ) -> crate::proxy::auth_lifetime::ComposedAuthBound {
+        crate::http3::server::h3_upload_authorization_bound(ctx, max_lifetime_seconds)
+    }
+
+    /// Run one native-H3 buffered request-upload drain against an
+    /// ALREADY-COMPOSED authorization bound (issue #3815).
+    ///
+    /// This is the seam every native-H3 upload site uses, so a test can
+    /// compose, let arbitrary scheduling delay pass, and still observe that the
+    /// reported owner comes from the composition rather than from the clock.
+    pub async fn collect_h3_upload_under_authorization_for_test<F>(
+        collect: F,
+        bound: crate::proxy::auth_lifetime::ComposedAuthBound,
+        request_body_read_timeout_ms: u64,
+    ) -> H3UploadWaitOutcomeForTest
+    where
+        F: std::future::Future<Output = Result<(), ()>>,
+    {
+        use crate::http3::server::H3RequestBodyReadError as H3UploadError;
+
+        match crate::http3::server::collect_h3_request_body_under_authorization(
+            collect,
+            bound,
+            request_body_read_timeout_ms,
+        )
+        .await
+        {
+            Ok(()) => H3UploadWaitOutcomeForTest::Collected,
+            Err(H3UploadError::Read(())) => H3UploadWaitOutcomeForTest::ClientError,
+            Err(H3UploadError::TimedOut) => H3UploadWaitOutcomeForTest::TimedOut,
+            Err(H3UploadError::DeadlineExceeded(None)) => {
+                H3UploadWaitOutcomeForTest::DeadlineExceeded
+            }
+            Err(H3UploadError::DeadlineExceeded(Some(termination))) => {
+                H3UploadWaitOutcomeForTest::AuthorizationExpired(termination)
             }
         }
     }

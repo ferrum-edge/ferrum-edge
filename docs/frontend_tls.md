@@ -525,6 +525,104 @@ For reqwest-based backend paths (HTTP/1.1, HTTP/2 via reqwest, HTTP/3 frontend-t
 4. **Document certificate issuance procedures**
 5. **Plan for certificate compromise scenarios**
 
+### Client-Certificate Authorization Lifetime
+
+The TLS handshake proves the client certificate was valid **at handshake time**.
+That is necessary but not sufficient for the gateway's authorization contract:
+HTTP/2 and HTTP/3 multiplex new request streams over one transport connection
+for a long time without repeating the handshake, HTTP/1.1 reuses a connection
+for keep-alive requests, and a TCP+TLS stream session can stay open
+continuously. Issue #3816 tracks that gap.
+
+`mtls_auth` therefore enforces the leaf certificate's validity interval itself:
+
+- **Unconditional leaf validity.** Every request re-checks the leaf's
+  `notBefore` / `notAfter` window, independently of whether the optional
+  `allowed_issuers` / `allowed_ca_fingerprints_sha256` constraints are
+  configured. The default configuration (`cert_field` only) is covered. The
+  existing CA/intermediate validity checks inside the issuer-constraint paths
+  remain as defense in depth and cannot bypass this check.
+- **Fail closed on unusable times.** A certificate whose validity interval
+  cannot be represented as a coherent window — a malformed or overflowing ASN.1
+  time, or an inverted `notAfter < notBefore` — is rejected outright, before any
+  identity is extracted.
+- **Boundaries are inclusive.** `notBefore` and `notAfter` themselves are inside
+  the window, matching RFC 5280 "valid at" semantics. One second past `notAfter`
+  is outside it.
+- **The connection cache stays, but never caches a time-dependent decision.**
+  HTTP/3 memoizes the expensive X.509 parse, path verification, and identity
+  extraction once per plugin instance and transport connection. What is cached
+  is the certificate-*invariant* result — the identity plus the validity window
+  — never "this was valid". Every request re-checks the Unix window, and the
+  first successful evaluation converts `notAfter` once to a monotonic Instant
+  that later cache hits must return unchanged, so a wall-clock rollback cannot
+  recreate a later deadline. A cached success becomes a fixed `401` the moment
+  that retained Instant elapses. `ConsumerIndex` lookup likewise stays per
+  request, so a consumer removed by a config reload stops being authorized
+  immediately.
+- **The client learns nothing.** The rejection body is a fixed
+  `{"error":"Client certificate is not currently valid"}`. `notBefore`,
+  `notAfter`, the observed time, the subject, the SAN, the serial, the
+  fingerprint, and the DER are never echoed to the client and never logged or
+  exported as a metric label.
+
+A successful `mtls_auth` verification also publishes the leaf's `notAfter` as
+the request's authoritative **credential deadline** on the shared,
+protocol-neutral contract. That single value is what bounds:
+
+- the WebSocket session deadline arbiter (earlier of certificate expiry and
+  `FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS`), on H1 Upgrade, H2 Extended CONNECT,
+  and H3 Extended CONNECT;
+- generic HTTP/SSE, native gRPC, and gRPC-Web streaming bodies (see
+  [Authorization Lifetime of an Admitted Stream](response_body_streaming.md#authorization-lifetime-of-an-admitted-stream));
+- TCP+TLS and UDP+DTLS stream sessions, whose `on_stream_connect` admission runs
+  exactly once and would otherwise leave a continuously active relay unbounded.
+
+The deadline is converted to a **monotonic** instant once, at the first
+successful evaluation, and that Instant is retained on the cached evaluation so
+a wall-clock rollback cannot lengthen a later request on the same connection.
+Relay traffic never refreshes it.
+
+#### Kernel TLS and the stream authorization deadline
+
+The optional Linux kernel-TLS (kTLS) fast path for terminating `tcp_tls`
+listeners hands the socket to the kernel and relays with `splice(2)`. The
+gateway no longer owns the byte stream at that point, so the userspace
+authorization-deadline wrapper that bounds an admitted TCP+TLS session cannot be
+installed — and once `dangerous_into_kernel_connection` has run there is no safe
+conversion back to a userspace rustls session.
+
+Eligibility is therefore decided **before the frontend handshake starts**, while
+the socket is still pristine. A TLS-terminating TCP listener whose plugin chain
+can admit an authenticated stream principal — today that means `mtls_auth` —
+does not take the kTLS handoff at all. Such a connection stays on the ordinary
+buffered rustls path, is relayed normally, and is bounded by the certificate
+deadline exactly as described above. Nothing is refused and no authentication is
+skipped; only the optional fast path is declined.
+
+Listeners that cannot admit such a principal keep kTLS unchanged, alongside the
+pre-existing refusals (opt-in off, TLS backend, decrypted first-bytes
+inspection, TLS 1.3, and the cipher/kernel probes inside the handoff itself).
+
+#### Expiry is not revocation
+
+These are two different mechanisms and this document does not conflate them:
+
+| Event | Effect on a NEW handshake | Effect on an ALREADY-ESTABLISHED session |
+|-------|---------------------------|------------------------------------------|
+| Client certificate reaches `notAfter` | Rejected at TLS verification | **Enforced.** New H1 keep-alive requests, new H2/H3 streams, and admitted HTTP/SSE/gRPC/gRPC-Web/WebSocket/TCP+TLS relays are terminated at the certificate deadline |
+| `FERRUM_TLS_CRL_FILE_PATH` live-reloaded with a new revocation list | Applied — the rebuilt verifier rejects revoked certificates | **Not applied.** The session keeps the `ServerConfig` generation it negotiated with |
+| `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` live-reloaded (CA rotation/removal) | Applied to new handshakes | **Not applied** to established sessions |
+
+In other words: **live-reloaded CRLs and client-CA bundles affect new handshakes
+only.** Ferrum does not currently attach a trust/revocation generation to
+admitted connections, and makes no claim to terminate an in-flight session when
+a certificate is revoked mid-session. Deployments that need a bounded exposure
+window after a revocation should rely on short client-certificate lifetimes —
+which *are* enforced against established sessions by the contract above — and on
+`FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` /
+`FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS` as the finite ceiling.
+
 ### Per-Proxy CA Filtering with `mtls_auth`
 
 The global `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` applies to all connections on the HTTPS listener — the TLS handshake happens before routing, so the gateway cannot know which proxy a request targets until after the handshake completes. The same source controls terminated TCP+TLS; UDP+DTLS uses the separate `FERRUM_DTLS_CLIENT_CA_CERT_PATH` / `_SOURCE`. When the client-CA source for a frontend is configured, Ferrum requires every client to present a certificate that validates to it. Without that source, the frontend does not request a client certificate, so an `mtls_auth` plugin will not have a certificate to authenticate.

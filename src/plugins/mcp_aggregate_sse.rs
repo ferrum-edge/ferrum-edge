@@ -1665,12 +1665,14 @@ impl fmt::Debug for AggregateSseBody {
 }
 
 impl AggregateSseBody {
-    /// Absolute end of this stream's bounded lifetime.
+    /// Absolute end of this stream's broker-owned listener lifetime.
     ///
     /// The in-body timer only advances while the transport polls this stream.
     /// Native HTTP/3 writes with an awaited `send_data`, which a peer that stops
-    /// reading can park indefinitely, so that writer enforces this deadline as a
-    /// hard bound around its own send loop instead of relying on the poll.
+    /// reading can park indefinitely, so that writer composes this deadline with
+    /// the admitted request's captured authorization plan and enforces the
+    /// earliest of the two as a hard bound around every flow-control-blocked
+    /// write instead of relying on the poll.
     pub fn deadline(&self) -> tokio::time::Instant {
         self.deadline
     }
@@ -1715,7 +1717,8 @@ impl futures_util::Stream for AggregateSseBody {
         // guarantees are elsewhere: `AggregateSseBroker::attach_listener`
         // supersedes a listener past `expires_at`, session delete / idle
         // reaping / generation retirement close the session outright, and the
-        // native H3 writer bounds its send loop by `deadline()`.
+        // native H3 writer composes `deadline()` with the captured
+        // authorization plan and bounds its send loop by the earlier instant.
         if this.timer.as_mut().poll(cx).is_pending() {
             return Poll::Pending;
         }

@@ -455,6 +455,23 @@ impl Http3Client {
             .await
     }
 
+    /// Open a client-driven HTTP/3 POST stream with an arbitrary content type
+    /// and request metadata, leaving both directions open.
+    ///
+    /// Needed by the authorization-lifetime suite: a gRPC-Web stream and a plain
+    /// streaming upload must both carry the credential that admitted them, and
+    /// the plain upload must keep sending DATA past the credential deadline
+    /// without ever half-closing.
+    pub async fn open_request_stream_with_content_type(
+        &self,
+        url: &str,
+        content_type: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<Http3GrpcStream, Box<dyn std::error::Error + Send + Sync>> {
+        self.open_grpc_stream_with_content_type(url, content_type, headers)
+            .await
+    }
+
     async fn open_grpc_stream_with_content_type(
         &self,
         url: &str,

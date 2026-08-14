@@ -54,6 +54,8 @@ mod functional_grpc_method_pre_hook_test;
 mod functional_grpc_plugins_test;
 mod functional_grpc_test;
 mod functional_grpcroute_pathless_dispatch_test;
+mod functional_h1_h2_auth_lifetime_test;
+mod functional_h3_auth_lifetime_test;
 mod functional_h3_authority_validation_test;
 mod functional_h3_grpc_streaming_test;
 mod functional_h3_grpc_web_test;
