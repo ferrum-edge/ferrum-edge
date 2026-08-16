@@ -70,6 +70,15 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   two-family a PR may leave the workflow byte-identical or adopt the whole
   three-family shape, and once the base is three-family a revert is refused. See
   `docs/ci_cd.md` → "Admitted release image-family adoption".
+- `fips-build.yml` carries ONE temporary admitted generation transition for
+  issue #3888 / PR #3889: the exact retired file text moving to the exact
+  adopted one, each pinned by whole-file SHA-256
+  (`FIPS_BUILD_RETIRED_GENERATION_SHA256`,
+  `FIPS_BUILD_ADOPTED_GENERATION_SHA256`). It is exact on both ends, bound to
+  the path, one-way, and withholds exactly one surface-equality verdict. Delete
+  it once #3889 is on `main`. See `docs/ci_cd.md` and
+  `docs/dependency-policy.md` → "Admitted `fips-build.yml` generation
+  transition".
 
 ## Drift Guard
 

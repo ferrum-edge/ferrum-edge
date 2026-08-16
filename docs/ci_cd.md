@@ -1605,6 +1605,67 @@ modification of the verifier it protects, and the landing is administrative afte
 root review), then an ordinary pull request that adopts the release workflow
 under the now-trusted policy and runs the full hosted matrix.
 
+##### Admitted `fips-build.yml` generation transition (temporary, issue #3888)
+
+`.github/workflows/fips-build.yml` is an ordinary workflow — unprotected and
+uncontracted — so the only thing the pull-request Cross scan says about it is
+that its Cross executable/configuration surface must not move between the
+trusted base and the proposal. The FIPS runtime rework in PR #3889 rewrites the
+file (trusted-base path planning, split compile/lint phases, scoped sccache and
+`ci-fips` rust-cache reuse, a `force_cold_cache` dispatch input, per-phase
+summaries) and moves that surface, so the scan rejects it with
+`workflow directory/fips-build.yml cannot add or change Cross
+executable/configuration surfaces`. The verifier that decides this always
+executes from the trusted base, so that pull request cannot repair it inside its
+own proposal.
+
+Rather than relaxing the scan, the trusted policy admits **exactly one**
+transition of that one file, bound to the two complete file **generations** it
+moves between. Each generation is named by the SHA-256 of its entire text and is
+pinned in the trusted verifier itself
+(`FIPS_BUILD_RETIRED_GENERATION_SHA256`, `FIPS_BUILD_ADOPTED_GENERATION_SHA256`).
+A workflow this large has no frozen job contract to project fragment by
+fragment, so exact whole-file generation binding is what replaces the release
+workflow's derived projection. Nothing about the admission comes from the pull
+request — not the digest, not a manifest, not an allowlist, not a projection,
+not a rationale — so a proposal reaches it only by being, byte for byte, the
+destination revision the trusted policy already names.
+
+The admission is fail-closed in every direction it does not name:
+
+- Both ends are exact. The trusted base must be the retired generation and the
+  proposal the adopted one. A one-byte drift on either side, an absent file, the
+  destination added outright, or a partially applied rewrite is scanned exactly
+  as before.
+- It is bound to the path as well as to the two contents; the same two revisions
+  under any other workflow filename are not this transition.
+- It is one-way. Once the trusted base carries the adopted generation, returning
+  the file to the retired one is refused explicitly
+  (`cannot return to the retired FIPS workflow generation after the trusted base
+  adopts the admitted one`) rather than relying on the two surfaces differing.
+- It withholds one surface-equality verdict, for one file, for one revision
+  pair. Every other workflow, action, automation script, protected job contract,
+  digest name space, required-check binding, and live-gate relevance contract is
+  evaluated exactly as before, so a Cross surface added anywhere else in the
+  same pull request is still rejected. Hard scan failures on either revision are
+  reported regardless.
+
+**Retirement is mandatory.** Once PR #3889 is on `main` the trusted base *is*
+the adopted generation, so the admission is permanently unreachable — the
+retired generation can only become a trusted base again by first passing the
+one-way refusal. The pinned digests, the `admitted_generation_transition`
+parameter, the self-tests, and this section must be deleted in the next
+trusted-policy change. If #3889's `fips-build.yml` changes for any reason before
+it lands (including a conflicting merge of `main`), the adopted digest no longer
+matches and the transition must be re-pinned by another trusted-policy pull
+request.
+
+Landing this admission takes the same two stages as the release image-family
+adoption: a policy-only pull request whose own `Trusted Cross Build Policy`
+check fails by design (that check refuses any pull-request modification of the
+verifier it protects, so `Candidate policy self-test` is the substantive
+evidence), then the ordinary workflow pull request under the now-trusted policy.
+
 #### 8. Latest Release and Docker Jobs
 
 **Runs**: `ubuntu-latest`
