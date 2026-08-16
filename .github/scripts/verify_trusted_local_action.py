@@ -343,7 +343,10 @@ def setup_kubernetes_tools_destination_generation() -> (
 
 
 def read_bounded_local_payload(
-    path: Path, *, limit: int = MAX_MEMBER_BYTES
+    path: Path,
+    *,
+    limit: int = MAX_MEMBER_BYTES,
+    expected_executable: bool | None = None,
 ) -> bytes:
     """Read a candidate file without exceeding `limit` bytes.
 
@@ -357,18 +360,47 @@ def read_bounded_local_payload(
         raise TrustedActionError("local action read limit is invalid")
     try:
         with path.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise TrustedActionError(
+                    "local action input must remain a regular file"
+                )
+            executable = bool(
+                before.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            )
+            if (
+                expected_executable is not None
+                and executable != expected_executable
+            ):
+                raise TrustedActionError(
+                    "local action executable bit changed before bounded read"
+                )
+            if before.st_size > limit:
+                raise TrustedActionError(
+                    f"local action input exceeds {limit} bytes"
+                )
             payload = handle.read(limit + 1)
+            after = os.fstat(handle.fileno())
     except OSError as exc:
         raise TrustedActionError(
             f"unreadable local action input ({exc})"
         ) from exc
     if len(payload) > limit:
         raise TrustedActionError(f"local action input exceeds {limit} bytes")
-    try:
-        observed = path.stat().st_size
-    except OSError as exc:
-        raise TrustedActionError(f"unreadable local action size ({exc})") from exc
-    if observed != len(payload):
+    stable_fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    if any(
+        getattr(before, field) != getattr(after, field)
+        for field in stable_fields
+    ):
+        raise TrustedActionError("local action input changed during bounded read")
+    if after.st_size != len(payload):
         raise TrustedActionError(
             "local action input size does not match the bytes read"
         )
@@ -419,17 +451,14 @@ def read_admitted_transition_generation(
     limit = admitted_transition_payload_limit()
     for relative, path in discovered.items():
         try:
-            mode = path.stat().st_mode
-        except OSError:
-            return None
-        executable = bool(mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
-        if executable != expected_modes[relative]:
-            return None
-        try:
-            payload = read_bounded_local_payload(path, limit=limit)
+            payload = read_bounded_local_payload(
+                path,
+                limit=limit,
+                expected_executable=expected_modes[relative],
+            )
         except (TrustedActionError, OSError):
             return None
-        generation[relative] = (executable, payload)
+        generation[relative] = (expected_modes[relative], payload)
     return generation
 
 
