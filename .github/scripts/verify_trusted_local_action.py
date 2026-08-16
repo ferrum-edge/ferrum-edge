@@ -25,6 +25,20 @@ unexpected member type — fails closed. The verifier deliberately spawns no
 process and never reads a secret; the workflow performs the one `git archive`
 invocation while the runner `PATH` is still the pristine one.
 
+Byte identity is the default. Issue #3904 admits exactly one additional move
+for `.github/actions/setup-kubernetes-tools`: the frozen current trusted
+generation (sole governed file `action.yml`, non-executable, SHA-256
+`6ecb4bde09a0d3d456d6019c03ef1678c3903cbc0275bba31fde3e56f6e6ef08`) may
+become the frozen PR #3910 generation (same path set and mode, SHA-256
+`41dd4b9ae1b0ad74e021e2974afbcdac1a1bc0d856a166a57e94046e803d6cd9`). Both
+generations are bound here, including every governed file and executable bit.
+Another base generation, a one-byte or mode change, an extra or missing file,
+or any other local-action path is still rejected. The candidate cannot supply
+a digest or extend the map. Once the destination is the trusted base,
+unchanged destination bytes pass by ordinary identity and further unadmitted
+drift still fails. Retire the predecessor constants after that landing so the
+old tree cannot remain an admitted source.
+
 Usage:
   python3 -I .github/scripts/verify_trusted_local_action.py --self-test
   python3 -I .github/scripts/verify_trusted_local_action.py \
@@ -35,6 +49,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import os
 import stat
@@ -52,6 +67,20 @@ TRUSTED_FILE_MODES = frozenset((0o644, 0o664, 0o755, 0o775))
 # Bound a hostile archive so a crafted manifest cannot exhaust the runner.
 MAX_ARCHIVE_MEMBERS = 4096
 MAX_MEMBER_BYTES = 8 * 1024 * 1024
+
+# The only local-action path that may use the generation transition below.
+# Every other `uses: ./.github/actions/...` tree stays on ordinary byte identity.
+SETUP_KUBERNETES_TOOLS_ACTION_PATH = ".github/actions/setup-kubernetes-tools"
+# Published SHA-256 of the sole governed file in each bound generation. The
+# complete identity also includes the path set and executable bit; see
+# `generation_fingerprint`. Bytes live at the bottom of this file so the
+# extracted checker does not read a candidate digest or companion fixture.
+SETUP_KUBERNETES_TOOLS_CURRENT_ACTION_YML_SHA256 = (
+    "6ecb4bde09a0d3d456d6019c03ef1678c3903cbc0275bba31fde3e56f6e6ef08"
+)
+SETUP_KUBERNETES_TOOLS_DESTINATION_ACTION_YML_SHA256 = (
+    "41dd4b9ae1b0ad74e021e2974afbcdac1a1bc0d856a166a57e94046e803d6cd9"
+)
 
 
 class TrustedActionError(Exception):
@@ -280,6 +309,97 @@ def verify_local_action(
     return findings
 
 
+def generation_fingerprint(
+    files: dict[str, tuple[bool, bytes]],
+) -> tuple[tuple[str, bool, str], ...]:
+    """Bind a complete local-action generation: path set, mode, and content.
+
+    The identity is the sorted tuple of `(relative path, executable bit,
+    SHA-256 of the file bytes)`. An extra file, a missing file, a flipped
+    executable bit, or a one-byte edit all produce a different identity.
+    """
+
+    return tuple(
+        (path, executable, hashlib.sha256(payload).hexdigest())
+        for path, (executable, payload) in sorted(files.items())
+    )
+
+
+def setup_kubernetes_tools_current_generation() -> tuple[tuple[str, bool, str], ...]:
+    return generation_fingerprint(
+        {"action.yml": (False, SETUP_KUBERNETES_TOOLS_CURRENT_ACTION_YML)}
+    )
+
+
+def setup_kubernetes_tools_destination_generation() -> (
+    tuple[tuple[str, bool, str], ...]
+):
+    return generation_fingerprint(
+        {"action.yml": (False, SETUP_KUBERNETES_TOOLS_DESTINATION_ACTION_YML)}
+    )
+
+
+def read_local_generation(
+    root: Path,
+    action_dir: PurePosixPath,
+) -> dict[str, tuple[bool, bytes]]:
+    """Read the working-tree action into the same shape as a trusted manifest."""
+
+    discovered = local_action_files(root, action_dir)
+    generation: dict[str, tuple[bool, bytes]] = {}
+    for relative, path in discovered.items():
+        payload = path.read_bytes()
+        mode = path.stat().st_mode
+        executable = bool(mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+        generation[relative] = (executable, payload)
+    return generation
+
+
+def is_admitted_generation_transition(
+    action_dir: PurePosixPath,
+    trusted: dict[str, tuple[bool, bytes]],
+    local: dict[str, tuple[bool, bytes]],
+) -> bool:
+    """Accept only the frozen setup-kubernetes-tools current→destination move.
+
+    Source and destination are both bound in this extracted checker. The
+    working tree cannot supply a digest, name another path, or widen the
+    pair. A revert (destination trusted, current local) is not admitted.
+    """
+
+    if action_dir.as_posix() != SETUP_KUBERNETES_TOOLS_ACTION_PATH:
+        return False
+    return (
+        generation_fingerprint(trusted) == setup_kubernetes_tools_current_generation()
+        and generation_fingerprint(local)
+        == setup_kubernetes_tools_destination_generation()
+    )
+
+
+def evaluate_local_action(
+    root: Path,
+    action_dir: PurePosixPath,
+    manifest: dict[str, tuple[bool, bytes]],
+) -> tuple[list[str], bool]:
+    """Compare the working tree to the trusted manifest, then the frozen pair.
+
+    Returns `(findings, admitted_transition)`. Ordinary byte identity yields
+    empty findings and `False`. The one admitted generation move yields empty
+    findings and `True`. Every other mismatch keeps its fail-closed findings.
+    """
+
+    findings = verify_local_action(root, action_dir, manifest)
+    if not findings:
+        return findings, False
+    try:
+        local = read_local_generation(root, action_dir)
+    except OSError:
+        return findings, False
+    if is_admitted_generation_transition(action_dir, manifest, local):
+        return [], True
+    return findings, False
+
+
 def _write(path: Path, contents: bytes, *, executable: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(contents)
@@ -330,8 +450,43 @@ def _clean_worktree(root: Path) -> None:
     _write(root / _ACTION_DIR / "bin" / "helper.sh", _HELPER_SH, executable=True)
 
 
+def _archive_generation(
+    action_dir: str,
+    files: dict[str, tuple[bool, bytes]],
+) -> bytes:
+    entries = [
+        (name, payload, 0o775 if executable else 0o664)
+        for name, (executable, payload) in files.items()
+    ]
+    return _archive_bytes(action_dir, entries)
+
+
+def _write_generation(
+    root: Path,
+    action_dir: str,
+    files: dict[str, tuple[bool, bytes]],
+) -> None:
+    for name, (executable, payload) in files.items():
+        _write(root / action_dir / name, payload, executable=executable)
+
+
+def _current_setup_k8s_files() -> dict[str, tuple[bool, bytes]]:
+    return {"action.yml": (False, SETUP_KUBERNETES_TOOLS_CURRENT_ACTION_YML)}
+
+
+def _destination_setup_k8s_files() -> dict[str, tuple[bool, bytes]]:
+    return {"action.yml": (False, SETUP_KUBERNETES_TOOLS_DESTINATION_ACTION_YML)}
+
+
 def run_self_test() -> list[str]:
-    """Synthetic manifests and worktrees: only an exact match is accepted."""
+    """Synthetic manifests and worktrees: only an exact match is accepted.
+
+    Also proves the frozen setup-kubernetes-tools current→destination pair:
+    exact old→new admission, then rejection of a wrong predecessor, a wrong
+    destination digest, extra or missing files, a mode change, and the same
+    bytes on an unrelated action path. Destination-as-base identity still
+    passes; further unadmitted drift and a revert still fail.
+    """
 
     failures: list[str] = []
     action_dir = normalize_action_path(_ACTION_DIR)
@@ -414,6 +569,18 @@ def run_self_test() -> list[str]:
         else:
             if findings:
                 failures.append(f"matching action tree was rejected: {findings}")
+        try:
+            findings, transitioned = evaluate_local_action(
+                clean, action_dir, manifest
+            )
+        except TrustedActionError as exc:
+            failures.append(f"matching action tree evaluate raised: {exc}")
+        else:
+            if findings or transitioned:
+                failures.append(
+                    "matching action tree lost ordinary byte-identical behavior: "
+                    f"findings={findings} transitioned={transitioned}"
+                )
 
         modified = Path(tmp) / "modified"
         _clean_worktree(modified)
@@ -521,6 +688,310 @@ def run_self_test() -> list[str]:
         else:
             failures.append("missing trusted archive was accepted")
 
+        failures.extend(_generation_transition_self_tests(Path(tmp), action_dir))
+
+    return failures
+
+
+def _generation_transition_self_tests(
+    tmp: Path,
+    default_action_dir: PurePosixPath,
+) -> list[str]:
+    """Exact old→new admission and every nearby miss for the frozen pair."""
+
+    failures: list[str] = []
+    current_files = _current_setup_k8s_files()
+    destination_files = _destination_setup_k8s_files()
+    current_fp = setup_kubernetes_tools_current_generation()
+    destination_fp = setup_kubernetes_tools_destination_generation()
+    action_dir = normalize_action_path(SETUP_KUBERNETES_TOOLS_ACTION_PATH)
+    if action_dir != default_action_dir:
+        failures.append(
+            "setup-kubernetes-tools path drifted from the self-test action dir"
+        )
+
+    if hashlib.sha256(SETUP_KUBERNETES_TOOLS_CURRENT_ACTION_YML).hexdigest() != (
+        SETUP_KUBERNETES_TOOLS_CURRENT_ACTION_YML_SHA256
+    ):
+        failures.append("current setup-kubernetes-tools payload hash drifted")
+    if hashlib.sha256(SETUP_KUBERNETES_TOOLS_DESTINATION_ACTION_YML).hexdigest() != (
+        SETUP_KUBERNETES_TOOLS_DESTINATION_ACTION_YML_SHA256
+    ):
+        failures.append("destination setup-kubernetes-tools payload hash drifted")
+    if current_fp != (
+        ("action.yml", False, SETUP_KUBERNETES_TOOLS_CURRENT_ACTION_YML_SHA256),
+    ):
+        failures.append(f"current generation fingerprint drifted: {current_fp}")
+    if destination_fp != (
+        ("action.yml", False, SETUP_KUBERNETES_TOOLS_DESTINATION_ACTION_YML_SHA256),
+    ):
+        failures.append(
+            f"destination generation fingerprint drifted: {destination_fp}"
+        )
+    if current_fp == destination_fp:
+        failures.append("current and destination generations are not distinct")
+
+    current_manifest = _manifest_from_bytes(
+        _archive_generation(SETUP_KUBERNETES_TOOLS_ACTION_PATH, current_files),
+        action_dir,
+    )
+    destination_manifest = _manifest_from_bytes(
+        _archive_generation(SETUP_KUBERNETES_TOOLS_ACTION_PATH, destination_files),
+        action_dir,
+    )
+    if generation_fingerprint(current_manifest) != current_fp:
+        failures.append("archived current generation lost a bound field")
+    if generation_fingerprint(destination_manifest) != destination_fp:
+        failures.append("archived destination generation lost a bound field")
+
+    admitted = tmp / "admitted-old-to-new"
+    _write_generation(
+        admitted, SETUP_KUBERNETES_TOOLS_ACTION_PATH, destination_files
+    )
+    try:
+        findings, transitioned = evaluate_local_action(
+            admitted, action_dir, current_manifest
+        )
+    except TrustedActionError as exc:
+        failures.append(f"exact current→destination transition raised: {exc}")
+    else:
+        if findings or not transitioned:
+            failures.append(
+                "exact current→destination transition was rejected: "
+                f"findings={findings} transitioned={transitioned}"
+            )
+
+    current_match = tmp / "current-byte-identical"
+    _write_generation(
+        current_match, SETUP_KUBERNETES_TOOLS_ACTION_PATH, current_files
+    )
+    try:
+        findings, transitioned = evaluate_local_action(
+            current_match, action_dir, current_manifest
+        )
+    except TrustedActionError as exc:
+        failures.append(f"current byte-identical tree raised: {exc}")
+    else:
+        if findings or transitioned:
+            failures.append(
+                "current byte-identical tree was not an ordinary match: "
+                f"findings={findings} transitioned={transitioned}"
+            )
+
+    dest_match = tmp / "destination-as-trusted-base"
+    _write_generation(
+        dest_match, SETUP_KUBERNETES_TOOLS_ACTION_PATH, destination_files
+    )
+    try:
+        findings, transitioned = evaluate_local_action(
+            dest_match, action_dir, destination_manifest
+        )
+    except TrustedActionError as exc:
+        failures.append(f"destination-as-base identical tree raised: {exc}")
+    else:
+        if findings or transitioned:
+            failures.append(
+                "destination-as-base identical tree was not an ordinary match: "
+                f"findings={findings} transitioned={transitioned}"
+            )
+
+    dest_drift = tmp / "destination-unadmitted-drift"
+    drifted_dest = destination_files["action.yml"][1] + b"# unadmitted drift\n"
+    _write_generation(
+        dest_drift,
+        SETUP_KUBERNETES_TOOLS_ACTION_PATH,
+        {"action.yml": (False, drifted_dest)},
+    )
+    try:
+        findings, transitioned = evaluate_local_action(
+            dest_drift, action_dir, destination_manifest
+        )
+    except TrustedActionError as exc:
+        failures.append(f"destination-base drift raised: {exc}")
+    else:
+        if not findings or transitioned:
+            failures.append("unadmitted drift against destination base was accepted")
+
+    revert = tmp / "destination-to-current-revert"
+    _write_generation(revert, SETUP_KUBERNETES_TOOLS_ACTION_PATH, current_files)
+    try:
+        findings, transitioned = evaluate_local_action(
+            revert, action_dir, destination_manifest
+        )
+    except TrustedActionError as exc:
+        failures.append(f"destination→current revert raised: {exc}")
+    else:
+        if not findings or transitioned:
+            failures.append("destination→current revert was accepted")
+
+    wrong_old = tmp / "wrong-old-generation"
+    _write_generation(
+        wrong_old, SETUP_KUBERNETES_TOOLS_ACTION_PATH, destination_files
+    )
+    wrong_old_files = {
+        "action.yml": (
+            False,
+            current_files["action.yml"][1] + b"# not the frozen predecessor\n",
+        )
+    }
+    wrong_old_manifest = _manifest_from_bytes(
+        _archive_generation(SETUP_KUBERNETES_TOOLS_ACTION_PATH, wrong_old_files),
+        action_dir,
+    )
+    try:
+        findings, transitioned = evaluate_local_action(
+            wrong_old, action_dir, wrong_old_manifest
+        )
+    except TrustedActionError as exc:
+        failures.append(f"wrong old generation raised: {exc}")
+    else:
+        if not findings or transitioned:
+            failures.append("wrong old generation was accepted as a transition")
+
+    wrong_dest = tmp / "wrong-destination-digest"
+    _write_generation(
+        wrong_dest,
+        SETUP_KUBERNETES_TOOLS_ACTION_PATH,
+        {
+            "action.yml": (
+                False,
+                destination_files["action.yml"][1] + b"# one-byte dest miss\n",
+            )
+        },
+    )
+    try:
+        findings, transitioned = evaluate_local_action(
+            wrong_dest, action_dir, current_manifest
+        )
+    except TrustedActionError as exc:
+        failures.append(f"wrong destination digest raised: {exc}")
+    else:
+        if not findings or transitioned:
+            failures.append("wrong destination digest was accepted")
+
+    extra_dest = tmp / "destination-extra-file"
+    _write_generation(
+        extra_dest, SETUP_KUBERNETES_TOOLS_ACTION_PATH, destination_files
+    )
+    _write(
+        extra_dest / SETUP_KUBERNETES_TOOLS_ACTION_PATH / "bin" / "extra.sh",
+        b"#!/bin/sh\necho extra\n",
+        executable=True,
+    )
+    try:
+        findings, transitioned = evaluate_local_action(
+            extra_dest, action_dir, current_manifest
+        )
+    except TrustedActionError as exc:
+        failures.append(f"destination extra file raised: {exc}")
+    else:
+        if not findings or transitioned:
+            failures.append("destination extra file was accepted")
+
+    missing_dest = tmp / "destination-missing-file"
+    missing_dest.joinpath(SETUP_KUBERNETES_TOOLS_ACTION_PATH).mkdir(parents=True)
+    try:
+        findings, transitioned = evaluate_local_action(
+            missing_dest, action_dir, current_manifest
+        )
+    except TrustedActionError as exc:
+        failures.append(f"destination missing file raised: {exc}")
+    else:
+        if not findings or transitioned:
+            failures.append("destination missing action.yml was accepted")
+
+    remoded_dest = tmp / "destination-mode-change"
+    _write_generation(
+        remoded_dest, SETUP_KUBERNETES_TOOLS_ACTION_PATH, destination_files
+    )
+    (
+        remoded_dest / SETUP_KUBERNETES_TOOLS_ACTION_PATH / "action.yml"
+    ).chmod(0o755)
+    try:
+        findings, transitioned = evaluate_local_action(
+            remoded_dest, action_dir, current_manifest
+        )
+    except TrustedActionError as exc:
+        failures.append(f"destination mode change raised: {exc}")
+    else:
+        if not findings or transitioned:
+            failures.append("destination executable-bit change was accepted")
+
+    extra_source_files = dict(current_files)
+    extra_source_files["bin/helper.sh"] = (True, b"#!/bin/sh\necho helper\n")
+    extra_source_manifest = _manifest_from_bytes(
+        _archive_generation(SETUP_KUBERNETES_TOOLS_ACTION_PATH, extra_source_files),
+        action_dir,
+    )
+    extra_source = tmp / "wrong-old-extra-file"
+    _write_generation(
+        extra_source, SETUP_KUBERNETES_TOOLS_ACTION_PATH, destination_files
+    )
+    try:
+        findings, transitioned = evaluate_local_action(
+            extra_source, action_dir, extra_source_manifest
+        )
+    except TrustedActionError as exc:
+        failures.append(f"source extra file raised: {exc}")
+    else:
+        if not findings or transitioned:
+            failures.append("wrong old generation with an extra file was accepted")
+
+    remoded_source_files = {"action.yml": (True, current_files["action.yml"][1])}
+    remoded_source_manifest = _manifest_from_bytes(
+        _archive_generation(
+            SETUP_KUBERNETES_TOOLS_ACTION_PATH, remoded_source_files
+        ),
+        action_dir,
+    )
+    remoded_source = tmp / "wrong-old-mode"
+    _write_generation(
+        remoded_source, SETUP_KUBERNETES_TOOLS_ACTION_PATH, destination_files
+    )
+    try:
+        findings, transitioned = evaluate_local_action(
+            remoded_source, action_dir, remoded_source_manifest
+        )
+    except TrustedActionError as exc:
+        failures.append(f"source mode change raised: {exc}")
+    else:
+        if not findings or transitioned:
+            failures.append("wrong old generation with a mode change was accepted")
+
+    other_dir_text = ".github/actions/other-action"
+    other_dir = normalize_action_path(other_dir_text)
+    other_current = _manifest_from_bytes(
+        _archive_generation(other_dir_text, current_files), other_dir
+    )
+    other_transition = tmp / "unrelated-path-transition"
+    _write_generation(other_transition, other_dir_text, destination_files)
+    try:
+        findings, transitioned = evaluate_local_action(
+            other_transition, other_dir, other_current
+        )
+    except TrustedActionError as exc:
+        failures.append(f"unrelated path transition raised: {exc}")
+    else:
+        if not findings or transitioned:
+            failures.append(
+                "current→destination bytes were accepted on an unrelated action path"
+            )
+
+    other_match = tmp / "unrelated-path-byte-identical"
+    _write_generation(other_match, other_dir_text, current_files)
+    try:
+        findings, transitioned = evaluate_local_action(
+            other_match, other_dir, other_current
+        )
+    except TrustedActionError as exc:
+        failures.append(f"unrelated path byte-identical tree raised: {exc}")
+    else:
+        if findings or transitioned:
+            failures.append(
+                "unrelated path lost ordinary byte-identical behavior: "
+                f"findings={findings} transitioned={transitioned}"
+            )
+
     return failures
 
 
@@ -575,7 +1046,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         action_dir = normalize_action_path(args.action_path)
         manifest = load_trusted_manifest(args.trusted_archive, action_dir)
-        findings = verify_local_action(root, action_dir, manifest)
+        findings, admitted_transition = evaluate_local_action(
+            root, action_dir, manifest
+        )
     except (TrustedActionError, OSError, ValueError) as exc:
         print(
             f"::error::trusted local action check failed closed: {exc}",
@@ -587,11 +1060,478 @@ def main(argv: list[str] | None = None) -> int:
         print(f"::error::{action_dir.as_posix()}/{finding}", file=sys.stderr)
     if findings:
         return 1
+    if admitted_transition:
+        local_count = len(setup_kubernetes_tools_destination_generation())
+        print(
+            f"{action_dir.as_posix()} matches the admitted "
+            f"setup-kubernetes-tools generation transition "
+            f"({len(manifest)} trusted files → {local_count} local files)"
+        )
+        return 0
     print(
         f"{action_dir.as_posix()} matches the trusted revision "
         f"({len(manifest)} governed files)"
     )
     return 0
+
+
+# Frozen complete generations for the one admitted setup-kubernetes-tools
+# transition (issue #3904). Each mapping is the entire governed tree:
+# `action.yml` only, non-executable (git 100644). Source is origin/main at
+# this predecessor PR; destination is PR #3910 head
+# 937710ce513588b3d3e6d1814516bdd00648398e. The extracted checker carries
+# these bytes so a candidate cannot supply a digest or companion fixture.
+SETUP_KUBERNETES_TOOLS_CURRENT_ACTION_YML = (
+    b'name: Setup Kubernetes tools\n'
+    b'description: >-\n'
+    b'  Install kind, kubectl, and Helm from official versioned release URLs after\n'
+    b'  verifying each download against repository-pinned SHA-256 digests and the\n'
+    b'  matching official published checksum files. Fail closed on download or\n'
+    b'  verification errors. Never pipes remote content to a shell.\n'
+    b'\n'
+    b'inputs:\n'
+    b'  kind-version:\n'
+    b'    description: kind release tag (for example v0.27.0)\n'
+    b'    required: false\n'
+    b'    default: "v0.27.0"\n'
+    b'  kubectl-version:\n'
+    b'    description: kubectl release tag (for example v1.32.3)\n'
+    b'    required: false\n'
+    b'    default: "v1.32.3"\n'
+    b'  helm-version:\n'
+    b'    description: Helm release tag (for example v3.17.3)\n'
+    b'    required: false\n'
+    b'    default: "v3.17.3"\n'
+    b'  kind-sha256:\n'
+    b'    description: >-\n'
+    b'      Expected SHA-256 of kind-linux-amd64 from the kind GitHub release\n'
+    b'      checksum file for kind-version.\n'
+    b'    required: false\n'
+    b'    default: "a6875aaea358acf0ac07786b1a6755d08fd640f4c79b7a2e46681cc13f49a04b"\n'
+    b'  kubectl-sha256:\n'
+    b'    description: >-\n'
+    b'      Expected SHA-256 of the linux/amd64 kubectl binary from\n'
+    b'      dl.k8s.io for kubectl-version.\n'
+    b'    required: false\n'
+    b'    default: "ab209d0c5134b61486a0486585604a616a5bb2fc07df46d304b3c95817b2d79f"\n'
+    b'  helm-sha256:\n'
+    b'    description: >-\n'
+    b'      Expected SHA-256 of helm-<version>-linux-amd64.tar.gz from get.helm.sh\n'
+    b'      for helm-version.\n'
+    b'    required: false\n'
+    b'    default: "ee88b3c851ae6466a3de507f7be73fe94d54cbf2987cbaa3d1a3832ea331f2cd"\n'
+    b'  install-kind:\n'
+    b'    description: Install kind when true\n'
+    b'    required: false\n'
+    b'    default: "true"\n'
+    b'  install-kubectl:\n'
+    b'    description: Install kubectl when true\n'
+    b'    required: false\n'
+    b'    default: "true"\n'
+    b'  install-helm:\n'
+    b'    description: Install Helm when true\n'
+    b'    required: false\n'
+    b'    default: "true"\n'
+    b'\n'
+    b'runs:\n'
+    b'  using: composite\n'
+    b'  steps:\n'
+    b'    - name: Install kind, kubectl, and Helm with pinned checksums\n'
+    b'      shell: bash\n'
+    b'      env:\n'
+    b'        KIND_VERSION: ${{ inputs.kind-version }}\n'
+    b'        KUBECTL_VERSION: ${{ inputs.kubectl-version }}\n'
+    b'        HELM_VERSION: ${{ inputs.helm-version }}\n'
+    b'        KIND_SHA256: ${{ inputs.kind-sha256 }}\n'
+    b'        KUBECTL_SHA256: ${{ inputs.kubectl-sha256 }}\n'
+    b'        HELM_SHA256: ${{ inputs.helm-sha256 }}\n'
+    b'        INSTALL_KIND: ${{ inputs.install-kind }}\n'
+    b'        INSTALL_KUBECTL: ${{ inputs.install-kubectl }}\n'
+    b'        INSTALL_HELM: ${{ inputs.install-helm }}\n'
+    b'      run: |\n'
+    b'        set -euo pipefail\n'
+    b'\n'
+    b'        # Linux/amd64 GitHub-hosted runners only. Refuse other platforms instead\n'
+    b'        # of silently installing binaries for the wrong OS or architecture.\n'
+    b'        os="$(uname -s)"\n'
+    b'        arch="$(uname -m)"\n'
+    b'        if [ "$os" != "Linux" ] || { [ "$arch" != "x86_64" ] && [ "$arch" != "amd64" ]; }; then\n'
+    b'          echo "::error::setup-kubernetes-tools supports linux/amd64 only (got ${os}/${arch})"\n'
+    b'          exit 1\n'
+    b'        fi\n'
+    b'\n'
+    b'        require_sha256() {\n'
+    b'          local value="$1"\n'
+    b'          local label="$2"\n'
+    b'          if ! [[ "$value" =~ ^[0-9a-f]{64}$ ]]; then\n'
+    b'            echo "::error::${label} must be a 64-character lowercase hex SHA-256"\n'
+    b'            exit 1\n'
+    b'          fi\n'
+    b'        }\n'
+    b'\n'
+    b'        download() {\n'
+    b'          local url="$1"\n'
+    b'          local dest="$2"\n'
+    b'          if ! curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \\\n'
+    b'            --connect-timeout 30 --max-time 300 \\\n'
+    b'            -o "$dest" "$url"; then\n'
+    b'            echo "::error::download failed: ${url}"\n'
+    b'            exit 1\n'
+    b'          fi\n'
+    b'          if [ ! -s "$dest" ]; then\n'
+    b'            echo "::error::download produced an empty file: ${url}"\n'
+    b'            exit 1\n'
+    b'          fi\n'
+    b'        }\n'
+    b'\n'
+    b'        file_sha256() {\n'
+    b'          # Prefer sha256sum (Linux runners); fall back to shasum (macOS).\n'
+    b'          if command -v sha256sum >/dev/null 2>&1; then\n'
+    b'            sha256sum "$1" | awk \'{print $1}\'\n'
+    b'          elif command -v shasum >/dev/null 2>&1; then\n'
+    b'            shasum -a 256 "$1" | awk \'{print $1}\'\n'
+    b'          else\n'
+    b'            echo "::error::neither sha256sum nor shasum is available"\n'
+    b'            exit 1\n'
+    b'          fi\n'
+    b'        }\n'
+    b'\n'
+    b'        verify_pinned_sha256() {\n'
+    b'          local path="$1"\n'
+    b'          local expected="$2"\n'
+    b'          local label="$3"\n'
+    b'          local actual\n'
+    b'          actual="$(file_sha256 "$path")"\n'
+    b'          if [ "$actual" != "$expected" ]; then\n'
+    b'            echo "::error::${label} checksum mismatch: got ${actual}, want ${expected}"\n'
+    b'            exit 1\n'
+    b'          fi\n'
+    b'        }\n'
+    b'\n'
+    b'        # Cross-check the repository pin against the official published\n'
+    b'        # checksum for this exact version. Reject if either the download or the\n'
+    b'        # pin disagrees with official provenance.\n'
+    b'        assert_official_checksum_matches_pin() {\n'
+    b'          local official_url="$1"\n'
+    b'          local pinned="$2"\n'
+    b'          local label="$3"\n'
+    b'          local checksum_path official\n'
+    b'          checksum_path="$(mktemp)"\n'
+    b'          download "$official_url" "$checksum_path"\n'
+    b'          official="$(awk \'{print $1; exit}\' "$checksum_path" | tr -d \'[:space:]\' | tr \'A-F\' \'a-f\')"\n'
+    b'          rm -f "$checksum_path"\n'
+    b'          if ! [[ "$official" =~ ^[0-9a-f]{64}$ ]]; then\n'
+    b'            echo "::error::${label}: official checksum file did not contain a SHA-256 digest (${official_url})"\n'
+    b'            exit 1\n'
+    b'          fi\n'
+    b'          if [ "$official" != "$pinned" ]; then\n'
+    b'            echo "::error::${label}: repository pin ${pinned} does not match official checksum ${official} from ${official_url}"\n'
+    b'            exit 1\n'
+    b'          fi\n'
+    b'        }\n'
+    b'\n'
+    b'        install_dir="${RUNNER_TEMP}/ferrum-k8s-tools/bin"\n'
+    b'        work_dir="${RUNNER_TEMP}/ferrum-k8s-tools/work"\n'
+    b'        mkdir -p "$install_dir" "$work_dir"\n'
+    b'        echo "$install_dir" >> "$GITHUB_PATH"\n'
+    b'\n'
+    b'        if [ "$INSTALL_KIND" = "true" ]; then\n'
+    b'          require_sha256 "$KIND_SHA256" "kind-sha256"\n'
+    b'          kind_bin="${work_dir}/kind-linux-amd64"\n'
+    b'          # GitHub release assets are the authoritative kind provenance.\n'
+    b'          download \\\n'
+    b'            "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64" \\\n'
+    b'            "$kind_bin"\n'
+    b'          assert_official_checksum_matches_pin \\\n'
+    b'            "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64.sha256sum" \\\n'
+    b'            "$KIND_SHA256" \\\n'
+    b'            "kind ${KIND_VERSION}"\n'
+    b'          verify_pinned_sha256 "$kind_bin" "$KIND_SHA256" "kind ${KIND_VERSION}"\n'
+    b'          install -m 0755 "$kind_bin" "${install_dir}/kind"\n'
+    b'          "${install_dir}/kind" version\n'
+    b'        fi\n'
+    b'\n'
+    b'        if [ "$INSTALL_KUBECTL" = "true" ]; then\n'
+    b'          require_sha256 "$KUBECTL_SHA256" "kubectl-sha256"\n'
+    b'          kubectl_bin="${work_dir}/kubectl"\n'
+    b'          download \\\n'
+    b'            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \\\n'
+    b'            "$kubectl_bin"\n'
+    b'          assert_official_checksum_matches_pin \\\n'
+    b'            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256" \\\n'
+    b'            "$KUBECTL_SHA256" \\\n'
+    b'            "kubectl ${KUBECTL_VERSION}"\n'
+    b'          verify_pinned_sha256 "$kubectl_bin" "$KUBECTL_SHA256" "kubectl ${KUBECTL_VERSION}"\n'
+    b'          install -m 0755 "$kubectl_bin" "${install_dir}/kubectl"\n'
+    b'          "${install_dir}/kubectl" version --client=true\n'
+    b'        fi\n'
+    b'\n'
+    b'        if [ "$INSTALL_HELM" = "true" ]; then\n'
+    b'          require_sha256 "$HELM_SHA256" "helm-sha256"\n'
+    b'          helm_archive="${work_dir}/helm-linux-amd64.tar.gz"\n'
+    b'          # Official Helm distribution host; never raw.githubusercontent.com/helm/helm/main.\n'
+    b'          download \\\n'
+    b'            "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \\\n'
+    b'            "$helm_archive"\n'
+    b'          assert_official_checksum_matches_pin \\\n'
+    b'            "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz.sha256sum" \\\n'
+    b'            "$HELM_SHA256" \\\n'
+    b'            "helm ${HELM_VERSION}"\n'
+    b'          verify_pinned_sha256 "$helm_archive" "$HELM_SHA256" "helm ${HELM_VERSION}"\n'
+    b'          tar -xzf "$helm_archive" -C "$work_dir"\n'
+    b'          if [ ! -x "${work_dir}/linux-amd64/helm" ]; then\n'
+    b'            echo "::error::helm archive did not contain linux-amd64/helm"\n'
+    b'            exit 1\n'
+    b'          fi\n'
+    b'          install -m 0755 "${work_dir}/linux-amd64/helm" "${install_dir}/helm"\n'
+    b'          "${install_dir}/helm" version --short\n'
+    b'        fi\n'
+)
+
+SETUP_KUBERNETES_TOOLS_DESTINATION_ACTION_YML = (
+    b'name: Setup Kubernetes tools\n'
+    b'description: >-\n'
+    b'  Install kind, kubectl, and Helm from official versioned release URLs after\n'
+    b'  verifying each download against repository-pinned SHA-256 digests and the\n'
+    b'  matching official published checksum files. Restored cache entries are\n'
+    b'  re-checked against the same pins before install. Fail closed on download or\n'
+    b'  verification errors. Never pipes remote content to a shell.\n'
+    b'\n'
+    b'inputs:\n'
+    b'  kind-version:\n'
+    b'    description: kind release tag (for example v0.27.0)\n'
+    b'    required: false\n'
+    b'    default: "v0.27.0"\n'
+    b'  kubectl-version:\n'
+    b'    description: kubectl release tag (for example v1.32.3)\n'
+    b'    required: false\n'
+    b'    default: "v1.32.3"\n'
+    b'  helm-version:\n'
+    b'    description: Helm release tag (for example v3.17.3)\n'
+    b'    required: false\n'
+    b'    default: "v3.17.3"\n'
+    b'  kind-sha256:\n'
+    b'    description: >-\n'
+    b'      Expected SHA-256 of kind-linux-amd64 from the kind GitHub release\n'
+    b'      checksum file for kind-version.\n'
+    b'    required: false\n'
+    b'    default: "a6875aaea358acf0ac07786b1a6755d08fd640f4c79b7a2e46681cc13f49a04b"\n'
+    b'  kubectl-sha256:\n'
+    b'    description: >-\n'
+    b'      Expected SHA-256 of the linux/amd64 kubectl binary from\n'
+    b'      dl.k8s.io for kubectl-version.\n'
+    b'    required: false\n'
+    b'    default: "ab209d0c5134b61486a0486585604a616a5bb2fc07df46d304b3c95817b2d79f"\n'
+    b'  helm-sha256:\n'
+    b'    description: >-\n'
+    b'      Expected SHA-256 of helm-<version>-linux-amd64.tar.gz from get.helm.sh\n'
+    b'      for helm-version.\n'
+    b'    required: false\n'
+    b'    default: "ee88b3c851ae6466a3de507f7be73fe94d54cbf2987cbaa3d1a3832ea331f2cd"\n'
+    b'  install-kind:\n'
+    b'    description: Install kind when true\n'
+    b'    required: false\n'
+    b'    default: "true"\n'
+    b'  install-kubectl:\n'
+    b'    description: Install kubectl when true\n'
+    b'    required: false\n'
+    b'    default: "true"\n'
+    b'  install-helm:\n'
+    b'    description: Install Helm when true\n'
+    b'    required: false\n'
+    b'    default: "true"\n'
+    b'\n'
+    b'runs:\n'
+    b'  using: composite\n'
+    b'  steps:\n'
+    b'    # Exact-key restore only: versions, checksums, install subset, and runner\n'
+    b'    # platform/arch all participate in the key. Prefix restore-keys are omitted\n'
+    b'    # so a different pin cannot be installed from a partial match. Checksums\n'
+    b'    # are verified again after restore; a mismatch discards the entry and\n'
+    b'    # re-downloads rather than installing untrusted bytes.\n'
+    b'    - name: Restore pinned Kubernetes tool downloads\n'
+    b'      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0\n'
+    b'      with:\n'
+    b'        path: ${{ runner.temp }}/ferrum-k8s-tools/cache\n'
+    b'        key: ferrum-k8s-tools-v1-${{ runner.os }}-${{ runner.arch }}-kind-${{ inputs.kind-version }}-${{ inputs.kind-sha256 }}-kubectl-${{ inputs.kubectl-version }}-${{ inputs.kubectl-sha256 }}-helm-${{ inputs.helm-version }}-${{ inputs.helm-sha256 }}-ik-${{ inputs.install-kind }}-ic-${{ inputs.install-kubectl }}-ih-${{ inputs.install-helm }}\n'
+    b'\n'
+    b'    - name: Install kind, kubectl, and Helm with pinned checksums\n'
+    b'      shell: bash\n'
+    b'      env:\n'
+    b'        KIND_VERSION: ${{ inputs.kind-version }}\n'
+    b'        KUBECTL_VERSION: ${{ inputs.kubectl-version }}\n'
+    b'        HELM_VERSION: ${{ inputs.helm-version }}\n'
+    b'        KIND_SHA256: ${{ inputs.kind-sha256 }}\n'
+    b'        KUBECTL_SHA256: ${{ inputs.kubectl-sha256 }}\n'
+    b'        HELM_SHA256: ${{ inputs.helm-sha256 }}\n'
+    b'        INSTALL_KIND: ${{ inputs.install-kind }}\n'
+    b'        INSTALL_KUBECTL: ${{ inputs.install-kubectl }}\n'
+    b'        INSTALL_HELM: ${{ inputs.install-helm }}\n'
+    b'      run: |\n'
+    b'        set -euo pipefail\n'
+    b'\n'
+    b'        # Linux/amd64 GitHub-hosted runners only. Refuse other platforms instead\n'
+    b'        # of silently installing binaries for the wrong OS or architecture.\n'
+    b'        os="$(uname -s)"\n'
+    b'        arch="$(uname -m)"\n'
+    b'        if [ "$os" != "Linux" ] || { [ "$arch" != "x86_64" ] && [ "$arch" != "amd64" ]; }; then\n'
+    b'          echo "::error::setup-kubernetes-tools supports linux/amd64 only (got ${os}/${arch})"\n'
+    b'          exit 1\n'
+    b'        fi\n'
+    b'\n'
+    b'        require_sha256() {\n'
+    b'          local value="$1"\n'
+    b'          local label="$2"\n'
+    b'          if ! [[ "$value" =~ ^[0-9a-f]{64}$ ]]; then\n'
+    b'            echo "::error::${label} must be a 64-character lowercase hex SHA-256"\n'
+    b'            exit 1\n'
+    b'          fi\n'
+    b'        }\n'
+    b'\n'
+    b'        download() {\n'
+    b'          local url="$1"\n'
+    b'          local dest="$2"\n'
+    b'          if ! curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \\\n'
+    b'            --connect-timeout 30 --max-time 300 \\\n'
+    b'            -o "$dest" "$url"; then\n'
+    b'            echo "::error::download failed: ${url}"\n'
+    b'            exit 1\n'
+    b'          fi\n'
+    b'          if [ ! -s "$dest" ]; then\n'
+    b'            echo "::error::download produced an empty file: ${url}"\n'
+    b'            exit 1\n'
+    b'          fi\n'
+    b'        }\n'
+    b'\n'
+    b'        file_sha256() {\n'
+    b'          # Prefer sha256sum (Linux runners); fall back to shasum (macOS).\n'
+    b'          if command -v sha256sum >/dev/null 2>&1; then\n'
+    b'            sha256sum "$1" | awk \'{print $1}\'\n'
+    b'          elif command -v shasum >/dev/null 2>&1; then\n'
+    b'            shasum -a 256 "$1" | awk \'{print $1}\'\n'
+    b'          else\n'
+    b'            echo "::error::neither sha256sum nor shasum is available"\n'
+    b'            exit 1\n'
+    b'          fi\n'
+    b'        }\n'
+    b'\n'
+    b'        verify_pinned_sha256() {\n'
+    b'          local path="$1"\n'
+    b'          local expected="$2"\n'
+    b'          local label="$3"\n'
+    b'          local actual\n'
+    b'          actual="$(file_sha256 "$path")"\n'
+    b'          if [ "$actual" != "$expected" ]; then\n'
+    b'            echo "::error::${label} checksum mismatch: got ${actual}, want ${expected}"\n'
+    b'            exit 1\n'
+    b'          fi\n'
+    b'        }\n'
+    b'\n'
+    b'        # Compare the repository pin against the official published checksum\n'
+    b'        # for this exact version. Reject if either the artifact or the pin\n'
+    b'        # disagrees with official provenance. Official checksum files are\n'
+    b'        # always fetched and are never taken from cache.\n'
+    b'        assert_official_checksum_matches_pin() {\n'
+    b'          local official_url="$1"\n'
+    b'          local pinned="$2"\n'
+    b'          local label="$3"\n'
+    b'          local checksum_path official\n'
+    b'          checksum_path="$(mktemp)"\n'
+    b'          download "$official_url" "$checksum_path"\n'
+    b'          official="$(awk \'{print $1; exit}\' "$checksum_path" | tr -d \'[:space:]\' | tr \'A-F\' \'a-f\')"\n'
+    b'          rm -f "$checksum_path"\n'
+    b'          if ! [[ "$official" =~ ^[0-9a-f]{64}$ ]]; then\n'
+    b'            echo "::error::${label}: official checksum file did not contain a SHA-256 digest (${official_url})"\n'
+    b'            exit 1\n'
+    b'          fi\n'
+    b'          if [ "$official" != "$pinned" ]; then\n'
+    b'            echo "::error::${label}: repository pin ${pinned} does not match official checksum ${official} from ${official_url}"\n'
+    b'            exit 1\n'
+    b'          fi\n'
+    b'        }\n'
+    b'\n'
+    b'        restore_or_download() {\n'
+    b'          local dest="$1"\n'
+    b'          local url="$2"\n'
+    b'          local expected="$3"\n'
+    b'          local label="$4"\n'
+    b'          if [ -s "$dest" ]; then\n'
+    b'            local actual\n'
+    b'            actual="$(file_sha256 "$dest")"\n'
+    b'            if [ "$actual" = "$expected" ]; then\n'
+    b'              echo "${label}: restored pinned artifact from cache"\n'
+    b'              return 0\n'
+    b'            fi\n'
+    b'            echo "::warning::${label}: restored cache checksum mismatch: got ${actual}, want ${expected}; discarding and re-downloading"\n'
+    b'            rm -f "$dest"\n'
+    b'          fi\n'
+    b'          download "$url" "$dest"\n'
+    b'        }\n'
+    b'\n'
+    b'        install_dir="${RUNNER_TEMP}/ferrum-k8s-tools/bin"\n'
+    b'        work_dir="${RUNNER_TEMP}/ferrum-k8s-tools/work"\n'
+    b'        cache_dir="${RUNNER_TEMP}/ferrum-k8s-tools/cache"\n'
+    b'        mkdir -p "$install_dir" "$work_dir" "$cache_dir"\n'
+    b'        echo "$install_dir" >> "$GITHUB_PATH"\n'
+    b'\n'
+    b'        if [ "$INSTALL_KIND" = "true" ]; then\n'
+    b'          require_sha256 "$KIND_SHA256" "kind-sha256"\n'
+    b'          kind_bin="${cache_dir}/kind-linux-amd64"\n'
+    b'          # GitHub release assets are the authoritative kind provenance.\n'
+    b'          restore_or_download \\\n'
+    b'            "$kind_bin" \\\n'
+    b'            "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64" \\\n'
+    b'            "$KIND_SHA256" \\\n'
+    b'            "kind ${KIND_VERSION}"\n'
+    b'          assert_official_checksum_matches_pin \\\n'
+    b'            "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64.sha256sum" \\\n'
+    b'            "$KIND_SHA256" \\\n'
+    b'            "kind ${KIND_VERSION}"\n'
+    b'          verify_pinned_sha256 "$kind_bin" "$KIND_SHA256" "kind ${KIND_VERSION}"\n'
+    b'          install -m 0755 "$kind_bin" "${install_dir}/kind"\n'
+    b'          "${install_dir}/kind" version\n'
+    b'        fi\n'
+    b'\n'
+    b'        if [ "$INSTALL_KUBECTL" = "true" ]; then\n'
+    b'          require_sha256 "$KUBECTL_SHA256" "kubectl-sha256"\n'
+    b'          kubectl_bin="${cache_dir}/kubectl"\n'
+    b'          restore_or_download \\\n'
+    b'            "$kubectl_bin" \\\n'
+    b'            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \\\n'
+    b'            "$KUBECTL_SHA256" \\\n'
+    b'            "kubectl ${KUBECTL_VERSION}"\n'
+    b'          assert_official_checksum_matches_pin \\\n'
+    b'            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256" \\\n'
+    b'            "$KUBECTL_SHA256" \\\n'
+    b'            "kubectl ${KUBECTL_VERSION}"\n'
+    b'          verify_pinned_sha256 "$kubectl_bin" "$KUBECTL_SHA256" "kubectl ${KUBECTL_VERSION}"\n'
+    b'          install -m 0755 "$kubectl_bin" "${install_dir}/kubectl"\n'
+    b'          "${install_dir}/kubectl" version --client=true\n'
+    b'        fi\n'
+    b'\n'
+    b'        if [ "$INSTALL_HELM" = "true" ]; then\n'
+    b'          require_sha256 "$HELM_SHA256" "helm-sha256"\n'
+    b'          helm_archive="${cache_dir}/helm-linux-amd64.tar.gz"\n'
+    b'          # Official Helm distribution host; never raw.githubusercontent.com/helm/helm/main.\n'
+    b'          restore_or_download \\\n'
+    b'            "$helm_archive" \\\n'
+    b'            "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \\\n'
+    b'            "$HELM_SHA256" \\\n'
+    b'            "helm ${HELM_VERSION}"\n'
+    b'          assert_official_checksum_matches_pin \\\n'
+    b'            "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz.sha256sum" \\\n'
+    b'            "$HELM_SHA256" \\\n'
+    b'            "helm ${HELM_VERSION}"\n'
+    b'          verify_pinned_sha256 "$helm_archive" "$HELM_SHA256" "helm ${HELM_VERSION}"\n'
+    b'          tar -xzf "$helm_archive" -C "$work_dir"\n'
+    b'          if [ ! -x "${work_dir}/linux-amd64/helm" ]; then\n'
+    b'            echo "::error::helm archive did not contain linux-amd64/helm"\n'
+    b'            exit 1\n'
+    b'          fi\n'
+    b'          install -m 0755 "${work_dir}/linux-amd64/helm" "${install_dir}/helm"\n'
+    b'          "${install_dir}/helm" version --short\n'
+    b'        fi\n'
+)
 
 
 if __name__ == "__main__":

@@ -443,6 +443,20 @@ Versions and digests live as defaults on the
 5. Land the change via PR; the trusted CI planner policy and the live suites that
    path-filter on the composite action will exercise the new pins.
 
+`Helm Chart` proves `.github/actions/setup-kubernetes-tools` against the trusted
+revision before `uses:`, so a pull request that edits that action is rejected
+unless `verify_trusted_local_action.py` already admits that exact
+source→destination generation pair. Issue #3904's predecessor transition binds
+the current `action.yml`
+(`6ecb4bde09a0d3d456d6019c03ef1678c3903cbc0275bba31fde3e56f6e6ef08`,
+non-executable, sole governed file) moving to the PR #3910 cached-installer
+generation
+(`41dd4b9ae1b0ad74e021e2974afbcdac1a1bc0d856a166a57e94046e803d6cd9`, same path
+set and mode). Future installer edits need a new frozen pair, or must match the
+trusted tree byte for byte. Do not treat a working-tree digest or a mutable
+allowlist as admission. After #3910 is the trusted base, retire the predecessor
+constants so the old generation cannot remain an admitted source.
+
 Never refresh a checksum by copying a digest from an unpinned adjacent path
 without official release provenance, and never pipe a remote install script to
 a shell as a shortcut.

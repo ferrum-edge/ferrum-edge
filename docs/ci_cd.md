@@ -264,9 +264,31 @@ while `PATH` is still the pristine runner one, and
 `.github/scripts/verify_trusted_local_action.py` decides regular-file,
 no-symlink, mode, byte-content, no-extra-file, and ancestor-directory
 constraints entirely from that manifest, spawning no process of its own.
-Anything it cannot answer fails closed. Keeping the proof in Python rather than
-inline shell also keeps `helm-chart` free of the opaque-inline-shell and Cross
-surfaces that `Trusted Cross Build Policy` freezes per job.
+Anything it cannot answer fails closed.
+
+The default comparison is byte-identical. Issue #3904 admits exactly one
+additional, controller-frozen generation transition for
+`.github/actions/setup-kubernetes-tools`, and only that path. The trusted-base
+tree whose sole governed file is non-executable `action.yml` at SHA-256
+`6ecb4bde09a0d3d456d6019c03ef1678c3903cbc0275bba31fde3e56f6e6ef08` may move to
+the PR #3910 tree whose `action.yml` is SHA-256
+`41dd4b9ae1b0ad74e021e2974afbcdac1a1bc0d856a166a57e94046e803d6cd9` with the same
+path set and executable bit. Both source and destination generations are bound
+inside the extracted checker (complete file set, modes, and content hashes).
+Another base generation, a one-byte or mode change, an extra or missing file,
+or any other local-action path is still rejected. The candidate cannot supply
+a digest, a mutable allowlist, or an unbound proposed manifest.
+
+Once the destination generation is the trusted base, an unchanged working tree
+passes by ordinary byte identity, and any further unadmitted drift fails. The
+predecessor constants are then inert — the trusted archive is no longer the
+source generation — and should be retired in a follow-up so the old tree
+cannot remain an admitted source. This predecessor PR must merge before #3910
+and does not contain #3910's action or workflow changes.
+
+Keeping the proof in Python rather than inline shell also keeps `helm-chart`
+free of the opaque-inline-shell and Cross surfaces that `Trusted Cross Build
+Policy` freezes per job.
 On pull requests and merge groups the checker is extracted from the base revision when
 one exists, then self-tested and executed against the proposed chart tree. That
 prevents the step from executing a checker replaced by the same pull request and
