@@ -55,6 +55,19 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   still compared byte for byte, and the wiring cannot be removed once adopted. A
   committed `.cargo/config[.toml]` below the repository root is rejected
   outright.
+- The `fuzz-smoke` job carries TWO admitted generations for issue #3902
+  (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first): `CI_FUZZ_SMOKE_RETIRED_JOB`
+  ran the six-target libFuzzer budget on every pull request with caching
+  disabled; `CI_FUZZ_SMOKE_JOB` keeps the deterministic property smoke as the
+  required pull-request gate, moves the budget to `merge_group` / push to `main`
+  / `workflow_dispatch`, and admits `./.github/actions/setup-sccache` plus a
+  `main`-push-only `save-if` cache. The transition is exact on both ends and
+  one-way — withholding is symmetric, so `admitted_fuzz_smoke_removal_errors` is
+  what refuses a revert. `CI_FUZZ_SMOKE_BOUNDED_BUDGET` must appear exactly once
+  in every generation, so a generation can never move the lane and relax its
+  bounds at the same time. Delete the retired generation once the adopted one is
+  on `main`. See `docs/ci_cd.md` → "Admitted `fuzz-smoke` lane-split
+  generation".
 - `release.yml` is admitted in exactly two shapes
   (`RELEASE_IMAGE_FAMILY_GENERATIONS`): the current two image families, or those
   plus the complete frozen `-ebpf-tools` contract (`docker-ebpf-tools-manifest`
@@ -70,15 +83,29 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   two-family a PR may leave the workflow byte-identical or adopt the whole
   three-family shape, and once the base is three-family a revert is refused. See
   `docs/ci_cd.md` → "Admitted release image-family adoption".
-- `fips-build.yml` carries ONE temporary admitted generation transition for
-  issue #3888 / PR #3889: the exact retired file text moving to the exact
-  adopted one, each pinned by whole-file SHA-256
-  (`FIPS_BUILD_RETIRED_GENERATION_SHA256`,
-  `FIPS_BUILD_ADOPTED_GENERATION_SHA256`). It is exact on both ends, bound to
-  the path, one-way, and withholds exactly one surface-equality verdict. Delete
-  it once #3889 is on `main`. See `docs/ci_cd.md` and
-  `docs/dependency-policy.md` → "Admitted `fips-build.yml` generation
-  transition".
+- The temporary `fips-build.yml` whole-file generation admission for issue
+  #3888 / PR #3889 is **retired** now that #3889 is on `main`. Ordinary
+  `fips-build.yml` edits are compared by the normal fail-closed Cross surface
+  scan with no special case. The generic SHA-256 generation digest helper
+  remains for CI-job and local-action transitions. See `docs/ci_cd.md` →
+  "Retired `fips-build.yml` generation transition".
+- `Helm Chart` proves `.github/actions/setup-kubernetes-tools` against the
+  trusted revision before `uses:`. Issue #3904 admits exactly one extracted
+  checker generation: current `action.yml`
+  `6ecb4bde09a0d3d456d6019c03ef1678c3903cbc0275bba31fde3e56f6e6ef08` moving to
+  PR #3910 `41dd4b9ae1b0ad74e021e2974afbcdac1a1bc0d856a166a57e94046e803d6cd9`.
+  Source and destination are bound inside `verify_trusted_local_action.py`; the
+  candidate cannot supply a digest. Retire the pair after #3910 is the trusted
+  base.
+- Cross-sensitive `ci.yml` jobs `ci-plan`, `test`, and `performance-regression`
+  carry temporary SHA-256 generation pairs (`CI_JOB_GENERATION_TRANSITIONS`)
+  for PRs #3913 and #3911. `setup-rust-ci/action.yml` carries exactly one
+  trusted-base pair (`LOCAL_ACTION_GENERATION_TRANSITIONS`): current-main
+  `fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda` moving to
+  the combined #3911 destination
+  `57a99a179ddc2935af187f518a803bf167eb9e33593c37b7b29f7151ec994da2`. Exact,
+  path-bound, one-way, no candidate allowlist. See `docs/ci_cd.md` →
+  "Admitted CI job SHA-256 generation transitions".
 
 ## Drift Guard
 

@@ -719,7 +719,12 @@ def check_no_sccache_credential_exporter(
             failures,
         )
     require(
-        "core.exportVariable" not in text,
+        # Invocation-shaped match: `setup-sccache/action.yml` is whole-file
+        # digest-frozen under the Cross policy, and its description prose
+        # legitimately names the `core.exportVariable` API while documenting
+        # that no installer calling it is invoked. Only an actual call site
+        # (always followed by an argument list) is a credential leak.
+        "core.exportVariable(" not in text,
         f"{source} must not call core.exportVariable (ACTIONS_RUNTIME_TOKEN leak)",
         failures,
     )

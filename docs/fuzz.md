@@ -27,7 +27,9 @@ authenticated-shape envelope (freshness + tag TLVs) and a wrong-length
 freshness TLV alongside the earlier address/command/TLV cases. It is **not**
 yet in the byte-frozen `CI_FUZZ_SMOKE_JOB` libFuzzer loop
 (`.github/workflows/ci.yml`) or the `.github/workflows/fuzz.yml` matrix; those
-trusted-base lists can only change on `main` after merge.
+trusted-base lists can only change on `main` after merge. Adding it means a new
+admitted generation of the whole `fuzz-smoke` job, not an edit to the existing
+one.
 
 Shared budgets and helpers live in `src/fuzz_support.rs`.
 
@@ -39,13 +41,42 @@ rejects crash artifacts larger than 64 KiB before upload.
 
 ## Hosted CI
 
-- **PR / `main` smoke** (`ci.yml` → `Fuzz Smoke`): locked `proptest` smoke tests
-  plus ~8 s libFuzzer budget per target (`-runs=512`, `-max_len=4096`,
-  `-rss_limit_mb=1024`).
+- **PR gate** (`ci.yml` → `Fuzz Smoke`): the locked `proptest` smoke tests
+  (`cargo test --locked` in `fuzz/`). This is the required full-mode
+  pull-request gate and runs on every full-mode pull request.
+- **Bounded libFuzzer budget** (same `Fuzz Smoke` job, `if: github.event_name !=
+  'pull_request'`): all six targets at ~8 s each (`-runs=512`,
+  `-max_total_time=8`, `-max_len=4096`, `-timeout=2`, `-rss_limit_mb=1024`), on
+  `merge_group`, on the push to `main`, and on manual `workflow_dispatch` of
+  `ci.yml`. The bounds are byte-identical to what pull requests used to run;
+  only *where* the budget executes changed (issue #3902). The merge queue still
+  runs the whole budget before a change merges, so nothing reaches `main`
+  without it.
 - **Scheduled sanitizer lane** (`.github/workflows/fuzz.yml`): AddressSanitizer
   builds, 300 s per target, bounded crash artifacts uploaded after size/count
   checks, a 2048 MiB RSS cap, 7-day retention, and concurrency capped at two
-  targets.
+  targets. Unchanged by #3902.
+
+`cargo fuzz run` defaults to AddressSanitizer, so the six-target budget is a
+sanitizer build in both lanes. That build, not the fuzzing, was the cost: the
+`Fuzz Smoke` job averaged ~47 minutes on pull requests, of which ~39 minutes was
+compiling the instrumented targets for ~48 seconds of fuzzing. The `Fuzz Smoke`
+job now uses the repository's checksum-pinned `setup-sccache` action and
+persists its bounded local cache directory through `Swatinem/rust-cache`. That
+cache is written only by pushes to `main` (`save-if`), so no untrusted ref can
+populate what the sanitizer build later restores, and the credential-bearing
+sccache GHA backend is never enabled. Every run logs `Fuzz property smoke
+seconds`, the lane shape it took, a closing `sccache --show-stats`, and the
+on-disk cache size; runs that execute the sanitizer budget add a second
+`--show-stats` just before it plus `Fuzz sanitizer lane seconds`, so the log
+shows directly whether the sanitizer build reused compilation. When sccache is
+unavailable the job emits a warning annotation rather than letting caching fail
+silently.
+
+Both hosted shapes are byte-frozen by the trusted Cross build policy. The
+`fuzz-smoke` job is admitted as two generations with a one-way transition
+(`CI_FUZZ_SMOKE_JOB_GENERATIONS`); see
+[ci_cd.md](ci_cd.md#admitted-fuzz-smoke-lane-split-generation).
 
 The fuzz crate links the main Ferrum Edge crate, whose Kafka dependency builds
 `librdkafka` from source with OAuthBearer OIDC disabled. librdkafka 2.12.1

@@ -82,7 +82,8 @@ Pull Request / Merge Queue group
                     ├─► Format + integration-shard coverage (in CI plan)
                     ├─► Unit+inline-lib / integration-shard / functional-shard tests
                     ├─► Lint, dependency audit, vendored regressions
-                    ├─► Fuzz smoke (libFuzzer + property budgets)
+                    ├─► Fuzz smoke (property budgets on PRs; the six-target
+                    │   libFuzzer budget on merge_group / push to main / manual)
                     ├─► eBPF/netns live checks when planner marks relevant
                     ├─► Planner-gated mesh / Helm / performance gates
                     └─► Five target release builds
@@ -473,9 +474,31 @@ while `PATH` is still the pristine runner one, and
 `.github/scripts/verify_trusted_local_action.py` decides regular-file,
 no-symlink, mode, byte-content, no-extra-file, and ancestor-directory
 constraints entirely from that manifest, spawning no process of its own.
-Anything it cannot answer fails closed. Keeping the proof in Python rather than
-inline shell also keeps `helm-chart` free of the opaque-inline-shell and Cross
-surfaces that `Trusted Cross Build Policy` freezes per job.
+Anything it cannot answer fails closed.
+
+The default comparison is byte-identical. Issue #3904 admits exactly one
+additional, controller-frozen generation transition for
+`.github/actions/setup-kubernetes-tools`, and only that path. The trusted-base
+tree whose sole governed file is non-executable `action.yml` at SHA-256
+`6ecb4bde09a0d3d456d6019c03ef1678c3903cbc0275bba31fde3e56f6e6ef08` may move to
+the PR #3910 tree whose `action.yml` is SHA-256
+`41dd4b9ae1b0ad74e021e2974afbcdac1a1bc0d856a166a57e94046e803d6cd9` with the same
+path set and executable bit. Both source and destination generations are bound
+inside the extracted checker (complete file set, modes, and content hashes).
+Another base generation, a one-byte or mode change, an extra or missing file,
+or any other local-action path is still rejected. The candidate cannot supply
+a digest, a mutable allowlist, or an unbound proposed manifest.
+
+Once the destination generation is the trusted base, an unchanged working tree
+passes by ordinary byte identity, and any further unadmitted drift fails. The
+predecessor constants are then inert — the trusted archive is no longer the
+source generation — and should be retired in a follow-up so the old tree
+cannot remain an admitted source. This predecessor must merge before #3910
+and does not contain #3910's action or workflow changes.
+
+Keeping the proof in Python rather than inline shell also keeps `helm-chart`
+free of the opaque-inline-shell and Cross surfaces that `Trusted Cross Build
+Policy` freezes per job.
 On pull requests and merge groups the checker is extracted from the base revision when
 one exists, then self-tested and executed against the proposed chart tree. That
 prevents the step from executing a checker replaced by the same pull request and
@@ -1691,10 +1714,14 @@ shapes and nothing else:
   tests and fuzz targets. The frozen job installs `protobuf-compiler` before
   invoking Cargo because the workspace build script requires `protoc`. Its
   1024 MiB RSS cap leaves bounded headroom above the roughly 400 MiB baseline
-  of the fully linked, sanitizer-instrumented fuzz binaries. The job's
-  environment clears both repository sccache wrapper inputs and `RUSTFLAGS`,
-  because the isolated lane installs neither sccache nor the mold linker selected
-  by the root Cargo configuration.
+  of the fully linked, sanitizer-instrumented fuzz binaries.
+
+  Because a whole-job freeze cannot express an edit, issue #3902's change of
+  *where* each half of the lane runs is admitted as two byte-frozen
+  **generations** with a one-way transition between them
+  (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first) — the same shape as the
+  admitted `release.yml` image-family adoption. See
+  [Admitted `fuzz-smoke` lane-split generation](#admitted-fuzz-smoke-lane-split-generation).
 - `FUZZ_WORKFLOW` — the whole of `.github/workflows/fuzz.yml`. A repository
   that has not adopted it may omit it; once the trusted base carries it, a pull
   request may neither remove nor alter it. Whole-file
@@ -1736,18 +1763,98 @@ wiring back out once the trusted base carries it. The aggregate `test` job is no
 otherwise exempt, and no other job, action, automation surface, publisher
 contract, top-level `env`/trigger, or Cross token is affected.
 
-Neither admitted shape names the protected ARM64 target or the Cross executable,
-requests write permission, or references a secret; the verifier self-tests
-assert each of those directly, plus rejection of budget widening, unpinned or
-mutable action/tool pins, local-action substitution, shell indirection,
-untrusted interpolation, broadened triggers or permissions, arbitrary target
-selection, ungated publication, and widened artifact paths.
+No admitted generation, and not the scheduled lane, names the protected ARM64
+target or the Cross executable, requests write permission, or references a
+secret; the verifier self-tests assert each of those directly, plus rejection of
+budget widening, unpinned or mutable action/tool pins, local-action
+substitution, shell indirection, untrusted interpolation, broadened triggers or
+permissions, arbitrary target selection, ungated publication, and widened
+artifact paths.
 
 Because only the repository-root Cargo configuration is validated, a committed
 `.cargo/config[.toml]` anywhere below the root is now rejected outright
 (`validate_nested_cargo_configuration_tree`): the fuzz lane runs with
 `working-directory: fuzz`, and a nested Cargo configuration there would be an
 unreviewed place to set a target linker, runner, or rustflags.
+
+###### Admitted `fuzz-smoke` lane-split generation
+
+`Fuzz Smoke` was the longest job in required pull-request CI — roughly 47
+minutes — and roughly 46 of those minutes were compilation. The six
+sanitizer-instrumented libFuzzer targets were rebuilt from scratch on every
+pull request, because the retired generation cleared `RUSTC_WRAPPER` /
+`CARGO_BUILD_RUSTC_WRAPPER` and installed no compiler cache, to buy about 48
+seconds of actual fuzzing (issue #3902).
+
+The whole job is frozen, so this could not be an edit. `CI_FUZZ_SMOKE_JOB_GENERATIONS`
+therefore lists the job's admitted texts oldest first:
+
+- `CI_FUZZ_SMOKE_RETIRED_JOB` — the shape issue #2461 landed: property smoke and
+  the six-target libFuzzer budget on every full-mode pull request, with compiler
+  caching explicitly disabled.
+- `CI_FUZZ_SMOKE_JOB` — the adopted shape:
+  - the property smoke runs the same `cargo test --locked` and is still the
+    required full-mode pull-request gate; only a duration line was added around
+    it;
+  - the six-target bounded budget carries `if: github.event_name != 'pull_request'`,
+    so it runs on `merge_group`, on the push to `main`, and on
+    `workflow_dispatch` (added to the job's own `if:`). Nothing reaches `main`
+    without it, and the merge queue still runs it before merge;
+  - the run itself is byte-identical across generations. The self-test asserts
+    `CI_FUZZ_SMOKE_BOUNDED_BUDGET` — the six `Fuzz smoke target:` markers, the
+    `cargo fuzz run --codegen-units 16` invocation, and `-runs=512`,
+    `-max_total_time=8`, `-max_len=4096`, `-timeout=2`, `-rss_limit_mb=1024` —
+    appears exactly once in every generation, so a generation cannot move the
+    lane and relax it in the same change;
+  - compiler caching is admitted through the repository's own
+    `./.github/actions/setup-sccache`, the single local action the contract
+    permits. That action installs a checksum-pinned sccache release, never
+    enables the credential-bearing sccache GHA backend, never persists
+    `ACTIONS_RUNTIME_TOKEN` / `ACTIONS_RESULTS_URL` into later
+    pull-request-controlled steps, asserts those variables are absent before any
+    build runs, and clears the wrapper entirely if the install fails. Local
+    actions are not exempt from the policy: `validate_action_collection` and
+    `compare_pr_action_collection` reject a Cross executable or configuration
+    input in any of them, and the action's own surfaces are attributed to
+    `actions/<name>`, never withheld with the job's;
+  - the job therefore no longer pins `RUSTC_WRAPPER` at job level — a job-level
+    `env` entry would override the installer's fail-closed `GITHUB_ENV`
+    decision — while `RUSTFLAGS: ""` stays, because the root Cargo
+    configuration still selects a mold linker this lane does not install;
+  - the sccache directory is persisted by the pinned `Swatinem/rust-cache` step
+    under `save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}`.
+    GitHub already scopes a pull request's cache writes to its own ref; writing
+    nothing at all from an untrusted ref is the stronger statement, and it keeps
+    every compiler artifact the sanitizer build restores attributable to code
+    that already merged;
+  - telemetry: the job prints `Fuzz property smoke seconds`, `Fuzz sanitizer
+    lane seconds`, sccache statistics before and after the sanitizer build, the
+    lane shape it took, and the on-disk cache size — so a hosted log shows
+    whether the sanitizer build actually reused work, and warns explicitly when
+    sccache was unavailable.
+
+The transition is exact on both ends and one-way. `admitted_fuzz_smoke_errors`
+accepts a `fuzz-smoke` job only at one of these two texts (or absent);
+`admitted_fuzz_smoke_removal_errors` refuses both removal and a move to a lower
+generation. That direction check is load-bearing rather than decorative: every
+admitted generation is withheld from *both* sides of the surface comparison, so
+the digest comparison alone would accept a revert. The self-test drives the full
+transition through `compare_pr_workflow_job` in both directions, re-runs all
+thirteen shared tamper mutations against every generation, and adds seven
+mutations covering exactly what #3902 introduced — restoring the sanitizer
+budget to pull requests, dropping it from the merge queue, skipping the property
+gate on pull requests, allowing untrusted cache writes, substituting an
+unpinned third-party sccache installer, enabling the credential-bearing GHA
+backend, and widening the cached directory.
+
+The aggregate wiring is unaffected: this is still one job named `fuzz-smoke`,
+so `CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS` and the `require_success "Fuzz Smoke"`
+assertion are byte-identical across the transition.
+
+Delete `CI_FUZZ_SMOKE_RETIRED_JOB` from `CI_FUZZ_SMOKE_JOB_GENERATIONS` — and the
+`("retired fuzz-smoke generation", CI_FUZZ_SMOKE_RETIRED_JOB)` self-test row with
+it — once the adopted generation is on `main` and no supported base still carries
+the retired one.
 
 ##### Admitted release image-family adoption (`-ebpf-tools`)
 
@@ -1823,66 +1930,100 @@ modification of the verifier it protects, and the landing is administrative afte
 root review), then an ordinary pull request that adopts the release workflow
 under the now-trusted policy and runs the full hosted matrix.
 
-##### Admitted `fips-build.yml` generation transition (temporary, issue #3888)
+##### Retired `fips-build.yml` generation transition (issue #3888 / PR #3889)
 
-`.github/workflows/fips-build.yml` is an ordinary workflow — unprotected and
-uncontracted — so the only thing the pull-request Cross scan says about it is
-that its Cross executable/configuration surface must not move between the
-trusted base and the proposal. The FIPS runtime rework in PR #3889 rewrites the
-file (trusted-base path planning, split compile/lint phases, scoped sccache and
-`ci-fips` rust-cache reuse, a `force_cold_cache` dispatch input, per-phase
-summaries) and moves that surface, so the scan rejects it with
-`workflow directory/fips-build.yml cannot add or change Cross
-executable/configuration surfaces`. The verifier that decides this always
-executes from the trusted base, so that pull request cannot repair it inside its
-own proposal.
+PR #3889 landed on `main` as `7e9e69493`. The temporary whole-file SHA-256
+admission that let that rewrite pass the Cross surface scan is **retired and
+non-operational**. Ordinary `.github/workflows/fips-build.yml` edits are
+compared by the normal fail-closed Cross surface scan with no special case, no
+`admitted_generation_transition` bypass, and no FIPS-only classifier. The
+generic SHA-256 generation digest helper remains because CI-job and
+local-action finite transitions still use it.
 
-Rather than relaxing the scan, the trusted policy admits **exactly one**
-transition of that one file, bound to the two complete file **generations** it
-moves between. Each generation is named by the SHA-256 of its entire text and is
-pinned in the trusted verifier itself
-(`FIPS_BUILD_RETIRED_GENERATION_SHA256`, `FIPS_BUILD_ADOPTED_GENERATION_SHA256`).
-A workflow this large has no frozen job contract to project fragment by
-fragment, so exact whole-file generation binding is what replaces the release
-workflow's derived projection. Nothing about the admission comes from the pull
-request — not the digest, not a manifest, not an allowlist, not a projection,
-not a rationale — so a proposal reaches it only by being, byte for byte, the
-destination revision the trusted policy already names.
+##### Admitted CI job SHA-256 generation transitions (temporary)
 
-The admission is fail-closed in every direction it does not name:
+`ci.yml` is a protected workflow. The ARM64 job stays digest-frozen; every other
+job the pull-request scan reads as Cross-sensitive is compared by its whole-job
+SHA-256. The CI optimization tranche rewrites some of those jobs. Rather than
+relaxing the scan, the trusted policy admits exact retired→adopted pairs
+(`CI_JOB_GENERATION_TRANSITIONS` in `.github/scripts/verify_cross_build_policy.py`):
 
-- Both ends are exact. The trusted base must be the retired generation and the
-  proposal the adopted one. A one-byte drift on either side, an absent file, the
-  destination added outright, or a partially applied rewrite is scanned exactly
-  as before.
-- It is bound to the path as well as to the two contents; the same two revisions
-  under any other workflow filename are not this transition.
-- It is one-way. Once the trusted base carries the adopted generation, returning
-  the file to the retired one is refused explicitly
-  (`cannot return to the retired FIPS workflow generation after the trusted base
-  adopts the admitted one`) rather than relying on the two surfaces differing.
-- It withholds one surface-equality verdict, for one file, for one revision
-  pair. Every other workflow, action, automation script, protected job contract,
-  digest name space, required-check binding, and live-gate relevance contract is
-  evaluated exactly as before, so a Cross surface added anywhere else in the
-  same pull request is still rejected. Hard scan failures on either revision are
-  reported regardless.
+| Job | Retired SHA-256 (trusted base) | Adopted SHA-256 | Destination |
+|---|---|---|---|
+| `ci-plan` | `b3d95b6f0324f9a9ef842516907d7f5ff58d6d4a13f4a2d8afa5d659d6ab8336` | `c818a55308d27fe47692af3f22c8fdbd495755cf471760114ec2e6e4cb849c08` | PR #3913 / issue #3903 |
+| `test` | `e70ecf0924d88b6d86591608b471b70faad270ece6067c65b94eb5509ae1a03f` | `6bc548059b5b5efffbeb403ccfafebff8124c99af49a00c14aaa9af7e948e59d` | PR #3913 / issue #3903 |
+| `performance-regression` | `74673023dee4c0970a8b8d3c9a99089be2f28eddf57ddb7337febdf22bd5a7e4` | `e7d9a4c0ea26a14efd92844998a42219ca2fb1379072776a313de6dd9b720986` | PR #3911 / issue #3906 |
 
-**Retirement is mandatory.** Once PR #3889 is on `main` the trusted base *is*
-the adopted generation, so the admission is permanently unreachable — the
-retired generation can only become a trusted base again by first passing the
-one-way refusal. The pinned digests, the `admitted_generation_transition`
-parameter, the self-tests, and this section must be deleted in the next
-trusted-policy change. If #3889's `fips-build.yml` changes for any reason before
-it lands (including a conflicting merge of `main`), the adopted digest no longer
-matches and the transition must be re-pinned by another trusted-policy pull
-request.
+Each digest is the SHA-256 of `extract_job_block` text. Both ends are exact, the
+binding includes the job name, the move is one-way, and only that job's
+`job:<name>:*` surfaces are withheld for that one pair. The candidate supplies
+no digest. `fuzz-smoke` is not in this table; it uses
+`CI_FUZZ_SMOKE_JOB_GENERATIONS`.
 
-Landing this admission takes the same two stages as the release image-family
-adoption: a policy-only pull request whose own `Trusted Cross Build Policy`
-check fails by design (that check refuses any pull-request modification of the
-verifier it protects, so `Candidate policy self-test` is the substantive
-evidence), then the ordinary workflow pull request under the now-trusted policy.
+Jobs omitted because a single predecessor cannot name a unique merged text:
+
+- `test-pkcs11-softhsm` — #3889 already rewrote this job on `main`. #3913
+  rewrites it from a different retired text. #3913 must merge latest `main` and
+  needs a follow-up predecessor if the remaining PKCS path-gate still moves a
+  Cross-sensitive digest.
+- `ci-plan` / `test` for #3915 (issue #3900) — different destination hashes from
+  #3913. After #3913 is the trusted base, #3915 needs a follow-up predecessor.
+
+Lint (`#3909`), `build-binaries` (`#3916`), coverage planning (`#3917`), and
+optional live-suite `changes` jobs (`#3919`) are not admitted here. They are not
+folded into this predecessor; if hosted Cross disagrees after a latest-`main`
+merge, they need their own exact pair rather than a wildcard.
+
+##### Admitted `setup-rust-ci` generation transition (temporary)
+
+`.github/actions/setup-rust-ci/action.yml` on current `main` (PR #3889's landed
+file, SHA-256
+`fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda`) may move to
+exactly one combined destination decided by this trusted policy
+(`LOCAL_ACTION_GENERATION_TRANSITIONS`):
+
+- PR #3911 / issue #3906, after merging latest `main` while preserving every
+  #3889 cache-safety change plus #3911's optional `workspaces` input/pass-through:
+  `57a99a179ddc2935af187f518a803bf167eb9e33593c37b7b29f7151ec994da2`
+
+The pair is exact, path-bound, one-way, and fail-closed. The candidate supplies
+no digest, allowlist, or fallback. A dest-to-dest rewrite, a one-byte drift, or
+any other path is scanned as an ordinary Cross surface change. The obsolete
+two-destination table from before #3889 landed is retired. #3910's comment-only
+`setup-rust-ci` tweak is not admitted here; drop or re-pin it after merging
+latest `main`.
+
+##### Remaining CI-tranche predecessor sequence
+
+This predecessor is the maximum safe consolidation. Preserve every original
+issue-closing implementation PR; this policy PR tracks those issues and does
+not close them.
+
+1. Land this predecessor (admin; `Trusted Cross Build Policy` expected RED).
+   PR #3889 is already on `main`; this change retires the FIPS whole-file
+   admission and rebinds `setup-rust-ci` to the current-main → combined #3911
+   pair.
+2. Merge latest `main` into #3910 and land it. Helm Chart admits the
+   setup-kubernetes-tools move via this predecessor's extracted checker.
+   #3912 is superseded by this PR; do not merge #3912 itself (it would revert
+   later Cross policy).
+3. Merge latest `main` into #3918 and land the destination `ci.yml` (the
+   policy-only first commit is already in this predecessor). Then retire
+   `CI_FUZZ_SMOKE_RETIRED_JOB`.
+4. Merge latest `main` into #3913 and land it (`ci-plan` / `test` pairs).
+   #3889 already rewrote `test-pkcs11-softhsm` on `main`, so #3913 must merge
+   that result and may need a new PKCS job pair.
+5. Merge latest `main` into #3909, #3916, and #3917 and land them as ordinary
+   implementation PRs unless hosted Cross names a new frozen surface.
+6. Merge latest `main` into #3911 and land it. This predecessor now admits the
+   combined `setup-rust-ci` destination; the `performance-regression` pair
+   remains valid if that job is untouched.
+7. #3915 (issue #3900) after #3913: remaining predecessor for `ci-plan` /
+   `test` (hashes differ from #3913).
+8. #3919: destination freeze plus optional live-suite `changes` jobs. Do not
+   self-admit its verifier `LIVE_SUITE_RELEVANCE_CONTRACTS`; those are absolute
+   and fail without the matching workflow jobs. Classifier bootstrap until it
+   is on `main`.
 
 #### 8. Latest Release and Docker Jobs
 
