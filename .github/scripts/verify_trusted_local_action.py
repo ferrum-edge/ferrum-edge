@@ -294,21 +294,16 @@ def verify_local_action(
         executable, expected = manifest[relative]
         path = discovered[relative]
         try:
-            actual = path.read_bytes()
-        except OSError as exc:
+            actual = read_bounded_local_payload(
+                path,
+                limit=MAX_MEMBER_BYTES,
+                expected_executable=executable,
+            )
+        except (TrustedActionError, OSError) as exc:
             findings.append(f"{relative}: unreadable local action input ({exc})")
             continue
         if actual != expected:
             findings.append(f"{relative}: differs from the trusted revision")
-        try:
-            mode = path.stat().st_mode
-        except OSError as exc:
-            findings.append(f"{relative}: unreadable local action mode ({exc})")
-            continue
-        if bool(mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)) != executable:
-            findings.append(
-                f"{relative}: executable bit differs from the trusted revision"
-            )
     return findings
 
 
@@ -1050,6 +1045,33 @@ def _generation_transition_self_tests(
         failures.append(
             "oversized extra file still produced a transition generation"
         )
+
+    oversized_primary = tmp / "destination-oversized-primary-file"
+    _write_generation(
+        oversized_primary,
+        SETUP_KUBERNETES_TOOLS_ACTION_PATH,
+        destination_files,
+    )
+    primary_overflow = (
+        oversized_primary
+        / SETUP_KUBERNETES_TOOLS_ACTION_PATH
+        / "action.yml"
+    )
+    _write_sparse(primary_overflow, MAX_MEMBER_BYTES + 1)
+    try:
+        findings, transitioned = evaluate_local_action(
+            oversized_primary, action_dir, current_manifest
+        )
+    except TrustedActionError as exc:
+        failures.append(f"oversized primary file raised: {exc}")
+    else:
+        if not findings or transitioned:
+            failures.append("oversized primary file was accepted as a transition")
+        elif not any("exceeds" in item for item in findings):
+            failures.append(
+                "oversized primary file lost the bounded-read finding: "
+                f"{findings}"
+            )
 
     oversized_dest = tmp / "destination-oversized-payload"
     _write_generation(
