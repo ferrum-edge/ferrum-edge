@@ -363,7 +363,7 @@ jobs:
 
       - name: Save BuildKit local cache
         if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
-        uses: actions/cache/save@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
+        uses: actions/cache/save@3edfce9056124e459a23f683a21433670d47daca # v4.2.4
         with:
           path: ${{ runner.temp }}/production-dockerfile-smoke-default
           key: production-dockerfile-smoke-default-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
@@ -568,7 +568,7 @@ jobs:
 
       - name: Save BuildKit local cache
         if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
-        uses: actions/cache/save@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
+        uses: actions/cache/save@3edfce9056124e459a23f683a21433670d47daca # v4.2.4
         with:
           path: ${{ runner.temp }}/production-dockerfile-smoke-ebpf
           key: production-dockerfile-smoke-ebpf-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
