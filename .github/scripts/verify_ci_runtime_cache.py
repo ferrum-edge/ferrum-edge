@@ -769,7 +769,7 @@ def check_no_sccache_credential_exporter(
         # legitimately names the `core.exportVariable` API while documenting
         # that no installer calling it is invoked. Only an actual call site
         # (always followed by an argument list) is a credential leak.
-        "core.exportVariable(" not in text,
+        re.search(r"\bcore\s*\.\s*exportVariable\s*\(", text) is None,
         f"{source} must not call core.exportVariable (ACTIONS_RUNTIME_TOKEN leak)",
         failures,
     )
@@ -3304,6 +3304,19 @@ def self_test() -> int:
         "self-test: mozilla-actions/sccache-action must fail",
         failures,
     )
+
+    for separator in (" ", "\n"):
+        export_call_failures: list[str] = []
+        check_no_sccache_credential_exporter(
+            f"core.exportVariable{separator}('ACTIONS_RUNTIME_TOKEN', token)",
+            "self-test-sccache-export-call",
+            export_call_failures,
+        )
+        require(
+            any("must not call core.exportVariable" in item for item in export_call_failures),
+            "self-test: whitespace before core.exportVariable arguments must fail",
+            failures,
+        )
 
     path_based_sccache = (
         '        echo "$install_dir" >> "$GITHUB_PATH"\n'
