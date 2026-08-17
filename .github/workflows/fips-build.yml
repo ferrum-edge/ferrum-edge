@@ -681,7 +681,7 @@ jobs:
       - name: Restore FIPS producer compile outputs
         if: github.event.inputs.force_cold_cache != 'true'
         id: fips-producer
-        uses: actions/cache/restore@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
+        uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca # v4.2.4
         with:
           path: |
             ${{ github.workspace }}/target
@@ -895,7 +895,7 @@ jobs:
       - name: Restore FIPS producer compile outputs
         if: github.event.inputs.force_cold_cache != 'true'
         id: fips-producer
-        uses: actions/cache/restore@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
+        uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca # v4.2.4
         with:
           path: |
             ${{ github.workspace }}/target
@@ -1067,7 +1067,7 @@ jobs:
       - name: Restore FIPS producer compile outputs
         if: github.event.inputs.force_cold_cache != 'true'
         id: fips-producer
-        uses: actions/cache/restore@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
+        uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca # v4.2.4
         with:
           path: |
             ${{ github.workspace }}/target
