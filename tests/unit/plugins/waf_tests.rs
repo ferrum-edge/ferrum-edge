@@ -2202,11 +2202,7 @@ async fn custom_fullurl_lfi_or_path_traversal_category_does_not_mirror_canonical
         );
         assert_eq!(encoded_lfi.raw_query_string(), Some("file=%2Fetc%2Fpasswd"));
 
-        let trav_plugin = custom_full_url_waf(
-            "CUSTOM-FULLURL-TRAV",
-            category,
-            r"(?:\.\./|\.\.\\)",
-        );
+        let trav_plugin = custom_full_url_waf("CUSTOM-FULLURL-TRAV", category, r"(?:\.\./|\.\.\\)");
         let mut encoded_trav = ctx("GET", "/w/rec");
         encoded_trav.set_raw_query_string("file=..%2fetc%2Fpasswd".into());
         let result = trav_plugin.authorize(&mut encoded_trav).await;
@@ -2215,7 +2211,10 @@ async fn custom_fullurl_lfi_or_path_traversal_category_does_not_mirror_canonical
             "custom FullUrl labeled {category} must not decode `%2f`, got {result:?}"
         );
         assert!(!monitored(&encoded_trav, "CUSTOM-FULLURL-TRAV"));
-        assert_eq!(encoded_trav.raw_query_string(), Some("file=..%2fetc%2Fpasswd"));
+        assert_eq!(
+            encoded_trav.raw_query_string(),
+            Some("file=..%2fetc%2Fpasswd")
+        );
     }
 }
 
