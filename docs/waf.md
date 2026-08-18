@@ -173,8 +173,8 @@ and `rule_overrides`. Categories:
 | `xpath_injection` | FE-XPATH-001, FE-XPATH-002 (L3, low value) | |
 | `ssti` | FE-SSTI-001 (broad, L2), FE-SSTI-002 (arithmetic probe, L1), FE-SSTI-003 (Java/Spring EL, L2) | |
 | `xss` | FE-XSS-001..005 plus `-B`/`-Q` body/query mirrors | script-tag and js-URL now cover both query and body |
-| `path_traversal` | FE-PATHTRAV-001..003, FE-PATHTRAV-001-B | covers request bodies and percent-decoded query values (including `%2f`), not just the raw URL |
-| `lfi` / `rfi` | FE-LFI-001(+ -B), FE-RFI-001 (L2) | LFI also inspects canonical query values |
+| `path_traversal` | FE-PATHTRAV-001..003, FE-PATHTRAV-001-B | FE-PATHTRAV-001..003 (FullUrl) also scan percent-decoded query values (including `%2f`); 001-B covers request bodies. Category labels do not select scan targets. |
+| `lfi` / `rfi` | FE-LFI-001(+ -B), FE-RFI-001 (L2) | FE-LFI-001 (FullUrl) also inspects canonical query values; 001-B covers bodies. The `lfi` label itself does not. |
 | `ssrf` | FE-SSRF-001(+ -Q), FE-SSRF-002(+ -Q) | metadata/private-IP and dangerous schemes across body and query |
 | `xxe` | FE-XXE-001 | external-entity markers; no longer trips on `<!DOCTYPE html>` |
 | `deserialization` | FE-DESER-001..003 | Java / .NET / PHP markers |

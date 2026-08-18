@@ -1,4 +1,4 @@
-use super::rules::{MatchKind, RuleAction, RuleTarget, Severity, WafRule};
+use super::rules::{MatchKind, QueryScanMirror, RuleAction, RuleTarget, Severity, WafRule};
 
 /// Tightened XSS event-handler attribute list. The original `on[a-z]{3,32}=`
 /// matched benign fields like `online=`/`onset=`; this enumerates real DOM
@@ -26,12 +26,12 @@ pub fn default_rules() -> Vec<WafRule> {
         r("FE-XSS-003", "HTML event handler", "xss", Severity::Medium, RuleTarget::BodyText, EVENT_HANDLER),
         r("FE-XSS-004", "Iframe srcdoc payload", "xss", Severity::High, RuleTarget::BodyText, r"(?i)<\s*iframe\b[^>]*\bsrcdoc\s*="),
         r("FE-XSS-005", "HTML data URL", "xss", Severity::Medium, RuleTarget::QueryValues, r"(?i)data\s*:\s*text/html"),
-        // FullUrl PATHTRAV/LFI also compile into `canonical_query_values` so
-        // query payload is matched after bounded percent-decode of `%2f`.
-        r("FE-PATHTRAV-001", "Dot-dot path traversal", "path_traversal", Severity::High, RuleTarget::FullUrl, r"(?:\.\./|\.\.\\)"),
-        r("FE-PATHTRAV-002", "Encoded path traversal", "path_traversal", Severity::High, RuleTarget::FullUrl, r"(?i)%25?2e%25?2e(?:%25?2f|%25?5c|/|\\)"),
-        r("FE-PATHTRAV-003", "Encoded null byte", "path_traversal", Severity::Medium, RuleTarget::FullUrl, r"(?i)%00"),
-        r("FE-LFI-001", "Local file inclusion target", "lfi", Severity::High, RuleTarget::FullUrl, r"(?i)(?:/etc/passwd|/proc/self/|c:\\windows\\|php://filter|expect://|file:///)"),
+        // Built-in FullUrl PATHTRAV/LFI signatures opt into a compile-time
+        // canonical-query-value mirror (`%2f` decoded). Category labels do not.
+        r_canonical_query("FE-PATHTRAV-001", "Dot-dot path traversal", "path_traversal", Severity::High, RuleTarget::FullUrl, r"(?:\.\./|\.\.\\)"),
+        r_canonical_query("FE-PATHTRAV-002", "Encoded path traversal", "path_traversal", Severity::High, RuleTarget::FullUrl, r"(?i)%25?2e%25?2e(?:%25?2f|%25?5c|/|\\)"),
+        r_canonical_query("FE-PATHTRAV-003", "Encoded null byte", "path_traversal", Severity::Medium, RuleTarget::FullUrl, r"(?i)%00"),
+        r_canonical_query("FE-LFI-001", "Local file inclusion target", "lfi", Severity::High, RuleTarget::FullUrl, r"(?i)(?:/etc/passwd|/proc/self/|c:\\windows\\|php://filter|expect://|file:///)"),
         r("FE-RFI-001", "Remote URL in request parameter", "rfi", Severity::Medium, RuleTarget::QueryValues, r"(?i)\b(?:https?|ftp)://[^\s/?#]+"),
         r("FE-XXE-001", "XML external entity marker", "xxe", Severity::High, RuleTarget::BodyText, r#"(?i)(?:<!ENTITY|\bSYSTEM\s+["']|\bPUBLIC\s+["'])"#),
         r("FE-DESER-001", "Java serialized object marker", "deserialization", Severity::High, RuleTarget::BodyText, r"\brO0AB[A-Za-z0-9+/=]{8,}"),
@@ -134,6 +134,25 @@ fn r(
     rp(id, name, category, severity, target, pattern, 1)
 }
 
+/// Built-in FullUrl PATHTRAV/LFI helper: same as [`r`], plus the canonical
+/// query-value mirror. Must not be used for custom rules or other built-ins.
+fn r_canonical_query(
+    id: &str,
+    name: &str,
+    category: &str,
+    severity: Severity,
+    target: RuleTarget,
+    pattern: &str,
+) -> WafRule {
+    let mut rule = r(id, name, category, severity, target, pattern);
+    debug_assert!(
+        matches!(rule.target, RuleTarget::FullUrl),
+        "canonical query-value mirror is FullUrl-only"
+    );
+    rule.query_scan_mirror = QueryScanMirror::CanonicalQueryValues;
+    rule
+}
+
 /// Like [`r`] but with an explicit `paranoia_min`. Rules above the configured
 /// `paranoia_level` are compiled out, so loud/broad signatures live at 2–3.
 #[allow(clippy::too_many_arguments)]
@@ -159,5 +178,6 @@ fn rp(
         fp_filters: Vec::new(),
         paranoia_min,
         score: None,
+        query_scan_mirror: QueryScanMirror::None,
     }
 }

@@ -9,11 +9,11 @@
 //! materialized the parsed query map, so duplicate raw pairs remain visible for
 //! HPP checks instead of being collapsed by `HashMap` parsing. Each `&`/`=`-
 //! split component is then run through a bounded canonical percent-decode
-//! (including `%2f`) shared by query-value rules and FullUrl path-traversal
-//! and LFI rules; the raw query bytes are never rewritten. Synthetic contexts
-//! without a raw query string fall back to the decoded
-//! `RequestContext::query_params` map for key/value scans and best-effort
-//! full-URL checks.
+//! (including `%2f`) shared by query-value rules and the built-in FullUrl
+//! FE-PATHTRAV/LFI signatures that opt into that mirror at compile time; the
+//! raw query bytes are never rewritten. Synthetic contexts without a raw query
+//! string fall back to the decoded `RequestContext::query_params` map for
+//! key/value scans and best-effort full-URL checks.
 
 mod decode;
 mod defaults;

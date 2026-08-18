@@ -97,8 +97,9 @@ impl CanonicalQueryViews<'_> {
     }
 }
 
-/// Bounded query-component normalization shared by query-value rules and the
-/// FullUrl `path_traversal` / `lfi` classes.
+/// Bounded query-component normalization shared by query-value rules and by
+/// built-in FullUrl FE-PATHTRAV/LFI signatures that opt into a compile-time
+/// canonical-query-value mirror. Category labels do not select this path.
 ///
 /// `primary` is one percent-decode plus `+`→space (the historical query-value
 /// view). Additional views are the same layered decode used for body XSS,

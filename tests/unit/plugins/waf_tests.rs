@@ -1893,10 +1893,10 @@ fn pathtrav_lfi_enforced_waf() -> Waf {
 
 #[tokio::test]
 async fn query_encoded_slash_cannot_bypass_path_traversal_or_lfi() {
-    // PATHTRAV/LFI target FullUrl and historically scanned the raw query, so
-    // `%2e` could still match the encoded-dot rule while `%2f` never became
-    // `/`. Canonical query-value views decode `%2f` (unlike path canonicalization)
-    // before those rule classes run.
+    // Built-in FullUrl PATHTRAV/LFI signatures historically scanned the raw
+    // query, so `%2e` could still match the encoded-dot rule while `%2f` never
+    // became `/`. Their compile-time canonical query-value mirror decodes `%2f`
+    // (unlike path canonicalization) without rewriting forwarded bytes.
     let plugin = pathtrav_lfi_enforced_waf();
 
     struct Case {
@@ -2129,6 +2129,148 @@ async fn h3_style_raw_query_params_still_decode_slash_for_lfi() {
         other => panic!("expected LFI reject on raw materialized value, got {other:?}"),
     }
     assert!(monitored(&req, "FE-LFI-001"));
+}
+
+fn custom_full_url_waf(id: &str, category: &str, pattern: &str) -> Waf {
+    Waf::new(&json!({
+        "include_default_rules": false,
+        "mode": "enforce",
+        "custom_rules": [{
+            "id": id,
+            "name": id,
+            "category": category,
+            "severity": "high",
+            "target": "full_url",
+            "pattern": pattern,
+            "action": "enforce"
+        }]
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn builtin_fullurl_pathtrav_lfi_still_catch_encoded_query_slash() {
+    let plugin = pathtrav_lfi_enforced_waf();
+
+    let mut trav = ctx("GET", "/w/rec");
+    trav.set_raw_query_string("file=..%2fetc%2Fpasswd".into());
+    let result = plugin.authorize(&mut trav).await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("expected built-in PATHTRAV reject, got {other:?}"),
+    }
+    assert!(
+        monitored(&trav, "FE-PATHTRAV-001") || monitored(&trav, "FE-PATHTRAV-002"),
+        "built-in PATHTRAV must still see decoded `%2f`, hits={:?}",
+        trav.metadata.get("waf.rule_hits")
+    );
+    assert_eq!(trav.raw_query_string(), Some("file=..%2fetc%2Fpasswd"));
+
+    let mut lfi = ctx("GET", "/w/rec");
+    lfi.set_raw_query_string("file=%2Fetc%2Fpasswd".into());
+    let result = plugin.authorize(&mut lfi).await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("expected built-in LFI reject, got {other:?}"),
+    }
+    assert!(monitored(&lfi, "FE-LFI-001"));
+    assert_eq!(lfi.raw_query_string(), Some("file=%2Fetc%2Fpasswd"));
+}
+
+#[tokio::test]
+async fn custom_fullurl_lfi_or_path_traversal_category_does_not_mirror_canonical_query() {
+    // A custom FullUrl rule merely labeled `lfi` / `path_traversal` must not
+    // inherit the built-in pack's decoded query-value mirror. Category is
+    // operator-facing metadata; the declared target stays `full_url`.
+    for category in ["lfi", "path_traversal"] {
+        let lfi_plugin = custom_full_url_waf(
+            "CUSTOM-FULLURL-LFI",
+            category,
+            r"(?i)(?:/etc/passwd|/proc/self/|c:\\windows\\|php://filter|expect://|file:///)",
+        );
+        let mut encoded_lfi = ctx("GET", "/w/rec");
+        encoded_lfi.set_raw_query_string("file=%2Fetc%2Fpasswd".into());
+        let result = lfi_plugin.authorize(&mut encoded_lfi).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "custom FullUrl labeled {category} must not decode `%2f`, got {result:?}"
+        );
+        assert!(
+            !monitored(&encoded_lfi, "CUSTOM-FULLURL-LFI"),
+            "undeclared canonical-query mirror for category={category}, hits={:?}",
+            encoded_lfi.metadata.get("waf.rule_hits")
+        );
+        assert_eq!(encoded_lfi.raw_query_string(), Some("file=%2Fetc%2Fpasswd"));
+
+        let trav_plugin = custom_full_url_waf(
+            "CUSTOM-FULLURL-TRAV",
+            category,
+            r"(?:\.\./|\.\.\\)",
+        );
+        let mut encoded_trav = ctx("GET", "/w/rec");
+        encoded_trav.set_raw_query_string("file=..%2fetc%2Fpasswd".into());
+        let result = trav_plugin.authorize(&mut encoded_trav).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "custom FullUrl labeled {category} must not decode `%2f`, got {result:?}"
+        );
+        assert!(!monitored(&encoded_trav, "CUSTOM-FULLURL-TRAV"));
+        assert_eq!(encoded_trav.raw_query_string(), Some("file=..%2fetc%2Fpasswd"));
+    }
+}
+
+#[tokio::test]
+async fn changing_waf_rule_category_cannot_alter_scan_targets() {
+    let encoded_query = "file=%2Fetc%2Fpasswd";
+    let literal_query = "file=/etc/passwd";
+    let pattern = r"(?i)/etc/passwd";
+    let mut encoded_outcomes = Vec::new();
+    let mut literal_outcomes = Vec::new();
+
+    for category in ["lfi", "path_traversal", "custom", "encoding_evasion"] {
+        let plugin = custom_full_url_waf("CUSTOM-FULLURL", category, pattern);
+
+        let mut encoded = ctx("GET", "/w/rec");
+        encoded.set_raw_query_string(encoded_query.into());
+        let encoded_result = plugin.authorize(&mut encoded).await;
+        let encoded_hit = monitored(&encoded, "CUSTOM-FULLURL");
+        encoded_outcomes.push((
+            matches!(encoded_result, PluginResult::Reject { .. }),
+            encoded_hit,
+        ));
+        assert!(
+            !encoded_hit,
+            "encoded `%2f` must not match declared FullUrl for category={category}"
+        );
+        assert_eq!(encoded.raw_query_string(), Some(encoded_query));
+
+        let mut literal = ctx("GET", "/w/rec");
+        literal.set_raw_query_string(literal_query.into());
+        let literal_result = plugin.authorize(&mut literal).await;
+        let literal_hit = monitored(&literal, "CUSTOM-FULLURL");
+        literal_outcomes.push((
+            matches!(literal_result, PluginResult::Reject { .. }),
+            literal_hit,
+        ));
+        assert!(
+            literal_hit,
+            "literal `/etc/passwd` must still match declared FullUrl for category={category}"
+        );
+        match literal_result {
+            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+            other => panic!("expected literal FullUrl reject for {category}, got {other:?}"),
+        }
+        assert_eq!(literal.raw_query_string(), Some(literal_query));
+    }
+
+    assert!(
+        encoded_outcomes.windows(2).all(|pair| pair[0] == pair[1]),
+        "encoded outcomes must be identical across categories: {encoded_outcomes:?}"
+    );
+    assert!(
+        literal_outcomes.windows(2).all(|pair| pair[0] == pair[1]),
+        "literal outcomes must be identical across categories: {literal_outcomes:?}"
+    );
 }
 
 #[tokio::test]

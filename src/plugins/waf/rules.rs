@@ -239,6 +239,21 @@ impl CompiledConditions {
     }
 }
 
+/// Pack-internal extra scan target folded at rule compilation.
+///
+/// Operator-facing `category` is metadata and must not select this. Custom
+/// rules and ordinary built-ins stay [`Self::None`]. Only the built-in FullUrl
+/// FE-PATHTRAV / FE-LFI signatures set [`Self::CanonicalQueryValues`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum QueryScanMirror {
+    #[default]
+    None,
+    /// Also evaluate this FullUrl rule against canonical query-value views
+    /// (bounded percent-decode including `%2f`). Request-path cost is unchanged:
+    /// those views already exist for `query_values`.
+    CanonicalQueryValues,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct WafRule {
     pub(super) id: String,
@@ -255,6 +270,8 @@ pub(super) struct WafRule {
     /// Anomaly-score contribution when scoring is enabled. `None` falls back to
     /// the configured per-severity weight.
     pub(super) score: Option<u32>,
+    /// Pack-internal compile-time mirror. Never parsed from custom-rule JSON.
+    pub(super) query_scan_mirror: QueryScanMirror,
 }
 
 #[derive(Debug)]
@@ -342,9 +359,10 @@ pub(super) struct CompiledRules {
     pub(super) header_values: Option<TextRuleSet>,
     pub(super) query_keys: Option<TextRuleSet>,
     pub(super) query_values: Option<TextRuleSet>,
-    /// FullUrl `path_traversal` / `lfi` patterns evaluated against canonical
-    /// (percent-decoded, including `%2f`) query values. Same rule ids as the
-    /// raw `full_url` set; hits are deduped by `rule_index`.
+    /// FullUrl rules that opted into [`QueryScanMirror::CanonicalQueryValues`]
+    /// at compile time, evaluated against canonical (percent-decoded, including
+    /// `%2f`) query values. Same rule ids as the raw `full_url` set; hits are
+    /// deduped by `rule_index`. Not selected by operator-facing `category`.
     pub(super) canonical_query_values: Option<TextRuleSet>,
     pub(super) cookies: Option<TextRuleSet>,
     pub(super) url_path: Option<TextRuleSet>,
@@ -612,6 +630,14 @@ fn validate_rule(rule: &WafRule) -> Result<(), String> {
             rule.id
         ));
     }
+    if rule.query_scan_mirror == QueryScanMirror::CanonicalQueryValues
+        && !matches!(rule.target, RuleTarget::FullUrl)
+    {
+        return Err(format!(
+            "waf: rule '{}' canonical query-value mirror is only valid for full_url targets",
+            rule.id
+        ));
+    }
     Ok(())
 }
 
@@ -709,7 +735,7 @@ impl RuleSetBuilders {
             RuleTarget::Cookies => self.cookies.push(pattern, rule_ref),
             RuleTarget::UrlPath => self.url_path.push(pattern, rule_ref),
             RuleTarget::FullUrl => {
-                if matches!(rule.category.as_str(), "path_traversal" | "lfi") {
+                if rule.query_scan_mirror == QueryScanMirror::CanonicalQueryValues {
                     self.canonical_query_values
                         .push(pattern.clone(), rule_ref.clone());
                 }
@@ -991,6 +1017,7 @@ pub(super) fn parse_custom_rule(
         fp_filters,
         paranoia_min,
         score,
+        query_scan_mirror: QueryScanMirror::None,
     })
 }
 
@@ -1264,6 +1291,7 @@ mod tests {
             fp_filters: vec![],
             paranoia_min: 1,
             score: None,
+            query_scan_mirror: QueryScanMirror::None,
         };
         let compiled = compile_rules(
             vec![(rule, false)],
@@ -1293,6 +1321,7 @@ mod tests {
             fp_filters: vec![],
             paranoia_min: 1,
             score: None,
+            query_scan_mirror: QueryScanMirror::None,
         };
         let mut modes = HashMap::new();
         modes.insert("R-TYPO".to_string(), RuleAction::Enforce);
@@ -1329,6 +1358,7 @@ mod tests {
             fp_filters: vec![],
             paranoia_min: 4,
             score: None,
+            query_scan_mirror: QueryScanMirror::None,
         };
         let mut modes = HashMap::new();
         modes.insert("R1".to_string(), RuleAction::Enforce);
