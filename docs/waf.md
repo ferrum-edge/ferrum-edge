@@ -107,8 +107,16 @@ matching request and response bodies, the WAF also scans **decoded variants**:
 So a `<script>` written as `<script>`, `&lt;script&gt;`, or
 `%3Cscript%3E` in a body is still caught by the script-tag rule. Decoding is
 content-type-agnostic (an attacker controls the declared `Content-Type`), and
-bounded to a small number of variants. Query values are percent-decoded before
-matching as well.
+bounded to a small number of variants.
+
+Query **values** (each `&`/`=`-split component — never the structural
+delimiters, and never the request path) run through that same bounded layered
+percent-decode before matching, including reserved octets such as `%2f` /
+`%2F`. Path canonicalization still refuses encoded separators; that contract
+is not applied to query payload. At most three decode rounds are applied;
+deeper stacks are not fully reduced and are flagged as `encoding_evasion` on
+the raw URL/body rather than being decoded indefinitely. Decoding is
+inspection-only: the original query bytes are forwarded unchanged.
 
 The layered decode runs a bounded number of rounds (a cost guard against
 decompression-style blowups), so double- and triple-stacked encodings are fully
@@ -165,8 +173,8 @@ and `rule_overrides`. Categories:
 | `xpath_injection` | FE-XPATH-001, FE-XPATH-002 (L3, low value) | |
 | `ssti` | FE-SSTI-001 (broad, L2), FE-SSTI-002 (arithmetic probe, L1), FE-SSTI-003 (Java/Spring EL, L2) | |
 | `xss` | FE-XSS-001..005 plus `-B`/`-Q` body/query mirrors | script-tag and js-URL now cover both query and body |
-| `path_traversal` | FE-PATHTRAV-001..003, FE-PATHTRAV-001-B | now covers request bodies, not just the URL |
-| `lfi` / `rfi` | FE-LFI-001(+ -B), FE-RFI-001 (L2) | |
+| `path_traversal` | FE-PATHTRAV-001..003, FE-PATHTRAV-001-B | covers request bodies and percent-decoded query values (including `%2f`), not just the raw URL |
+| `lfi` / `rfi` | FE-LFI-001(+ -B), FE-RFI-001 (L2) | LFI also inspects canonical query values |
 | `ssrf` | FE-SSRF-001(+ -Q), FE-SSRF-002(+ -Q) | metadata/private-IP and dangerous schemes across body and query |
 | `xxe` | FE-XXE-001 | external-entity markers; no longer trips on `<!DOCTYPE html>` |
 | `deserialization` | FE-DESER-001..003 | Java / .NET / PHP markers |

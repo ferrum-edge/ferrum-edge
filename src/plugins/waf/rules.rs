@@ -342,6 +342,10 @@ pub(super) struct CompiledRules {
     pub(super) header_values: Option<TextRuleSet>,
     pub(super) query_keys: Option<TextRuleSet>,
     pub(super) query_values: Option<TextRuleSet>,
+    /// FullUrl `path_traversal` / `lfi` patterns evaluated against canonical
+    /// (percent-decoded, including `%2f`) query values. Same rule ids as the
+    /// raw `full_url` set; hits are deduped by `rule_index`.
+    pub(super) canonical_query_values: Option<TextRuleSet>,
     pub(super) cookies: Option<TextRuleSet>,
     pub(super) url_path: Option<TextRuleSet>,
     pub(super) full_url: Option<TextRuleSet>,
@@ -629,6 +633,7 @@ struct RuleSetBuilders {
     header_values: PatternBuilder,
     query_keys: PatternBuilder,
     query_values: PatternBuilder,
+    canonical_query_values: PatternBuilder,
     cookies: PatternBuilder,
     url_path: PatternBuilder,
     full_url: PatternBuilder,
@@ -703,7 +708,13 @@ impl RuleSetBuilders {
             RuleTarget::QueryValues => self.query_values.push(pattern, rule_ref),
             RuleTarget::Cookies => self.cookies.push(pattern, rule_ref),
             RuleTarget::UrlPath => self.url_path.push(pattern, rule_ref),
-            RuleTarget::FullUrl => self.full_url.push(pattern, rule_ref),
+            RuleTarget::FullUrl => {
+                if matches!(rule.category.as_str(), "path_traversal" | "lfi") {
+                    self.canonical_query_values
+                        .push(pattern.clone(), rule_ref.clone());
+                }
+                self.full_url.push(pattern, rule_ref);
+            }
             RuleTarget::Method => self.method.push(pattern, rule_ref),
             RuleTarget::BodyText | RuleTarget::BodyJsonPath(_) => {
                 self.body_bytes.push(pattern, rule_ref)
@@ -721,6 +732,9 @@ impl RuleSetBuilders {
             header_values: self.header_values.finish_text("header_values")?,
             query_keys: self.query_keys.finish_text("query_keys")?,
             query_values: self.query_values.finish_text("query_values")?,
+            canonical_query_values: self
+                .canonical_query_values
+                .finish_text("canonical_query_values")?,
             cookies: self.cookies.finish_text("cookies")?,
             url_path: self.url_path.finish_text("url_path")?,
             full_url: self.full_url.finish_text("full_url")?,

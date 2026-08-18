@@ -1,11 +1,12 @@
-//! Decode/normalization pass for WAF body scanning.
+//! Decode/normalization pass for WAF body and query-value scanning.
 //!
 //! The body regex set runs over raw bytes, so a payload hidden behind an
 //! encoding the rules never see slips through: JSON `<script>`,
 //! HTML `&lt;script&gt;`, or form `%3Cscript%3E`. `decoded_variants_with_residual`
 //! returns up to [`MAX_VARIANTS`] normalized forms of a value (deduped, and
 //! excluding the raw input which the caller scans separately) so the same rule
-//! set matches the decoded payload without per-rule changes.
+//! set matches the decoded payload without per-rule changes. Query components
+//! share that pipeline via [`canonical_query_component_views`].
 //!
 //! Decoders are deliberately content-type-agnostic: an attacker controls the
 //! declared `Content-Type`, so we apply every transformation regardless. Each
@@ -76,6 +77,39 @@ pub(super) fn decoded_variants_with_residual(text: &str) -> (Vec<String>, bool) 
         }
     }
     (out, !converged)
+}
+
+/// Canonical inspection views of one query name or value.
+///
+/// Callers must split the raw query on `&` and `=` *before* calling this so
+/// `%26` / `%3D` cannot smuggle extra pairs. Encoded structural octets inside a
+/// *value* (`%2f`, `%3f`, `%23`) are decoded: they are payload, not URI
+/// delimiters. Path canonicalization (which refuses encoded `/`) is not used.
+/// The original request bytes are not modified.
+pub(super) struct CanonicalQueryViews<'a> {
+    primary: Cow<'a, str>,
+    variants: Vec<String>,
+}
+
+impl CanonicalQueryViews<'_> {
+    pub(super) fn iter(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.primary.as_ref()).chain(self.variants.iter().map(String::as_str))
+    }
+}
+
+/// Bounded query-component normalization shared by query-value rules and the
+/// FullUrl `path_traversal` / `lfi` classes.
+///
+/// `primary` is one percent-decode plus `+`→space (the historical query-value
+/// view). Additional views are the same layered decode used for body XSS,
+/// capped at [`MAX_DECODE_ROUNDS`], so `%252f` reduces to `/` while a stack
+/// deeper than the cap is not fully peeled. Variants identical to `primary`
+/// are dropped to avoid duplicate scans.
+pub(super) fn canonical_query_component_views(raw: &str) -> CanonicalQueryViews<'_> {
+    let primary = percent_decode_plus(raw);
+    let (mut variants, _) = decoded_variants_with_residual(raw);
+    variants.retain(|variant| variant != primary.as_ref());
+    CanonicalQueryViews { primary, variants }
 }
 
 fn has_decodable_marker(text: &str) -> bool {

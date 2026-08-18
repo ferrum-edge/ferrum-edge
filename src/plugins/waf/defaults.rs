@@ -26,6 +26,8 @@ pub fn default_rules() -> Vec<WafRule> {
         r("FE-XSS-003", "HTML event handler", "xss", Severity::Medium, RuleTarget::BodyText, EVENT_HANDLER),
         r("FE-XSS-004", "Iframe srcdoc payload", "xss", Severity::High, RuleTarget::BodyText, r"(?i)<\s*iframe\b[^>]*\bsrcdoc\s*="),
         r("FE-XSS-005", "HTML data URL", "xss", Severity::Medium, RuleTarget::QueryValues, r"(?i)data\s*:\s*text/html"),
+        // FullUrl PATHTRAV/LFI also compile into `canonical_query_values` so
+        // query payload is matched after bounded percent-decode of `%2f`.
         r("FE-PATHTRAV-001", "Dot-dot path traversal", "path_traversal", Severity::High, RuleTarget::FullUrl, r"(?:\.\./|\.\.\\)"),
         r("FE-PATHTRAV-002", "Encoded path traversal", "path_traversal", Severity::High, RuleTarget::FullUrl, r"(?i)%25?2e%25?2e(?:%25?2f|%25?5c|/|\\)"),
         r("FE-PATHTRAV-003", "Encoded null byte", "path_traversal", Severity::Medium, RuleTarget::FullUrl, r"(?i)%00"),

@@ -1879,6 +1879,258 @@ async fn plus_encoded_query_space_is_detected_by_query_value_rules() {
     );
 }
 
+fn pathtrav_lfi_enforced_waf() -> Waf {
+    Waf::new(&json!({
+        "mode": "enforce",
+        "rule_modes": {
+            "FE-PATHTRAV-001": "enforce",
+            "FE-PATHTRAV-002": "enforce",
+            "FE-LFI-001": "enforce"
+        }
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn query_encoded_slash_cannot_bypass_path_traversal_or_lfi() {
+    // PATHTRAV/LFI target FullUrl and historically scanned the raw query, so
+    // `%2e` could still match the encoded-dot rule while `%2f` never became
+    // `/`. Canonical query-value views decode `%2f` (unlike path canonicalization)
+    // before those rule classes run.
+    let plugin = pathtrav_lfi_enforced_waf();
+
+    struct Case {
+        query: &'static str,
+        expect_pathtrav: bool,
+        expect_lfi: bool,
+    }
+
+    let cases = [
+        Case {
+            query: "file=../../../etc/passwd",
+            expect_pathtrav: true,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=/etc/passwd",
+            expect_pathtrav: false,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=..%2f..%2f..%2fetc/passwd",
+            expect_pathtrav: true,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=..%2F..%2F..%2Fetc/passwd",
+            expect_pathtrav: true,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=..%2fetc%2Fpasswd",
+            expect_pathtrav: true,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=%2e%2e/%2e%2e/%2e%2e/etc/passwd",
+            expect_pathtrav: true,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=%2E%2E%2F%2E%2E%2F%2E%2E%2Fetc%2Fpasswd",
+            expect_pathtrav: true,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=%2e%2e%2fetc%2fpasswd",
+            expect_pathtrav: true,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=%2e%2E%2fetc%2Fpasswd",
+            expect_pathtrav: true,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=%2Fetc%2Fpasswd",
+            expect_pathtrav: false,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=%2fetc%2fpasswd",
+            expect_pathtrav: false,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=%252e%252e%252fetc%252fpasswd",
+            expect_pathtrav: true,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=%252Fetc%252Fpasswd",
+            expect_pathtrav: false,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=%252fetc%252fpasswd",
+            expect_pathtrav: false,
+            expect_lfi: true,
+        },
+        Case {
+            query: "file=%25252Fetc%25252Fpasswd",
+            expect_pathtrav: false,
+            expect_lfi: true,
+        },
+    ];
+
+    for case in cases {
+        let mut req = ctx("GET", "/w/rec");
+        req.set_raw_query_string(case.query.into());
+
+        let result = plugin.authorize(&mut req).await;
+        match result {
+            PluginResult::Reject { status_code, .. } => {
+                assert_eq!(status_code, 403, "status for {}", case.query)
+            }
+            other => panic!("expected reject for {}, got {other:?}", case.query),
+        }
+        if case.expect_pathtrav {
+            assert!(
+                monitored(&req, "FE-PATHTRAV-001") || monitored(&req, "FE-PATHTRAV-002"),
+                "expected PATHTRAV hit for {}, hits={:?}",
+                case.query,
+                req.metadata.get("waf.rule_hits")
+            );
+        } else {
+            assert!(
+                !monitored(&req, "FE-PATHTRAV-001") && !monitored(&req, "FE-PATHTRAV-002"),
+                "unexpected PATHTRAV hit for {}, hits={:?}",
+                case.query,
+                req.metadata.get("waf.rule_hits")
+            );
+        }
+        if case.expect_lfi {
+            assert!(
+                monitored(&req, "FE-LFI-001"),
+                "expected LFI hit for {}, hits={:?}",
+                case.query,
+                req.metadata.get("waf.rule_hits")
+            );
+        }
+        assert_eq!(
+            req.raw_query_string(),
+            Some(case.query),
+            "inspection must not rewrite forwarded query bytes"
+        );
+    }
+}
+
+#[tokio::test]
+async fn query_malformed_percent_plus_and_benign_literals_are_not_traversal() {
+    let plugin = pathtrav_lfi_enforced_waf();
+    for query in [
+        "file=..%2",
+        "file=..%2Getc",
+        "file=..%zz",
+        "q=100% sure",
+        "q=SAVE50%25",
+        "q=hello+world",
+        "file=%2fhome%2fuser",
+        "q=%2f",
+        // Four percent layers is past the documented 3-round cap, so LFI must
+        // not see `/etc/passwd` (and PATHTRAV must not be synthesized either).
+        "file=%2525252Fetc%2525252Fpasswd",
+    ] {
+        let mut req = ctx("GET", "/w/rec");
+        req.set_raw_query_string(query.into());
+        let result = plugin.authorize(&mut req).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "expected continue for {query}, got {result:?}"
+        );
+        assert!(
+            !monitored(&req, "FE-PATHTRAV-001")
+                && !monitored(&req, "FE-PATHTRAV-002")
+                && !monitored(&req, "FE-LFI-001"),
+            "benign/malformed query {query} must not hit PATHTRAV/LFI, hits={:?}",
+            req.metadata.get("waf.rule_hits")
+        );
+        assert_eq!(req.raw_query_string(), Some(query));
+    }
+}
+
+#[tokio::test]
+async fn query_xss_percent_decode_is_unchanged() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "rule_modes": { "FE-XSS-001": "enforce" }
+    }))
+    .unwrap();
+    let mut req = ctx("GET", "/search");
+    req.set_raw_query_string("q=%3Cscript%3Ealert(1)%3C/script%3E".into());
+
+    let result = plugin.authorize(&mut req).await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("expected XSS reject, got {other:?}"),
+    }
+    assert_eq!(
+        req.metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-XSS-001")
+    );
+}
+
+#[tokio::test]
+async fn encoded_ampersand_does_not_smuggle_an_extra_query_key() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "mode": "enforce",
+        "custom_rules": [{
+            "id": "CUSTOM-SMUGGLE-KEY",
+            "name": "smuggled key",
+            "category": "custom",
+            "severity": "high",
+            "target": "query_keys",
+            "pattern": "^smuggled$",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+
+    let mut smuggled = ctx("GET", "/search");
+    smuggled.set_raw_query_string("q=ok%26smuggled=1".into());
+    let result = plugin.authorize(&mut smuggled).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "encoded '&' inside a value must not become a second pair, got {result:?}"
+    );
+
+    let mut real = ctx("GET", "/search");
+    real.set_raw_query_string("smuggled=1".into());
+    let result = plugin.authorize(&mut real).await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("literal smuggled key must still match, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn h3_style_raw_query_params_still_decode_slash_for_lfi() {
+    let plugin = pathtrav_lfi_enforced_waf();
+    let mut req = ctx("GET", "/w/rec");
+    req.query_params
+        .insert("file".into(), "%2Fetc%2Fpasswd".into());
+
+    let result = plugin.authorize(&mut req).await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("expected LFI reject on raw materialized value, got {other:?}"),
+    }
+    assert!(monitored(&req, "FE-LFI-001"));
+}
+
 #[tokio::test]
 async fn disabled_default_rules_are_skipped() {
     let plugin = Waf::new(&json!({
