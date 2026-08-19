@@ -4551,7 +4551,7 @@ representations explicitly outside the configured response-body scan scope.
 | `category` | string | required | Category label, such as `sqli`, `xss`, or `custom`. |
 | `severity` | string | `medium` | `info`, `low`, `medium`, `high`, or `critical`. |
 | `target` | string/object | required | Scan target. Strings cover every target except `body_json_path` (object-only). Object form uses `type`; optional non-empty `names` only for `header_values`/`request_headers`; required non-empty `path` only for `body_json_path`. Aliases `request_headers`, `request_query`, `request_path`, `request_url`, `request_method`, and `request_body` are accepted. |
-| `match_kind` | string | `regex` | `regex`, `literal`, `contains`, `equals`, `luhn`, or `cidr`. `literal` is a case-sensitive substring; `contains` is the case-insensitive substring form; `equals` is a case-insensitive full-value match. For folding with `regex`, write `(?i)…` explicitly. |
+| `match_kind` | string | `regex` | `regex`, `literal`, `contains`, `equals`, `luhn`, or `cidr`. `literal` and `contains` are case-insensitive substrings; `equals` is a case-insensitive full-value match. For folding with `regex`, write `(?i)…` explicitly. |
 | `pattern` | string | `""` | Pattern text. Required except for `luhn` rules. CIDR rules accept an IP or CIDR range. |
 | `action` | string | global default | `enforce`, `monitor`, or `disabled`. |
 | `score` | integer | severity weight | Anomaly-score contribution when `scoring` is enabled. |

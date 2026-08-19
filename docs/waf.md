@@ -181,8 +181,8 @@ Semantics:
 | Kind | Matching |
 | --- | --- |
 | `regex` | Operator-authored Rust regex. Case sensitivity follows the pattern; use `(?i)…` when you need folding. |
-| `literal` | Case-sensitive Unicode substring. `EVIL-LITERAL` does not match `evil-literal`; the value need not equal the whole field (unlike `equals`). |
-| `contains` | Case-insensitive substring (same substring semantics as `literal`, but folded). |
+| `literal` | Case-insensitive substring. Metacharacters are escaped, so the pattern is always matched as literal text. |
+| `contains` | Case-insensitive substring (equivalent matching semantics to `literal`). |
 | `equals` | Case-insensitive full-value match (anchored; does not prefix-match). |
 | `luhn` | Valid credit-card Luhn checksum on digit runs (body targets only). |
 | `cidr` | IP membership test. |

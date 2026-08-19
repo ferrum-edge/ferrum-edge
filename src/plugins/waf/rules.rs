@@ -873,7 +873,7 @@ impl PatternBuilder {
 fn rule_pattern(rule: &WafRule) -> String {
     match rule.match_kind {
         MatchKind::Regex => rule.pattern.clone(),
-        MatchKind::Literal => regex::escape(&rule.pattern),
+        MatchKind::Literal => format!("(?i){}", regex::escape(&rule.pattern)),
         MatchKind::Contains => format!("(?i){}", regex::escape(&rule.pattern)),
         MatchKind::Equals => format!("(?i)^{}$", regex::escape(&rule.pattern)),
         MatchKind::Luhn | MatchKind::Cidr => unreachable!("non-regex rule handled separately"),
