@@ -1,0 +1,32 @@
+last=/r4 -> 200 echo=200 alive=True
+log=
+{"timestamp":"2026-08-20T08:02:49.605512Z","level":"INFO","fields":{"message":"Stopping stream listener","listener_key":"ferrum|tcp-echo","port":21003,"scheme":"tcp"},"target":"ferrum_edge::proxy::stream_listener"}
+{"timestamp":"2026-08-20T08:02:49.605572Z","level":"INFO","fields":{"message":"DNS warmup complete"},"target":"ferrum_edge::dns"}
+{"timestamp":"2026-08-20T08:02:49.605580Z","level":"INFO","fields":{"message":"TCP proxy listener shutting down on port 21003","proxy_id":"tcp-echo","accept_loop":1},"target":"ferrum_edge::proxy::tcp_proxy"}
+{"timestamp":"2026-08-20T08:02:49.606037Z","level":"INFO","fields":{"message":"TCP proxy listener shutting down on port 21003","proxy_id":"tcp-echo","accept_loop":2},"target":"ferrum_edge::proxy::tcp_proxy"}
+{"timestamp":"2026-08-20T08:02:49.606110Z","level":"INFO","fields":{"message":"TCP proxy listener shutting down on port 21003","proxy_id":"tcp-echo","accept_loop":3},"target":"ferrum_edge::proxy::tcp_proxy"}
+{"timestamp":"2026-08-20T08:02:49.606128Z","level":"INFO","fields":{"message":"TCP proxy listener shutting down on port 21003","proxy_id":"tcp-echo","accept_loop":0},"target":"ferrum_edge::proxy::tcp_proxy"}
+{"timestamp":"2026-08-20T08:02:49.606264Z","level":"INFO","fields":{"message":"Stopped stream listener","listener_key":"ferrum|tcp-echo","port":21003,"scheme":"tcp"},"target":"ferrum_edge::proxy::stream_listener"}
+{"timestamp":"2026-08-20T08:02:49.606695Z","level":"INFO","fields":{"message":"Backend capability refresh complete: 1 backends classified (h2_tls=0, h3=0, h2c=0, hbone=0), 0 probe results discarded in favor of newer live state"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:50.747099Z","level":"INFO","fields":{"message":"SIGHUP received, reloading configuration..."},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-20T08:02:50.747268Z","level":"INFO","fields":{"message":"Reloading configuration from file: /tmp/agent01-9xkfat51/reload.yaml"},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-20T08:02:50.747351Z","level":"WARN","fields":{"message":"Config file /tmp/agent01-9xkfat51/reload.yaml is world-readable (mode 644). Consider restricting permissions as it may contain credentials."},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-20T08:02:50.767539Z","level":"WARN","fields":{"message":"Configuration file read was unstable; retrying","attempt":1,"max_attempts":5,"path":"/tmp/agent01-9xkfat51/reload.yaml","source":"configuration file","reason":"file identity changed between consecutive stable-read probes"},"target":"ferrum_edge::config::stable_file"}
+{"timestamp":"2026-08-20T08:02:50.807887Z","level":"INFO","fields":{"message":"Configuration file stabilized after retry","attempt":2,"path":"/tmp/agent01-9xkfat51/reload.yaml","source":"configuration file"},"target":"ferrum_edge::config::stable_file"}
+{"timestamp":"2026-08-20T08:02:50.807959Z","level":"INFO","fields":{"message":"Loading YAML configuration from /tmp/agent01-9xkfat51/reload.yaml"},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-20T08:02:50.856697Z","level":"INFO","fields":{"message":"Configuration loaded (version 1): 2 proxies, 0 consumers, 0 plugin configs"},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-20T08:02:50.858427Z","level":"INFO","fields":{"message":"Config updated incrementally: 3 changes (proxies: +1 -1 ~1, consumers: +0 -0 ~0, plugins: +0 -0 ~0, plugin associations: ~0, upstreams: +0 -0 ~0, 2 proxy plugin lists rebuilt)"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:50.858513Z","level":"INFO","fields":{"message":"Configuration reloaded successfully"},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-20T08:02:50.858538Z","level":"INFO","fields":{"message":"SIGHUP received, reloading configuration..."},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-20T08:02:50.858651Z","level":"INFO","fields":{"message":"DNS warmup: resolving 1 unique hostnames (2 before dedup, concurrency=500)"},"target":"ferrum_edge::dns"}
+{"timestamp":"2026-08-20T08:02:50.858771Z","level":"INFO","fields":{"message":"DNS warmup complete"},"target":"ferrum_edge::dns"}
+{"timestamp":"2026-08-20T08:02:50.858824Z","level":"INFO","fields":{"message":"Reloading configuration from file: /tmp/agent01-9xkfat51/reload.yaml"},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-20T08:02:50.858851Z","level":"WARN","fields":{"message":"Config file /tmp/agent01-9xkfat51/reload.yaml is world-readable (mode 644). Consider restricting permissions as it may contain credentials."},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-20T08:02:50.859733Z","level":"INFO","fields":{"message":"Backend capability refresh complete: 1 backends classified (h2_tls=0, h3=0, h2c=0, hbone=0), 0 probe results discarded in favor of newer live state"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:50.879038Z","level":"INFO","fields":{"message":"Loading YAML configuration from /tmp/agent01-9xkfat51/reload.yaml"},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-20T08:02:50.927038Z","level":"INFO","fields":{"message":"Configuration loaded (version 1): 2 proxies, 0 consumers, 0 plugin configs"},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-20T08:02:50.928451Z","level":"INFO","fields":{"message":"Config updated incrementally: 2 changes (proxies: +0 -0 ~2, consumers: +0 -0 ~0, plugins: +0 -0 ~0, plugin associations: ~0, upstreams: +0 -0 ~0, 2 proxy plugin lists rebuilt)"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:50.928513Z","level":"INFO","fields":{"message":"Configuration reloaded successfully"},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-20T08:02:50.928628Z","level":"INFO","fields":{"message":"DNS warmup: resolving 1 unique hostnames (2 before dedup, concurrency=500)"},"target":"ferrum_edge::dns"}
+{"timestamp":"2026-08-20T08:02:50.928740Z","level":"INFO","fields":{"message":"DNS warmup complete"},"target":"ferrum_edge::dns"}
+{"timestamp":"2026-08-20T08:02:50.929694Z","level":"INFO","fields":{"message":"Backend capability refresh complete: 1 backends classified (h2_tls=0, h3=0, h2c=0, hbone=0), 0 probe results discarded in favor of newer live state"},"target":"ferrum_edge::proxy"}

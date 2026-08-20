@@ -1,0 +1,17 @@
+Isolated reproduction of `ferrum-edge reload --pid 0` on
+f4b62fe7d4620d81c836d6418f2957269ac6e115 (linux x86_64).
+
+Command:
+  setsid /workspace/target/debug/ferrum-edge reload --pid 0
+
+Observed:
+  bash: Hangup
+  process exit 129 (128 + SIGHUP)
+
+Root cause:
+  src/cli.rs execute_reload runs `kill -HUP <pid>` with no lower bound.
+  POSIX/Linux `kill -HUP 0` means "signal my process group", not "PID 0".
+  clap accepts u32 so 0 is a legal --pid.
+
+Expected:
+  reject pid 0 (and other non-positive / special PIDs) with a diagnostic.

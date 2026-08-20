@@ -1,0 +1,7 @@
+exit=2
+
+error: unrecognized subcommand 'nosuch'
+
+Usage: ferrum-edge [COMMAND]
+
+For more information, try '--help'.

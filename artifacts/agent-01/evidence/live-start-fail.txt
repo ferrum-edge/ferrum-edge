@@ -1,0 +1,9 @@
+{"timestamp":"2026-08-20T07:57:36.766210Z","level":"INFO","fields":{"message":"Ferrum Edge v0.9.0 (x86_64-unknown-linux-gnu) starting..."},"target":"ferrum_edge"}
+{"timestamp":"2026-08-20T07:57:36.767756Z","level":"INFO","fields":{"message":"Operating mode: File"},"target":"ferrum_edge"}
+{"timestamp":"2026-08-20T07:57:36.767833Z","level":"INFO","fields":{"message":"Proxy bind address: 127.0.0.1, Admin bind address: 127.0.0.1"},"target":"ferrum_edge"}
+{"timestamp":"2026-08-20T07:57:36.768991Z","level":"INFO","fields":{"message":"Starting in file mode with log level: info"},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-20T07:57:36.769099Z","level":"INFO","fields":{"message":"Custom HTTPS port configured: 0"},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-20T07:57:36.769130Z","level":"INFO","fields":{"message":"Custom admin HTTPS port configured: 0"},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-20T07:57:36.769516Z","level":"WARN","fields":{"message":"Config file /tmp/agent01-5uf913tl/live.yaml is world-readable (mode 644). Consider restricting permissions as it may contain credentials."},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-20T07:57:36.789989Z","level":"INFO","fields":{"message":"Loading YAML configuration from /tmp/agent01-5uf913tl/live.yaml"},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-20T07:57:36.790889Z","level":"ERROR","fields":{"message":"Fatal error: unknown variant `none`, expected `single` or `multi`"},"target":"ferrum_edge"}

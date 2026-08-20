@@ -1,0 +1,9 @@
+Correct hand-authored operations (path_template + request_required, no api_spec_id).
+
+Command: ferrum-edge validate -m file -c /tmp/oas3.yaml
+Tested SHA product pin: f4b62fe7d4620d81c836d6418f2957269ac6e115
+Result: exit 0, Validation passed, Plugin configs: 1
+
+Confirms #4037: file-mode admits openapi_validator without proxy.api_spec_id.
+docs/openapi_validator.md L305 on main still says Admin-style api_spec_id is required.
+PR #4066 (unmerged) rewrites that sentence.

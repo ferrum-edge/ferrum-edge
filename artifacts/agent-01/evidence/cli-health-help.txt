@@ -1,0 +1,13 @@
+exit=0
+Check if the gateway is healthy (for Docker HEALTHCHECK in distroless images)
+
+Usage: ferrum-edge health [OPTIONS]
+
+Options:
+  -p, --port <PORT>    Admin API port to check (defaults to FERRUM_ADMIN_HTTP_PORT, or FERRUM_ADMIN_HTTPS_PORT when --tls is set, or 9000/9443 respectively)
+      --host <HOST>    Admin API host to connect to [default: 127.0.0.1]
+      --tls            Use TLS (HTTPS) to connect to the admin API. Required when the plaintext admin HTTP listener is disabled (FERRUM_ADMIN_HTTP_PORT=0)
+      --tls-no-verify  Skip TLS certificate verification (for self-signed certs / testing only)
+      --live           Probe liveness (GET /live) instead of readiness (GET /health). `/live` returns 200 whenever the process and admin listener are up — even during startup or while serving degraded — so a Kubernetes livenessProbe won't restart-loop an alive-but-unready pod. Without this flag the check hits `/health`, which returns 503 until the gateway is ready
+  -h, --help           Print help
+

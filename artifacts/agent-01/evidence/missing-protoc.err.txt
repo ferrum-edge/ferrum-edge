@@ -1,0 +1,50 @@
+   Compiling ferrum-edge v0.9.0 (/workspace)
+warning: unused import: `ready`
+ --> vendor/reqwest-0.13.3-ferrum-patched/src/async_impl/client.rs:7:17
+  |
+7 | use std::task::{ready, Context, Poll};
+  |                 ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `timeout::TimeoutLayer`
+  --> vendor/reqwest-0.13.3-ferrum-patched/src/connect.rs:14:13
+   |
+14 | use tower::{timeout::TimeoutLayer, util::BoxCloneSyncService, ServiceBuilder};
+   |             ^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `connect_timeout` is never read
+   --> vendor/reqwest-0.13.3-ferrum-patched/src/connect.rs:675:5
+    |
+668 | pub(crate) struct ConnectorService {
+    |                   ---------------- field in this struct
+...
+675 |     connect_timeout: Option<Duration>,
+    |     ^^^^^^^^^^^^^^^
+    |
+    = note: `ConnectorService` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `request_connect_timeout` is never used
+   --> vendor/reqwest-0.13.3-ferrum-patched/src/connect.rs:725:8
+    |
+724 | impl ConnectorService {
+    | --------------------- method in this implementation
+725 |     fn request_connect_timeout(&self) -> Option<Duration> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `reqwest` (lib) generated 4 warnings (run `cargo fix --lib -p reqwest` to apply 2 suggestions)
+error: failed to run custom build command for `ferrum-edge v0.9.0 (/workspace)`
+
+Caused by:
+  process didn't exit successfully: `/workspace/target/debug/build/ferrum-edge-47585dd333c89fc8/build-script-build` (exit status: 1)
+  --- stdout
+  cargo:rerun-if-changed=proto/ferrum.proto
+  cargo:rerun-if-changed=proto/envoy/service/discovery/v3/discovery.proto
+  cargo:rerun-if-changed=proto/envoy/service/runtime/v3/rtds.proto
+  cargo:rerun-if-changed=proto/envoy/stock/v3/stock_xds.proto
+  cargo:rerun-if-changed=proto/health.proto
+  cargo:rerun-if-changed=proto/workload_api.proto
+
+  --- stderr
+  Error: Custom { kind: NotFound, error: "Could not find `protoc`. If `protoc` is installed, try setting the `PROTOC` environment variable to the path of the `protoc` binary. To install it on Debian, run `apt-get install protobuf-compiler`. It is also available at https://github.com/protocolbuffers/protobuf/releases  For more information: https://docs.rs/prost-build/#sourcing-protoc" }

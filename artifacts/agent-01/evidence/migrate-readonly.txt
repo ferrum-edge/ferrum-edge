@@ -1,0 +1,7 @@
+exit=0
+Config file: /tmp/agent01-5uf913tl/mig-ro.yaml
+Current version: 1
+Target version: 1
+
+Config file is already at the current version. No migration needed.
+

@@ -1,0 +1,2 @@
+got=b'tcp-ping\n'
+backend_hits=1

@@ -25,6 +25,10 @@ cargo --config 'build.rustc-wrapper=""' build --release --bin ferrum-edge -j 1
 ```bash
 export FERRUM_EDGE_BIN=/workspace/target/debug/ferrum-edge
 python3 artifacts/agent-01/harness/run_matrix.py
+# leftover rows after R06 (never run `reload --pid 0` in-process — it SIGHUPs the group):
+python3 artifacts/agent-01/harness/finish_rows.py
 ```
 
 Evidence lands under `artifacts/agent-01/evidence/`.
+Do **not** set `auth_mode: none` (only `single`/`multi`; omit to default `single`).
+`GatewayConfig` requires `plugin_configs` (use `[]`).

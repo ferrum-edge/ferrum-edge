@@ -1,0 +1,4 @@
+exit=1
+
+kill: (999999): No such process
+{"timestamp":"2026-08-20T08:02:52.291121248+00:00","level":"ERROR","target":"ferrum_edge::bootstrap","message":"admin CLI reload failed","command":"reload","error":"Failed to send SIGHUP to PID 999999"}

@@ -1,0 +1,42 @@
+rc=0 closed=True
+log=
+{"timestamp":"2026-08-20T08:02:45.460725Z","level":"INFO","fields":{"message":"TCP_FASTOPEN auto-detection","enabled":false,"config":"auto"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:45.460975Z","level":"INFO","fields":{"message":"kTLS auto-detection: disabled","config":"auto"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:45.461432Z","level":"INFO","fields":{"message":"io_uring splice auto-detection: enabled (IORING_OP_SPLICE probe passed)"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:45.461571Z","level":"INFO","fields":{"message":"UDP GRO auto-detection (reserved, not active)","enabled":true,"config":"auto"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:45.461599Z","level":"INFO","fields":{"message":"UDP GSO auto-detection: enabled (setsockopt probe passed)"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:45.461628Z","level":"INFO","fields":{"message":"UDP IP_PKTINFO auto-detection: enabled (setsockopt probe passed)"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:45.461916Z","level":"INFO","fields":{"message":"DNS warmup: resolving 1 unique hostnames (2 before dedup, concurrency=500)"},"target":"ferrum_edge::dns"}
+{"timestamp":"2026-08-20T08:02:45.462050Z","level":"INFO","fields":{"message":"DNS warmup complete"},"target":"ferrum_edge::dns"}
+{"timestamp":"2026-08-20T08:02:45.462032Z","level":"INFO","fields":{"message":"TLS material source set changed; refreshed dynamic watcher inputs","surface":"backend_tls","source_count":0},"target":"ferrum_edge::tls::source::subscription"}
+{"timestamp":"2026-08-20T08:02:45.462310Z","level":"INFO","fields":{"message":"Overload monitor started (interval=1000ms, fd_limit=524288, max_conn=100000, max_req=0)"},"target":"ferrum_edge::overload"}
+{"timestamp":"2026-08-20T08:02:45.462377Z","level":"INFO","fields":{"message":"TLS not configured - HTTPS listener disabled"},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-20T08:02:45.462804Z","level":"INFO","fields":{"message":"Starting admin HTTP listener on 127.0.0.1:21031"},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-20T08:02:45.462913Z","level":"INFO","fields":{"message":"Admin API listener started on 127.0.0.1:21031"},"target":"ferrum_edge::admin"}
+{"timestamp":"2026-08-20T08:02:45.463057Z","level":"INFO","fields":{"message":"Starting HTTP proxy listener on 127.0.0.1:21030"},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-20T08:02:45.463089Z","level":"INFO","fields":{"message":"Started stream listener","listener_key":"ferrum|tcp-echo","namespace":"ferrum","proxy_id":"tcp-echo","port":21003,"scheme":"tcp"},"target":"ferrum_edge::proxy::stream_listener"}
+{"timestamp":"2026-08-20T08:02:45.463142Z","level":"INFO","fields":{"message":"Connection limit: 100000 max concurrent connections"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:45.463189Z","level":"INFO","fields":{"message":"Proxy listener started on 127.0.0.1:21030 (backlog=2048, accept_threads=4)"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:45.463401Z","level":"INFO","fields":{"message":"TCP proxy listener started on 127.0.0.1:21003","proxy_id":"tcp-echo","backlog":2048,"accept_threads":4},"target":"ferrum_edge::proxy::tcp_proxy"}
+{"timestamp":"2026-08-20T08:02:45.463521Z","level":"WARN","fields":{"message":"gRPC: all DNS candidates failed protocol establishment for backend 127.0.0.1 (last=127.0.0.1:21002): Connection failed: Connection refused (os error 111)"},"target":"ferrum_edge::proxy::grpc_proxy"}
+{"timestamp":"2026-08-20T08:02:45.463673Z","level":"INFO","fields":{"message":"Backend capability refresh complete: 1 backends classified (h2_tls=0, h3=0, h2c=0, hbone=0), 0 probe results discarded in favor of newer live state"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:45.473927Z","level":"INFO","fields":{"message":"Gateway startup complete; /health now reports ready"},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-20T08:02:45.585814Z","level":"ERROR","fields":{"message":"Backend request failed","proxy_id":"http-echo","backend_url":"http://127.0.0.1:21002/rebind","error_kind":"connect_failure","error":"error sending request for url (http://127.0.0.1:21002/rebind)"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:45.588956Z","level":"INFO","fields":{"message":"SIGINT received, initiating graceful shutdown..."},"target":"ferrum_edge"}
+{"timestamp":"2026-08-20T08:02:45.589063Z","level":"INFO","fields":{"message":"Proxy listener shutting down"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:45.589115Z","level":"INFO","fields":{"message":"Proxy listener shutting down"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:45.589142Z","level":"INFO","fields":{"message":"DNS failed retry task shutting down"},"target":"ferrum_edge::dns"}
+{"timestamp":"2026-08-20T08:02:45.589193Z","level":"INFO","fields":{"message":"TCP proxy listener shutting down on port 21003 (global SIGTERM)","proxy_id":"tcp-echo","accept_loop":2},"target":"ferrum_edge::proxy::tcp_proxy"}
+{"timestamp":"2026-08-20T08:02:45.589207Z","level":"INFO","fields":{"message":"Proxy listener shutting down"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:45.589185Z","level":"INFO","fields":{"message":"Proxy listener shutting down"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:45.589259Z","level":"INFO","fields":{"message":"TCP proxy listener shutting down on port 21003 (global SIGTERM)","proxy_id":"tcp-echo","accept_loop":1},"target":"ferrum_edge::proxy::tcp_proxy"}
+{"timestamp":"2026-08-20T08:02:45.589268Z","level":"INFO","fields":{"message":"TCP proxy listener shutting down on port 21003 (global SIGTERM)","proxy_id":"tcp-echo","accept_loop":0},"target":"ferrum_edge::proxy::tcp_proxy"}
+{"timestamp":"2026-08-20T08:02:45.589300Z","level":"INFO","fields":{"message":"SIGHUP listener shutting down"},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-20T08:02:45.589325Z","level":"INFO","fields":{"message":"TCP proxy listener shutting down on port 21003 (global SIGTERM)","proxy_id":"tcp-echo","accept_loop":3},"target":"ferrum_edge::proxy::tcp_proxy"}
+{"timestamp":"2026-08-20T08:02:45.589371Z","level":"INFO","fields":{"message":"DNS background refresh shutting down"},"target":"ferrum_edge::dns"}
+{"timestamp":"2026-08-20T08:02:45.589392Z","level":"INFO","fields":{"message":"Admin API listener shutting down"},"target":"ferrum_edge::admin"}
+{"timestamp":"2026-08-20T08:02:45.589072Z","level":"ERROR","fields":{"message":"HTTP connection error","remote_addr":"127.0.0.1:53346","listen_port":21030,"tls":false,"error":"Cancelled"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:45.589491Z","level":"INFO","fields":{"message":"Shutting down stream listener","listener_key":"ferrum|tcp-echo","port":21003},"target":"ferrum_edge::proxy::stream_listener"}
+{"timestamp":"2026-08-20T08:02:45.589540Z","level":"INFO","fields":{"message":"No active connections or requests to drain","phase":"drain"},"target":"ferrum_edge::overload"}
+{"timestamp":"2026-08-20T08:02:45.589944Z","level":"INFO","fields":{"message":"Service discovery: all tasks stopped"},"target":"ferrum_edge::service_discovery"}
+{"timestamp":"2026-08-20T08:02:45.590311Z","level":"INFO","fields":{"message":"Ferrum Edge shut down cleanly"},"target":"ferrum_edge"}

@@ -1,0 +1,33 @@
+exit=0
+Retire Ambient UDP predecessor placements on this node and publish the node-scoped cleanup proof the steady-state host producer requires.
+
+Runs as a privileged INIT CONTAINER in the Ambient DaemonSet's own pod, beside its unprivileged steady-state container (issue #3809). Same-pod placement is the point: Kubernetes orders an init container before the app container, and orders nothing at all between two DaemonSets, so this is what guarantees the steady-state producer cannot read a leftover identity/proof pair a same-boot, same-name Node recreation left on the shared registry hostPath. A node with no durable placement record cannot tell a fresh/rebooted node from a pre-contract node whose running workloads still redirect UDP to a retired listener, so it proves the distinction by doing the retirement rather than by trusting release-level desired state. Exits non-zero without publishing anything when it cannot prove completion, which keeps the whole pod non-running.
+
+It takes no pod-scoped `hostPID` for that: `--host-proc-root` points its TARGET-pid reads at a read-only host `/proc` mount declared on this container alone, so the long-running proxy beside it stays out of the host PID namespace. `SYS_ADMIN`/`SYS_PTRACE` are likewise init-only.
+
+Usage: ferrum-edge ambient-udp-preflight [OPTIONS]
+
+Options:
+  -s, --settings <SETTINGS>
+          Path to ferrum.conf (operational settings)
+
+      --timeout-seconds <TIMEOUT_SECONDS>
+          Maximum seconds to spend proving predecessor retirement before failing closed. The init stage must fail rather than block pod creation forever
+          
+          [default: 300]
+
+      --host-proc-root <HOST_PROC_ROOT>
+          Procfs root to resolve TARGET pids through (default: this process's own `/proc`).
+          
+          This is what lets the preflight stay an init container in the ambient pod — preserving Kubernetes' init-before-container ordering against the steady-state proxy — WITHOUT pod-scoped `hostPID`, which Kubernetes would apply to the long-running proxy container for its whole lifetime. The chart mounts the host's own `/proc` read-only on this container alone and points this flag at it.
+          
+          It redirects nothing else. `/proc/self/ns/net` — the caller's own namespace identity and the `setns` save/restore handle — always comes from this container's own procfs, because the preflight runs in the host network namespace already and must compare pod namespaces against ITS OWN.
+          
+          Deliberately a flag and not a `FERRUM_*` variable: it is an internal contract between one chart-rendered mount and one chart-rendered argument, not an operator-tunable runtime setting, and the ambient env map is copied verbatim into this container.
+
+  -v, --verbose...
+          Increase log verbosity (-v=info, -vv=debug, -vvv=trace)
+
+  -h, --help
+          Print help (see a summary with '-h')
+

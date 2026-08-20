@@ -1,0 +1,9 @@
+exit=1
+---stdout---
+Settings (ferrum.conf): OK
+  Mode: File
+{"timestamp":"2026-08-20T08:02:26.346763Z","level":"INFO","fields":{"message":"Loading YAML configuration from /tmp/agent01-9xkfat51/N10.yaml"},"target":"ferrum_edge::config::file_loader"}
+
+---stderr---
+{"timestamp":"2026-08-20T08:02:26.326453Z","level":"WARN","fields":{"message":"Config file /tmp/agent01-9xkfat51/N10.yaml is world-readable (mode 644). Consider restricting permissions as it may contain credentials."},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-20T08:02:26.347132Z","level":"ERROR","fields":{"message":"Validation error: Spec validation failed: Configuration file missing required 'version' field"},"target":"ferrum_edge"}

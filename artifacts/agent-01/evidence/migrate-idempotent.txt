@@ -1,0 +1,12 @@
+exit=0
+{"timestamp":"2026-08-20T08:01:00.079599Z","level":"INFO","fields":{"message":"Ferrum Edge v0.9.0 (x86_64-unknown-linux-gnu) starting..."},"target":"ferrum_edge"}
+{"timestamp":"2026-08-20T08:01:00.080780Z","level":"INFO","fields":{"message":"Operating mode: Migrate"},"target":"ferrum_edge"}
+{"timestamp":"2026-08-20T08:01:00.080838Z","level":"INFO","fields":{"message":"Proxy bind address: 0.0.0.0, Admin bind address: 127.0.0.1"},"target":"ferrum_edge"}
+{"timestamp":"2026-08-20T08:01:00.080927Z","level":"INFO","fields":{"message":"IPv6 dual-stack support detected. To accept both IPv4 and IPv6 connections, set FERRUM_PROXY_BIND_ADDRESS=:: and/or FERRUM_ADMIN_BIND_ADDRESS=:: (dual-stack binds to [::] and accepts IPv4 via mapped addresses on most OSes)"},"target":"ferrum_edge"}
+Config file: /tmp/agent01-5uf913tl/mig-current.yaml
+Current version: 1
+Target version: 1
+
+Config file is already at the current version. No migration needed.
+{"timestamp":"2026-08-20T08:01:00.102759Z","level":"INFO","fields":{"message":"Ferrum Edge shut down cleanly"},"target":"ferrum_edge"}
+

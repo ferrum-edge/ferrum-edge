@@ -1,0 +1,10 @@
+exit=1
+---stdout---
+Settings (ferrum.conf): OK
+  Mode: File
+{"timestamp":"2026-08-20T08:02:25.937764Z","level":"INFO","fields":{"message":"Loading YAML configuration from /tmp/agent01-9xkfat51/N03.yaml"},"target":"ferrum_edge::config::file_loader"}
+
+---stderr---
+{"timestamp":"2026-08-20T08:02:25.917424Z","level":"WARN","fields":{"message":"Config file /tmp/agent01-9xkfat51/N03.yaml is world-readable (mode 644). Consider restricting permissions as it may contain credentials."},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-20T08:02:25.938498Z","level":"ERROR","fields":{"message":"Duplicate listen_path '/same' found in proxy 'b' (conflicts with 'a')"},"target":"ferrum_edge::config::validation_pipeline"}
+{"timestamp":"2026-08-20T08:02:25.938587Z","level":"ERROR","fields":{"message":"Validation error: Spec validation failed: Configuration validation failed: 1 duplicate listen_path(s) found"},"target":"ferrum_edge"}

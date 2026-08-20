@@ -8,8 +8,7 @@
       "backend_scheme": "http",
       "backend_host": "127.0.0.1",
       "backend_port": 21002,
-      "strip_listen_path": true,
-      "auth_mode": "none"
+      "strip_listen_path": true
     },
     {
       "id": "tcp-echo",

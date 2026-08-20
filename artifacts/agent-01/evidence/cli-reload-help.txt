@@ -1,0 +1,9 @@
+exit=0
+Send a reload signal (SIGHUP) to a running gateway instance
+
+Usage: ferrum-edge reload [OPTIONS]
+
+Options:
+  -p, --pid <PID>  PID of the running gateway (auto-detected if omitted)
+  -h, --help       Print help
+

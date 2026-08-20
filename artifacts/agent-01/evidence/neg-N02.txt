@@ -1,0 +1,10 @@
+exit=1
+---stdout---
+Settings (ferrum.conf): OK
+  Mode: File
+{"timestamp":"2026-08-20T08:02:25.885904Z","level":"INFO","fields":{"message":"Loading YAML configuration from /tmp/agent01-9xkfat51/N02.yaml"},"target":"ferrum_edge::config::file_loader"}
+
+---stderr---
+{"timestamp":"2026-08-20T08:02:25.865577Z","level":"WARN","fields":{"message":"Config file /tmp/agent01-9xkfat51/N02.yaml is world-readable (mode 644). Consider restricting permissions as it may contain credentials."},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-20T08:02:25.886549Z","level":"ERROR","fields":{"message":"Duplicate proxy ID 'dup' in namespace 'ferrum'"},"target":"ferrum_edge::config::validation_pipeline"}
+{"timestamp":"2026-08-20T08:02:25.886642Z","level":"ERROR","fields":{"message":"Validation error: Spec validation failed: Configuration validation failed: 1 duplicate resource ID(s) found"},"target":"ferrum_edge"}

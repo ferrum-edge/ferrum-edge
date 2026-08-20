@@ -1,0 +1,110 @@
+[
+  {
+    "id": "R08",
+    "priority": "P1",
+    "capability": "SIGHUP after deleted spec keeps last-good",
+    "mode": "file/reload",
+    "method": "binary",
+    "expected": "echo 200 + alive",
+    "result": "passed",
+    "evidence": "artifacts/agent-01/evidence/reload-deleted.txt",
+    "issue": "",
+    "notes": "echo=200 alive=True"
+  },
+  {
+    "id": "R09",
+    "priority": "P1",
+    "capability": "reload during graceful shutdown",
+    "mode": "file/reload",
+    "method": "binary",
+    "expected": "process exits",
+    "result": "passed",
+    "evidence": "artifacts/agent-01/evidence/reload-during-shutdown.txt",
+    "issue": "",
+    "notes": "reload_exit=0 rc=0"
+  },
+  {
+    "id": "R10",
+    "priority": "P1",
+    "capability": "partial in-place write + SIGHUP",
+    "mode": "file/reload",
+    "method": "binary",
+    "expected": "last-good /echo 200",
+    "result": "passed",
+    "evidence": "artifacts/agent-01/evidence/reload-partial.txt",
+    "issue": "",
+    "notes": "echo=200"
+  },
+  {
+    "id": "R11",
+    "priority": "P1",
+    "capability": "permission loss on spec + SIGHUP",
+    "mode": "file/reload",
+    "method": "binary",
+    "expected": "last-good",
+    "result": "passed",
+    "evidence": "artifacts/agent-01/evidence/reload-chmod.txt",
+    "issue": "",
+    "notes": "echo=200"
+  },
+  {
+    "id": "R12",
+    "priority": "P1",
+    "capability": "symlink swap reload",
+    "mode": "file/reload",
+    "method": "binary",
+    "expected": "/link 200",
+    "result": "passed",
+    "evidence": "artifacts/agent-01/evidence/reload-symlink.txt",
+    "issue": "",
+    "notes": "link=200"
+  },
+  {
+    "id": "R13",
+    "priority": "P2",
+    "capability": "large valid config reload (80 proxies)",
+    "mode": "file/reload",
+    "method": "binary",
+    "expected": "/bulk79 200",
+    "result": "passed",
+    "evidence": "artifacts/agent-01/evidence/reload-large.txt",
+    "issue": "",
+    "notes": "bulk79=200"
+  },
+  {
+    "id": "D06b",
+    "priority": "P1",
+    "capability": "openapi_validator file-mode without api_spec_id (path_template)",
+    "mode": "file/reload",
+    "method": "binary",
+    "expected": "validate 0",
+    "result": "failed",
+    "evidence": "artifacts/agent-01/evidence/docs-openapi-no-spec-id-retest.txt",
+    "issue": "",
+    "notes": "nfig::validation_pipeline\"}\n{\"timestamp\":\"2026-08-20T08:06:41.012125Z\",\"level\":\"ERROR\",\"fields\":{\"message\":\"Validation error: Spec validation failed: Configuration validation failed: 1 plugin config error(s) found\"},\"target\":\"ferrum_edge\"}\n"
+  },
+  {
+    "id": "M01b",
+    "priority": "P0",
+    "capability": "migrate config already-current (reconfirm)",
+    "mode": "file/reload",
+    "method": "binary",
+    "expected": "exit 0",
+    "result": "passed",
+    "evidence": "artifacts/agent-01/evidence/migrate-current-2.txt",
+    "issue": "",
+    "notes": ""
+  },
+  {
+    "id": "R07",
+    "priority": "P1",
+    "capability": "reload --pid 0 is not rejected (kill process-group)",
+    "mode": "file/reload",
+    "method": "binary",
+    "expected": "exit != 0 with invalid-pid diagnostic",
+    "result": "failed",
+    "evidence": "artifacts/agent-01/evidence/reload-pid-zero-isolated.txt",
+    "issue": "",
+    "notes": "kill -HUP 0 signals the current process group; isolated run exited 129 (SIGHUP)"
+  }
+]

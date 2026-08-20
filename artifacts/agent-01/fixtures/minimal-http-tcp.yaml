@@ -9,7 +9,6 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: 21002
     strip_listen_path: true
-    auth_mode: none
 
   - id: "tcp-echo"
     name: "TCP Echo"

@@ -1,0 +1,7 @@
+exit=1
+Settings (ferrum.conf): OK
+  Mode: File
+
+{"timestamp":"2026-08-20T08:06:40.891999Z","level":"WARN","fields":{"message":"Config file /tmp/agent01d-bzf1qpgb/oas2.yaml is world-readable (mode 644). Consider restricting permissions as it may contain credentials."},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-20T08:06:41.011865Z","level":"ERROR","fields":{"message":"Plugin 'openapi_validator' (id=ov): openapi_validator: unknown configuration key(s): 'config.operations[0].request_body.required'"},"target":"ferrum_edge::config::validation_pipeline"}
+{"timestamp":"2026-08-20T08:06:41.012125Z","level":"ERROR","fields":{"message":"Validation error: Spec validation failed: Configuration validation failed: 1 plugin config error(s) found"},"target":"ferrum_edge"}

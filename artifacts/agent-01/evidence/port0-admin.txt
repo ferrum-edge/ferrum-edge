@@ -1,0 +1,33 @@
+alive=True proxy=True admin21041=False admin9000=False
+log=
+{"timestamp":"2026-08-20T08:02:38.413949Z","level":"INFO","fields":{"message":"Ferrum Edge v0.9.0 (x86_64-unknown-linux-gnu) starting..."},"target":"ferrum_edge"}
+{"timestamp":"2026-08-20T08:02:38.415216Z","level":"INFO","fields":{"message":"Operating mode: File"},"target":"ferrum_edge"}
+{"timestamp":"2026-08-20T08:02:38.415276Z","level":"INFO","fields":{"message":"Proxy bind address: 127.0.0.1, Admin bind address: 127.0.0.1"},"target":"ferrum_edge"}
+{"timestamp":"2026-08-20T08:02:38.416368Z","level":"INFO","fields":{"message":"Starting in file mode with log level: info"},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-20T08:02:38.416466Z","level":"INFO","fields":{"message":"Custom HTTPS port configured: 0"},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-20T08:02:38.416481Z","level":"INFO","fields":{"message":"Custom admin HTTPS port configured: 0"},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-20T08:02:38.416789Z","level":"WARN","fields":{"message":"Config file /tmp/agent01-9xkfat51/p0.yaml is world-readable (mode 644). Consider restricting permissions as it may contain credentials."},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-20T08:02:38.437165Z","level":"INFO","fields":{"message":"Loading YAML configuration from /tmp/agent01-9xkfat51/p0.yaml"},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-20T08:02:38.489157Z","level":"INFO","fields":{"message":"Configuration loaded (version 1): 2 proxies, 0 consumers, 0 plugin configs"},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-20T08:02:38.489626Z","level":"INFO","fields":{"message":"file::serve: starting in-process gateway with 2 proxies, 0 consumers"},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-20T08:02:38.490323Z","level":"INFO","fields":{"message":"TLS policy: versions=[\"TLS 1.2\", \"TLS 1.3\"], cipher_suites=[\"TLS13_AES_128_GCM_SHA256\", \"TLS13_AES_256_GCM_SHA384\", \"TLS13_CHACHA20_POLY1305_SHA256\", \"TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256\", \"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256\", \"TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256\", \"TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256\", \"TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384\", \"TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384\"], curves=[\"X25519\", \"secp256r1\"], prefer_server_order=true"},"target":"ferrum_edge::tls"}
+{"timestamp":"2026-08-20T08:02:38.565034Z","level":"INFO","fields":{"message":"TCP_FASTOPEN auto-detection","enabled":false,"config":"auto"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:38.565307Z","level":"INFO","fields":{"message":"kTLS auto-detection: disabled","config":"auto"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:38.565595Z","level":"INFO","fields":{"message":"io_uring splice auto-detection: enabled (IORING_OP_SPLICE probe passed)"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:38.565680Z","level":"INFO","fields":{"message":"UDP GRO auto-detection (reserved, not active)","enabled":true,"config":"auto"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:38.565704Z","level":"INFO","fields":{"message":"UDP GSO auto-detection: enabled (setsockopt probe passed)"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:38.565729Z","level":"INFO","fields":{"message":"UDP IP_PKTINFO auto-detection: enabled (setsockopt probe passed)"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:38.566009Z","level":"INFO","fields":{"message":"DNS warmup: resolving 1 unique hostnames (2 before dedup, concurrency=500)"},"target":"ferrum_edge::dns"}
+{"timestamp":"2026-08-20T08:02:38.566135Z","level":"INFO","fields":{"message":"DNS warmup complete"},"target":"ferrum_edge::dns"}
+{"timestamp":"2026-08-20T08:02:38.566504Z","level":"WARN","fields":{"message":"No admin API listeners are active — FERRUM_ADMIN_HTTP_PORT=0 and admin HTTPS is not configured or disabled. The admin API is unreachable."},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-20T08:02:38.566125Z","level":"INFO","fields":{"message":"TLS material source set changed; refreshed dynamic watcher inputs","surface":"backend_tls","source_count":0},"target":"ferrum_edge::tls::source::subscription"}
+{"timestamp":"2026-08-20T08:02:38.566423Z","level":"INFO","fields":{"message":"Overload monitor started (interval=1000ms, fd_limit=524288, max_conn=100000, max_req=0)"},"target":"ferrum_edge::overload"}
+{"timestamp":"2026-08-20T08:02:38.566461Z","level":"INFO","fields":{"message":"FERRUM_ADMIN_HTTP_PORT=0 — plaintext admin HTTP listener disabled"},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-20T08:02:38.566552Z","level":"INFO","fields":{"message":"TLS not configured - HTTPS listener disabled"},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-20T08:02:38.566989Z","level":"INFO","fields":{"message":"Starting HTTP proxy listener on 127.0.0.1:21040"},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-20T08:02:38.567124Z","level":"INFO","fields":{"message":"Connection limit: 100000 max concurrent connections"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:38.567173Z","level":"INFO","fields":{"message":"Proxy listener started on 127.0.0.1:21040 (backlog=2048, accept_threads=4)"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-20T08:02:38.567243Z","level":"INFO","fields":{"message":"Started stream listener","listener_key":"ferrum|tcp-echo","namespace":"ferrum","proxy_id":"tcp-echo","port":21003,"scheme":"tcp"},"target":"ferrum_edge::proxy::stream_listener"}
+{"timestamp":"2026-08-20T08:02:38.567309Z","level":"INFO","fields":{"message":"TCP proxy listener started on 127.0.0.1:21003","proxy_id":"tcp-echo","backlog":2048,"accept_threads":4},"target":"ferrum_edge::proxy::tcp_proxy"}
+{"timestamp":"2026-08-20T08:02:38.567355Z","level":"INFO","fields":{"message":"Gateway startup complete; /health now reports ready"},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-20T08:02:38.568583Z","level":"INFO","fields":{"message":"Backend capability refresh complete: 1 backends classified (h2_tls=0, h3=0, h2c=0, hbone=0), 0 probe results discarded in favor of newer live state"},"target":"ferrum_edge::proxy"}

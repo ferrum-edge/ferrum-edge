@@ -1,0 +1,3 @@
+exit=1
+stdout=''
+stderr='{"timestamp":"2026-08-20T08:02:25.531725Z","level":"ERROR","fields":{"message":"Configuration error: Invalid FERRUM_MODE \'not-a-mode\'. Expected: database, file, cp, dp, mesh, injector, node_agent, migrate"},"target":"ferrum_edge"}\n'

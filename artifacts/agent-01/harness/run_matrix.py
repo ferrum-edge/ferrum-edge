@@ -191,11 +191,19 @@ class HttpEcho(threading.Thread):
     def run(self) -> None:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((BIND, self.port))
-        s.listen(64)
-        s.settimeout(0.3)
-        self.sock = s
-        self.ready.set()
+        try:
+            s.bind((BIND, self.port))
+            s.listen(64)
+            s.settimeout(0.3)
+            self.sock = s
+            self.ready.set()
+        except OSError as e:
+            print(f"HttpEcho bind {self.port} failed: {e}", file=sys.stderr)
+            try:
+                s.close()
+            except OSError:
+                pass
+            return
         while not self._stop.is_set():
             try:
                 conn, _ = s.accept()
@@ -250,11 +258,19 @@ class TcpEcho(threading.Thread):
     def run(self) -> None:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((BIND, self.port))
-        s.listen(32)
-        s.settimeout(0.3)
-        self.sock = s
-        self.ready.set()
+        try:
+            s.bind((BIND, self.port))
+            s.listen(32)
+            s.settimeout(0.3)
+            self.sock = s
+            self.ready.set()
+        except OSError as e:
+            print(f"TcpEcho bind {self.port} failed: {e}", file=sys.stderr)
+            try:
+                s.close()
+            except OSError:
+                pass
+            return
         while not self._stop.is_set():
             try:
                 conn, _ = s.accept()
@@ -344,7 +360,6 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: {http_be}
     strip_listen_path: true
-    auth_mode: none
   - id: "tcp-echo"
     name: "TCP Echo"
     listen_port: {tcp_listen}
@@ -416,7 +431,7 @@ class Gateway:
     def pid(self) -> int | None:
         return self.proc.pid if self.proc else None
 
-    def signal(self, sig: int) -> None:
+    def send(self, sig: int) -> None:
         if self.proc and self.proc.poll() is None:
             self.proc.send_signal(sig)
 
@@ -432,6 +447,7 @@ class Gateway:
                 self.proc.wait(timeout=5)
         if self.log_fh:
             self.log_fh.close()
+        time.sleep(0.25)
         return self.proc.returncode
 
     def log_tail(self, n: int = 80) -> str:
@@ -571,7 +587,7 @@ def phase_validate_positive(tmpdir: Path) -> None:
         "version": "1",
         "proxies": [
             {"id": "http-echo", "listen_path": "/echo", "backend_scheme": "http",
-             "backend_host": "127.0.0.1", "backend_port": P_HTTP_BE, "strip_listen_path": True, "auth_mode": "none"},
+             "backend_host": "127.0.0.1", "backend_port": P_HTTP_BE, "strip_listen_path": True},
             {"id": "tcp-echo", "listen_port": P_TCP, "backend_scheme": "tcp",
              "backend_host": "127.0.0.1", "backend_port": P_TCP_BE},
         ],
@@ -587,25 +603,25 @@ def phase_validate_positive(tmpdir: Path) -> None:
 def phase_negative(tmpdir: Path) -> None:
     cases = [
         ("N01", "unknown field enabled on stream proxy",
-         'version: "1"\nproxies:\n  - id: "p"\n    listen_port: 21003\n    backend_scheme: tcp\n    backend_host: "127.0.0.1"\n    backend_port: 21004\n    enabled: true\n',
+         'version: "1"\nplugin_configs: []\nproxies:\n  - id: "p"\n    listen_port: 21003\n    backend_scheme: tcp\n    backend_host: "127.0.0.1"\n    backend_port: 21004\n    enabled: true\n',
          "unknown field"),
         ("N02", "duplicate proxy IDs",
-         'version: "1"\nproxies:\n  - id: "dup"\n    listen_path: "/a"\n    backend_scheme: http\n    backend_host: "127.0.0.1"\n    backend_port: 21002\n  - id: "dup"\n    listen_path: "/b"\n    backend_scheme: http\n    backend_host: "127.0.0.1"\n    backend_port: 21002\n',
+         'version: "1"\nplugin_configs: []\nproxies:\n  - id: "dup"\n    listen_path: "/a"\n    backend_scheme: http\n    backend_host: "127.0.0.1"\n    backend_port: 21002\n  - id: "dup"\n    listen_path: "/b"\n    backend_scheme: http\n    backend_host: "127.0.0.1"\n    backend_port: 21002\n',
          "duplicate"),
         ("N03", "duplicate listen_path",
-         'version: "1"\nproxies:\n  - id: "a"\n    listen_path: "/same"\n    backend_scheme: http\n    backend_host: "127.0.0.1"\n    backend_port: 21002\n  - id: "b"\n    listen_path: "/same"\n    backend_scheme: http\n    backend_host: "127.0.0.1"\n    backend_port: 21002\n',
+         'version: "1"\nplugin_configs: []\nproxies:\n  - id: "a"\n    listen_path: "/same"\n    backend_scheme: http\n    backend_host: "127.0.0.1"\n    backend_port: 21002\n  - id: "b"\n    listen_path: "/same"\n    backend_scheme: http\n    backend_host: "127.0.0.1"\n    backend_port: 21002\n',
          "listen_path"),
         ("N04", "stream listen_port conflicts reserved admin port",
-         f'version: "1"\nproxies:\n  - id: "clash"\n    listen_port: {P_ADMIN}\n    backend_scheme: tcp\n    backend_host: "127.0.0.1"\n    backend_port: 21004\n',
+         f'version: "1"\nplugin_configs: []\nproxies:\n  - id: "clash"\n    listen_port: {P_ADMIN}\n    backend_scheme: tcp\n    backend_host: "127.0.0.1"\n    backend_port: 21004\n',
          "conflict"),
         ("N05", "invalid backend_scheme",
-         'version: "1"\nproxies:\n  - id: "bad"\n    listen_path: "/x"\n    backend_scheme: ftp\n    backend_host: "127.0.0.1"\n    backend_port: 21002\n',
+         'version: "1"\nplugin_configs: []\nproxies:\n  - id: "bad"\n    listen_path: "/x"\n    backend_scheme: ftp\n    backend_host: "127.0.0.1"\n    backend_port: 21002\n',
          "scheme"),
         ("N06", "missing required backend_host",
-         'version: "1"\nproxies:\n  - id: "bad"\n    listen_path: "/x"\n    backend_scheme: http\n    backend_port: 21002\n',
+         'version: "1"\nplugin_configs: []\nproxies:\n  - id: "bad"\n    listen_path: "/x"\n    backend_scheme: http\n    backend_port: 21002\n',
          "missing"),
         ("N07", "empty proxy id",
-         'version: "1"\nproxies:\n  - id: ""\n    listen_path: "/x"\n    backend_scheme: http\n    backend_host: "127.0.0.1"\n    backend_port: 21002\n',
+         'version: "1"\nplugin_configs: []\nproxies:\n  - id: ""\n    listen_path: "/x"\n    backend_scheme: http\n    backend_host: "127.0.0.1"\n    backend_port: 21002\n',
          "empty"),
         ("N08", "malformed YAML",
          'version: "1"\nproxies: [\n  - id: broken\n',
@@ -614,25 +630,25 @@ def phase_negative(tmpdir: Path) -> None:
          '{"version":"1","proxies":[',
          "json"),
         ("N10", "missing version field",
-         'proxies:\n  - id: "p"\n    listen_path: "/x"\n    backend_scheme: http\n    backend_host: "127.0.0.1"\n    backend_port: 21002\n',
+         'plugin_configs: []\nproxies:\n  - id: "p"\n    listen_path: "/x"\n    backend_scheme: http\n    backend_host: "127.0.0.1"\n    backend_port: 21002\n',
          "version"),
         ("N11", "invalid path missing file",
          None,
          "not found"),
         ("N12", "boundary listen_port 0 on stream",
-         'version: "1"\nproxies:\n  - id: "z"\n    listen_port: 0\n    backend_scheme: tcp\n    backend_host: "127.0.0.1"\n    backend_port: 21004\n',
+         'version: "1"\nplugin_configs: []\nproxies:\n  - id: "z"\n    listen_port: 0\n    backend_scheme: tcp\n    backend_host: "127.0.0.1"\n    backend_port: 21004\n',
          "port"),
-        ("N13", "Unicode proxy id",
-         'version: "1"\nproxies:\n  - id: "路由-α"\n    listen_path: "/uni"\n    backend_scheme: http\n    backend_host: "127.0.0.1"\n    backend_port: 21002\n    auth_mode: none\n',
-         None),  # may pass or fail; record
-        ("N14", "HTTP proxy with listen_path on stream-like tcp scheme using path",
-         'version: "1"\nproxies:\n  - id: "mix"\n    listen_path: "/tcp"\n    listen_port: 21003\n    backend_scheme: tcp\n    backend_host: "127.0.0.1"\n    backend_port: 21004\n',
+        ("N13", "Unicode proxy id rejected by ID charset",
+         'version: "1"\nplugin_configs: []\nproxies:\n  - id: "路由-α"\n    listen_path: "/uni"\n    backend_scheme: http\n    backend_host: "127.0.0.1"\n    backend_port: 21002\n',
+         "invalid"),
+        ("N14", "stream proxy must not set listen_path",
+         'version: "1"\nplugin_configs: []\nproxies:\n  - id: "mix"\n    listen_path: "/tcp"\n    listen_port: 21003\n    backend_scheme: tcp\n    backend_host: "127.0.0.1"\n    backend_port: 21004\n',
          "listen_path"),
         ("N15", "empty string backend_host",
-         'version: "1"\nproxies:\n  - id: "eh"\n    listen_path: "/x"\n    backend_scheme: http\n    backend_host: ""\n    backend_port: 21002\n',
+         'version: "1"\nplugin_configs: []\nproxies:\n  - id: "eh"\n    listen_path: "/x"\n    backend_scheme: http\n    backend_host: ""\n    backend_port: 21002\n',
          "empty"),
         ("N16", "duplicate listen_port stream proxies",
-         'version: "1"\nproxies:\n  - id: "s1"\n    listen_port: 21003\n    backend_scheme: tcp\n    backend_host: "127.0.0.1"\n    backend_port: 21004\n  - id: "s2"\n    listen_port: 21003\n    backend_scheme: tcp\n    backend_host: "127.0.0.1"\n    backend_port: 21004\n',
+         'version: "1"\nplugin_configs: []\nproxies:\n  - id: "s1"\n    listen_port: 21003\n    backend_scheme: tcp\n    backend_host: "127.0.0.1"\n    backend_port: 21004\n  - id: "s2"\n    listen_port: 21003\n    backend_scheme: tcp\n    backend_host: "127.0.0.1"\n    backend_port: 21004\n',
          "port"),
     ]
     for cid, title, body, expect_token in cases:
@@ -651,14 +667,9 @@ def phase_negative(tmpdir: Path) -> None:
         blob = f"exit={p.returncode}\n---stdout---\n{p.stdout}\n---stderr---\n{p.stderr}"
         ev = write_ev(f"neg-{cid}.txt", blob)
         combined = (p.stdout + p.stderr).lower()
-        if expect_token is None:
-            # Unicode: record actual
-            result = "passed" if p.returncode == 0 else "failed"
-            notes = f"unicode id accepted={p.returncode==0}"
-        else:
-            rejected = p.returncode != 0
-            result = "passed" if rejected else "failed"
-            notes = f"token_hint={expect_token!r} seen={expect_token.lower() in combined}"
+        rejected = p.returncode != 0
+        result = "passed" if rejected else "failed"
+        notes = f"token_hint={expect_token!r} seen={expect_token.lower() in combined}"
         add(Row(cid, "P0" if cid in {"N01", "N02", "N03", "N04", "N08", "N09"} else "P1",
                 title, "file/validate", "binary validate negative fixture",
                 "fail closed, no Validation passed", result, ev, notes=notes))
@@ -782,7 +793,7 @@ def phase_port_zero(tmpdir: Path) -> None:
     # reserved-port: stream on 0-disabled proxy port should be allowed
     spec2 = tmpdir / "p0-reserved.yaml"
     spec2.write_text(
-        'version: "1"\nproxies:\n'
+        'version: "1"\nplugin_configs: []\nproxies:\n'
         f'  - id: "s"\n    listen_port: {P_HTTP}\n    backend_scheme: tcp\n'
         f'    backend_host: "127.0.0.1"\n    backend_port: {P_TCP_BE}\n'
     )
@@ -858,7 +869,7 @@ def phase_health_shutdown(tmpdir: Path) -> None:
 
     # SIGTERM drain + rebind
     pid = gw.pid()
-    gw.signal(signal.SIGTERM)
+    gw.send(signal.SIGTERM)
     closed = port_closed(BIND, P_SHUT_HTTP, timeout=10)
     rc = gw.proc.wait(timeout=12) if gw.proc else None
     ev = write_ev("sigterm.txt", f"pid={pid} rc={rc} port_closed={closed}\nlog=\n{gw.log_tail(60)}")
@@ -875,7 +886,7 @@ def phase_health_shutdown(tmpdir: Path) -> None:
             "admin+proxy accept again",
             "passed" if rebound and st == 200 else "failed", ev))
     # SIGINT
-    gw2.signal(signal.SIGINT)
+    gw2.send(signal.SIGINT)
     closed2 = port_closed(BIND, P_SHUT_HTTP, timeout=10)
     rc2 = gw2.proc.wait(timeout=12) if gw2.proc else None
     ev = write_ev("sigint.txt", f"rc={rc2} closed={closed2}\nlog=\n{gw2.log_tail(40)}")
@@ -913,7 +924,6 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: {P_HTTP_BE}
     strip_listen_path: true
-    auth_mode: none
   - id: "http-v2"
     name: "HTTP V2"
     listen_path: "/v2"
@@ -921,7 +931,6 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: {P_HTTP_BE}
     strip_listen_path: true
-    auth_mode: none
   - id: "tcp-echo"
     name: "TCP Echo"
     listen_port: {P_TCP}
@@ -971,14 +980,12 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: {P_HTTP_BE}
     strip_listen_path: true
-    auth_mode: none
   - id: "http-v3"
     listen_path: "/v3"
     backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {P_HTTP_BE}
     strip_listen_path: true
-    auth_mode: none
 consumers: []
 plugin_configs: []
 upstreams: []
@@ -1004,14 +1011,12 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: {P_HTTP_BE}
     strip_listen_path: true
-    auth_mode: none
   - id: "rapid-{i}"
     listen_path: "/r{i}"
     backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {P_HTTP_BE}
     strip_listen_path: true
-    auth_mode: none
 consumers: []
 plugin_configs: []
 upstreams: []
@@ -1053,7 +1058,7 @@ upstreams: []
 
     # reload during shutdown
     spec.write_text(spec_http_tcp())
-    gw.signal(signal.SIGTERM)
+    gw.send(signal.SIGTERM)
     p = run_cmd([str(BIN), "reload", "--pid", str(gw.pid())], env=clean_env(), timeout=8)
     try:
         rc = gw.proc.wait(timeout=12) if gw.proc else None
@@ -1120,14 +1125,12 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: {P_HTTP_BE}
     strip_listen_path: true
-    auth_mode: none
   - id: "via-link"
     listen_path: "/link"
     backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {P_HTTP_BE}
     strip_listen_path: true
-    auth_mode: none
 consumers: []
 plugin_configs: []
 upstreams: []
@@ -1155,7 +1158,7 @@ upstreams: []
         proxies.append(
             f'  - id: "p{i}"\n    listen_path: "/bulk{i}"\n    backend_scheme: http\n'
             f'    backend_host: "127.0.0.1"\n    backend_port: {P_HTTP_BE}\n'
-            f'    strip_listen_path: true\n    auth_mode: none\n'
+            f'    strip_listen_path: true\n'
         )
     large = 'version: "1"\nproxies:\n' + "".join(proxies) + "consumers: []\nplugin_configs: []\nupstreams: []\n"
     if spec.is_symlink():
@@ -1319,6 +1322,8 @@ def phase_docs_examples(tmpdir: Path) -> None:
 
     # same without enabled
     cleaned = "\n".join(ln for ln in block.splitlines() if "enabled:" not in ln)
+    if "plugin_configs:" not in cleaned:
+        cleaned = cleaned.rstrip() + "\nplugin_configs: []\nconsumers: []\nupstreams: []\n"
     path = tmpdir / "tcp-udp-doc-cleaned.yaml"
     path.write_text(cleaned)
     p = run_cmd([str(BIN), "validate", "-m", "file", "-c", str(path)],
@@ -1347,7 +1352,6 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: 21002
     strip_listen_path: false
-    auth_mode: none
     plugins:
       - plugin_config_id: "ov"
 plugin_configs:
@@ -1391,7 +1395,6 @@ proxies:
     backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 21002
-    auth_mode: none
 plugin_configs:
   - id: "alerts-error"
     plugin_name: "stdout_logging"

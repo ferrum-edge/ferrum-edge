@@ -1,0 +1,9 @@
+exit=1
+---stdout---
+Settings (ferrum.conf): OK
+  Mode: File
+{"timestamp":"2026-08-20T08:02:26.295873Z","level":"INFO","fields":{"message":"Loading JSON configuration from /tmp/agent01-9xkfat51/N09.json"},"target":"ferrum_edge::config::file_loader"}
+
+---stderr---
+{"timestamp":"2026-08-20T08:02:26.275479Z","level":"WARN","fields":{"message":"Config file /tmp/agent01-9xkfat51/N09.json is world-readable (mode 644). Consider restricting permissions as it may contain credentials."},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-20T08:02:26.296030Z","level":"ERROR","fields":{"message":"Validation error: Spec validation failed: EOF while parsing a list at line 1 column 26"},"target":"ferrum_edge"}

@@ -1,0 +1,20 @@
+exit=0
+---stdout---
+A high-performance edge proxy built in Rust
+
+Usage: ferrum-edge [COMMAND]
+
+Commands:
+  run                    Start the gateway in the foreground
+  validate               Validate configuration files without starting the gateway
+  reload                 Send a reload signal (SIGHUP) to a running gateway instance
+  version                Print version information
+  health                 Check if the gateway is healthy (for Docker HEALTHCHECK in distroless images)
+  ambient-udp-preflight  Retire Ambient UDP predecessor placements on this node and publish the node-scoped cleanup proof the steady-state host producer requires
+  help                   Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+
+---stderr---
