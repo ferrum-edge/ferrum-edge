@@ -110,10 +110,12 @@ pub struct ServeOptions {
     /// to the (often scripted) backend, which would consume the first
     /// `ExpectRequest` step or perturb per-test connection counts.
     /// Tests that explicitly need the probe behaviour opt in via
-    /// `pool_warmup_enabled(true)` instead — that path runs warmup first
-    /// (which itself populates the registry) and is awaited before
-    /// `serve()` returns, so the test gets a deterministic snapshot
-    /// rather than racing the background refresh.
+    /// `pool_warmup_enabled(true)` instead — that path runs warmup after
+    /// every required listener has bound (which itself populates the
+    /// registry) and is awaited before `serve()` returns and before
+    /// `/health` becomes ready, so the test gets a deterministic snapshot
+    /// rather than racing the background refresh. An abandoned bind never
+    /// reaches this path (issue #4080).
     pub skip_initial_capability_refresh: bool,
     /// Optional override for the background-task drain cap used by
     /// [`ServeHandles::join`]. Defaults to [`BACKGROUND_DRAIN_TIMEOUT`]
@@ -611,7 +613,7 @@ pub async fn run(
     .await?;
 
     // Install the SIGHUP handler BEFORE serve() so a HUP arriving during
-    // startup (DNS warmup, pool warmup, listener bind) doesn't take the
+    // startup (DNS warmup, listener bind, pool warmup) doesn't take the
     // default termination action and kill the process. Once the
     // `Signal` stream is created, tokio overrides the default handler
     // and queues incoming signals; the reload loop below `recv()`s them
@@ -721,7 +723,9 @@ pub async fn run(
 /// - Skips the shutdown-signal handler — the caller already owns the
 ///   `shutdown_tx`.
 /// - Returns once every listener has bound (or adopted its pre-bound socket)
-///   — the gateway is ready to take traffic before this function returns.
+///   and, when enabled, pool warmup has finished — the gateway is ready to
+///   take traffic before this function returns. Backend capability probes
+///   do not start until that bind barrier succeeds (issue #4080).
 ///
 /// Stream proxy bind failures are still fatal here: this matches `run()`'s
 /// invariants and keeps tests honest about config typos.
@@ -874,18 +878,11 @@ pub async fn serve(
 
     dns_cache.warmup(hostnames).await;
 
-    if env_config.pool_warmup_enabled {
-        proxy_state.warmup_connection_pools().await;
-    }
-    // Without warmup, the registry is otherwise empty until the first
-    // periodic tick (24 h default) — pass `true` so `start_backend_*`
-    // kicks off an immediate probe pass. In-process tests that want a
-    // truly cold gateway set `skip_initial_capability_refresh` to opt
-    // out of that probe (see `ServeOptions` docs).
-    let run_initial_refresh =
-        !env_config.pool_warmup_enabled && !prebound.skip_initial_capability_refresh;
-    proxy_state
-        .start_backend_capability_refresh_task(run_initial_refresh, Some(shutdown_tx.subscribe()));
+    // Pool warmup and the initial capability-refresh probe dial caller-owned
+    // backends. Defer both until every required listener has bound so a
+    // lost exclusive-bind race cannot consume a stateful scripted fixture
+    // before TestGateway retries with fresh ports (issue #4080). DNS warmup
+    // stays here: it does not open backend TCP connections.
 
     let per_ip_cleanup_handle =
         proxy_state.start_per_ip_cleanup_task(Some(shutdown_tx.subscribe()));
@@ -1588,6 +1585,9 @@ pub async fn serve(
     // critical for the in-process retry path in
     // `GatewayHarnessBuilder::spawn_in_process`, which would otherwise
     // accumulate orphan listeners holding sockets across attempts.
+    // Subscribe before moving `shutdown_tx` so a successful bind can
+    // start capability refresh without orphaning the watch sender.
+    let capability_refresh_shutdown = shutdown_tx.subscribe();
     let serve_handles = ServeHandles {
         proxy_state: proxy_state.clone(),
         config_rejected,
@@ -1612,8 +1612,6 @@ pub async fn serve(
             .wait_until_started(Duration::from_secs(10))
             .await?;
         proxy_state.set_h3_websocket_listener_started(h3_listener_started);
-        startup_ready.store(true, Ordering::Release);
-        info!("Gateway startup complete; /health now reports ready");
         Ok(())
     }
     .await;
@@ -1629,6 +1627,28 @@ pub async fn serve(
         }
         return Err(e);
     }
+
+    // Bind succeeded. Warmup remains startup-gating (`/health` stays not
+    // ready until it finishes). The async capability-refresh loop starts
+    // only after ready so a later readiness-barrier failure cannot share
+    // a backend fixture with a retry.
+    if env_config.pool_warmup_enabled {
+        proxy_state.warmup_connection_pools().await;
+    }
+    startup_ready.store(true, Ordering::Release);
+    info!("Gateway startup complete; /health now reports ready");
+
+    // Without warmup, the registry is otherwise empty until the first
+    // periodic tick (24 h default) — pass `true` so `start_backend_*`
+    // kicks off an immediate probe pass. In-process tests that want a
+    // truly cold gateway set `skip_initial_capability_refresh` to opt
+    // out of that probe (see `ServeOptions` docs).
+    let run_initial_refresh =
+        !env_config.pool_warmup_enabled && !prebound.skip_initial_capability_refresh;
+    proxy_state.start_backend_capability_refresh_task(
+        run_initial_refresh,
+        Some(capability_refresh_shutdown),
+    );
 
     Ok(serve_handles)
 }

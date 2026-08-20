@@ -332,6 +332,12 @@ cannot join the same TCP proxy port. The harness still pins
 `FERRUM_ACCEPT_THREADS=1` unless the caller overrides it, so a colliding
 bind is a single-socket `EADDRINUSE` and the spawn retry picks a fresh port.
 
+File mode does not run pool warmup or the initial backend-capability probe
+until every required listener has bound and, for the async probe, until
+`/health` is ready (issue #4080). A spawn attempt that loses the proxy-port
+race therefore cannot consume a caller-owned stateful backend fixture
+before the successful retry.
+
 `wait_for_proxy_port` re-proves that ownership before trusting a TCP
 accept, and the spawn wait polls the child so a process that dies after a
 partial bind fails fast instead of burning the health timeout against

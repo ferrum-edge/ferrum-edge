@@ -8,8 +8,8 @@
 //! See `tests/scaffolding/mod.rs` for the API docs.
 
 use crate::scaffolding::backends::{
-    HttpStep, RequestMatcher, ScriptedHttp1Backend, ScriptedTcpBackend, ScriptedTlsBackend,
-    TcpStep, TlsConfig,
+    H2Step, HttpStep, MatchHeaders, RequestMatcher, ScriptedH2Backend, ScriptedHttp1Backend,
+    ScriptedTcpBackend, ScriptedTlsBackend, TcpStep, TlsConfig,
 };
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::Http1Client;
@@ -1214,4 +1214,166 @@ async fn in_process_backend_refused_stays_502_connection_failure() {
         "in-process refused-connect test failed across {MAX_ATTEMPTS} attempts; last failure: {}",
         last_failure.unwrap_or_else(|| "unknown".into())
     );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Issue #4080: file-mode startup used to run pool warmup and the initial
+// capability-refresh probe before `wait_for_start_signals`. A child that
+// then lost the exclusive proxy bind still dialed the caller-owned scripted
+// backend; TestGateway's fresh-port retry reused that fixture, so
+// `pooled_h2_goaway_canceled_send_retries_buffered_unary` observed a consumed
+// connection script. This in-process regression occupies the proxy port the
+// same way production does, asserts zero backend side effects on each failed
+// start (warmup on and off), then proves a successful retry performs the
+// first probe exactly once.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abandoned_bind_failure_does_not_probe_backend_before_successful_retry() {
+    use ferrum_edge::_test_support::bind_exclusive_proxy_accept_listeners_for_test;
+    use ferrum_edge::config::types::GatewayConfig;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let reservation = reserve_port().await.expect("reserve backend port");
+    let backend_port = reservation.port;
+    let backend = ScriptedH2Backend::builder_plain(reservation.into_listener())
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .spawn()
+        .expect("spawn scripted h2 backend");
+
+    let mut config: GatewayConfig =
+        serde_yaml::from_str(&file_mode_yaml_for_backend(backend_port)).expect("parse yaml");
+    config.resolve_dispatch_kind();
+
+    for warmup in [false, true] {
+        let occupiers = bind_exclusive_proxy_accept_listeners_for_test(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            128,
+            1,
+        )
+        .expect("occupy exclusive proxy port");
+        let proxy_port = occupiers[0].local_addr().expect("occupier addr").port();
+        let err = match start_file_serve_env_proxy(
+            config.clone(),
+            proxy_port,
+            warmup,
+            false,
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!(
+                "serve() must fail while exclusive occupier holds proxy port {proxy_port} \
+                 (warmup={warmup})"
+            ),
+            Err(err) => err,
+        };
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("in use")
+                || msg.contains("address already")
+                || msg.contains("exited before completing startup")
+                || msg.contains("bind"),
+            "failed exclusive bind must surface as a listener/bind error \
+             (warmup={warmup}); got {err}"
+        );
+        assert_eq!(
+            backend.accepted_connections(),
+            0,
+            "abandoned bind (warmup={warmup}) must not consume the caller-owned \
+             backend; accepted={}",
+            backend.accepted_connections()
+        );
+        drop(occupiers);
+    }
+
+    let proxy_ok = reserve_port().await.expect("reserve successful proxy port");
+    let handles = start_file_serve_env_proxy(
+        config,
+        proxy_ok.port,
+        false,
+        false,
+        Some(proxy_ok.into_listener()),
+    )
+    .await
+    .expect("successful retry after abandoned bind must start");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let accepted = backend.accepted_connections();
+        assert!(
+            accepted <= 1,
+            "successful warmup-off retry must probe the backend once; accepted={accepted}"
+        );
+        if accepted == 1 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "successful retry never performed the post-ready capability probe; \
+                 accepted={}",
+                backend.accepted_connections()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    handles
+        .shutdown_and_join()
+        .await
+        .expect("drain successful retry");
+    assert_eq!(
+        backend.accepted_connections(),
+        1,
+        "draining the successful gateway must not add further backend connections"
+    );
+}
+
+async fn start_file_serve_env_proxy(
+    config: ferrum_edge::config::types::GatewayConfig,
+    proxy_http_port: u16,
+    pool_warmup_enabled: bool,
+    skip_initial_capability_refresh: bool,
+    proxy_http: Option<tokio::net::TcpListener>,
+) -> Result<ferrum_edge::modes::file::ServeHandles, anyhow::Error> {
+    use ferrum_edge::admin::jwt_auth::{JwtConfig, JwtManager};
+    use ferrum_edge::config::{EnvConfig, OperatingMode};
+    use ferrum_edge::modes::file::{self, ServeOptions};
+
+    let admin_reservation = reserve_port().await.expect("reserve admin port");
+    let admin_port = admin_reservation.port;
+    let admin_http = admin_reservation.into_listener();
+
+    let env_config = EnvConfig {
+        mode: OperatingMode::File,
+        proxy_http_port,
+        proxy_https_port: 0,
+        admin_http_port: admin_port,
+        admin_https_port: 0,
+        admin_jwt_secret: Some("regression-test-secret-32-chars-min-len".to_string()),
+        admin_jwt_issuer: "regression-test".to_string(),
+        shutdown_drain_seconds: 0,
+        pool_warmup_enabled,
+        max_connections: 0,
+        proxy_bind_address: "127.0.0.1".to_string(),
+        stream_proxy_bind_address: "127.0.0.1".to_string(),
+        ..EnvConfig::default()
+    };
+
+    let opts = ServeOptions {
+        proxy_http,
+        admin_http: Some(admin_http),
+        admin_jwt_manager: Some(JwtManager::new(JwtConfig {
+            secret: env_config.admin_jwt_secret.clone().unwrap(),
+            issuer: env_config.admin_jwt_issuer.clone(),
+            audience: None,
+            max_ttl_seconds: 3600,
+            algorithm: jsonwebtoken::Algorithm::HS256,
+        })),
+        skip_initial_capability_refresh,
+        background_drain_timeout: Some(Duration::from_millis(200)),
+        ..ServeOptions::default()
+    };
+
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    file::serve(env_config, config, opts, shutdown_tx).await
 }

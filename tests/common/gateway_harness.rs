@@ -62,6 +62,12 @@
 //!   colliding bind is a single-socket `EADDRINUSE` and the spawn retry picks
 //!   a fresh port.
 //!
+//! File-mode startup does not dial caller-owned backends until that exclusive
+//! bind has succeeded (issue #4080). A stolen proxy port therefore fails the
+//! attempt without consuming a scripted connection script or mutating warmup
+//! counters that belong to the successful retry. The retry still uses fresh
+//! gateway ports and the same ownership-proof barrier.
+//!
 //! The spawn wait also polls `Child::try_wait`, so a child that dies after a
 //! partial bind fails fast instead of letting the retry loop burn the full
 //! health timeout against whatever else answers on the released port.

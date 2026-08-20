@@ -2583,14 +2583,14 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
         // `accepted_connections()` is asserted below, so the reqwest `HEAD /`
         // warmup must not add an extra dial to the count. Note this does NOT
         // make the gateway cold: with warmup off, `modes::file::serve` sets
-        // `run_initial_refresh = true` and the backend-capability refresh task
-        // immediately probes this plaintext backend via
+        // `run_initial_refresh = true` only after required listeners have bound
+        // and `/health` is ready (issue #4080). The backend-capability refresh
+        // task then probes this plaintext backend via
         // `ProxyState::probe_h2c` -> `grpc_pool.get_sender_for_capability_probe()`.
         // That probe uses
         // a clone of this proxy whose only delta is a clamped connect timeout —
         // a field deliberately excluded from the pool key — so it lands on the
-        // SAME single-shard gRPC pool entry the request path uses, and it is
-        // spawned rather than awaited before readiness.
+        // SAME single-shard gRPC pool entry the request path uses.
         // `wait_for_grpc_h2c_probe_accept_armed` below waits until that probe
         // has finished inserting its sender *and* connection 0's AcceptRpc is
         // parked, so the warmup RPC reuses the healthy probe sender instead of
@@ -2683,9 +2683,10 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
 /// `AcceptRpc` is armed.
 ///
 /// With `FERRUM_POOL_WARMUP_ENABLED=false` the binary harness still gets
-/// `run_initial_refresh = true` (see `modes::file::serve`), so a spawned
-/// capability-refresh pass dials plaintext backends through the shared gRPC
-/// pool via `probe_h2c` → `get_sender_for_capability_probe()`. Under
+/// `run_initial_refresh = true` after listeners bind and `/health` is ready
+/// (see `modes::file::serve`, issue #4080), so a spawned capability-refresh
+/// pass dials plaintext backends through the shared gRPC pool via
+/// `probe_h2c` → `get_sender_for_capability_probe()`. Under
 /// `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST=1` that probe occupies the only
 /// shard and inserts a pooled sender the request path will reuse.
 ///
