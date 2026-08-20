@@ -2,7 +2,7 @@
 
 Domain: Build, CLI, configuration precedence, validation, file mode, reload, and migration.
 Agent: Launch-Readiness Agent 01 (execution worker).
-Report PR: https://github.com/ferrum-edge/ferrum-edge/pull/4078
+Report PR: https://github.com/ferrum-edge/ferrum-edge/pull/4078 (closed by maintainer as report-only; do not merge)
 
 ## 1. Tested revision and environment
 
