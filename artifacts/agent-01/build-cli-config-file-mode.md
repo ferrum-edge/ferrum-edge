@@ -24,7 +24,7 @@ Report PR: https://github.com/ferrum-edge/ferrum-edge/pull/4078
 | Parent `FERRUM_*` at start | **none** |
 | Listeners | **127.0.0.1 only**, ports **21000–21099** |
 | Debug binary | `/workspace/target/debug/ferrum-edge` (398 MiB, 2026-08-20 07:53 UTC) |
-| Release binary | **not finished** in this window (compile still running) |
+| Release binary | `/workspace/target/release/ferrum-edge` (79 MiB, 2026-08-20 08:32 UTC; fat LTO, 36m) |
 
 ### Prerequisites installed this run
 
@@ -39,13 +39,13 @@ rdkafka-sys compiled successfully after those packages (`<iostream>` was availab
 
 ## 2. Coverage matrix
 
-**85 rows:** 82 passed, 2 failed, 1 blocked. Includes **16** negative config, **13** reload/atomicity, **3** shutdown/restart, and **J01** complete copy-paste journey.
+**85 rows:** 83 passed, 2 failed, 0 blocked. Includes **16** negative config, **13** reload/atomicity, **3** shutdown/restart, and **J01** complete copy-paste journey.
 
 | ID | Priority | Capability | Mode/Protocol | Method | Expected | Result | Evidence | Issue/PR |
 |----|----------|------------|---------------|--------|----------|--------|----------|----------|
 | B00 | P0 | debug binary present | build | stat ferrum-edge | executable exists | **passed** | `/workspace/target/debug/ferrum-edge` |  |
 | B01 | P0 | missing-protoc build diagnostic | build | hide `/usr/bin/protoc`, touch proto, `cargo build --bin ferrum-edge` | actionable protoc install diagnostic; existing binary preserved | **passed** | `artifacts/agent-01/evidence/missing-protoc.err.txt` |  |
-| B02 | P1 | release binary build | build | `cargo build --release --bin ferrum-edge -j 2` | `target/release/ferrum-edge` | **blocked** | still compiling at report time |  |
+| B02 | P1 | release binary build + live smoke | build/file | `cargo build --release --bin ferrum-edge -j 2`; HTTP+TCP on 21090–21094 | 79 MiB binary; GET `/echo` 200; TCP echo; `health --live` 0 | **passed** | `release-smoke.txt` |  |
 | B03 | P1 | sccache rustc-wrapper missing | build | cargo without wrapper override | documented fallback | **passed** | `artifacts/agent-01/harness/README.md` |  |
 | C01 | P0 | `--help` lists documented subcommands | cli | binary `--help` | exit 0; stdout help; stderr empty; run/validate/reload/version/health/ambient-udp-preflight | **passed** | `cli-help.txt` |  |
 | C02 | P0 | `run --help` flags | cli | binary `run --help` | `-s/-c/-m/-v` | **passed** | `cli-run-help.txt` |  |
@@ -186,9 +186,9 @@ FERRUM_POOL_WARMUP_ENABLED=false \
 
 | Status | Count | Notes |
 |--------|-------|-------|
-| **passed** | 82 | All P0 runtime/startup/reload/health/shutdown/migrate rows except docs #4033 |
+| **passed** | 83 | All P0 runtime/startup/reload/health/shutdown/migrate rows except docs #4033; release smoke included |
 | **failed** | 2 | D03 (`enabled: true` on main docs); R07 (`reload --pid 0`) |
-| **blocked** | 1 | B02 release binary not finished |
+| **blocked** | 0 | Release binary finished (36m fat LTO) |
 | **not-tested** | listed in §8 | cloud secrets, docker/kind, privileged Ambient UDP, PR #4066 worktree runtime |
 
 P0/P1 startup and reload claims were executed against the **real debug binary**, not code-review-only.
@@ -222,7 +222,6 @@ No production code was pushed.
 
 ### Unresolved / out of scope
 
-- Release-profile binary not exercised (B02 blocked).
 - PR #4066 head not checked out in a second worktree (diff reviewed via GitHub API; docs-only, +7/−7).
 - Runtime webhook re-proof of #4038 (validate + source confirmed).
 - `auth_mode: none` is invalid (`single`/`multi` only). Not a product bug; easy fixture footgun.
@@ -251,14 +250,14 @@ No production code was pushed.
 
 ## 9. Confidence and verdict
 
-**Confidence: high** on file-mode startup, validation, precedence, port-0, health (plain + TLS), SIGHUP atomicity, SIGTERM/SIGINT, and migrate-config. All of those ran on the real debug binary at `f4b62fe7d4620d81c836d6418f2957269ac6e115`.
+**Confidence: high** on file-mode startup, validation, precedence, port-0, health (plain + TLS), SIGHUP atomicity, SIGTERM/SIGINT, and migrate-config. Those ran on the real debug binary at `f4b62fe7d4620d81c836d6418f2957269ac6e115`. Release binary (79 MiB) also validated and served HTTP+TCP on loopback.
 
 **Verdict: Ready with explicit risks**
 
-- Runtime file-mode HTTP + TCP, validate, reload fail-closed, health gating, and shutdown/rebind worked on loopback.
+- Runtime file-mode HTTP + TCP, validate, reload fail-closed, health gating, and shutdown/rebind worked on loopback (debug + release smoke).
 - Main-branch docs still ship a failing TCP copy-paste (#4033). That is a launch usability defect, not a silent data-plane failure.
 - `reload --pid 0` is an operator footgun (#4079), Medium.
-- Release binary and container/K8s paths were not completed here.
+- Container/K8s paths were not completed here (docker/kind/kubectl missing).
 
 ## 10. Three most important follow-ups by launch risk
 

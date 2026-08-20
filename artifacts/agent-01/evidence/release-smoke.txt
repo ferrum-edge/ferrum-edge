@@ -1,0 +1,7 @@
+binary=/workspace/target/release/ferrum-edge
+size=79M
+http_status=200
+http_body=release-http-ok
+tcp_echo=b'release-tcp-ping'
+health_live_exit=0
+health_stdout=
