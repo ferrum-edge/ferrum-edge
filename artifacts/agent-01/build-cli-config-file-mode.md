@@ -19,7 +19,7 @@ Report PR: https://github.com/ferrum-edge/ferrum-edge/pull/4078
 | openssl / curl / python | OpenSSL 3.0.13 / curl 8.5.0 / Python 3.12.3 |
 | g++ / gcc / clang / mold | 13.3.0 / 13.3.0 / 18.1.3 / 2.30.0 |
 | sccache | **missing**; `.cargo/config.toml` sets `build.rustc-wrapper = "sccache"` |
-| Build profile | debug `--bin ferrum-edge` only; `RUSTFLAGS='-C debuginfo=0'`; `-j 2`; `cargo --config 'build.rustc-wrapper=""'` |
+| Build profile | debug then release `--bin ferrum-edge`; `RUSTFLAGS='-C debuginfo=0'`; `-j 2`; `cargo --config 'build.rustc-wrapper=""'` |
 | Features | default (`crypto-ring`); no `cloud-secrets` / `fips` / `ebpf` |
 | Parent `FERRUM_*` at start | **none** |
 | Listeners | **127.0.0.1 only**, ports **21000–21099** |
