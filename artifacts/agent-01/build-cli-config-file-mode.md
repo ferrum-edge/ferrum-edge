@@ -202,7 +202,7 @@ P0/P1 startup and reload claims were executed against the **real debug binary**,
 | https://github.com/ferrum-edge/ferrum-edge/issues/4038#issuecomment-5353181175 | Validate admits `proxy_id` only; attachment still `proxies[].plugins` |
 | https://github.com/ferrum-edge/ferrum-edge/issues/4079 | **New** — `reload --pid 0` → `kill -HUP 0` |
 | https://github.com/ferrum-edge/ferrum-edge/pull/4066 | Unmerged docs-only fix; **not treated as a fix on main** |
-| https://github.com/ferrum-edge/ferrum-edge/pull/4078 | This artifacts-only report |
+| https://github.com/ferrum-edge/ferrum-edge/pull/4078 | This artifacts-only report (closed by maintainer as report-only) |
 
 No production code was pushed.
 
