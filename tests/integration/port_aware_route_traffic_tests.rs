@@ -416,10 +416,28 @@ async fn gateway_listener_ports_follow_config_reload_add_and_withdraw() {
         vec![listener_a_port]
     );
     assert_eq!(http_get(listener_a_port, "/api/x").await.0, 200);
+    // The authoritative check is the manager's own port table: `reserve_free_port`
+    // released this port, so an unrelated parallel test may legitimately be
+    // listening on it by now. The wire check below therefore only has to prove
+    // that whatever answers is not this gateway serving the undeclared route.
     assert!(
-        try_http_get(listener_b_port, "/api/x").await.is_err(),
-        "an undeclared listener port must not be bound"
+        !handles
+            .gateway_listeners
+            .active_ports()
+            .await
+            .contains(&listener_b_port),
+        "an undeclared listener port must not be bound by the gateway"
     );
+    let undeclared =
+        tokio::time::timeout(Duration::from_secs(2), try_http_get(listener_b_port, "/api/x")).await;
+    match undeclared {
+        Err(_) | Ok(Err(_)) => {}
+        Ok(Ok((status, body))) => assert_ne!(
+            (status, body.as_str()),
+            (200, "listener-b"),
+            "an undeclared listener port must not serve the gateway route"
+        ),
+    }
 
     // ── Update: add a second listener ────────────────────────────────────
     let outcome = handles.proxy_state.update_config(config_with(vec![
@@ -648,60 +666,79 @@ async fn a_config_publication_before_the_supervisor_starts_is_not_missed() {
     use ferrum_edge::proxy::gateway_listener::{GatewayListenerManager, GatewayListenerTls};
 
     let (backend, _b) = start_body_backend(b"listener-a").await;
-    let listener_port = reserve_free_port().await;
 
-    let state = ProxyState::new(
-        config_with(vec![]),
-        DnsCache::new(DnsConfig::default()),
-        test_env_config(0, 0),
-        None,
-        None,
-    )
-    .expect("proxy state")
-    .0;
+    // The manager binds the Gateway listener port itself, so the reserved port
+    // is necessarily released before production claims it. Retry the whole
+    // attempt when an unrelated parallel test wins that race; a genuine
+    // reconcile regression still fails on the final attempt.
+    for attempt in 1..=GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+        let listener_port = reserve_free_port().await;
 
-    let manager = std::sync::Arc::new(GatewayListenerManager::new(
-        state.clone(),
-        std::net::IpAddr::from([127, 0, 0, 1]),
-        GatewayListenerTls::default(),
-    ));
+        let state = ProxyState::new(
+            config_with(vec![]),
+            DnsCache::new(DnsConfig::default()),
+            test_env_config(0, 0),
+            None,
+            None,
+        )
+        .expect("proxy state")
+        .0;
 
-    // Readiness reconcile: nothing to bind yet.
-    manager.reconcile().await;
-    assert!(manager.active_ports().await.is_empty());
+        let manager = std::sync::Arc::new(GatewayListenerManager::new(
+            state.clone(),
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            GatewayListenerTls::default(),
+        ));
 
-    // The publication happens HERE — after the readiness reconcile and before
-    // the supervisor task exists.
-    let outcome = state.update_config(config_with(vec![port_scoped_proxy(
-        "gw-a",
-        backend,
-        Some(listener_port),
-    )]));
-    assert!(
-        matches!(outcome, ferrum_edge::proxy::ConfigApplyOutcome::Applied),
-        "publication must apply: {outcome:?}"
-    );
+        // Readiness reconcile: nothing to bind yet.
+        manager.reconcile().await;
+        assert!(manager.active_ports().await.is_empty());
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let supervisor = tokio::spawn(manager.clone().run(shutdown_rx));
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if manager.active_ports().await == vec![listener_port] {
-            break;
-        }
+        // The publication happens HERE — after the readiness reconcile and before
+        // the supervisor task exists.
+        let outcome = state.update_config(config_with(vec![port_scoped_proxy(
+            "gw-a",
+            backend,
+            Some(listener_port),
+        )]));
         assert!(
-            std::time::Instant::now() < deadline,
-            "the publication made before the supervisor started was never reconciled; \
-             failures {:?}",
-            manager.bind_failures()
+            matches!(outcome, ferrum_edge::proxy::ConfigApplyOutcome::Applied),
+            "publication must apply: {outcome:?}"
         );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert_eq!(http_get(listener_port, "/api/x").await.1, "listener-a");
 
-    let _ = shutdown_tx.send(true);
-    let _ = tokio::time::timeout(Duration::from_secs(5), supervisor).await;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let supervisor = tokio::spawn(manager.clone().run(shutdown_rx));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut reconciled = false;
+        while std::time::Instant::now() < deadline {
+            if manager.active_ports().await == vec![listener_port] {
+                reconciled = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        if reconciled {
+            assert_eq!(http_get(listener_port, "/api/x").await.1, "listener-a");
+            let _ = shutdown_tx.send(true);
+            let _ = tokio::time::timeout(Duration::from_secs(5), supervisor).await;
+            return;
+        }
+
+        let bind_failures = manager.bind_failures();
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), supervisor).await;
+        eprintln!(
+            "pre-supervisor publication attempt {attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} \
+             did not reconcile port {listener_port}: {bind_failures:?}"
+        );
+        assert!(
+            attempt < GATEWAY_LISTENER_STARTUP_ATTEMPTS,
+            "the publication made before the supervisor started was never reconciled \
+             after {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts; failures {bind_failures:?}"
+        );
+    }
 }
 
 /// Listener routing admission is part of the exact request/config generation:
