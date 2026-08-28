@@ -1897,6 +1897,13 @@ async fn trust_domain_alias_accepts_baggage_principal_from_aliased_domain() {
     runtime
         .trust_domain_aliases
         .push(TrustDomain::new("aliased.local").expect("trust domain"));
+    // Pin the relaying ztunnel by EXACT SPIFFE id. It asserts an identity in
+    // `default` while living in `istio-system`, and a bare service-account
+    // assertor only carries same-namespace authority (issue #4274); without the
+    // pin the baggage would be dropped for a namespace reason and this test
+    // would stop exercising the trust-domain alias at all.
+    runtime.trusted_hbone_assertors =
+        vec!["spiffe://cluster.local/ns/istio-system/sa/ztunnel".to_string()];
     let mesh = mesh_config_with(Vec::new(), Vec::new(), vec![allow]);
     let config = ferrum_edge::config::types::GatewayConfig {
         version: "test".to_string(),
@@ -1962,6 +1969,11 @@ async fn trust_domain_alias_accepts_baggage_principal_from_aliased_domain() {
         !ctx.metadata
             .contains_key("mesh_authz.ignored_baggage.trust_domain_mismatch"),
         "trust-domain alias must keep the baggage principal in scope, got metadata {:?}",
+        ctx.metadata
+    );
+    assert!(
+        !ctx.metadata.contains_key("mesh_authz.ignored_baggage"),
+        "an exact-SPIFFE assertor keeps cross-namespace authority, got metadata {:?}",
         ctx.metadata
     );
 }

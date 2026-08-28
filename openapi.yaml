@@ -20401,7 +20401,12 @@ components:
             Allow-list of identity-asserting infrastructure components whose
             HBONE baggage `source.principal` may rewrite the authz principal.
             Bare service-account names match any peer whose SPIFFE path ends
-            with `/sa/<name>`; full SPIFFE IDs match exactly. Default is
+            with `/sa/<name>` and grant assertion authority ONLY inside the
+            matched peer's own `ns/<namespace>` (a tenant can name its own
+            pod's service account, so a namespace-blind match would be a
+            cross-tenant bypass); the check fails closed when either identity
+            has no namespace segment. Full SPIFFE IDs match exactly and keep
+            mesh-wide (cross-namespace) assertion authority. Default is
             `["ztunnel", "waypoint"]`. Explicit empty array disables all
             baggage rewriting.
 
@@ -21064,9 +21069,13 @@ components:
             Allow-list of identity-asserting infrastructure components whose
             HBONE baggage `source.principal` may be trusted for workload
             metrics source attribution. Bare service-account names match any
-            peer whose SPIFFE path ends with `/sa/<name>`; full SPIFFE IDs
-            match exactly. Default is `["ztunnel", "waypoint"]`. Explicit
-            empty array disables baggage-derived source attribution.
+            peer whose SPIFFE path ends with `/sa/<name>` and grant attribution
+            authority ONLY inside the matched peer's own `ns/<namespace>`; full
+            SPIFFE IDs match exactly and keep mesh-wide (cross-namespace)
+            authority. This gate is the same authoritative decision `mesh_authz`
+            applies, so attribution cannot diverge from authorization. Default
+            is `["ztunnel", "waypoint"]`. Explicit empty array disables
+            baggage-derived source attribution.
         sampling_percentage:
           type: number
           format: double

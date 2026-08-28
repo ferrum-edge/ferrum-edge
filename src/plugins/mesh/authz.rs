@@ -1315,12 +1315,24 @@ fn jwt_scalar_attribute_to_mesh_attribute(
 /// Operators may supply either a bare service-account name (the Istio default
 /// for ztunnel and waypoints), or a full SPIFFE ID to pin a specific
 /// assertor identity, trust domain, and namespace.
+///
+/// The two forms do NOT carry the same authority (issue #4274). A bare
+/// service-account name matches on the SA path segment alone, so any tenant
+/// that can create a pod with `serviceAccountName: waypoint` in its own
+/// namespace receives a legitimate SVID that satisfies it. Such a peer may
+/// therefore only assert an identity inside its OWN namespace. Mesh-wide
+/// assertion (rewriting the authorization principal to a workload in another
+/// namespace) requires an exact `spiffe://` entry, which pins the assertor's
+/// namespace, trust domain, and service account and cannot be minted by an
+/// ordinary tenant.
 #[derive(Debug, Clone)]
 pub(crate) enum TrustedAssertor {
     /// Match any peer whose SPIFFE-ID path encodes this Kubernetes service
-    /// account per the Istio convention `ns/<ns>/sa/<sa>`.
+    /// account per the Istio convention `ns/<ns>/sa/<sa>`. Namespace-scoped
+    /// assertion authority only — see [`HboneAssertionVerdict`].
     ServiceAccount(String),
-    /// Match a specific SPIFFE-ID exactly.
+    /// Match a specific SPIFFE-ID exactly. Carries mesh-wide (cross-namespace)
+    /// assertion authority because the operator pinned the exact identity.
     Spiffe(SpiffeId),
 }
 
@@ -1333,11 +1345,122 @@ impl TrustedAssertor {
     }
 }
 
+/// Disposition of an HBONE `baggage: source.principal` assertion.
+///
+/// Produced by [`evaluate_hbone_baggage_assertion`], the single authoritative
+/// gate shared by `mesh_authz` (authorization principal) and
+/// `workload_metrics` (telemetry attribution principal) so the two can never
+/// drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HboneAssertionVerdict {
+    /// The peer is trusted to assert this identity; use the baggage principal.
+    Honored,
+    /// The peer is not on the trusted-assertor allow-list at all.
+    UntrustedAssertor,
+    /// The peer is a trusted assertor, but the asserted identity's trust
+    /// domain neither matched the peer cert's nor a configured alias.
+    TrustDomainMismatch,
+    /// The peer matched only by BARE SERVICE-ACCOUNT NAME and tried to assert
+    /// an identity outside its own namespace (issue #4274). Namespace-blind
+    /// SA matching is satisfiable by any tenant that can name its own pod's
+    /// service account, so cross-namespace authority must be granted
+    /// explicitly with an exact `spiffe://` allow-list entry.
+    CrossNamespaceAssertion,
+}
+
+impl HboneAssertionVerdict {
+    /// Stable, low-cardinality diagnostic reason. `Honored` has none.
+    pub(crate) const fn ignored_baggage_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Honored => None,
+            Self::UntrustedAssertor => Some("untrusted_assertor"),
+            Self::TrustDomainMismatch => Some("trust_domain_mismatch"),
+            Self::CrossNamespaceAssertion => Some(CROSS_NAMESPACE_ASSERTION_REASON),
+        }
+    }
+}
+
+/// Stable diagnostic reason for a refused cross-namespace baggage assertion.
+pub(crate) const CROSS_NAMESPACE_ASSERTION_REASON: &str = "cross_namespace_assertion";
+
+/// The single authoritative HBONE baggage-assertion gate.
+///
+/// Shared by `mesh_authz` and `workload_metrics` so the authorization decision
+/// and the telemetry attribution always apply the SAME trust gate — a forked
+/// copy is exactly how a workload-to-workload baggage spoof could slip into
+/// dashboards / the service graph while authz still correctly rejects it.
+///
+/// Checks, in order (each is fail-closed):
+///
+/// 1. the peer must match at least one allow-list entry;
+/// 2. the asserted identity's trust domain must match the peer cert's or a
+///    configured alias;
+/// 3. a peer matched ONLY by bare service-account name may assert only inside
+///    its own namespace. A peer matched by an exact `spiffe://` entry keeps
+///    mesh-wide authority.
+///
+/// Step 3 fails closed when either side has no `ns/<namespace>` path segment:
+/// a bare-SA assertor that cannot prove its own namespace has nothing to scope
+/// the assertion to.
+pub(crate) fn evaluate_hbone_baggage_assertion(
+    assertors: &[TrustedAssertor],
+    trust_domain_aliases: &[TrustDomain],
+    peer: &SpiffeId,
+    asserted: &SpiffeId,
+) -> HboneAssertionVerdict {
+    let mut matched_exact = false;
+    let mut matched_service_account = false;
+    for entry in assertors {
+        if !entry.matches(peer) {
+            continue;
+        }
+        match entry {
+            TrustedAssertor::Spiffe(_) => {
+                matched_exact = true;
+                break;
+            }
+            TrustedAssertor::ServiceAccount(_) => matched_service_account = true,
+        }
+    }
+    if !matched_exact && !matched_service_account {
+        return HboneAssertionVerdict::UntrustedAssertor;
+    }
+    if !trust_domain_allowed(
+        peer.trust_domain(),
+        asserted.trust_domain(),
+        trust_domain_aliases,
+    ) {
+        return HboneAssertionVerdict::TrustDomainMismatch;
+    }
+    if matched_exact {
+        return HboneAssertionVerdict::Honored;
+    }
+    match (peer.namespace(), asserted.namespace()) {
+        (Some(peer_ns), Some(asserted_ns)) if peer_ns == asserted_ns => {
+            HboneAssertionVerdict::Honored
+        }
+        _ => HboneAssertionVerdict::CrossNamespaceAssertion,
+    }
+}
+
+/// Whether an asserted identity's trust domain is acceptable for `peer_td`.
+pub(crate) fn trust_domain_allowed(
+    peer_td: &TrustDomain,
+    asserted_td: &TrustDomain,
+    aliases: &[TrustDomain],
+) -> bool {
+    peer_td == asserted_td || aliases.iter().any(|alias| alias == asserted_td)
+}
+
 /// Default trusted-assertor allow-list used when the plugin config does not
 /// supply one. Matches Istio ambient's `ztunnel` and `waypoint` service
 /// accounts. Operators with custom waypoint SA names (Gateway-managed
 /// waypoints often use `<gateway-name>` or `<gateway-name>-istio`) must
 /// override this list to add their names.
+///
+/// These are bare service-account names, so they only grant SAME-NAMESPACE
+/// assertion authority (issue #4274). A shared ztunnel / waypoint that asserts
+/// identities across namespaces must be pinned by its exact `spiffe://` id.
 const DEFAULT_TRUSTED_HBONE_ASSERTOR_SA_NAMES: &[&str] = &["ztunnel", "waypoint"];
 
 fn ambient_udp_source_scope_index(
@@ -2598,8 +2721,11 @@ impl Plugin for MeshAuthz {
         let source_for_log = source_principal.as_ref().map(|id| id.as_str().to_string());
         let trust_domain_mismatch = baggage_outcome == BaggageOutcome::TrustDomainMismatch;
         let untrusted_assertor = baggage_outcome == BaggageOutcome::UntrustedAssertor;
-        let asserted_identity_rejected =
-            unauthenticated_hbone_baggage || untrusted_assertor || trust_domain_mismatch;
+        let cross_namespace_assertion = baggage_outcome == BaggageOutcome::CrossNamespaceAssertion;
+        let asserted_identity_rejected = unauthenticated_hbone_baggage
+            || untrusted_assertor
+            || trust_domain_mismatch
+            || cross_namespace_assertion;
         if trust_domain_mismatch {
             record_ignored_baggage_reason(&mut ctx.metadata, "trust_domain_mismatch");
             ctx.metadata.insert(
@@ -2614,12 +2740,23 @@ impl Plugin for MeshAuthz {
                 "true".to_string(),
             );
         }
+        if cross_namespace_assertion {
+            record_ignored_baggage_reason(&mut ctx.metadata, CROSS_NAMESPACE_ASSERTION_REASON);
+            ctx.metadata.insert(
+                "mesh_authz.ignored_baggage.cross_namespace_assertion".to_string(),
+                "true".to_string(),
+            );
+        }
         if self.per_pod_policy_scoping {
             if unauthenticated_hbone_baggage {
                 crate::modes::mesh::node_waypoint_observability::record_asserted_identity_rejected(
                     crate::modes::mesh::node_waypoint_observability::NodeWaypointAssertedIdentityRejectReason::UnauthenticatedHbone,
                 );
-            } else if untrusted_assertor {
+            } else if untrusted_assertor || cross_namespace_assertion {
+                // A bare-SA assertor reaching outside its own namespace is an
+                // assertor that is not trusted FOR THAT IDENTITY, so it shares
+                // the existing bounded `untrusted_assertor` ADR counter rather
+                // than widening the published metric schema.
                 crate::modes::mesh::node_waypoint_observability::record_asserted_identity_rejected(
                     crate::modes::mesh::node_waypoint_observability::NodeWaypointAssertedIdentityRejectReason::UntrustedAssertor,
                 );
@@ -3115,6 +3252,11 @@ impl Plugin for MeshAuthz {
                     "mesh_authz.deny_policy".to_string(),
                     "untrusted_assertor".to_string(),
                 );
+            } else if cross_namespace_assertion {
+                ctx.metadata.insert(
+                    "mesh_authz.deny_policy".to_string(),
+                    CROSS_NAMESPACE_ASSERTION_REASON.to_string(),
+                );
             } else if self.per_pod_policy_scoping {
                 // Identity accept/reject already recorded above; AuthorizationPolicy
                 // denies are a distinct ADR signal.
@@ -3127,8 +3269,9 @@ impl Plugin for MeshAuthz {
             // trusted assertors record the workload identity that authz
             // evaluated, not the ztunnel/waypoint peer cert. The
             // synthesised-deny branches (untrusted_assertor /
-            // trust_domain_mismatch / unauthenticated_baggage) carry the
-            // peer cert identity or `None`, matching the authz request.
+            // cross_namespace_assertion / trust_domain_mismatch /
+            // unauthenticated_baggage) carry the peer cert identity or `None`,
+            // matching the authz request.
             self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
         }
         result
@@ -3442,6 +3585,10 @@ impl MeshAuthz {
     ///   in [`MeshAuthz::trust_domain_aliases`]. Baggage is dropped; the
     ///   returned principal is the peer cert identity (typically the
     ///   ztunnel's own SPIFFE id).
+    /// - `CrossNamespaceAssertion` — the peer matched the allow-list only by
+    ///   BARE SERVICE-ACCOUNT NAME and asserted an identity outside its own
+    ///   namespace (issue #4274). Baggage is dropped; the returned principal
+    ///   is the peer cert identity.
     /// - `NoBaggageOrNonHbone` — non-HBONE request, no baggage, or no
     ///   authenticated peer to begin with. No diagnostic stamped.
     fn resolve_source_principal(&self, ctx: &RequestContext) -> (Option<SpiffeId>, BaggageOutcome) {
@@ -3459,45 +3606,32 @@ impl MeshAuthz {
                 .chain(ctx.headers.get(BAGGAGE_HEADER).map(String::as_str)),
         )
         .source_principal;
-        if !is_trusted_hbone_assertor(&self.trusted_hbone_assertors, peer) {
-            // Stamp `UntrustedAssertor` only when the request actually carried
-            // a baggage source identity that we suppressed. Without that
-            // signal there's nothing observable for operators to triage and
-            // the metadata would just be noise on every non-assertor HBONE
-            // flow.
-            let outcome = if baggage_principal.is_some() {
-                BaggageOutcome::UntrustedAssertor
-            } else {
-                BaggageOutcome::NoBaggageOrNonHbone
-            };
-            return (Some(peer.clone()), outcome);
-        }
-        match baggage_principal {
-            Some(b) if self.trust_domain_allowed(peer.trust_domain(), b.trust_domain()) => {
-                (Some(b), BaggageOutcome::Honored)
+        // Only an actually-present baggage source identity can be suppressed,
+        // so the refusal outcomes are stamped only when there is something for
+        // operators to triage; without that signal the metadata would just be
+        // noise on every non-assertor HBONE flow.
+        let Some(baggage) = baggage_principal else {
+            return (Some(peer.clone()), BaggageOutcome::NoBaggageOrNonHbone);
+        };
+        let verdict = evaluate_hbone_baggage_assertion(
+            &self.trusted_hbone_assertors,
+            &self.trust_domain_aliases,
+            peer,
+            &baggage,
+        );
+        match verdict {
+            HboneAssertionVerdict::Honored => (Some(baggage), BaggageOutcome::Honored),
+            HboneAssertionVerdict::UntrustedAssertor => {
+                (Some(peer.clone()), BaggageOutcome::UntrustedAssertor)
             }
-            Some(_) => (Some(peer.clone()), BaggageOutcome::TrustDomainMismatch),
-            None => (Some(peer.clone()), BaggageOutcome::NoBaggageOrNonHbone),
+            HboneAssertionVerdict::TrustDomainMismatch => {
+                (Some(peer.clone()), BaggageOutcome::TrustDomainMismatch)
+            }
+            HboneAssertionVerdict::CrossNamespaceAssertion => {
+                (Some(peer.clone()), BaggageOutcome::CrossNamespaceAssertion)
+            }
         }
     }
-
-    fn trust_domain_allowed(&self, peer_td: &TrustDomain, baggage_td: &TrustDomain) -> bool {
-        peer_td == baggage_td
-            || self
-                .trust_domain_aliases
-                .iter()
-                .any(|alias| alias == baggage_td)
-    }
-}
-
-/// Whether `peer` is on the trusted-assertor allow-list.
-///
-/// Shared by `mesh_authz` and `workload_metrics` so the authorization decision
-/// and the telemetry attribution always apply the SAME baggage trust gate — a
-/// forked copy is exactly how a workload-to-workload baggage spoof could slip
-/// into dashboards / the service graph while authz still correctly rejects it.
-pub(crate) fn is_trusted_hbone_assertor(assertors: &[TrustedAssertor], peer: &SpiffeId) -> bool {
-    assertors.iter().any(|entry| entry.matches(peer))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3510,6 +3644,9 @@ enum BaggageOutcome {
     /// Baggage's trust domain did not match the peer's or an alias; returned
     /// principal is the peer cert identity.
     TrustDomainMismatch,
+    /// A bare-service-account-matched assertor tried to assert an identity in
+    /// another namespace; returned principal is the peer cert identity.
+    CrossNamespaceAssertion,
     /// Nothing to surface — non-HBONE request, no baggage, or no authenticated
     /// peer.
     NoBaggageOrNonHbone,
@@ -3665,6 +3802,22 @@ fn parse_trusted_hbone_assertor(raw: &str) -> Result<TrustedAssertor, String> {
 }
 
 fn default_trusted_hbone_assertors() -> Vec<TrustedAssertor> {
+    // One-shot operator advisory: the built-in defaults are BARE service-account
+    // names, which only carry same-namespace assertion authority (issue #4274).
+    // A shared ztunnel / waypoint that legitimately fronts workloads in other
+    // namespaces must be pinned by its exact `spiffe://` id. Emitted once per
+    // process so config reloads / slice updates cannot make it noisy. No
+    // identity, credential, or baggage value is logged.
+    static DEFAULT_ASSERTOR_ADVISORY: std::sync::Once = std::sync::Once::new();
+    DEFAULT_ASSERTOR_ADVISORY.call_once(|| {
+        tracing::warn!(
+            assertors = ?DEFAULT_TRUSTED_HBONE_ASSERTOR_SA_NAMES,
+            "mesh: trusted_hbone_assertors is unset; using the built-in service-account \
+             defaults. A bare service-account assertor may only assert identities in its \
+             OWN namespace. Configure exact 'spiffe://' entries (or \
+             FERRUM_MESH_TRUSTED_HBONE_ASSERTORS) to grant cross-namespace assertion authority"
+        );
+    });
     DEFAULT_TRUSTED_HBONE_ASSERTOR_SA_NAMES
         .iter()
         .map(|name| TrustedAssertor::ServiceAccount((*name).to_string()))

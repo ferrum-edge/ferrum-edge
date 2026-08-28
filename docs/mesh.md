@@ -215,7 +215,7 @@ Where to look, and what to expect, when the mesh data plane misbehaves. All slic
 | **CP goes down after startup** | The last-good slice is retained (ArcSwap snapshot keeps serving). No new slices arrive; the client backs off and reconnects. | `GET /mesh/config-drift` shows `slice.last_received_at` / `age_seconds` going stale; alert on `ferrum_mesh_config_last_received_timestamp_seconds`. **SVID interaction:** while disconnected, SVID rotation still proceeds via the CA backend (SPIRE Agent / internal); the federation poller and CP-pushed trust bundles do not update, so a *new* federated trust domain will not appear until the CP returns. Existing identities and bundles remain valid until their own TTLs expire. |
 | **Slice rejected (invalid update)** | The update is logged (`Ignoring invalid mesh slice update` / `Ignoring invalid initial mesh slice`) and dropped; the last accepted slice keeps serving. A rejected slice never advances `config-drift` `last_received_at`/fingerprint and never alters inbound trust (staged SPIFFE bundle is dropped on rejection). Over xDS, a malformed mesh-slice carrier causes the DP to NACK the whole ECDS response and retain the previous slice. | Search logs for `Ignoring invalid` and the `mesh_slice_version` + `error`. Compare `slice.fingerprint` across DPs via `GET /mesh/config-drift` to spot split-brain. |
 | **eBPF capture unavailable** | The node-agent probes kernel ≥ 5.7 + cgroup v2 + bpffs once at startup. On a miss it sets `ferrum_mesh_node_topology_degraded{reason}` to `1` (reason ∈ `kernel_too_old` / `cgroup_v1` / `bpffs_missing`) and, with the default `FERRUM_NODE_AGENT_FALLBACK_MODE=fail`, refuses to start. `=iptables` falls back to host iptables capture (needs a custom image with `/bin/sh` + `iptables`). On a build without `--features ebpf`, the orig-dst bridge logs once and exits and node-waypoint accept fails closed. | Alert on `ferrum_mesh_node_topology_degraded == 1` and node-agent readiness. See [Node Agent Mode](#node-agent-mode) and [docs/node_agent.md](node_agent.md#kernel-fallback) for the per-reason remediation table. The rest of the data plane (slice apply, `mesh_authz`, `workload_metrics`, HBONE) is unaffected by node-level capture degradation. |
-| **Requests denied unexpectedly** | `mesh_authz` evaluated DENY-first then implicit-deny-on-no-ALLOW-match. | `GET /mesh/policy-denies/recent` (JWT) groups recent denies by `(rule, source, destination, reason)`; correlate with `ferrum_mesh_requests_total{response_code="403"}`. Transaction logs carry `mesh_authz.deny_policy` (e.g. `untrusted_assertor`, `trust_domain_mismatch`, `unauthenticated_baggage`) and `mesh_authz.scope_missing` (node-waypoint per-pod scope not yet enrolled). |
+| **Requests denied unexpectedly** | `mesh_authz` evaluated DENY-first then implicit-deny-on-no-ALLOW-match. | `GET /mesh/policy-denies/recent` (JWT) groups recent denies by `(rule, source, destination, reason)`; correlate with `ferrum_mesh_requests_total{response_code="403"}`. Transaction logs carry `mesh_authz.deny_policy` (e.g. `untrusted_assertor`, `cross_namespace_assertion`, `trust_domain_mismatch`, `unauthenticated_baggage`) and `mesh_authz.scope_missing` (node-waypoint per-pod scope not yet enrolled). |
 | **mTLS / HBONE handshake failures** | Peer cert chain or SPIFFE trust-domain validation failed, or a plaintext peer hit a STRICT listener. | `ferrum_mesh_mtls_handshake_failures_total{reason}` (`timeout` / `error`) for mesh-wide TLS. On NodeWaypoint also `ferrum_mesh_node_waypoint_hbone_handshakes_total{phase,result}` (phased inbound_tls / inbound_connect / outbound_dial; see `docs/plans/node_waypoint_transport_adr.md`). Check that gateway SVID material (`FERRUM_GATEWAY_SVID_*`) and the slice trust bundles cover the peer's trust domain; for HBONE baggage rewrites, confirm the assertor is on `FERRUM_MESH_TRUSTED_HBONE_ASSERTORS`. Remember PERMISSIVE-with-no-client-CA admits unauthenticated peers (see [Limitations](#limitations-and-not-supported)). **Read the client-visible label first:** `Sidecar mTLS backend unavailable: …` is an outbound `:15006` SVID-mTLS failure and involves no tunnel, while `HBONE backend unavailable: …` is an Ambient/waypoint CONNECT over `:15008` — the two have different remediations. The body carries only a fixed phase name; the operator `error!` record uses the same closed-cardinality phase plus `error_kind` (and CONNECT `peer_status` when present) and does not interpolate peer address, identity, or verifier text. Two `FERRUM_MESH_CA_BACKEND=internal` processes can never handshake each other (each mints its own root) — see [File-Based SVIDs: Two-Process Local Mesh](#file-based-svids-two-process-local-mesh). |
 | **Cert / CA health** | SVID rotation or CA backend problems. | `ferrum_mesh_cert_expiry_seconds`, `ferrum_mesh_cert_rotation_failures_total`, `ferrum_mesh_ca_health{ca_type}`, `ferrum_mesh_trust_bundle_version`. |
 
@@ -2113,8 +2113,29 @@ trusted_hbone_assertors = ["ztunnel", "waypoint"]
 
 Each entry is matched against the peer's SPIFFE id as follows:
 
-- **Bare service-account name** (e.g., `ztunnel`): matches any peer whose path is `<...>/sa/<name>` per the Istio convention `ns/<ns>/sa/<sa>`. Trust-domain-independent — `spiffe://cluster.local/.../sa/ztunnel` and `spiffe://partner.local/.../sa/ztunnel` both match.
-- **Full SPIFFE id** (e.g., `spiffe://cluster.local/ns/istio-system/sa/ztunnel`): exact-identity match including trust domain, namespace, and service account.
+- **Bare service-account name** (e.g., `ztunnel`): matches any peer whose path is `<...>/sa/<name>` per the Istio convention `ns/<ns>/sa/<sa>`. The match itself is namespace- and trust-domain-independent — `spiffe://cluster.local/ns/team-a/sa/ztunnel` and `spiffe://partner.local/ns/team-b/sa/ztunnel` both match. **A peer admitted this way may only assert an identity in its OWN namespace.**
+- **Full SPIFFE id** (e.g., `spiffe://cluster.local/ns/istio-system/sa/ztunnel`): exact-identity match including trust domain, namespace, and service account. A peer admitted this way keeps **mesh-wide (cross-namespace)** assertion authority.
+
+#### Namespace boundary on bare service-account entries
+
+A bare service-account entry is satisfiable by any tenant: creating a pod with `serviceAccountName: waypoint` in namespace `attacker` yields a legitimate `spiffe://cluster.local/ns/attacker/sa/waypoint` SVID that matches the shipped default allow-list. Because the rewritten baggage principal becomes the authorization principal (`source.principal`, `source.namespace`, `source.trustDomain` all derive from it) **and** the `workload_metrics` attribution principal, a namespace-blind match would let that tenant authorize and attribute as `spiffe://cluster.local/ns/prod/sa/payments`.
+
+Ferrum therefore binds a bare-SA-matched assertor to its own namespace:
+
+| Allow-list entry that matched the peer | Assertion scope |
+|---|---|
+| Bare service-account name | The peer's own `ns/<namespace>` only |
+| Exact `spiffe://` id | Mesh-wide (any namespace in an accepted trust domain) |
+
+The namespace check fails **closed**: if either the peer SVID or the asserted identity has no `ns/<namespace>` path segment, a bare-SA assertor cannot prove a scope and the baggage is dropped. The trust-domain check (below) still applies first and is unchanged. `mesh_authz` and `workload_metrics` share one authoritative decision (`evaluate_hbone_baggage_assertion`) so authorization and telemetry attribution cannot drift.
+
+**A shared ztunnel or waypoint that legitimately fronts workloads in other namespaces must be pinned by its exact SPIFFE id.** For example, an ambient ztunnel in `istio-system` relaying identities from every namespace needs:
+
+```
+FERRUM_MESH_TRUSTED_HBONE_ASSERTORS="spiffe://cluster.local/ns/istio-system/sa/ztunnel"
+```
+
+When the allow-list falls back to the built-in service-account defaults, Ferrum logs a one-time startup advisory naming the defaults and this restriction. The advisory logs the default SA names only — never a peer identity, asserted principal, or baggage value.
 
 Operators with Gateway-managed waypoints often run with SA names like `<gateway-name>-istio` instead of `waypoint`; override the allow-list via `FERRUM_MESH_TRUSTED_HBONE_ASSERTORS` (comma-separated, mix-and-match SA names and full SPIFFE ids):
 
@@ -2127,6 +2148,8 @@ When the env var is unset or empty, mesh injection usually uses the defaults. Th
 `FERRUM_MESH_TRUST_DOMAIN_ALIASES` continues to gate the baggage identity's trust domain — both checks apply to a baggage rewrite.
 
 **Observability**: when baggage is dropped because the peer is not a trusted assertor, transaction logs surface `mesh_authz.ignored_baggage=untrusted_assertor` and `mesh_authz.ignored_baggage.untrusted_assertor=true`. If the resulting authz decision is a DENY, `mesh_authz.deny_policy` is stamped as `untrusted_assertor`. Trust-domain-mismatch diagnostics retain their existing `trust_domain_mismatch` reason.
+
+When baggage is dropped because a bare-service-account assertor reached outside its own namespace, the reason is `cross_namespace_assertion`: `mesh_authz.ignored_baggage=cross_namespace_assertion`, `mesh_authz.ignored_baggage.cross_namespace_assertion=true`, `mesh_authz.deny_policy=cross_namespace_assertion` on a resulting DENY, and `mesh.ignored_baggage=cross_namespace_assertion` on the `workload_metrics` side. The reason set is fixed and low-cardinality; no asserted principal or baggage value is logged. Under `NodeWaypoint` per-pod scoping this refusal increments the existing bounded `asserted_identity_rejected{reason="untrusted_assertor"}` counter — an assertor reaching outside its namespace is an assertor not trusted for that identity — so the published metric schema is unchanged.
 
 ## RequestAuthentication
 

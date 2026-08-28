@@ -608,6 +608,7 @@ async fn mesh_authz_ambient_udp_applies_scope_for_validated_source_pod() {
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": ambient_udp_source_scoping_slice(),
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": [AMBIENT_UDP_ZTUNNEL_ASSERTOR],
     }))
     .expect("plugin config");
     let mut ctx = ambient_udp_request_context(
@@ -646,6 +647,7 @@ async fn mesh_authz_ambient_udp_retains_identical_duplicate_pod_scopes() {
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": [AMBIENT_UDP_ZTUNNEL_ASSERTOR],
     }))
     .expect("plugin config");
     let mut ctx = ambient_udp_request_context(
@@ -688,6 +690,7 @@ async fn mesh_authz_ambient_udp_suppresses_conflicting_duplicate_pod_scopes() {
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": [AMBIENT_UDP_ZTUNNEL_ASSERTOR],
     }))
     .expect("plugin config");
     let mut ctx = ambient_udp_request_context(
@@ -721,6 +724,7 @@ async fn mesh_authz_ambient_udp_missing_or_invalid_pod_evidence_uses_gateway_pri
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": [AMBIENT_UDP_ZTUNNEL_ASSERTOR],
     }))
     .expect("plugin config");
     for baggage in [
@@ -752,6 +756,7 @@ async fn mesh_authz_ambient_udp_untrusted_stamp_cannot_activate_scoped_policy() 
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": ambient_udp_source_scoping_slice(),
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": [AMBIENT_UDP_ZTUNNEL_ASSERTOR],
     }))
     .expect("plugin config");
     let mut ctx = ambient_udp_request_context(
@@ -787,6 +792,7 @@ async fn mesh_authz_ambient_udp_rejects_principal_pod_mismatch_as_scope_evidence
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": [AMBIENT_UDP_ZTUNNEL_ASSERTOR],
     }))
     .expect("plugin config");
     let mut ctx = ambient_udp_request_context(
@@ -946,6 +952,14 @@ fn ambient_udp_service_waypoint_slice(policies: Vec<MeshPolicy>) -> MeshSlice {
     }
 }
 
+/// The node ztunnel that relays ambient HBONE in these fixtures.
+///
+/// Pinned as an EXACT SPIFFE assertor rather than relying on the built-in bare
+/// `ztunnel` service-account default: a bare service-account entry only carries
+/// SAME-NAMESPACE assertion authority (issue #4274), and every ambient fixture
+/// here relays a client identity from a different namespace than the ztunnel's.
+const AMBIENT_UDP_ZTUNNEL_ASSERTOR: &str = "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel";
+
 const AMBIENT_UDP_CLIENT_BAGGAGE: &str = "source.principal=spiffe://cluster.local/ns/client-ns/sa/client,\
      source.pod_uid=6ba7b810-9dad-11d1-80b4-00c04fd430c8";
 
@@ -996,6 +1010,7 @@ async fn mesh_authz_service_waypoint_byte_stream_resolves_destination_namespace_
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": [AMBIENT_UDP_ZTUNNEL_ASSERTOR],
     }))
     .expect("plugin config");
     let mut ctx = service_waypoint_byte_stream_request_context(
@@ -1040,6 +1055,7 @@ async fn mesh_authz_service_waypoint_byte_stream_enforces_destination_allow() {
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": [AMBIENT_UDP_ZTUNNEL_ASSERTOR],
     }))
     .expect("plugin config");
 
@@ -1114,6 +1130,7 @@ async fn mesh_authz_service_waypoint_byte_stream_uses_exact_destination_workload
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": [AMBIENT_UDP_ZTUNNEL_ASSERTOR],
     }))
     .expect("plugin config");
 
@@ -1163,6 +1180,7 @@ async fn mesh_authz_service_waypoint_byte_stream_missing_destination_scope_fails
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": [AMBIENT_UDP_ZTUNNEL_ASSERTOR],
     }))
     .expect("plugin config");
     let mut ctx = service_waypoint_byte_stream_request_context(
@@ -1216,6 +1234,7 @@ async fn mesh_authz_service_waypoint_byte_stream_materializes_destination_condit
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": [AMBIENT_UDP_ZTUNNEL_ASSERTOR],
     }))
     .expect("plugin config");
     let mut ctx = service_waypoint_byte_stream_request_context(
@@ -1276,6 +1295,7 @@ async fn mesh_authz_ambient_udp_destination_namespace_deny_blocks_source_allowed
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": [AMBIENT_UDP_ZTUNNEL_ASSERTOR],
     }))
     .expect("plugin config");
     let mut ctx = ambient_udp_request_context(
@@ -1328,6 +1348,7 @@ async fn mesh_authz_service_waypoint_udp_resolves_destination_service_scope() {
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": [AMBIENT_UDP_ZTUNNEL_ASSERTOR],
     }))
     .expect("plugin config");
     let mut ctx = ambient_udp_request_context(
@@ -1394,6 +1415,7 @@ async fn mesh_authz_service_waypoint_udp_uses_exact_destination_workload_scope()
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": [AMBIENT_UDP_ZTUNNEL_ASSERTOR],
     }))
     .expect("plugin config");
     let mut ctx = ambient_udp_request_context(
@@ -1440,6 +1462,7 @@ async fn mesh_authz_service_waypoint_udp_missing_destination_scope_fails_closed(
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": [AMBIENT_UDP_ZTUNNEL_ASSERTOR],
     }))
     .expect("plugin config");
     let mut ctx = ambient_udp_request_context(
@@ -1489,6 +1512,7 @@ async fn mesh_authz_ambient_udp_source_scoped_deny_still_blocks_after_union() {
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": [AMBIENT_UDP_ZTUNNEL_ASSERTOR],
     }))
     .expect("plugin config");
     let mut ctx = ambient_udp_request_context(
@@ -1549,6 +1573,7 @@ async fn mesh_authz_ambient_udp_allow_aggregation_spans_union() {
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": [AMBIENT_UDP_ZTUNNEL_ASSERTOR],
     }))
     .expect("plugin config");
     let mut ctx = ambient_udp_request_context(
@@ -1579,6 +1604,7 @@ async fn mesh_authz_ambient_udp_absent_source_evidence_still_applies_destination
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": [AMBIENT_UDP_ZTUNNEL_ASSERTOR],
     }))
     .expect("plugin config");
     // Principal present but no pod_uid → source scope unresolved, evidence falls
@@ -1641,17 +1667,210 @@ async fn mesh_authz_default_trusts_waypoint_service_account() {
     assert!(!ctx.metadata.contains_key("mesh_authz.ignored_baggage"));
 }
 
+/// Issue #4274 — cross-tenant HBONE trusted-assertor authorization bypass.
+///
+/// The shipped default allow-list is BARE service-account names, which any
+/// tenant satisfies by naming its own pod's service account `waypoint`. Such a
+/// peer must not be able to rewrite the authorization principal to a workload
+/// in someone else's namespace: the victim-keyed ALLOW must not match, the
+/// request must fail closed, and the refusal must be diagnosable.
+#[tokio::test]
+async fn mesh_authz_default_assertor_cannot_assert_across_namespaces() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [principal_scoped_policy(
+            "payments-allow",
+            PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector::default(),
+            },
+            "spiffe://cluster.local/ns/prod/sa/payments",
+            PolicyAction::Allow,
+        )]
+    }))
+    .expect("plugin config");
+    // A legitimate SVID for a pod the ATTACKER controls, in the attacker's own
+    // namespace, using the service-account name Ferrum's own docs recommend.
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/attacker/sa/waypoint"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "baggage",
+        "source.principal=spiffe://cluster.local/ns/prod/sa/payments"
+            .parse()
+            .expect("header value"),
+    );
+    ctx.set_raw_headers(headers);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "a bare-SA assertor must not be able to assert a victim identity in \
+         another namespace, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.ignored_baggage")
+            .map(String::as_str),
+        Some("cross_namespace_assertion")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.ignored_baggage.cross_namespace_assertion")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("cross_namespace_assertion")
+    );
+}
+
+/// The documented explicit opt-in: an operator who pins the relaying ztunnel /
+/// waypoint by EXACT SPIFFE id keeps mesh-wide (cross-namespace) assertion
+/// authority. That entry cannot be minted by an ordinary tenant, so it is the
+/// safe carrier for the authority the bare-SA default no longer implies.
+#[tokio::test]
+async fn mesh_authz_exact_spiffe_assertor_retains_cross_namespace_authority() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [principal_scoped_policy(
+            "payments-allow",
+            PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector::default(),
+            },
+            "spiffe://cluster.local/ns/prod/sa/payments",
+            PolicyAction::Allow,
+        )],
+        "trusted_hbone_assertors": ["spiffe://cluster.local/ns/istio-system/sa/ztunnel"],
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/istio-system/sa/ztunnel"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "baggage",
+        "source.principal=spiffe://cluster.local/ns/prod/sa/payments"
+            .parse()
+            .expect("header value"),
+    );
+    ctx.set_raw_headers(headers);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "an exact-SPIFFE assertor keeps cross-namespace authority, got {result:?}"
+    );
+    assert!(!ctx.metadata.contains_key("mesh_authz.ignored_baggage"));
+}
+
+/// The same peer, now impersonating a service account that does exist in its
+/// OWN namespace, must still be honored — the fix is a namespace boundary, not
+/// a blanket removal of bare-SA assertion.
+#[tokio::test]
+async fn mesh_authz_default_assertor_still_asserts_within_its_own_namespace() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [principal_scoped_policy(
+            "attacker-ns-allow",
+            PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector::default(),
+            },
+            "spiffe://cluster.local/ns/attacker/sa/payments",
+            PolicyAction::Allow,
+        )]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/attacker/sa/waypoint"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "baggage",
+        "source.principal=spiffe://cluster.local/ns/attacker/sa/payments"
+            .parse()
+            .expect("header value"),
+    );
+    ctx.set_raw_headers(headers);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "same-namespace assertion must keep working, got {result:?}"
+    );
+    assert!(!ctx.metadata.contains_key("mesh_authz.ignored_baggage"));
+}
+
+/// A bare-SA assertor whose SVID carries no `ns/<namespace>` segment cannot
+/// prove a namespace to scope the assertion to, so it fails CLOSED rather than
+/// inheriting mesh-wide authority.
+#[tokio::test]
+async fn mesh_authz_namespaceless_bare_sa_assertor_cannot_assert() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [principal_scoped_policy(
+            "payments-allow",
+            PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector::default(),
+            },
+            "spiffe://cluster.local/ns/prod/sa/payments",
+            PolicyAction::Allow,
+        )]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/sa/waypoint"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "baggage",
+        "source.principal=spiffe://cluster.local/ns/prod/sa/payments"
+            .parse()
+            .expect("header value"),
+    );
+    ctx.set_raw_headers(headers);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "an assertor without a provable namespace must fail closed, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.ignored_baggage")
+            .map(String::as_str),
+        Some("cross_namespace_assertion")
+    );
+}
+
 #[tokio::test]
 async fn mesh_authz_trusted_hbone_assertors_accepts_custom_service_account() {
     // Operators with Gateway-managed waypoints (SA names like
     // "default-waypoint") configure the allow-list to cover their custom
-    // names. The configured SA must be treated as a trusted assertor.
+    // names. The configured SA must be treated as a trusted assertor for
+    // identities in its OWN namespace — a bare service-account entry carries
+    // no cross-namespace authority (issue #4274).
     let plugin = MeshAuthz::new(&json!({
         "mesh_policies": [allow_client_policy(PolicyAction::Allow)],
         "trusted_hbone_assertors": ["default-waypoint"],
     }))
     .expect("plugin config");
-    let mut ctx = request_context(Some("spiffe://cluster.local/ns/team-a/sa/default-waypoint"));
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/default-waypoint"));
     ctx.metadata
         .insert("request_protocol".to_string(), "hbone".to_string());
     let mut headers = http::HeaderMap::new();
@@ -2733,9 +2952,71 @@ async fn workload_metrics_ignores_baggage_from_untrusted_assertor() {
     );
 }
 
+/// Issue #4274 mirror in telemetry attribution. `workload_metrics` shares the
+/// authoritative `evaluate_hbone_baggage_assertion` decision with `mesh_authz`,
+/// so a cross-namespace bare-SA assertion must be dropped here too — otherwise
+/// metrics, the service graph, spans, and access logs would attribute the
+/// attacker's traffic to the victim workload even while authz refuses it.
+#[tokio::test]
+async fn workload_metrics_default_assertor_cannot_assert_across_namespaces() {
+    let plugin = WorkloadMetrics::new(&json!({})).expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/attacker/sa/waypoint"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = HashMap::from([(
+        "baggage".to_string(),
+        "source.principal=spiffe://cluster.local/ns/prod/sa/payments".to_string(),
+    )]);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    // Attribution falls back to the peer cert identity, NOT the forged baggage.
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/ns/attacker/sa/waypoint")
+    );
+    assert_eq!(
+        ctx.metadata.get("mesh.ignored_baggage").map(String::as_str),
+        Some("cross_namespace_assertion")
+    );
+}
+
+/// The telemetry side honors the same explicit opt-in as authz: an exact
+/// `spiffe://` assertor entry keeps cross-namespace attribution authority.
+#[tokio::test]
+async fn workload_metrics_exact_spiffe_assertor_retains_cross_namespace_authority() {
+    let plugin = WorkloadMetrics::new(&json!({
+        "trusted_hbone_assertors": ["spiffe://cluster.local/ns/istio-system/sa/ztunnel"]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/istio-system/sa/ztunnel"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = HashMap::from([(
+        "baggage".to_string(),
+        "source.principal=spiffe://cluster.local/ns/prod/sa/payments".to_string(),
+    )]);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/ns/prod/sa/payments")
+    );
+    assert!(!ctx.metadata.contains_key("mesh.ignored_baggage"));
+}
+
 /// A custom-configured assertor (matching the peer SA) honors the baggage,
 /// confirming the gate is the shared `mesh_authz` allow-list and configurable —
-/// not a hardcoded ztunnel/waypoint check.
+/// not a hardcoded ztunnel/waypoint check. The asserted identity is in the
+/// assertor's OWN namespace, which is the whole authority a bare
+/// service-account entry carries (issue #4274).
 #[tokio::test]
 async fn workload_metrics_honors_baggage_from_configured_assertor() {
     let plugin = WorkloadMetrics::new(&json!({
@@ -2747,7 +3028,7 @@ async fn workload_metrics_honors_baggage_from_configured_assertor() {
         .insert("request_protocol".to_string(), "hbone".to_string());
     let mut headers = HashMap::from([(
         "baggage".to_string(),
-        "source.principal=spiffe://cluster.local/ns/web/sa/frontend".to_string(),
+        "source.principal=spiffe://cluster.local/ns/default/sa/frontend".to_string(),
     )]);
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -2757,7 +3038,7 @@ async fn workload_metrics_honors_baggage_from_configured_assertor() {
         ctx.metadata
             .get("mesh.source.principal")
             .map(String::as_str),
-        Some("spiffe://cluster.local/ns/web/sa/frontend")
+        Some("spiffe://cluster.local/ns/default/sa/frontend")
     );
     assert!(!ctx.metadata.contains_key("mesh.ignored_baggage"));
 }
