@@ -10565,3 +10565,204 @@ fn observability_sink_endpoint_schemas_document_credential_redaction() {
         "insert_query_params description must document the profile-default durability pin: {params}"
     );
 }
+
+/// Config-database mutations that complete through
+/// `AdminState::complete_live_config_mutation_after_commit` after a durable
+/// commit. Mapped from the boxed helper call sites (CRUD, credentials, batch,
+/// restore, API specs) plus `complete_namespace_registry_mutation` (served
+/// rename / cascade delete). `createNamespace` is excluded: it writes no
+/// `config_changes` row and never waits. Namespace mutations stay on the
+/// synchronous path and do not accept `?apply=async`.
+///
+/// `(operation_id, synchronous success statuses, documents deferred 202)`
+const LIVE_APPLIED_CONFIG_MUTATIONS: &[(&str, &[&str], bool)] = &[
+    ("batchCreate", &["201"], true),
+    ("restoreConfig", &["200"], true),
+    ("createProxy", &["201"], true),
+    ("updateProxy", &["200"], true),
+    ("deleteProxy", &["204"], true),
+    ("createConsumer", &["201"], true),
+    ("updateConsumer", &["200"], true),
+    ("deleteConsumer", &["204"], true),
+    ("updateConsumerCredentials", &["200"], true),
+    ("appendConsumerCredential", &["200"], true),
+    ("deleteConsumerCredentials", &["204"], true),
+    ("deleteConsumerCredentialByIndex", &["200"], true),
+    ("createPluginConfig", &["201"], true),
+    ("updatePluginConfig", &["200"], true),
+    ("deletePluginConfig", &["204"], true),
+    ("createUpstream", &["201"], true),
+    ("updateUpstream", &["200"], true),
+    ("deleteUpstream", &["204"], true),
+    ("createGatewayTrustBundle", &["201"], true),
+    ("updateGatewayTrustBundle", &["200"], true),
+    ("deleteGatewayTrustBundle", &["204"], true),
+    ("submitApiSpec", &["201"], true),
+    ("replaceApiSpec", &["200"], true),
+    ("deleteApiSpec", &["204"], true),
+    ("updateNamespace", &["200"], false),
+    ("deleteNamespace", &["204"], false),
+];
+
+const CONFIG_CURSOR_HEADER_REF: &str = "#/components/headers/X-Ferrum-Config-Cursor";
+const LIVE_APPLY_MODE_PARAM_REF: &str = "#/components/parameters/LiveApplyMode";
+
+fn resolve_openapi_value<'a>(
+    spec: &'a serde_json::Value,
+    value: &'a serde_json::Value,
+) -> &'a serde_json::Value {
+    match value.get("$ref").and_then(serde_json::Value::as_str) {
+        Some(reference) => {
+            let pointer = reference.strip_prefix('#').unwrap_or_else(|| {
+                panic!("external OpenAPI reference is unsupported: {reference}")
+            });
+            spec.pointer(pointer)
+                .unwrap_or_else(|| panic!("unresolved OpenAPI reference: {reference}"))
+        }
+        None => value,
+    }
+}
+
+fn response_declares_config_cursor_header(
+    spec: &serde_json::Value,
+    response: &serde_json::Value,
+) -> bool {
+    let resolved = resolve_openapi_value(spec, response);
+    match resolved.pointer("/headers/X-Ferrum-Config-Cursor") {
+        Some(header) => {
+            header.get("$ref").and_then(serde_json::Value::as_str)
+                == Some(CONFIG_CURSOR_HEADER_REF)
+        }
+        None => false,
+    }
+}
+
+fn operation_references_live_apply_mode(operation: &serde_json::Value) -> bool {
+    operation["parameters"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|parameter| parameter["$ref"] == LIVE_APPLY_MODE_PARAM_REF)
+}
+
+/// Generated clients must see the optional covering cursor on every response
+/// that `complete_live_config_mutation_after_commit` can return: synchronous
+/// 2xx, deferred 202, and the committed-but-not-live 503. Pre-commit 503
+/// families stay optional via the shared component description; unrelated
+/// 503 routes must not claim the header.
+#[test]
+fn live_applied_mutations_declare_config_cursor_on_success_deferred_and_committed_503() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let header = spec
+        .pointer("/components/headers/X-Ferrum-Config-Cursor")
+        .expect("X-Ferrum-Config-Cursor header component");
+    assert_eq!(header["required"], false);
+
+    let service_unavailable = spec
+        .pointer("/components/responses/ServiceUnavailable")
+        .expect("ServiceUnavailable response component");
+    assert!(
+        !response_declares_config_cursor_header(&spec, service_unavailable),
+        "ServiceUnavailable is the pre-commit write-gate 503 and must not declare the cursor"
+    );
+
+    let mut table_ids = BTreeSet::new();
+    let mut expected_live_apply_ops = BTreeSet::new();
+    for (operation_id, success_statuses, documents_deferred_202) in LIVE_APPLIED_CONFIG_MUTATIONS {
+        assert!(
+            table_ids.insert(*operation_id),
+            "duplicate live-applied mutation operationId `{operation_id}`"
+        );
+        if *documents_deferred_202 {
+            expected_live_apply_ops.insert(*operation_id);
+        }
+
+        let (method, path, operation) = openapi_operation_by_id(&spec, operation_id);
+        let responses = operation["responses"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{method} {path} responses is an object"));
+
+        for status in *success_statuses {
+            let response = responses.get(*status).unwrap_or_else(|| {
+                panic!("{method} {path} ({operation_id}) missing success status {status}")
+            });
+            assert!(
+                response_declares_config_cursor_header(&spec, response),
+                "{method} {path} ({operation_id}) {status} must declare {CONFIG_CURSOR_HEADER_REF}"
+            );
+        }
+
+        let response_503 = responses.get("503").unwrap_or_else(|| {
+            panic!("{method} {path} ({operation_id}) missing committed-not-live 503")
+        });
+        assert!(
+            response_declares_config_cursor_header(&spec, response_503),
+            "{method} {path} ({operation_id}) 503 must declare {CONFIG_CURSOR_HEADER_REF}"
+        );
+
+        if *documents_deferred_202 {
+            assert!(
+                operation_references_live_apply_mode(operation),
+                "{method} {path} ({operation_id}) must accept LiveApplyMode"
+            );
+            let response_202 = responses.get("202").unwrap_or_else(|| {
+                panic!("{method} {path} ({operation_id}) missing deferred 202")
+            });
+            assert!(
+                response_declares_config_cursor_header(&spec, response_202),
+                "{method} {path} ({operation_id}) 202 must declare {CONFIG_CURSOR_HEADER_REF}"
+            );
+        } else {
+            assert!(
+                !operation_references_live_apply_mode(operation),
+                "{method} {path} ({operation_id}) must not accept LiveApplyMode"
+            );
+            assert!(
+                responses.get("202").is_none(),
+                "{method} {path} ({operation_id}) must not document deferred 202"
+            );
+        }
+    }
+
+    let mut documented_live_apply_ops = BTreeSet::new();
+    for (path, path_item) in spec["paths"].as_object().expect("paths is an object") {
+        let path_item = path_item
+            .as_object()
+            .unwrap_or_else(|| panic!("path item {path} is an object"));
+        for method in OPENAPI_HTTP_METHODS {
+            let Some(operation) = path_item.get(*method) else {
+                continue;
+            };
+            if !operation_references_live_apply_mode(operation) {
+                continue;
+            }
+            let operation_id = operation["operationId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{method} {path} is missing operationId"));
+            documented_live_apply_ops.insert(operation_id);
+        }
+    }
+    assert_eq!(
+        documented_live_apply_ops, expected_live_apply_ops,
+        "LiveApplyMode operations drifted from the mapped live-apply helper surface"
+    );
+
+    let (_, _, create_namespace) = openapi_operation_by_id(&spec, "createNamespace");
+    assert!(
+        !response_declares_config_cursor_header(&spec, &create_namespace["responses"]["201"]),
+        "POST /namespaces does not wait on live-apply and must not declare the cursor on 201"
+    );
+
+    for operation_id in ["listProxies", "getProxy", "listApiSpecs", "getHealth"] {
+        let (method, path, operation) = openapi_operation_by_id(&spec, operation_id);
+        let Some(response_503) = operation["responses"].get("503") else {
+            panic!("{method} {path} ({operation_id}) expected an unrelated 503");
+        };
+        assert!(
+            !response_declares_config_cursor_header(&spec, response_503),
+            "{method} {path} ({operation_id}) 503 is not a live-apply outcome and must not declare the cursor"
+        );
+    }
+}

@@ -4250,6 +4250,9 @@ paths:
           description: |
             All resources created successfully. In database mode the committed
             generation is already live on this process.
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -4518,6 +4521,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Configuration restored successfully
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -4627,12 +4633,21 @@ paths:
             intentionally retained uncertain operation instead returns the
             stable retryable namespace-admission error. Database mode with
             `FERRUM_ADMIN_READ_ONLY=true` still returns `403`.
+
+            In database mode this status is also returned after restore has
+            committed when the in-process poll-loop reload cannot make that
+            generation live (`applied: false` and a closed `reason`). That
+            committed-but-not-live family may carry `X-Ferrum-Config-Cursor`
+            so the caller can keep gating on `GET /config/apply-status`. The
+            pre-commit abort family never attaches the cursor.
           headers:
             Retry-After:
               description: Present as `1` for namespace-admission contention.
               schema:
                 type: integer
                 minimum: 1
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -4721,6 +4736,9 @@ paths:
           description: |
             Proxy created. In database mode a covering `config_changes`
             generation is already live on this process.
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -4797,6 +4815,9 @@ paths:
           description: |
             Proxy updated. In database mode a covering `config_changes`
             generation is already live on this process.
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -4866,6 +4887,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "204":
           description: Proxy deleted
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
         "400":
           description: Deletion would leave an invalid plugin-composition graph, or an API-spec-owned proxy has foreign/missing ownership metadata or another restore-snapshot shape that atomic compensation cannot reproduce safely, or `cleanup_orphaned_upstream` was duplicated or supplied with a value other than the exact strings `true` or `false`
           content:
@@ -4955,6 +4979,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "201":
           description: Consumer created
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -5029,6 +5056,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Consumer updated
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -5069,6 +5099,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "204":
           description: Consumer deleted
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -5139,6 +5172,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Credentials updated — returns full consumer object
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -5193,6 +5229,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Credential appended — returns full consumer object
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -5247,6 +5286,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "204":
           description: Credential removed
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -5298,6 +5340,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Credential entry removed — returns full consumer object
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -5480,6 +5525,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "201":
           description: Plugin configuration created
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -5542,6 +5590,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Plugin configuration updated
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -5572,6 +5623,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "204":
           description: Plugin configuration deleted
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
         "400":
           description: Deletion would expose an invalid plugin-composition graph, including unsupported TCP connection-throttle attachments
           content:
@@ -5645,6 +5699,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "201":
           description: Created upstream
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -5705,6 +5762,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Updated upstream
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -5743,6 +5803,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "204":
           description: Upstream deleted
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -5835,6 +5898,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "201":
           description: Created gateway trust bundle
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -5918,6 +5984,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Updated gateway trust bundle
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -5957,6 +6026,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "204":
           description: Gateway trust bundle deleted
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -6227,6 +6299,9 @@ paths:
       responses:
         "200":
           description: Updated namespace
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -6310,6 +6385,9 @@ paths:
       responses:
         "204":
           description: Namespace deleted
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -6620,6 +6698,8 @@ paths:
               schema:
                 type: string
               description: URL of the newly created spec (`/api-specs/{id}`)
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -6849,6 +6929,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Spec replaced; spec-owned resources recreated
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -6965,6 +7048,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "204":
           description: Spec and spec-owned resources deleted
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -7194,11 +7280,16 @@ components:
         generation is live on this process. `async` is the explicit
         bulk-provisioning opt-in: the mutation commits durably, the covering
         cursor is still captured fail-closed under the write pins, and the
-        response is `202 Accepted` with an `X-Ferrum-Config-Cursor` header
-        instead of waiting — one blocking `GET /config/apply-status` on the
-        last cursor then proves every prior deferred write live with a single
-        reload. Request-level validation (`400`) still happens synchronously;
-        only graph-level poll rejections are deferred to the status endpoint.
+        response is `202 Accepted` instead of waiting — one blocking
+        `GET /config/apply-status` on the last cursor then proves every prior
+        deferred write live with a single reload. Request-level validation
+        (`400`) still happens synchronously; only graph-level poll rejections
+        are deferred to the status endpoint.
+
+        When this process serves the written namespace, a covering cursor is
+        attached as the optional `X-Ferrum-Config-Cursor` header on
+        synchronous 2xx, deferred `202`, and the committed-but-not-live `503`
+        — not on pre-commit validation, admission, or storage failures.
 
         Exactly one occurrence of the exact string `sync` or `async` is
         accepted; any other value or a duplicate returns `400`, because this
@@ -7257,14 +7348,18 @@ components:
     X-Ferrum-Config-Cursor:
       description: |
         Covering live-apply cursor of a config-database mutation, as
-        `{topology_epoch}:{sequence}` (issue #4139). Present on database-mode
-        mutation responses when this process serves the written namespace —
+        `{topology_epoch}:{sequence}` (issue #4139). Optional: present on
+        database-mode mutation responses when this process serves the written
+        namespace and a covering cursor was captured after durable commit —
         on synchronous 2xx (the proven-live generation), on deferred `202`
         (the cursor to prove later), and on the committed-but-not-live `503`
         (so the caller can keep gating on `GET /config/apply-status` instead
-        of guessing whether the durable commit converged). Cursors are
-        monotone per topology epoch, so a bulk client only needs to keep the
-        last one it saw.
+        of guessing whether the durable commit converged). Absent on
+        pre-commit validation, admission, and storage failures, on writes to
+        a namespace this process does not serve, and in CP/file/DP modes.
+        HeaderValue formatting can also omit it. Cursors are monotone per
+        topology epoch, so a bulk client only needs to keep the last one it
+        saw.
       required: false
       schema:
         type: string
@@ -7394,7 +7489,10 @@ components:
         The row is durable; `Retry-After` is not used for this case. Namespace
         registry mutations that change the served runtime snapshot (rename of
         or into the served namespace, and a confirmed cascade delete of the
-        served namespace) use this same contract.
+        served namespace) use this same contract. This family may carry
+        `X-Ferrum-Config-Cursor` (optional; see that header) so the caller can
+        keep gating on `GET /config/apply-status`. The nothing-applied family
+        never attaches the cursor.
       headers:
         Retry-After:
           required: false
@@ -7405,6 +7503,8 @@ components:
             type: integer
             minimum: 1
             example: 1
+        X-Ferrum-Config-Cursor:
+          $ref: "#/components/headers/X-Ferrum-Config-Cursor"
       content:
         application/json:
           schema:
