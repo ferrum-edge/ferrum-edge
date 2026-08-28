@@ -10630,8 +10630,7 @@ fn response_declares_config_cursor_header(
     let resolved = resolve_openapi_value(spec, response);
     match resolved.pointer("/headers/X-Ferrum-Config-Cursor") {
         Some(header) => {
-            header.get("$ref").and_then(serde_json::Value::as_str)
-                == Some(CONFIG_CURSOR_HEADER_REF)
+            header.get("$ref").and_then(serde_json::Value::as_str) == Some(CONFIG_CURSOR_HEADER_REF)
         }
         None => false,
     }
@@ -10707,9 +10706,9 @@ fn live_applied_mutations_declare_config_cursor_on_success_deferred_and_committe
                 operation_references_live_apply_mode(operation),
                 "{method} {path} ({operation_id}) must accept LiveApplyMode"
             );
-            let response_202 = responses.get("202").unwrap_or_else(|| {
-                panic!("{method} {path} ({operation_id}) missing deferred 202")
-            });
+            let response_202 = responses
+                .get("202")
+                .unwrap_or_else(|| panic!("{method} {path} ({operation_id}) missing deferred 202"));
             assert!(
                 response_declares_config_cursor_header(&spec, response_202),
                 "{method} {path} ({operation_id}) 202 must declare {CONFIG_CURSOR_HEADER_REF}"
