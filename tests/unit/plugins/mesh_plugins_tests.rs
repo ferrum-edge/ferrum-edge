@@ -1870,7 +1870,9 @@ async fn mesh_authz_trusted_hbone_assertors_accepts_custom_service_account() {
         "trusted_hbone_assertors": ["default-waypoint"],
     }))
     .expect("plugin config");
-    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/default-waypoint"));
+    let mut ctx = request_context(Some(
+        "spiffe://cluster.local/ns/default/sa/default-waypoint",
+    ));
     ctx.metadata
         .insert("request_protocol".to_string(), "hbone".to_string());
     let mut headers = http::HeaderMap::new();
