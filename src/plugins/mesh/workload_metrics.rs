@@ -23,9 +23,9 @@ use crate::modes::mesh::metric_tag_cel::{
 };
 use crate::plugins::mesh::CUSTOM_TRACE_ATTRIBUTES_METADATA;
 use crate::plugins::mesh::authz::{
-    HboneAssertionVerdict, IGNORED_UDP_SOURCE_SCOPE_METADATA, TrustedAssertor,
-    evaluate_hbone_baggage_assertion, mesh_authz_destination_port,
-    mesh_stream_authz_destination_port, parse_trust_domain_aliases, parse_trusted_hbone_assertors,
+    IGNORED_UDP_SOURCE_SCOPE_METADATA, TrustedAssertor, evaluate_hbone_baggage_assertion,
+    mesh_authz_destination_port, mesh_stream_authz_destination_port, parse_trust_domain_aliases,
+    parse_trusted_hbone_assertors,
 };
 use crate::plugins::mesh::prometheus_helpers::{
     MESH_METRICS_DISABLED_METADATA, MESH_WORKLOAD_METRICS_OBSERVED_METADATA, MeshMetricFamily,
