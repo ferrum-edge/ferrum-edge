@@ -4842,8 +4842,8 @@ impl MeshConfig {
     /// 3. **[`Self::inbound_relay_destinations`]** — the deliberate, narrow
     ///    multi-destination allowance for the topologies that are MEANT to
     ///    terminate for a workload other than the pod the proxy runs in
-    ///    (`Sidecar` / `Ambient` own-identity workload records, `NodeWaypoint`
-    ///    enrolled pods, `ServiceWaypoint` workloads visible in its namespaces).
+    ///    (`Ambient` own-identity workload records, `NodeWaypoint` enrolled
+    ///    pods, `ServiceWaypoint` workloads visible in its namespaces).
     ///    An entry is matched by IP when the authority is an IP literal and by
     ///    verbatim (case-insensitive) name when it is not; a name is never
     ///    resolved here, so this cannot reach anything the inventory does not

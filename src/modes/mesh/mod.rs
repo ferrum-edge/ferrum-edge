@@ -1649,7 +1649,13 @@ fn prepare_normalized_gateway_config_for_mesh(
         // slice-wide workload view — which is what made this terminator an
         // open relay into other nodes' pods.
         let (inbound_relay_destinations, admits_accepted_local_address) = match runtime.topology {
-            // Own-IDENTITY terminators. Two admission sources, both narrow:
+            // Pod-local Sidecar terminators admit only the accepted socket's
+            // local address. A SPIFFE id is normally a service-account
+            // identity shared by sibling pods, so it is not proof that this
+            // sidecar owns every matching workload address in the slice.
+            MeshTopology::Sidecar => (Vec::new(), true),
+            // Ambient is a node-shared own-identity terminator. Two admission
+            // sources, both narrow:
             //
             // 1. The accepted connection's own local address — the pod IP the
             //    peer actually reached on this socket. A transport fact, so it
@@ -1664,15 +1670,14 @@ fn prepare_normalized_gateway_config_for_mesh(
             //    `docs/mesh.md`, "Enrolled Ambient destination pod UDP relay").
             //    That destination is legitimately NOT the accepted socket's
             //    local address, so source 1 alone would break the documented
-            //    datapath. A Sidecar reaches the same records through its own
-            //    pod address, so this is a no-op there in practice.
+            //    datapath.
             //
             // The identity is the narrowing: a workload the slice declares
             // under a DIFFERENT SPIFFE — another service, or another node's pod
             // of another service — is still refused, which is the issue #4150
             // property. A blank/absent identity yields an EMPTY inventory
             // (fail closed), leaving only the accepted local address.
-            MeshTopology::Sidecar | MeshTopology::Ambient => {
+            MeshTopology::Ambient => {
                 let own_identity = runtime
                     .workload_spiffe_id
                     .as_deref()
@@ -40295,10 +40300,10 @@ mod tests {
 
     /// Issue #4150: the authenticated inbound CONNECT terminator's admitted
     /// destinations are derived from the TOPOLOGY, not from the slice-wide
-    /// workload view. The own-identity terminators fall back to the accepted
-    /// socket's local address alone when no workload identity is configured;
-    /// the two waypoint topologies carry exactly their narrow inventory; the
-    /// gateway topologies carry neither.
+    /// workload view. Sidecar always uses the accepted socket's local address
+    /// alone; Ambient falls back to that proof when no workload identity is
+    /// configured; the two waypoint topologies carry exactly their narrow
+    /// inventory; the gateway topologies carry neither.
     #[test]
     fn inbound_relay_termination_scope_is_back_projected_per_topology() {
         use crate::modes::mesh::config::{InboundRelayDenial, MeshInboundRelayHost};
@@ -40486,6 +40491,45 @@ mod tests {
         assert_eq!(
             decide("10.244.0.1", 8080),
             Err(InboundRelayDenial::PortNotDeclared)
+        );
+    }
+
+    /// A service-account SPIFFE identity is not pod-unique. A Sidecar must not
+    /// turn same-identity sibling workload records into relay destinations;
+    /// only the accepted socket's local address proves which pod was reached.
+    #[test]
+    fn inbound_relay_sidecar_does_not_admit_same_spiffe_sibling() {
+        use crate::modes::mesh::config::InboundRelayDenial;
+
+        const OWN_SPIFFE: &str = "spiffe://cluster.local/ns/default/sa/reviews";
+        let mut local = workload("reviews", "reviews");
+        local.addresses = vec!["10.244.5.5".to_string()];
+        let mut sibling = workload("reviews", "reviews");
+        sibling.addresses = vec!["10.244.6.6".to_string()];
+        let slice = MeshSlice {
+            workloads: vec![local, sibling],
+            ..MeshSlice::default()
+        };
+        let runtime = MeshRuntimeConfig {
+            topology: MeshTopology::Sidecar,
+            workload_spiffe_id: Some(OWN_SPIFFE.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let config = gateway_config_from_mesh_slice(&slice, &runtime, None, None);
+        let mesh = config
+            .expect("slice -> config")
+            .mesh
+            .expect("prepared mesh");
+        let local_ip = "10.244.5.5".parse().expect("local pod IP");
+
+        assert!(mesh.inbound_relay_destinations.is_empty());
+        assert_eq!(
+            mesh.inbound_relay_destination_decision("10.244.5.5", 8080, Some(local_ip)),
+            Ok(())
+        );
+        assert_eq!(
+            mesh.inbound_relay_destination_decision("10.244.6.6", 8080, Some(local_ip)),
+            Err(InboundRelayDenial::AddressNotTerminated)
         );
     }
 
