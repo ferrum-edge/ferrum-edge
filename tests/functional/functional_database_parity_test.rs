@@ -148,6 +148,64 @@ fn docker_pause(container: &str) -> Option<DockerUnpauseGuard> {
     })
 }
 
+fn recovery_proxy_payload(recovery_id: &str, recovered_listen_path: &str) -> serde_json::Value {
+    json!({
+        "id": recovery_id,
+        "listen_path": recovered_listen_path,
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 9,
+        "strip_listen_path": true
+    })
+}
+
+fn recovery_proxy_matches_canonical(
+    value: &serde_json::Value,
+    recovery_id: &str,
+    recovered_listen_path: &str,
+) -> bool {
+    value.get("id").and_then(|v| v.as_str()) == Some(recovery_id)
+        && value.get("listen_path").and_then(|v| v.as_str()) == Some(recovered_listen_path)
+        && value.get("backend_scheme").and_then(|v| v.as_str()) == Some("http")
+        && value.get("backend_host").and_then(|v| v.as_str()) == Some("127.0.0.1")
+        && value.get("backend_port").and_then(|v| v.as_u64()) == Some(9)
+        && value.get("strip_listen_path").and_then(|v| v.as_bool()) == Some(true)
+}
+
+async fn recovery_proxy_committed(
+    client: &reqwest::Client,
+    gateway: &TestGateway,
+    auth: &str,
+    recovery_id: &str,
+    recovered_listen_path: &str,
+) -> Result<bool, String> {
+    let response = client
+        .get(gateway.admin_url(&format!("/proxies/{recovery_id}")))
+        .header("Authorization", auth)
+        .send()
+        .await
+        .map_err(|error| format!("GET /proxies/{recovery_id}: {error}"))?;
+    let status = response.status();
+    if status.as_u16() == 404 {
+        return Ok(false);
+    }
+    if !status.is_success() {
+        return Err(format!(
+            "GET /proxies/{recovery_id} returned unexpected status {status}"
+        ));
+    }
+    let value: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| format!("parse GET /proxies/{recovery_id} body: {error}"))?;
+    if recovery_proxy_matches_canonical(&value, recovery_id, recovered_listen_path) {
+        return Ok(true);
+    }
+    Err(format!(
+        "GET /proxies/{recovery_id} returned non-canonical recovery proxy: {value}"
+    ))
+}
+
 async fn run_connectivity_recovery(db: DbType, container: &str, label: &str) {
     ensure_shared_sql_containers_resumed();
     if !continue_if_backend_available(
@@ -227,28 +285,44 @@ async fn run_connectivity_recovery(db: DbType, container: &str, label: &str) {
     // Wait for docker unpause + pool reconnect.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let recovery_id = format!("{proxy_id}-recovered");
+    let recovered_listen_path = format!("{listen_path}-recovered");
+    let recovery_payload = recovery_proxy_payload(&recovery_id, &recovered_listen_path);
     loop {
         let recovered = client
             .post(gateway.admin_url("/proxies"))
             .header("Authorization", &auth)
-            .json(&json!({
-                "id": recovery_id,
-                "listen_path": format!("{listen_path}-recovered"),
-                "backend_scheme": "http",
-                "backend_host": "127.0.0.1",
-                "backend_port": 9,
-                "strip_listen_path": true
-            }))
+            .json(&recovery_payload)
             .send()
             .await
             .expect("admin write after recovery");
-        if recovered.status().is_success() {
+        let status = recovered.status();
+        if status.is_success() {
             break;
+        }
+        if status.as_u16() == 409 {
+            match recovery_proxy_committed(
+                &client,
+                &gateway,
+                &auth,
+                &recovery_id,
+                &recovered_listen_path,
+            )
+            .await
+            {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(diagnostic) => panic!("{label} {diagnostic}"),
+            }
+        } else if status.as_u16() != 503 && !status.is_server_error() {
+            let body = recovered.text().await.unwrap_or_default();
+            panic!(
+                "{label} admin write after unpause returned unexpected status {status}: {body}"
+            );
         }
         assert!(
             tokio::time::Instant::now() < deadline,
             "{label} admin writes did not recover within 30s after unpause (last status {})",
-            recovered.status()
+            status
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
