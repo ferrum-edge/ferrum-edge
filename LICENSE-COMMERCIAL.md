@@ -19,7 +19,7 @@ Commercial use includes, but is not limited to:
 
 ## Obtaining a Commercial License
 
-For commercial licensing inquiries, please contact the Ferrum Edge team.
+For commercial licensing inquiries, email **contact@ferrumedge.com**.
 
 ## Dual Licensing Summary
 
