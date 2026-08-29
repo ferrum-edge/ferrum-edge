@@ -315,9 +315,7 @@ async fn run_connectivity_recovery(db: DbType, container: &str, label: &str) {
             }
         } else if status.as_u16() != 503 && !status.is_server_error() {
             let body = recovered.text().await.unwrap_or_default();
-            panic!(
-                "{label} admin write after unpause returned unexpected status {status}: {body}"
-            );
+            panic!("{label} admin write after unpause returned unexpected status {status}: {body}");
         }
         assert!(
             tokio::time::Instant::now() < deadline,
