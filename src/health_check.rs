@@ -4324,35 +4324,58 @@ mod tests {
 
     #[tokio::test]
     async fn fallback_client_uses_dns_cache_resolver() {
-        // Verify the fallback client routes DNS through the gateway cache by
-        // observing cache_len() growth after a request. If the fallback bypassed
-        // the resolver and used system DNS, the cache would stay empty.
-        let dns_cache = DnsCache::new(DnsConfig::default());
-        let initial_len = dns_cache.cache_len();
-        let client = build_dns_cached_fallback_client(Some(dns_cache.clone()), "test")
+        // `.invalid` cannot resolve through system DNS. The request can reach
+        // this listener only when the fallback client uses the supplied cache's
+        // static override, making resolver attachment observable without a
+        // wall-clock race on asynchronous cache population.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fallback resolver test listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let hostname = "fallback-health-resolver.invalid";
+        let dns_cache = DnsCache::new(DnsConfig {
+            global_overrides: std::collections::HashMap::from([(
+                hostname.to_string(),
+                "127.0.0.1".to_string(),
+            )]),
+            ..DnsConfig::default()
+        });
+        let client = build_dns_cached_fallback_client(Some(dns_cache), "test")
             .expect("fallback client should build");
 
-        // Issue a request to a well-known hostname. The connection itself will
-        // either succeed or fail (we don't care); what matters is that the
-        // resolver was used. Use a short timeout so the test runs quickly.
-        let _ = client
-            .get("http://localhost:1/")
-            .timeout(Duration::from_millis(100))
-            .send()
-            .await;
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
+                .await
+                .expect("fallback resolver connection timed out")
+                .expect("accept fallback resolver connection");
+            let mut request = [0u8; 1024];
+            let request_len = socket
+                .read(&mut request)
+                .await
+                .expect("read fallback resolver request");
+            assert!(
+                request
+                    .get(..request_len)
+                    .is_some_and(|bytes| bytes.starts_with(b"GET ")),
+                "fallback resolver listener did not receive an HTTP request"
+            );
+            socket
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write fallback resolver response");
+        });
 
-        // After the request, the gateway DNS cache should contain an entry
-        // for `localhost`. If the request had bypassed the resolver via
-        // ambient proxying, the cache would be unchanged.
-        let after_len = dns_cache.cache_len();
-        assert!(
-            after_len > initial_len,
-            "DNS cache should have populated via the cached resolver \
-             (initial={}, after={}). If the fallback bypassed the resolver \
-             via ambient proxying, the cache would stay empty.",
-            initial_len,
-            after_len
-        );
+        let response = tokio::time::timeout(
+            Duration::from_secs(30),
+            client.get(format!("http://{hostname}:{port}/")).send(),
+        )
+        .await
+        .expect("fallback resolver request timed out")
+        .expect("fallback client must resolve the override-only hostname");
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        server.await.expect("fallback resolver test server failed");
     }
 
     #[test]
