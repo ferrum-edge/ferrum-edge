@@ -1,0 +1,9 @@
+product_sha=b96cfaadd41a676d39a409d47b48e0b0588fa86e
+origin_main=b96cfaadd41a676d39a409d47b48e0b0588fa86e
+started_utc=2026-08-29T01:15:33Z
+uname=Linux cursor 6.12.94+ #1 SMP PREEMPT_DYNAMIC Fri Aug 28 16:08:20 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+rustc=rustc 1.98.0 (88d9e12ae 2026-08-18)
+cargo=cargo 1.98.0 (797e8a9bc 2026-08-05)
+protoc=libprotoc 3.21.12
+nproc=4
+mem=15Gi

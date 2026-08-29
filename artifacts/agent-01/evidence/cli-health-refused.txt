@@ -1,0 +1,3 @@
+exit=1
+stdout=''
+stderr='{"timestamp":"2026-08-29T01:31:23.532277612+00:00","level":"ERROR","target":"ferrum_edge::bootstrap","message":"admin CLI health check failed","command":"health","error":"Cannot connect to 127.0.0.1:1: Connection refused (os error 111)"}\n'

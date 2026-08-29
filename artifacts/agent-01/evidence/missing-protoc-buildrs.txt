@@ -1,0 +1,15 @@
+exit=101
+---stdout---
+cargo:rerun-if-changed=proto/ferrum.proto
+cargo:rerun-if-changed=proto/envoy/service/discovery/v3/discovery.proto
+cargo:rerun-if-changed=proto/envoy/service/runtime/v3/rtds.proto
+cargo:rerun-if-changed=proto/envoy/stock/v3/stock_xds.proto
+cargo:rerun-if-changed=proto/health.proto
+cargo:rerun-if-changed=proto/workload_api.proto
+
+---stderr---
+
+thread 'main' (41241) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tonic-prost-build-0.14.6/src/lib.rs:752:52:
+called `Result::unwrap()` on an `Err` value: NotPresent
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+

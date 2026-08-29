@@ -1,0 +1,2 @@
+status=401
+body_head={"error":"Unauthorized: /metrics requires a valid admin JWT or metrics bearer token, or the client must be in FERRUM_METRICS_ALLOWED_CIDRS"}

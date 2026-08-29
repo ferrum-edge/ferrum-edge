@@ -1,0 +1,3 @@
+exit=0
+stdout='{"version":"0.9.0","target":"x86_64-unknown-linux-gnu"}\n'
+stderr=''

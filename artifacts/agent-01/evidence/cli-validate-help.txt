@@ -1,0 +1,26 @@
+exit=0
+Validate configuration files without starting the gateway
+
+Usage: ferrum-edge validate [OPTIONS]
+
+Options:
+  -s, --settings <SETTINGS>
+          Path to ferrum.conf (operational settings)
+
+  -c, --spec <SPEC>
+          Path to resources YAML/JSON, or a localized `{version?, mesh}` slice when validating mesh file protocol
+
+  -m, --mode <MODE>
+          Operating mode (database, file, cp, dp, mesh, injector, node_agent, migrate)
+
+      --fips-mode <FIPS_MODE>
+          FIPS deployment mode: `off` (default) or `enforce`.
+          
+          Highest-precedence source for the FIPS request; it is materialized into `FERRUM_FIPS_MODE` before the crypto provider is installed. A request that only appears in `ferrum.conf` arrives too late to select the AWS-LC FIPS provider profile and is refused. See docs/fips.md.
+
+  -v, --verbose...
+          Increase log verbosity (-v=info, -vv=debug, -vvv=trace)
+
+  -h, --help
+          Print help (see a summary with '-h')
+

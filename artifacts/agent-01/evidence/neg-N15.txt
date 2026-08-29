@@ -1,0 +1,10 @@
+exit=1
+---stdout---
+Settings (ferrum.conf): OK
+  Mode: File
+{"timestamp":"2026-08-29T01:31:24.611638Z","level":"INFO","fields":{"message":"Loading YAML configuration from /tmp/agent01-uxzqzpi3/N15.yaml"},"target":"ferrum_edge::config::file_loader"}
+
+---stderr---
+{"timestamp":"2026-08-29T01:31:24.591260Z","level":"WARN","fields":{"message":"Config file /tmp/agent01-uxzqzpi3/N15.yaml is world-readable (mode 644). Consider restricting permissions as it may contain credentials."},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-29T01:31:24.612127Z","level":"ERROR","fields":{"message":"Proxy 'eh': backend_host must be non-empty (or set upstream_id)"},"target":"ferrum_edge::config::validation_pipeline"}
+{"timestamp":"2026-08-29T01:31:24.612205Z","level":"ERROR","fields":{"message":"Validation error: Spec validation failed: Configuration validation failed: 1 invalid field(s) found"},"target":"ferrum_edge"}

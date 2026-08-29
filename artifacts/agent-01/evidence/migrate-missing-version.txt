@@ -1,0 +1,3 @@
+exit=1
+
+{"timestamp":"2026-08-29T01:32:00.239553Z","level":"ERROR","fields":{"message":"Fatal error: Config is missing required 'version' field"},"target":"ferrum_edge"}

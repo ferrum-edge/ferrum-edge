@@ -1,0 +1,3 @@
+status=200
+body_redacted_len=1797
+body_head={"status":"ok","timestamp":"2026-08-29T01:31:43.154913140+00:00","mode":"file","admin_writes_enabled":false,"ready":true,"gateway_listeners":{"config_generation":1,"desired_listeners":0,"active_listeners":0,"failed_ports":0,"active_failures":0,"retained_failures":0,"truncated":false,"overflowed":false,"active_by_category":[],"failures":[]},"fips":{"mode":"off","enforcing":false,"build_capable":false,"build_profile":"crypto-ring","provider":"ring","module_self_test_passed":false,"provider_algorit

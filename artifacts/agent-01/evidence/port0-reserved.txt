@@ -1,0 +1,16 @@
+exit=0
+Settings (ferrum.conf): OK
+  Mode: File
+{"timestamp":"2026-08-29T01:31:36.315386Z","level":"INFO","fields":{"message":"Loading YAML configuration from /tmp/agent01-uxzqzpi3/p0-reserved.yaml"},"target":"ferrum_edge::config::file_loader"}
+Spec (/tmp/agent01-uxzqzpi3/p0-reserved.yaml): OK
+  Proxies: 1
+  Consumers: 0
+  Upstreams: 0
+  Plugin configs: 0
+Startup security (env TLS/CIDRs/metrics): OK
+
+Validation passed.
+{"timestamp":"2026-08-29T01:31:36.363874Z","level":"INFO","fields":{"message":"Configuration loaded (version 1): 1 proxies, 0 consumers, 0 plugin configs"},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-29T01:31:36.364019Z","level":"INFO","fields":{"message":"TLS policy: versions=[\"TLS 1.2\", \"TLS 1.3\"], cipher_suites=[\"TLS13_AES_128_GCM_SHA256\", \"TLS13_AES_256_GCM_SHA384\", \"TLS13_CHACHA20_POLY1305_SHA256\", \"TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256\", \"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256\", \"TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256\", \"TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256\", \"TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384\", \"TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384\"], curves=[\"X25519\", \"secp256r1\"], prefer_server_order=true"},"target":"ferrum_edge::tls"}
+
+{"timestamp":"2026-08-29T01:31:36.295036Z","level":"WARN","fields":{"message":"Config file /tmp/agent01-uxzqzpi3/p0-reserved.yaml is world-readable (mode 644). Consider restricting permissions as it may contain credentials."},"target":"ferrum_edge::config::file_loader"}

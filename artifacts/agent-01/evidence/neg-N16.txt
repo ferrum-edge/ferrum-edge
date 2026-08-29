@@ -1,0 +1,10 @@
+exit=1
+---stdout---
+Settings (ferrum.conf): OK
+  Mode: File
+{"timestamp":"2026-08-29T01:31:24.663034Z","level":"INFO","fields":{"message":"Loading YAML configuration from /tmp/agent01-uxzqzpi3/N16.yaml"},"target":"ferrum_edge::config::file_loader"}
+
+---stderr---
+{"timestamp":"2026-08-29T01:31:24.642697Z","level":"WARN","fields":{"message":"Config file /tmp/agent01-uxzqzpi3/N16.yaml is world-readable (mode 644). Consider restricting permissions as it may contain credentials."},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-29T01:31:24.711712Z","level":"ERROR","fields":{"message":"Duplicate listen_port 21003 — proxies sharing a port must form one shared listener: all passthrough: true, all opaque tcp listeners with at least one declaring hosts (SNI routing), or an L4 stream_match group. Offending: no candidate declares hosts or stream_match"},"target":"ferrum_edge::config::validation_pipeline"}
+{"timestamp":"2026-08-29T01:31:24.711818Z","level":"ERROR","fields":{"message":"Validation error: Spec validation failed: Configuration validation failed: 1 stream proxy error(s) found"},"target":"ferrum_edge"}

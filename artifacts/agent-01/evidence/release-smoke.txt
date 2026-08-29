@@ -1,0 +1,2 @@
+release binary missing
+release LTO killed to avoid OOM; 15Gi RAM exhausted during ferrum_edge lib -C linker-plugin-lto -C codegen-units=1. Debug binary preserved. Charter: use debug binary already built.

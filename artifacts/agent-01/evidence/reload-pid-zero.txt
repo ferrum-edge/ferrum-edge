@@ -1,0 +1,5 @@
+exit=2
+stdout=''
+stderr="error: invalid value '0' for '--pid <PID>': 0 is not in 1..=4294967295\n\nFor more information, try '--help'.\n"
+setsid_wait=1
+#4084 expect reject, not kill -HUP 0 (exit 129)

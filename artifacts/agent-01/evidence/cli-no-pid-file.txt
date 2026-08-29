@@ -1,0 +1,2 @@
+pid_file_in_cli_rs=False
+reload uses --pid or pgrep

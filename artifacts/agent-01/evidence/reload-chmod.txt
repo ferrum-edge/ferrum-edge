@@ -1,0 +1,32 @@
+retry=1 echo=200 alive=True
+log=
+{"timestamp":"2026-08-29T01:35:55.817614Z","level":"INFO","fields":{"message":"Overload monitor started (interval=1000ms, fd_limit=524288, max_conn=100000, max_req=0)"},"target":"ferrum_edge::overload"}
+{"timestamp":"2026-08-29T01:35:55.817700Z","level":"INFO","fields":{"message":"TLS not configured - HTTPS listener disabled"},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-29T01:35:55.817731Z","level":"INFO","fields":{"message":"Starting HTTP proxy listener on 127.0.0.1:21083"},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-29T01:35:55.817765Z","level":"INFO","fields":{"message":"Starting admin HTTP listener on 127.0.0.1:21084"},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-29T01:35:55.817845Z","level":"INFO","fields":{"message":"Connection limit: 100000 max concurrent connections"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-29T01:35:55.817912Z","level":"INFO","fields":{"message":"Proxy listener started on 127.0.0.1:21083 (backlog=2048, accept_threads=4)"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-29T01:35:55.817923Z","level":"INFO","fields":{"message":"Admin API listener started on 127.0.0.1:21084"},"target":"ferrum_edge::admin"}
+{"timestamp":"2026-08-29T01:35:55.818357Z","level":"INFO","fields":{"message":"Started stream listener","listener_key":"ferrum|tcp-echo","namespace":"ferrum","proxy_id":"tcp-echo","port":21081,"scheme":"tcp"},"target":"ferrum_edge::proxy::stream_listener"}
+{"timestamp":"2026-08-29T01:35:55.818609Z","level":"INFO","fields":{"message":"TCP proxy listener started on 127.0.0.1:21081","proxy_id":"tcp-echo","backlog":2048,"accept_threads":4},"target":"ferrum_edge::proxy::tcp_proxy"}
+{"timestamp":"2026-08-29T01:35:55.829912Z","level":"INFO","fields":{"message":"Gateway startup complete; /health now reports ready"},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-29T01:35:55.831669Z","level":"INFO","fields":{"message":"Backend capability refresh complete: 1 backends classified (h2_tls=0, h3=0, h2c=0, hbone=0), 0 probe results discarded in favor of newer live state"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-29T01:35:55.939498Z","level":"INFO","fields":{"message":"SIGHUP received, reloading configuration..."},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-29T01:35:55.940029Z","level":"WARN","fields":{"message":"Config file /tmp/agent01-retry-n6co1ky7/fs.yaml is world-readable (mode 644). Consider restricting permissions as it may contain credentials."},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-29T01:35:55.939831Z","level":"INFO","fields":{"message":"Reloading configuration from file: /tmp/agent01-retry-n6co1ky7/fs.yaml"},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-29T01:35:55.960283Z","level":"INFO","fields":{"message":"Loading YAML configuration from /tmp/agent01-retry-n6co1ky7/fs.yaml"},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-29T01:35:55.960698Z","level":"ERROR","fields":{"message":"Configuration reload failed, keeping previous config: missing field `plugin_configs`"},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-29T01:35:57.146317Z","level":"INFO","fields":{"message":"SIGHUP received, reloading configuration..."},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-29T01:35:57.146662Z","level":"WARN","fields":{"message":"Config file /tmp/agent01-retry-n6co1ky7/fs.yaml is world-readable (mode 644). Consider restricting permissions as it may contain credentials."},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-29T01:35:57.146575Z","level":"INFO","fields":{"message":"Reloading configuration from file: /tmp/agent01-retry-n6co1ky7/fs.yaml"},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-29T01:35:57.166849Z","level":"INFO","fields":{"message":"Loading YAML configuration from /tmp/agent01-retry-n6co1ky7/fs.yaml"},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-29T01:35:57.214666Z","level":"INFO","fields":{"message":"Configuration loaded (version 1): 2 proxies, 0 consumers, 0 plugin configs"},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-29T01:35:57.216272Z","level":"INFO","fields":{"message":"Config updated incrementally: 2 changes (proxies: +0 -0 ~2, consumers: +0 -0 ~0, plugins: +0 -0 ~0, plugin associations: ~0, upstreams: +0 -0 ~0, 2 proxy plugin lists rebuilt)"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-29T01:35:57.216334Z","level":"INFO","fields":{"message":"Configuration reloaded successfully"},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-29T01:35:57.216349Z","level":"INFO","fields":{"message":"Full config snapshot accepted after a prior validation rejection (file reload); config_rejected cleared"},"target":"ferrum_edge::modes"}
+{"timestamp":"2026-08-29T01:35:57.216427Z","level":"INFO","fields":{"message":"DNS warmup: resolving 1 unique hostnames (2 before dedup, concurrency=500)"},"target":"ferrum_edge::dns"}
+{"timestamp":"2026-08-29T01:35:57.216557Z","level":"INFO","fields":{"message":"DNS warmup complete"},"target":"ferrum_edge::dns"}
+{"timestamp":"2026-08-29T01:35:57.217283Z","level":"INFO","fields":{"message":"Backend capability refresh complete: 1 backends classified (h2_tls=0, h3=0, h2c=0, hbone=0), 0 probe results discarded in favor of newer live state"},"target":"ferrum_edge::proxy"}
+{"timestamp":"2026-08-29T01:35:58.346499Z","level":"INFO","fields":{"message":"SIGHUP received, reloading configuration..."},"target":"ferrum_edge::modes::file"}
+{"timestamp":"2026-08-29T01:35:58.346769Z","level":"INFO","fields":{"message":"Reloading configuration from file: /tmp/agent01-retry-n6co1ky7/fs.yaml"},"target":"ferrum_edge::config::file_loader"}
+{"timestamp":"2026-08-29T01:35:58.347165Z","level":"ERROR","fields":{"message":"Configuration reload failed, keeping previous config: Failed to read configuration file /tmp/agent01-retry-n6co1ky7/fs.yaml: Permission denied (os error 13)"},"target":"ferrum_edge::modes::file"}

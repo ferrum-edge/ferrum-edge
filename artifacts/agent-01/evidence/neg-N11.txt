@@ -1,0 +1,7 @@
+exit=1
+---stdout---
+Settings (ferrum.conf): OK
+  Mode: File
+
+---stderr---
+{"timestamp":"2026-08-29T01:31:24.358886Z","level":"ERROR","fields":{"message":"Validation error: Spec validation failed: Configuration file not found: /tmp/agent01-uxzqzpi3/does-not-exist.yaml"},"target":"ferrum_edge"}
