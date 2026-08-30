@@ -1,0 +1,1591 @@
+{
+  "sha_hint": "bf05855f8429e466511610f9072f666b45cd309a",
+  "pass": 84,
+  "fail": 0,
+  "results": [
+    {
+      "name": "file-mode startup",
+      "ok": true,
+      "expected": "200 /live",
+      "observed": "200",
+      "detail": "live"
+    },
+    {
+      "name": "unauth GET /live",
+      "ok": true,
+      "expected": "HTTP [200]",
+      "observed": "HTTP 200 {\"status\": \"ok\"}",
+      "detail": {
+        "status": "ok"
+      }
+    },
+    {
+      "name": "unauth GET /health coarse",
+      "ok": true,
+      "expected": "200/503 with only status+ready",
+      "observed": "HTTP 200 {\"status\": \"ok\", \"ready\": true}",
+      "detail": {
+        "status": "ok",
+        "ready": true
+      }
+    },
+    {
+      "name": "missing JWT GET /proxies",
+      "ok": true,
+      "expected": "HTTP [401]",
+      "observed": "HTTP 401 {\"error\": \"Missing Authorization header\"}",
+      "detail": {
+        "error": "Missing Authorization header"
+      }
+    },
+    {
+      "name": "malformed JWT GET /proxies",
+      "ok": true,
+      "expected": "HTTP [401]",
+      "observed": "HTTP 401 {\"error\": \"Token verification failed: InvalidToken\"}",
+      "detail": {
+        "error": "Token verification failed: InvalidToken"
+      }
+    },
+    {
+      "name": "wrong secret GET /proxies",
+      "ok": true,
+      "expected": "HTTP [401]",
+      "observed": "HTTP 401 {\"error\": \"Token verification failed: InvalidSignature\"}",
+      "detail": {
+        "error": "Token verification failed: InvalidSignature"
+      }
+    },
+    {
+      "name": "alg=none GET /proxies",
+      "ok": true,
+      "expected": "HTTP [401]",
+      "observed": "HTTP 401 {\"error\": \"Token verification failed: JSON error: unknown variant `none`, expected one of `HS256`, `HS384`, `HS512`, `ES256`, `ES384`, `RS256`, `RS384`, `RS512`, `PS256`, `PS384`, `PS512`, `EdDSA` at line 1 column 13\"}",
+      "detail": {
+        "error": "Token verification failed: JSON error: unknown variant `none`, expected one of `HS256`, `HS384`, `HS512`, `ES256`, `ES384`, `RS256`, `RS384`, `RS512`, `PS256`, `PS384`, `PS512`, `EdDSA` at line 1 column 13"
+      }
+    },
+    {
+      "name": "alg=HS384 GET /proxies",
+      "ok": true,
+      "expected": "HTTP [401]",
+      "observed": "HTTP 401 {\"error\": \"Token verification failed: InvalidAlgorithm\"}",
+      "detail": {
+        "error": "Token verification failed: InvalidAlgorithm"
+      }
+    },
+    {
+      "name": "expired JWT GET /proxies",
+      "ok": true,
+      "expected": "HTTP [401]",
+      "observed": "HTTP 401 {\"error\": \"Token verification failed: ExpiredSignature\"}",
+      "detail": {
+        "error": "Token verification failed: ExpiredSignature"
+      }
+    },
+    {
+      "name": "future nbf GET /proxies",
+      "ok": true,
+      "expected": "HTTP [401]",
+      "observed": "HTTP 401 {\"error\": \"Token verification failed: ImmatureSignature\"}",
+      "detail": {
+        "error": "Token verification failed: ImmatureSignature"
+      }
+    },
+    {
+      "name": "wrong iss GET /proxies",
+      "ok": true,
+      "expected": "HTTP [401]",
+      "observed": "HTTP 401 {\"error\": \"Token verification failed: InvalidIssuer\"}",
+      "detail": {
+        "error": "Token verification failed: InvalidIssuer"
+      }
+    },
+    {
+      "name": "missing role GET /proxies",
+      "ok": true,
+      "expected": "HTTP [401]",
+      "observed": "HTTP 401 {\"error\": \"Missing admin role claim; expected viewer, operator, or admin\"}",
+      "detail": {
+        "error": "Missing admin role claim; expected viewer, operator, or admin"
+      }
+    },
+    {
+      "name": "unexpected aud GET /proxies",
+      "ok": true,
+      "expected": "HTTP [401]",
+      "observed": "HTTP 401 {\"error\": \"Token verification failed: InvalidAudience\"}",
+      "detail": {
+        "error": "Token verification failed: InvalidAudience"
+      }
+    },
+    {
+      "name": "viewer GET /proxies",
+      "ok": true,
+      "expected": "HTTP [200]",
+      "observed": "HTTP 200 {\"data\": [{\"id\": \"fe-agent-13-file-px\", \"name\": null, \"namespace\": \"ferrum\", \"hosts\": [], \"listen_path\": \"/fe-agent-13-file\", \"backend_scheme\": \"http\", \"backend_host\": \"127.0.0.1\", \"backend_port\": 9, \"backend_path\": null, \"strip_listen_path",
+      "detail": {
+        "data": [
+          {
+            "id": "fe-agent-13-file-px",
+            "name": null,
+            "namespace": "ferrum",
+            "hosts": [],
+            "listen_path": "/fe-agent-13-file",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": 9,
+            "backend_path": null,
+            "strip_listen_path": true,
+            "preserve_host_header": false,
+            "backend_connect_timeout_ms": 5000,
+            "backend_read_timeout_ms": 30000,
+            "backend_write_timeout_ms": 30000,
+            "backend_tls_client_cert_path": null,
+            "backend_tls_client_key_path": null,
+            "backend_tls_verify_server_cert": true,
+            "backend_tls_server_ca_cert_path": null,
+            "dns_override": null,
+            "dns_cache_ttl_seconds": null,
+            "auth_mode": "single",
+            "plugins": [],
+            "pool_idle_timeout_seconds": null,
+            "pool_enable_http_keep_alive": null,
+            "pool_enable_http2": null,
+            "pool_tcp_keepalive_seconds": null,
+            "pool_http2_keep_alive_interval_seconds": null,
+            "pool_http2_keep_alive_timeout_seconds": null,
+            "pool_http2_initial_stream_window_size": null,
+            "pool_http2_initial_connection_window_size": null,
+            "pool_http2_adaptive_window": null,
+            "pool_http2_max_frame_size": null,
+            "pool_http2_max_concurrent_streams": null,
+            "pool_http3_connections_per_backend": null,
+            "upstream_id": null,
+            "circuit_breaker": null,
+            "retry": null,
+            "response_body_mode": "stream",
+            "listen_port": null,
+            "frontend_tls": false,
+            "passthrough": false,
+            "udp_idle_timeout_seconds": 60,
+            "udp_max_response_amplification_factor": null,
+            "tcp_idle_timeout_seconds": null,
+            "allowed_methods": null,
+            "allowed_ws_origins": [],
+            "created_at": "2026-08-30T08:52:52.020510328Z",
+            "updated_at": "2026-08-30T08:52:52.020517175Z"
+          }
+        ],
+        "pagination": {
+          "offset": 0,
+          "limit": 100,
+          "total": 1
+        }
+      }
+    },
+    {
+      "name": "viewer POST /proxies",
+      "ok": true,
+      "expected": "HTTP [403]",
+      "observed": "HTTP 403 {\"error\": \"Admin role 'viewer' cannot access this endpoint; required role is 'operator'\"}",
+      "detail": {
+        "error": "Admin role 'viewer' cannot access this endpoint; required role is 'operator'"
+      }
+    },
+    {
+      "name": "operator POST /consumers",
+      "ok": true,
+      "expected": "HTTP [403]",
+      "observed": "HTTP 403 {\"error\": \"Admin role 'operator' cannot access this endpoint; required role is 'admin'\"}",
+      "detail": {
+        "error": "Admin role 'operator' cannot access this endpoint; required role is 'admin'"
+      }
+    },
+    {
+      "name": "operator GET /audit",
+      "ok": true,
+      "expected": "HTTP [403]",
+      "observed": "HTTP 403 {\"error\": \"Admin role 'operator' cannot access this endpoint; required role is 'admin'\"}",
+      "detail": {
+        "error": "Admin role 'operator' cannot access this endpoint; required role is 'admin'"
+      }
+    },
+    {
+      "name": "viewer GET /backup",
+      "ok": true,
+      "expected": "403 admin-only unredacted export",
+      "observed": "HTTP 403 {\"error\": \"Admin role 'viewer' cannot access this endpoint; required role is 'admin'\"}",
+      "detail": {
+        "error": "Admin role 'viewer' cannot access this endpoint; required role is 'admin'"
+      }
+    },
+    {
+      "name": "admin GET /health detailed",
+      "ok": true,
+      "expected": "HTTP [200, 503]",
+      "observed": "HTTP 200 {\"status\": \"ok\", \"timestamp\": \"2026-08-30T08:52:52.260846782+00:00\", \"mode\": \"file\", \"admin_writes_enabled\": false, \"ready\": true, \"gateway_listeners\": {\"config_generation\": 1, \"desired_listeners\": 0, \"active_listeners\": 0, \"failed_ports\": ",
+      "detail": {
+        "status": "ok",
+        "timestamp": "2026-08-30T08:52:52.260846782+00:00",
+        "mode": "file",
+        "admin_writes_enabled": false,
+        "ready": true,
+        "gateway_listeners": {
+          "config_generation": 1,
+          "desired_listeners": 0,
+          "active_listeners": 0,
+          "failed_ports": 0,
+          "active_failures": 0,
+          "retained_failures": 0,
+          "truncated": false,
+          "overflowed": false,
+          "active_by_category": [],
+          "failures": []
+        },
+        "fips": {
+          "mode": "off",
+          "enforcing": false,
+          "build_capable": false,
+          "build_profile": "crypto-ring",
+          "provider": "ring",
+          "module_self_test_passed": false,
+          "provider_algorithms_approved": false,
+          "certified": false,
+          "boundary_documentation": "docs/fips.md"
+        },
+        "cached_config": {
+          "available": true,
+          "loaded_at": "2026-08-30T08:52:52.020542430+00:00",
+          "proxy_count": 1,
+          "consumer_count": 0
+        },
+        "logging": {
+          "stdout": {
+            "sink": "stdout",
+            "healthy": true,
+            "accepting": true,
+            "queue_capacity_records": 4096,
+            "queue_capacity_bytes": 33554432,
+            "max_record_bytes": 65536,
+            "queued_records": 0,
+            "reserved_bytes": 0,
+            "queued_bytes": 0,
+            "accepted_records_total": 0,
+            "saturation_dropped_records_total": 0,
+            "oversized_dropped_records_total": 0,
+            "closed_dropped_records_total": 0,
+            "writer_failures_total": 0,
+            "flush_failures_total": 0,
+            "shutdown_timeouts_total": 0,
+            "shutdown_incomplete_records_total": 0,
+            "last_failure": null
+          },
+          "stderr": {
+            "sink": "stderr",
+            "healthy": true,
+            "accepting": true,
+            "queue_capacity_records": 4096,
+            "queue_capacity_bytes": 33554432,
+            "max_record_bytes": 65536,
+            "queued_records": 0,
+            "reserved_bytes": 0,
+            "queued_bytes": 0,
+            "accepted_records_total": 2,
+            "saturation_dropped_records_total": 0,
+            "oversized_dropped_records_total": 0,
+            "closed_dropped_records_total": 0,
+            "writer_failures_total": 0,
+            "flush_failures_total": 0,
+            "shutdown_timeouts_total": 0,
+            "shutdown_incomplete_records_total": 0,
+            "last_failure": null
+          }
+        },
+        "kafka_logging": [],
+        "ai_transcript_audit": [],
+        "jwks_trust": {
+          "fresh": 0,
+          "grace": 0,
+          "expired": 0,
+          "max_age_seconds": {
+            "fresh": 0,
+            "grace": 0,
+            "expired": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "admin GET /namespaces",
+      "ok": true,
+      "expected": "HTTP [200]",
+      "observed": "HTTP 200 {\"data\": [\"ferrum\"], \"pagination\": {\"offset\": 0, \"limit\": 100, \"total\": 1}}",
+      "detail": {
+        "data": [
+          "ferrum"
+        ],
+        "pagination": {
+          "offset": 0,
+          "limit": 100,
+          "total": 1
+        }
+      }
+    },
+    {
+      "name": "file-mode POST /proxies",
+      "ok": true,
+      "expected": "403 Admin API is in read-only mode",
+      "observed": "HTTP 403 {\"error\": \"Admin API is in read-only mode\"}",
+      "detail": {
+        "error": "Admin API is in read-only mode"
+      }
+    },
+    {
+      "name": "file-mode POST /batch",
+      "ok": true,
+      "expected": "HTTP [403]",
+      "observed": "HTTP 403 {\"error\": \"Admin API is in read-only mode\"}",
+      "detail": {
+        "error": "Admin API is in read-only mode"
+      }
+    },
+    {
+      "name": "file-mode GET /backup",
+      "ok": true,
+      "expected": "HTTP [200]",
+      "observed": "HTTP 200 {\"version\": \"1\", \"ferrum_version\": \"0.9.0\", \"exported_at\": \"2026-08-30T08:52:52.265148780+00:00\", \"source\": \"cached\", \"counts\": {\"proxies\": 1, \"consumers\": 0, \"plugin_configs\": 0, \"upstreams\": 0, \"api_specs\": 0, \"gateway_trust_bundles\": 0},",
+      "detail": {
+        "version": "1",
+        "ferrum_version": "0.9.0",
+        "exported_at": "2026-08-30T08:52:52.265148780+00:00",
+        "source": "cached",
+        "counts": {
+          "proxies": 1,
+          "consumers": 0,
+          "plugin_configs": 0,
+          "upstreams": 0,
+          "api_specs": 0,
+          "gateway_trust_bundles": 0
+        },
+        "proxies": [
+          {
+            "id": "fe-agent-13-file-px",
+            "name": null,
+            "namespace": "ferrum",
+            "hosts": [],
+            "listen_path": "/fe-agent-13-file",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": 9,
+            "backend_path": null,
+            "strip_listen_path": true,
+            "preserve_host_header": false,
+            "backend_connect_timeout_ms": 5000,
+            "backend_read_timeout_ms": 30000,
+            "backend_write_timeout_ms": 30000,
+            "backend_tls_client_cert_path": null,
+            "backend_tls_client_key_path": null,
+            "backend_tls_verify_server_cert": true,
+            "backend_tls_server_ca_cert_path": null,
+            "dns_override": null,
+            "dns_cache_ttl_seconds": null,
+            "auth_mode": "single",
+            "plugins": [],
+            "pool_idle_timeout_seconds": null,
+            "pool_enable_http_keep_alive": null,
+            "pool_enable_http2": null,
+            "pool_tcp_keepalive_seconds": null,
+            "pool_http2_keep_alive_interval_seconds": null,
+            "pool_http2_keep_alive_timeout_seconds": null,
+            "pool_http2_initial_stream_window_size": null,
+            "pool_http2_initial_connection_window_size": null,
+            "pool_http2_adaptive_window": null,
+            "pool_http2_max_frame_size": null,
+            "pool_http2_max_concurrent_streams": null,
+            "pool_http3_connections_per_backend": null,
+            "upstream_id": null,
+            "circuit_breaker": null,
+            "retry": null,
+            "response_body_mode": "stream",
+            "listen_port": null,
+            "frontend_tls": false,
+            "passthrough": false,
+            "udp_idle_timeout_seconds": 60,
+            "udp_max_response_amplification_factor": null,
+            "tcp_idle_timeout_seconds": null,
+            "allowed_methods": null,
+            "allowed_ws_origins": [],
+            "created_at": "2026-08-30T08:52:52.020510328Z",
+            "updated_at": "2026-08-30T08:52:52.020517175Z"
+          }
+        ],
+        "consumers": [],
+        "plugin_configs": [],
+        "upstreams": []
+      }
+    },
+    {
+      "name": "file-mode POST /restore",
+      "ok": true,
+      "expected": "503 {error: No database} (docs/admin_backup_restore.md; closed #4027)",
+      "observed": "HTTP 503 {\"error\": \"No database\"}",
+      "detail": {
+        "error": "No database"
+      }
+    },
+    {
+      "name": "file-mode POST /api-specs",
+      "ok": true,
+      "expected": "403 read-only (docs/admin_api.md mode table)",
+      "observed": "HTTP 403 {\"error\": \"Admin API is in read-only mode\"}",
+      "detail": {
+        "error": "Admin API is in read-only mode"
+      }
+    },
+    {
+      "name": "file-mode GET /api-specs",
+      "ok": true,
+      "expected": "503 no database",
+      "observed": "HTTP 503 {\"error\": \"No database configured\"}",
+      "detail": {
+        "error": "No database configured"
+      }
+    },
+    {
+      "name": "file-mode GET /proxies",
+      "ok": true,
+      "expected": "HTTP [200]",
+      "observed": "HTTP 200 {\"data\": [{\"id\": \"fe-agent-13-file-px\", \"name\": null, \"namespace\": \"ferrum\", \"hosts\": [], \"listen_path\": \"/fe-agent-13-file\", \"backend_scheme\": \"http\", \"backend_host\": \"127.0.0.1\", \"backend_port\": 9, \"backend_path\": null, \"strip_listen_path",
+      "detail": {
+        "data": [
+          {
+            "id": "fe-agent-13-file-px",
+            "name": null,
+            "namespace": "ferrum",
+            "hosts": [],
+            "listen_path": "/fe-agent-13-file",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": 9,
+            "backend_path": null,
+            "strip_listen_path": true,
+            "preserve_host_header": false,
+            "backend_connect_timeout_ms": 5000,
+            "backend_read_timeout_ms": 30000,
+            "backend_write_timeout_ms": 30000,
+            "backend_tls_client_cert_path": null,
+            "backend_tls_client_key_path": null,
+            "backend_tls_verify_server_cert": true,
+            "backend_tls_server_ca_cert_path": null,
+            "dns_override": null,
+            "dns_cache_ttl_seconds": null,
+            "auth_mode": "single",
+            "plugins": [],
+            "pool_idle_timeout_seconds": null,
+            "pool_enable_http_keep_alive": null,
+            "pool_enable_http2": null,
+            "pool_tcp_keepalive_seconds": null,
+            "pool_http2_keep_alive_interval_seconds": null,
+            "pool_http2_keep_alive_timeout_seconds": null,
+            "pool_http2_initial_stream_window_size": null,
+            "pool_http2_initial_connection_window_size": null,
+            "pool_http2_adaptive_window": null,
+            "pool_http2_max_frame_size": null,
+            "pool_http2_max_concurrent_streams": null,
+            "pool_http3_connections_per_backend": null,
+            "upstream_id": null,
+            "circuit_breaker": null,
+            "retry": null,
+            "response_body_mode": "stream",
+            "listen_port": null,
+            "frontend_tls": false,
+            "passthrough": false,
+            "udp_idle_timeout_seconds": 60,
+            "udp_max_response_amplification_factor": null,
+            "tcp_idle_timeout_seconds": null,
+            "allowed_methods": null,
+            "allowed_ws_origins": [],
+            "created_at": "2026-08-30T08:52:52.020510328Z",
+            "updated_at": "2026-08-30T08:52:52.020517175Z"
+          }
+        ],
+        "pagination": {
+          "offset": 0,
+          "limit": 100,
+          "total": 1
+        }
+      }
+    },
+    {
+      "name": "file-mode POST /namespaces",
+      "ok": true,
+      "expected": "HTTP [403]",
+      "observed": "HTTP 403 {\"error\": \"Admin API is in read-only mode\"}",
+      "detail": {
+        "error": "Admin API is in read-only mode"
+      }
+    },
+    {
+      "name": "database-mode startup",
+      "ok": true,
+      "expected": "200 /live",
+      "observed": "200",
+      "detail": "live"
+    },
+    {
+      "name": "unauth GET /live",
+      "ok": true,
+      "expected": "HTTP [200]",
+      "observed": "HTTP 200 {\"status\": \"ok\"}",
+      "detail": {
+        "status": "ok"
+      }
+    },
+    {
+      "name": "unauth GET /health coarse",
+      "ok": true,
+      "expected": "200/503 with only status+ready",
+      "observed": "HTTP 200 {\"status\": \"ok\", \"ready\": true}",
+      "detail": {
+        "status": "ok",
+        "ready": true
+      }
+    },
+    {
+      "name": "missing JWT GET /proxies",
+      "ok": true,
+      "expected": "HTTP [401]",
+      "observed": "HTTP 401 {\"error\": \"Missing Authorization header\"}",
+      "detail": {
+        "error": "Missing Authorization header"
+      }
+    },
+    {
+      "name": "malformed JWT GET /proxies",
+      "ok": true,
+      "expected": "HTTP [401]",
+      "observed": "HTTP 401 {\"error\": \"Token verification failed: InvalidToken\"}",
+      "detail": {
+        "error": "Token verification failed: InvalidToken"
+      }
+    },
+    {
+      "name": "wrong secret GET /proxies",
+      "ok": true,
+      "expected": "HTTP [401]",
+      "observed": "HTTP 401 {\"error\": \"Token verification failed: InvalidSignature\"}",
+      "detail": {
+        "error": "Token verification failed: InvalidSignature"
+      }
+    },
+    {
+      "name": "alg=none GET /proxies",
+      "ok": true,
+      "expected": "HTTP [401]",
+      "observed": "HTTP 401 {\"error\": \"Token verification failed: JSON error: unknown variant `none`, expected one of `HS256`, `HS384`, `HS512`, `ES256`, `ES384`, `RS256`, `RS384`, `RS512`, `PS256`, `PS384`, `PS512`, `EdDSA` at line 1 column 13\"}",
+      "detail": {
+        "error": "Token verification failed: JSON error: unknown variant `none`, expected one of `HS256`, `HS384`, `HS512`, `ES256`, `ES384`, `RS256`, `RS384`, `RS512`, `PS256`, `PS384`, `PS512`, `EdDSA` at line 1 column 13"
+      }
+    },
+    {
+      "name": "alg=HS384 GET /proxies",
+      "ok": true,
+      "expected": "HTTP [401]",
+      "observed": "HTTP 401 {\"error\": \"Token verification failed: InvalidAlgorithm\"}",
+      "detail": {
+        "error": "Token verification failed: InvalidAlgorithm"
+      }
+    },
+    {
+      "name": "expired JWT GET /proxies",
+      "ok": true,
+      "expected": "HTTP [401]",
+      "observed": "HTTP 401 {\"error\": \"Token verification failed: ExpiredSignature\"}",
+      "detail": {
+        "error": "Token verification failed: ExpiredSignature"
+      }
+    },
+    {
+      "name": "future nbf GET /proxies",
+      "ok": true,
+      "expected": "HTTP [401]",
+      "observed": "HTTP 401 {\"error\": \"Token verification failed: ImmatureSignature\"}",
+      "detail": {
+        "error": "Token verification failed: ImmatureSignature"
+      }
+    },
+    {
+      "name": "wrong iss GET /proxies",
+      "ok": true,
+      "expected": "HTTP [401]",
+      "observed": "HTTP 401 {\"error\": \"Token verification failed: InvalidIssuer\"}",
+      "detail": {
+        "error": "Token verification failed: InvalidIssuer"
+      }
+    },
+    {
+      "name": "missing role GET /proxies",
+      "ok": true,
+      "expected": "HTTP [401]",
+      "observed": "HTTP 401 {\"error\": \"Missing admin role claim; expected viewer, operator, or admin\"}",
+      "detail": {
+        "error": "Missing admin role claim; expected viewer, operator, or admin"
+      }
+    },
+    {
+      "name": "unexpected aud GET /proxies",
+      "ok": true,
+      "expected": "HTTP [401]",
+      "observed": "HTTP 401 {\"error\": \"Token verification failed: InvalidAudience\"}",
+      "detail": {
+        "error": "Token verification failed: InvalidAudience"
+      }
+    },
+    {
+      "name": "viewer GET /proxies",
+      "ok": true,
+      "expected": "HTTP [200]",
+      "observed": "HTTP 200 {\"data\": [], \"pagination\": {\"offset\": 0, \"limit\": 100, \"total\": 0}}",
+      "detail": {
+        "data": [],
+        "pagination": {
+          "offset": 0,
+          "limit": 100,
+          "total": 0
+        }
+      }
+    },
+    {
+      "name": "viewer POST /proxies",
+      "ok": true,
+      "expected": "HTTP [403]",
+      "observed": "HTTP 403 {\"error\": \"Admin role 'viewer' cannot access this endpoint; required role is 'operator'\"}",
+      "detail": {
+        "error": "Admin role 'viewer' cannot access this endpoint; required role is 'operator'"
+      }
+    },
+    {
+      "name": "operator POST /consumers",
+      "ok": true,
+      "expected": "HTTP [403]",
+      "observed": "HTTP 403 {\"error\": \"Admin role 'operator' cannot access this endpoint; required role is 'admin'\"}",
+      "detail": {
+        "error": "Admin role 'operator' cannot access this endpoint; required role is 'admin'"
+      }
+    },
+    {
+      "name": "operator GET /audit",
+      "ok": true,
+      "expected": "HTTP [403]",
+      "observed": "HTTP 403 {\"error\": \"Admin role 'operator' cannot access this endpoint; required role is 'admin'\"}",
+      "detail": {
+        "error": "Admin role 'operator' cannot access this endpoint; required role is 'admin'"
+      }
+    },
+    {
+      "name": "viewer GET /backup",
+      "ok": true,
+      "expected": "403 admin-only unredacted export",
+      "observed": "HTTP 403 {\"error\": \"Admin role 'viewer' cannot access this endpoint; required role is 'admin'\"}",
+      "detail": {
+        "error": "Admin role 'viewer' cannot access this endpoint; required role is 'admin'"
+      }
+    },
+    {
+      "name": "admin GET /health detailed",
+      "ok": true,
+      "expected": "HTTP [200, 503]",
+      "observed": "HTTP 200 {\"status\": \"ok\", \"timestamp\": \"2026-08-30T08:52:52.894474122+00:00\", \"mode\": \"database\", \"database\": {\"status\": \"connected\", \"type\": \"sqlite\", \"pool\": {\"size\": 2, \"idle\": 2, \"active\": 0, \"max_connections\": 32, \"min_connections\": 1}}, \"admin",
+      "detail": {
+        "status": "ok",
+        "timestamp": "2026-08-30T08:52:52.894474122+00:00",
+        "mode": "database",
+        "database": {
+          "status": "connected",
+          "type": "sqlite",
+          "pool": {
+            "size": 2,
+            "idle": 2,
+            "active": 0,
+            "max_connections": 32,
+            "min_connections": 1
+          }
+        },
+        "admin_writes_enabled": true,
+        "ready": true,
+        "gateway_listeners": {
+          "config_generation": 1,
+          "desired_listeners": 0,
+          "active_listeners": 0,
+          "failed_ports": 0,
+          "active_failures": 0,
+          "retained_failures": 0,
+          "truncated": false,
+          "overflowed": false,
+          "active_by_category": [],
+          "failures": []
+        },
+        "fips": {
+          "mode": "off",
+          "enforcing": false,
+          "build_capable": false,
+          "build_profile": "crypto-ring",
+          "provider": "ring",
+          "module_self_test_passed": false,
+          "provider_algorithms_approved": false,
+          "certified": false,
+          "boundary_documentation": "docs/fips.md"
+        },
+        "cached_config": {
+          "available": true,
+          "loaded_at": "2026-08-30T08:52:52.420226479+00:00",
+          "proxy_count": 0,
+          "consumer_count": 0
+        },
+        "database_polling": {
+          "status": "ok",
+          "consecutive_identical_rejections": 0,
+          "current_backoff_bucket": "none",
+          "current_backoff_seconds": 0
+        },
+        "logging": {
+          "stdout": {
+            "sink": "stdout",
+            "healthy": true,
+            "accepting": true,
+            "queue_capacity_records": 4096,
+            "queue_capacity_bytes": 33554432,
+            "max_record_bytes": 65536,
+            "queued_records": 0,
+            "reserved_bytes": 0,
+            "queued_bytes": 0,
+            "accepted_records_total": 0,
+            "saturation_dropped_records_total": 0,
+            "oversized_dropped_records_total": 0,
+            "closed_dropped_records_total": 0,
+            "writer_failures_total": 0,
+            "flush_failures_total": 0,
+            "shutdown_timeouts_total": 0,
+            "shutdown_incomplete_records_total": 0,
+            "last_failure": null
+          },
+          "stderr": {
+            "sink": "stderr",
+            "healthy": true,
+            "accepting": true,
+            "queue_capacity_records": 4096,
+            "queue_capacity_bytes": 33554432,
+            "max_record_bytes": 65536,
+            "queued_records": 0,
+            "reserved_bytes": 0,
+            "queued_bytes": 0,
+            "accepted_records_total": 0,
+            "saturation_dropped_records_total": 0,
+            "oversized_dropped_records_total": 0,
+            "closed_dropped_records_total": 0,
+            "writer_failures_total": 0,
+            "flush_failures_total": 0,
+            "shutdown_timeouts_total": 0,
+            "shutdown_incomplete_records_total": 0,
+            "last_failure": null
+          }
+        },
+        "kafka_logging": [],
+        "ai_transcript_audit": [],
+        "jwks_trust": {
+          "fresh": 0,
+          "grace": 0,
+          "expired": 0,
+          "max_age_seconds": {
+            "fresh": 0,
+            "grace": 0,
+            "expired": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "admin GET /namespaces",
+      "ok": true,
+      "expected": "HTTP [200]",
+      "observed": "HTTP 200 {\"data\": [\"ferrum\"], \"pagination\": {\"offset\": 0, \"limit\": 100, \"total\": 1}}",
+      "detail": {
+        "data": [
+          "ferrum"
+        ],
+        "pagination": {
+          "offset": 0,
+          "limit": 100,
+          "total": 1
+        }
+      }
+    },
+    {
+      "name": "POST /namespaces empty tenant",
+      "ok": true,
+      "expected": "HTTP [201, 409]",
+      "observed": "HTTP 201 {\"name\": \"fe-agent-13-tenant\", \"description\": \"agent 13\", \"created_at\": \"2026-08-30T08:52:52.901628658Z\", \"updated_at\": \"2026-08-30T08:52:52.901628658Z\"}",
+      "detail": {
+        "name": "fe-agent-13-tenant",
+        "description": "agent 13",
+        "created_at": "2026-08-30T08:52:52.901628658Z",
+        "updated_at": "2026-08-30T08:52:52.901628658Z"
+      }
+    },
+    {
+      "name": "POST /upstreams other-namespace (no local live-apply cursor)",
+      "ok": true,
+      "expected": "201 without cursor when this process does not serve the namespace (docs/admin_api.md)",
+      "observed": "HTTP 201 {\"body\": {\"id\": \"fe-agent-13-up\", \"name\": \"fe-agent-13-up\", \"namespace\": \"fe-agent-13-tenant\", \"targets\": [{\"host\": \"127.0.0.1\", \"port\": 9, \"weight\": 1, \"tags\": {}}], \"algorithm\": \"round_robin\", \"hash_on\": null, \"health_checks\": null, \"serv",
+      "detail": {
+        "body": {
+          "id": "fe-agent-13-up",
+          "name": "fe-agent-13-up",
+          "namespace": "fe-agent-13-tenant",
+          "targets": [
+            {
+              "host": "127.0.0.1",
+              "port": 9,
+              "weight": 1,
+              "tags": {}
+            }
+          ],
+          "algorithm": "round_robin",
+          "hash_on": null,
+          "health_checks": null,
+          "service_discovery": null,
+          "backend_tls_client_cert_path": null,
+          "backend_tls_client_key_path": null,
+          "backend_tls_verify_server_cert": true,
+          "backend_tls_server_ca_cert_path": null,
+          "created_at": "2026-08-30T08:52:52.907827959Z",
+          "updated_at": "2026-08-30T08:52:52.907827959Z"
+        },
+        "cursor": null
+      }
+    },
+    {
+      "name": "POST /upstreams served-namespace 201 + cursor header",
+      "ok": true,
+      "expected": "201 with X-Ferrum-Config-Cursor on served namespace (runtime; OpenAPI only documents 202 \u2014 #4287)",
+      "observed": "HTTP 201 {\"body\": {\"id\": \"fe-agent-13-up-ferrum\", \"name\": null, \"namespace\": \"ferrum\", \"targets\": [{\"host\": \"127.0.0.1\", \"port\": 9, \"weight\": 1, \"tags\": {}}], \"algorithm\": \"round_robin\", \"hash_on\": null, \"health_checks\": null, \"service_discovery\": n",
+      "detail": {
+        "body": {
+          "id": "fe-agent-13-up-ferrum",
+          "name": null,
+          "namespace": "ferrum",
+          "targets": [
+            {
+              "host": "127.0.0.1",
+              "port": 9,
+              "weight": 1,
+              "tags": {}
+            }
+          ],
+          "algorithm": "round_robin",
+          "hash_on": null,
+          "health_checks": null,
+          "service_discovery": null,
+          "backend_tls_client_cert_path": null,
+          "backend_tls_client_key_path": null,
+          "backend_tls_verify_server_cert": true,
+          "backend_tls_server_ca_cert_path": null,
+          "created_at": "2026-08-30T08:52:52.912546938Z",
+          "updated_at": "2026-08-30T08:52:52.912546938Z"
+        },
+        "cursor": "1:2",
+        "headers": {
+          "x-content-type-options": "nosniff",
+          "x-frame-options": "DENY",
+          "x-ferrum-config-cursor": "1:2"
+        }
+      }
+    },
+    {
+      "name": "POST /proxies with upstream_id omits host/port",
+      "ok": true,
+      "expected": "201 (closed #4029)",
+      "observed": "HTTP 201 {\"id\": \"fe-agent-13-px-up\", \"name\": null, \"namespace\": \"fe-agent-13-tenant\", \"hosts\": [], \"listen_path\": \"/fe-agent-13-via-up\", \"backend_scheme\": \"http\", \"backend_host\": \"\", \"backend_port\": 0, \"backend_path\": null, \"strip_listen_path\": true",
+      "detail": {
+        "id": "fe-agent-13-px-up",
+        "name": null,
+        "namespace": "fe-agent-13-tenant",
+        "hosts": [],
+        "listen_path": "/fe-agent-13-via-up",
+        "backend_scheme": "http",
+        "backend_host": "",
+        "backend_port": 0,
+        "backend_path": null,
+        "strip_listen_path": true,
+        "preserve_host_header": false,
+        "backend_connect_timeout_ms": 5000,
+        "backend_read_timeout_ms": 30000,
+        "backend_write_timeout_ms": 30000,
+        "backend_tls_client_cert_path": null,
+        "backend_tls_client_key_path": null,
+        "backend_tls_verify_server_cert": true,
+        "backend_tls_server_ca_cert_path": null,
+        "dns_override": null,
+        "dns_cache_ttl_seconds": null,
+        "auth_mode": "single",
+        "plugins": [],
+        "pool_idle_timeout_seconds": null,
+        "pool_enable_http_keep_alive": null,
+        "pool_enable_http2": null,
+        "pool_tcp_keepalive_seconds": null,
+        "pool_http2_keep_alive_interval_seconds": null,
+        "pool_http2_keep_alive_timeout_seconds": null,
+        "pool_http2_initial_stream_window_size": null,
+        "pool_http2_initial_connection_window_size": null,
+        "pool_http2_adaptive_window": null,
+        "pool_http2_max_frame_size": null,
+        "pool_http2_max_concurrent_streams": null,
+        "pool_http3_connections_per_backend": null,
+        "upstream_id": "fe-agent-13-up",
+        "circuit_breaker": null,
+        "retry": null,
+        "response_body_mode": "stream",
+        "listen_port": null,
+        "frontend_tls": false,
+        "passthrough": false,
+        "udp_idle_timeout_seconds": 60,
+        "udp_max_response_amplification_factor": null,
+        "tcp_idle_timeout_seconds": null,
+        "allowed_methods": null,
+        "allowed_ws_origins": [],
+        "created_at": "2026-08-30T08:52:52.923243615Z",
+        "updated_at": "2026-08-30T08:52:52.923243615Z"
+      }
+    },
+    {
+      "name": "DELETE referenced upstream",
+      "ok": true,
+      "expected": "409 referenced by proxies (closed #4044)",
+      "observed": "HTTP 409 {\"error\": \"Upstream is referenced by one or more proxies and cannot be deleted\"}",
+      "detail": {
+        "error": "Upstream is referenced by one or more proxies and cannot be deleted"
+      }
+    },
+    {
+      "name": "POST /consumers",
+      "ok": true,
+      "expected": "HTTP [201]",
+      "observed": "HTTP 201 {\"id\": \"fe-agent-13-cs\", \"username\": \"feagent13user\", \"namespace\": \"fe-agent-13-tenant\", \"custom_id\": null, \"credentials\": {\"keyauth\": [{\"key\": \"[REDACTED]\"}]}, \"acl_groups\": [], \"created_at\": \"2026-08-30T08:52:52.932764097Z\", \"updated_at\":",
+      "detail": {
+        "id": "fe-agent-13-cs",
+        "username": "feagent13user",
+        "namespace": "fe-agent-13-tenant",
+        "custom_id": null,
+        "credentials": {
+          "keyauth": [
+            {
+              "key": "[REDACTED]"
+            }
+          ]
+        },
+        "acl_groups": [],
+        "created_at": "2026-08-30T08:52:52.932764097Z",
+        "updated_at": "2026-08-30T08:52:52.932764097Z"
+      }
+    },
+    {
+      "name": "consumer keyauth redacted",
+      "ok": true,
+      "expected": "ordinary GET/POST response redacts keyauth.key",
+      "observed": "HTTP 200 {\"key\": \"[REDACTED]\"}",
+      "detail": {
+        "key": "[REDACTED]"
+      }
+    },
+    {
+      "name": "POST /plugins/config access_control",
+      "ok": true,
+      "expected": "HTTP [201]",
+      "observed": "HTTP 201 {\"id\": \"fe-agent-13-acl\", \"plugin_name\": \"access_control\", \"namespace\": \"fe-agent-13-tenant\", \"config\": {\"allowed_consumers\": [\"feagent13user\"]}, \"scope\": \"proxy\", \"proxy_id\": \"fe-agent-13-px-up\", \"enabled\": true, \"created_at\": \"2026-08-30T",
+      "detail": {
+        "id": "fe-agent-13-acl",
+        "plugin_name": "access_control",
+        "namespace": "fe-agent-13-tenant",
+        "config": {
+          "allowed_consumers": [
+            "feagent13user"
+          ]
+        },
+        "scope": "proxy",
+        "proxy_id": "fe-agent-13-px-up",
+        "enabled": true,
+        "created_at": "2026-08-30T08:52:52.938238533Z",
+        "updated_at": "2026-08-30T08:52:52.938238533Z"
+      }
+    },
+    {
+      "name": "POST /plugins/config with name not plugin_name",
+      "ok": true,
+      "expected": "400 unknown field name (closed #4031)",
+      "observed": "HTTP 400 {\"error\": \"Invalid body: unknown field `name`, expected one of `id`, `plugin_name`, `namespace`, `config`, `scope`, `proxy_id`, `enabled`, `priority_override`, `trigger`, `api_spec_id`, `created_at`, `updated_at` at line 1 column 7\"}",
+      "detail": {
+        "error": "Invalid body: unknown field `name`, expected one of `id`, `plugin_name`, `namespace`, `config`, `scope`, `proxy_id`, `enabled`, `priority_override`, `trigger`, `api_spec_id`, `created_at`, `updated_at` at line 1 column 7"
+      }
+    },
+    {
+      "name": "DELETE consumer referenced by access_control",
+      "ok": true,
+      "expected": "409 (closed #4045)",
+      "observed": "HTTP 409 {\"error\": \"Consumer is referenced by one or more access_control plugin_configs and cannot be deleted\"}",
+      "detail": {
+        "error": "Consumer is referenced by one or more access_control plugin_configs and cannot be deleted"
+      }
+    },
+    {
+      "name": "POST /batch unknown envelope keys updates/deletes/dry_run",
+      "ok": true,
+      "expected": "400 deny unknown top-level keys (closed #4042)",
+      "observed": "HTTP 400 {\"error\": \"Invalid JSON body: unknown field `updates`, expected one of `proxies`, `consumers`, `plugin_configs`, `upstreams`, `version`, `ferrum_version`, `exported_at`, `source`, `counts`, `api_specs`, `gateway_trust_bundles` at line 1 col",
+      "detail": {
+        "error": "Invalid JSON body: unknown field `updates`, expected one of `proxies`, `consumers`, `plugin_configs`, `upstreams`, `version`, `ferrum_version`, `exported_at`, `source`, `counts`, `api_specs`, `gateway_trust_bundles` at line 1 column 10"
+      }
+    },
+    {
+      "name": "POST /batch valid create",
+      "ok": true,
+      "expected": "HTTP [201]",
+      "observed": "HTTP 201 {\"created\": {\"proxies\": 1, \"consumers\": 1, \"plugin_configs\": 1, \"upstreams\": 0}}",
+      "detail": {
+        "created": {
+          "proxies": 1,
+          "consumers": 1,
+          "plugin_configs": 1,
+          "upstreams": 0
+        }
+      }
+    },
+    {
+      "name": "GET batch-created proxy",
+      "ok": true,
+      "expected": "HTTP [200]",
+      "observed": "HTTP 200 {\"id\": \"fe-agent-13-batch-px\", \"name\": null, \"namespace\": \"fe-agent-13-tenant\", \"hosts\": [], \"listen_path\": \"/fe-agent-13-batch\", \"backend_scheme\": \"http\", \"backend_host\": \"127.0.0.1\", \"backend_port\": 9, \"backend_path\": null, \"strip_listen_",
+      "detail": {
+        "id": "fe-agent-13-batch-px",
+        "name": null,
+        "namespace": "fe-agent-13-tenant",
+        "hosts": [],
+        "listen_path": "/fe-agent-13-batch",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 9,
+        "backend_path": null,
+        "strip_listen_path": true,
+        "preserve_host_header": false,
+        "backend_connect_timeout_ms": 5000,
+        "backend_read_timeout_ms": 30000,
+        "backend_write_timeout_ms": 30000,
+        "backend_tls_client_cert_path": null,
+        "backend_tls_client_key_path": null,
+        "backend_tls_verify_server_cert": true,
+        "backend_tls_server_ca_cert_path": null,
+        "dns_override": null,
+        "dns_cache_ttl_seconds": null,
+        "auth_mode": "single",
+        "plugins": [
+          {
+            "plugin_config_id": "fe-agent-13-batch-pc"
+          }
+        ],
+        "pool_idle_timeout_seconds": null,
+        "pool_enable_http_keep_alive": null,
+        "pool_enable_http2": null,
+        "pool_tcp_keepalive_seconds": null,
+        "pool_http2_keep_alive_interval_seconds": null,
+        "pool_http2_keep_alive_timeout_seconds": null,
+        "pool_http2_initial_stream_window_size": null,
+        "pool_http2_initial_connection_window_size": null,
+        "pool_http2_adaptive_window": null,
+        "pool_http2_max_frame_size": null,
+        "pool_http2_max_concurrent_streams": null,
+        "pool_http3_connections_per_backend": null,
+        "upstream_id": null,
+        "circuit_breaker": null,
+        "retry": null,
+        "response_body_mode": "stream",
+        "listen_port": null,
+        "frontend_tls": false,
+        "passthrough": false,
+        "udp_idle_timeout_seconds": 60,
+        "udp_max_response_amplification_factor": null,
+        "tcp_idle_timeout_seconds": null,
+        "allowed_methods": null,
+        "allowed_ws_origins": [],
+        "created_at": "2026-08-30T08:52:52.953068428Z",
+        "updated_at": "2026-08-30T08:52:52.953068428Z"
+      }
+    },
+    {
+      "name": "cross-namespace GET proxy isolated",
+      "ok": true,
+      "expected": "404 in a different X-Ferrum-Namespace",
+      "observed": "HTTP 404 {\"error\": \"Proxy not found\"}",
+      "detail": {
+        "error": "Proxy not found"
+      }
+    },
+    {
+      "name": "POST proxy in other namespace",
+      "ok": true,
+      "expected": "HTTP [201]",
+      "observed": "HTTP 201 {\"id\": \"fe-agent-13-other-px\", \"name\": null, \"namespace\": \"fe-agent-13-other\", \"hosts\": [], \"listen_path\": \"/fe-agent-13-other\", \"backend_scheme\": \"http\", \"backend_host\": \"127.0.0.1\", \"backend_port\": 9, \"backend_path\": null, \"strip_listen_p",
+      "detail": {
+        "id": "fe-agent-13-other-px",
+        "name": null,
+        "namespace": "fe-agent-13-other",
+        "hosts": [],
+        "listen_path": "/fe-agent-13-other",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 9,
+        "backend_path": null,
+        "strip_listen_path": true,
+        "preserve_host_header": false,
+        "backend_connect_timeout_ms": 5000,
+        "backend_read_timeout_ms": 30000,
+        "backend_write_timeout_ms": 30000,
+        "backend_tls_client_cert_path": null,
+        "backend_tls_client_key_path": null,
+        "backend_tls_verify_server_cert": true,
+        "backend_tls_server_ca_cert_path": null,
+        "dns_override": null,
+        "dns_cache_ttl_seconds": null,
+        "auth_mode": "single",
+        "plugins": [],
+        "pool_idle_timeout_seconds": null,
+        "pool_enable_http_keep_alive": null,
+        "pool_enable_http2": null,
+        "pool_tcp_keepalive_seconds": null,
+        "pool_http2_keep_alive_interval_seconds": null,
+        "pool_http2_keep_alive_timeout_seconds": null,
+        "pool_http2_initial_stream_window_size": null,
+        "pool_http2_initial_connection_window_size": null,
+        "pool_http2_adaptive_window": null,
+        "pool_http2_max_frame_size": null,
+        "pool_http2_max_concurrent_streams": null,
+        "pool_http3_connections_per_backend": null,
+        "upstream_id": null,
+        "circuit_breaker": null,
+        "retry": null,
+        "response_body_mode": "stream",
+        "listen_port": null,
+        "frontend_tls": false,
+        "passthrough": false,
+        "udp_idle_timeout_seconds": 60,
+        "udp_max_response_amplification_factor": null,
+        "tcp_idle_timeout_seconds": null,
+        "allowed_methods": null,
+        "allowed_ws_origins": [],
+        "created_at": "2026-08-30T08:52:52.963913302Z",
+        "updated_at": "2026-08-30T08:52:52.963913302Z"
+      }
+    },
+    {
+      "name": "DELETE last proxy referencing hand-owned upstream (default cleanup)",
+      "ok": true,
+      "expected": "HTTP [204]",
+      "observed": "HTTP 204 null",
+      "detail": null
+    },
+    {
+      "name": "GET hand-owned upstream after last proxy delete (default orphan-clean)",
+      "ok": true,
+      "expected": "404 default cleanup (closed #4046/#4064; opt-out exists)",
+      "observed": "HTTP 404 {\"error\": \"Upstream not found\"}",
+      "detail": {
+        "error": "Upstream not found"
+      }
+    },
+    {
+      "name": "recreate upstream for opt-out",
+      "ok": true,
+      "expected": "HTTP [201]",
+      "observed": "HTTP 201 {\"id\": \"fe-agent-13-up-keep\", \"name\": null, \"namespace\": \"fe-agent-13-tenant\", \"targets\": [{\"host\": \"127.0.0.1\", \"port\": 9, \"weight\": 1, \"tags\": {}}], \"algorithm\": \"round_robin\", \"hash_on\": null, \"health_checks\": null, \"service_discovery\": ",
+      "detail": {
+        "id": "fe-agent-13-up-keep",
+        "name": null,
+        "namespace": "fe-agent-13-tenant",
+        "targets": [
+          {
+            "host": "127.0.0.1",
+            "port": 9,
+            "weight": 1,
+            "tags": {}
+          }
+        ],
+        "algorithm": "round_robin",
+        "hash_on": null,
+        "health_checks": null,
+        "service_discovery": null,
+        "backend_tls_client_cert_path": null,
+        "backend_tls_client_key_path": null,
+        "backend_tls_verify_server_cert": true,
+        "backend_tls_server_ca_cert_path": null,
+        "created_at": "2026-08-30T08:52:52.978196857Z",
+        "updated_at": "2026-08-30T08:52:52.978196857Z"
+      }
+    },
+    {
+      "name": "DELETE proxy with cleanup_orphaned_upstream=false",
+      "ok": true,
+      "expected": "HTTP [204]",
+      "observed": "HTTP 204 null",
+      "detail": null
+    },
+    {
+      "name": "hand-owned upstream survives when cleanup opted out",
+      "ok": true,
+      "expected": "200 (closed #4064)",
+      "observed": "HTTP 200 {\"id\": \"fe-agent-13-up-keep\", \"name\": null, \"namespace\": \"fe-agent-13-tenant\", \"targets\": [{\"host\": \"127.0.0.1\", \"port\": 9, \"weight\": 1, \"tags\": {}}], \"algorithm\": \"round_robin\", \"hash_on\": null, \"health_checks\": null, \"service_discovery\": ",
+      "detail": {
+        "id": "fe-agent-13-up-keep",
+        "name": null,
+        "namespace": "fe-agent-13-tenant",
+        "targets": [
+          {
+            "host": "127.0.0.1",
+            "port": 9,
+            "weight": 1,
+            "tags": {}
+          }
+        ],
+        "algorithm": "round_robin",
+        "hash_on": null,
+        "health_checks": null,
+        "service_discovery": null,
+        "backend_tls_client_cert_path": null,
+        "backend_tls_client_key_path": null,
+        "backend_tls_verify_server_cert": true,
+        "backend_tls_server_ca_cert_path": null,
+        "created_at": "2026-08-30T08:52:52.978196857Z",
+        "updated_at": "2026-08-30T08:52:52.978196857Z"
+      }
+    },
+    {
+      "name": "POST /api-specs database mode",
+      "ok": true,
+      "expected": "HTTP [201]",
+      "observed": "HTTP 201 {\"id\": \"91dbfcbf-661e-4548-b6df-684f3cac2ed2\", \"proxy_id\": \"fe-agent-13-spec-px\", \"content_hash\": \"83492364f2dc6c6f662b4ccc9beb30eafe8903a0fe8f67fed3e7afe5be899ced\", \"spec_version\": \"3.1.0\"}",
+      "detail": {
+        "id": "91dbfcbf-661e-4548-b6df-684f3cac2ed2",
+        "proxy_id": "fe-agent-13-spec-px",
+        "content_hash": "83492364f2dc6c6f662b4ccc9beb30eafe8903a0fe8f67fed3e7afe5be899ced",
+        "spec_version": "3.1.0"
+      }
+    },
+    {
+      "name": "spec-extracted proxy exists",
+      "ok": true,
+      "expected": "HTTP [200]",
+      "observed": "HTTP 200 {\"id\": \"fe-agent-13-spec-px\", \"name\": null, \"namespace\": \"fe-agent-13-tenant\", \"hosts\": [], \"listen_path\": \"/fe-agent-13-spec\", \"backend_scheme\": \"http\", \"backend_host\": \"127.0.0.1\", \"backend_port\": 9, \"backend_path\": null, \"strip_listen_pa",
+      "detail": {
+        "id": "fe-agent-13-spec-px",
+        "name": null,
+        "namespace": "fe-agent-13-tenant",
+        "hosts": [],
+        "listen_path": "/fe-agent-13-spec",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 9,
+        "backend_path": null,
+        "strip_listen_path": true,
+        "preserve_host_header": false,
+        "backend_connect_timeout_ms": 5000,
+        "backend_read_timeout_ms": 30000,
+        "backend_write_timeout_ms": 30000,
+        "backend_tls_client_cert_path": null,
+        "backend_tls_client_key_path": null,
+        "backend_tls_verify_server_cert": true,
+        "backend_tls_server_ca_cert_path": null,
+        "dns_override": null,
+        "dns_cache_ttl_seconds": null,
+        "auth_mode": "single",
+        "plugins": [],
+        "pool_idle_timeout_seconds": null,
+        "pool_enable_http_keep_alive": null,
+        "pool_enable_http2": null,
+        "pool_tcp_keepalive_seconds": null,
+        "pool_http2_keep_alive_interval_seconds": null,
+        "pool_http2_keep_alive_timeout_seconds": null,
+        "pool_http2_initial_stream_window_size": null,
+        "pool_http2_initial_connection_window_size": null,
+        "pool_http2_adaptive_window": null,
+        "pool_http2_max_frame_size": null,
+        "pool_http2_max_concurrent_streams": null,
+        "pool_http3_connections_per_backend": null,
+        "upstream_id": null,
+        "api_spec_id": "91dbfcbf-661e-4548-b6df-684f3cac2ed2",
+        "circuit_breaker": null,
+        "retry": null,
+        "response_body_mode": "stream",
+        "listen_port": null,
+        "frontend_tls": false,
+        "passthrough": false,
+        "udp_idle_timeout_seconds": 60,
+        "udp_max_response_amplification_factor": null,
+        "tcp_idle_timeout_seconds": null,
+        "allowed_methods": null,
+        "allowed_ws_origins": [],
+        "created_at": "2026-08-30T08:52:52.995936015Z",
+        "updated_at": "2026-08-30T08:52:52.995936015Z"
+      }
+    },
+    {
+      "name": "viewer GET /api-specs list",
+      "ok": true,
+      "expected": "HTTP [200]",
+      "observed": "HTTP 200 {\"items\": [{\"id\": \"91dbfcbf-661e-4548-b6df-684f3cac2ed2\", \"proxy_id\": \"fe-agent-13-spec-px\", \"spec_version\": \"3.1.0\", \"spec_format\": \"json\", \"title\": \"fe-agent-13\", \"info_version\": \"1.0.0\", \"description\": null, \"contact_name\": null, \"contac",
+      "detail": {
+        "items": [
+          {
+            "id": "91dbfcbf-661e-4548-b6df-684f3cac2ed2",
+            "proxy_id": "fe-agent-13-spec-px",
+            "spec_version": "3.1.0",
+            "spec_format": "json",
+            "title": "fe-agent-13",
+            "info_version": "1.0.0",
+            "description": null,
+            "contact_name": null,
+            "contact_email": null,
+            "license_name": null,
+            "license_identifier": null,
+            "tags": [],
+            "server_urls": [],
+            "operation_count": 0,
+            "uncompressed_size": 233,
+            "content_hash": "83492364f2dc6c6f662b4ccc9beb30eafe8903a0fe8f67fed3e7afe5be899ced",
+            "external_ref_digest": null,
+            "created_at": "2026-08-30T08:52:52.998651133Z",
+            "updated_at": "2026-08-30T08:52:52.998651133Z"
+          }
+        ],
+        "limit": 50,
+        "offset": 0,
+        "next_offset": null,
+        "total": 1
+      }
+    },
+    {
+      "name": "viewer GET /api-specs/{id} raw document",
+      "ok": true,
+      "expected": "HTTP [403]",
+      "observed": "HTTP 403 {\"error\": \"Admin role 'viewer' cannot access this endpoint; required role is 'admin'\"}",
+      "detail": {
+        "error": "Admin role 'viewer' cannot access this endpoint; required role is 'admin'"
+      }
+    },
+    {
+      "name": "invalid X-Ferrum-Namespace",
+      "ok": true,
+      "expected": "HTTP [400]",
+      "observed": "HTTP 400 {\"error\": \"Invalid X-Ferrum-Namespace: namespace '../evil' is invalid: must start with alphanumeric and contain only alphanumeric, dots, underscores, or hyphens\"}",
+      "detail": {
+        "error": "Invalid X-Ferrum-Namespace: namespace '../evil' is invalid: must start with alphanumeric and contain only alphanumeric, dots, underscores, or hyphens"
+      }
+    },
+    {
+      "name": "implicit namespace via header without registry POST",
+      "ok": true,
+      "expected": "HTTP [201]",
+      "observed": "HTTP 201 {\"id\": \"fe-agent-13-implicit-px\", \"name\": null, \"namespace\": \"fe-agent-13-implicit\", \"hosts\": [], \"listen_path\": \"/fe-agent-13-implicit\", \"backend_scheme\": \"http\", \"backend_host\": \"127.0.0.1\", \"backend_port\": 9, \"backend_path\": null, \"strip",
+      "detail": {
+        "id": "fe-agent-13-implicit-px",
+        "name": null,
+        "namespace": "fe-agent-13-implicit",
+        "hosts": [],
+        "listen_path": "/fe-agent-13-implicit",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 9,
+        "backend_path": null,
+        "strip_listen_path": true,
+        "preserve_host_header": false,
+        "backend_connect_timeout_ms": 5000,
+        "backend_read_timeout_ms": 30000,
+        "backend_write_timeout_ms": 30000,
+        "backend_tls_client_cert_path": null,
+        "backend_tls_client_key_path": null,
+        "backend_tls_verify_server_cert": true,
+        "backend_tls_server_ca_cert_path": null,
+        "dns_override": null,
+        "dns_cache_ttl_seconds": null,
+        "auth_mode": "single",
+        "plugins": [],
+        "pool_idle_timeout_seconds": null,
+        "pool_enable_http_keep_alive": null,
+        "pool_enable_http2": null,
+        "pool_tcp_keepalive_seconds": null,
+        "pool_http2_keep_alive_interval_seconds": null,
+        "pool_http2_keep_alive_timeout_seconds": null,
+        "pool_http2_initial_stream_window_size": null,
+        "pool_http2_initial_connection_window_size": null,
+        "pool_http2_adaptive_window": null,
+        "pool_http2_max_frame_size": null,
+        "pool_http2_max_concurrent_streams": null,
+        "pool_http3_connections_per_backend": null,
+        "upstream_id": null,
+        "circuit_breaker": null,
+        "retry": null,
+        "response_body_mode": "stream",
+        "listen_port": null,
+        "frontend_tls": false,
+        "passthrough": false,
+        "udp_idle_timeout_seconds": 60,
+        "udp_max_response_amplification_factor": null,
+        "tcp_idle_timeout_seconds": null,
+        "allowed_methods": null,
+        "allowed_ws_origins": [],
+        "created_at": "2026-08-30T08:52:53.009263442Z",
+        "updated_at": "2026-08-30T08:52:53.009263442Z"
+      }
+    },
+    {
+      "name": "GET /namespaces includes implicit derived name",
+      "ok": true,
+      "expected": "derived name appears without registry row",
+      "observed": "HTTP 200 [\"fe-agent-13-implicit\", \"fe-agent-13-other\", \"fe-agent-13-tenant\", \"ferrum\"]",
+      "detail": [
+        "fe-agent-13-implicit",
+        "fe-agent-13-other",
+        "fe-agent-13-tenant",
+        "ferrum"
+      ]
+    },
+    {
+      "name": "ns-claim startup",
+      "ok": true,
+      "expected": "200 /live",
+      "observed": "200",
+      "detail": "live"
+    },
+    {
+      "name": "ns-claim POST /namespaces a",
+      "ok": true,
+      "expected": "HTTP [201, 403, 409]",
+      "observed": "HTTP 201 {\"name\": \"fe-agent-13-claim-a\", \"created_at\": \"2026-08-30T08:52:53.624921603Z\", \"updated_at\": \"2026-08-30T08:52:53.624921603Z\"}",
+      "detail": {
+        "name": "fe-agent-13-claim-a",
+        "created_at": "2026-08-30T08:52:53.624921603Z",
+        "updated_at": "2026-08-30T08:52:53.624921603Z"
+      }
+    },
+    {
+      "name": "ns-claim POST /namespaces b",
+      "ok": true,
+      "expected": "HTTP [201, 403, 409]",
+      "observed": "HTTP 201 {\"name\": \"fe-agent-13-claim-b\", \"created_at\": \"2026-08-30T08:52:53.635767348Z\", \"updated_at\": \"2026-08-30T08:52:53.635767348Z\"}",
+      "detail": {
+        "name": "fe-agent-13-claim-b",
+        "created_at": "2026-08-30T08:52:53.635767348Z",
+        "updated_at": "2026-08-30T08:52:53.635767348Z"
+      }
+    },
+    {
+      "name": "ns-claim matching header POST /proxies",
+      "ok": true,
+      "expected": "HTTP [201]",
+      "observed": "HTTP 201 {\"id\": \"fe-agent-13-claim-px\", \"name\": null, \"namespace\": \"fe-agent-13-claim-a\", \"hosts\": [], \"listen_path\": \"/fe-agent-13-claim\", \"backend_scheme\": \"http\", \"backend_host\": \"127.0.0.1\", \"backend_port\": 9, \"backend_path\": null, \"strip_listen",
+      "detail": {
+        "id": "fe-agent-13-claim-px",
+        "name": null,
+        "namespace": "fe-agent-13-claim-a",
+        "hosts": [],
+        "listen_path": "/fe-agent-13-claim",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 9,
+        "backend_path": null,
+        "strip_listen_path": true,
+        "preserve_host_header": false,
+        "backend_connect_timeout_ms": 5000,
+        "backend_read_timeout_ms": 30000,
+        "backend_write_timeout_ms": 30000,
+        "backend_tls_client_cert_path": null,
+        "backend_tls_client_key_path": null,
+        "backend_tls_verify_server_cert": true,
+        "backend_tls_server_ca_cert_path": null,
+        "dns_override": null,
+        "dns_cache_ttl_seconds": null,
+        "auth_mode": "single",
+        "plugins": [],
+        "pool_idle_timeout_seconds": null,
+        "pool_enable_http_keep_alive": null,
+        "pool_enable_http2": null,
+        "pool_tcp_keepalive_seconds": null,
+        "pool_http2_keep_alive_interval_seconds": null,
+        "pool_http2_keep_alive_timeout_seconds": null,
+        "pool_http2_initial_stream_window_size": null,
+        "pool_http2_initial_connection_window_size": null,
+        "pool_http2_adaptive_window": null,
+        "pool_http2_max_frame_size": null,
+        "pool_http2_max_concurrent_streams": null,
+        "pool_http3_connections_per_backend": null,
+        "upstream_id": null,
+        "circuit_breaker": null,
+        "retry": null,
+        "response_body_mode": "stream",
+        "listen_port": null,
+        "frontend_tls": false,
+        "passthrough": false,
+        "udp_idle_timeout_seconds": 60,
+        "udp_max_response_amplification_factor": null,
+        "tcp_idle_timeout_seconds": null,
+        "allowed_methods": null,
+        "allowed_ws_origins": [],
+        "created_at": "2026-08-30T08:52:53.643389822Z",
+        "updated_at": "2026-08-30T08:52:53.643389822Z"
+      }
+    },
+    {
+      "name": "ns-claim mismatch GET /proxies",
+      "ok": true,
+      "expected": "403 JWT ns claim does not authorize",
+      "observed": "HTTP 403 {\"error\": \"JWT `ns` claim does not authorize namespace 'fe-agent-13-claim-b'; the bearer may only address the namespaces listed in its token\"}",
+      "detail": {
+        "error": "JWT `ns` claim does not authorize namespace 'fe-agent-13-claim-b'; the bearer may only address the namespaces listed in its token"
+      }
+    },
+    {
+      "name": "ns-claim missing ns on scoped route",
+      "ok": true,
+      "expected": "403 require-namespace-claim with no ns",
+      "observed": "HTTP 403 {\"error\": \"FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true on this instance: the admin JWT must include an `ns` claim (string or array) listing the namespaces it may manage\"}",
+      "detail": {
+        "error": "FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true on this instance: the admin JWT must include an `ns` claim (string or array) listing the namespaces it may manage"
+      }
+    },
+    {
+      "name": "ns-claim GET /namespaces filtered",
+      "ok": true,
+      "expected": "200 filtered to token ns; no 403",
+      "observed": "HTTP 200 [\"fe-agent-13-claim-a\"]",
+      "detail": [
+        "fe-agent-13-claim-a"
+      ]
+    },
+    {
+      "name": "ns-claim GET /cluster global surface still allowed",
+      "ok": true,
+      "expected": "global surface not gated by ns claim",
+      "observed": "HTTP 200 {\"mode\": \"database\", \"message\": \"Cluster status is only available in cp or dp modes\"}",
+      "detail": {
+        "mode": "database",
+        "message": "Cluster status is only available in cp or dp modes"
+      }
+    },
+    {
+      "name": "ns-claim GET /namespaces/{other}",
+      "ok": true,
+      "expected": "403 on registry get for unauthorized name",
+      "observed": "HTTP 403 {\"error\": \"JWT `ns` claim does not authorize namespace 'fe-agent-13-claim-b'; the bearer may only address the namespaces listed in its token\"}",
+      "detail": {
+        "error": "JWT `ns` claim does not authorize namespace 'fe-agent-13-claim-b'; the bearer may only address the namespaces listed in its token"
+      }
+    }
+  ]
+}
