@@ -163,7 +163,7 @@ Still fail-closed (no smuggle). Clients and tests that key off `{"error":...}` /
 
 - Comments: [#4025](https://github.com/ferrum-edge/ferrum-edge/issues/4025#issuecomment-5467742701), [#4053](https://github.com/ferrum-edge/ferrum-edge/issues/4053#issuecomment-5467742772), [#4054](https://github.com/ferrum-edge/ferrum-edge/issues/4054#issuecomment-5467742812), [#4055](https://github.com/ferrum-edge/ferrum-edge/issues/4055#issuecomment-5467742886).
 - New issue: [#4393](https://github.com/ferrum-edge/ferrum-edge/issues/4393) parser-layer empty 400 envelope.
-- This artifacts-only PR.
+- Artifacts PR: [#4395](https://github.com/ferrum-edge/ferrum-edge/pull/4395).
 
 ---
 
