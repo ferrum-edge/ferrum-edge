@@ -7,6 +7,7 @@ Investigation only. No production Rust changes.
 | Agent | Ferrum Edge Launch-Readiness Agent 17 |
 | Tested SHA | `bf05855f8429e466511610f9072f666b45cd309a` (`bf05855f8 Merge pull request #4319 from ferrum-edge/codex/issue-4311-cli-fips-doc`) |
 | Branch | `cursor/agent-17-kind-helm-0949` |
+| PR | https://github.com/ferrum-edge/ferrum-edge/pull/4387 |
 | Ports reserved | `127.0.0.1:22600-22699` (unused — no cluster) |
 | Resource prefix | `fe-agent-17-` (unused — no cluster) |
 | Date | 2026-08-30 |
