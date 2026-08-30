@@ -1,0 +1,113 @@
+{
+  "proxy_port": 22800,
+  "admin_port": 22801,
+  "ts": 1788079934.4675055,
+  "http1_cases": [
+    {
+      "name": "h11_clean",
+      "status": 200,
+      "note": "baseline with Host",
+      "body_snippet": "HTTP/1.1 200 OK\\r\\ncontent-length: 180\\r\\nx-backend-marker: host-app\\r\\ncontent-type: application/json\\r\\nvia: 1.1 ferrum-edge\\r\\nconnection: close\\r\\ndate: Sun, 30 Aug 2026 08:52:14 GMT\\r\\n\\r\\n{\"marker\": \"host-app\", \"request_line\": \"GET / HTTP/1.1\", \"host\": \"127.0.0.1\", \"header_names\": [\"accept\", \"host\", \"via\", \"x-forwarded-for\", \"x-forwarded-host\", \"x-forwarded-proto\"]}"
+    },
+    {
+      "name": "h11_cl_te",
+      "status": 400,
+      "note": "CL.TE smuggling shape",
+      "body_snippet": "HTTP/1.1 400 Bad Request\\r\\ncontent-type: application/json\\r\\nconnection: close\\r\\ncontent-length: 78\\r\\ndate: Sun, 30 Aug 2026 08:52:14 GMT\\r\\n\\r\\n{\"error\":\"Request contains both Content-Length and Transfer-Encoding headers\"}"
+    },
+    {
+      "name": "h11_te_cl",
+      "status": 200,
+      "note": "TE.CL smuggling shape",
+      "body_snippet": "HTTP/1.1 200 OK\\r\\ncontent-length: 202\\r\\nx-backend-marker: host-app\\r\\ncontent-type: application/json\\r\\nvia: 1.1 ferrum-edge\\r\\nconnection: close\\r\\ndate: Sun, 30 Aug 2026 08:52:14 GMT\\r\\n\\r\\n{\"marker\": \"host-app\", \"request_line\": \"POST / HTTP/1.1\", \"host\": \"127.0.0.1\", \"header_names\": [\"accept\", \"host\", \"transfer-encoding\", \"via\", \"x-forwarded-for\", \"x-forwarded-host\", \"x-forwarded-proto\"]}"
+    },
+    {
+      "name": "h11_dup_cl_conflict",
+      "status": 400,
+      "note": "duplicate conflicting Content-Length",
+      "body_snippet": "HTTP/1.1 400 Bad Request\\r\\nconnection: close\\r\\ncontent-length: 0\\r\\ndate: Sun, 30 Aug 2026 08:52:14 GMT\\r\\n\\r\\n"
+    },
+    {
+      "name": "h11_dup_host",
+      "status": 400,
+      "note": "duplicate Host",
+      "body_snippet": "HTTP/1.1 400 Bad Request\\r\\ncontent-type: application/json\\r\\nconnection: close\\r\\ncontent-length: 50\\r\\ndate: Sun, 30 Aug 2026 08:52:14 GMT\\r\\n\\r\\n{\"error\":\"Request contains multiple Host headers\"}"
+    },
+    {
+      "name": "h11_missing_host",
+      "status": 404,
+      "note": "HTTP/1.1 origin-form without Host (RFC 9112 MUST 400)",
+      "body_snippet": "HTTP/1.1 404 Not Found\\r\\ncontent-type: application/json\\r\\ncontent-length: 21\\r\\nconnection: close\\r\\ndate: Sun, 30 Aug 2026 08:52:14 GMT\\r\\n\\r\\n{\"error\":\"Not Found\"}"
+    },
+    {
+      "name": "h11_missing_host_catchall_path",
+      "status": 200,
+      "note": "HTTP/1.1 without Host against catch-all path",
+      "body_snippet": "HTTP/1.1 200 OK\\r\\nx-backend-marker: catchall\\r\\ncontent-length: 174\\r\\ncontent-type: application/json\\r\\nvia: 1.1 ferrum-edge\\r\\nconnection: close\\r\\ndate: Sun, 30 Aug 2026 08:52:14 GMT\\r\\n\\r\\n{\"marker\": \"catchall\", \"request_line\": \"GET /catchall HTTP/1.1\", \"host\": \"127.0.0.1:22811\", \"header_names\": [\"accept\", \"host\", \"via\", \"x-forwarded-for\", \"x-forwarded-proto\"]}"
+    },
+    {
+      "name": "h11_absolute_form_mismatch",
+      "status": 200,
+      "note": "absolute-form authority disagrees with Host",
+      "body_snippet": "HTTP/1.1 200 OK\\r\\nx-backend-marker: host-app\\r\\ncontent-length: 180\\r\\ncontent-type: application/json\\r\\nvia: 1.1 ferrum-edge\\r\\nconnection: close\\r\\ndate: Sun, 30 Aug 2026 08:52:14 GMT\\r\\n\\r\\n{\"marker\": \"host-app\", \"request_line\": \"GET / HTTP/1.1\", \"host\": \"127.0.0.1\", \"header_names\": [\"accept\", \"host\", \"via\", \"x-forwarded-for\", \"x-forwarded-host\", \"x-forwarded-proto\"]}"
+    },
+    {
+      "name": "h11_absolute_form_no_host",
+      "status": 200,
+      "note": "absolute-form without Host",
+      "body_snippet": "HTTP/1.1 200 OK\\r\\nx-backend-marker: host-app\\r\\ncontent-type: application/json\\r\\ncontent-length: 180\\r\\nvia: 1.1 ferrum-edge\\r\\nconnection: close\\r\\ndate: Sun, 30 Aug 2026 08:52:14 GMT\\r\\n\\r\\n{\"marker\": \"host-app\", \"request_line\": \"GET / HTTP/1.1\", \"host\": \"127.0.0.1\", \"header_names\": [\"accept\", \"host\", \"via\", \"x-forwarded-for\", \"x-forwarded-host\", \"x-forwarded-proto\"]}"
+    },
+    {
+      "name": "h11_obs_fold",
+      "status": 400,
+      "note": "obsolete line folding",
+      "body_snippet": "HTTP/1.1 400 Bad Request\\r\\nconnection: close\\r\\ncontent-length: 0\\r\\ndate: Sun, 30 Aug 2026 08:52:14 GMT\\r\\n\\r\\n"
+    },
+    {
+      "name": "h11_connection_nominated",
+      "status": 200,
+      "note": "Connection-nominated header should be stripped before backend",
+      "body_snippet": "HTTP/1.1 200 OK\\r\\ncontent-length: 180\\r\\ncontent-type: application/json\\r\\nx-backend-marker: host-app\\r\\nvia: 1.1 ferrum-edge\\r\\nconnection: close\\r\\ndate: Sun, 30 Aug 2026 08:52:14 GMT\\r\\n\\r\\n{\"marker\": \"host-app\", \"request_line\": \"GET / HTTP/1.1\", \"host\": \"127.0.0.1\", \"header_names\": [\"accept\", \"host\", \"via\", \"x-forwarded-for\", \"x-forwarded-host\", \"x-forwarded-proto\"]}"
+    },
+    {
+      "name": "h11_te_only_chunked",
+      "status": 200,
+      "note": "TE-only chunked is valid HTTP/1.1",
+      "body_snippet": "HTTP/1.1 200 OK\\r\\ncontent-length: 202\\r\\ncontent-type: application/json\\r\\nx-backend-marker: host-app\\r\\nvia: 1.1 ferrum-edge\\r\\nconnection: close\\r\\ndate: Sun, 30 Aug 2026 08:52:14 GMT\\r\\n\\r\\n{\"marker\": \"host-app\", \"request_line\": \"POST / HTTP/1.1\", \"host\": \"127.0.0.1\", \"header_names\": [\"accept\", \"host\", \"transfer-encoding\", \"via\", \"x-forwarded-for\", \"x-forwarded-host\", \"x-forwarded-proto\"]}"
+    },
+    {
+      "name": "h10_with_te",
+      "status": 400,
+      "note": "HTTP/1.0 + TE",
+      "body_snippet": "HTTP/1.1 400 Bad Request\\r\\nconnection: close\\r\\ncontent-length: 0\\r\\ndate: Sun, 30 Aug 2026 08:52:14 GMT\\r\\n\\r\\n"
+    },
+    {
+      "name": "h11_control_byte_header",
+      "status": 400,
+      "note": "control byte in header value",
+      "body_snippet": "HTTP/1.1 400 Bad Request\\r\\nconnection: close\\r\\ncontent-length: 0\\r\\ndate: Sun, 30 Aug 2026 08:52:14 GMT\\r\\n\\r\\n"
+    }
+  ],
+  "admin_cases": {
+    "live": {
+      "status": 200,
+      "body": "{\"status\":\"ok\"}"
+    },
+    "health": {
+      "status": 200,
+      "body": "{\"status\":\"ok\",\"ready\":true}"
+    },
+    "status": {
+      "status": 200,
+      "body": "{\"status\":\"ok\",\"ready\":true}"
+    },
+    "overload": {
+      "status": 200,
+      "body": "{\"level\":\"normal\"}"
+    },
+    "metrics": {
+      "status": 401,
+      "body": "{\"error\":\"Unauthorized: /metrics requires a valid admin JWT or metrics bearer token, or the client must be in FERRUM_METRICS_ALLOWED_CIDRS\"}"
+    }
+  }
+}

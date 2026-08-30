@@ -1,0 +1,10 @@
+version: "1"
+proxies:
+  - id: "fe-agent-19-catchall"
+    listen_path: "/"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: 22810
+    strip_listen_path: false
+consumers: []
+plugin_configs: []
