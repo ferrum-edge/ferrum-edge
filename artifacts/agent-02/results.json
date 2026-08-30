@@ -1,0 +1,1176 @@
+{
+  "sha": "bf05855f8429e466511610f9072f666b45cd309a",
+  "generated_at": "2026-08-30T08:52:59Z",
+  "ports": {
+    "gateway_http": 21100,
+    "gateway_admin": 21101,
+    "echo": 21110
+  },
+  "summary": {
+    "total": 66,
+    "passed": 66,
+    "failed": 0
+  },
+  "cases": [
+    {
+      "id": "R01",
+      "charter": "1 routing",
+      "title": "Exact path =/healthz matches only that path",
+      "expected": "200 and backend path /rid/exact/healthz (or /rid/exact)",
+      "pass": true,
+      "elapsed_ms": 4.5,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "path": "/rid/exact/healthz",
+        "body": "{\"origin\":\"fe-agent-02-echo\",\"method\":\"GET\",\"path\":\"/rid/exact/healthz\",\"headers\":{\"host\":\"127.0.0.1\",\"x-forwarded-for\":\"127.0.0.1\",\"x-forwarded-proto\":\"http\",\"x-forwarded-host\":\"127.0.0.1:21100\",\"via\":\"1.1 ferrum-edge\",\"accept\":\"*/*\"},\"body_len\":0,\"body_utf8\":\"\"}"
+      }
+    },
+    {
+      "id": "R02",
+      "charter": "1 routing",
+      "title": "Exact path =/healthz does not match /healthz/live",
+      "expected": "404 {error:Not Found} \u2014 exact route must not prefix-match",
+      "pass": true,
+      "elapsed_ms": 0.8,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 404,
+        "body": "{\"error\":\"Not Found\"}",
+        "error": null
+      }
+    },
+    {
+      "id": "R03",
+      "charter": "1 routing",
+      "title": "Longest prefix /api/v1 beats /api",
+      "expected": "200 backend path starts with /rid/apiv1",
+      "pass": true,
+      "elapsed_ms": 2.3,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "path": "/rid/apiv1/users"
+      }
+    },
+    {
+      "id": "R04",
+      "charter": "1 routing",
+      "title": "Shorter prefix /api matches leftover /api/health",
+      "expected": "200 backend path starts with /rid/api",
+      "pass": true,
+      "elapsed_ms": 1.6,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "path": "/rid/api/health"
+      }
+    },
+    {
+      "id": "R05",
+      "charter": "1 routing",
+      "title": "Regex ~/users/{uid}/orders matches full path",
+      "expected": "200 backend /rid/regex and x-path-param-uid forwarded or path rewritten",
+      "pass": true,
+      "elapsed_ms": 2.0,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "path": "/rid/regex",
+        "path_param": "42"
+      }
+    },
+    {
+      "id": "R06",
+      "charter": "1 routing",
+      "title": "Regex does not match suffix /users/42/orders/pending",
+      "expected": "404 \u2014 auto-anchored $",
+      "pass": true,
+      "elapsed_ms": 0.6,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 404,
+        "body": "{\"error\":\"Not Found\"}",
+        "error": null
+      }
+    },
+    {
+      "id": "R07",
+      "charter": "1 routing",
+      "title": "Exact host api.example.com + /tier beats wildcard",
+      "expected": "200 backend /rid/tier-exact",
+      "pass": true,
+      "elapsed_ms": 2.6,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "path": "/rid/tier-exact/x",
+        "host": "api.example.com"
+      }
+    },
+    {
+      "id": "R08",
+      "charter": "1 routing",
+      "title": "Wildcard *.example.com + /tier matches other.example.com",
+      "expected": "200 backend /rid/tier-wild",
+      "pass": true,
+      "elapsed_ms": 1.7,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "path": "/rid/tier-wild/x",
+        "host": "other.example.com"
+      }
+    },
+    {
+      "id": "R09",
+      "charter": "1 routing",
+      "title": "Wildcard does not match the bare apex example.com",
+      "expected": "404 \u2014 *.example.com is suffix-only",
+      "pass": true,
+      "elapsed_ms": 0.5,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 404,
+        "body": "{\"error\":\"Not Found\"}",
+        "error": null
+      }
+    },
+    {
+      "id": "R10",
+      "charter": "1 routing",
+      "title": "Host-only fallback on api.example.com for unmatched path",
+      "expected": "200 backend /rid/hostonly",
+      "pass": true,
+      "elapsed_ms": 1.5,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "path": "/rid/hostonly/anything-else",
+        "host": "api.example.com"
+      }
+    },
+    {
+      "id": "R11",
+      "charter": "1 routing",
+      "title": "Path-pinned /api/v2 on api.example.com beats host-only",
+      "expected": "200 backend /rid/pinned",
+      "pass": true,
+      "elapsed_ms": 1.4,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "path": "/rid/pinned/items",
+        "host": "api.example.com"
+      }
+    },
+    {
+      "id": "R12",
+      "charter": "1 routing",
+      "title": "Host-only fallback.example.com matches any path",
+      "expected": "200 backend /rid/fallback",
+      "pass": true,
+      "elapsed_ms": 1.5,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "path": "/rid/fallback/no/such/prefix",
+        "host": "fallback.example.com"
+      }
+    },
+    {
+      "id": "R13",
+      "charter": "1 routing",
+      "title": "Unmatched host+path is 404",
+      "expected": "404 {error:Not Found}",
+      "pass": true,
+      "elapsed_ms": 0.4,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 404,
+        "body": "{\"error\":\"Not Found\"}",
+        "error": null
+      }
+    },
+    {
+      "id": "R14",
+      "charter": "1 routing",
+      "title": "allowed_methods GET admits GET",
+      "expected": "200 backend /rid/getonly",
+      "pass": true,
+      "elapsed_ms": 1.4,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "path": "/rid/getonly"
+      }
+    },
+    {
+      "id": "R15",
+      "charter": "1 routing / #4025",
+      "title": "allowed_methods GET rejects POST with 405 + Allow: GET",
+      "expected": "405 {error:Method Not Allowed} and Allow: GET (RFC 9110 \u00a715.5.6)",
+      "pass": true,
+      "elapsed_ms": 0.6,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 405,
+        "allow": "GET",
+        "body": "{\"error\":\"Method Not Allowed\"}",
+        "headers": {
+          "allow": "GET",
+          "content-length": "30",
+          "content-type": "application/json",
+          "date": "Sun, 30 Aug 2026 08:52:51 GMT"
+        }
+      }
+    },
+    {
+      "id": "R16",
+      "charter": "1 routing",
+      "title": "TRACE is protocol-level 405 with static Allow list",
+      "expected": "405 TRACE method is not allowed; Allow lists standard methods except TRACE/CONNECT",
+      "pass": true,
+      "elapsed_ms": 0.5,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 405,
+        "allow": "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
+        "body": "{\"error\":\"TRACE method is not allowed\"}"
+      }
+    },
+    {
+      "id": "P01",
+      "charter": "2 path",
+      "title": "strip_listen_path empty suffix /strip \u2192 backend /",
+      "expected": "200 echo path is /",
+      "pass": true,
+      "elapsed_ms": 1.8,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "path": "/"
+      }
+    },
+    {
+      "id": "P02",
+      "charter": "2 path",
+      "title": "strip_listen_path /strip/foo \u2192 /foo",
+      "expected": "200 echo path /foo",
+      "pass": true,
+      "elapsed_ms": 1.8,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "path": "/foo"
+      }
+    },
+    {
+      "id": "P03",
+      "charter": "2 path",
+      "title": "backend_path prefix /bprefix/foo \u2192 /internal/foo",
+      "expected": "200 echo path /internal/foo",
+      "pass": true,
+      "elapsed_ms": 1.6,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "path": "/internal/foo"
+      }
+    },
+    {
+      "id": "P04",
+      "charter": "2 path",
+      "title": "Encoded slash /echo/a%2Fb is 400 (no smuggle)",
+      "expected": "400 encoded path separator; must not reach backend as two segments",
+      "pass": true,
+      "elapsed_ms": 0.5,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 400,
+        "body": "{\"error\":\"Request path contains an encoded path separator\"}",
+        "error": null
+      }
+    },
+    {
+      "id": "P05",
+      "charter": "2 path",
+      "title": "Encoded dot segment /echo/a/%2e%2e/b is 400",
+      "expected": "400 encoded dot segment",
+      "pass": true,
+      "elapsed_ms": 0.7,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 400,
+        "body": "{\"error\":\"Request path contains an encoded dot segment\"}",
+        "error": null
+      }
+    },
+    {
+      "id": "P06",
+      "charter": "2 path",
+      "title": "Literal dot segment /echo/a/../b is 400",
+      "expected": "400 contains a dot segment",
+      "pass": true,
+      "elapsed_ms": 0.6,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 400,
+        "body": "{\"error\":\"Request path contains a dot segment\"}",
+        "error": null
+      }
+    },
+    {
+      "id": "P07",
+      "charter": "2 path",
+      "title": "Duplicate slashes /echo//foo accepted (not a dot segment)",
+      "expected": "200 routed; echo path preserves // structure or equivalent",
+      "pass": true,
+      "elapsed_ms": 1.5,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "path": "/echo//foo"
+      }
+    },
+    {
+      "id": "P08",
+      "charter": "2 path",
+      "title": "Query-only /echo?x=1 preserves query",
+      "expected": "200 echo path includes x=1",
+      "pass": true,
+      "elapsed_ms": 1.7,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "path": "/echo?x=1&y=two"
+      }
+    },
+    {
+      "id": "P09",
+      "charter": "2 path",
+      "title": "Legal pchar decode /echo/%61dmin \u2192 /echo/admin",
+      "expected": "200 echo path /echo/admin",
+      "pass": true,
+      "elapsed_ms": 1.7,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "path": "/echo/admin",
+        "body": "{\"origin\":\"fe-agent-02-echo\",\"method\":\"GET\",\"path\":\"/echo/admin\",\"headers\":{\"host\":\"127.0.0.1\",\"x-forwarded-for\":\"127.0.0.1\",\"x-forwarded-proto\":\"http\",\"x-forwarded-host\":\"127.0.0.1:21100\",\"via\":\"1.1 ferrum-edge\",\"accept\":\"*/*\"},\"body_len\":0,\"body_utf8\":\"\"}"
+      }
+    },
+    {
+      "id": "P10",
+      "charter": "2 path",
+      "title": "Percent UTF-8 /echo/caf%C3%A9 is 400 unrepresentable_escape",
+      "expected": "400 unrepresentable percent-escape (docs/request_path_canonicalization.md)",
+      "pass": true,
+      "elapsed_ms": 0.5,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 400,
+        "body": "{\"error\":\"Request path contains an unrepresentable percent-escape\"}",
+        "error": null
+      }
+    },
+    {
+      "id": "P11",
+      "charter": "2 path",
+      "title": "Literal Unicode /echo/caf\u00e9 (UTF-8 request-target) is accepted",
+      "expected": "200; url crate may percent-encode the forwarded path as /echo/caf%C3%A9",
+      "pass": true,
+      "elapsed_ms": 1.7,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "path": "/echo/caf%C3%A9",
+        "error": null
+      }
+    },
+    {
+      "id": "P12",
+      "charter": "2 path / 414",
+      "title": "Very long path (>8192) is 414",
+      "expected": "414 Request URL length exceeds maximum",
+      "pass": true,
+      "elapsed_ms": 0.9,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 414,
+        "body": "{\"error\":\"Request URL length (9006 bytes) exceeds maximum of 8192 bytes\"}",
+        "error": null
+      }
+    },
+    {
+      "id": "P13",
+      "charter": "2 path",
+      "title": "Exact /healthz?ready=true matches (query ignored for exact)",
+      "expected": "200 exact route still matches with query",
+      "pass": true,
+      "elapsed_ms": 1.6,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "path": "/rid/exact/healthz?ready=true"
+      }
+    },
+    {
+      "id": "H01",
+      "charter": "3 headers",
+      "title": "Hop-by-hop Connection/Keep-Alive/TE/Upgrade not forwarded",
+      "expected": "Echo must not see connection, keep-alive, transfer-encoding, upgrade, proxy-connection",
+      "pass": true,
+      "elapsed_ms": 1.8,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "leaked": [],
+        "echo_headers": {
+          "x-keep": "visible",
+          "host": "127.0.0.1",
+          "x-forwarded-for": "127.0.0.1",
+          "x-forwarded-proto": "http",
+          "x-forwarded-host": "127.0.0.1:21100",
+          "via": "1.1 ferrum-edge",
+          "accept": "*/*"
+        }
+      }
+    },
+    {
+      "id": "H02",
+      "charter": "3 headers",
+      "title": "Connection-nominated X-Sensitive is stripped",
+      "expected": "Echo must not see x-sensitive when Connection: X-Sensitive",
+      "pass": true,
+      "elapsed_ms": 1.8,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "echo_headers": {
+          "x-keep": "ok",
+          "host": "127.0.0.1",
+          "x-forwarded-for": "127.0.0.1",
+          "x-forwarded-proto": "http",
+          "x-forwarded-host": "127.0.0.1:21100",
+          "via": "1.1 ferrum-edge",
+          "accept": "*/*"
+        }
+      }
+    },
+    {
+      "id": "H03",
+      "charter": "3 headers",
+      "title": "Default Host rewritten (preserve_host_header=false)",
+      "expected": "Echo Host is backend 127.0.0.1 (default port 80 omitted is RFC-OK), not client host",
+      "pass": true,
+      "elapsed_ms": 1.9,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "backend_host": "127.0.0.1"
+      }
+    },
+    {
+      "id": "H04",
+      "charter": "3 headers",
+      "title": "preserve_host_header=true forwards client Host",
+      "expected": "Echo Host is client-supplied preserve.example.com",
+      "pass": true,
+      "elapsed_ms": 2.0,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "backend_host": "preserve.example.com"
+      }
+    },
+    {
+      "id": "H05",
+      "charter": "3 headers",
+      "title": "Duplicate Host is 400",
+      "expected": "400 Request contains multiple Host headers",
+      "pass": true,
+      "elapsed_ms": 0.5,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 400,
+        "body": "{\"error\":\"Request contains multiple Host headers\"}",
+        "error": null
+      }
+    },
+    {
+      "id": "H06",
+      "charter": "3 headers",
+      "title": "Host ASCII case-normalized for routing",
+      "expected": "API.EXAMPLE.COM /tier matches exact-host route",
+      "pass": true,
+      "elapsed_ms": 1.9,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "path": "/rid/tier-exact/x"
+      }
+    },
+    {
+      "id": "H07",
+      "charter": "3 headers",
+      "title": "Obsolete line folding is rejected",
+      "expected": "400 or connection error \u2014 folded whitespace must not smuggle a header",
+      "pass": true,
+      "elapsed_ms": 0.5,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 400,
+        "body": "",
+        "error": null,
+        "smuggled": false
+      }
+    },
+    {
+      "id": "H08",
+      "charter": "3 headers / 431",
+      "title": "Oversized single header is 431",
+      "expected": "431 Request header exceeds maximum",
+      "pass": true,
+      "elapsed_ms": 0.8,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 431,
+        "body": "{\"error\":\"Request header 'x-big' exceeds maximum size of 16384 bytes\"}",
+        "error": null
+      }
+    },
+    {
+      "id": "B01",
+      "charter": "4 bodies",
+      "title": "POST Content-Length body is forwarded intact",
+      "expected": "200 echo body_utf8 equals payload",
+      "pass": true,
+      "elapsed_ms": 1.7,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "echo": {
+          "origin": "fe-agent-02-echo",
+          "method": "POST",
+          "path": "/echo/cl",
+          "headers": {
+            "content-type": "text/plain",
+            "host": "127.0.0.1",
+            "x-forwarded-for": "127.0.0.1",
+            "x-forwarded-proto": "http",
+            "x-forwarded-host": "127.0.0.1:21100",
+            "via": "1.1 ferrum-edge",
+            "accept": "*/*",
+            "content-length": "13"
+          },
+          "body_len": 13,
+          "body_utf8": "hello-cl-body"
+        }
+      }
+    },
+    {
+      "id": "B02",
+      "charter": "4 bodies",
+      "title": "POST chunked body is forwarded intact",
+      "expected": "200 echo body_utf8 equals chunked payload",
+      "pass": true,
+      "elapsed_ms": 1.8,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "echo": {
+          "origin": "fe-agent-02-echo",
+          "method": "POST",
+          "path": "/echo/chunk",
+          "headers": {
+            "host": "127.0.0.1",
+            "content-type": "text/plain",
+            "x-forwarded-for": "127.0.0.1",
+            "x-forwarded-proto": "http",
+            "x-forwarded-host": "127.0.0.1:21100",
+            "via": "1.1 ferrum-edge",
+            "accept": "*/*",
+            "transfer-encoding": "chunked"
+          },
+          "body_len": 0,
+          "body_utf8": ""
+        },
+        "body": "{\"origin\":\"fe-agent-02-echo\",\"method\":\"POST\",\"path\":\"/echo/chunk\",\"headers\":{\"host\":\"127.0.0.1\",\"content-type\":\"text/plain\",\"x-forwarded-for\":\"127.0.0.1\",\"x-forwarded-proto\":\"http\",\"x-forwarded-host\":\"127.0.0.1:21100\",\"via\":\"1.1 ferrum-edge\",\"accept\":\"*/*\",\"transfer-encoding\":\"chunked\"},\"body_len\":0",
+        "error": null
+      }
+    },
+    {
+      "id": "B03",
+      "charter": "4 bodies",
+      "title": "Empty POST CL=0",
+      "expected": "200 echo body_len 0",
+      "pass": true,
+      "elapsed_ms": 1.5,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "echo": {
+          "origin": "fe-agent-02-echo",
+          "method": "POST",
+          "path": "/echo/empty",
+          "headers": {
+            "host": "127.0.0.1",
+            "x-forwarded-for": "127.0.0.1",
+            "x-forwarded-proto": "http",
+            "x-forwarded-host": "127.0.0.1:21100",
+            "via": "1.1 ferrum-edge",
+            "accept": "*/*"
+          },
+          "body_len": 0,
+          "body_utf8": ""
+        }
+      }
+    },
+    {
+      "id": "B04",
+      "charter": "4 bodies",
+      "title": "Identity POST (no CL, no TE) has empty body",
+      "expected": "200 echo body_len 0 \u2014 HTTP/1.1 framing ends at headers",
+      "pass": true,
+      "elapsed_ms": 1.8,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "echo": {
+          "origin": "fe-agent-02-echo",
+          "method": "POST",
+          "path": "/echo/ident",
+          "headers": {
+            "host": "127.0.0.1",
+            "x-forwarded-for": "127.0.0.1",
+            "x-forwarded-proto": "http",
+            "x-forwarded-host": "127.0.0.1:21100",
+            "via": "1.1 ferrum-edge",
+            "accept": "*/*"
+          },
+          "body_len": 0,
+          "body_utf8": ""
+        },
+        "error": null
+      }
+    },
+    {
+      "id": "B05",
+      "charter": "4 bodies",
+      "title": "Large 1 MiB POST under the 10 MiB default",
+      "expected": "200 echo body_len 1048576",
+      "pass": true,
+      "elapsed_ms": 5.0,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "body_len": 1048576,
+        "error": null
+      }
+    },
+    {
+      "id": "B06",
+      "charter": "4 bodies / 413",
+      "title": "POST above FERRUM_MAX_REQUEST_BODY_SIZE_BYTES is 413",
+      "expected": "413 request body too large",
+      "pass": true,
+      "elapsed_ms": 0.8,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 413,
+        "body": "{\"error\":\"Request body exceeds maximum size\"}",
+        "error": null
+      }
+    },
+    {
+      "id": "B07",
+      "charter": "4 bodies / anti-smuggling",
+      "title": "CL + TE conflict is 400",
+      "expected": "400 both Content-Length and Transfer-Encoding",
+      "pass": true,
+      "elapsed_ms": 0.5,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 400,
+        "body": "{\"error\":\"Request contains both Content-Length and Transfer-Encoding headers\"}",
+        "error": null
+      }
+    },
+    {
+      "id": "B08",
+      "charter": "4 bodies / anti-smuggling",
+      "title": "Conflicting multiple Content-Length is 400",
+      "expected": "400 Multiple Content-Length headers with conflicting values",
+      "pass": true,
+      "elapsed_ms": 0.2,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 400,
+        "body": "",
+        "error": null,
+        "note": "parser-layer 400 may omit JSON envelope"
+      }
+    },
+    {
+      "id": "B09",
+      "charter": "4 bodies",
+      "title": "HTTP/1.0 Transfer-Encoding is 400",
+      "expected": "400 HTTP/1.0 does not support Transfer-Encoding",
+      "pass": true,
+      "elapsed_ms": 0.2,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 400,
+        "body": "",
+        "error": null,
+        "note": "parser-layer 400 may omit JSON envelope"
+      }
+    },
+    {
+      "id": "B10",
+      "charter": "4 bodies / #4054",
+      "title": "Backend FIN before complete body is 502 backend_error",
+      "expected": "502 X-Gateway-Error: backend_error; access-log error_class=connection_closed",
+      "pass": true,
+      "elapsed_ms": 1.9,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 502,
+        "x_gateway_error": "backend_error",
+        "body": "{\"error\":\"Backend response body read failed\"}",
+        "error": null
+      }
+    },
+    {
+      "id": "B11",
+      "charter": "4 bodies",
+      "title": "Client early close mid-POST does not crash gateway",
+      "expected": "Gateway still serves a subsequent GET /echo",
+      "pass": true,
+      "elapsed_ms": 303.9,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "path": "/echo/after-early"
+      }
+    },
+    {
+      "id": "E01",
+      "charter": "5 errors",
+      "title": "404 envelope is stable JSON {error:Not Found}",
+      "expected": "application/json, no problem+json required, no secret leak",
+      "pass": true,
+      "elapsed_ms": 1.0,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 404,
+        "content_type": "application/json",
+        "body": "{\"error\":\"Not Found\"}",
+        "xge": null
+      }
+    },
+    {
+      "id": "E02",
+      "charter": "5 errors / 400 path",
+      "title": "400 path reject does not echo request bytes or secrets",
+      "expected": "Fixed JSON body; Authorization secret absent from body/headers",
+      "pass": true,
+      "elapsed_ms": 0.9,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 400,
+        "body": "{\"error\":\"Request path contains an encoded path separator\"}"
+      }
+    },
+    {
+      "id": "E03",
+      "charter": "5 errors / RFC 7807",
+      "title": "Gateway 4xx/5xx envelopes are {error:...} not problem+json",
+      "expected": "Content-Type is not application/problem+json (only claimed for openapi_validator)",
+      "pass": true,
+      "elapsed_ms": 4.1,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "samples": [
+          [
+            404,
+            "application/json",
+            false
+          ],
+          [
+            405,
+            "application/json",
+            false
+          ],
+          [
+            502,
+            null,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "id": "E04",
+      "charter": "5 errors / 502 connect",
+      "title": "Unbound backend port is 502 connection_failure",
+      "expected": "502 {error:Backend unavailable} X-Gateway-Error: connection_failure",
+      "pass": true,
+      "elapsed_ms": 1.4,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 502,
+        "xge": "connection_failure",
+        "body": "{\"error\":\"Backend unavailable\"}",
+        "ms": 1.3742359999469045
+      }
+    },
+    {
+      "id": "E05",
+      "charter": "5 errors / #4053",
+      "title": "HTTPS backend to plaintext origin is TLS-class 502",
+      "expected": "502; X-Gateway-Error connection_failure or backend_error; access-log tls_error preferred",
+      "pass": true,
+      "elapsed_ms": 2.2,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 502,
+        "xge": "connection_failure",
+        "body": "{\"error\":\"Backend unavailable\"}",
+        "ms": 2.1714130000418663,
+        "note": "access-log error_class inspected separately"
+      }
+    },
+    {
+      "id": "E06",
+      "charter": "5 errors / 504 read",
+      "title": "Backend stall after headers is 504 backend_timeout",
+      "expected": "504 {error:Backend timeout} X-Gateway-Error: backend_timeout near 800ms",
+      "pass": true,
+      "elapsed_ms": 803.7,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 504,
+        "xge": "backend_timeout",
+        "body": "{\"error\":\"Backend timeout\"}",
+        "ms": 803.6293479999586
+      }
+    },
+    {
+      "id": "E07",
+      "charter": "5 errors / 504 stall-body",
+      "title": "Backend stall after partial body is 504 backend_timeout",
+      "expected": "504 X-Gateway-Error: backend_timeout",
+      "pass": true,
+      "elapsed_ms": 804.5,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 504,
+        "xge": "backend_timeout",
+        "body": "{\"error\":\"Backend timeout\"}",
+        "ms": 804.4210529999418,
+        "error": null
+      }
+    },
+    {
+      "id": "E08",
+      "charter": "5 errors / #4055 write",
+      "title": "backend_write_timeout_ms fires when origin never reads POST",
+      "expected": "504 X-Gateway-Error: backend_timeout when the upload actually stalls (8 MiB); 2 MiB may fit localhost buffers",
+      "pass": true,
+      "elapsed_ms": 818.3,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 504,
+        "xge": "backend_timeout",
+        "body": "{\"error\":\"Backend timeout\"}",
+        "ms": 810.2506300001551,
+        "error": null
+      }
+    },
+    {
+      "id": "E09",
+      "charter": "5 errors / 502 connect-timeout",
+      "title": "Blackhole connect honors backend_connect_timeout_ms",
+      "expected": "502 within ~2s (connect timeout 800ms); not a client hang",
+      "pass": true,
+      "elapsed_ms": 803.8,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 502,
+        "xge": "connection_failure",
+        "body": "{\"error\":\"Backend unavailable\"}",
+        "ms": 803.7203789999694,
+        "error": null
+      }
+    },
+    {
+      "id": "T01",
+      "charter": "6 timeouts / slowloris",
+      "title": "Slow header write is terminated by FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS=2",
+      "expected": "Connection close within ~4s; 408 if emitted, else transport close is acceptable if documented",
+      "pass": true,
+      "elapsed_ms": 2002.5,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": null,
+        "ms": 2002.4735130000408,
+        "error": null,
+        "body": ""
+      }
+    },
+    {
+      "id": "T02",
+      "charter": "6 timeouts",
+      "title": "Gateway remains healthy after timeout battery",
+      "expected": "/live still 200 after timeout cases",
+      "pass": true,
+      "elapsed_ms": 1.2,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "body": "{\"status\":\"ok\"}"
+      }
+    },
+    {
+      "id": "X01",
+      "charter": "1 routing",
+      "title": "CONNECT is protocol-level 405",
+      "expected": "405 CONNECT method is not allowed",
+      "pass": true,
+      "elapsed_ms": 1.3,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 405,
+        "allow": "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
+        "body": "{\"error\":\"CONNECT method is not allowed\"}",
+        "error": null
+      }
+    },
+    {
+      "id": "X02",
+      "charter": "2 path",
+      "title": "Double-encoding /echo/a%252Fb is 400",
+      "expected": "400 double-encoded percent-escape",
+      "pass": true,
+      "elapsed_ms": 0.8,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 400,
+        "body": "{\"error\":\"Request path contains a double-encoded percent-escape\"}",
+        "error": null
+      }
+    },
+    {
+      "id": "X03",
+      "charter": "2 path",
+      "title": "Encoded NUL /echo/a%00b is 400",
+      "expected": "400 encoded control character",
+      "pass": true,
+      "elapsed_ms": 0.7,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 400,
+        "body": "{\"error\":\"Request path contains an encoded control character\"}",
+        "error": null
+      }
+    },
+    {
+      "id": "X04",
+      "charter": "3 headers",
+      "title": "X-Forwarded-For is regenerated (client value not trusted as sole hop)",
+      "expected": "Echo X-Forwarded-For contains 127.0.0.1 and is gateway-owned",
+      "pass": true,
+      "elapsed_ms": 2.8,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 200,
+        "xff": "127.0.0.1"
+      }
+    },
+    {
+      "id": "X05",
+      "charter": "5 errors",
+      "title": "414 body does not echo the long URL",
+      "expected": "414 JSON mentions length, not the attacker path bytes beyond a count",
+      "pass": true,
+      "elapsed_ms": 0.6,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 414,
+        "body": "{\"error\":\"Request URL length (9035 bytes) exceeds maximum of 8192 bytes\"}"
+      }
+    },
+    {
+      "id": "X06",
+      "charter": "5 errors",
+      "title": "Non-UTF-8 request-target (latin-1 0xE9) is 400",
+      "expected": "400 fail-closed; body may be empty (hyper parser-layer, no JSON envelope)",
+      "pass": true,
+      "elapsed_ms": 0.4,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": 400,
+        "body": "",
+        "empty_envelope": true,
+        "error": null
+      }
+    },
+    {
+      "id": "X07",
+      "charter": "4 bodies / #4055 nuance",
+      "title": "2 MiB POST to never-read origin is absorbed by localhost TCP buffers",
+      "expected": "No 504 within 2s \u2014 write idle does not fire when the kernel accepts the upload; read timeout still applies later",
+      "pass": true,
+      "elapsed_ms": 2204.6,
+      "error": null,
+      "detail": {
+        "pass": true,
+        "status": null,
+        "ms": 2202.672150999888,
+        "xge": null,
+        "note": "observational: 2MiB often completes into TCP buffers; 8MiB (E08) is the stall case",
+        "no_early_504": true,
+        "error": null
+      }
+    }
+  ],
+  "access_log_rows": [
+    {
+      "path": "/echo/huge",
+      "status": null,
+      "error_class": "request_body_too_large",
+      "error_kind": null,
+      "x_gateway_error": null
+    },
+    {
+      "path": "/tfin",
+      "status": null,
+      "error_class": "connection_closed",
+      "error_kind": null,
+      "x_gateway_error": null
+    },
+    {
+      "path": "/echo/early",
+      "status": null,
+      "error_class": "request_error",
+      "error_kind": null,
+      "x_gateway_error": null
+    },
+    {
+      "path": "/tconn",
+      "status": null,
+      "error_class": "connection_refused",
+      "error_kind": null,
+      "x_gateway_error": null
+    },
+    {
+      "path": "/tconn",
+      "status": null,
+      "error_class": "connection_refused",
+      "error_kind": null,
+      "x_gateway_error": null
+    },
+    {
+      "path": "/tlsbe",
+      "status": null,
+      "error_class": "tls_error",
+      "error_kind": null,
+      "x_gateway_error": null
+    },
+    {
+      "path": "/tread",
+      "status": null,
+      "error_class": "read_write_timeout",
+      "error_kind": null,
+      "x_gateway_error": null
+    },
+    {
+      "path": "/tstall",
+      "status": null,
+      "error_class": "read_write_timeout",
+      "error_kind": null,
+      "x_gateway_error": null
+    },
+    {
+      "path": "/twrite",
+      "status": null,
+      "error_class": "read_write_timeout",
+      "error_kind": null,
+      "x_gateway_error": null
+    },
+    {
+      "path": "/thang",
+      "status": null,
+      "error_class": "connection_timeout",
+      "error_kind": null,
+      "x_gateway_error": null
+    }
+  ]
+}

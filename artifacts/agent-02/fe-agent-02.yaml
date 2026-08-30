@@ -1,0 +1,320 @@
+---
+version: "1"
+proxies:
+  - id: fe-agent-02-exact
+    name: fe-agent-02-exact
+    listen_path: "=/healthz"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: 21110
+    strip_listen_path: false
+    backend_path: "/rid/exact"
+    preserve_host_header: false
+    backend_connect_timeout_ms: 2000
+    backend_read_timeout_ms: 4000
+    backend_write_timeout_ms: 4000
+    auth_mode: single
+    plugins: []
+
+  - id: fe-agent-02-apiv1
+    name: fe-agent-02-apiv1
+    listen_path: "/api/v1"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: 21110
+    strip_listen_path: true
+    backend_path: "/rid/apiv1"
+    preserve_host_header: false
+    backend_connect_timeout_ms: 2000
+    backend_read_timeout_ms: 4000
+    backend_write_timeout_ms: 4000
+    auth_mode: single
+    plugins: []
+
+  - id: fe-agent-02-api
+    name: fe-agent-02-api
+    listen_path: "/api"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: 21110
+    strip_listen_path: true
+    backend_path: "/rid/api"
+    preserve_host_header: false
+    backend_connect_timeout_ms: 2000
+    backend_read_timeout_ms: 4000
+    backend_write_timeout_ms: 4000
+    auth_mode: single
+    plugins: []
+
+  - id: fe-agent-02-regex
+    name: fe-agent-02-regex
+    listen_path: "~/users/(?P<uid>[^/]+)/orders"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: 21110
+    strip_listen_path: true
+    backend_path: "/rid/regex"
+    preserve_host_header: false
+    backend_connect_timeout_ms: 2000
+    backend_read_timeout_ms: 4000
+    backend_write_timeout_ms: 4000
+    auth_mode: single
+    plugins: []
+
+  - id: fe-agent-02-strip
+    name: fe-agent-02-strip
+    listen_path: "/strip"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: 21110
+    strip_listen_path: true
+    preserve_host_header: false
+    backend_connect_timeout_ms: 2000
+    backend_read_timeout_ms: 4000
+    backend_write_timeout_ms: 4000
+    auth_mode: single
+    plugins: []
+
+  - id: fe-agent-02-bprefix
+    name: fe-agent-02-bprefix
+    listen_path: "/bprefix"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: 21110
+    strip_listen_path: true
+    backend_path: "/internal"
+    preserve_host_header: false
+    backend_connect_timeout_ms: 2000
+    backend_read_timeout_ms: 4000
+    backend_write_timeout_ms: 4000
+    auth_mode: single
+    plugins: []
+
+  - id: fe-agent-02-getonly
+    name: fe-agent-02-getonly
+    listen_path: "/getonly"
+    allowed_methods: ["GET"]
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: 21110
+    strip_listen_path: true
+    backend_path: "/rid/getonly"
+    preserve_host_header: false
+    backend_connect_timeout_ms: 2000
+    backend_read_timeout_ms: 4000
+    backend_write_timeout_ms: 4000
+    auth_mode: single
+    plugins: []
+
+  - id: fe-agent-02-echo
+    name: fe-agent-02-echo
+    listen_path: "/echo"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: 21110
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 2000
+    backend_read_timeout_ms: 8000
+    backend_write_timeout_ms: 8000
+    auth_mode: single
+    plugins: []
+
+  - id: fe-agent-02-preserve
+    name: fe-agent-02-preserve
+    listen_path: "/preserve"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: 21110
+    strip_listen_path: false
+    preserve_host_header: true
+    backend_connect_timeout_ms: 2000
+    backend_read_timeout_ms: 4000
+    backend_write_timeout_ms: 4000
+    auth_mode: single
+    plugins: []
+
+  - id: fe-agent-02-twrite
+    name: fe-agent-02-twrite
+    listen_path: "/twrite"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: 21111
+    strip_listen_path: true
+    preserve_host_header: false
+    backend_connect_timeout_ms: 2000
+    backend_read_timeout_ms: 8000
+    backend_write_timeout_ms: 800
+    auth_mode: single
+    plugins: []
+
+  - id: fe-agent-02-tread
+    name: fe-agent-02-tread
+    listen_path: "/tread"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: 21113
+    strip_listen_path: true
+    preserve_host_header: false
+    backend_connect_timeout_ms: 2000
+    backend_read_timeout_ms: 800
+    backend_write_timeout_ms: 8000
+    auth_mode: single
+    plugins: []
+
+  - id: fe-agent-02-tfin
+    name: fe-agent-02-tfin
+    listen_path: "/tfin"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: 21112
+    strip_listen_path: true
+    preserve_host_header: false
+    backend_connect_timeout_ms: 2000
+    backend_read_timeout_ms: 4000
+    backend_write_timeout_ms: 4000
+    auth_mode: single
+    plugins: []
+
+  - id: fe-agent-02-tstall
+    name: fe-agent-02-tstall
+    listen_path: "/tstall"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: 21114
+    strip_listen_path: true
+    preserve_host_header: false
+    backend_connect_timeout_ms: 2000
+    backend_read_timeout_ms: 800
+    backend_write_timeout_ms: 8000
+    auth_mode: single
+    plugins: []
+
+  - id: fe-agent-02-tlsbe
+    name: fe-agent-02-tlsbe
+    listen_path: "/tlsbe"
+    backend_scheme: https
+    backend_host: "127.0.0.1"
+    backend_port: 21110
+    strip_listen_path: true
+    preserve_host_header: false
+    backend_tls_verify_server_cert: false
+    backend_connect_timeout_ms: 2000
+    backend_read_timeout_ms: 4000
+    backend_write_timeout_ms: 4000
+    auth_mode: single
+    plugins: []
+
+  - id: fe-agent-02-tconn
+    name: fe-agent-02-tconn
+    listen_path: "/tconn"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: 21122
+    strip_listen_path: true
+    preserve_host_header: false
+    backend_connect_timeout_ms: 800
+    backend_read_timeout_ms: 4000
+    backend_write_timeout_ms: 4000
+    auth_mode: single
+    plugins: []
+
+  - id: fe-agent-02-thang
+    name: fe-agent-02-thang
+    listen_path: "/thang"
+    backend_scheme: http
+    backend_host: "192.0.2.1"
+    backend_port: 21123
+    strip_listen_path: true
+    preserve_host_header: false
+    backend_connect_timeout_ms: 800
+    backend_read_timeout_ms: 4000
+    backend_write_timeout_ms: 4000
+    auth_mode: single
+    plugins: []
+
+  - id: fe-agent-02-tier-exact
+    name: fe-agent-02-tier-exact
+    hosts: ["api.example.com"]
+    listen_path: "/tier"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: 21110
+    strip_listen_path: true
+    backend_path: "/rid/tier-exact"
+    preserve_host_header: false
+    backend_connect_timeout_ms: 2000
+    backend_read_timeout_ms: 4000
+    backend_write_timeout_ms: 4000
+    auth_mode: single
+    plugins: []
+
+  - id: fe-agent-02-tier-wild
+    name: fe-agent-02-tier-wild
+    hosts: ["*.example.com"]
+    listen_path: "/tier"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: 21110
+    strip_listen_path: true
+    backend_path: "/rid/tier-wild"
+    preserve_host_header: false
+    backend_connect_timeout_ms: 2000
+    backend_read_timeout_ms: 4000
+    backend_write_timeout_ms: 4000
+    auth_mode: single
+    plugins: []
+
+  - id: fe-agent-02-pinned
+    name: fe-agent-02-pinned
+    hosts: ["api.example.com"]
+    listen_path: "/api/v2"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: 21110
+    strip_listen_path: true
+    backend_path: "/rid/pinned"
+    preserve_host_header: false
+    backend_connect_timeout_ms: 2000
+    backend_read_timeout_ms: 4000
+    backend_write_timeout_ms: 4000
+    auth_mode: single
+    plugins: []
+
+  - id: fe-agent-02-hostonly
+    name: fe-agent-02-hostonly
+    hosts: ["api.example.com"]
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: 21110
+    strip_listen_path: true
+    backend_path: "/rid/hostonly"
+    preserve_host_header: false
+    backend_connect_timeout_ms: 2000
+    backend_read_timeout_ms: 4000
+    backend_write_timeout_ms: 4000
+    auth_mode: single
+    plugins: []
+
+  - id: fe-agent-02-fallback-host
+    name: fe-agent-02-fallback-host
+    hosts: ["fallback.example.com"]
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: 21110
+    strip_listen_path: false
+    backend_path: "/rid/fallback"
+    preserve_host_header: false
+    backend_connect_timeout_ms: 2000
+    backend_read_timeout_ms: 4000
+    backend_write_timeout_ms: 4000
+    auth_mode: single
+    plugins: []
+
+consumers: []
+plugin_configs:
+  - id: fe-agent-02-stdout
+    plugin_name: stdout_logging
+    scope: global
+    enabled: true
+    config: {}
