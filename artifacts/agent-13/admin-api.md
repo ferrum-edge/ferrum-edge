@@ -172,7 +172,12 @@ No new “missing registry” issue.
 
 ## New issues filed
 
-None. Residual findings comment on #4287, #4284, #4377.
+None. Residual findings commented on existing tracking:
+
+- https://github.com/ferrum-edge/ferrum-edge/issues/4287#issuecomment-5467740812
+- https://github.com/ferrum-edge/ferrum-edge/issues/4284#issuecomment-5467740873
+- https://github.com/ferrum-edge/ferrum-edge/issues/4377#issuecomment-5467740894
+- Closed hot-zone retests: #3926, #3955, #4027, #4029, #4031, #4042, #4044, #4045, #4046, #4064
 
 ## Artifacts
 
@@ -185,5 +190,5 @@ None. Residual findings comment on #4287, #4284, #4377.
 - **SHA:** `bf05855f8429e466511610f9072f666b45cd309a`
 - **Status:** PASS (residual in-flight: #4287, #4284, #4377)
 - **Issue URLs:** no new issues; comments on existing tracking
-- **PR URL:** (filled after open)
+- **PR URL:** https://github.com/ferrum-edge/ferrum-edge/pull/4394
 - **Verdict:** Admin API launch-ready on this SHA except the three already-tracked repair items.
