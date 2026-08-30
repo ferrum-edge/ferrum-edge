@@ -1,0 +1,4 @@
+Deployment
+PodDisruptionBudget
+Service
+ServiceAccount

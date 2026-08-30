@@ -1,0 +1,29 @@
+Gateway API v1.5.1 CRD inventory (source bundles, not applied).
+SHA tested: bf05855f8429e466511610f9072f666b45cd309a
+
+standard-install.yaml (8 CRDs):
+  BackendTLSPolicy   backendtlspolicies.gateway.networking.k8s.io  served=['v1']
+  GatewayClass       gatewayclasses.gateway.networking.k8s.io      served=['v1', 'v1beta1']
+  Gateway            gateways.gateway.networking.k8s.io            served=['v1', 'v1beta1']
+  GRPCRoute          grpcroutes.gateway.networking.k8s.io          served=['v1']
+  HTTPRoute          httproutes.gateway.networking.k8s.io          served=['v1', 'v1beta1']
+  ListenerSet        listenersets.gateway.networking.k8s.io        served=['v1']
+  ReferenceGrant     referencegrants.gateway.networking.k8s.io     served=['v1', 'v1beta1']
+  TLSRoute           tlsroutes.gateway.networking.k8s.io           served=['v1']
+
+experimental-install.yaml (12 CRDs):
+  BackendTLSPolicy        backendtlspolicies.gateway.networking.k8s.io         served=['v1', 'v1alpha3']
+  GatewayClass            gatewayclasses.gateway.networking.k8s.io             served=['v1', 'v1beta1']
+  Gateway                 gateways.gateway.networking.k8s.io                   served=['v1', 'v1beta1']
+  GRPCRoute               grpcroutes.gateway.networking.k8s.io                 served=['v1']
+  HTTPRoute               httproutes.gateway.networking.k8s.io                 served=['v1', 'v1beta1']
+  ListenerSet             listenersets.gateway.networking.k8s.io               served=['v1']
+  ReferenceGrant          referencegrants.gateway.networking.k8s.io            served=['v1', 'v1beta1']
+  TCPRoute                tcproutes.gateway.networking.k8s.io                  served=['v1alpha2']
+  TLSRoute                tlsroutes.gateway.networking.k8s.io                  served=['v1', 'v1alpha2', 'v1alpha3']
+  UDPRoute                udproutes.gateway.networking.k8s.io                  served=['v1alpha2']
+  XBackendTrafficPolicy   xbackendtrafficpolicies.gateway.networking.x-k8s.io  served=['v1alpha1']
+  XMesh                   xmeshes.gateway.networking.x-k8s.io                  served=['v1alpha1']
+
+Ferrum chart CRD (charts/ferrum-mesh/crds/):
+  UDPResponseAmplificationPolicy  udpresponseamplificationpolicies.gateway.ferrum.io  v1alpha1

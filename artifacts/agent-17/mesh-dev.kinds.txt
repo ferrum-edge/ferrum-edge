@@ -1,0 +1,6 @@
+ClusterRole
+ClusterRoleBinding
+Deployment
+GatewayClass
+Service
+ServiceAccount
