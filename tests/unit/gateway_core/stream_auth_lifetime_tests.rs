@@ -3257,8 +3257,9 @@ async fn a_fully_drained_replayable_upload_still_ends_the_header_wait_on_the_wri
 #[tokio::test(start_paused = true)]
 async fn a_progressing_buffered_upload_skips_the_eos_holdover_after_backpressure() {
     // Partial consume must reset the pre-EOS idle; 400ms gaps under an 800ms
-    // bound must not 504. Waiting for capacity is also positive evidence that
-    // the peer is consuming, so it must suppress the post-EOS holdover.
+    // bound must not 504. Waiting for capacity through EOS is also positive
+    // evidence that the peer is consuming, so it must suppress the post-EOS
+    // holdover even though an earlier blocked reserve is no longer a latch.
     let frame = BufferedUploadPumpProbe::frame_size();
     let frames = 4;
     let mut probe = BufferedUploadPumpProbe::start(frame * frames, 800).expect("buffered pump");

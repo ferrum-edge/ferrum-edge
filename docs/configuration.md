@@ -1275,11 +1275,13 @@ that accepts and never reads
 surfaces as `504` / `X-Gateway-Error: backend_timeout` /
 `error_class=read_write_timeout`. The watermark stays live through the
 response-header wait only when the local transport absorbed the whole body
-without backpressure after the watermark armed. The pump records backpressure
+without backpressure at end-of-stream. The pump records backpressure
 when a bridge-capacity `reserve()` poll returns `Pending` instead of an immediate
-permit. That is evidence that the peer's receive window is consuming and
-throttling the upload. Once observed, backpressure prevents the post-EOS
-holdover from arming, while the existing pre-EOS idle still bounds any later
+permit, and clears it when a later reserve obtains a permit without yielding.
+That is evidence that the peer's receive window is consuming and
+throttling the upload. The most recent completed reserve at end-of-stream
+decides whether the post-EOS holdover arms; a transient earlier `Pending` does
+not latch it off. The existing pre-EOS idle still bounds any later
 upload stall. `0` disables the write bound. Because the bound is idle rather
 than total, a large upload that is slow but continuously progressing is not
 timed out. Streaming pass-through uploads are otherwise unaffected by the

@@ -9961,6 +9961,45 @@ pub mod _test_support {
             }
         }
 
+        /// Drain remaining frames with the runtime waker registered on the
+        /// bridge. Unlike [`Self::poll_transport_once`], a `Pending` poll
+        /// waits until the pump sends instead of returning to the caller, so
+        /// later reserves can complete immediately the way a live transport
+        /// does when it is already waiting on the channel.
+        pub async fn drain_transport(&mut self, max_frames: usize) -> Vec<ProbeTransportPoll> {
+            let mut frames = Vec::new();
+            for _ in 0..max_frames {
+                let observed = std::future::poll_fn(|cx| {
+                    let Some(body) = self.body.as_mut() else {
+                        return std::task::Poll::Ready(ProbeTransportPoll::Ended);
+                    };
+                    match http_body::Body::poll_frame(std::pin::Pin::new(body), cx) {
+                        std::task::Poll::Pending => std::task::Poll::Pending,
+                        std::task::Poll::Ready(None) => {
+                            std::task::Poll::Ready(ProbeTransportPoll::Ended)
+                        }
+                        std::task::Poll::Ready(Some(Ok(frame))) => {
+                            let len = frame.data_ref().map_or(0, bytes::Bytes::len);
+                            std::task::Poll::Ready(ProbeTransportPoll::Data(len))
+                        }
+                        std::task::Poll::Ready(Some(Err(e))) => {
+                            std::task::Poll::Ready(ProbeTransportPoll::Errored(e.to_string()))
+                        }
+                    }
+                })
+                .await;
+                let done = matches!(
+                    observed,
+                    ProbeTransportPoll::Ended | ProbeTransportPoll::Errored(_)
+                );
+                frames.push(observed);
+                if done {
+                    break;
+                }
+            }
+            frames
+        }
+
         /// Race the dispatcher's response-header wait against the pump's
         /// backend write watermark, exactly as `proxy_to_backend` does.
         ///

@@ -18,13 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HTTP/1.1 and prior-knowledge h2c hung until the client deadline. The
   transport now records terminal-frame consumption in shared holdover state
   before hyper can drop the exact-length body and abort the pump task. The
-  holdover arms only when the transport consumed clean EOS without the armed
-  pump ever waiting for bridge capacity. A `reserve()` poll that returns
-  `Pending`, rather than an immediate permit, is receive-window backpressure and
-  therefore evidence that the peer is consuming the upload; in that case the
-  pre-EOS idle bound remains authoritative and no post-EOS holdover is installed.
-  The absence of backpressure plus a stalled response-header wait is the
-  kernel-absorb signature. The bound remains dormant through DNS/TCP/TLS
+  holdover arms only when the transport consumed clean EOS and the most
+  recent completed bridge reserve obtained a permit without yielding. A
+  `reserve()` poll that returns `Pending` is receive-window backpressure for
+  that reserve; a later immediate permit clears the level so an earlier
+  `Pending` cannot latch the holdover off. Continuous backpressure through
+  EOS leaves the pre-EOS idle bound authoritative and installs no post-EOS
+  holdover. The absence of backpressure at EOS plus a stalled response-header
+  wait is the kernel-absorb signature. The bound remains dormant through DNS/TCP/TLS
   acquisition and disabled by `0`, so the documented 504 /
   `X-Gateway-Error: backend_timeout` / `error_class=read_write_timeout` contract
   holds for that never-`recv` shape without killing slow-but-progressing uploads.

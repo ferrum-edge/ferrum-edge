@@ -78,14 +78,16 @@
 //! its source-end marker, so transport consumption records clean EOS in shared
 //! join state before that drop.
 //!
-//! The holdover arms only when the write watermark was live and the pump never
-//! observed transport backpressure. A `reserve()` poll that returns `Pending`
-//! is the precise backpressure signal; a permit returned on the first poll is
-//! not. Pending means the transport's peer receive window throttled the bridge,
-//! which is positive evidence that the peer was consuming the upload. Its
-//! absence plus a stalled response-head wait is the kernel-absorb signature.
-//! This keeps slow-but-progressing uploads on the pre-EOS idle bound instead of
-//! turning their final drain into a total post-upload deadline.
+//! The holdover arms only when the write watermark was live and the most
+//! recent completed bridge reserve was not blocked. A `reserve()` poll that
+//! returns `Pending` is backpressure for THAT reserve; a permit returned
+//! without yielding clears it. The signal is a level evaluated at
+//! end-of-stream, not a latch of any earlier `Pending`. Pending means the
+//! transport's peer receive window throttled the bridge, which is positive
+//! evidence that the peer was consuming the upload. A clear level plus a
+//! stalled response-head wait is the kernel-absorb signature. This keeps
+//! slow-but-progressing uploads on the pre-EOS idle bound instead of turning
+//! their final drain into a total post-upload deadline.
 //!
 //! The dispatcher holds an [`UploadPumpJoin`], whose
 //! [`cancel_and_join`](UploadPumpJoin::cancel_and_join) is an actual join: it
@@ -149,17 +151,19 @@ const PUMP_WRITE_TIMEOUT: u8 = 6;
 ///
 /// The transport can consume the terminal body frame and immediately drop its
 /// [`UploadPumpSource`] before the pump task is scheduled again. Keeping both
-/// facts and the pump's backpressure history here lets the join make the
-/// holdover decision without depending on the task surviving the source's
-/// abort guard (issue #4411).
+/// facts and the pump's latest reserve-backpressure level here lets the join
+/// make the holdover decision without depending on the task surviving the
+/// source's abort guard (issue #4411).
 struct UploadPumpWriteState {
     armed: AtomicBool,
     eos_consumed: AtomicBool,
-    /// Set when an armed pump polls `reserve()` to `Pending` rather than
-    /// receiving a permit immediately. That is transport receive-window
-    /// backpressure, hence positive evidence that the peer consumed upload
-    /// bytes. Its absence is required for the issue #4411 kernel-absorb
-    /// response holdover.
+    /// Level: the most recently completed armed `reserve()` blocked (`true`)
+    /// or obtained a permit without yielding (`false`). Transport
+    /// receive-window backpressure is positive evidence that the peer
+    /// consumed upload bytes. A clear level at end-of-stream is required
+    /// for the issue #4411 kernel-absorb response holdover. Frozen once
+    /// clean EOS is recorded so a later empty-channel reserve cannot
+    /// rewrite the decision.
     backpressured: AtomicBool,
     changed: tokio::sync::Notify,
 }
@@ -186,8 +190,12 @@ impl UploadPumpWriteState {
         }
     }
 
-    fn record_backpressure(&self) {
-        if !self.backpressured.swap(true, Ordering::AcqRel) {
+    fn set_backpressured(&self, backpressured: bool) {
+        if self.eos_consumed.load(Ordering::Acquire) {
+            return;
+        }
+        let previous = self.backpressured.swap(backpressured, Ordering::AcqRel);
+        if previous != backpressured && !self.eos_consumed.load(Ordering::Acquire) {
             self.changed.notify_one();
         }
     }
@@ -493,9 +501,9 @@ pub(crate) struct UploadPumpJoin {
     /// task, so the source's abort guard cannot drop the response holdover.
     write_state: Option<Arc<UploadPumpWriteState>>,
     /// Set when [`write_state`](Self::write_state) reports an armed watermark,
-    /// consumed EOS, and no backpressure, then slept with `sleep_until` so a
-    /// dropped header-wait race can resume the same idle rather than losing
-    /// the bound.
+    /// consumed EOS, and a clear reserve-backpressure level, then slept with
+    /// `sleep_until` so a dropped header-wait race can resume the same idle
+    /// rather than losing the bound.
     eos_holdover_deadline: Option<tokio::time::Instant>,
     write_timeout_ms: u64,
     /// Shared with the pump task and with [`UploadPumpSource`]'s abort guard.
@@ -832,13 +840,13 @@ async fn write_timeout_fired(write_timeout: &mut Option<tokio::sync::oneshot::Re
     }
 }
 
-/// After the source is exhausted without transport backpressure, idle
+/// After the source is exhausted without current transport backpressure, idle
 /// `write_timeout_ms` so the header wait still observes
 /// `backend_write_timeout_ms` when the kernel absorbed the body (issue #4411).
 ///
 /// Shared state starts this idle only after the write watermark is armed AND
-/// the transport consumes clean EOS AND the pump has never awaited a full
-/// bridge since arming. That last condition keeps a receive-window-throttled,
+/// the transport consumes clean EOS AND the most recent completed bridge
+/// reserve did not block. That last condition keeps a receive-window-throttled,
 /// slow-but-progressing upload off the post-EOS holdover. Recording the events
 /// independently also handles native gRPC, whose dispatcher can arm after the
 /// terminal body state is observable in a synthetic probe even though
@@ -882,29 +890,34 @@ async fn eos_holdover_elapsed(
     }
 }
 
-/// Reserve one bridge slot and publish whether the armed pump had to yield.
+/// Reserve one bridge slot and publish whether THIS reserve had to yield.
 ///
-/// The first poll is decisive and does not use elapsed time: `Ready` means a
-/// permit was immediately available, while `Pending` means the transport was
-/// applying backpressure. The future remains cancel-safe inside the pump's
-/// outer `select!`; dropping it loses no permit.
+/// `Pending` on any poll of this future means the transport was applying
+/// backpressure; a permit on the first poll means a slot was already free.
+/// The boolean is published once when the reserve completes, so an earlier
+/// blocked reserve does not latch the holdover off. Dropping the future
+/// mid-poll publishes nothing and leaves the previous level standing. The
+/// future remains cancel-safe inside the pump's outer `select!`; dropping it
+/// loses no permit.
 async fn reserve_upload_capacity<'a, T>(
     sender: &'a tokio::sync::mpsc::Sender<T>,
     write_armed: bool,
     write_state: Option<&UploadPumpWriteState>,
 ) -> Result<tokio::sync::mpsc::Permit<'a, T>, tokio::sync::mpsc::error::SendError<()>> {
     let mut reserve = std::pin::pin!(sender.reserve());
-    std::future::poll_fn(|cx| {
+    let mut this_reserve_blocked = false;
+    let result = std::future::poll_fn(|cx| {
         let poll = std::future::Future::poll(reserve.as_mut(), cx);
-        if poll.is_pending()
-            && write_armed
-            && let Some(write_state) = write_state
-        {
-            write_state.record_backpressure();
+        if poll.is_pending() {
+            this_reserve_blocked = true;
         }
         poll
     })
-    .await
+    .await;
+    if write_armed && let Some(write_state) = write_state {
+        write_state.set_backpressured(this_reserve_blocked);
+    }
+    result
 }
 
 /// State moved into the gateway-owned upload task.

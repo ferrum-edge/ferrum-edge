@@ -20,7 +20,10 @@ use crate::scaffolding::clients::Http2Client;
 use crate::scaffolding::file_mode_yaml_for_backend_with;
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::reserve_port;
-use ferrum_edge::_test_support::{GrpcBufferedUploadPumpProbe, ProbePumpOutcome, ProbeReplayFrame};
+use ferrum_edge::_test_support::{
+    BufferedUploadPumpProbe, GrpcBufferedUploadPumpProbe, ProbePumpOutcome, ProbeReplayFrame,
+    ProbeTransportPoll,
+};
 use futures_util::StreamExt;
 use serde_json::json;
 use std::time::{Duration, Instant};
@@ -496,6 +499,96 @@ async fn in_process_h2c_kernel_absorb_write_timeout_maps_to_504() {
     );
     assert_eq!(body, r#"{"error":"Backend timeout"}"#);
     assert_timeout_envelope(elapsed, WRITE_TIMEOUT_MS);
+}
+
+// A single `reserve()` `Pending` after arming must not latch the holdover
+// off. The early blocked reserve completes, then a waiting drain lets later
+// reserves finish immediately, so the level at EOS is clear and the 800ms
+// write holdover still wins the header wait.
+#[tokio::test(start_paused = true)]
+async fn in_process_transient_reserve_pending_still_arms_eos_holdover() {
+    let frame = BufferedUploadPumpProbe::frame_size();
+    let frames = 4;
+    let mut probe = BufferedUploadPumpProbe::start(frame * frames, WRITE_TIMEOUT_MS)
+        .expect("buffered pump");
+
+    loop {
+        match probe.poll_transport_once() {
+            ProbeTransportPoll::Data(len) => {
+                assert_eq!(len, frame);
+                break;
+            }
+            ProbeTransportPoll::Pending => tokio::task::yield_now().await,
+            other => panic!("unexpected first-frame poll: {other:?}"),
+        }
+    }
+    assert!(
+        probe
+            .write_watermark_stays_dormant(Duration::from_millis(400))
+            .await,
+        "an early blocked reserve must refresh the pre-EOS idle, not 504"
+    );
+
+    let drained = probe.drain_transport(16).await;
+    assert!(
+        drained
+            .last()
+            .is_some_and(|frame| *frame == ProbeTransportPoll::Ended),
+        "remaining frames must reach clean EOS: {drained:?}"
+    );
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await,
+        "a transient reserve Pending must not latch the holdover off"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+}
+
+// Continuous reserve backpressure through EOS must keep the holdover from
+// arming: each capacity wait is evidence the peer is still consuming.
+#[tokio::test(start_paused = true)]
+async fn in_process_reserve_backpressure_through_eos_skips_holdover() {
+    let frame = BufferedUploadPumpProbe::frame_size();
+    let frames = 4;
+    let mut probe = BufferedUploadPumpProbe::start(frame * frames, WRITE_TIMEOUT_MS)
+        .expect("buffered pump");
+    let mut seen = 0;
+    while seen < frames {
+        loop {
+            match probe.poll_transport_once() {
+                ProbeTransportPoll::Data(_) => {
+                    seen += 1;
+                    break;
+                }
+                ProbeTransportPoll::Pending => tokio::task::yield_now().await,
+                other => panic!("unexpected poll while progressing: {other:?}"),
+            }
+        }
+        if seen < frames {
+            assert!(
+                probe
+                    .write_watermark_stays_dormant(Duration::from_millis(400))
+                    .await,
+                "slow-but-progressing consume must refresh the idle"
+            );
+        }
+    }
+    loop {
+        match probe.poll_transport_once() {
+            ProbeTransportPoll::Data(_) => {}
+            ProbeTransportPoll::Pending => tokio::task::yield_now().await,
+            ProbeTransportPoll::Ended => break,
+            other => panic!("unexpected poll draining EOS: {other:?}"),
+        }
+    }
+    assert!(
+        probe
+            .write_watermark_stays_dormant(Duration::from_secs(30))
+            .await,
+        "backpressure through EOS must not arm the post-EOS holdover"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
 }
 
 // Slow-but-progressing reads must refresh the pre-EOS write watermark. The
