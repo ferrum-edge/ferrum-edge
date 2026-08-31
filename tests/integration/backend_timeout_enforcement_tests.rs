@@ -20,9 +20,7 @@ use crate::scaffolding::clients::Http2Client;
 use crate::scaffolding::file_mode_yaml_for_backend_with;
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::reserve_port;
-use ferrum_edge::_test_support::{
-    GrpcBufferedUploadPumpProbe, ProbePumpOutcome, ProbeReplayFrame,
-};
+use ferrum_edge::_test_support::{GrpcBufferedUploadPumpProbe, ProbePumpOutcome, ProbeReplayFrame};
 use futures_util::StreamExt;
 use serde_json::json;
 use std::time::{Duration, Instant};
@@ -71,10 +69,7 @@ async fn deferred_write_pump_publishes_clean_terminal_before_closing_bridge() {
     // Cancellation now concerns only the response-wait holdover. It may settle
     // the coordinator task, but it cannot rewrite the BODY terminal observed by
     // the transport.
-    assert_eq!(
-        probe.cancel_and_join().await,
-        ProbePumpOutcome::Cancelled
-    );
+    assert_eq!(probe.cancel_and_join().await, ProbePumpOutcome::Cancelled);
     assert_eq!(
         probe.poll_transport_once(),
         ProbeReplayFrame::Ended,
