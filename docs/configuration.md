@@ -1288,12 +1288,13 @@ on how long a backend may take to produce response headers *after* it has taken
 the whole body. Once the body is on the wire the gateway has no application-level
 read receipt: a peer that never called `recv()` and a peer that read the body and
 is still computing are indistinguishable to TCP, so the same watermark covers
-both. Set `backend_write_timeout_ms` at or above the slowest post-upload response
-latency you expect from the route's backend, or leave it `0` to disable the write
-bound and let `backend_read_timeout_ms` alone bound the response. A value below
-your backend's think time will return `504` /
-`X-Gateway-Error: backend_timeout` for requests that would otherwise have
-succeeded.
+both. Both the write and read timeouts default to `30000` ms, so a route left at
+those defaults is unaffected: the read watermark already bounded the wait at 30
+seconds. A route is affected only when `backend_write_timeout_ms` is less than
+both the backend's slowest post-upload think time and the effective
+`backend_read_timeout_ms` or client deadline. Compare all three values. Set the
+write timeout at or above the slowest expected think time, or set it to `0` to
+disable the write bound and let the read/client deadline bound the response.
 
 The bound starts when the backend transport begins consuming the request body —
 the first moment a connection provably exists and the request head is written —

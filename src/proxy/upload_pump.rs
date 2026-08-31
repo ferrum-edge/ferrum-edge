@@ -71,12 +71,12 @@
 //!
 //! Once the transport has consumed, the watermark must also survive a *clean*
 //! source end (issue #4411). A never-read origin still lets the local TCP send
-//! buffer absorb a small-or-medium POST; hyper then observes end-of-stream,
-//! the pump would otherwise publish [`UploadPumpOutcome::Completed`] and drop
-//! the write-timeout signal, and the response-header wait would run on to
-//! `backend_read_timeout_ms`. Closing the bridge for a clean EOS and handing
-//! the join a holdover idle — refreshed only by genuine consume progress
-//! before that EOS — keeps `backend_write_timeout_ms` on the header wait
+//! buffer absorb a small-or-medium POST; hyper then observes end-of-stream and
+//! may immediately drop an exact-length body, aborting the pump before it can
+//! publish a response holdover. The terminal bridge frame now carries its
+//! source-end marker, so transport consumption records the holdover in shared
+//! join state before that drop. The holdover is refreshed only by genuine
+//! consume progress and keeps `backend_write_timeout_ms` on the header wait
 //! without treating "we queued a frame" as progress.
 //!
 //! The dispatcher holds an [`UploadPumpJoin`], whose
@@ -110,7 +110,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -136,6 +136,44 @@ const PUMP_CANCELLED: u8 = 3;
 const PUMP_AUTHORIZATION_EXPIRED: u8 = 4;
 const PUMP_CONSUMER_GONE: u8 = 5;
 const PUMP_WRITE_TIMEOUT: u8 = 6;
+
+/// Shared response-holdover state for one live backend write watermark.
+///
+/// The transport can consume the terminal body frame and immediately drop its
+/// [`UploadPumpSource`] before the pump task is scheduled again. Keeping both
+/// facts here lets the join observe that consume without depending on the task
+/// surviving the source's abort guard (issue #4411).
+struct UploadPumpWriteState {
+    armed: AtomicBool,
+    eos_consumed: AtomicBool,
+    changed: tokio::sync::Notify,
+}
+
+impl UploadPumpWriteState {
+    fn new() -> Self {
+        Self {
+            armed: AtomicBool::new(false),
+            eos_consumed: AtomicBool::new(false),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn arm(&self) {
+        if !self.armed.swap(true, Ordering::AcqRel) {
+            self.changed.notify_one();
+        }
+    }
+
+    fn record_eos_consumed(&self) {
+        if !self.eos_consumed.swap(true, Ordering::AcqRel) {
+            self.changed.notify_one();
+        }
+    }
+
+    fn holdover_ready(&self) -> bool {
+        self.armed.load(Ordering::Acquire) && self.eos_consumed.load(Ordering::Acquire)
+    }
+}
 
 /// Terminal state of one gateway-owned upload pump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,6 +272,17 @@ struct AbortPumpOnDrop {
     terminal: Arc<AtomicU8>,
 }
 
+/// One frame on the bounded bridge plus whether it ended the source body.
+///
+/// Hyper may use an exact size hint to drop a request body immediately after
+/// polling its last DATA frame, without polling once more for `None`. Carrying
+/// the source terminal bit with that frame lets the transport publish genuine
+/// terminal consumption before such a drop can abort the pump task.
+struct PumpedUploadFrame {
+    frame: Frame<Bytes>,
+    source_ended: bool,
+}
+
 impl Drop for AbortPumpOnDrop {
     fn drop(&mut self) {
         let _ = self.terminal.compare_exchange(
@@ -249,7 +298,7 @@ impl Drop for AbortPumpOnDrop {
 /// Transport-side half of the pump: an `http_body`-shaped view over the bridge
 /// channel, installed inside the gateway's own request-body adapters.
 pub struct UploadPumpSource {
-    receiver: tokio::sync::mpsc::Receiver<Frame<Bytes>>,
+    receiver: tokio::sync::mpsc::Receiver<PumpedUploadFrame>,
     terminal: Arc<AtomicU8>,
     /// Held only for its `Drop`.
     _abort: AbortPumpOnDrop,
@@ -261,6 +310,7 @@ pub struct UploadPumpSource {
     /// consumer-armed; the native-gRPC deferred pump hands this sender to its
     /// dispatcher instead, and a pump with no write bound has none at all.
     write_start: Option<tokio::sync::oneshot::Sender<()>>,
+    write_state: Option<Arc<UploadPumpWriteState>>,
     delivered: u64,
     ended: bool,
     reported_error: bool,
@@ -291,6 +341,9 @@ impl UploadPumpSource {
         // TCP / TLS connection acquisition off a per-direction write policy
         // (issue #4074).
         if let Some(write_start) = self.write_start.take() {
+            if let Some(write_state) = self.write_state.as_ref() {
+                write_state.arm();
+            }
             let _ = write_start.send(());
         }
         if self.ended || self.reported_error {
@@ -306,7 +359,32 @@ impl UploadPumpSource {
             return Poll::Ready(Some(Err(pump_terminal_error(outcome))));
         }
         match self.receiver.poll_recv(cx) {
-            Poll::Ready(Some(frame)) => {
+            Poll::Ready(Some(pumped)) => {
+                let PumpedUploadFrame {
+                    frame,
+                    source_ended,
+                } = pumped;
+                if source_ended {
+                    match self.terminal.compare_exchange(
+                        PUMP_RUNNING,
+                        PUMP_COMPLETED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) | Err(PUMP_COMPLETED) => {
+                            if let Some(write_state) = self.write_state.as_ref() {
+                                write_state.record_eos_consumed();
+                            }
+                            self.ended = true;
+                        }
+                        Err(code) => {
+                            self.reported_error = true;
+                            let outcome = code_outcome(code)
+                                .unwrap_or(UploadPumpOutcome::ConsumerGone);
+                            return Poll::Ready(Some(Err(pump_terminal_error(outcome))));
+                        }
+                    }
+                }
                 if let Some(data) = frame.data_ref() {
                     self.delivered = self.delivered.saturating_add(data.len() as u64);
                 }
@@ -321,6 +399,9 @@ impl UploadPumpSource {
                 // complete.
                 match code_outcome(self.terminal.load(Ordering::Acquire)) {
                     Some(UploadPumpOutcome::Completed) => {
+                        if let Some(write_state) = self.write_state.as_ref() {
+                            write_state.record_eos_consumed();
+                        }
                         self.ended = true;
                         Poll::Ready(None)
                     }
@@ -384,14 +465,12 @@ pub(crate) struct UploadPumpJoin {
     /// [`backend_write_watermark_expired`](UploadPumpJoin::backend_write_watermark_expired)
     /// turns into "never" rather than a spurious wake.
     write_timeout: Option<tokio::sync::oneshot::Receiver<()>>,
-    /// Fires when the pump has handed every source frame to the transport
-    /// *and* the write watermark is armed. The join then idles for
-    /// `write_timeout_ms` so a kernel send buffer that absorbed the whole
-    /// body cannot disarm the header-wait write bound (issue #4411).
-    eos_holdover: Option<tokio::sync::oneshot::Receiver<()>>,
-    /// Set when [`eos_holdover`](Self::eos_holdover) fires, then slept with
-    /// `sleep_until` so a dropped header-wait race can resume the same idle
-    /// rather than losing the bound.
+    /// Records transport consumption of clean EOS independently of the pump
+    /// task, so the source's abort guard cannot drop the response holdover.
+    write_state: Option<Arc<UploadPumpWriteState>>,
+    /// Set when [`write_state`](Self::write_state) reports both an armed
+    /// watermark and consumed EOS, then slept with `sleep_until` so a dropped
+    /// header-wait race can resume the same idle rather than losing the bound.
     eos_holdover_deadline: Option<tokio::time::Instant>,
     write_timeout_ms: u64,
     /// Shared with the pump task and with [`UploadPumpSource`]'s abort guard.
@@ -412,6 +491,9 @@ impl UploadPumpJoin {
     /// dial cannot be misreported as `ReadWriteTimeout`.
     pub(crate) fn arm_write_watermark(&mut self) {
         if let Some(write_start) = self.write_start.take() {
+            if let Some(write_state) = self.write_state.as_ref() {
+                write_state.arm();
+            }
             let _ = write_start.send(());
         }
     }
@@ -490,7 +572,7 @@ impl UploadPumpJoin {
             biased;
             () = write_timeout_fired(&mut self.write_timeout) => {}
             () = eos_holdover_elapsed(
-                &mut self.eos_holdover,
+                self.write_state.as_deref(),
                 &mut self.eos_holdover_deadline,
                 self.write_timeout_ms,
             ) => {}
@@ -596,24 +678,23 @@ where
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
     let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
     let (write_timeout_tx, write_timeout_rx) = tokio::sync::oneshot::channel();
-    // One channel, one owner. A pump with no write bound creates none at all,
-    // so `write_configured` and the arm condition can never disagree. The EOS
-    // holdover is the same bound: it exists only when a write watermark does.
-    let (
-        dispatcher_write_start,
-        consumer_write_start,
-        write_start_rx,
-        eos_holdover_tx,
-        eos_holdover_rx,
-    ) = if write_timeout_ms == 0 {
-        (None, None, None, None, None)
+    // One arm channel, one owner. A pump with no write bound creates neither
+    // that channel nor shared holdover state, so `write_configured` and the arm
+    // condition can never disagree.
+    let (dispatcher_write_start, consumer_write_start, write_start_rx) =
+        if write_timeout_ms == 0 {
+            (None, None, None)
+        } else {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            match arm {
+                WriteWatermarkArm::Dispatcher => (Some(tx), None, Some(rx)),
+                WriteWatermarkArm::Consumer => (None, Some(tx), Some(rx)),
+            }
+        };
+    let write_state = if write_timeout_ms == 0 {
+        None
     } else {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let (eos_tx, eos_rx) = tokio::sync::oneshot::channel();
-        match arm {
-            WriteWatermarkArm::Dispatcher => (Some(tx), None, Some(rx), Some(eos_tx), Some(eos_rx)),
-            WriteWatermarkArm::Consumer => (None, Some(tx), Some(rx), Some(eos_tx), Some(eos_rx)),
-        }
+        Some(Arc::new(UploadPumpWriteState::new()))
     };
     let terminal = Arc::new(AtomicU8::new(PUMP_RUNNING));
     let task_terminal = Arc::clone(&terminal);
@@ -628,7 +709,6 @@ where
             write_start_rx,
             terminal: task_terminal,
             write_timeout_tx,
-            eos_holdover_tx,
         })
         .await;
         let _ = finished_tx.send(outcome);
@@ -643,6 +723,7 @@ where
             },
             initial_hint,
             write_start: consumer_write_start,
+            write_state: write_state.as_ref().map(Arc::clone),
             delivered: 0,
             ended: false,
             reported_error: false,
@@ -652,7 +733,7 @@ where
             write_start: dispatcher_write_start,
             finished: Some(finished_rx),
             write_timeout: Some(write_timeout_rx),
-            eos_holdover: eos_holdover_rx,
+            write_state,
             eos_holdover_deadline: None,
             write_timeout_ms,
             terminal,
@@ -727,46 +808,46 @@ async fn write_timeout_fired(write_timeout: &mut Option<tokio::sync::oneshot::Re
 /// still observes `backend_write_timeout_ms` when the kernel absorbed the
 /// body (issue #4411).
 ///
-/// The pump publishes this signal only once the write watermark is armed, so
-/// connection acquisition stays off the write clock. A dropped sender is a
-/// non-complete terminal: disarm and stay pending.
+/// Shared state starts this idle only after the write watermark is armed AND
+/// the transport consumes clean EOS, so connection acquisition stays off the
+/// write clock. Recording those events independently also handles native gRPC,
+/// whose dispatcher can arm after the terminal body state is observable in a
+/// synthetic probe even though production arms before `send_request()`.
 ///
 /// Cancel-safe: the deadline is stored on the join before any sleep, so a
 /// `select!` that loses the header-wait race (or a probe that observes
 /// dormancy) resumes the same idle instead of dropping the bound.
 async fn eos_holdover_elapsed(
-    eos_holdover: &mut Option<tokio::sync::oneshot::Receiver<()>>,
+    write_state: Option<&UploadPumpWriteState>,
     eos_holdover_deadline: &mut Option<tokio::time::Instant>,
     write_timeout_ms: u64,
 ) {
+    let Some(write_state) = write_state else {
+        never().await;
+        return;
+    };
     loop {
         if let Some(at) = *eos_holdover_deadline {
             tokio::time::sleep_until(at).await;
             *eos_holdover_deadline = None;
             return;
         }
-        match eos_holdover.as_mut() {
-            Some(receiver) => match await_oneshot_signal(receiver).await {
-                Ok(()) => {
-                    *eos_holdover = None;
-                    if write_timeout_ms == 0 {
-                        never().await;
-                    } else {
-                        let deadline = tokio::time::Instant::now()
-                            .checked_add(Duration::from_millis(write_timeout_ms));
-                        match deadline {
-                            Some(at) => *eos_holdover_deadline = Some(at),
-                            // Instant overflow: fail closed; the bound has
-                            // elapsed as far as this join can represent.
-                            None => return,
-                        }
-                    }
+        let changed = write_state.changed.notified();
+        if write_state.holdover_ready() {
+            if write_timeout_ms == 0 {
+                never().await;
+            } else {
+                let deadline = tokio::time::Instant::now()
+                    .checked_add(Duration::from_millis(write_timeout_ms));
+                match deadline {
+                    Some(at) => *eos_holdover_deadline = Some(at),
+                    // Instant overflow: fail closed; the bound has elapsed as
+                    // far as this join can represent.
+                    None => return,
                 }
-                Err(_) => {
-                    *eos_holdover = None;
-                }
-            },
-            None => never().await,
+            }
+        } else {
+            changed.await;
         }
     }
 }
@@ -778,14 +859,13 @@ async fn eos_holdover_elapsed(
 /// path publishes through the corresponding terminal and watermark channels.
 struct UploadPumpTask<B> {
     body: B,
-    sender: tokio::sync::mpsc::Sender<Frame<Bytes>>,
+    sender: tokio::sync::mpsc::Sender<PumpedUploadFrame>,
     cancel_rx: tokio::sync::oneshot::Receiver<()>,
     plan: Option<RequestAuthLifetimePlan>,
     write_timeout_ms: u64,
     write_start_rx: Option<tokio::sync::oneshot::Receiver<()>>,
     terminal: Arc<AtomicU8>,
     write_timeout_tx: tokio::sync::oneshot::Sender<()>,
-    eos_holdover_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 async fn run_upload_pump<B>(task: UploadPumpTask<B>) -> UploadPumpOutcome
@@ -801,7 +881,6 @@ where
         write_start_rx: mut write_start,
         terminal,
         write_timeout_tx,
-        mut eos_holdover_tx,
     } = task;
     let mut sender = Some(sender);
     let mut cancel = Some(cancel_rx);
@@ -894,7 +973,11 @@ where
                 true
             }
             Some(Ok(frame)) => {
-                permit.send(frame);
+                let source_ended = http_body::Body::is_end_stream(&body);
+                permit.send(PumpedUploadFrame {
+                    frame,
+                    source_ended,
+                });
                 false
             }
             Some(Err(_)) => break 'pump UploadPumpOutcome::SourceError,
@@ -915,34 +998,12 @@ where
             Ordering::Acquire,
         );
         // Close the sender so the transport observes that clean end-of-stream
-        // and can read response headers. Completing here used to drop the
-        // write-timeout signal, so a never-read origin whose kernel send buffer
-        // absorbed the body ran on to the read watermark (issue #4411). Hand
-        // the join a holdover idle instead.
+        // and can read response headers. A terminal frame already carried the
+        // source-end marker; consuming it recorded the join's holdover before
+        // the transport could drop this source and abort the task. A body that
+        // ended without a terminal frame records the same fact when the source
+        // observes this closed bridge.
         drop(sender.take());
-        if !write_configured {
-            break 'pump UploadPumpOutcome::Completed;
-        }
-        while !write_armed {
-            tokio::select! {
-                biased;
-                () = cancel_requested(&mut cancel) => {
-                    break 'pump UploadPumpOutcome::Cancelled;
-                }
-                () = &mut expiry, if auth_armed => {
-                    if let Some((deadline, family, latch)) = plan.as_ref() {
-                        latch.record_once(deadline.termination, *family);
-                    }
-                    break 'pump UploadPumpOutcome::AuthorizationExpired;
-                }
-                () = signal_requested(&mut write_start) => {
-                    write_armed = true;
-                }
-            }
-        }
-        if let Some(eos) = eos_holdover_tx.take() {
-            let _ = eos.send(());
-        }
         break 'pump UploadPumpOutcome::Completed;
     };
     // Publish BEFORE the sender drops: the transport side reads this exactly

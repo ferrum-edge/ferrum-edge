@@ -68,7 +68,7 @@ The consequence is that `backend_write_timeout_ms` is in practice also a ceiling
 
 This fails **silently at cutover**: nothing refuses to load, and affected requests simply change from `200` to `504`.
 
-**Operator action:** for every route that sets a non-zero `backend_write_timeout_ms` on a request path that carries a body, check that the value is at or above the backend's slowest post-upload response latency. Raise it if not, or set it to `0` to disable the write bound entirely and let `backend_read_timeout_ms` alone bound the response. Routes that leave `backend_write_timeout_ms` at `0` are unaffected.
+**Operator action:** both `backend_write_timeout_ms` and `backend_read_timeout_ms` default to `30000` ms, so a route left entirely at defaults is unaffected: the read watermark already bounded its response-header wait at 30 seconds. The affected population is routes where `backend_write_timeout_ms` is less than both the backend's slowest post-upload think time and the effective `backend_read_timeout_ms` or client deadline. Compare all three values for every request path that carries a body. Raise the write timeout above the slowest expected think time, or set it to `0` to disable the write bound and let the read/client deadline bound the response.
 
 ### HTTP/1.1 requests without a Host header are rejected with 400 (issue [#4390](https://github.com/ferrum-edge/ferrum-edge/issues/4390))
 

@@ -46,8 +46,10 @@ const SSE_FIRST_EVENT: &[u8] = b"data: hello\r\n\n";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deferred_write_pump_publishes_clean_terminal_before_closing_bridge() {
-    // Native gRPC defers the write watermark until sender acquisition. A small
-    // unary body can reach source EOS while that arm is still dormant.
+    // Native gRPC defers the write watermark until sender acquisition and arms
+    // before production `send_request()`. This synthetic ordering reaches EOS
+    // first to prove the two shared facts cannot park the pump or start the
+    // holdover early when observed in the opposite order.
     let mut probe = GrpcBufferedUploadPumpProbe::start(1, &[], 50);
     assert!(probe.pumped(), "a live write bound must install the pump");
 
@@ -66,10 +68,10 @@ async fn deferred_write_pump_publishes_clean_terminal_before_closing_bridge() {
         "draining the transport must not arm the dispatcher-owned watermark"
     );
 
-    // Cancellation now concerns only the response-wait holdover. It may settle
-    // the coordinator task, but it cannot rewrite the BODY terminal observed by
-    // the transport.
-    assert_eq!(probe.cancel_and_join().await, ProbePumpOutcome::Cancelled);
+    // The response-wait holdover now lives independently of the coordinator
+    // task. A dormant dispatcher-owned watermark therefore leaves this clean
+    // body completion settled rather than parking the coordinator until cancel.
+    assert_eq!(probe.cancel_and_join().await, ProbePumpOutcome::Completed);
     assert_eq!(
         probe.poll_transport_once(),
         ProbeReplayFrame::Ended,

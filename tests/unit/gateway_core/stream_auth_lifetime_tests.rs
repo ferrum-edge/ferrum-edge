@@ -3211,14 +3211,23 @@ async fn a_fully_drained_buffered_upload_still_ends_the_header_wait_on_the_write
     // write-timeout signal, so the header wait ran on to the read bound.
     let frame = BufferedUploadPumpProbe::frame_size();
     let mut probe = BufferedUploadPumpProbe::start(frame * 2, 800).expect("buffered pump");
-    loop {
-        match probe.poll_transport_once() {
-            ProbeTransportPoll::Data(_) => {}
-            ProbeTransportPoll::Pending => tokio::task::yield_now().await,
-            ProbeTransportPoll::Ended => break,
-            other => panic!("unexpected transport poll while draining: {other:?}"),
+    for _ in 0..2 {
+        loop {
+            match probe.poll_transport_once() {
+                ProbeTransportPoll::Data(len) => {
+                    assert_eq!(len, frame);
+                    break;
+                }
+                ProbeTransportPoll::Pending => tokio::task::yield_now().await,
+                other => panic!("unexpected transport poll while draining: {other:?}"),
+            }
         }
     }
+    // Reqwest/hyper knows the exact Content-Length and can release its body as
+    // soon as the last DATA frame arrives, without polling once more for
+    // `None`. The holdover must already be independent of the pump task before
+    // this synchronous drop aborts it.
+    probe.drop_transport();
     assert!(
         probe
             .write_watermark_wins_header_wait(Duration::from_secs(30))
