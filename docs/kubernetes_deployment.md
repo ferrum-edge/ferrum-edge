@@ -381,6 +381,19 @@ capture mode. `hostPID` / `hostIPC` are not skip conditions: they share no
 namespace that an injected surface writes to. See
 [docs/mesh.md](mesh.md#host-network-pods-are-never-injected).
 
+**Injected sidecar lifecycle (issues [#4430](https://github.com/ferrum-edge/ferrum-edge/issues/4430) /
+[#4431](https://github.com/ferrum-edge/ferrum-edge/issues/4431)).** The webhook
+emits Ferrum as a Kubernetes **native sidecar** (`spec.initContainers` with
+`restartPolicy: Always`), with exec startup/readiness probes against loopback
+`/health`. That is the Job-completion shape and the startup-ordering contract:
+application containers wait until the proxy is serving, and an injected Job can
+finish without an operator killing Ferrum. **Minimum Kubernetes version is
+1.29** (native sidecars enabled by default; 1.28 needs the `SidecarContainers`
+feature gate). There is no ordinary-container fallback. HTTP `httpGet` and TCP
+`tcpSocket` probe ports on every container in the pod are added to the inbound
+capture exclusion set; `exec`/`grpc` probes are not. Unresolved named probe
+ports fail admission. See [docs/mesh.md](mesh.md#sidecar-container).
+
 The chart mounts the injector serving certificate through a Secret volume when
 the injector is enabled; the injector process does not read Kubernetes Secrets
 through the API, so the default service account does not need Secret RBAC for

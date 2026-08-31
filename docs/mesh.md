@@ -3729,7 +3729,7 @@ Keep all three nonzero on any injector reachable beyond the API server; a nonzer
 - **`dryRun`:** the patch-only webhook has no side effects, so a `dryRun: true` request returns the identical computed patch without implying any side effect.
 - **`spec.hostNetwork: true`:** never injected — see [Host-Network Pods Are Never Injected](#host-network-pods-are-never-injected) below.
 
-These complement the existing boundary checks: the body-size limit (returns `413`), reserved-container-name conflicts (`ferrum-edge` / `ferrum-edge-init`) refuse injection, and invalid port/CIDR annotations are rejected with a webhook error that names the offending annotation.
+These complement the existing boundary checks: the body-size limit (returns `413`), reserved-container-name conflicts (`ferrum-edge` / `ferrum-edge-init`) refuse injection, a pod with no application containers is refused (a native sidecar is not a sufficient `spec.containers` entry), unresolved named kubelet probe ports are refused, and invalid port/CIDR annotations are rejected with a webhook error that names the offending annotation.
 
 **Self-exclusion (bootstrap deadlock).** A self-hosted mutating webhook with `failurePolicy: Fail` must not intercept its own replacement pods: when every injector replica is down, admission calls fail and pod `CREATE` in the release namespace is rejected until an operator deletes the `MutatingWebhookConfiguration`. The `charts/ferrum-mesh` chart therefore renders two guards on `sidecar-injector.ferrum.io`:
 
@@ -3788,6 +3788,8 @@ The injector checks annotations and labels to decide whether to inject:
 
 When `FERRUM_INJECTOR_REQUIRE_ANNOTATION=true` (default), pods must explicitly opt in via `ferrum.io/inject: "true"`, `sidecar.istio.io/inject: "true"` (Istio compat), or the `ferrum.io/mesh: "enabled"` label. When `false`, all pods are injected unless explicitly opted out.
 
+**Minimum Kubernetes version: 1.29.** Native sidecar containers (`initContainers` with `restartPolicy: Always`) are beta and enabled by default from 1.29, and GA in 1.33. There is **no ordinary-container fallback**: an ordinary sidecar cannot provide startup ordering or Job completion, so the injector always emits the native-sidecar shape. On Kubernetes 1.28 the `SidecarContainers` feature gate must be enabled; on 1.27 and earlier the apiserver rejects `spec.initContainers[].restartPolicy`. Do not install the injector on clusters older than 1.29 unless that feature gate is on.
+
 ### Host-Network Pods Are Never Injected
 
 A pod with `spec.hostNetwork: true` shares the **node's** network namespace, so every pod-scoped mesh surface becomes node-scoped. The injector therefore **skips such pods unconditionally**, matching Istio's `injectRequired()` host-networking skip:
@@ -3831,6 +3833,14 @@ The injector supports per-pod capture overrides via annotations. The Istio annot
 
 Port-list annotations merge with their Ferrum aliases; exclude lists also merge with the applicable injector-level defaults. `includeOutboundPorts` is annotation-only and narrows outbound REDIRECT rules to the listed TCP destination ports when the include CIDR list is only the implicit catch-all. If `includeOutboundIPRanges` is also explicit, the rule sets are additive: all ports inside the explicit CIDRs are captured, plus the listed ports to any destination. The `*` wildcard means all outbound ports to any destination, even when explicit include CIDRs are also present. Outbound exclude ports still win because their RETURN rules are emitted first. CIDR annotations are validated at admission time -- invalid ports or CIDRs are rejected with a webhook error that names the offending annotation, so a typo cannot silently produce a broken iptables plan.
 
+**Kubelet probe ports (issue [#4431](https://github.com/ferrum-edge/ferrum-edge/issues/4431)).** Inbound capture also excludes TCP ports used by `startupProbe` / `readinessProbe` / `livenessProbe` on every container in the pod (`containers`, `initContainers`, and `ephemeralContainers`):
+
+- `httpGet` and `tcpSocket` probes contribute their port.
+- `exec` and `grpc` probes are skipped — they have no HTTP/TCP kubelet port to exclude.
+- A named probe port is resolved against **that container's** `ports[].name` → `containerPort`. Numeric strings (`"8080"`) are treated as numbers.
+- An unresolved or ambiguous name fails admission rather than leaving the probe captured by the inbound catch-all (kubelet probes the Pod IP by default; Ferrum's inbound HTTP routes are service-host based, so a captured liveness probe 404/503s and restarts a healthy container).
+- Operator annotations and `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS` still win: probe ports are unioned with those lists and deduplicated.
+
 **Pod-restart caveat (injector / iptables init container):** annotations consumed by the `injector` mode are evaluated at pod admission time only. Existing pods retain their previous iptables capture rules until restart; bouncing affected workloads is required for previously-ignored annotations to take effect in the init-container path. The eBPF capture path lifts this restriction for `includeOutboundPorts` -- see below.
 
 **eBPF/ambient capture:** the eBPF capture path honors per-pod `includeOutboundPorts` annotations through the `FERRUM_INCLUDE_PORTS` BPF map (keyed by cgroup id). The node-agent parses `traffic.sidecar.istio.io/includeOutboundPorts` / `ferrum.io/includeOutboundPorts` on enrollment via the shared `crate::capture::include_outbound_ports_from_annotations` helper -- exactly the same parser the injector uses for the iptables init container -- and writes a per-cgroup `IncludePortsPolicy` record. The `connect4` / `connect6` BPF programs look up the calling task's cgroup id (`bpf_get_current_cgroup_id`); absent entries fail-open (capture every port that survived the earlier checks), so un-annotated pods retain their previous behavior. The map caps explicit ports at `INCLUDE_PORTS_MAX` (16) per pod; overflow truncates with a `warn!` -- it does not abort enrollment.
@@ -3864,7 +3874,11 @@ spiffe://{TRUST_DOMAIN}/ns/{NAMESPACE}/sa/{SERVICE_ACCOUNT}
 
 ### Sidecar Container
 
-The injected sidecar container runs `ferrum-edge run` with environment variables:
+The injected Ferrum proxy is a **Kubernetes native sidecar**: an `initContainers` entry named `ferrum-edge` with `restartPolicy: Always`. Native sidecars start before later init containers and application containers, do not block Job completion, and keep running while the workload drains. The iptables capture init (`ferrum-edge-init`, run-once) is inserted immediately after Ferrum so capture rules are installed only once the proxy's startup probe has succeeded.
+
+That ordering is load-bearing. Mesh mode waits for the first valid control-plane slice and then binds capture listeners before `/health` reports ready. The injected startup and readiness probes are exec checks of `ferrum-edge health` (admin `/health` on loopback port 9000, **not** `/live`), so later containers — and the iptables init — wait until Ferrum is actually serving. `/live` would succeed as soon as the admin listener is up, which is too early.
+
+The container runs `ferrum-edge run` with environment variables:
 
 - `FERRUM_MODE=mesh`
 - `FERRUM_NAMESPACE={pod_namespace}`
@@ -3875,6 +3889,10 @@ The injected sidecar container runs `ferrum-edge run` with environment variables
 - `FERRUM_CP_DP_GRPC_JWT_SECRET` via `valueFrom.secretKeyRef` (never plaintext)
 
 The container runs as `FERRUM_MESH_PROXY_UID` (default 1337) with `allowPrivilegeEscalation: false`.
+
+A pod with no application containers is refused: Kubernetes requires at least one non-sidecar container, and emitting only a native sidecar would be rejected by the apiserver. If the webhook cannot build a valid patch, it fails the admission request with a named error rather than emitting a broken pod.
+
+Existing pods that still carry Ferrum as an ordinary `spec.containers` entry must be recreated. The webhook refuses to mix that legacy shape with the native sidecar.
 
 ### Capture Modes
 

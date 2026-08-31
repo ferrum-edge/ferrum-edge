@@ -73,6 +73,22 @@ const SIDECAR_ENV_KEYS: &[&str] = &[
     "FERRUM_DP_GRPC_TLS_NO_VERIFY",
     "FERRUM_MESH_CONFIG_PROTOCOL",
 ];
+const SIDECAR_CONTAINER_NAME: &str = "ferrum-edge";
+const INIT_CONTAINER_NAME: &str = "ferrum-edge-init";
+const NATIVE_SIDECAR_PATCH_PATH: &str = "/spec/initContainers/0";
+const IPTABLES_INIT_PATCH_PATH: &str = "/spec/initContainers/1";
+const SIDECAR_HEALTH_BINARY: &str = "/app/ferrum-edge";
+const SIDECAR_HEALTH_ADMIN_PORT: &str = "9000";
+const SIDECAR_STARTUP_PROBE_PERIOD_SECONDS: u64 = 2;
+const SIDECAR_STARTUP_PROBE_FAILURE_THRESHOLD: u64 = 150;
+const SIDECAR_READINESS_PROBE_PERIOD_SECONDS: u64 = 5;
+const SIDECAR_READINESS_PROBE_FAILURE_THRESHOLD: u64 = 3;
+const CONTAINER_PROBE_FIELDS: [&str; 3] = ["startupProbe", "readinessProbe", "livenessProbe"];
+const POD_CONTAINER_LIST_POINTERS: [&str; 3] = [
+    "/spec/containers",
+    "/spec/initContainers",
+    "/spec/ephemeralContainers",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretKeyRef {
@@ -985,6 +1001,7 @@ fn build_sidecar_patch_for_namespace(
     }
 
     reject_reserved_name_conflicts(pod, config)?;
+    require_application_containers(pod)?;
 
     let mut patch = Vec::new();
     let pod_namespace = pod_namespace(pod, admission_namespace, config);
@@ -994,10 +1011,14 @@ fn build_sidecar_patch_for_namespace(
         path: "/metadata/annotations/ferrum.io~1injected".to_string(),
         value: Some(Value::String("true".to_string())),
     });
-    ensure_containers(pod, &mut patch);
+    // Native sidecar (Kubernetes 1.29+): insert Ferrum first in
+    // initContainers with restartPolicy Always so later init containers
+    // (including iptables capture) and application containers wait for
+    // the startup probe. There is no ordinary-container fallback.
+    ensure_init_containers(pod, &mut patch)?;
     patch.push(JsonPatchOperation {
         op: "add",
-        path: "/spec/containers/-".to_string(),
+        path: NATIVE_SIDECAR_PATCH_PATH.to_string(),
         value: Some(sidecar_container(config, pod, &pod_namespace)),
     });
 
@@ -1010,10 +1031,9 @@ fn build_sidecar_patch_for_namespace(
     }
 
     if config.capture_mode == CaptureMode::Iptables {
-        ensure_init_containers(pod, &mut patch);
         patch.push(JsonPatchOperation {
             op: "add",
-            path: "/spec/initContainers/-".to_string(),
+            path: IPTABLES_INIT_PATCH_PATH.to_string(),
             value: Some(init_container(config, pod)?),
         });
     }
@@ -1026,7 +1046,7 @@ fn injected_shape_matches(
     config: &InjectorConfig,
     admission_namespace: Option<&str>,
 ) -> Result<bool, String> {
-    let Some(sidecar) = named_container(pod, "/spec/containers", "ferrum-edge") else {
+    let Some(sidecar) = named_container(pod, "/spec/initContainers", SIDECAR_CONTAINER_NAME) else {
         return Ok(false);
     };
     let namespace = pod_namespace(pod, admission_namespace, config);
@@ -1037,7 +1057,7 @@ fn injected_shape_matches(
     if config.capture_mode != CaptureMode::Iptables {
         return Ok(true);
     }
-    let Some(init) = named_container(pod, "/spec/initContainers", "ferrum-edge-init") else {
+    let Some(init) = named_container(pod, "/spec/initContainers", INIT_CONTAINER_NAME) else {
         return Ok(false);
     };
     Ok(init == &init_container(config, pod)?)
@@ -1050,7 +1070,8 @@ fn injected_shape_matches(
 /// missing opt-in is the ordinary steady-state outcome and must stay silent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InjectionDecision {
-    /// Inject the sidecar (and, in `CaptureMode::Iptables`, the init container).
+    /// Inject the native sidecar (and, in `CaptureMode::Iptables`, the
+    /// iptables init container).
     Inject,
     /// `spec.hostNetwork: true` -- the pod shares the node's network namespace.
     SkipHostNetwork,
@@ -1167,18 +1188,29 @@ fn pod_display_name(pod: &Value) -> &str {
 }
 
 fn reject_reserved_name_conflicts(pod: &Value, config: &InjectorConfig) -> Result<(), String> {
-    if named_container(pod, "/spec/containers", "ferrum-edge").is_some() {
+    if named_container(pod, "/spec/containers", SIDECAR_CONTAINER_NAME).is_some() {
         return Err(
-            "pod spec already defines reserved container name ferrum-edge; refusing injection"
+            "pod spec already defines reserved container name ferrum-edge in spec.containers; \
+Ferrum now injects a Kubernetes native sidecar under spec.initContainers \
+(restartPolicy: Always, Kubernetes 1.29+). Recreate the pod so the webhook \
+can inject the new shape"
+                .to_string(),
+        );
+    }
+
+    if named_container(pod, "/spec/initContainers", SIDECAR_CONTAINER_NAME).is_some() {
+        return Err(
+            "pod spec already defines reserved init container name ferrum-edge; refusing injection"
                 .to_string(),
         );
     }
 
     if config.capture_mode == CaptureMode::Iptables
-        && named_container(pod, "/spec/initContainers", "ferrum-edge-init").is_some()
+        && named_container(pod, "/spec/initContainers", INIT_CONTAINER_NAME).is_some()
     {
         return Err(
-            "pod spec already defines reserved init container name ferrum-edge-init; refusing injection"
+            "pod spec already defines reserved init container name ferrum-edge-init; \
+refusing injection"
                 .to_string(),
         );
     }
@@ -1225,23 +1257,38 @@ fn ensure_metadata_annotations(pod: &Value, patch: &mut Vec<JsonPatchOperation>)
     }
 }
 
-fn ensure_init_containers(pod: &Value, patch: &mut Vec<JsonPatchOperation>) {
-    if pod.pointer("/spec/initContainers").is_none() {
-        patch.push(JsonPatchOperation {
-            op: "add",
-            path: "/spec/initContainers".to_string(),
-            value: Some(json!([])),
-        });
+fn require_application_containers(pod: &Value) -> Result<(), String> {
+    match pod.pointer("/spec/containers") {
+        Some(Value::Array(containers)) if !containers.is_empty() => Ok(()),
+        Some(Value::Array(_)) | None => Err(
+            "pod spec has no application containers; refusing to inject a native sidecar \
+that Kubernetes would reject (a Pod must have at least one non-sidecar container)"
+                .to_string(),
+        ),
+        Some(_) => Err(
+            "pod spec.containers is not an array; refusing injection rather than emitting \
+a patch Kubernetes would reject"
+                .to_string(),
+        ),
     }
 }
 
-fn ensure_containers(pod: &Value, patch: &mut Vec<JsonPatchOperation>) {
-    if pod.pointer("/spec/containers").is_none() {
-        patch.push(JsonPatchOperation {
-            op: "add",
-            path: "/spec/containers".to_string(),
-            value: Some(json!([])),
-        });
+fn ensure_init_containers(pod: &Value, patch: &mut Vec<JsonPatchOperation>) -> Result<(), String> {
+    match pod.pointer("/spec/initContainers") {
+        None => {
+            patch.push(JsonPatchOperation {
+                op: "add",
+                path: "/spec/initContainers".to_string(),
+                value: Some(json!([])),
+            });
+            Ok(())
+        }
+        Some(Value::Array(_)) => Ok(()),
+        Some(_) => Err(
+            "pod spec.initContainers is not an array; refusing injection rather than \
+emitting a patch Kubernetes would reject"
+                .to_string(),
+        ),
     }
 }
 
@@ -1443,7 +1490,39 @@ fn sidecar_container(config: &InjectorConfig, pod: &Value, namespace: &str) -> V
             {"containerPort": 15001, "name": "outbound"},
             {"containerPort": 15006, "name": "inbound"}
         ],
+        "restartPolicy": "Always",
+        "startupProbe": sidecar_exec_health_probe(
+            SIDECAR_STARTUP_PROBE_PERIOD_SECONDS,
+            SIDECAR_STARTUP_PROBE_FAILURE_THRESHOLD,
+        ),
+        "readinessProbe": sidecar_exec_health_probe(
+            SIDECAR_READINESS_PROBE_PERIOD_SECONDS,
+            SIDECAR_READINESS_PROBE_FAILURE_THRESHOLD,
+        ),
         "env": sidecar_env(config, pod, namespace)
+    })
+}
+
+/// Exec probe against loopback admin `/health` (not `/live`). Mesh sets
+/// `startup_ready` only after the first admissible slice is applied and
+/// capture listeners are bound, so this probe stays unready until traffic
+/// can actually be served. Exec targets 127.0.0.1 inside the container and
+/// therefore is not captured by inbound iptables redirect.
+fn sidecar_exec_health_probe(period_seconds: u64, failure_threshold: u64) -> Value {
+    json!({
+        "exec": {
+            "command": [
+                SIDECAR_HEALTH_BINARY,
+                "health",
+                "-p",
+                SIDECAR_HEALTH_ADMIN_PORT,
+                "--host",
+                "127.0.0.1"
+            ]
+        },
+        "periodSeconds": period_seconds,
+        "timeoutSeconds": 1,
+        "failureThreshold": failure_threshold
     })
 }
 
@@ -1628,9 +1707,189 @@ fn exclude_inbound_ports_for_pod(config: &InjectorConfig, pod: &Value) -> Result
         .map_err(|e| format!("invalid {key}: {e}"))?;
         ports.extend(annotation_ports);
     }
+    ports.extend(inbound_probe_ports_for_pod(pod)?);
     ports.sort_unstable();
     ports.dedup();
     Ok(ports)
+}
+
+/// HTTP `httpGet` and TCP `tcpSocket` probe ports on every container in the
+/// pod, resolved against that container's named `ports` when the probe uses
+/// a name. `exec` and `grpc` probes are skipped: they have no HTTP/TCP
+/// kubelet port to exclude. Unresolved or ambiguous names fail admission
+/// rather than leaving the probe captured by the inbound catch-all.
+fn inbound_probe_ports_for_pod(pod: &Value) -> Result<Vec<u16>, String> {
+    let mut ports = Vec::new();
+    for pointer in POD_CONTAINER_LIST_POINTERS {
+        let Some(containers) = pod.pointer(pointer).and_then(Value::as_array) else {
+            continue;
+        };
+        for container in containers {
+            collect_container_probe_ports(container, &mut ports)?;
+        }
+    }
+    Ok(ports)
+}
+
+fn collect_container_probe_ports(container: &Value, ports: &mut Vec<u16>) -> Result<(), String> {
+    let container_name = container_display_name(container);
+    for probe_field in CONTAINER_PROBE_FIELDS {
+        let Some(probe) = container.get(probe_field) else {
+            continue;
+        };
+        if let Some(port) =
+            inbound_exclusion_port_for_probe(container, container_name, probe_field, probe)?
+        {
+            ports.push(port);
+        }
+    }
+    Ok(())
+}
+
+fn container_display_name(container: &Value) -> &str {
+    container
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("<unnamed>")
+}
+
+fn inbound_exclusion_port_for_probe(
+    container: &Value,
+    container_name: &str,
+    probe_field: &str,
+    probe: &Value,
+) -> Result<Option<u16>, String> {
+    if let Some(http_get) = probe.get("httpGet") {
+        return resolve_probe_handler_port(
+            container,
+            container_name,
+            probe_field,
+            "httpGet",
+            http_get,
+        )
+        .map(Some);
+    }
+    if let Some(tcp_socket) = probe.get("tcpSocket") {
+        return resolve_probe_handler_port(
+            container,
+            container_name,
+            probe_field,
+            "tcpSocket",
+            tcp_socket,
+        )
+        .map(Some);
+    }
+    Ok(None)
+}
+
+fn resolve_probe_handler_port(
+    container: &Value,
+    container_name: &str,
+    probe_field: &str,
+    handler: &str,
+    handler_value: &Value,
+) -> Result<u16, String> {
+    let Some(port) = handler_value.get("port") else {
+        return Err(format!(
+            "container '{container_name}' {probe_field}.{handler} is missing port; \
+refusing injection"
+        ));
+    };
+    match port {
+        Value::Number(number) => json_u16_port(number).ok_or_else(|| {
+            format!(
+                "container '{container_name}' {probe_field}.{handler} port is not \
+an integer in 1-65535; refusing injection"
+            )
+        }),
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(format!(
+                    "container '{container_name}' {probe_field}.{handler} port is \
+empty; refusing injection"
+                ));
+            }
+            if trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+                parse_numeric_probe_port(trimmed).ok_or_else(|| {
+                    format!(
+                        "container '{container_name}' {probe_field}.{handler} port \
+'{trimmed}' is not an integer in 1-65535; refusing injection"
+                    )
+                })
+            } else {
+                resolve_named_container_port(container, container_name, probe_field, trimmed)
+            }
+        }
+        _ => Err(format!(
+            "container '{container_name}' {probe_field}.{handler} port must be a \
+number or name; refusing injection"
+        )),
+    }
+}
+
+fn json_u16_port(number: &serde_json::Number) -> Option<u16> {
+    number
+        .as_u64()
+        .and_then(|value| u16::try_from(value).ok())
+        .filter(|port| *port != 0)
+}
+
+fn parse_numeric_probe_port(raw: &str) -> Option<u16> {
+    raw.parse::<u16>().ok().filter(|port| *port != 0)
+}
+
+fn resolve_named_container_port(
+    container: &Value,
+    container_name: &str,
+    probe_field: &str,
+    port_name: &str,
+) -> Result<u16, String> {
+    let unresolved = || {
+        format!(
+            "container '{container_name}' {probe_field} names port '{port_name}' \
+which is not declared in that container's ports; refusing injection so the \
+kubelet probe is not captured by inbound mesh redirect"
+        )
+    };
+    let Some(declared_ports) = container.get("ports").and_then(Value::as_array) else {
+        return Err(unresolved());
+    };
+    let mut resolved = None;
+    for declared in declared_ports {
+        if declared.get("name").and_then(Value::as_str) != Some(port_name) {
+            continue;
+        }
+        let Some(container_port) = declared
+            .get("containerPort")
+            .and_then(json_value_port_number)
+        else {
+            return Err(format!(
+                "container '{container_name}' port '{port_name}' has a \
+containerPort that is not an integer in 1-65535; refusing injection"
+            ));
+        };
+        match resolved {
+            Some(existing) if existing != container_port => {
+                return Err(format!(
+                    "container '{container_name}' declares port name '{port_name}' \
+on more than one containerPort; refusing injection"
+                ));
+            }
+            Some(_) => {}
+            None => resolved = Some(container_port),
+        }
+    }
+    resolved.ok_or_else(unresolved)
+}
+
+fn json_value_port_number(value: &Value) -> Option<u16> {
+    match value {
+        Value::Number(number) => json_u16_port(number),
+        Value::String(raw) => parse_numeric_probe_port(raw.trim()),
+        _ => None,
+    }
 }
 
 fn json_response(status: StatusCode, value: Value) -> Response<Full<Bytes>> {
@@ -1776,6 +2035,18 @@ mod tests {
             .expect("injector test server panicked");
     }
 
+    fn patch_named_container<'a>(patch: &'a [JsonPatchOperation], name: &str) -> Option<&'a Value> {
+        patch.iter().find_map(|op| {
+            op.value
+                .as_ref()
+                .filter(|value| value.get("name").and_then(Value::as_str) == Some(name))
+        })
+    }
+
+    fn patch_has_named_container(patch: &[JsonPatchOperation], name: &str) -> bool {
+        patch_named_container(patch, name).is_some()
+    }
+
     #[test]
     fn patch_requires_opt_in_by_default() {
         let pod = json!({"metadata": {"labels": {}}, "spec": {"containers": []}});
@@ -1810,8 +2081,8 @@ mod tests {
         .expect("patch");
 
         assert!(
-            patch.iter().any(|op| op.path == "/spec/containers/-"),
-            "expected sidecar container to be appended"
+            patch_has_named_container(&patch, "ferrum-edge"),
+            "expected Ferrum native sidecar to be injected"
         );
     }
 
@@ -1852,7 +2123,7 @@ mod tests {
         let namespace = pod_namespace(&pod, None, &config);
         let sidecar = sidecar_container(&config, &pod, &namespace);
         let init = init_container(&config, &pod).expect("init container");
-        pod["spec"]["containers"]
+        pod["spec"]["initContainers"]
             .as_array_mut()
             .unwrap()
             .push(sidecar);
@@ -1883,7 +2154,7 @@ mod tests {
         let mut sidecar = sidecar_container(&config, &pod, &namespace);
         sidecar["securityContext"]["privileged"] = Value::Bool(true);
         let init = init_container(&config, &pod).expect("init container");
-        pod["spec"]["containers"]
+        pod["spec"]["initContainers"]
             .as_array_mut()
             .unwrap()
             .push(sidecar);
@@ -1894,7 +2165,7 @@ mod tests {
 
         let error = build_sidecar_patch_for_namespace(&pod, &config, None)
             .expect_err("extra sidecar fields must not pass reinvocation validation");
-        assert!(error.contains("reserved container name ferrum-edge"));
+        assert!(error.contains("reserved init container name ferrum-edge"));
     }
 
     #[test]
@@ -1953,8 +2224,8 @@ mod tests {
             None,
         )
         .expect("patch");
-        assert!(patch.iter().any(|op| op.path == "/spec/containers/-"));
-        assert!(patch.iter().any(|op| op.path == "/spec/initContainers/-"));
+        assert!(patch_has_named_container(&patch, "ferrum-edge"));
+        assert!(patch_has_named_container(&patch, "ferrum-edge-init"));
     }
 
     #[test]
@@ -1973,23 +2244,66 @@ mod tests {
         )
         .expect("patch");
 
-        assert!(patch.iter().any(|op| op.path == "/spec/containers/-"));
-        assert!(patch.iter().any(|op| op.path == "/spec/initContainers/-"));
-        let sidecar = patch
-            .iter()
-            .find(|op| op.path == "/spec/containers/-")
-            .and_then(|op| op.value.as_ref())
-            .expect("sidecar container");
-        let init = patch
-            .iter()
-            .find(|op| op.path == "/spec/initContainers/-")
-            .and_then(|op| op.value.as_ref())
-            .expect("init container");
+        assert!(
+            patch_has_named_container(&patch, "ferrum-edge"),
+            "expected Ferrum native sidecar to be injected"
+        );
+        assert!(patch_has_named_container(&patch, "ferrum-edge-init"));
+        assert!(
+            !patch.iter().any(|op| op.path == "/spec/containers/-"),
+            "native sidecar must not be appended as an ordinary container"
+        );
+        let sidecar = patch_named_container(&patch, "ferrum-edge").expect("sidecar container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let env = sidecar
             .get("env")
             .and_then(Value::as_array)
             .expect("sidecar env");
         assert_eq!(sidecar.get("args"), Some(&json!(["run"])));
+        assert_eq!(
+            sidecar.get("restartPolicy"),
+            Some(&Value::String("Always".to_string()))
+        );
+        assert_eq!(
+            sidecar.pointer("/startupProbe/exec/command"),
+            Some(&json!([
+                "/app/ferrum-edge",
+                "health",
+                "-p",
+                "9000",
+                "--host",
+                "127.0.0.1"
+            ]))
+        );
+        assert!(
+            sidecar
+                .pointer("/startupProbe/exec/command")
+                .and_then(Value::as_array)
+                .is_some_and(|command| {
+                    !command.iter().any(|part| part.as_str() == Some("--live"))
+                }),
+            "startupProbe must wait on /health readiness, not /live"
+        );
+        assert_eq!(
+            sidecar.pointer("/readinessProbe/exec/command"),
+            sidecar.pointer("/startupProbe/exec/command")
+        );
+        assert_eq!(
+            patch
+                .iter()
+                .find(|op| op.value.as_ref() == Some(sidecar))
+                .map(|op| op.path.as_str()),
+            Some("/spec/initContainers/0"),
+            "native sidecar must be inserted first so later inits wait on startupProbe"
+        );
+        assert_eq!(
+            patch
+                .iter()
+                .find(|op| op.value.as_ref() == Some(init))
+                .map(|op| op.path.as_str()),
+            Some("/spec/initContainers/1"),
+            "iptables init must run after the native sidecar is ready"
+        );
         assert_eq!(
             sidecar.pointer("/securityContext/capabilities/drop"),
             Some(&json!(["ALL"]))
@@ -2053,10 +2367,12 @@ mod tests {
     }
 
     #[test]
-    fn patch_creates_missing_containers_array_before_appending_sidecar() {
+    fn patch_creates_missing_init_containers_array_before_inserting_sidecar() {
         let pod = json!({
             "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
-            "spec": {}
+            "spec": {
+                "containers": [{"name": "app", "image": "app:test"}]
+            }
         });
         let patch = build_sidecar_patch_for_namespace(
             &pod,
@@ -2065,18 +2381,50 @@ mod tests {
         )
         .expect("patch");
 
-        let containers_index = patch
+        let init_list_index = patch
             .iter()
-            .position(|op| op.path == "/spec/containers")
-            .expect("containers array guard");
+            .position(|op| op.path == "/spec/initContainers")
+            .expect("initContainers array guard");
         let sidecar_index = patch
             .iter()
-            .position(|op| op.path == "/spec/containers/-")
-            .expect("sidecar append");
+            .position(|op| op.path == "/spec/initContainers/0")
+            .expect("native sidecar insert");
         assert!(
-            containers_index < sidecar_index,
-            "containers array must exist before appending the sidecar"
+            init_list_index < sidecar_index,
+            "initContainers array must exist before inserting the native sidecar"
         );
+        assert!(patch_has_named_container(&patch, "ferrum-edge"));
+        assert!(!patch_has_named_container(&patch, "ferrum-edge-init"));
+    }
+
+    #[test]
+    fn patch_rejects_pod_with_no_application_containers() {
+        let pod = json!({
+            "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
+            "spec": {}
+        });
+        let err = build_sidecar_patch_for_namespace(
+            &pod,
+            &test_config(true, CaptureMode::Explicit),
+            None,
+        )
+        .expect_err("empty spec must not emit a native-sidecar-only pod");
+        assert!(err.contains("no application containers"));
+    }
+
+    #[test]
+    fn patch_rejects_empty_application_container_list() {
+        let pod = json!({
+            "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
+            "spec": {"containers": []}
+        });
+        let err = build_sidecar_patch_for_namespace(
+            &pod,
+            &test_config(true, CaptureMode::Explicit),
+            None,
+        )
+        .expect_err("empty containers must not emit a native-sidecar-only pod");
+        assert!(err.contains("no application containers"));
     }
 
     #[test]
@@ -2142,7 +2490,7 @@ mod tests {
             )
             .expect("patch");
             assert!(
-                patch.iter().any(|op| op.path == "/spec/containers/-"),
+                patch_has_named_container(&patch, "ferrum-edge"),
                 "ferrum.io/inject={value:?} must opt in"
             );
         }
@@ -2184,7 +2532,7 @@ mod tests {
             )
             .expect("patch");
             assert!(
-                patch.iter().any(|op| op.path == "/spec/containers/-"),
+                patch_has_named_container(&patch, "ferrum-edge"),
                 "ferrum.io/mesh={value:?} must opt in"
             );
         }
@@ -2311,11 +2659,11 @@ mod tests {
             .expect("patch");
 
             assert!(
-                patch.iter().any(|op| op.path == "/spec/containers/-"),
+                patch_has_named_container(&patch, "ferrum-edge"),
                 "expected sidecar container for hostNetwork={host_network:?}"
             );
             assert!(
-                patch.iter().any(|op| op.path == "/spec/initContainers/-"),
+                patch_has_named_container(&patch, "ferrum-edge-init"),
                 "expected iptables init container for hostNetwork={host_network:?}"
             );
         }
@@ -2403,11 +2751,7 @@ mod tests {
         let mut config = test_config(true, CaptureMode::Iptables);
         config.udp_capture_enabled = false;
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let sidecar = patch
-            .iter()
-            .find(|op| op.path == "/spec/containers/-")
-            .and_then(|op| op.value.as_ref())
-            .expect("sidecar container");
+        let sidecar = patch_named_container(&patch, "ferrum-edge").expect("sidecar container");
         assert_eq!(
             sidecar.pointer("/securityContext/capabilities/drop"),
             Some(&json!(["ALL"]))
@@ -2422,11 +2766,7 @@ mod tests {
         let mut config = test_config(true, CaptureMode::Iptables);
         config.udp_capture_enabled = true;
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let sidecar = patch
-            .iter()
-            .find(|op| op.path == "/spec/containers/-")
-            .and_then(|op| op.value.as_ref())
-            .expect("sidecar container");
+        let sidecar = patch_named_container(&patch, "ferrum-edge").expect("sidecar container");
         assert_eq!(
             sidecar.pointer("/securityContext/capabilities/drop"),
             Some(&json!(["ALL"]))
@@ -2456,11 +2796,7 @@ mod tests {
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
 
         // Init container: UDP TPROXY/mangle rules ARE emitted.
-        let init = patch
-            .iter()
-            .find(|op| op.path == "/spec/initContainers/-")
-            .and_then(|op| op.value.as_ref())
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -2479,11 +2815,7 @@ mod tests {
         );
 
         // Sidecar container: runtime UDP-enable env IS set.
-        let sidecar = patch
-            .iter()
-            .find(|op| op.path == "/spec/containers/-")
-            .and_then(|op| op.value.as_ref())
-            .expect("sidecar container");
+        let sidecar = patch_named_container(&patch, "ferrum-edge").expect("sidecar container");
         let env = sidecar
             .pointer("/env")
             .and_then(Value::as_array)
@@ -2526,11 +2858,7 @@ mod tests {
         let mut config = test_config(true, CaptureMode::Iptables);
         config.udp_capture_enabled = false;
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch
-            .iter()
-            .find(|op| op.path == "/spec/initContainers/-")
-            .and_then(|op| op.value.as_ref())
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -2539,11 +2867,7 @@ mod tests {
             !commands.contains("-p udp"),
             "UDP capture off must emit no `-p udp` rules: {commands}"
         );
-        let sidecar = patch
-            .iter()
-            .find(|op| op.path == "/spec/containers/-")
-            .and_then(|op| op.value.as_ref())
-            .expect("sidecar container");
+        let sidecar = patch_named_container(&patch, "ferrum-edge").expect("sidecar container");
         if let Some(env) = sidecar.pointer("/env").and_then(Value::as_array) {
             assert!(
                 !env.iter().any(|e| {
@@ -2571,11 +2895,7 @@ mod tests {
         config.exclude_outbound_ports = vec![3306, 5432];
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch
-            .iter()
-            .find(|op| op.path == "/spec/initContainers/-")
-            .and_then(|op| op.value.as_ref())
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -2601,11 +2921,7 @@ mod tests {
         let config = test_config(true, CaptureMode::Iptables);
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch
-            .iter()
-            .find(|op| op.path == "/spec/initContainers/-")
-            .and_then(|op| op.value.as_ref())
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -2640,11 +2956,7 @@ mod tests {
         let config = test_config(true, CaptureMode::Iptables);
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch
-            .iter()
-            .find(|op| op.path == "/spec/initContainers/-")
-            .and_then(|op| op.value.as_ref())
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -2678,11 +2990,7 @@ mod tests {
         let config = test_config(true, CaptureMode::Iptables);
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch
-            .iter()
-            .find(|op| op.path == "/spec/initContainers/-")
-            .and_then(|op| op.value.as_ref())
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -2713,11 +3021,7 @@ mod tests {
         let config = test_config(true, CaptureMode::Iptables);
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch
-            .iter()
-            .find(|op| op.path == "/spec/initContainers/-")
-            .and_then(|op| op.value.as_ref())
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -2787,16 +3091,8 @@ mod tests {
         config.init_resources = test_resources("2m", "8Mi", "20m", "32Mi");
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let sidecar = patch
-            .iter()
-            .find(|op| op.path == "/spec/containers/-")
-            .and_then(|op| op.value.as_ref())
-            .expect("sidecar container");
-        let init = patch
-            .iter()
-            .find(|op| op.path == "/spec/initContainers/-")
-            .and_then(|op| op.value.as_ref())
-            .expect("init container");
+        let sidecar = patch_named_container(&patch, "ferrum-edge").expect("sidecar container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
 
         assert_eq!(
             sidecar.pointer("/resources/requests/cpu"),
@@ -3038,7 +3334,7 @@ mod tests {
                 "resource": {"group": "", "version": "v1", "resource": "pods"},
                 "object": {
                     "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
-                    "spec": {"containers": []}
+                    "spec": {"containers": [{"name": "app", "image": "app:1"}]}
                 }
             }
         });
@@ -3066,7 +3362,7 @@ mod tests {
         let operations: Vec<Value> = serde_json::from_slice(&decoded).expect("json patch");
         let sidecar = operations
             .iter()
-            .find(|op| op.get("path").and_then(Value::as_str) == Some("/spec/containers/-"))
+            .find(|op| op.get("path").and_then(Value::as_str) == Some("/spec/initContainers/0"))
             .and_then(|op| op.get("value"))
             .expect("sidecar patch");
         let env = sidecar
@@ -3097,7 +3393,7 @@ mod tests {
                 "resource": {"group": "", "version": "v1", "resource": "pods"},
                 "object": {
                     "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
-                    "spec": {"containers": []}
+                    "spec": {"containers": [{"name": "app", "image": "app:1"}]}
                 }
             }
         });
@@ -3171,7 +3467,7 @@ mod tests {
                 "resource": {"group": "", "version": "v1", "resource": "pods"},
                 "object": {
                     "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
-                    "spec": {"containers": []}
+                    "spec": {"containers": [{"name": "app", "image": "app:1"}]}
                 }
             }
         });
@@ -3278,10 +3574,16 @@ mod tests {
             build_sidecar_patch_for_namespace(&pod, &test_config(true, CaptureMode::Ebpf), None)
                 .expect("patch");
 
-        assert!(patch.iter().any(|op| op.path == "/spec/containers/-"));
+        assert!(patch_has_named_container(&patch, "ferrum-edge"));
         assert!(
-            !patch.iter().any(|op| op.path == "/spec/initContainers/-"),
+            !patch_has_named_container(&patch, "ferrum-edge-init"),
             "ebpf mode should not inject privileged init container"
+        );
+        assert_eq!(
+            patch_named_container(&patch, "ferrum-edge")
+                .and_then(|sidecar| sidecar.get("restartPolicy")),
+            Some(&Value::String("Always".to_string())),
+            "ebpf mode still emits the native sidecar"
         );
     }
 
@@ -3300,8 +3602,13 @@ mod tests {
         )
         .expect("patch");
 
-        assert!(patch.iter().any(|op| op.path == "/spec/containers/-"));
-        assert!(!patch.iter().any(|op| op.path == "/spec/initContainers/-"));
+        assert!(patch_has_named_container(&patch, "ferrum-edge"));
+        assert!(!patch_has_named_container(&patch, "ferrum-edge-init"));
+        assert_eq!(
+            patch_named_container(&patch, "ferrum-edge")
+                .and_then(|sidecar| sidecar.get("restartPolicy")),
+            Some(&Value::String("Always".to_string()))
+        );
     }
 
     #[test]
@@ -3415,11 +3722,7 @@ mod tests {
         config.exclude_inbound_ports = vec![22, 8080];
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch
-            .iter()
-            .find(|op| op.path == "/spec/initContainers/-")
-            .and_then(|op| op.value.as_ref())
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -3451,6 +3754,244 @@ mod tests {
                 "inbound RETURN for port {port} must precede the REDIRECT"
             );
         }
+    }
+
+    #[test]
+    fn patch_excludes_numeric_http_and_tcp_probe_ports() {
+        let pod = json!({
+            "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
+            "spec": {
+                "containers": [
+                    {
+                        "name": "app",
+                        "image": "app:test",
+                        "livenessProbe": {
+                            "httpGet": {"path": "/livez", "port": 8080}
+                        },
+                        "readinessProbe": {
+                            "httpGet": {"path": "/readyz", "port": 8081}
+                        }
+                    },
+                    {
+                        "name": "metrics",
+                        "image": "metrics:test",
+                        "startupProbe": {
+                            "tcpSocket": {"port": 9090}
+                        }
+                    }
+                ],
+                "initContainers": [
+                    {
+                        "name": "migrate",
+                        "image": "migrate:test",
+                        "readinessProbe": {
+                            "httpGet": {"path": "/healthz", "port": "9091"}
+                        }
+                    }
+                ],
+                "ephemeralContainers": [
+                    {
+                        "name": "debug",
+                        "image": "debug:test",
+                        "livenessProbe": {
+                            "tcpSocket": {"port": 9092}
+                        }
+                    }
+                ]
+            }
+        });
+        let config = test_config(true, CaptureMode::Iptables);
+        let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
+        let commands = patch_named_container(&patch, "ferrum-edge-init")
+            .expect("init container")
+            .pointer("/args/0")
+            .and_then(Value::as_str)
+            .expect("iptables plan");
+        for port in [8080, 8081, 9090, 9091, 9092] {
+            assert!(
+                commands.contains(&format!("--dport {port} -j RETURN")),
+                "probe port {port} must be excluded from inbound capture:\n{commands}"
+            );
+        }
+    }
+
+    #[test]
+    fn patch_resolves_named_http_probe_ports_against_container_ports() {
+        let pod = json!({
+            "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "app:test",
+                    "ports": [
+                        {"containerPort": 8080, "name": "http"},
+                        {"containerPort": 9090, "name": "admin"}
+                    ],
+                    "livenessProbe": {
+                        "httpGet": {"path": "/livez", "port": "http"}
+                    },
+                    "readinessProbe": {
+                        "httpGet": {"path": "/readyz", "port": "admin"}
+                    }
+                }]
+            }
+        });
+        let config = test_config(true, CaptureMode::Iptables);
+        let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
+        let commands = patch_named_container(&patch, "ferrum-edge-init")
+            .expect("init container")
+            .pointer("/args/0")
+            .and_then(Value::as_str)
+            .expect("iptables plan");
+        for port in [8080, 9090] {
+            assert!(
+                commands.contains(&format!("--dport {port} -j RETURN")),
+                "named probe port must resolve to {port}:\n{commands}"
+            );
+        }
+    }
+
+    #[test]
+    fn patch_does_not_exclude_exec_or_grpc_probe_ports() {
+        let pod = json!({
+            "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "app:test",
+                    "livenessProbe": {
+                        "exec": {"command": ["true"]}
+                    },
+                    "readinessProbe": {
+                        "grpc": {"port": 50051}
+                    }
+                }]
+            }
+        });
+        let config = test_config(true, CaptureMode::Iptables);
+        let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
+        let commands = patch_named_container(&patch, "ferrum-edge-init")
+            .expect("init container")
+            .pointer("/args/0")
+            .and_then(Value::as_str)
+            .expect("iptables plan");
+        assert!(
+            !commands.contains("--dport 50051 -j RETURN"),
+            "gRPC probes are not HTTP/TCP kubelet ports and must not be excluded:\n{commands}"
+        );
+    }
+
+    #[test]
+    fn patch_unions_probe_ports_with_explicit_inbound_exclusions() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {
+                    "traffic.sidecar.istio.io/excludeInboundPorts": "22, 8080"
+                }
+            },
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "app:test",
+                    "livenessProbe": {
+                        "httpGet": {"path": "/livez", "port": 8080}
+                    },
+                    "readinessProbe": {
+                        "httpGet": {"path": "/readyz", "port": 9090}
+                    }
+                }]
+            }
+        });
+        let mut config = test_config(true, CaptureMode::Iptables);
+        config.exclude_inbound_ports = vec![22, 15090];
+        let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
+        let commands = patch_named_container(&patch, "ferrum-edge-init")
+            .expect("init container")
+            .pointer("/args/0")
+            .and_then(Value::as_str)
+            .expect("iptables plan");
+        for port in [22, 8080, 9090, 15090] {
+            assert!(
+                commands.contains(&format!("--dport {port} -j RETURN")),
+                "explicit and probe exclusions must both remain for {port}:\n{commands}"
+            );
+        }
+    }
+
+    #[test]
+    fn patch_rejects_unresolved_named_probe_port() {
+        let pod = json!({
+            "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "app:test",
+                    "ports": [{"containerPort": 8080, "name": "http"}],
+                    "livenessProbe": {
+                        "httpGet": {"path": "/livez", "port": "metrics"}
+                    }
+                }]
+            }
+        });
+        let err = build_sidecar_patch_for_namespace(
+            &pod,
+            &test_config(true, CaptureMode::Iptables),
+            None,
+        )
+        .expect_err("unresolved named probe port must fail closed");
+        assert!(
+            err.contains("names port 'metrics'"),
+            "error must name the unresolved probe port: {err}"
+        );
+        assert!(
+            err.contains("refusing injection"),
+            "unresolved names must fail admission, not capture the probe: {err}"
+        );
+    }
+
+    #[test]
+    fn patch_inserts_native_sidecar_before_existing_user_init_containers() {
+        let pod = json!({
+            "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
+            "spec": {
+                "containers": [{"name": "app", "image": "app:test"}],
+                "initContainers": [{"name": "migrate", "image": "migrate:test"}]
+            }
+        });
+        let patch = build_sidecar_patch_for_namespace(
+            &pod,
+            &test_config(true, CaptureMode::Iptables),
+            None,
+        )
+        .expect("patch");
+        assert_eq!(
+            patch
+                .iter()
+                .find(|op| {
+                    op.value
+                        .as_ref()
+                        .and_then(|value| value.get("name"))
+                        .and_then(Value::as_str)
+                        == Some("ferrum-edge")
+                })
+                .map(|op| op.path.as_str()),
+            Some("/spec/initContainers/0")
+        );
+        assert_eq!(
+            patch
+                .iter()
+                .find(|op| {
+                    op.value
+                        .as_ref()
+                        .and_then(|value| value.get("name"))
+                        .and_then(Value::as_str)
+                        == Some("ferrum-edge-init")
+                })
+                .map(|op| op.path.as_str()),
+            Some("/spec/initContainers/1")
+        );
+        assert!(!patch.iter().any(|op| op.path == "/spec/initContainers"));
     }
 
     #[test]
@@ -3491,11 +4032,7 @@ mod tests {
         config.exclude_outbound_cidrs = vec!["10.0.0.0/8".to_string()];
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch
-            .iter()
-            .find(|op| op.path == "/spec/initContainers/-")
-            .and_then(|op| op.value.as_ref())
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -3525,11 +4062,7 @@ mod tests {
         config.include_outbound_cidrs = vec!["172.16.0.0/12".to_string()];
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch
-            .iter()
-            .find(|op| op.path == "/spec/initContainers/-")
-            .and_then(|op| op.value.as_ref())
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -3555,11 +4088,7 @@ mod tests {
         config.include_outbound_cidrs = vec!["10.0.0.0/8".to_string()];
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch
-            .iter()
-            .find(|op| op.path == "/spec/initContainers/-")
-            .and_then(|op| op.value.as_ref())
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -3973,11 +4502,7 @@ mod tests {
         let config = test_config(true, CaptureMode::Iptables);
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch
-            .iter()
-            .find(|op| op.path == "/spec/initContainers/-")
-            .and_then(|op| op.value.as_ref())
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -4015,11 +4540,7 @@ mod tests {
         config.ip6tables_mode = Ip6TablesMode::Required;
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch
-            .iter()
-            .find(|op| op.path == "/spec/initContainers/-")
-            .and_then(|op| op.value.as_ref())
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)
@@ -4048,11 +4569,7 @@ mod tests {
         config.ip6tables_mode = Ip6TablesMode::Disabled;
 
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let init = patch
-            .iter()
-            .find(|op| op.path == "/spec/initContainers/-")
-            .and_then(|op| op.value.as_ref())
-            .expect("init container");
+        let init = patch_named_container(&patch, "ferrum-edge-init").expect("init container");
         let commands = init
             .pointer("/args/0")
             .and_then(Value::as_str)

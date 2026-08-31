@@ -6,6 +6,14 @@ This document describes how to safely upgrade Ferrum Edge between versions with 
 
 Every current `[Unreleased]` `BREAKING` changelog entry is listed here exactly once, with its issue number and the operator action that entry already states. Several of these fail **silently** at cutover (HMAC clients get `401`, WAF `literal` rules stop matching folded spellings, backends stop seeing client-supplied XFF hops) rather than refusing config load. Read this section before the per-mode procedures below.
 
+### Injected Ferrum is a Kubernetes native sidecar (issue [#4430](https://github.com/ferrum-edge/ferrum-edge/issues/4430))
+
+The injector no longer appends Ferrum as an ordinary `spec.containers` entry. New pods receive a native sidecar (`spec.initContainers` with `restartPolicy: Always`) and exec probes against loopback `/health`. That is also what unblocks Kubernetes Job completion. **Minimum Kubernetes version is 1.29** (native sidecars enabled by default; 1.28 needs `SidecarContainers=true`). There is no ordinary-container fallback: the webhook always emits the native-sidecar shape, and a cluster older than that will reject the patched Pod.
+
+HTTP `httpGet` and TCP `tcpSocket` kubelet probe ports are now inbound-excluded automatically (issue [#4431](https://github.com/ferrum-edge/ferrum-edge/issues/4431)); unresolved named probe ports fail admission.
+
+**Operator action:** run the injector only on Kubernetes 1.29+ (or 1.28 with the `SidecarContainers` feature gate), then roll every injected Deployment/StatefulSet/DaemonSet/Job so replacement pods receive the new shape. Pods that still carry `ferrum-edge` in `spec.containers` will be refused on re-admission until they are recreated.
+
 ### `ferrum-gateway` `mode=cp` no longer starts the in-cluster K8s controller (issue [#4384](https://github.com/ferrum-edge/ferrum-edge/issues/4384))
 
 The `ferrum-edge` binary defaults `FERRUM_K8S_CONTROLLER_ENABLED` and
