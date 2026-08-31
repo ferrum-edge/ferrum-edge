@@ -74,6 +74,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail-closed pair `forward_sensitive_query=true` plus an exact decoded-name
   `forward_sensitive_query_allowlist`. Mirror logs still omit the entire query.
 
+- **BREAKING — configured `jwks_auth` audiences and issuer require the claim to
+  be present** (issue #4264). The shared JWT verifier used by `jwks_auth`, OIDC,
+  and mesh `RequestAuthentication` translation now adds `iss` and `aud` to
+  `required_spec_claims` whenever those restrictions are configured.
+  `jsonwebtoken` previously rejected only a *mismatching* claim, so a
+  correctly signed token with no `aud` (or no `iss`) authenticated against
+  every provider fronting the same IdP regardless of the configured audience.
+  Mesh rules with `audiences` now refuse aud-less tokens before staging
+  `mesh.request_principal` or `request.auth.audiences`. `jwks_auth` and
+  CP/DP gRPC also enable `validate_nbf`; a present future `nbf` is rejected
+  under each surface's leeway. Unconfigured audiences are unchanged: tokens
+  without `aud` still pass; a token that carries `aud` is still rejected when
+  no acceptable audience is configured. **Operator action**: ensure every
+  client mints an `aud` (and `iss` when the provider pins one) that matches
+  the configured restriction, or remove the restriction if aud-less tokens are
+  intentional.
+
+- **BREAKING — credentialed CORS refuses effectively universal prefix/regex
+  matchers at config load** (issue #4269). The wildcard-plus-credentials
+  interlock previously inspected only the `AllowedOrigins::Wildcard` variant,
+  so Istio-style matchers such as `{"prefix": "https://"}`, `{"regex": ".*"}`,
+  or `{"prefix": "h"}` with `allow_credentials: true` reflected any matching
+  origin with `Access-Control-Allow-Credentials: true`. Breadth is now
+  classified once at construction and the same predicate drives the credentials
+  interlock, `uses_strict_origin_policy()`, and Istio/mesh admission; universal
+  prefix/regex plus credentials is refused rather than silently weakened. In
+  file mode this is refuse-to-start. Exact `*` still drops credentials per the
+  documented contract. **Operator action**: narrow `allowed_origins` to a
+  host-constraining prefix or regex, or set `allow_credentials: false` if a
+  universal matcher is required.
+
+- **BREAKING — CRL validity windows and full-chain revocation are enforced**
+  (issues #4297 / #4298). Every CRL-enabled verifier now routes through a
+  shared policy module. Admission refuses CRLs whose `thisUpdate` is in the
+  future, whose `nextUpdate` is absent, or whose `nextUpdate` has passed; there
+  is no `allow_expired` escape. Handshake verification enables rustls's default
+  full-chain revocation depth (leaf-only checking removed) and
+  `enforce_revocation_expiration()`, so a revoked intermediate stops
+  authenticating the certificates it issued and an expired CRL stops authorizing
+  new handshakes. `allow_unknown_revocation_status()` is retained: a chain with
+  no applicable configured CRL is still accepted. **Operator action**: publish
+  fresh CRLs with a valid `nextUpdate` before expiry, and expect clients signed
+  by a revoked intermediate to be rejected even when the leaf is not listed.
+
+- **BREAKING — `trusted_hbone_assertors` entries carry an `AssertionGrant`**
+  (issue #4274). Bare service-account matchers (`"ztunnel"`, `"waypoint"`) now
+  default to `SameNamespace`, so an Istio ambient `ztunnel` in `istio-system`
+  can no longer assert application-namespace identities. Object forms support
+  an exact `asserts` inventory or explicit `scope: same_namespace` /
+  `scope: mesh_wide` (the latter requires an exact SPIFFE assertor pin and logs
+  a construction warning). `mesh_authz` and `workload_metrics` share the same
+  compiled relation; there is no global compatibility switch restoring
+  namespace-blind behavior. **Operator action**: pin the exact assertor SPIFFE
+  ID and either the exact fronted identities or `scope: mesh_wide` when a
+  ztunnel/waypoint must assert cross-namespace workloads.
+
 ### Fixed
 
 - **Injector inbound capture excludes kubelet HTTP and TCP probe ports**
