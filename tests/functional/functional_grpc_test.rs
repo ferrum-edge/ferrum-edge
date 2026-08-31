@@ -487,7 +487,7 @@ async fn send_grpc_request(
 
     let mut req_builder = Request::builder()
         .method("POST")
-        .uri(path)
+        .uri(format!("http://{addr}{path}"))
         .header("content-type", "application/grpc")
         .header("te", "trailers");
 
@@ -581,7 +581,7 @@ async fn open_grpc_stream(
 
     let req = Request::builder()
         .method("POST")
-        .uri(path)
+        .uri(format!("http://{addr}{path}"))
         .header("content-type", "application/grpc")
         .header("te", "trailers")
         .body(Full::new(Bytes::from(body.to_vec())))?;
@@ -634,7 +634,7 @@ async fn probe_gateway_h2c(
 
     let req = Request::builder()
         .method("GET")
-        .uri("/__ferrum_startup_probe")
+        .uri(format!("http://{addr}/__ferrum_startup_probe"))
         .body(Full::new(Bytes::new()))?;
     let response = tokio::time::timeout(Duration::from_secs(1), sender.send_request(req)).await??;
     let _ = tokio::time::timeout(Duration::from_secs(1), response.into_body().collect()).await??;

@@ -203,7 +203,7 @@ async fn send_h2_request(
 
     let req = Request::builder()
         .method("POST")
-        .uri(path)
+        .uri(format!("http://{addr}{path}"))
         .header("content-type", content_type)
         .header("te", "trailers")
         .body(Full::new(Bytes::from(body.to_vec())))?;

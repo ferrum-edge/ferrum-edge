@@ -832,7 +832,7 @@ async fn send_grpc_request_unbounded(
 
     let mut req_builder = Request::builder()
         .method("POST")
-        .uri(path)
+        .uri(format!("http://{addr}{path}"))
         .header("content-type", "application/grpc")
         .header("te", "trailers");
     for (key, value) in extra_headers {

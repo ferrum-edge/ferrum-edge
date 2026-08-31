@@ -405,7 +405,7 @@ async fn h2c_request_inside_deadline_is_served() {
 
     let req = Request::builder()
         .method("GET")
-        .uri("/slow")
+        .uri(format!("http://{}/slow", harness.addr))
         .body(Full::new(Bytes::new()))
         .expect("build request");
     let resp = sender.send_request(req).await.expect("send request");
@@ -439,7 +439,7 @@ async fn h2c_idle_keepalive_after_first_request_is_not_closed() {
 
     let first = Request::builder()
         .method("GET")
-        .uri("/slow")
+        .uri(format!("http://{}/slow", harness.addr))
         .body(Full::new(Bytes::new()))
         .expect("build first request");
     let resp = sender.send_request(first).await.expect("first request");
@@ -451,7 +451,7 @@ async fn h2c_idle_keepalive_after_first_request_is_not_closed() {
 
     let second = Request::builder()
         .method("GET")
-        .uri("/slow")
+        .uri(format!("http://{}/slow", harness.addr))
         .body(Full::new(Bytes::new()))
         .expect("build second request");
     let resp = tokio::time::timeout(WINDOW, sender.send_request(second))

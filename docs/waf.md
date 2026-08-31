@@ -14,10 +14,9 @@ concerns are handled by dedicated layers and the WAF does not duplicate them:
 
 | Concern | Handled by |
 | --- | --- |
-| Request smuggling (CL/TE conflicts, duplicate Content-Length) | core proxy `check_protocol_headers()` + hyper strict parsing |
 | Missing or empty HTTP/1.1 `Host` (RFC 9112 §3.2.2) | core proxy `check_protocol_headers()` (HTTP/1.0 and absolute-form URI authority are not rejected; HTTP/2/3 `:authority` is `check_host_authority_consistency()`) |
-
 | Request smuggling (CL/TE conflicts, duplicate Content-Length) | bounded proxy-frontend HTTP/1 wire framing guard + core proxy `check_protocol_headers()` + Hyper parsing |
+| Missing both HTTP/2 and HTTP/3 `:authority` and `Host` (RFC 9113 §8.3.1 / RFC 9114 §4.3.1) | core proxy `check_host_authority_consistency()` (`:authority`-only and Host-only remain valid; Extended CONNECT is `:authority`-only) |
 | Header/URI/body size limits | `FERRUM_MAX_*` env vars, `request_size_limiting` |
 | Authentication / authorization | auth plugins, `access_control`, `mesh_authz`, `opa` |
 | Rate limiting / flooding | `rate_limiting`, `*_rate_limiting` |

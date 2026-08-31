@@ -45658,10 +45658,17 @@ pub fn normalize_request_authority_for_signing(
 
 /// Validate HTTP/2 and HTTP/3 `Host`/`:authority` consistency before routing.
 ///
-/// RFC 9113 states that `Host` and `:authority` are not permitted to disagree;
-/// RFC 9114 says that if both are present, they must contain the same value.
-/// Rejecting disagreement here prevents routing/plugin decisions from keying on
-/// one authority while a backend sees another during H2/H3-to-H1 translation.
+/// RFC 9113 §8.3.1 and RFC 9114 §4.3.1 require a request to include either
+/// `:authority` or `Host`. Both absent is malformed: routing would skip
+/// exact/wildcard host tiers and fall through to a catch-all (empty `hosts`)
+/// route. RFC 9113 also states that `Host` and `:authority` are not permitted
+/// to disagree; RFC 9114 says that if both are present, they must contain the
+/// same value. Rejecting disagreement here prevents routing/plugin decisions
+/// from keying on one authority while a backend sees another during H2/H3-to-H1
+/// translation.
+///
+/// `:authority`-only is the usual H2/H3 client shape, including RFC 8441 /
+/// RFC 9220 Extended CONNECT (`:protocol=websocket`), and is accepted.
 pub fn check_host_authority_consistency(
     headers: &hyper::HeaderMap,
     uri: &hyper::Uri,
@@ -45677,7 +45684,16 @@ pub fn check_host_authority_consistency(
         return Some(r#"{"error":"Request contains multiple Host headers"}"#);
     }
 
-    let host = host?;
+    let Some(host) = host else {
+        // RFC 9113 §8.3.1 / RFC 9114 §4.3.1: a request with neither
+        // `:authority` nor Host is malformed. One extra `uri.authority()`
+        // probe, no allocation; the common `:authority`-only path (no Host)
+        // returns None immediately.
+        if uri.authority().is_none() {
+            return Some(r#"{"error":"Request is missing both :authority and Host"}"#);
+        }
+        return None;
+    };
     let Ok(host) = host.to_str() else {
         return Some(r#"{"error":"Host header contains invalid characters"}"#);
     };

@@ -608,6 +608,12 @@ async fn start_test_gateway(state: ProxyState) -> (SocketAddr, tokio::task::Join
 }
 
 /// Send a gRPC-like request through the gateway using hyper's HTTP/2 client.
+///
+/// The request target is absolute-form (`http://{gateway_addr}{path}`) so hyper
+/// emits `:authority`. Since issue #4416 an HTTP/2 request carrying neither
+/// `:authority` nor Host is rejected with 400 before routing, and the HMAC
+/// signed-request regression binds that exact authority, so an origin-form
+/// target here would fail every caller rather than exercise the gateway.
 async fn send_grpc_request(
     gateway_addr: SocketAddr,
     path: &str,
@@ -629,7 +635,7 @@ async fn send_grpc_request(
 
     let mut req_builder = Request::builder()
         .method("POST")
-        .uri(path)
+        .uri(format!("http://{gateway_addr}{path}"))
         .header("content-type", "application/grpc")
         .header("te", "trailers");
 
@@ -657,56 +663,6 @@ async fn send_grpc_request(
         .unwrap_or_default();
 
     Ok((status, headers, body_bytes))
-}
-
-/// Send a native gRPC request with an explicit HTTP/2 authority. HMAC binds
-/// that authority, so a relative URI (used by most transport-only tests) is
-/// intentionally insufficient for the signed-request regression.
-async fn send_grpc_request_with_authority(
-    gateway_addr: SocketAddr,
-    path: &str,
-    body: &[u8],
-    extra_headers: &[(&str, &str)],
-) -> Result<(u16, HashMap<String, String>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
-    use hyper::client::conn::http2;
-
-    let stream = tokio::net::TcpStream::connect(gateway_addr).await?;
-    let _ = stream.set_nodelay(true);
-    let io = TokioIo::new(stream);
-
-    let (mut sender, conn) = http2::handshake(TokioExecutor::new(), io).await?;
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            eprintln!("Client connection error: {}", e);
-        }
-    });
-
-    let mut req_builder = Request::builder()
-        .method("POST")
-        .uri(format!("http://{gateway_addr}{path}"))
-        .header("content-type", "application/grpc")
-        .header("te", "trailers");
-
-    for (key, value) in extra_headers {
-        req_builder = req_builder.header(*key, *value);
-    }
-
-    let response = sender
-        .send_request(req_builder.body(Full::new(Bytes::copy_from_slice(body)))?)
-        .await?;
-    let status = response.status().as_u16();
-    let headers = response
-        .headers()
-        .iter()
-        .filter_map(|(key, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (key.as_str().to_string(), value.to_string()))
-        })
-        .collect();
-    let body = response.into_body().collect().await?.to_bytes().to_vec();
-    Ok((status, headers, body))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2074,7 +2030,7 @@ async fn hmac_auth_reuses_prebuffered_native_grpc_body_for_primary_dispatch() {
         "hmac username=\"grpc-hmac-user\", algorithm=\"hmac-sha256\", signature=\"{signature}\""
     );
 
-    let (status, headers, body) = send_grpc_request_with_authority(
+    let (status, headers, body) = send_grpc_request(
         gateway_addr,
         path,
         grpc_message,
@@ -2146,7 +2102,7 @@ async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambigu
         "hmac username=\"grpc-hmac-cd-user\", algorithm=\"hmac-sha256\", signature=\"{signature}\""
     );
 
-    let (status, headers, body) = send_grpc_request_with_authority(
+    let (status, headers, body) = send_grpc_request(
         gateway_addr,
         path,
         grpc_message,
@@ -2178,7 +2134,7 @@ async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambigu
     let empty_authorization = format!(
         "hmac username=\"grpc-hmac-cd-user\", algorithm=\"hmac-sha256\", signature=\"{empty_signature}\""
     );
-    let (empty_status, empty_headers, empty_response) = send_grpc_request_with_authority(
+    let (empty_status, empty_headers, empty_response) = send_grpc_request(
         gateway_addr,
         path,
         empty_body,
@@ -2211,7 +2167,7 @@ async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambigu
     let ambiguous_authorization = format!(
         "hmac username=\"grpc-hmac-cd-user\", algorithm=\"hmac-sha256\", signature=\"{ambiguous_signature}\""
     );
-    let (ambiguous_status, ambiguous_headers, _) = send_grpc_request_with_authority(
+    let (ambiguous_status, ambiguous_headers, _) = send_grpc_request(
         gateway_addr,
         path,
         grpc_message,
@@ -2356,7 +2312,9 @@ async fn request_mirror_prebuffer_handles_client_stream_and_cancellation_without
     let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(2);
     let request = Request::builder()
         .method(Method::POST)
-        .uri("/grpc-mirror-stream/my.Service/ClientStream")
+        .uri(format!(
+            "http://{gateway_addr}/grpc-mirror-stream/my.Service/ClientStream"
+        ))
         .header("content-type", "application/grpc")
         .header("te", "trailers")
         .body(StreamBody::new(ReceiverStream::new(body_rx)))
@@ -2395,7 +2353,9 @@ async fn request_mirror_prebuffer_handles_client_stream_and_cancellation_without
     let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(1);
     let request = Request::builder()
         .method(Method::POST)
-        .uri("/grpc-mirror-stream/my.Service/ClientStream")
+        .uri(format!(
+            "http://{gateway_addr}/grpc-mirror-stream/my.Service/ClientStream"
+        ))
         .header("content-type", "application/grpc")
         .header("te", "trailers")
         .body(StreamBody::new(ReceiverStream::new(body_rx)))
@@ -2673,7 +2633,7 @@ async fn grpc_buffered_non_empty_response_sends_status_as_trailer() {
 
     let req = Request::builder()
         .method("POST")
-        .uri("/grpc/my.Service/Unary")
+        .uri(format!("http://{gateway_addr}/grpc/my.Service/Unary"))
         .header("content-type", "application/grpc")
         .header("te", "trailers")
         .body(Full::new(Bytes::new()))
@@ -2984,7 +2944,7 @@ async fn grpc_buffered_trailer_writeback_honors_hook_removal_and_duplicate_keys(
 
     let req = Request::builder()
         .method("POST")
-        .uri("/grpc/my.Service/Unary")
+        .uri(format!("http://{gateway_addr}/grpc/my.Service/Unary"))
         .header("content-type", "application/grpc")
         .header("te", "trailers")
         .body(Full::new(Bytes::new()))
@@ -3120,7 +3080,7 @@ async fn grpc_buffered_security_removal_wins_over_cookie_rehome_and_trailer_repl
     });
     let request = Request::builder()
         .method("POST")
-        .uri("/grpc/my.Service/Unary")
+        .uri(format!("http://{gateway_addr}/grpc/my.Service/Unary"))
         .header("content-type", "application/grpc")
         .header("te", "trailers")
         .body(Full::new(Bytes::new()))
@@ -3197,7 +3157,7 @@ async fn grpc_buffered_security_policy_stays_initial_without_relocating_trailers
     });
     let request = Request::builder()
         .method("POST")
-        .uri("/grpc/my.Service/Unary")
+        .uri(format!("http://{gateway_addr}/grpc/my.Service/Unary"))
         .header("content-type", "application/grpc")
         .header("te", "trailers")
         .body(Full::new(Bytes::new()))
@@ -3386,7 +3346,7 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
         // (flag 0x00 + 4-byte zero length) so framing is valid end-to-end.
         let req = Request::builder()
             .method("POST")
-            .uri("/grpc/my.Service/Unary")
+            .uri(format!("http://{gateway_addr}/grpc/my.Service/Unary"))
             .header("content-type", "application/grpc-web+proto")
             .body(Full::new(Bytes::from_static(&[0u8, 0, 0, 0, 0])))
             .unwrap();
@@ -4016,7 +3976,7 @@ async fn grpc_web_text_keeps_security_policy_in_initial_headers() {
         });
         let request = Request::builder()
             .method("POST")
-            .uri("/grpc/my.Service/Unary")
+            .uri(format!("http://{gateway_addr}/grpc/my.Service/Unary"))
             .header("content-type", "application/grpc-web-text+proto")
             .body(Full::new(Bytes::copy_from_slice(request_body.as_bytes())))
             .unwrap();
@@ -4137,7 +4097,7 @@ async fn grpc_web_gateway_backend_error_is_grpc_web_shaped() {
 
     let req = Request::builder()
         .method("POST")
-        .uri("/grpc/my.Service/Unary")
+        .uri(format!("http://{gateway_addr}/grpc/my.Service/Unary"))
         .header("content-type", "application/grpc-web+proto")
         .body(Full::new(Bytes::from_static(&[0u8, 0, 0, 0, 0])))
         .unwrap();
@@ -4235,7 +4195,7 @@ async fn grpc_web_deadline_preflight_reject_is_grpc_web_shaped() {
 
     let request = Request::builder()
         .method("POST")
-        .uri("/grpc/my.Service/Unary")
+        .uri(format!("http://{gateway_addr}/grpc/my.Service/Unary"))
         .header("content-type", "application/grpc-web+proto")
         .body(Full::new(Bytes::from_static(&[0, 0, 0, 0, 0])))
         .unwrap();
@@ -4306,7 +4266,9 @@ async fn buffered_grpc_upload_deadline_preserves_gateway_deadline_contract() {
     let request_body = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(body_rx));
     let request = Request::builder()
         .method("POST")
-        .uri("/grpc/my.Service/ClientStreaming")
+        .uri(format!(
+            "http://{gateway_addr}/grpc/my.Service/ClientStreaming"
+        ))
         .header("content-type", "application/grpc")
         .header("te", "trailers")
         .header("grpc-timeout", "50m")
@@ -4396,7 +4358,7 @@ async fn grpc_web_backend_path_policy_reject_is_grpc_web_shaped() {
 
     let request = Request::builder()
         .method("POST")
-        .uri("/grpc/my.Service/Unary")
+        .uri(format!("http://{gateway_addr}/grpc/my.Service/Unary"))
         .header("content-type", "application/grpc-web+proto")
         .body(Full::new(Bytes::from_static(&[0u8, 0, 0, 0, 0])))
         .unwrap();
@@ -4581,7 +4543,9 @@ async fn grpc_retry_enabled_does_not_stall_trailers_behind_streaming_body() {
 
     let req = Request::builder()
         .method("POST")
-        .uri("/grpc/my.Service/StreamingEcho")
+        .uri(format!(
+            "http://{gateway_addr}/grpc/my.Service/StreamingEcho"
+        ))
         .header("content-type", "application/grpc")
         .header("te", "trailers")
         .body(Full::new(Bytes::from_static(b"")))
@@ -4890,7 +4854,9 @@ async fn grpc_streaming_late_upload_overflow_during_response_records_neutral() {
     let req_body = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(body_rx));
     let req = Request::builder()
         .method("POST")
-        .uri("/grpc/my.Service/BidiOverflow")
+        .uri(format!(
+            "http://{gateway_addr}/grpc/my.Service/BidiOverflow"
+        ))
         .header("content-type", "application/grpc")
         .header("te", "trailers")
         .body(req_body)
@@ -5109,7 +5075,7 @@ async fn grpc_streaming_closed_state_backend_failure_trips_breaker_at_header_tim
     let req_body = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(body_rx));
     let req = Request::builder()
         .method("POST")
-        .uri("/grpc/my.Service/SlowUpload")
+        .uri(format!("http://{gateway_addr}/grpc/my.Service/SlowUpload"))
         .header("content-type", "application/grpc")
         .header("te", "trailers")
         .body(req_body)

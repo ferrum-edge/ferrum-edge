@@ -10,6 +10,11 @@
 //! - Non-numeric `Content-Length` (negative, decimal, hex, alpha)
 //! - Multiple `Host` headers (HTTP/1.1)
 //! - HTTP/1.1 missing `Host` (RFC 9112 §3.2.2) — catch-all and host-scoped routes
+//! - HTTP/2 missing both `:authority` and `Host` (RFC 9113 §8.3.1) — catch-all and host-scoped
+//! - HTTP/3 missing both `:authority` and `Host` (RFC 9114 §4.3.1) — raw QPACK in
+//!   `functional_h3_authority_validation_test.rs`; `:authority`-only still served here
+//! - HTTP/2 `:authority`-only (no Host) is still served
+//! - HTTP/2 Extended CONNECT (`:protocol=websocket`) with `:authority` still proceeds
 //! - HTTP/1.0 missing `Host` is still served
 //! - HTTP/1.1 absolute-form request-target without a Host field is still served
 //! - `Host` trailing-dot normalization
@@ -1091,6 +1096,163 @@ async fn functional_protocol_validation_http11_empty_host_rejected() {
     assert_eq!(resp.status_code, 400, "body={}", resp.body);
 
     h.cleanup();
+}
+
+// --- 5c. HTTP/2 missing `:authority` and Host (RFC 9113 §8.3.1) ------------
+//
+// hyper's H2 encoder omits `:authority` when the request URI is origin-form
+// (`/path`) and no Host header is set. That is the wire shape that used to
+// skip host routing tiers and fall through to a catch-all. HeaderMap unit
+// tests cannot reproduce it.
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http2_missing_authority_and_host_catchall_rejected() {
+    let h = Harness::new(false).await;
+
+    let (status, body) = send_h2_get(h.proxy_port, "/catchall", &[]).await;
+
+    assert_eq!(status, 400, "body={body}");
+    assert!(
+        body.contains("missing both :authority and Host"),
+        "unexpected body: {body}"
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http2_missing_authority_and_host_host_scoped_rejected() {
+    let h = Harness::new(true).await;
+
+    let (status, body) = send_h2_get(h.proxy_port, "/", &[]).await;
+
+    assert_eq!(status, 400, "body={body}");
+    assert!(
+        body.contains("missing both :authority and Host"),
+        "unexpected body: {body}"
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http2_authority_only_still_routes() {
+    let h = Harness::new(true).await;
+
+    let (status, body) = send_h2_get(h.proxy_port, "http://example.com/", &[]).await;
+
+    assert_eq!(
+        status, 200,
+        "`:authority`-only H2 request must still route; body={body}"
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http2_extended_connect_websocket_authority_only() {
+    // RFC 8441 Extended CONNECT carries `:authority` (absolute-form URI) and
+    // typically omits Host. The both-absent reject must not fire; this
+    // catch-all HTTP echo is not a WebSocket backend, so we only assert we
+    // got past the authority check. Full echo coverage lives in
+    // `test_h2_websocket_extended_connect_echo`.
+    let h = Harness::new(false).await;
+
+    let mut req = Request::builder()
+        .method("CONNECT")
+        .version(hyper::Version::HTTP_2)
+        .uri("http://example.com/")
+        .header("sec-websocket-version", "13")
+        .body(Full::new(Bytes::new()))
+        .expect("build H2 Extended CONNECT");
+    req.extensions_mut()
+        .insert(hyper::ext::Protocol::from_static("websocket"));
+    let (status, body_str, _headers) =
+        send_h2_prior_knowledge_with_headers(h.proxy_port, req, "CONNECT websocket").await;
+
+    assert!(
+        !body_str.contains("missing both :authority and Host"),
+        "Extended CONNECT with :authority must not trip the both-absent reject; status={status} body={body_str}"
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http3_authority_only_still_routes() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let (mut gateway, https_port) = start_h3_validation_gateway(echo_port, &[]).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{https_port}/");
+    // HostHeader::Auto (default): only `:authority`, no explicit Host.
+    let resp = h3_get_with_startup_retry(&client, &url, GetOptions::default()).await;
+
+    assert_eq!(
+        resp.status.as_u16(),
+        200,
+        "`:authority`-only H3 request must still route; body={}",
+        resp.body_text()
+    );
+
+    gateway.shutdown();
+    echo_task.abort();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http3_extended_connect_websocket_authority_only() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let (mut gateway, https_port) = start_h3_validation_gateway(echo_port, &[]).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{https_port}/");
+    let mut last_err = None;
+    let resp = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(40);
+        loop {
+            match client
+                .extended_connect(&url, h3::ext::Protocol::WEB_SOCKET)
+                .await
+            {
+                Ok(resp) => break resp,
+                Err(err) if std::time::Instant::now() < deadline => {
+                    last_err = Some(err.to_string());
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => {
+                    panic!(
+                        "H3 Extended CONNECT websocket request did not complete; last startup error={last_err:?}; final error={err}"
+                    );
+                }
+            }
+        }
+    };
+
+    assert!(
+        !resp
+            .body_text()
+            .contains("missing both :authority and Host"),
+        "H3 Extended CONNECT with :authority must not trip the both-absent reject; status={} body={}",
+        resp.status.as_u16(),
+        resp.body_text()
+    );
+
+    gateway.shutdown();
+    echo_task.abort();
 }
 
 // --- 6. Host trailing dot normalizes ---------------------------------------

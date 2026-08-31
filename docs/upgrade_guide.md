@@ -27,6 +27,12 @@ controller, migrate to `charts/ferrum-mesh` (`controlPlane.enabled=true`).
 Database-backed CP + DP pairs need no change, and the documented
 `examples/cp-values.yaml` quickstart now matches the chart's grant surface.
 
+### HTTP/2 and HTTP/3 requests without `:authority` or Host are rejected with 400 (issue [#4416](https://github.com/ferrum-edge/ferrum-edge/issues/4416))
+
+RFC 9113 §8.3.1 and RFC 9114 §4.3.1 require either `:authority` or Host. Ferrum previously treated the both-absent case as agreement and admitted the request, so routing skipped exact/wildcard host tiers and could fall through to a catch-all (empty `hosts`) route. `check_host_authority_consistency()` now rejects that shape with 400. `:authority`-only (typical H2/H3 clients, including RFC 8441 / RFC 9220 Extended CONNECT) and Host-only remain valid. HTTP/1.1 is unchanged and still owned by `check_protocol_headers()` (issue #4390).
+
+**Operator action:** any HTTP/2 or HTTP/3 client that omitted both `:authority` and Host will start seeing `400` `{"error":"Request is missing both :authority and Host"}` instead of being routed. Send `:authority` or Host.
+
 ### `backend_write_timeout_ms` now also bounds the post-upload response-header wait (issue [#4411](https://github.com/ferrum-edge/ferrum-edge/issues/4411))
 
 `backend_write_timeout_ms` is documented to return `504` /

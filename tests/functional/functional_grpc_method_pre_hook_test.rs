@@ -258,7 +258,7 @@ async fn send_h2_grpc(
     });
     let request = Request::builder()
         .method(Method::POST)
-        .uri(path)
+        .uri(format!("http://{addr}{path}"))
         .header("content-type", "application/grpc")
         .header("te", "trailers")
         .body(Full::new(Bytes::new()))?;

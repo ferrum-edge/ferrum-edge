@@ -123,7 +123,7 @@ async fn send_h2_grpc_two_messages(
     body.extend_from_slice(&grpc_frame(b"two"));
     let req = Request::builder()
         .method("POST")
-        .uri(path)
+        .uri(format!("http://{addr}{path}"))
         .header("content-type", "application/grpc")
         .header("te", "trailers")
         .body(Full::new(Bytes::from(body)))?;
@@ -259,7 +259,7 @@ async fn send_h2_grpc_web(
     });
     let req = Request::builder()
         .method("POST")
-        .uri(path)
+        .uri(format!("http://{addr}{path}"))
         .header("content-type", content_type)
         .body(Full::new(Bytes::from(body)))?;
     let response = sender.send_request(req).await?;

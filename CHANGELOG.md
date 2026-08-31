@@ -39,6 +39,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **BREAKING — HTTP/2 and HTTP/3 requests without `:authority` or Host are rejected with 400**
+  (issue #4416). RFC 9113 §8.3.1 and RFC 9114 §4.3.1 require a request to
+  include either `:authority` or a Host field. Ferrum previously treated the
+  both-absent case as a vacuous Host/`:authority` agreement and admitted the
+  request, so routing skipped exact/wildcard host tiers and fell through to a
+  catch-all (empty `hosts`) route — the HTTP/2 and HTTP/3 counterpart of the
+  HTTP/1.1 bypass closed in issue #4390. `check_host_authority_consistency()`
+  now returns 400 when both are absent. `:authority`-only (the usual H2/H3
+  client shape, including RFC 8441 / RFC 9220 Extended CONNECT) and Host-only
+  remain valid. HTTP/1.1 is unchanged and still owned by
+  `check_protocol_headers()`. **Operator action**: any HTTP/2 or HTTP/3 client
+  that omitted both `:authority` and Host (non-conformant scanners, some raw
+  frames) will start seeing `400`
+  `{"error":"Request is missing both :authority and Host"}` instead of being
+  routed. Send `:authority` or Host.
+
 - **`request_mirror` denies cross-origin query credentials by default**
   (issue #4295). Sensitive query pairs (`access_token`, `api_key`,
   delimiter-bounded `token`/`sig`/`signature` including `oauth_token` and

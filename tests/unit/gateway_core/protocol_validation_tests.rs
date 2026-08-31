@@ -522,9 +522,31 @@ fn http2_rejects_unbracketed_ipv6_host_authority() {
 }
 
 #[test]
-fn http2_no_host_no_authority_passes_consistency_check() {
+fn http2_and_http3_reject_missing_authority_and_host() {
     let headers = hyper::HeaderMap::new();
     let uri: hyper::Uri = "/path".parse().unwrap();
+    let h2 = check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_2);
+    let h3 = check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_3);
+    assert!(h2.is_some());
+    assert!(h2.unwrap().contains("missing both :authority and Host"));
+    assert_eq!(h2, h3);
+}
+
+#[test]
+fn http2_and_http3_accept_authority_only_without_host() {
+    let headers = hyper::HeaderMap::new();
+    let uri: hyper::Uri = "https://api.example/path".parse().unwrap();
+    assert!(check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_2).is_none());
+    assert!(check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_3).is_none());
+}
+
+#[test]
+fn http2_and_http3_extended_connect_authority_only_passes() {
+    // RFC 8441 / RFC 9220 Extended CONNECT carries `:authority` (mapped onto
+    // the URI by hyper/h3) and typically omits Host. The both-absent reject
+    // must not fire on that shape.
+    let headers = hyper::HeaderMap::new();
+    let uri: hyper::Uri = "https://example.com/chat".parse().unwrap();
     assert!(check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_2).is_none());
     assert!(check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_3).is_none());
 }
@@ -908,6 +930,17 @@ fn build_test_request(
 fn h2_connect_with_websocket_protocol_is_detected() {
     let req = build_test_request("CONNECT", hyper::Version::HTTP_2, Some("websocket"));
     assert!(is_h2_websocket_connect(&req));
+}
+
+#[test]
+fn h2_extended_connect_websocket_authority_only_passes_consistency_check() {
+    // Same request shape the H2 WebSocket functional tests send: CONNECT +
+    // `:protocol=websocket` + absolute-form URI (`:authority`) and no Host.
+    let req = build_test_request("CONNECT", hyper::Version::HTTP_2, Some("websocket"));
+    assert!(is_h2_websocket_connect(&req));
+    assert!(req.headers().get("host").is_none());
+    assert!(req.uri().authority().is_some());
+    assert!(check_host_authority_consistency(req.headers(), req.uri(), req.version()).is_none());
 }
 
 #[test]

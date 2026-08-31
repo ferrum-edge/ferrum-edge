@@ -2324,7 +2324,7 @@ async fn handle_h3_request(
             StatusCode::BAD_REQUEST,
             error_body,
             crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
-            "Host and authority mismatch",
+            "Invalid :authority or Host",
         )
         .await?;
         return Ok(());

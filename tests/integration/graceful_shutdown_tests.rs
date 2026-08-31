@@ -227,7 +227,7 @@ async fn http2_connection_receives_goaway_on_shutdown() {
 
     let req = Request::builder()
         .method("GET")
-        .uri("/api/")
+        .uri(format!("http://{gateway_addr}/api/"))
         .body(Full::new(Bytes::new()))
         .unwrap();
     let resp = sender.send_request(req).await.expect("first request");

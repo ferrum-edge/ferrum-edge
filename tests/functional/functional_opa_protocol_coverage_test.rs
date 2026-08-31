@@ -104,7 +104,7 @@ async fn send_grpc_request(
 
     let req = Request::builder()
         .method("POST")
-        .uri(path)
+        .uri(format!("http://{addr}{path}"))
         .header("content-type", "application/grpc")
         .header("te", "trailers")
         .body(Full::new(Bytes::from(body.to_vec())))?;

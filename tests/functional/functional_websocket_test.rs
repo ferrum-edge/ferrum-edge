@@ -2184,6 +2184,9 @@ async fn test_websocket_multiple_messages() {
 
 /// Test HTTP/2 WebSocket (RFC 8441 Extended CONNECT) proxying:
 /// client →(h2c Extended CONNECT)→ gateway → backend echo.
+///
+/// The request is `:authority`-only (absolute-form URI, no `Host` header) —
+/// the RFC 8441 shape. Issue #4416's both-absent reject must not fire here.
 #[ignore]
 #[tokio::test]
 async fn test_h2_websocket_extended_connect_echo() {
@@ -2934,6 +2937,9 @@ async fn test_response_mock_short_circuits_websocket_handshakes_h1_h2_and_h3() {
 /// Test HTTP/3 WebSocket (RFC 9220 Extended CONNECT) proxying through the
 /// gateway, including unmasked compliant frames, binary frames, and strict
 /// RFC 9220 rejection of masked client frames.
+///
+/// `Http3Client::websocket` sends `:authority` from the URL and no Host
+/// header. Issue #4416's both-absent reject must not fire on that shape.
 #[ignore]
 #[tokio::test]
 async fn test_h3_websocket_rfc9220_echo_and_masked_frame() {

@@ -1,7 +1,8 @@
 //! Functional tests for HTTP/3 authority validation.
 //!
 //! Unit tests cover the validator directly; this module verifies the live H3
-//! listener rejects conflicting `Host` and `:authority` values before routing.
+//! listener rejects conflicting `Host` and `:authority` values, and requests
+//! that carry neither, before routing. `:authority`-only remains admitted.
 
 use crate::common::TestGateway;
 use crate::scaffolding::clients::bind_quinn_client_endpoint;
@@ -72,6 +73,14 @@ async fn send_mismatched_host_h3_request(
     url: &str,
     host_header: &str,
 ) -> Result<RawH3Outcome, Box<dyn std::error::Error + Send + Sync>> {
+    send_raw_h3_get(url, true, Some(host_header)).await
+}
+
+async fn send_raw_h3_get(
+    url: &str,
+    include_authority: bool,
+    host_header: Option<&str>,
+) -> Result<RawH3Outcome, Box<dyn std::error::Error + Send + Sync>> {
     let parsed: http::Uri = url.parse()?;
     let host = parsed.host().ok_or("missing host in url")?.to_string();
     let port = parsed.port_u16().unwrap_or(443);
@@ -104,7 +113,11 @@ async fn send_mismatched_host_h3_request(
     decoder.write_all(&[0x03]).await?;
 
     let (mut send, mut recv) = conn.open_bi().await?;
-    let header_block = encode_qpack_h3_get_headers(&authority, path, host_header);
+    let header_block = encode_qpack_h3_get_headers(
+        include_authority.then_some(authority.as_str()),
+        path,
+        host_header,
+    );
     let mut request = Vec::with_capacity(header_block.len() + 8);
     encode_h3_varint(0x01, &mut request);
     encode_h3_varint(header_block.len() as u64, &mut request);
@@ -144,13 +157,17 @@ fn insecure_h3_endpoint() -> Result<Endpoint, Box<dyn std::error::Error + Send +
     Ok(endpoint)
 }
 
-fn encode_qpack_h3_get_headers(authority: &str, path: &str, host: &str) -> Vec<u8> {
+fn encode_qpack_h3_get_headers(authority: Option<&str>, path: &str, host: Option<&str>) -> Vec<u8> {
     let mut block = vec![0x00, 0x00]; // Required Insert Count = 0, Delta Base = 0.
     encode_qpack_literal(&mut block, b":method", b"GET");
     encode_qpack_literal(&mut block, b":scheme", b"https");
-    encode_qpack_literal(&mut block, b":authority", authority.as_bytes());
+    if let Some(authority) = authority {
+        encode_qpack_literal(&mut block, b":authority", authority.as_bytes());
+    }
     encode_qpack_literal(&mut block, b":path", path.as_bytes());
-    encode_qpack_literal(&mut block, b"host", host.as_bytes());
+    if let Some(host) = host {
+        encode_qpack_literal(&mut block, b"host", host.as_bytes());
+    }
     block
 }
 
@@ -368,6 +385,154 @@ async fn functional_h3_host_authority_mismatch_rejected_before_backend() {
         backend_accepts.load(Ordering::Relaxed),
         0,
         "mismatched Host/:authority request must be rejected before backend connect"
+    );
+
+    gateway.shutdown();
+    backend_task.abort();
+}
+
+/// An H3 GET with neither `:authority` nor Host is malformed (RFC 9114 §4.3.1).
+/// The vendored h3 crate fails closed at parse time with `H3_MESSAGE_ERROR`;
+/// `check_host_authority_consistency` is defence in depth if a Request is
+/// ever materialized. Either way the request must not reach the backend.
+#[ignore]
+#[tokio::test]
+async fn functional_h3_missing_authority_and_host_rejected_before_backend() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let backend_accepts = Arc::new(AtomicUsize::new(0));
+    let backend_task =
+        start_counting_http_backend_on(backend_listener, Arc::clone(&backend_accepts));
+    sleep(Duration::from_millis(150)).await;
+
+    let mut gateway = TestGateway::builder()
+        .mode_file(build_config(backend_port))
+        .log_level("warn")
+        .env("FERRUM_ENABLE_HTTP3", "true")
+        .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+        .spawn()
+        .await
+        .expect("start gateway with h3");
+    let https_port = gateway
+        .env_port("FERRUM_PROXY_HTTPS_PORT")
+        .expect("harness-allocated HTTPS port");
+
+    sleep(Duration::from_millis(250)).await;
+    backend_accepts.store(0, Ordering::Relaxed);
+
+    let url = format!("https://localhost:{https_port}/");
+
+    let mut last_err = None;
+    let outcome = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match send_raw_h3_get(&url, false, None).await {
+                Ok(outcome) => break outcome,
+                Err(err) if std::time::Instant::now() < deadline => {
+                    last_err = Some(err.to_string());
+                    sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => {
+                    panic!(
+                        "H3 neither-:authority-nor-Host request did not complete; last startup error={last_err:?}; final error={err}"
+                    );
+                }
+            }
+        }
+    };
+
+    match outcome {
+        RawH3Outcome::StreamError(err) => {
+            assert!(
+                err.to_ascii_lowercase().contains("reset"),
+                "unexpected raw H3 stream error: {err}"
+            );
+        }
+        RawH3Outcome::Response(raw) => {
+            let body = String::from_utf8_lossy(&h3_data_payload(&raw)).to_string();
+            assert!(
+                body.contains("missing both :authority and Host"),
+                "unexpected raw H3 response bytes: {raw:?}, body: {body}"
+            );
+        }
+    }
+    assert_eq!(
+        backend_accepts.load(Ordering::Relaxed),
+        0,
+        "H3 request with neither :authority nor Host must be rejected before backend connect"
+    );
+
+    gateway.shutdown();
+    backend_task.abort();
+}
+
+/// Negative case: `:authority` without Host is the usual H3 client shape and
+/// must still reach the backend after the both-absent reject landed.
+#[ignore]
+#[tokio::test]
+async fn functional_h3_authority_only_still_reaches_backend() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let backend_accepts = Arc::new(AtomicUsize::new(0));
+    let backend_task =
+        start_counting_http_backend_on(backend_listener, Arc::clone(&backend_accepts));
+    sleep(Duration::from_millis(150)).await;
+
+    let mut gateway = TestGateway::builder()
+        .mode_file(build_config(backend_port))
+        .log_level("warn")
+        .env("FERRUM_ENABLE_HTTP3", "true")
+        .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+        .spawn()
+        .await
+        .expect("start gateway with h3");
+    let https_port = gateway
+        .env_port("FERRUM_PROXY_HTTPS_PORT")
+        .expect("harness-allocated HTTPS port");
+
+    sleep(Duration::from_millis(250)).await;
+    backend_accepts.store(0, Ordering::Relaxed);
+
+    let url = format!("https://localhost:{https_port}/");
+
+    let mut last_err = None;
+    let outcome = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match send_raw_h3_get(&url, true, None).await {
+                Ok(outcome) => break outcome,
+                Err(err) if std::time::Instant::now() < deadline => {
+                    last_err = Some(err.to_string());
+                    sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => {
+                    panic!(
+                        "H3 :authority-only request did not complete; last startup error={last_err:?}; final error={err}"
+                    );
+                }
+            }
+        }
+    };
+
+    match outcome {
+        RawH3Outcome::StreamError(err) => {
+            panic!(":authority-only H3 request must not be reset: {err}");
+        }
+        RawH3Outcome::Response(raw) => {
+            let body = String::from_utf8_lossy(&h3_data_payload(&raw)).to_string();
+            assert!(
+                body.contains("backend-ok"),
+                "unexpected raw H3 response bytes: {raw:?}, body: {body}"
+            );
+        }
+    }
+    assert!(
+        backend_accepts.load(Ordering::Relaxed) >= 1,
+        ":authority-only H3 request must reach the backend"
     );
 
     gateway.shutdown();
