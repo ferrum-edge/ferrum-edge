@@ -509,8 +509,8 @@ async fn in_process_h2c_kernel_absorb_write_timeout_maps_to_504() {
 async fn in_process_transient_reserve_pending_still_arms_eos_holdover() {
     let frame = BufferedUploadPumpProbe::frame_size();
     let frames = 4;
-    let mut probe = BufferedUploadPumpProbe::start(frame * frames, WRITE_TIMEOUT_MS)
-        .expect("buffered pump");
+    let mut probe =
+        BufferedUploadPumpProbe::start(frame * frames, WRITE_TIMEOUT_MS).expect("buffered pump");
 
     loop {
         match probe.poll_transport_once() {
@@ -551,8 +551,8 @@ async fn in_process_transient_reserve_pending_still_arms_eos_holdover() {
 async fn in_process_reserve_backpressure_through_eos_skips_holdover() {
     let frame = BufferedUploadPumpProbe::frame_size();
     let frames = 4;
-    let mut probe = BufferedUploadPumpProbe::start(frame * frames, WRITE_TIMEOUT_MS)
-        .expect("buffered pump");
+    let mut probe =
+        BufferedUploadPumpProbe::start(frame * frames, WRITE_TIMEOUT_MS).expect("buffered pump");
     let mut seen = 0;
     while seen < frames {
         loop {
