@@ -2384,9 +2384,11 @@ pub fn is_udp_hbone_connect_request<B>(req: &Request<B>, env_config: &EnvConfig)
 /// for — its own pod (proved by `terminator_local_ip`, the accepted
 /// connection's own local address) plus a narrow slice-derived inventory for
 /// the topologies that legitimately terminate for a workload other than the
-/// pod the proxy runs in (`Sidecar` / `Ambient` own-identity workload records,
-/// `NodeWaypoint` enrolled pods, `ServiceWaypoint` waypoint-bound backing
-/// workloads). Being declared ANYWHERE in the slice is deliberately not
+/// pod the proxy runs in (`Ambient` own-identity workload records, bounded to
+/// what this node's agent currently enrols; `NodeWaypoint` enrolled pods;
+/// `ServiceWaypoint` waypoint-bound backing workloads — a `Sidecar` shares its
+/// pod's netns and carries no such inventory). Being declared ANYWHERE in the
+/// slice is deliberately not
 /// enough: relaying to another node's workload would dial that pod in
 /// plaintext from this pod's IP, skipping the destination's own
 /// `AuthorizationPolicy` set and arriving as a trusted-looking unauthenticated
@@ -63006,7 +63008,9 @@ mod tests {
     /// not every workload the slice happens to declare.
     #[test]
     fn inbound_hbone_relay_guard_allows_only_the_terminators_own_destinations() {
-        use crate::modes::mesh::config::{InboundRelayDenial, MeshConfig};
+        use crate::modes::mesh::config::{
+            InboundRelayDenial, MeshConfig, own_address_port_bounds_from_workloads,
+        };
 
         let own_ip: std::net::IpAddr = "10.1.2.3".parse().expect("own pod IP");
         let own_v6: std::net::IpAddr = "fd00:10:244:1::4".parse().expect("own pod IPv6");
@@ -63030,6 +63034,11 @@ mod tests {
             ],
             inbound_relay_admits_accepted_local_address: true,
             inbound_relay_admits_loopback_namespace: true,
+            // What the apply path projects for an own-pod terminator: the
+            // per-address port bound of the record it owns (issue #4249).
+            inbound_relay_own_address_ports: own_address_port_bounds_from_workloads(&[
+                relay_guard_workload("app", &["10.1.2.3", "fd00:10:244:1::4"], &[8080]),
+            ]),
             ..MeshConfig::default()
         };
         let decide = |host: &str, port: u16, local: Option<std::net::IpAddr>| {
@@ -63122,27 +63131,40 @@ mod tests {
                 crate::modes::mesh::config::MeshInboundRelayDestination {
                     host: crate::modes::mesh::config::MeshInboundRelayHost::Ip(own_ip),
                     ports: vec![8080],
+                    enrollment: Default::default(),
+                    registry_uncontested: true,
                 },
                 crate::modes::mesh::config::MeshInboundRelayDestination {
                     host: crate::modes::mesh::config::MeshInboundRelayHost::Ip(
                         "127.0.0.1".parse().expect("loopback"),
                     ),
                     ports: vec![8080],
+                    enrollment: Default::default(),
+                    registry_uncontested: true,
                 },
                 crate::modes::mesh::config::MeshInboundRelayDestination {
                     host: crate::modes::mesh::config::MeshInboundRelayHost::Name(
                         "localhost".to_string(),
                     ),
                     ports: vec![8080],
+                    enrollment: Default::default(),
+                    registry_uncontested: true,
                 },
                 crate::modes::mesh::config::MeshInboundRelayDestination {
                     host: crate::modes::mesh::config::MeshInboundRelayHost::Name(
                         "app.localhost".to_string(),
                     ),
                     ports: vec![8080],
+                    enrollment: Default::default(),
+                    registry_uncontested: true,
                 },
             ],
             inbound_relay_admits_accepted_local_address: true,
+            // What the apply path projects for an own-pod terminator: the
+            // per-address port bound of the record it owns (issue #4249).
+            inbound_relay_own_address_ports: own_address_port_bounds_from_workloads(&[
+                relay_guard_workload("app", &["10.1.2.3", "127.0.0.1"], &[8080]),
+            ]),
             ..MeshConfig::default()
         };
         let ambient_decide = |host: &str, port: u16| {
@@ -63253,10 +63275,14 @@ mod tests {
                 MeshInboundRelayDestination {
                     host: MeshInboundRelayHost::Name("localhost.".to_string()),
                     ports: vec![8080],
+                    enrollment: Default::default(),
+                    registry_uncontested: true,
                 },
                 MeshInboundRelayDestination {
                     host: MeshInboundRelayHost::Name("app.localhost".to_string()),
                     ports: vec![8080],
+                    enrollment: Default::default(),
+                    registry_uncontested: true,
                 },
             ],
             ..MeshConfig::default()
@@ -63277,11 +63303,14 @@ mod tests {
 
     #[test]
     fn inbound_hbone_relay_proxy_normalizes_bracketed_ipv6_authority() {
-        use crate::modes::mesh::config::MeshConfig;
+        use crate::modes::mesh::config::{MeshConfig, own_address_port_bounds_from_workloads};
 
         let mesh = MeshConfig {
             workloads: vec![relay_guard_workload("app", &["fd00:10:244:1::4"], &[8080])],
             inbound_relay_admits_accepted_local_address: true,
+            inbound_relay_own_address_ports: own_address_port_bounds_from_workloads(&[
+                relay_guard_workload("app", &["fd00:10:244:1::4"], &[8080]),
+            ]),
             ..MeshConfig::default()
         };
         let authority: http::uri::Authority = "[fd00:10:244:1::4]:8080".parse().unwrap();

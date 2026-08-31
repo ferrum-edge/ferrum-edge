@@ -112,6 +112,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Database-backed CP+DP pairs need no change; the documented
   `examples/cp-values.yaml` quickstart now matches the chart's grant surface.
 
+- **BREAKING — Ambient pod-registry migration proofs and publication use one
+  canonical strict grammar** (issue #4249). Durable UDP placement cleanup now
+  reads `PodCaptureSource::list_complete_targets`, the same bounded, all-or-
+  nothing snapshot used by the inbound HBONE relay node bound. A registry leaf
+  that disappears between enumeration and open is skipped as a withdrawn pod,
+  but a present malformed `spiffe_id=` / `ipv4=` / `ipv6=` value, duplicate
+  recognized key, unknown non-empty line, unsafe leaf name, symlink, oversized
+  or non-regular file, ownership mismatch, or other read failure reports
+  `registry_not_synchronized`; several of those body shapes were previously
+  tolerated by migration cleanup. The node-agent writer now applies the same
+  canonical leaf grammar (non-empty, at most 256 bytes, ASCII alphanumeric
+  first, then ASCII alphanumeric / `-` / `_`) before publishing. **Operator
+  action**: before an Ambient UDP placement migration, remove stale hand-
+  authored registry artifacts and let the node-agent regenerate every pod
+  entry; do not publish custom leaf names or body lines outside the documented
+  grammar.
+
 - **BREAKING — `FERRUM_TLS_OFFLOAD_THREADS` nonzero values fail startup**
   (issue #4294). TLS handshake offload is not implemented; a nonzero setting
   was previously parsed and then silently ignored. `EnvConfig::validate()`

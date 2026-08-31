@@ -5937,13 +5937,14 @@ fn retry_pending_pod_detaches(
     clear_partial_capture_state_if_recovered(pod_states, metrics);
 }
 
-/// Reject a `pod_uid` that could escape the registry directory. A pod UID is a
-/// Kubernetes-assigned value; treating it as a path component without checks
-/// would let an empty, slash-, backslash-, or `..`-bearing value write or
+/// Reject a `pod_uid` that could escape the registry directory or is not a
+/// canonical registry leaf. A pod UID is a Kubernetes-assigned value; treating
+/// it as a path component without checks would let an empty, slash-,
+/// backslash-, whitespace-, control-character, or `..`-bearing value write or
 /// delete files outside `dir`. Returns `true` when the UID is unsafe to use as
 /// a leaf filename.
 fn pod_registry_uid_is_unsafe(pod_uid: &str) -> bool {
-    pod_uid.is_empty() || pod_uid.contains('/') || pod_uid.contains('\\') || pod_uid.contains("..")
+    !crate::modes::mesh::node_waypoint::is_safe_pod_registry_uid(pod_uid)
 }
 
 /// Best-effort durable publication of a single pod's registry entry. The file
@@ -5952,6 +5953,8 @@ fn pod_registry_uid_is_unsafe(pod_uid: &str) -> bool {
 /// and sync the directory once; it never has to reopen and fsync every pod.
 /// Never panics and returns `false` on any unsafe UID or I/O failure so the
 /// caller retains retry state instead of reporting a converged registry.
+/// The leaf-name guard is [`crate::modes::mesh::node_waypoint::is_safe_pod_registry_uid`]:
+/// the same canonical grammar strict consumers require.
 fn publish_pod_registry(
     dir: &std::path::Path,
     pod_uid: &str,
@@ -17243,9 +17246,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let registry = dir.path().join("node-waypoint-pods");
 
-        // None of these may write anything; an escaping UID must be refused
-        // before any directory is created or file written.
-        for unsafe_uid in ["", "../escape", "a/b", "a\\b", "..", "foo/../bar"] {
+        // None of these may write anything; an escaping or noncanonical UID
+        // must be refused before any directory is created or file written.
+        for unsafe_uid in [
+            "",
+            "../escape",
+            "a/b",
+            "a\\b",
+            "..",
+            "foo/../bar",
+            ".hidden",
+            "foo bar",
+            "pod;uid",
+            "pod.uid",
+        ] {
             assert!(!publish_pod_registry(
                 &registry,
                 unsafe_uid,

@@ -2170,6 +2170,12 @@ mod tests {
             node_waypoint: None,
             remote_provenance: false,
         });
+        // The per-address port bound the apply path projects for an own-pod
+        // terminator (issue #4249): the own-address / loopback arms read it,
+        // never the declared workload view.
+        let own_address_ports =
+            crate::modes::mesh::config::own_address_port_bounds_from_workloads(&mesh.workloads);
+        mesh.inbound_relay_own_address_ports = own_address_ports;
         mesh
     }
 

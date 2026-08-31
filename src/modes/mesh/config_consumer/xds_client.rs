@@ -1765,6 +1765,12 @@ fn reverse_translate(
         // An enforcing GatewayClass-targeted policy without this authoritative
         // carrier was rejected above, before the last-good slice can change.
         waypoint_gateway_class: recovered.waypoint_gateway_class,
+        // Exact ServiceWaypoint bound-service refs recovered from the
+        // dedicated carrier (issue #4251). Empty when the CP emitted no
+        // carrier — missing/old evidence fails closed, so the inbound HBONE
+        // relay never treats the (possibly fail-open) services view as a
+        // binding.
+        service_waypoint_bound_services: recovered.service_waypoint_bound_services,
         // A non-empty WorkloadLabels carrier is authoritative — the CP computed
         // real effective labels for this workload. An EMPTY carrier is NOT
         // treated as authoritative: a Ferrum CP always emits this carrier, and
@@ -2085,6 +2091,14 @@ struct RecoveredSliceCarriers {
     /// Guards against multiple WaypointGatewayClass carriers in one ECDS
     /// response (must be exactly one authoritative value when present).
     waypoint_gateway_class_seen: bool,
+    /// Exact ServiceWaypoint bound-service refs recovered from the dedicated
+    /// ECDS carrier (issue #4251). Empty when the CP emitted no carrier —
+    /// missing/old evidence — so the inbound HBONE relay inventory is empty.
+    service_waypoint_bound_services: Vec<crate::modes::mesh::config::MeshWaypointServiceRef>,
+    /// Guards against multiple ServiceWaypointBoundServices carriers in one
+    /// ECDS response. This binding evidence is authoritative when present, so
+    /// accepting last-wins duplicates would make admission order-dependent.
+    service_waypoint_bound_services_seen: bool,
     /// `meshConfig.rootNamespace` recovered from its own carrier (issue
     /// #2469). Empty when the producer emitted no carrier.
     istio_root_namespace: String,
@@ -2556,6 +2570,17 @@ fn apply_recovered_carrier(
             }
             recovered.waypoint_gateway_class_seen = true;
             recovered.waypoint_gateway_class = Some(value);
+        }
+        MeshSliceCarrier::ServiceWaypointBoundServices(value) => {
+            if recovered.service_waypoint_bound_services_seen {
+                return Err(
+                    "xDS ServiceWaypointBoundServices carrier appeared more than once; \
+                     exactly one authoritative bound-service value is required"
+                        .to_string(),
+                );
+            }
+            recovered.service_waypoint_bound_services_seen = true;
+            recovered.service_waypoint_bound_services = value;
         }
         // Decode already drops blank root carriers; ignore empty values here
         // so in-process construction cannot clear trustworthy provenance.
@@ -5921,6 +5946,10 @@ mod tests {
         // Services round-trip with full protocol + workload-ref shape via the
         // Services carrier (not the name-only CDS/EDS reconstruction).
         assert_eq!(recovered.services, native.services);
+        assert_eq!(
+            recovered.service_waypoint_bound_services, native.service_waypoint_bound_services,
+            "ServiceWaypoint bound-service refs must round-trip; missing evidence stays empty"
+        );
         // The inbound-only un-narrowed views round-trip via their own carriers.
         assert_eq!(
             recovered.local_inbound_services,
@@ -6153,6 +6182,66 @@ mod tests {
             "missing carrier must not reuse a stale class stamp"
         );
         assert!(cleared_recovered.mesh_policies.is_empty());
+    }
+
+    #[test]
+    fn xds_round_trip_preserves_service_waypoint_bound_services_carrier() {
+        use crate::modes::mesh::config::MeshWaypointServiceRef;
+
+        let native = MeshSlice {
+            node_id: "wp-node".to_string(),
+            namespace: "default".to_string(),
+            waypoint_name: Some("reviews-waypoint".to_string()),
+            service_waypoint_bound_services: vec![MeshWaypointServiceRef {
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
+            }],
+            version: "v1".to_string(),
+            ..MeshSlice::default()
+        };
+        let snapshot = translate_mesh_slice_to_snapshot(&native);
+        let accumulator = accumulator_from_snapshot(&snapshot);
+        let mut config = test_config();
+        config.node_id = native.node_id.clone();
+        config.namespace = native.namespace.clone();
+        config.waypoint_name = native.waypoint_name.clone();
+
+        let recovered = accumulator
+            .try_build_mesh_slice(&config)
+            .expect("reverse translate succeeds")
+            .expect("all required types present");
+        assert_eq!(
+            recovered.service_waypoint_bound_services, native.service_waypoint_bound_services,
+            "ServiceWaypointBoundServices carrier must stamp the exact bound refs"
+        );
+
+        let mut changed = native.clone();
+        changed.service_waypoint_bound_services = vec![MeshWaypointServiceRef {
+            namespace: "default".to_string(),
+            name: "ratings".to_string(),
+        }];
+        assert!(!native.content_eq(&changed));
+        let changed_recovered =
+            accumulator_from_snapshot(&translate_mesh_slice_to_snapshot(&changed))
+                .try_build_mesh_slice(&config)
+                .expect("changed binding recovers")
+                .expect("present");
+        assert_eq!(
+            changed_recovered.service_waypoint_bound_services,
+            changed.service_waypoint_bound_services
+        );
+
+        let mut cleared = native.clone();
+        cleared.service_waypoint_bound_services.clear();
+        let cleared_recovered =
+            accumulator_from_snapshot(&translate_mesh_slice_to_snapshot(&cleared))
+                .try_build_mesh_slice(&config)
+                .expect("missing carrier recovers")
+                .expect("present");
+        assert!(
+            cleared_recovered.service_waypoint_bound_services.is_empty(),
+            "missing/old bound-services evidence must default fail closed, not reuse a stale binding"
+        );
     }
 
     #[test]

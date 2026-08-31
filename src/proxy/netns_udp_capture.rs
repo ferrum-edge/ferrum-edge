@@ -1373,7 +1373,7 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
     /// passes under one exact node-agent registry publication proof before it
     /// persists completion.
     pub async fn migration_cleanup_once(&mut self) -> NetnsUdpCleanupProgress {
-        let targets = match self.source.list_targets_for_migration() {
+        let targets = match self.source.list_complete_targets() {
             Ok(targets) => targets,
             Err(_) => {
                 return NetnsUdpCleanupProgress {

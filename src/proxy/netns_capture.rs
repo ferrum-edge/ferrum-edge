@@ -61,7 +61,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use crate::modes::mesh::node_waypoint::parse_pod_uid;
+use crate::modes::mesh::node_waypoint::{is_safe_pod_registry_uid, parse_pod_uid};
 
 use super::{ListenerTlsSource, ProxyState, SourceIpOverride, run_accept_loop};
 
@@ -75,8 +75,11 @@ pub struct PodCaptureTarget {
     pub cgroup_path: String,
     /// Workload SPIFFE identity attested by the node-agent for this registry
     /// entry. Ambient UDP capture stamps it together with `pod_uid` into the
-    /// existing trusted HBONE baggage channel. Missing/malformed registry
-    /// evidence leaves this `None` and preserves mesh-wide authorization.
+    /// existing trusted HBONE baggage channel. The best-effort scan treats a
+    /// missing `spiffe_id=` line, or a present-but-malformed one, as `None`.
+    /// Strict complete snapshots distinguish those cases: omission stays
+    /// `None`, while a present malformed/empty/unbound identity fails the
+    /// production entry so it cannot weaken an identity binding.
     pub source_identity: Option<crate::modes::mesh::hbone::UdpSourceIdentity>,
     /// Source pod IPs, if the node-agent published them. Used to override the
     /// loopback peer of accepted in-netns capture connections so client-IP
@@ -110,25 +113,44 @@ impl PodCaptureSourceIps {
 /// Source of the current enrolled-pod set. Production reads a directory the
 /// node-agent publishes; tests inject a fake.
 pub trait PodCaptureSource: Send + Sync {
+    /// Best-effort enrolled-pod set. Production filesystem sources skip
+    /// unreadable or malformed entries so capture/steering reconcilers can
+    /// keep working around a bad file. Security-sensitive consumers must use
+    /// [`Self::list_complete_targets`].
     fn list_targets(&self) -> Vec<PodCaptureTarget>;
 
-    /// Return one complete registry snapshot suitable for a durable migration
-    /// proof. Production filesystem sources override this to fail closed on
-    /// any omitted or malformed entry; in-memory sources are already atomic.
-    fn list_targets_for_migration(&self) -> Result<Vec<PodCaptureTarget>, String> {
+    /// Return one complete registry snapshot, or an error.
+    ///
+    /// Production filesystem sources fail closed on any omitted, unsafe, or
+    /// malformed entry (entry-count cap, per-entry size cap, Unix `O_NOFOLLOW`,
+    /// regular file, single link, process-owned, canonical pod-UID leaf name,
+    /// and a strict body parse that distinguishes an omitted optional field from a
+    /// present malformed one). The sole exception is a leaf that no longer
+    /// exists when it is opened — the pod-teardown race, which removes an
+    /// enrolled pod rather than hiding one — which is skipped; see
+    /// [`read_complete_registry_entry`]. In-memory sources are already atomic
+    /// and default to `Ok(self.list_targets())`.
+    ///
+    /// Shared by durable UDP migration proofs and the inbound HBONE relay
+    /// destination guard: both need an all-or-nothing snapshot, not a partial
+    /// best-effort scan.
+    fn list_complete_targets(&self) -> Result<Vec<PodCaptureTarget>, String> {
         Ok(self.list_targets())
     }
 }
 
-const MAX_MIGRATION_REGISTRY_ENTRIES: usize = 100_000;
-const MAX_MIGRATION_REGISTRY_ENTRY_BYTES: u64 = 16 * 1024;
+const MAX_COMPLETE_REGISTRY_ENTRIES: usize = 100_000;
+const MAX_COMPLETE_REGISTRY_ENTRY_BYTES: u64 = 16 * 1024;
 
 /// Filesystem registry source: the node-agent writes one file per enrolled pod,
-/// named `<pod_uid>`, whose first line is the pod cgroup path and whose
-/// optional keyed lines carry the node-agent-derived workload SPIFFE identity
-/// (`spiffe_id=<id>`) and same-family source IP overrides (`ipv4=<addr>`,
-/// `ipv6=<addr>`). Removing the file (on pod teardown) drops the pod from the
-/// set. This mirrors the existing "pinned path is the entire node-agent ↔
+/// named `<pod_uid>` (canonical leaf grammar: non-empty, ≤256 bytes, ASCII
+/// alphanumeric start, then ASCII alphanumerics / `-` / `_`), whose first line
+/// is the pod cgroup path and whose optional keyed lines carry the
+/// node-agent-derived workload SPIFFE identity (`spiffe_id=<id>`) and
+/// same-family source IP overrides (`ipv4=<addr>`, `ipv6=<addr>`). Dot-prefixed
+/// names are registry control entries (`.ready`, `.udp-ready`, publication
+/// tempfiles), not pods. Removing the file (on pod teardown) drops the pod from
+/// the set. This mirrors the existing "pinned path is the entire node-agent ↔
 /// mesh-proxy IPC surface" contract.
 pub struct DirectoryCaptureSource {
     dir: PathBuf,
@@ -141,8 +163,34 @@ impl DirectoryCaptureSource {
 }
 
 fn parse_capture_target(pod_uid: String, contents: &str) -> Result<PodCaptureTarget, String> {
+    parse_capture_target_inner(pod_uid, contents, CaptureTargetParseMode::Permissive)
+}
+
+fn parse_complete_capture_target(
+    pod_uid: String,
+    contents: &str,
+) -> Result<PodCaptureTarget, String> {
+    parse_capture_target_inner(pod_uid, contents, CaptureTargetParseMode::Strict)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CaptureTargetParseMode {
+    /// Best-effort capture/steering: skip unknown lines and treat a present
+    /// malformed optional field as absent so one bad file cannot drop the rest
+    /// of the enrolled-pod set.
+    Permissive,
+    /// All-or-nothing snapshot: a present malformed or duplicate recognized field,
+    /// or any other non-empty content line, fails the whole production entry.
+    Strict,
+}
+
+fn parse_capture_target_inner(
+    pod_uid: String,
+    contents: &str,
+    mode: CaptureTargetParseMode,
+) -> Result<PodCaptureTarget, String> {
     // Line 1: pod cgroup path (required). Subsequent optional lines are
-    // family-specific source IPs (`ipv4=<addr>`, `ipv6=<addr>`).
+    // `spiffe_id=<id>`, `ipv4=<addr>`, `ipv6=<addr>`.
     let mut lines = contents.lines();
     let cgroup_path = lines.next().unwrap_or("").trim().to_string();
     if cgroup_path.is_empty() {
@@ -150,19 +198,86 @@ fn parse_capture_target(pod_uid: String, contents: &str) -> Result<PodCaptureTar
     }
     let mut source_ips = PodCaptureSourceIps::default();
     let mut source_principal = None;
+    let mut seen_spiffe = false;
+    let mut seen_ipv4 = false;
+    let mut seen_ipv6 = false;
     for line in lines {
         let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
         if let Some(value) = line.strip_prefix("spiffe_id=") {
-            source_principal = crate::identity::SpiffeId::new(value.trim()).ok();
+            if matches!(mode, CaptureTargetParseMode::Strict) && seen_spiffe {
+                return Err("Ambient capture registry entry repeats a recognized field".to_string());
+            }
+            seen_spiffe = true;
+            let value = value.trim();
+            match crate::identity::SpiffeId::new(value) {
+                Ok(principal) => source_principal = Some(principal),
+                Err(_) => match mode {
+                    CaptureTargetParseMode::Permissive => source_principal = None,
+                    CaptureTargetParseMode::Strict => {
+                        return Err(
+                            "Ambient capture registry entry has a malformed spiffe_id".to_string()
+                        );
+                    }
+                },
+            }
         } else if let Some(value) = line.strip_prefix("ipv4=") {
-            source_ips.ipv4 = value.trim().parse::<Ipv4Addr>().ok();
+            if matches!(mode, CaptureTargetParseMode::Strict) && seen_ipv4 {
+                return Err("Ambient capture registry entry repeats a recognized field".to_string());
+            }
+            seen_ipv4 = true;
+            match value.trim().parse::<Ipv4Addr>() {
+                Ok(addr) => source_ips.ipv4 = Some(addr),
+                Err(_) => match mode {
+                    CaptureTargetParseMode::Permissive => source_ips.ipv4 = None,
+                    CaptureTargetParseMode::Strict => {
+                        return Err(
+                            "Ambient capture registry entry has a malformed ipv4 address"
+                                .to_string(),
+                        );
+                    }
+                },
+            }
         } else if let Some(value) = line.strip_prefix("ipv6=") {
-            source_ips.ipv6 = value.trim().parse::<Ipv6Addr>().ok();
+            if matches!(mode, CaptureTargetParseMode::Strict) && seen_ipv6 {
+                return Err("Ambient capture registry entry repeats a recognized field".to_string());
+            }
+            seen_ipv6 = true;
+            match value.trim().parse::<Ipv6Addr>() {
+                Ok(addr) => source_ips.ipv6 = Some(addr),
+                Err(_) => match mode {
+                    CaptureTargetParseMode::Permissive => source_ips.ipv6 = None,
+                    CaptureTargetParseMode::Strict => {
+                        return Err(
+                            "Ambient capture registry entry has a malformed ipv6 address"
+                                .to_string(),
+                        );
+                    }
+                },
+            }
+        } else if matches!(mode, CaptureTargetParseMode::Strict) {
+            return Err("Ambient capture registry entry has unknown content".to_string());
         }
     }
-    let source_identity = source_principal.and_then(|principal| {
-        crate::modes::mesh::hbone::UdpSourceIdentity::new(principal, pod_uid.clone())
-    });
+    let source_identity = match source_principal {
+        None => None,
+        Some(principal) => {
+            match crate::modes::mesh::hbone::UdpSourceIdentity::new(principal, pod_uid.clone()) {
+                Some(identity) => Some(identity),
+                None => match mode {
+                    CaptureTargetParseMode::Permissive => None,
+                    CaptureTargetParseMode::Strict => {
+                        return Err(
+                            "Ambient capture registry entry identity is not bound to a valid pod UID"
+                                .to_string(),
+                        );
+                    }
+                },
+            }
+        }
+    };
     Ok(PodCaptureTarget {
         pod_uid,
         cgroup_path,
@@ -171,7 +286,18 @@ fn parse_capture_target(pod_uid: String, contents: &str) -> Result<PodCaptureTar
     })
 }
 
-fn read_migration_registry_entry(path: &Path) -> Result<String, String> {
+/// Read one registry entry under the strict all-or-nothing rules.
+///
+/// `Ok(None)` means the leaf `read_dir` enumerated no longer exists by the time
+/// it was opened — the ordinary pod-teardown race, since the node-agent unlinks
+/// an entry the instant a pod is withdrawn. That is NOT a partial or
+/// untrustworthy snapshot: an absent entry can only ever REMOVE an admission,
+/// so skipping it is exactly as fail-closed as retracting, without taking the
+/// whole node's enrolled-destination index (and therefore every authenticated
+/// inbound relay on it) out for a poll interval on every pod deletion. Every
+/// other failure — including `ELOOP` from `O_NOFOLLOW` on a symlinked entry, a
+/// permission error, and an unreadable or oversized body — still retracts.
+fn read_complete_registry_entry(path: &Path) -> Result<Option<String>, String> {
     #[cfg(unix)]
     let file = {
         use std::os::unix::fs::OpenOptionsExt;
@@ -182,11 +308,15 @@ fn read_migration_registry_entry(path: &Path) -> Result<String, String> {
     };
     #[cfg(not(unix))]
     let file = std::fs::File::open(path);
-    let file = file.map_err(|_| "could not securely open Ambient capture registry entry")?;
+    let file = match file {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("could not securely open Ambient capture registry entry".to_string()),
+    };
     let metadata = file
         .metadata()
         .map_err(|_| "could not inspect Ambient capture registry entry")?;
-    if !metadata.is_file() || metadata.len() > MAX_MIGRATION_REGISTRY_ENTRY_BYTES {
+    if !metadata.is_file() || metadata.len() > MAX_COMPLETE_REGISTRY_ENTRY_BYTES {
         return Err("Ambient capture registry entry is not a bounded regular file".to_string());
     }
     #[cfg(unix)]
@@ -201,13 +331,13 @@ fn read_migration_registry_entry(path: &Path) -> Result<String, String> {
         }
     }
     let mut contents = String::new();
-    file.take(MAX_MIGRATION_REGISTRY_ENTRY_BYTES + 1)
+    file.take(MAX_COMPLETE_REGISTRY_ENTRY_BYTES + 1)
         .read_to_string(&mut contents)
         .map_err(|_| "could not read Ambient capture registry entry as UTF-8")?;
-    if contents.len() as u64 > MAX_MIGRATION_REGISTRY_ENTRY_BYTES {
+    if contents.len() as u64 > MAX_COMPLETE_REGISTRY_ENTRY_BYTES {
         return Err("Ambient capture registry entry exceeds its size limit".to_string());
     }
-    Ok(contents)
+    Ok(Some(contents))
 }
 
 impl PodCaptureSource for DirectoryCaptureSource {
@@ -233,34 +363,34 @@ impl PodCaptureSource for DirectoryCaptureSource {
         targets
     }
 
-    fn list_targets_for_migration(&self) -> Result<Vec<PodCaptureTarget>, String> {
-        let entries = std::fs::read_dir(&self.dir)
-            .map_err(|_| "could not scan Ambient capture registry for migration")?;
+    fn list_complete_targets(&self) -> Result<Vec<PodCaptureTarget>, String> {
+        let entries =
+            std::fs::read_dir(&self.dir).map_err(|_| "could not scan Ambient capture registry")?;
         let mut targets = Vec::new();
         for (index, entry) in entries.enumerate() {
-            if index >= MAX_MIGRATION_REGISTRY_ENTRIES {
-                return Err(
-                    "Ambient capture registry exceeds its migration entry limit".to_string()
-                );
+            if index >= MAX_COMPLETE_REGISTRY_ENTRIES {
+                return Err("Ambient capture registry exceeds its entry limit".to_string());
             }
-            let entry =
-                entry.map_err(|_| "could not enumerate Ambient capture registry for migration")?;
+            let entry = entry.map_err(|_| "could not enumerate Ambient capture registry")?;
             let pod_uid = entry
                 .file_name()
                 .into_string()
                 .map_err(|_| "Ambient capture registry entry name is not UTF-8")?;
             if pod_uid.starts_with('.') {
+                // Node-agent control entries (`.ready`, `.udp-ready`,
+                // `.pod-registry-entry.tmp.*`) co-located in this directory are
+                // not pods: skip them rather than parsing or retracting.
                 continue;
             }
-            if pod_uid.is_empty()
-                || pod_uid.contains("..")
-                || pod_uid.contains('/')
-                || pod_uid.contains('\\')
-            {
+            if !is_safe_pod_registry_uid(&pod_uid) {
                 return Err("Ambient capture registry entry name is unsafe".to_string());
             }
-            let contents = read_migration_registry_entry(&entry.path())?;
-            targets.push(parse_capture_target(pod_uid, &contents)?);
+            // A leaf that vanished between enumeration and open is a
+            // withdrawn pod, not an incomplete snapshot: skip it.
+            let Some(contents) = read_complete_registry_entry(&entry.path())? else {
+                continue;
+            };
+            targets.push(parse_complete_capture_target(pod_uid, &contents)?);
         }
         Ok(targets)
     }
@@ -1554,6 +1684,54 @@ mod tests {
     fn directory_source_absent_dir_is_empty_not_error() {
         let source = DirectoryCaptureSource::new("/definitely/not/a/dir");
         assert!(source.list_targets().is_empty());
+    }
+
+    /// Issue #4249: the node-agent unlinks a registry entry the instant a pod is
+    /// withdrawn, so an ordinary pod teardown races every strict scan between
+    /// `read_dir` yielding a leaf and the reader opening it. That leaf is a
+    /// withdrawn pod, not an incomplete snapshot — reporting it as a snapshot
+    /// error would retract the whole node's enrolled-destination index (and with
+    /// it every authenticated inbound relay on the node) for a poll interval on
+    /// each pod deletion, while proving nothing an absent entry does not already
+    /// prove. Every other open failure must still retract.
+    #[test]
+    fn a_registry_entry_that_vanished_before_it_was_opened_is_skipped_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let vanished = dir.path().join("6ba7b810-9dad-11d1-80b4-00c04fd430c8");
+        assert!(!vanished.exists());
+        assert_eq!(
+            read_complete_registry_entry(&vanished),
+            Ok(None),
+            "an already-unlinked leaf is a withdrawn pod, not a snapshot error"
+        );
+
+        // The surviving sibling still publishes: skipping the vanished leaf is
+        // not a partial publish of a snapshot that failed.
+        let present = "7ba7b810-9dad-11d1-80b4-00c04fd430c8";
+        let entry = dir.path().join(present);
+        std::fs::write(&entry, "/sys/fs/cgroup/pod\nipv4=10.0.0.7\n").unwrap();
+        let targets = DirectoryCaptureSource::new(dir.path())
+            .list_complete_targets()
+            .expect("a complete snapshot");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].pod_uid, present);
+    }
+
+    /// The skip above is scoped to ABSENCE. A symlinked entry is refused by
+    /// `O_NOFOLLOW` with `ELOOP`, not `ENOENT`, so it still retracts — including
+    /// when its target does not exist.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_entry_still_retracts_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let leaf = dir.path().join("8ba7b810-9dad-11d1-80b4-00c04fd430c8");
+        std::os::unix::fs::symlink(dir.path().join("absent"), &leaf).unwrap();
+        assert!(
+            DirectoryCaptureSource::new(dir.path())
+                .list_complete_targets()
+                .is_err(),
+            "a symlinked entry is refused, never mistaken for a withdrawn pod"
+        );
     }
 
     #[test]

@@ -11,6 +11,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::common::{empty_digest_header, generate_hmac_signature};
 
+use super::mesh_test_support::{
+    DEFAULT_NAMESPACE, DEFAULT_TRUST_DOMAIN, default_mesh_runtime, service_for, workload_for,
+};
+
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, CircuitBreakerConfig, Consumer, DispatchKind, GatewayConfig,
     PluginAssociation, PluginConfig, PluginScope, Proxy,
@@ -18,12 +22,23 @@ use ferrum_edge::config::types::{
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::identity::{SpiffeId, TrustDomain};
-use ferrum_edge::modes::mesh::MeshTrafficDirection;
 use ferrum_edge::modes::mesh::config::{
     AppProtocol, InboundRelayDenial, MeshConfig, MeshEgressUdpDestination,
     MeshEgressUdpDialEndpoint, MeshInboundRelayDestination, MeshInboundRelayHost,
-    ResolvedIngressListener, Workload, WorkloadPort, WorkloadSelector,
-    inbound_relay_destinations_from_workloads, inbound_relay_resolved_ip_is_loopback_namespace,
+    MeshWaypointBinding, MeshWaypointServiceRef, MultiClusterConfig, ResolvedIngressListener,
+    Workload, WorkloadPort, WorkloadSelector, inbound_relay_destinations_from_workloads,
+    inbound_relay_resolved_ip_is_loopback_namespace, own_address_port_bounds_from_workloads,
+};
+use ferrum_edge::modes::mesh::enrolled_destinations::{
+    EnrolledPodEntry, NodeLocalEnrolledDestinations, NodeLocalEnrolledDestinationsHandle,
+    NodeLocalEnrolledDestinationsManager,
+};
+use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+use ferrum_edge::modes::mesh::{
+    MeshRuntimeConfig, MeshTopology, MeshTrafficDirection, prepare_gateway_config_from_mesh_slice,
+};
+use ferrum_edge::proxy::netns_capture::{
+    DirectoryCaptureSource, PodCaptureSource, PodCaptureSourceIps, PodCaptureTarget,
 };
 use ferrum_edge::proxy::{
     ProxyState, start_proxy_listener_with_bound_listener,
@@ -1642,6 +1657,12 @@ fn sidecar_terminator_mesh() -> MeshConfig {
         ],
         inbound_relay_admits_accepted_local_address: true,
         inbound_relay_admits_loopback_namespace: true,
+        // What the apply path projects for an own-pod terminator: the
+        // per-address port bound of the record it owns (issue #4249). The
+        // own-address / loopback arms read only this.
+        inbound_relay_own_address_ports: own_address_port_bounds_from_workloads(&[
+            relay_guard_workload("app", &["10.244.1.7", "fd00:10:244:1::7"], &[8080]),
+        ]),
         ..MeshConfig::default()
     }
 }
@@ -1660,21 +1681,34 @@ fn ambient_terminator_mesh() -> MeshConfig {
             MeshInboundRelayDestination {
                 host: MeshInboundRelayHost::Ip(ip("10.244.1.7")),
                 ports: vec![8080],
+                enrollment: Default::default(),
+                registry_uncontested: true,
             },
             MeshInboundRelayDestination {
                 host: MeshInboundRelayHost::Ip(ip("127.0.0.1")),
                 ports: vec![8080],
+                enrollment: Default::default(),
+                registry_uncontested: true,
             },
             MeshInboundRelayDestination {
                 host: MeshInboundRelayHost::Name("localhost".to_string()),
                 ports: vec![8080],
+                enrollment: Default::default(),
+                registry_uncontested: true,
             },
             MeshInboundRelayDestination {
                 host: MeshInboundRelayHost::Name("app.localhost".to_string()),
                 ports: vec![8080],
+                enrollment: Default::default(),
+                registry_uncontested: true,
             },
         ],
         inbound_relay_admits_accepted_local_address: true,
+        // What the apply path projects for an own-pod terminator: the
+        // per-address port bound of the record it owns (issue #4249).
+        inbound_relay_own_address_ports: own_address_port_bounds_from_workloads(&[
+            relay_guard_workload("app", &["10.244.1.7", "127.0.0.1"], &[8080]),
+        ]),
         ..MeshConfig::default()
     }
 }
@@ -1928,10 +1962,14 @@ fn inbound_relay_admits_only_the_waypoint_termination_inventory() {
             MeshInboundRelayDestination {
                 host: MeshInboundRelayHost::Name("localhost.".to_string()),
                 ports: vec![8080],
+                enrollment: Default::default(),
+                registry_uncontested: true,
             },
             MeshInboundRelayDestination {
                 host: MeshInboundRelayHost::Name("app.localhost".to_string()),
                 ports: vec![8080],
+                enrollment: Default::default(),
+                registry_uncontested: true,
             },
         ],
         ..MeshConfig::default()
@@ -2331,6 +2369,1619 @@ fn inbound_relay_resolved_candidates_all_safe_returns_none_without_filtering() {
     );
 }
 
+// ── Termination inventory is per-OWNER, not per-identity (issues #4249/#4251) ─
+
+/// Prepare a serving snapshot from `slice` and hand back its mesh block.
+fn prepared_mesh(slice: &MeshSlice, runtime: &MeshRuntimeConfig) -> Box<MeshConfig> {
+    prepare_gateway_config_from_mesh_slice(slice, runtime)
+        .expect("slice → config")
+        .mesh
+        .expect("prepared mesh")
+}
+
+/// Issue #4249: a shared SPIFFE id is a service-account identity, not
+/// ownership. The `Sidecar` / `Ambient` termination inventory is built with the
+/// same LOCAL-workload predicate the slice builder uses, so a same-identity
+/// record the slice places in another CLUSTER — or one carrying labels this
+/// workload does not have, i.e. a sibling replica on another node — is not a
+/// destination this proxy terminates for.
+#[test]
+fn inbound_relay_own_identity_inventory_requires_cluster_and_label_locality() {
+    let own_spiffe = format!("spiffe://{DEFAULT_TRUST_DOMAIN}/ns/{DEFAULT_NAMESPACE}/sa/reviews");
+
+    let mut own = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["10.244.5.5"],
+    );
+    own.cluster = Some("cluster-a".to_string());
+    // Same SPIFFE, remote cluster: `tag_remote_workloads` preserves a remote
+    // endpoint's identity, so an identity-only filter admits it and would dial
+    // it in plaintext, bypassing the east-west gateway's inner mTLS.
+    let mut remote_replica = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["10.244.7.7"],
+    );
+    remote_replica.cluster = Some("cluster-b".to_string());
+    // Same SPIFFE and cluster, labels this workload does not carry.
+    let mut label_mismatch = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews"), ("version", "canary")],
+        ["10.244.8.8"],
+    );
+    label_mismatch.cluster = Some("cluster-a".to_string());
+
+    let slice = MeshSlice {
+        node_id: "mesh-test-node".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        version: "test".to_string(),
+        workloads: vec![own, remote_replica, label_mismatch],
+        multi_cluster: Some(MultiClusterConfig {
+            local_cluster: Some("cluster-a".to_string()),
+            ..MultiClusterConfig::default()
+        }),
+        ..MeshSlice::default()
+    };
+    let runtime = MeshRuntimeConfig {
+        topology: MeshTopology::Ambient,
+        workload_spiffe_id: Some(own_spiffe),
+        workload_labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
+        ..default_mesh_runtime()
+    };
+
+    let mesh = prepared_mesh(&slice, &runtime);
+    // A ztunnel-style proxy's socket address is the node, not a workload, so
+    // nothing below rides in on the own-address arm.
+    let node = Some(ip("10.244.0.1"));
+
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(()),
+        "this proxy's own local workload record stays a termination destination"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.7.7", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a same-identity record in another cluster must not be an own-pod destination"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.8.8", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a same-identity sibling whose labels this workload does not carry must be refused"
+    );
+}
+
+/// Issue #4249: several workload records can legitimately declare ONE address —
+/// `hostNetwork` pods all declare the node IP — so the own-address arm and the
+/// own-namespace loopback shortcut take their port bound from the records this
+/// terminator OWNS. A co-located pod's app port must not become reachable
+/// through this proxy just because it shares the address.
+#[test]
+fn inbound_relay_own_address_port_bound_excludes_co_located_workloads() {
+    let own_spiffe = format!("spiffe://{DEFAULT_TRUST_DOMAIN}/ns/{DEFAULT_NAMESPACE}/sa/reviews");
+
+    // Both records declare the shared (host-network) address; only the first is
+    // this terminator's own, and it serves 8080 only.
+    let own = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["10.244.5.5"],
+    );
+    let mut co_located = workload_for(
+        "ratings",
+        DEFAULT_NAMESPACE,
+        [("app", "ratings")],
+        ["10.244.5.5"],
+    );
+    co_located.ports = vec![WorkloadPort {
+        port: 9443,
+        protocol: AppProtocol::Http,
+        name: Some("admin".to_string()),
+    }];
+
+    let slice = MeshSlice {
+        node_id: "mesh-test-node".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        version: "test".to_string(),
+        workloads: vec![own, co_located],
+        ..MeshSlice::default()
+    };
+    let runtime = MeshRuntimeConfig {
+        topology: MeshTopology::Sidecar,
+        workload_spiffe_id: Some(own_spiffe),
+        ..default_mesh_runtime()
+    };
+
+    let mesh = prepared_mesh(&slice, &runtime);
+    // The peer reached this pod at the shared address on this socket.
+    let own_ip = Some(ip("10.244.5.5"));
+
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, own_ip),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 9443, own_ip),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "a co-located workload's port must not widen the own-address bound"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("127.0.0.1", 8080, own_ip),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("localhost", 9443, own_ip),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "the own-namespace loopback shortcut is bounded by the same owned records"
+    );
+}
+
+/// The pod UIDs the node-agent registry keys these fixtures by. Real registry
+/// keys are Kubernetes `metadata.uid` values; the guard only compares them.
+const LOCAL_POD_UID: &str = "5a3c2f4e-0c11-4b2c-9c3a-000000000001";
+const OTHER_POD_UID: &str = "5a3c2f4e-0c11-4b2c-9c3a-000000000002";
+
+/// Publish `entries` into a fresh node-local enrolled-pod index and bind it to
+/// `mesh` exactly as the mesh serving runtime's registry poller does, returning
+/// the index so a test can re-publish (pod churn) or retract it.
+fn bind_enrolled_registry(
+    mesh: &mut MeshConfig,
+    entries: &[EnrolledPodEntry],
+) -> Arc<NodeLocalEnrolledDestinations> {
+    let index = Arc::new(NodeLocalEnrolledDestinations::new());
+    index.publish(entries);
+    let handle = NodeLocalEnrolledDestinationsHandle::new(index.clone());
+    mesh.inbound_relay_node_local_registry = handle;
+    index
+}
+
+fn enrolled(pod_uid: &str, identity: &str, address: &str) -> EnrolledPodEntry {
+    EnrolledPodEntry {
+        pod_uid: pod_uid.to_string(),
+        identity: Some(identity.to_string()),
+        addresses: vec![ip(address)],
+    }
+}
+
+fn write_strict_registry_entry(dir: &std::path::Path, pod_uid: &str, ipv4: &str, spiffe: &str) {
+    std::fs::write(
+        dir.join(pod_uid),
+        format!("/sys/fs/cgroup/kubepods/{pod_uid}\nspiffe_id={spiffe}\nipv4={ipv4}\n"),
+    )
+    .expect("strict registry entry");
+}
+
+fn strict_registry_manager(
+    source: Arc<dyn PodCaptureSource>,
+    index: Arc<NodeLocalEnrolledDestinations>,
+) -> NodeLocalEnrolledDestinationsManager {
+    NodeLocalEnrolledDestinationsManager::new(source, index, std::time::Duration::from_secs(2))
+}
+
+fn reviews_spiffe() -> String {
+    format!("spiffe://{DEFAULT_TRUST_DOMAIN}/ns/{DEFAULT_NAMESPACE}/sa/reviews")
+}
+
+/// One Ambient slice carrying `workloads`, all in the local cluster.
+fn ambient_relay_fixture(workloads: Vec<Workload>) -> (MeshSlice, MeshRuntimeConfig) {
+    let slice = MeshSlice {
+        node_id: "mesh-test-node".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        version: "test".to_string(),
+        workloads,
+        multi_cluster: Some(MultiClusterConfig {
+            local_cluster: Some("cluster-a".to_string()),
+            ..MultiClusterConfig::default()
+        }),
+        ..MeshSlice::default()
+    };
+    let runtime = MeshRuntimeConfig {
+        topology: MeshTopology::Ambient,
+        workload_spiffe_id: Some(reviews_spiffe()),
+        workload_labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
+        ..default_mesh_runtime()
+    };
+    (slice, runtime)
+}
+
+/// A `reviews` replica in the local cluster carrying the shared pod-template
+/// labels — the shape `workload_is_local` cannot tell apart.
+fn reviews_replica(pod_address: &'static str, pod_uid: &str) -> Workload {
+    let mut workload = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        [pod_address],
+    );
+    workload.cluster = Some("cluster-a".to_string());
+    workload.pod_uid = Some(pod_uid.to_string());
+    workload
+}
+
+/// Issue #4249, the residual this closes: two replicas of ONE Deployment share
+/// a service-account SPIFFE id, a cluster, AND their pod-template labels while
+/// running on different nodes. `workload_is_local` compares exactly those three
+/// facts, so it admits the off-node sibling — the assertion below states that
+/// explicitly rather than assuming it.
+///
+/// The node bound is the node-agent's enrolled-pod registry. Once it is
+/// authoritative only the replica this node actually enrols is a destination;
+/// the identical sibling is refused `AddressNotTerminated`, with no per-entry
+/// fallback to identity matching.
+#[test]
+fn inbound_relay_ambient_registry_refuses_same_identity_sibling_on_another_node() {
+    let own_spiffe = reviews_spiffe();
+    let local = reviews_replica("10.244.5.5", LOCAL_POD_UID);
+    // Byte-for-byte the same identity, cluster and labels. Only the pod — and
+    // the node whose agent enrols it — differs.
+    let off_node_sibling = reviews_replica("10.244.9.9", OTHER_POD_UID);
+    let (slice, runtime) = ambient_relay_fixture(vec![local, off_node_sibling]);
+
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    // A ztunnel-style proxy's socket address is the node, not a workload, so
+    // nothing below rides in on the own-address arm.
+    let node = Some(ip("10.244.0.1"));
+
+    // With no registry configured the identity/cluster/label predicate is the
+    // only bound, and it admits BOTH replicas. That is the documented
+    // no-registry fallback AND the exact gap #4249 tracks.
+    assert!(
+        !mesh.inbound_relay_node_local_registry.is_authoritative(),
+        "a config prepared outside a serving mesh runtime carries no registry"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.9.9", 8080, node),
+        Ok(()),
+        "identity + cluster + labels alone do NOT exclude a same-workload replica \
+         on another node; the node bound has to come from somewhere else"
+    );
+
+    // Bind the node-agent's registry: this node enrols the local replica only.
+    let enrollment = [enrolled(LOCAL_POD_UID, &own_spiffe, "10.244.5.5")];
+    bind_enrolled_registry(&mut mesh, &enrollment);
+
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(()),
+        "the replica this node's agent actually enrols stays a termination destination"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.9.9", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a same-cluster, same-SPIFFE, same-label sibling this node does not enrol \
+         must be refused, not fall back to identity matching"
+    );
+}
+
+/// Issue #4249: an ENROLLED address is not enough on its own — the enrolled pod
+/// must be the one the slice record names. A pod address recycled onto another
+/// pod (the ABA case the registry key exists to catch), or enrolled under
+/// another attested identity, is refused.
+#[test]
+fn inbound_relay_ambient_registry_binds_admission_to_the_enrolled_pod() {
+    let own_spiffe = reviews_spiffe();
+    let ratings_spiffe =
+        format!("spiffe://{DEFAULT_TRUST_DOMAIN}/ns/{DEFAULT_NAMESPACE}/sa/ratings");
+    let local = reviews_replica("10.244.5.5", LOCAL_POD_UID);
+    let (slice, runtime) = ambient_relay_fixture(vec![local]);
+
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let node = Some(ip("10.244.0.1"));
+
+    // The address is enrolled, but by a DIFFERENT pod than the slice names.
+    let recycled = [enrolled(OTHER_POD_UID, &own_spiffe, "10.244.5.5")];
+    bind_enrolled_registry(&mut mesh, &recycled);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "an enrolled address owned by another pod UID is not this record's destination"
+    );
+
+    // Same pod UID, attested by the node-agent under another workload identity.
+    let misattested = [enrolled(LOCAL_POD_UID, &ratings_spiffe, "10.244.5.5")];
+    bind_enrolled_registry(&mut mesh, &misattested);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "an enrolled pod attested under another identity is not this record's destination"
+    );
+
+    // The matching enrollment admits.
+    let matching = [enrolled(LOCAL_POD_UID, &own_spiffe, "10.244.5.5")];
+    bind_enrolled_registry(&mut mesh, &matching);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+}
+
+/// Issue #4249: registry churn must remove admission within the poller's own
+/// bounded lifecycle, never leave a stale fail-open entry. A withdrawn pod
+/// stops being a destination on the next published generation, and a retracted
+/// index (shutdown, aborted poller) vouches for nothing at all. The mesh slice
+/// is unchanged throughout.
+#[test]
+fn inbound_relay_ambient_registry_withdrawal_removes_admission() {
+    let own_spiffe = reviews_spiffe();
+    let local = reviews_replica("10.244.5.5", LOCAL_POD_UID);
+    let (slice, runtime) = ambient_relay_fixture(vec![local]);
+
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let node = Some(ip("10.244.0.1"));
+
+    let enrollment = [enrolled(LOCAL_POD_UID, &own_spiffe, "10.244.5.5")];
+    let index = bind_enrolled_registry(&mut mesh, &enrollment);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+
+    // The node-agent withdrew the pod; the next published generation stops
+    // admitting it.
+    index.publish(&[]);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a withdrawn pod must leave the admitted set with the registry generation, \
+         not at the next mesh apply"
+    );
+
+    // A re-enrolled pod is admitted again; a retracted index refuses.
+    index.publish(&enrollment);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+    index.clear();
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a retracted index vouches for nothing; it must not fall back to the slice view"
+    );
+}
+
+/// Issue #4249: an address two DIFFERENT enrolled pods claim is ambiguous and
+/// is refused for both, mirroring the contested-interface rule the host-UDP
+/// planner already applies. The registry cannot say which pod owns it, and
+/// guessing would relay to one pod under the other's enrollment.
+#[test]
+fn inbound_relay_ambient_registry_refuses_a_contested_enrolled_address() {
+    let own_spiffe = reviews_spiffe();
+    let local = reviews_replica("10.244.5.5", LOCAL_POD_UID);
+    let (slice, runtime) = ambient_relay_fixture(vec![local]);
+
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let node = Some(ip("10.244.0.1"));
+
+    let contested = [
+        enrolled(LOCAL_POD_UID, &own_spiffe, "10.244.5.5"),
+        enrolled(OTHER_POD_UID, &own_spiffe, "10.244.5.5"),
+    ];
+    bind_enrolled_registry(&mut mesh, &contested);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "an address claimed by two enrolled pods must be refused for both"
+    );
+}
+
+/// Issue #4249: while the registry is authoritative a DECLARED NAME is refused
+/// outright. The guard never resolves a name, and whatever address a dial would
+/// resolve it to is selected AFTER this decision — DNS may answer with an
+/// off-node sibling, or with anything else — so no evidence checked here would
+/// still bind the socket. Admitting a name because some record sharing it
+/// declares an enrolled address is exactly the union this must not perform.
+#[test]
+fn inbound_relay_ambient_registry_refuses_declared_name_destinations() {
+    let own_spiffe = reviews_spiffe();
+
+    // A workload declared ONLY by DNS name — the `ServiceEntry`/`WorkloadEntry`
+    // /VM shape node-local enrollment cannot express.
+    let named_only = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["enrolled-echo.live.ferrum.test"],
+    );
+    // A record sharing that same name while ALSO declaring the enrolled pod
+    // address. Merging the two and admitting the name because this one is
+    // enrolled would make the name relayable even though DNS may resolve it to
+    // the other record's (unenrolled, possibly off-node) pod.
+    let mut named_and_enrolled = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["enrolled-echo.live.ferrum.test", "10.244.5.5"],
+    );
+    named_and_enrolled.pod_uid = Some(LOCAL_POD_UID.to_string());
+    named_and_enrolled.cluster = Some("cluster-a".to_string());
+    let (slice, runtime) = ambient_relay_fixture(vec![named_only, named_and_enrolled]);
+
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let node = Some(ip("10.244.0.1"));
+
+    let named = "enrolled-echo.live.ferrum.test";
+    // Before the registry is bound the name is admitted on the identity /
+    // locality bound alone — the documented no-registry fallback.
+    assert!(!mesh.inbound_relay_node_local_registry.is_authoritative());
+    assert_eq!(
+        mesh.inbound_relay_destination_decision(named, 8080, node),
+        Ok(())
+    );
+
+    let enrollment = [enrolled(LOCAL_POD_UID, &own_spiffe, "10.244.5.5")];
+    bind_enrolled_registry(&mut mesh, &enrollment);
+
+    assert_eq!(
+        mesh.inbound_relay_destination_decision(named, 8080, node),
+        Err(InboundRelayDenial::UnresolvableHost),
+        "an authoritative registry must refuse a declared name outright, even when a \
+         record sharing that name declares an address this node does enrol"
+    );
+    // The enrolled ADDRESS itself stays relayable: refusing the name is not a
+    // refusal of the pod.
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+}
+
+/// Issue #4249: several workload records can declare ONE address while
+/// belonging to DIFFERENT pods (`hostNetwork` pods all declare the node IP).
+/// While the registry is authoritative each record is judged on its OWN pod
+/// UID against the enrolled owner, so the sibling's ports are refused without
+/// also refusing the enrolled pod. Absent pod-UID evidence is the case the
+/// registry cannot separate; that is covered by
+/// `inbound_relay_ambient_registry_refuses_uidless_record_contesting_enrolled_address`.
+#[test]
+fn inbound_relay_ambient_registry_separates_shared_address_claimed_by_different_pods() {
+    let own_spiffe = reviews_spiffe();
+
+    let mut enrolled_pod = reviews_replica("10.244.5.5", LOCAL_POD_UID);
+    enrolled_pod.ports = vec![WorkloadPort {
+        port: 8080,
+        protocol: AppProtocol::Http,
+        name: Some("http".to_string()),
+    }];
+    // Same declared address, same SPIFFE / cluster / labels, DIFFERENT pod —
+    // and a port the enrolled pod does not serve.
+    let mut unenrolled_sibling = reviews_replica("10.244.5.5", OTHER_POD_UID);
+    unenrolled_sibling.ports = vec![WorkloadPort {
+        port: 9443,
+        protocol: AppProtocol::Http,
+        name: Some("admin".to_string()),
+    }];
+    let (slice, runtime) = ambient_relay_fixture(vec![enrolled_pod, unenrolled_sibling]);
+
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let node = Some(ip("10.244.0.1"));
+
+    assert!(!mesh.inbound_relay_node_local_registry.is_authoritative());
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 9443, node),
+        Ok(()),
+        "without a registry, the documented identity/locality fallback still admits both records"
+    );
+
+    let enrollment = [enrolled(LOCAL_POD_UID, &own_spiffe, "10.244.5.5")];
+    bind_enrolled_registry(&mut mesh, &enrollment);
+
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(()),
+        "both records carry a pod UID, so the registry separates them: the \
+         enrolled pod is admitted on the port its OWN record declares"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 9443, node),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "the unenrolled sibling's pod UID does not match the registry owner, so \
+         its port is never admitted — that is the issue #4249 property, and it \
+         does not require refusing the enrolled pod as well"
+    );
+}
+
+/// Issue #4249: `WorkloadEntry` records carry no pod UID. If one declares an
+/// enrolled pod's IP under the same service-account identity, identity-only
+/// enrollment comparison would otherwise let it widen the admitted port set.
+/// A lone UID-less record remains valid; only the shared-address contest is
+/// refused once the registry is authoritative.
+#[test]
+fn inbound_relay_ambient_registry_refuses_uidless_record_contesting_enrolled_address() {
+    let own_spiffe = reviews_spiffe();
+
+    let mut enrolled_pod = reviews_replica("10.244.5.5", LOCAL_POD_UID);
+    enrolled_pod.ports = vec![WorkloadPort {
+        port: 8080,
+        protocol: AppProtocol::Http,
+        name: Some("http".to_string()),
+    }];
+    let mut uidless_record = reviews_replica("10.244.5.5", OTHER_POD_UID);
+    uidless_record.pod_uid = None;
+    uidless_record.ports = vec![WorkloadPort {
+        port: 9443,
+        protocol: AppProtocol::Http,
+        name: Some("operator-admin".to_string()),
+    }];
+    let mut lone_uidless_record = reviews_replica("10.244.5.6", OTHER_POD_UID);
+    lone_uidless_record.pod_uid = None;
+    lone_uidless_record.ports = vec![WorkloadPort {
+        port: 7070,
+        protocol: AppProtocol::Http,
+        name: Some("vm-http".to_string()),
+    }];
+    let (slice, runtime) =
+        ambient_relay_fixture(vec![enrolled_pod, uidless_record, lone_uidless_record]);
+
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let node = Some(ip("10.244.0.1"));
+
+    // First pin the old/no-registry behavior: both records pass the shared
+    // identity, cluster, and labels bound. The later refusal is therefore the
+    // registry-bounded contested-address rule, not a fixture mismatch.
+    assert!(!mesh.inbound_relay_node_local_registry.is_authoritative());
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 9443, node),
+        Ok(()),
+        "a UID-less same-identity record widens the no-registry fallback"
+    );
+
+    let enrollment = [
+        enrolled(LOCAL_POD_UID, &own_spiffe, "10.244.5.5"),
+        enrolled(OTHER_POD_UID, &own_spiffe, "10.244.5.6"),
+    ];
+    bind_enrolled_registry(&mut mesh, &enrollment);
+
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a UID-less sibling makes the address contested for every claimant"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 9443, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "the UID-less record must not widen the enrolled pod's admitted ports"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 7070, node),
+        Ok(()),
+        "a lone UID-less WorkloadEntry / VM record at an enrolled IP stays admissible"
+    );
+}
+
+struct StaticCaptureSource(Vec<PodCaptureTarget>);
+
+impl PodCaptureSource for StaticCaptureSource {
+    fn list_targets(&self) -> Vec<PodCaptureTarget> {
+        self.0.clone()
+    }
+}
+
+struct IncompleteCaptureSource;
+
+impl PodCaptureSource for IncompleteCaptureSource {
+    fn list_targets(&self) -> Vec<PodCaptureTarget> {
+        panic!("the relay-guard manager must not use the permissive list_targets scan");
+    }
+
+    fn list_complete_targets(&self) -> Result<Vec<PodCaptureTarget>, String> {
+        Err("registry snapshot was not complete".to_string())
+    }
+}
+
+fn capture_target(pod_uid: &str, ipv4: &str) -> PodCaptureTarget {
+    PodCaptureTarget {
+        pod_uid: pod_uid.to_string(),
+        cgroup_path: format!("/sys/fs/cgroup/kubepods/{pod_uid}"),
+        source_identity: None,
+        source_ips: PodCaptureSourceIps {
+            ipv4: Some(ipv4.parse().expect("fixture ipv4")),
+            ipv6: None,
+        },
+    }
+}
+
+/// In-memory sources stay testable through the default complete-snapshot
+/// implementation (`Ok(list_targets())`). An `Err` from that method must
+/// retract last-good immediately rather than retain or partially publish.
+#[test]
+fn inbound_relay_registry_manager_publishes_complete_snapshots_and_retracts_on_error() {
+    let local = reviews_replica("10.244.5.5", LOCAL_POD_UID);
+    let (slice, runtime) = ambient_relay_fixture(vec![local]);
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let node = Some(ip("10.244.0.1"));
+    let index = Arc::new(NodeLocalEnrolledDestinations::new());
+    mesh.inbound_relay_node_local_registry =
+        NodeLocalEnrolledDestinationsHandle::new(index.clone());
+
+    let publisher = strict_registry_manager(
+        Arc::new(StaticCaptureSource(vec![capture_target(
+            LOCAL_POD_UID,
+            "10.244.5.5",
+        )])),
+        index.clone(),
+    );
+    let published = publisher.reconcile_once();
+    assert_eq!(published.len(), 1);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(()),
+        "a complete in-memory snapshot must publish"
+    );
+
+    let retractor = strict_registry_manager(Arc::new(IncompleteCaptureSource), index);
+    assert!(retractor.reconcile_once().is_empty());
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "an incomplete snapshot must retract last-good rather than retain it"
+    );
+}
+
+/// Production `DirectoryCaptureSource` is the strict reader the relay guard
+/// must consume. A valid snapshot publishes; a malformed sibling entry is not
+/// skipped — the whole index retracts, including previously admitted pods —
+/// and a later complete snapshot recovers.
+#[test]
+fn inbound_relay_registry_malformed_production_entry_retracts_then_recovers() {
+    let own_spiffe = reviews_spiffe();
+    let local = reviews_replica("10.244.5.5", LOCAL_POD_UID);
+    let other = reviews_replica("10.244.5.6", OTHER_POD_UID);
+    let (slice, runtime) = ambient_relay_fixture(vec![local, other]);
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let node = Some(ip("10.244.0.1"));
+    let index = Arc::new(NodeLocalEnrolledDestinations::new());
+    mesh.inbound_relay_node_local_registry =
+        NodeLocalEnrolledDestinationsHandle::new(index.clone());
+
+    let dir = tempfile::tempdir().expect("registry");
+    write_strict_registry_entry(dir.path(), LOCAL_POD_UID, "10.244.5.5", &own_spiffe);
+    write_strict_registry_entry(dir.path(), OTHER_POD_UID, "10.244.5.6", &own_spiffe);
+    let manager = strict_registry_manager(Arc::new(DirectoryCaptureSource::new(dir.path())), index);
+
+    assert_eq!(manager.reconcile_once().len(), 2);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 8080, node),
+        Ok(())
+    );
+
+    std::fs::write(dir.path().join(OTHER_POD_UID), b"").expect("malformed registry entry");
+    assert!(manager.reconcile_once().is_empty());
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a malformed sibling must retract the whole index, not skip the bad file \
+         and keep last-good or the remaining valid entry"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+
+    write_strict_registry_entry(dir.path(), OTHER_POD_UID, "10.244.5.6", &own_spiffe);
+    assert_eq!(manager.reconcile_once().len(), 2);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(()),
+        "a later complete snapshot must be allowed to republish"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 8080, node),
+        Ok(())
+    );
+}
+
+/// Strict `list_complete_targets` distinguishes an omitted optional field from a
+/// present malformed one. A valid complete registry publishes; a present invalid
+/// `spiffe_id=` retracts instead of becoming missing evidence (so the address
+/// cannot still admit on address/pod-UID alone); invalid IPv4/IPv6, duplicate
+/// recognized keys, unknown content, and an unsafe pod-UID filename each retract
+/// the whole last-good index; repairing the entry republishes. Hidden
+/// dot-prefixed registry control entries are skipped rather than parsed as pods.
+/// `list_targets` remains the best-effort scan and is not what the manager uses.
+#[test]
+fn inbound_relay_registry_strict_parse_retracts_malformed_evidence_then_recovers() {
+    let own_spiffe = reviews_spiffe();
+    let local = reviews_replica("10.244.5.5", LOCAL_POD_UID);
+    let other = reviews_replica("10.244.5.6", OTHER_POD_UID);
+    let (slice, runtime) = ambient_relay_fixture(vec![local, other]);
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let node = Some(ip("10.244.0.1"));
+    let index = Arc::new(NodeLocalEnrolledDestinations::new());
+    mesh.inbound_relay_node_local_registry =
+        NodeLocalEnrolledDestinationsHandle::new(index.clone());
+
+    let dir = tempfile::tempdir().expect("registry");
+    write_strict_registry_entry(dir.path(), LOCAL_POD_UID, "10.244.5.5", &own_spiffe);
+    write_strict_registry_entry(dir.path(), OTHER_POD_UID, "10.244.5.6", &own_spiffe);
+    std::fs::create_dir_all(dir.path().join(".ready")).expect("ready control dir");
+    std::fs::write(dir.path().join(".ready").join("marker"), b"").expect("ready marker");
+    std::fs::create_dir_all(dir.path().join(".udp-ready")).expect("udp-ready control dir");
+    std::fs::write(dir.path().join(".udp-ready").join(LOCAL_POD_UID), b"")
+        .expect("udp-ready marker");
+    let source = DirectoryCaptureSource::new(dir.path());
+    let manager = strict_registry_manager(
+        Arc::new(DirectoryCaptureSource::new(dir.path())),
+        index.clone(),
+    );
+
+    assert_eq!(
+        manager.reconcile_once().len(),
+        2,
+        "a valid complete registry must publish, skipping hidden control entries"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 8080, node),
+        Ok(())
+    );
+
+    let local_body = |spiffe: &str, ipv4: &str, extra: &str| {
+        format!("/sys/fs/cgroup/kubepods/{LOCAL_POD_UID}\nspiffe_id={spiffe}\nipv4={ipv4}\n{extra}")
+    };
+    let other_body = |spiffe: &str, ipv4: &str, extra: &str| {
+        format!("/sys/fs/cgroup/kubepods/{OTHER_POD_UID}\nspiffe_id={spiffe}\nipv4={ipv4}\n{extra}")
+    };
+
+    std::fs::write(
+        dir.path().join(LOCAL_POD_UID),
+        local_body("not-a-spiffe", "10.244.5.5", ""),
+    )
+    .expect("invalid spiffe_id");
+    let permissive = source.list_targets();
+    assert!(
+        permissive
+            .iter()
+            .any(|target| { target.pod_uid == LOCAL_POD_UID && target.source_identity.is_none() }),
+        "the best-effort scan must keep the pod and treat a present malformed \
+         spiffe_id= as absent identity"
+    );
+    assert!(
+        source.list_complete_targets().is_err(),
+        "the complete snapshot must refuse a present malformed spiffe_id="
+    );
+    assert!(manager.reconcile_once().is_empty());
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a present invalid spiffe_id= must retract rather than publish missing evidence"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a malformed sibling must retract the whole last-good index"
+    );
+    assert!(
+        !index.terminates_for(ip("10.244.5.5"), None, Some(LOCAL_POD_UID)),
+        "malformed identity must not still admit the address on address/pod-UID alone"
+    );
+    assert!(
+        !index.terminates_for(
+            ip("10.244.5.5"),
+            Some(own_spiffe.as_str()),
+            Some(LOCAL_POD_UID),
+        ),
+        "malformed identity must not skip the identity comparison by becoming None"
+    );
+
+    write_strict_registry_entry(dir.path(), LOCAL_POD_UID, "10.244.5.5", &own_spiffe);
+    assert_eq!(manager.reconcile_once().len(), 2);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+
+    let poisons = [
+        (
+            "invalid ipv4",
+            OTHER_POD_UID,
+            other_body(&own_spiffe, "not-an-ipv4", ""),
+        ),
+        (
+            "invalid ipv6",
+            OTHER_POD_UID,
+            other_body(&own_spiffe, "10.244.5.6", "ipv6=not-an-ipv6\n"),
+        ),
+        (
+            "duplicate recognized key",
+            OTHER_POD_UID,
+            other_body(&own_spiffe, "10.244.5.6", "ipv4=10.244.5.7\n"),
+        ),
+        (
+            "unknown content",
+            OTHER_POD_UID,
+            other_body(&own_spiffe, "10.244.5.6", "hostname=evil.example\n"),
+        ),
+        (
+            "empty spiffe_id",
+            OTHER_POD_UID,
+            format!("/sys/fs/cgroup/kubepods/{OTHER_POD_UID}\nspiffe_id=\nipv4=10.244.5.6\n"),
+        ),
+    ];
+    for (reason, uid, body) in poisons {
+        std::fs::write(dir.path().join(uid), body).expect("poison registry entry");
+        assert!(
+            manager.reconcile_once().is_empty(),
+            "{reason}: complete snapshot must retract"
+        );
+        assert_eq!(
+            mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+            Err(InboundRelayDenial::AddressNotTerminated),
+            "{reason}: last-good must not be retained"
+        );
+        assert_eq!(
+            mesh.inbound_relay_destination_decision("10.244.5.6", 8080, node),
+            Err(InboundRelayDenial::AddressNotTerminated),
+            "{reason}: partial publish of the remaining valid file is forbidden"
+        );
+        write_strict_registry_entry(dir.path(), OTHER_POD_UID, "10.244.5.6", &own_spiffe);
+        assert_eq!(
+            manager.reconcile_once().len(),
+            2,
+            "{reason}: repairing the entry must allow republish"
+        );
+        assert_eq!(
+            mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+            Ok(()),
+            "{reason}: repaired snapshot must recover the sibling"
+        );
+        assert_eq!(
+            mesh.inbound_relay_destination_decision("10.244.5.6", 8080, node),
+            Ok(())
+        );
+    }
+
+    let unsafe_name = "uid with space";
+    std::fs::write(
+        dir.path().join(unsafe_name),
+        b"/sys/fs/cgroup/x\nipv4=10.0.0.9\n",
+    )
+    .expect("unsafe pod-UID filename");
+    assert!(
+        manager.reconcile_once().is_empty(),
+        "an unsafe pod-UID filename must retract the last-good index"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+    std::fs::remove_file(dir.path().join(unsafe_name)).expect("remove unsafe name");
+    assert_eq!(
+        manager.reconcile_once().len(),
+        2,
+        "removing the unsafe leaf must allow republish"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 8080, node),
+        Ok(())
+    );
+}
+
+/// A path-safe alphanumeric registry leaf is a valid filename, but pairing it
+/// with `spiffe_id=` does not produce a `UdpSourceIdentity`: production
+/// identity binding requires a Kubernetes UUID. The strict complete snapshot
+/// must retract rather than publish missing evidence (the live #4258 timeout
+/// was this fixture shape). Permissive `list_targets` may keep the pod with
+/// `source_identity=None`; that scan is not what the inbound relay uses.
+#[test]
+fn inbound_relay_registry_strict_parse_retracts_spiffe_on_non_uuid_leaf() {
+    let own_spiffe = reviews_spiffe();
+    let local = reviews_replica("10.244.5.5", LOCAL_POD_UID);
+    let (slice, runtime) = ambient_relay_fixture(vec![local]);
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let node = Some(ip("10.244.0.1"));
+    let index = Arc::new(NodeLocalEnrolledDestinations::new());
+    mesh.inbound_relay_node_local_registry =
+        NodeLocalEnrolledDestinationsHandle::new(index.clone());
+
+    let dir = tempfile::tempdir().expect("registry");
+    write_strict_registry_entry(dir.path(), LOCAL_POD_UID, "10.244.5.5", &own_spiffe);
+    let source = DirectoryCaptureSource::new(dir.path());
+    let manager = strict_registry_manager(
+        Arc::new(DirectoryCaptureSource::new(dir.path())),
+        index.clone(),
+    );
+    assert_eq!(manager.reconcile_once().len(), 1);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+
+    let safe_non_uuid = "functional-udp-enrolled-destination-pod";
+    std::fs::write(
+        dir.path().join(safe_non_uuid),
+        format!(
+            "/sys/fs/cgroup/kubepods/{safe_non_uuid}\nspiffe_id={own_spiffe}\nipv4=10.244.5.7\n"
+        ),
+    )
+    .expect("path-safe non-UUID leaf with identity");
+
+    let permissive = source.list_targets();
+    assert!(
+        permissive
+            .iter()
+            .any(|target| { target.pod_uid == safe_non_uuid && target.source_identity.is_none() }),
+        "the best-effort scan must keep the path-safe leaf and treat the unbound \
+         identity as absent"
+    );
+    assert!(
+        source.list_complete_targets().is_err(),
+        "the complete snapshot must refuse spiffe_id= bound to a non-UUID pod UID"
+    );
+    assert!(manager.reconcile_once().is_empty());
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a sibling with spiffe_id= on a non-UUID leaf must retract the whole last-good index"
+    );
+    assert!(
+        !index.terminates_for(
+            ip("10.244.5.7"),
+            Some(own_spiffe.as_str()),
+            Some(safe_non_uuid),
+        ),
+        "the non-UUID identity binding must not still admit on address/pod-UID alone"
+    );
+
+    std::fs::remove_file(dir.path().join(safe_non_uuid)).expect("remove non-UUID leaf");
+    assert_eq!(manager.reconcile_once().len(), 1);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(()),
+        "removing the non-UUID identity-bound leaf must allow republish"
+    );
+}
+
+/// Unsafe names, oversized files, and Unix symlinks are the production
+/// filesystem shapes the strict reader refuses. Each must retract a
+/// previously valid publish; repairing the directory recovers.
+#[test]
+fn inbound_relay_registry_unsafe_oversized_or_symlinked_entry_retracts_then_recovers() {
+    let own_spiffe = reviews_spiffe();
+    let local = reviews_replica("10.244.5.5", LOCAL_POD_UID);
+    let (slice, runtime) = ambient_relay_fixture(vec![local]);
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let node = Some(ip("10.244.0.1"));
+    let index = Arc::new(NodeLocalEnrolledDestinations::new());
+    mesh.inbound_relay_node_local_registry =
+        NodeLocalEnrolledDestinationsHandle::new(index.clone());
+
+    let dir = tempfile::tempdir().expect("registry");
+    write_strict_registry_entry(dir.path(), LOCAL_POD_UID, "10.244.5.5", &own_spiffe);
+    let manager = strict_registry_manager(
+        Arc::new(DirectoryCaptureSource::new(dir.path())),
+        index.clone(),
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "the index admits nothing before the first complete publish"
+    );
+    assert_eq!(manager.reconcile_once().len(), 1);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+
+    std::fs::write(
+        dir.path().join("pod..unsafe"),
+        b"/sys/fs/cgroup/x\nipv4=10.0.0.9\n",
+    )
+    .expect("unsafe name");
+    assert!(manager.reconcile_once().is_empty());
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "an unsafe registry name must retract the previously valid publish"
+    );
+    std::fs::remove_file(dir.path().join("pod..unsafe")).expect("remove unsafe name");
+    assert_eq!(manager.reconcile_once().len(), 1);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+
+    std::fs::write(dir.path().join("oversized"), vec![b'x'; 16 * 1024 + 1])
+        .expect("oversized entry");
+    assert!(manager.reconcile_once().is_empty());
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "an oversized registry entry must retract the previously valid publish"
+    );
+    std::fs::remove_file(dir.path().join("oversized")).expect("remove oversized");
+    assert_eq!(manager.reconcile_once().len(), 1);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("/etc/hosts", dir.path().join("symlink-pod"))
+            .expect("symlink entry");
+        assert!(manager.reconcile_once().is_empty());
+        assert_eq!(
+            mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+            Err(InboundRelayDenial::AddressNotTerminated),
+            "a symlinked registry entry must retract the previously valid publish"
+        );
+        std::fs::remove_file(dir.path().join("symlink-pod")).expect("remove symlink");
+        assert_eq!(manager.reconcile_once().len(), 1);
+        assert_eq!(
+            mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+            Ok(())
+        );
+    }
+
+    let missing = strict_registry_manager(
+        Arc::new(DirectoryCaptureSource::new("/definitely/not-a-registry")),
+        index,
+    );
+    assert!(missing.reconcile_once().is_empty());
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a missing registry directory must retract rather than retain last-good"
+    );
+}
+
+/// Issue #4249, the `Sidecar` half. A Sidecar shares the application pod's
+/// network namespace, so the accepted socket's local address is a pod-unique
+/// transport proof of every destination it may relay to — it needs no
+/// multi-destination inventory, and carrying one admitted a same-SPIFFE,
+/// same-cluster, same-label sibling replica it has no node-agent registry to
+/// exclude. The general inventory is now EMPTY; the owned workload view
+/// survives only as the own-address / loopback port bound.
+#[test]
+fn inbound_relay_sidecar_admits_only_its_own_accepted_local_address() {
+    let own_spiffe = format!("spiffe://{DEFAULT_TRUST_DOMAIN}/ns/{DEFAULT_NAMESPACE}/sa/reviews");
+
+    let mut own = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["10.244.5.5"],
+    );
+    own.cluster = Some("cluster-a".to_string());
+    // Byte-for-byte the same identity, cluster and labels; another pod, on
+    // another node. `workload_is_local` cannot tell it apart.
+    let mut sibling = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["10.244.9.9"],
+    );
+    sibling.cluster = Some("cluster-a".to_string());
+    // A co-located pod declaring the SAME address on a port this workload does
+    // not serve — the `hostNetwork` shape.
+    let mut co_located = workload_for(
+        "ratings",
+        DEFAULT_NAMESPACE,
+        [("app", "ratings")],
+        ["10.244.5.5"],
+    );
+    co_located.cluster = Some("cluster-a".to_string());
+    co_located.ports = vec![WorkloadPort {
+        port: 9443,
+        protocol: AppProtocol::Http,
+        name: Some("admin".to_string()),
+    }];
+
+    let slice = MeshSlice {
+        node_id: "mesh-test-node".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        version: "test".to_string(),
+        workloads: vec![own, sibling, co_located],
+        multi_cluster: Some(MultiClusterConfig {
+            local_cluster: Some("cluster-a".to_string()),
+            ..MultiClusterConfig::default()
+        }),
+        ..MeshSlice::default()
+    };
+    let runtime = MeshRuntimeConfig {
+        topology: MeshTopology::Sidecar,
+        workload_spiffe_id: Some(own_spiffe),
+        workload_labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
+        ..default_mesh_runtime()
+    };
+
+    let mesh = prepared_mesh(&slice, &runtime);
+    assert!(
+        mesh.inbound_relay_destinations.is_empty(),
+        "a Sidecar terminates only for the pod whose netns it shares, so it carries \
+         no multi-destination inventory"
+    );
+    assert!(mesh.inbound_relay_admits_accepted_local_address);
+
+    // The peer reached this pod at its own address, on this socket.
+    let own_ip = Some(ip("10.244.5.5"));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, own_ip),
+        Ok(()),
+        "the accepted local address stays admissible on a port this pod declares"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("127.0.0.1", 8080, own_ip),
+        Ok(()),
+        "the own-namespace loopback shortcut is bounded by the same owned records"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 9443, own_ip),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "a co-located hostNetwork sibling's port must not widen the own-address bound"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("localhost", 9443, own_ip),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "nor the loopback shortcut"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.9.9", 8080, own_ip),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a same-SPIFFE, same-cluster, same-label sibling replica is not this \
+         Sidecar's destination"
+    );
+    // ...and a Sidecar never installs a node-local registry, because it has no
+    // inventory for one to bound.
+    assert!(!mesh.inbound_relay_node_local_registry.is_authoritative());
+}
+
+// ── Own-address port bound: address-level pod ambiguity (issue #4249) ────────
+
+/// Declared application ports for a relay fixture workload.
+fn declared_ports(ports: &[u16]) -> Vec<WorkloadPort> {
+    ports
+        .iter()
+        .map(|port| WorkloadPort {
+            port: *port,
+            protocol: AppProtocol::Http,
+            name: None,
+        })
+        .collect()
+}
+
+/// A `reviews` replica declaring `address` on `ports`, carrying `pod_uid` when
+/// one is given. Same SPIFFE, same cluster and same pod-template labels as
+/// every other replica — the shape the owned-workload filter cannot separate.
+fn reviews_replica_declaring(
+    address: &'static str,
+    pod_uid: Option<&str>,
+    ports: &[u16],
+) -> Workload {
+    let mut workload = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        [address],
+    );
+    workload.cluster = Some("cluster-a".to_string());
+    workload.pod_uid = pod_uid.map(str::to_string);
+    workload.ports = declared_ports(ports);
+    workload
+}
+
+/// One own-pod terminator slice on `topology`, carrying `workloads` in the
+/// local cluster under this proxy's own `reviews` identity.
+fn own_pod_relay_fixture(
+    topology: MeshTopology,
+    workloads: Vec<Workload>,
+) -> (MeshSlice, MeshRuntimeConfig) {
+    let (slice, mut runtime) = ambient_relay_fixture(workloads);
+    runtime.topology = topology;
+    (slice, runtime)
+}
+
+/// Issue #4249, the own-ADDRESS half. Two replicas of one Deployment share a
+/// service-account SPIFFE id, a cluster and their pod-template labels, so both
+/// enter the owned workload view; under `hostNetwork` they also share the node
+/// IP while carrying different pod UIDs. The own-address and loopback arms must
+/// not admit the UNION of the two pods' ports on that address — a co-located
+/// pod's application port would become reachable through this terminator — and
+/// nothing at guard time can pick between them, so the address fails closed for
+/// BOTH.
+#[test]
+fn inbound_relay_sidecar_own_address_fails_closed_on_two_pods_sharing_an_address() {
+    let shared = reviews_replica_declaring("10.244.5.5", Some(LOCAL_POD_UID), &[8080]);
+    let co_located = reviews_replica_declaring("10.244.5.5", Some(OTHER_POD_UID), &[9443]);
+    let (slice, runtime) = own_pod_relay_fixture(MeshTopology::Sidecar, vec![shared, co_located]);
+
+    let mesh = prepared_mesh(&slice, &runtime);
+    // The peer reached the shared (host-network) address on this socket.
+    let own_ip = Some(ip("10.244.5.5"));
+
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, own_ip),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "an address two different pods declare cannot be attributed to either, so \
+         neither record's ports may be admitted through it"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 9443, own_ip),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "the co-located pod's port must not ride in on the shared address either"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("127.0.0.1", 8080, own_ip),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "the own-namespace loopback shortcut stands in for the same ambiguous \
+         address and fails closed with it"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("localhost", 9443, own_ip),
+        Err(InboundRelayDenial::PortNotDeclared)
+    );
+}
+
+/// The `Ambient` half of the same defect. `Ambient` sets the own-address marker
+/// too, and that arm returns BEFORE the registry-bounded inventory is consulted
+/// — so a shared address the node-agent registry would have disambiguated must
+/// still fail closed on the port bound itself.
+#[test]
+fn inbound_relay_ambient_own_address_fails_closed_on_two_pods_sharing_an_address() {
+    let own_spiffe = reviews_spiffe();
+    let shared = reviews_replica_declaring("10.244.5.5", Some(LOCAL_POD_UID), &[8080]);
+    let co_located = reviews_replica_declaring("10.244.5.5", Some(OTHER_POD_UID), &[9443]);
+    let (slice, runtime) = own_pod_relay_fixture(MeshTopology::Ambient, vec![shared, co_located]);
+
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let enrollment = [enrolled(LOCAL_POD_UID, &own_spiffe, "10.244.5.5")];
+    bind_enrolled_registry(&mut mesh, &enrollment);
+    let own_ip = Some(ip("10.244.5.5"));
+
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 9443, own_ip),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "the unenrolled co-located pod's port must not be admitted by the \
+         own-address arm, which never reaches the registry"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, own_ip),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "and the address stays ambiguous for the enrolled pod too — the arm has \
+         no evidence to pick between two records declaring it"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("localhost", 8080, own_ip),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "Ambient refuses the loopback namespace categorically, so the ambiguous \
+         own-address port bound never becomes the reported reason — declaring \
+         the port could not admit it either"
+    );
+
+    // The registry-bounded general inventory is unchanged and still admits the
+    // enrolled pod when the socket's own address is NOT the destination.
+    let node = Some(ip("10.244.0.1"));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+}
+
+/// The legitimate multi-record shape stays admitted: several Service records
+/// for ONE pod agree on a non-empty pod UID, which is positive proof they are
+/// the same pod, so their declared ports are unioned exactly as one record's
+/// would be. A lone record with no pod UID at all — a `WorkloadEntry` / VM
+/// record, or an ordinary pod whose carrier does not stamp one — is
+/// unambiguous for its address and keeps working.
+#[test]
+fn inbound_relay_own_address_unions_ports_only_across_one_proven_pod() {
+    let http = reviews_replica_declaring("10.244.5.5", Some(LOCAL_POD_UID), &[8080]);
+    let grpc = reviews_replica_declaring("10.244.5.5", Some(LOCAL_POD_UID), &[9090]);
+    // A second address, declared by a single record carrying no pod UID.
+    let uidless = reviews_replica_declaring("10.244.5.6", None, &[7070]);
+    let (slice, runtime) = own_pod_relay_fixture(MeshTopology::Sidecar, vec![http, grpc, uidless]);
+
+    let mesh = prepared_mesh(&slice, &runtime);
+    let own_ip = Some(ip("10.244.5.5"));
+
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, own_ip),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 9090, own_ip),
+        Ok(()),
+        "two Service records for one proven pod legitimately union their ports"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("localhost", 9090, own_ip),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 9443, own_ip),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "the union is still bounded by what that pod declares"
+    );
+
+    // The single uidless record is the only one on its address, so it is
+    // unambiguous and keeps the pre-#4249 behaviour.
+    let other_ip = Some(ip("10.244.5.6"));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 7070, other_ip),
+        Ok(())
+    );
+}
+
+/// A pod UID is only proof when EVERY record on the address carries it and they
+/// agree. A mix of present and missing UIDs, or several records none of which
+/// carries one, is ambiguous — the records may be one pod or several, and the
+/// guard cannot tell — so the address is refused rather than unioned.
+#[test]
+fn inbound_relay_own_address_fails_closed_on_missing_and_mixed_pod_uids() {
+    let with_uid = reviews_replica_declaring("10.244.5.5", Some(LOCAL_POD_UID), &[8080]);
+    let without_uid = reviews_replica_declaring("10.244.5.5", None, &[9443]);
+    // A second shared address where NEITHER record publishes a UID.
+    let anonymous_a = reviews_replica_declaring("10.244.5.6", None, &[7070]);
+    let anonymous_b = reviews_replica_declaring("10.244.5.6", None, &[7071]);
+    let (slice, runtime) = own_pod_relay_fixture(
+        MeshTopology::Sidecar,
+        vec![with_uid, without_uid, anonymous_a, anonymous_b],
+    );
+
+    let mesh = prepared_mesh(&slice, &runtime);
+
+    let mixed = Some(ip("10.244.5.5"));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, mixed),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "a record without a pod UID cannot be proven to be the same pod as one \
+         that has it"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 9443, mixed),
+        Err(InboundRelayDenial::PortNotDeclared)
+    );
+
+    let anonymous = Some(ip("10.244.5.6"));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 7070, anonymous),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "two records with no pod UID at all may be two pods; fail closed"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 7071, anonymous),
+        Err(InboundRelayDenial::PortNotDeclared)
+    );
+}
+
+/// With NO workload identity configured nothing can be attributed to this
+/// terminator, so there is no owned view to project. That must not become a
+/// permissive fallback to the whole declared workload view: the same ambiguity
+/// rule is applied to that view instead, so a shared address still fails closed
+/// while an unambiguous one still serves. Remote-provenance records are not
+/// candidates: an overlapping remote pod CIDR must not manufacture ambiguity
+/// at the local pod's address.
+#[test]
+fn inbound_relay_own_address_without_identity_does_not_union_a_shared_address() {
+    let shared_a = reviews_replica_declaring("10.244.5.5", Some(LOCAL_POD_UID), &[8080]);
+    let shared_b = reviews_replica_declaring("10.244.5.5", Some(OTHER_POD_UID), &[9443]);
+    let lone = reviews_replica_declaring("10.244.5.6", Some(LOCAL_POD_UID), &[7070]);
+    let mut remote_overlap = reviews_replica_declaring("10.244.5.6", Some(OTHER_POD_UID), &[7443]);
+    remote_overlap.remote_provenance = true;
+    let (slice, mut runtime) = own_pod_relay_fixture(
+        MeshTopology::Sidecar,
+        vec![shared_a, shared_b, lone, remote_overlap],
+    );
+    // No `FERRUM_MESH_WORKLOAD_SPIFFE_ID`.
+    runtime.workload_spiffe_id = None;
+
+    let mesh = prepared_mesh(&slice, &runtime);
+    assert!(
+        mesh.inbound_relay_destinations.is_empty(),
+        "no identity still means no general relay inventory"
+    );
+
+    let shared_ip = Some(ip("10.244.5.5"));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, shared_ip),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "an absent identity must not license the pre-#4249 whole-view union"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 9443, shared_ip),
+        Err(InboundRelayDenial::PortNotDeclared)
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("localhost", 9443, shared_ip),
+        Err(InboundRelayDenial::PortNotDeclared)
+    );
+
+    // ...while an address exactly one record declares is still served, so this
+    // is a narrowing rather than an inbound outage.
+    let lone_ip = Some(ip("10.244.5.6"));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 7070, lone_ip),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 9443, lone_ip),
+        Err(InboundRelayDenial::PortNotDeclared)
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 7443, lone_ip),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "an overlapping remote-provenance record must not widen or contest the local bound"
+    );
+}
+
+/// Issue #4251: a `ServiceWaypoint` is the L7 terminator for the services bound
+/// to it. The slice's own workload narrowing is only NAMESPACE-level (the
+/// waypoint's namespace plus its bound services' namespaces), so a workload
+/// sitting in a bound service's namespace that backs NO bound service must be
+/// refused `AddressNotTerminated` rather than relayed to in plaintext.
+#[test]
+fn inbound_relay_service_waypoint_admits_only_bound_service_backends() {
+    let backing = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["10.244.1.7"],
+    );
+    let unbound = workload_for(
+        "ratings",
+        DEFAULT_NAMESPACE,
+        [("app", "ratings")],
+        ["10.244.2.9"],
+    );
+    // Only `reviews` is bound to this waypoint, so only its Service survives
+    // the slice's service narrowing; `ratings` is namespace-visible only.
+    let bound_service = service_for("reviews", DEFAULT_NAMESPACE, &[&backing]);
+
+    let slice = MeshSlice {
+        node_id: "mesh-test-node".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        waypoint_name: Some("reviews-waypoint".to_string()),
+        version: "test".to_string(),
+        workloads: vec![backing, unbound],
+        services: vec![bound_service],
+        service_waypoint_bound_services: vec![MeshWaypointServiceRef {
+            namespace: DEFAULT_NAMESPACE.to_string(),
+            name: "reviews".to_string(),
+        }],
+        ..MeshSlice::default()
+    };
+    let runtime = MeshRuntimeConfig {
+        topology: MeshTopology::ServiceWaypoint,
+        waypoint_name: Some("reviews-waypoint".to_string()),
+        ..default_mesh_runtime()
+    };
+
+    let mesh = prepared_mesh(&slice, &runtime);
+    // A waypoint runs outside the destination pods' netns; its own address is
+    // never a relay destination.
+    let waypoint = Some(ip("10.244.4.4"));
+
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.1.7", 8080, waypoint),
+        Ok(()),
+        "a bound service's backing workload is a destination this waypoint terminates for"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.2.9", 8080, waypoint),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a workload visible in the bound service's namespace that backs no bound \
+         service is not a destination this waypoint terminates for"
+    );
+}
+
+/// Issue #4251, fail-closed side: bound services that list no backing workload
+/// leave the inventory EMPTY rather than falling back to the namespace-visible
+/// workload view.
+#[test]
+fn inbound_relay_service_waypoint_without_backing_refs_terminates_for_nothing() {
+    let visible = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["10.244.1.7"],
+    );
+    // A Service shell with no `workloads[]` authorization list.
+    let bound_service = service_for("reviews", DEFAULT_NAMESPACE, &[]);
+
+    let slice = MeshSlice {
+        node_id: "mesh-test-node".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        waypoint_name: Some("reviews-waypoint".to_string()),
+        version: "test".to_string(),
+        workloads: vec![visible],
+        services: vec![bound_service],
+        service_waypoint_bound_services: vec![MeshWaypointServiceRef {
+            namespace: DEFAULT_NAMESPACE.to_string(),
+            name: "reviews".to_string(),
+        }],
+        ..MeshSlice::default()
+    };
+    let runtime = MeshRuntimeConfig {
+        topology: MeshTopology::ServiceWaypoint,
+        waypoint_name: Some("reviews-waypoint".to_string()),
+        ..default_mesh_runtime()
+    };
+
+    let mesh = prepared_mesh(&slice, &runtime);
+
+    assert!(
+        mesh.inbound_relay_destinations.is_empty(),
+        "no authorized backing workload must leave the inventory empty"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.1.7", 8080, Some(ip("10.244.4.4"))),
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+}
+
+fn prepared_service_waypoint_from_gateway_config(
+    mesh: MeshConfig,
+    waypoint_name: &str,
+) -> (MeshSlice, Box<MeshConfig>) {
+    let config = GatewayConfig {
+        mesh: Some(Box::new(mesh)),
+        ..GatewayConfig::default()
+    };
+    let request = MeshSliceRequest {
+        node_id: "mesh-test-node".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        ..MeshSliceRequest::default()
+    }
+    .with_waypoint_name(Some(waypoint_name.to_string()));
+    let slice = MeshSlice::from_gateway_config(&config, request);
+    let runtime = MeshRuntimeConfig {
+        topology: MeshTopology::ServiceWaypoint,
+        waypoint_name: Some(waypoint_name.to_string()),
+        ..default_mesh_runtime()
+    };
+    let prepared = prepared_mesh(&slice, &runtime);
+    (slice, prepared)
+}
+
+fn reviews_and_ratings_mesh(bindings: Vec<MeshWaypointBinding>) -> MeshConfig {
+    let reviews = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["10.244.1.7"],
+    );
+    let ratings = workload_for(
+        "ratings",
+        DEFAULT_NAMESPACE,
+        [("app", "ratings")],
+        ["10.244.2.9"],
+    );
+    MeshConfig {
+        services: vec![
+            service_for("reviews", DEFAULT_NAMESPACE, &[&reviews]),
+            service_for("ratings", DEFAULT_NAMESPACE, &[&ratings]),
+        ],
+        workloads: vec![reviews, ratings],
+        waypoint_bindings: bindings,
+        ..MeshConfig::default()
+    }
+}
+
 // ── Issue #4252 — post-plugin effective-destination handler re-check ────────
 //
 // Mesh-mode has no deployed source that puts `mesh_route_dispatch` on the
@@ -2462,7 +4113,201 @@ fn post_plugin_refusal_mesh(b_port: u16, c_ip: IpAddr, c_port: u16) -> MeshConfi
         ],
         inbound_relay_admits_accepted_local_address: true,
         inbound_relay_admits_loopback_namespace: true,
+        // Issue #4249 bound the loopback arm to the per-address port the
+        // terminator actually owns, so the Sidecar-shaped fixture must project
+        // B's own-address ports the way the apply path does. Without this the
+        // control CONNECT to 127.0.0.1 is refused `PortNotDeclared` and the
+        // test sees a 404 instead of C's ownership 403.
+        inbound_relay_own_address_ports: own_address_port_bounds_from_workloads(&[
+            relay_guard_workload("svc-b", &["127.0.0.1"], &[b_port]),
+        ]),
         ..MeshConfig::default()
+    }
+}
+
+fn reviews_only_waypoint_binding(waypoint_for: &str) -> MeshWaypointBinding {
+    MeshWaypointBinding {
+        name: "reviews-waypoint".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        waypoint_for: waypoint_for.to_string(),
+        gateway_class_name: None,
+        services: vec![MeshWaypointServiceRef {
+            namespace: DEFAULT_NAMESPACE.to_string(),
+            name: "reviews".to_string(),
+        }],
+    }
+}
+
+fn reviews_bound_service_ref() -> MeshWaypointServiceRef {
+    MeshWaypointServiceRef {
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        name: "reviews".to_string(),
+    }
+}
+
+/// Issue #4251, production path: `narrow_for_service_waypoint` still fail-opens
+/// the routing view when the named binding is absent, so `MeshSlice.services`
+/// carries every namespace-visible Service. That view must NOT license the
+/// inbound HBONE relay — missing binding evidence yields an empty inventory.
+#[test]
+fn inbound_relay_service_waypoint_missing_binding_from_gateway_config_terminates_for_nothing() {
+    let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
+        reviews_and_ratings_mesh(Vec::new()),
+        "reviews-waypoint",
+    );
+
+    assert_eq!(
+        slice.services.len(),
+        2,
+        "routing still fail-opens when the named Gateway has not landed"
+    );
+    assert!(
+        slice.service_waypoint_bound_services.is_empty(),
+        "a missing binding must not stamp relay evidence from namespace-visible Services"
+    );
+    assert!(
+        mesh.inbound_relay_destinations.is_empty(),
+        "no matching binding must leave the relay inventory empty"
+    );
+
+    let waypoint = Some(ip("10.244.4.4"));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.1.7", 8080, waypoint),
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.2.9", 8080, waypoint),
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+}
+
+fn assert_reviews_service_relay_from_gateway_config(slice: &MeshSlice, mesh: &MeshConfig) {
+    assert_eq!(
+        slice.service_waypoint_bound_services,
+        vec![reviews_bound_service_ref()],
+        "service-terminating waypoint_for must stamp exact bound-service refs"
+    );
+    assert_eq!(
+        slice
+            .services
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["reviews"],
+        "the matching binding must narrow the routing view to the bound Service"
+    );
+
+    let waypoint = Some(ip("10.244.4.4"));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.1.7", 8080, waypoint),
+        Ok(()),
+        "a bound service's backing workload is a destination this waypoint terminates for"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.2.9", 8080, waypoint),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a namespace-visible workload that backs no bound service is not terminated here"
+    );
+}
+
+fn assert_no_service_relay_from_gateway_config(slice: &MeshSlice, mesh: &MeshConfig) {
+    assert!(
+        slice.service_waypoint_bound_services.is_empty(),
+        "non-service-terminating waypoint_for must not stamp inbound-relay binding evidence"
+    );
+    assert!(
+        mesh.inbound_relay_destinations.is_empty(),
+        "no service-terminating binding evidence must leave the relay inventory empty"
+    );
+
+    let waypoint = Some(ip("10.244.4.4"));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.1.7", 8080, waypoint),
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.2.9", 8080, waypoint),
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+}
+
+/// Issue #4251, production path: `waypoint_for=service` (and mixed-case) retains
+/// exact service binding evidence and admits only those bound backends.
+#[test]
+fn inbound_relay_service_waypoint_exact_binding_from_gateway_config_admits_only_bound_backends() {
+    for waypoint_for in ["service", "SERVICE"] {
+        let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
+            reviews_and_ratings_mesh(vec![reviews_only_waypoint_binding(waypoint_for)]),
+            "reviews-waypoint",
+        );
+        assert_reviews_service_relay_from_gateway_config(&slice, &mesh);
+    }
+}
+
+/// Issue #4251, production path: `waypoint_for=all` is also service-terminating
+/// and must stamp the same exact bound-service refs as `service`.
+#[test]
+fn inbound_relay_service_waypoint_waypoint_for_all_from_gateway_config_admits_only_bound_backends()
+{
+    for waypoint_for in ["all", "All"] {
+        let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
+            reviews_and_ratings_mesh(vec![reviews_only_waypoint_binding(waypoint_for)]),
+            "reviews-waypoint",
+        );
+        assert_reviews_service_relay_from_gateway_config(&slice, &mesh);
+    }
+}
+
+/// Issue #4251, production path: `waypoint_for=none` is an explicit opt-out and
+/// must produce an empty relay inventory even when the binding lists services.
+#[test]
+fn inbound_relay_service_waypoint_waypoint_for_none_from_gateway_config_terminates_for_nothing() {
+    let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
+        reviews_and_ratings_mesh(vec![reviews_only_waypoint_binding("none")]),
+        "reviews-waypoint",
+    );
+
+    assert!(
+        slice.services.is_empty() && slice.workloads.is_empty(),
+        "waypoint_for=none must produce an empty admitted routing set"
+    );
+    assert_no_service_relay_from_gateway_config(&slice, &mesh);
+}
+
+/// Issue #4251, production path: `waypoint_for=workload` still lists Service
+/// refs on the routing view (the K8s translator appends them) but does not
+/// claim service traffic, so inbound service relay must terminate for nothing.
+#[test]
+fn inbound_relay_service_waypoint_waypoint_for_workload_from_gateway_config_terminates_for_nothing()
+{
+    let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
+        reviews_and_ratings_mesh(vec![reviews_only_waypoint_binding("workload")]),
+        "reviews-waypoint",
+    );
+
+    assert_eq!(
+        slice
+            .services
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["reviews"],
+        "waypoint_for=workload must keep the existing routing-view narrowing"
+    );
+    assert_no_service_relay_from_gateway_config(&slice, &mesh);
+}
+
+/// Issue #4251, production path: blank and unknown/forward `waypoint_for`
+/// values fail closed for inbound service-relay evidence.
+#[test]
+fn inbound_relay_service_waypoint_unknown_waypoint_for_from_gateway_config_terminates_for_nothing()
+{
+    for waypoint_for in ["", "direct"] {
+        let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
+            reviews_and_ratings_mesh(vec![reviews_only_waypoint_binding(waypoint_for)]),
+            "reviews-waypoint",
+        );
+        assert_no_service_relay_from_gateway_config(&slice, &mesh);
     }
 }
 

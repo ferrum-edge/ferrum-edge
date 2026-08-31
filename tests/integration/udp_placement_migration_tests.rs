@@ -1709,7 +1709,7 @@ async fn malformed_registry_entry_blocks_migration_cleanup_proof() {
     std::fs::write(registry.path().join("pod-a"), b"").expect("malformed entry");
     let source = DirectoryCaptureSource::new(registry.path());
     assert!(source.list_targets().is_empty());
-    assert!(source.list_targets_for_migration().is_err());
+    assert!(source.list_complete_targets().is_err());
     let source = Arc::new(source);
     let backend = PartialCleanupBackend {
         fail_once: Mutex::new(HashSet::new()),

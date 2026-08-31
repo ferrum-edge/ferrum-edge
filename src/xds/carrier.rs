@@ -44,8 +44,9 @@ use std::collections::BTreeMap;
 
 use crate::modes::mesh::config::{
     MeshPolicy, MeshProxyConfig, MeshRequestAuthentication, MeshService, MeshTelemetryResource,
-    MeshVirtualServiceCorsPolicy, MultiClusterConfig, NodeWaypointAssertor, OutboundTrafficPolicy,
-    PeerAuthentication, ResolvedIngressListener, ServiceEntry, TrustBundleSet, Workload,
+    MeshVirtualServiceCorsPolicy, MeshWaypointServiceRef, MultiClusterConfig, NodeWaypointAssertor,
+    OutboundTrafficPolicy, PeerAuthentication, ResolvedIngressListener, ServiceEntry,
+    TrustBundleSet, Workload,
 };
 use crate::modes::mesh::revision::MeshConfigRevision;
 use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshSlice};
@@ -202,6 +203,14 @@ pub const FERRUM_ECDS_SIDECAR_EGRESS_SCOPE_TYPE_URL: &str =
 pub const FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.WaypointGatewayClassCarrier";
 
+/// Inner `type_url` for the exact ServiceWaypoint bound-service refs (issue
+/// #4251). Emitted only when the slice stamped a non-empty binding so the
+/// inbound HBONE relay can fail closed over xDS without inferring a binding
+/// from the (possibly fail-open) `services` carrier. Absence is empty
+/// evidence — the DP admits no ServiceWaypoint relay destinations.
+pub const FERRUM_ECDS_SERVICE_WAYPOINT_BOUND_SERVICES_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.ServiceWaypointBoundServicesCarrier";
+
 /// DNS-1123 subdomain upper bound for a waypoint GatewayClass name on the
 /// ECDS carrier and native TargetRef attachment boundary.
 pub const MAX_WAYPOINT_GATEWAY_CLASS_LEN: usize = 253;
@@ -210,6 +219,15 @@ pub const MAX_WAYPOINT_GATEWAY_CLASS_LEN: usize = 253;
 /// (quoted string + framing). Hostile oversized inputs are rejected before
 /// allocation into the recovered slice.
 pub const MAX_WAYPOINT_GATEWAY_CLASS_CARRIER_BYTES: usize = 512;
+
+/// DNS-1123 subdomain upper bound for a bound Service namespace or name on
+/// the ServiceWaypoint bound-services carrier.
+pub const MAX_SERVICE_WAYPOINT_BOUND_REF_LEN: usize = 253;
+
+/// Absolute byte ceiling for the ServiceWaypoint bound-services carrier JSON
+/// payload. Hostile oversized inputs are rejected before allocation into the
+/// recovered slice.
+pub const MAX_SERVICE_WAYPOINT_BOUND_SERVICES_CARRIER_BYTES: usize = 16_384;
 /// Inner `type_url` for the mesh root-namespace carrier (issue #2469). Carries
 /// `meshConfig.rootNamespace` so a reverse-translated slice can classify
 /// Istio's third DestinationRule lookup tier instead of collapsing it into the
@@ -279,6 +297,11 @@ pub enum MeshSliceCarrier {
     /// trimmed name when emitted; absence means the DP has no class stamp and
     /// GatewayClass targetRefs fail closed.
     WaypointGatewayClass(String),
+    /// Exact `(namespace, service)` refs this ServiceWaypoint is bound to
+    /// (issue #4251); see [`FERRUM_ECDS_SERVICE_WAYPOINT_BOUND_SERVICES_TYPE_URL`].
+    /// Emitted only when non-empty; absence leaves the DP with no binding
+    /// evidence so the inbound HBONE relay inventory is empty.
+    ServiceWaypointBoundServices(Vec<MeshWaypointServiceRef>),
     /// `meshConfig.rootNamespace` (issue #2469). Emitted only when non-empty
     /// after trim; its ABSENCE (or a blank / whitespace-only carrier, which
     /// decode ignores) tells the DP there is no trustworthy root provenance.
@@ -346,6 +369,9 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::WaypointGatewayClass(_) => {
                 FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL
             }
+            MeshSliceCarrier::ServiceWaypointBoundServices(_) => {
+                FERRUM_ECDS_SERVICE_WAYPOINT_BOUND_SERVICES_TYPE_URL
+            }
             MeshSliceCarrier::IstioRootNamespace(_) => FERRUM_ECDS_ISTIO_ROOT_NAMESPACE_TYPE_URL,
         }
     }
@@ -387,6 +413,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::MultiCluster(_) => "multi-cluster",
             MeshSliceCarrier::SidecarEgressScope(_) => "sidecar-egress-scope",
             MeshSliceCarrier::WaypointGatewayClass(_) => "waypoint-gateway-class",
+            MeshSliceCarrier::ServiceWaypointBoundServices(_) => "service-waypoint-bound-services",
             MeshSliceCarrier::IstioRootNamespace(_) => "istio-root-namespace",
         };
         format!("{FERRUM_CARRIER_RESOURCE_NAME_PREFIX}{suffix}")
@@ -425,6 +452,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::MultiCluster(value) => encode(value),
             MeshSliceCarrier::SidecarEgressScope(value) => encode(value),
             MeshSliceCarrier::WaypointGatewayClass(value) => encode(value),
+            MeshSliceCarrier::ServiceWaypointBoundServices(value) => encode(value),
             MeshSliceCarrier::IstioRootNamespace(value) => encode(value),
         }
     }
@@ -549,6 +577,11 @@ impl MeshSliceCarrier {
             FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL => {
                 MeshSliceCarrier::WaypointGatewayClass(decode_waypoint_gateway_class(value)?)
             }
+            FERRUM_ECDS_SERVICE_WAYPOINT_BOUND_SERVICES_TYPE_URL => {
+                MeshSliceCarrier::ServiceWaypointBoundServices(
+                    decode_service_waypoint_bound_services(value)?,
+                )
+            }
             FERRUM_ECDS_ISTIO_ROOT_NAMESPACE_TYPE_URL => {
                 let namespace: String = decode_json(value)?;
                 let trimmed = namespace.trim().to_string();
@@ -634,6 +667,9 @@ pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str
         FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL => {
             Some("ferrum-mesh-carrier/waypoint-gateway-class")
         }
+        FERRUM_ECDS_SERVICE_WAYPOINT_BOUND_SERVICES_TYPE_URL => {
+            Some("ferrum-mesh-carrier/service-waypoint-bound-services")
+        }
         FERRUM_ECDS_ISTIO_ROOT_NAMESPACE_TYPE_URL => {
             Some("ferrum-mesh-carrier/istio-root-namespace")
         }
@@ -677,6 +713,50 @@ fn decode_waypoint_gateway_class(value: &[u8]) -> Result<String, serde_json::Err
         )));
     }
     Ok(class)
+}
+
+/// Fail-closed decode for the ServiceWaypoint bound-services carrier:
+/// bounded payload, nonempty namespace/name with no surrounding whitespace.
+/// Does not log the raw payload or the carried refs.
+fn decode_service_waypoint_bound_services(
+    value: &[u8],
+) -> Result<Vec<MeshWaypointServiceRef>, serde_json::Error> {
+    use serde::de::Error;
+    if value.len() > MAX_SERVICE_WAYPOINT_BOUND_SERVICES_CARRIER_BYTES {
+        return Err(Error::custom(format!(
+            "ServiceWaypointBoundServices carrier payload exceeds {MAX_SERVICE_WAYPOINT_BOUND_SERVICES_CARRIER_BYTES} bytes"
+        )));
+    }
+    let refs: Vec<MeshWaypointServiceRef> = decode_json(value)?;
+    for reference in &refs {
+        validate_service_waypoint_bound_ref_field("namespace", &reference.namespace)?;
+        validate_service_waypoint_bound_ref_field("name", &reference.name)?;
+    }
+    Ok(refs)
+}
+
+fn validate_service_waypoint_bound_ref_field(
+    field: &str,
+    value: &str,
+) -> Result<(), serde_json::Error> {
+    use serde::de::Error;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(Error::custom(format!(
+            "ServiceWaypointBoundServices carrier {field} must be nonempty"
+        )));
+    }
+    if value != trimmed {
+        return Err(Error::custom(format!(
+            "ServiceWaypointBoundServices carrier {field} must not have leading or trailing whitespace"
+        )));
+    }
+    if value.len() > MAX_SERVICE_WAYPOINT_BOUND_REF_LEN {
+        return Err(Error::custom(format!(
+            "ServiceWaypointBoundServices carrier {field} exceeds {MAX_SERVICE_WAYPOINT_BOUND_REF_LEN} bytes"
+        )));
+    }
+    Ok(())
 }
 
 /// Build every slice carrier for `slice`.
@@ -867,6 +947,18 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
     {
         carriers.push(MeshSliceCarrier::WaypointGatewayClass(class.to_string()));
     }
+    // Exact ServiceWaypoint bound-service refs (issue #4251). Emitted only
+    // when the slice stamped a nonempty service-terminating binding
+    // (`waypoint_for=service` or `all`); absence leaves the DP with no
+    // evidence so the inbound HBONE relay inventory is empty.
+    // Missing/old producers that never emitted this carrier therefore fail
+    // closed rather than treating the (possibly fail-open) services view as
+    // a binding.
+    if !slice.service_waypoint_bound_services.is_empty() {
+        carriers.push(MeshSliceCarrier::ServiceWaypointBoundServices(
+            slice.service_waypoint_bound_services.clone(),
+        ));
+    }
     // Issue #2469: emitted only when non-empty after trim, so absence stays
     // the honest signal for "this producer carried no trustworthy root
     // namespace". Blank / whitespace-only values are never put on the wire;
@@ -939,6 +1031,9 @@ pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
         MeshSliceCarrier::MultiCluster(value) => slice.multi_cluster = Some(value),
         MeshSliceCarrier::SidecarEgressScope(value) => slice.sidecar_egress_scope = Some(value),
         MeshSliceCarrier::WaypointGatewayClass(value) => slice.waypoint_gateway_class = Some(value),
+        MeshSliceCarrier::ServiceWaypointBoundServices(value) => {
+            slice.service_waypoint_bound_services = value
+        }
         // Decode already rejects blank values; defend in depth so an empty
         // variant constructed in-process cannot clear trustworthy provenance.
         MeshSliceCarrier::IstioRootNamespace(value) => {
@@ -1138,6 +1233,10 @@ mod tests {
             MeshSliceCarrier::MultiCluster(MultiClusterConfig::default()),
             MeshSliceCarrier::SidecarEgressScope(MeshEgressScopeSnapshot::default()),
             MeshSliceCarrier::WaypointGatewayClass("istio-waypoint".to_string()),
+            MeshSliceCarrier::ServiceWaypointBoundServices(vec![MeshWaypointServiceRef {
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
+            }]),
             MeshSliceCarrier::IstioRootNamespace("istio-system".to_string()),
         ];
         for carrier in carriers {
@@ -1242,6 +1341,10 @@ mod tests {
             MeshSliceCarrier::MultiCluster(MultiClusterConfig::default()),
             MeshSliceCarrier::SidecarEgressScope(MeshEgressScopeSnapshot::default()),
             MeshSliceCarrier::WaypointGatewayClass("ferrum-waypoint".to_string()),
+            MeshSliceCarrier::ServiceWaypointBoundServices(vec![MeshWaypointServiceRef {
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
+            }]),
             MeshSliceCarrier::IstioRootNamespace("istio-system".to_string()),
         ];
         let mut names: Vec<String> = carriers.iter().map(|c| c.resource_name()).collect();
@@ -1299,6 +1402,65 @@ mod tests {
         assert!(
             MeshSliceCarrier::decode(FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL, b"{not json")
                 .is_err(),
+            "malformed JSON must fail closed"
+        );
+    }
+
+    #[test]
+    fn service_waypoint_bound_services_carrier_rejects_hostile_input() {
+        assert!(
+            MeshSliceCarrier::decode(
+                FERRUM_ECDS_SERVICE_WAYPOINT_BOUND_SERVICES_TYPE_URL,
+                b"[{\"namespace\":\"\",\"name\":\"reviews\"}]"
+            )
+            .is_err(),
+            "empty namespace must fail closed"
+        );
+        assert!(
+            MeshSliceCarrier::decode(
+                FERRUM_ECDS_SERVICE_WAYPOINT_BOUND_SERVICES_TYPE_URL,
+                b"[{\"namespace\":\"default\",\"name\":\"\"}]"
+            )
+            .is_err(),
+            "empty name must fail closed"
+        );
+        assert!(
+            MeshSliceCarrier::decode(
+                FERRUM_ECDS_SERVICE_WAYPOINT_BOUND_SERVICES_TYPE_URL,
+                b"[{\"namespace\":\" default\",\"name\":\"reviews\"}]"
+            )
+            .is_err(),
+            "leading whitespace must fail closed"
+        );
+        let oversized_name = "a".repeat(MAX_SERVICE_WAYPOINT_BOUND_REF_LEN + 1);
+        let oversized_json = serde_json::to_vec(&vec![MeshWaypointServiceRef {
+            namespace: "default".to_string(),
+            name: oversized_name,
+        }])
+        .expect("json");
+        assert!(
+            MeshSliceCarrier::decode(
+                FERRUM_ECDS_SERVICE_WAYPOINT_BOUND_SERVICES_TYPE_URL,
+                &oversized_json
+            )
+            .is_err(),
+            "oversized name must fail closed"
+        );
+        let oversized_payload = "x".repeat(MAX_SERVICE_WAYPOINT_BOUND_SERVICES_CARRIER_BYTES + 1);
+        assert!(
+            MeshSliceCarrier::decode(
+                FERRUM_ECDS_SERVICE_WAYPOINT_BOUND_SERVICES_TYPE_URL,
+                oversized_payload.as_bytes()
+            )
+            .is_err(),
+            "oversized carrier payload must fail closed"
+        );
+        assert!(
+            MeshSliceCarrier::decode(
+                FERRUM_ECDS_SERVICE_WAYPOINT_BOUND_SERVICES_TYPE_URL,
+                b"{not json"
+            )
+            .is_err(),
             "malformed JSON must fail closed"
         );
     }

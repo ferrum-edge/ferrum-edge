@@ -183,7 +183,7 @@ impl OpenLdapContainer {
         // quoting/heredoc concerns, then feed it to ldapadd.
         let script = format!(
             "echo {b64} | base64 -d | \
-             ldapadd -x -H ldap://localhost:{LDAP_CONTAINER_PORT} \
+             ldapadd -c -x -H ldap://localhost:{LDAP_CONTAINER_PORT} \
              -D '{LDAP_ADMIN_DN}' -w '{LDAP_ADMIN_PASSWORD}'"
         );
 
@@ -207,13 +207,11 @@ impl OpenLdapContainer {
                 tokio::time::sleep(Duration::from_millis(750)).await;
                 continue;
             }
-            if combined.contains("adding new entry") {
-                return Err(format!(
-                    "ldapadd partially applied LDIF before failing with exit {:?}: {}",
-                    out.exit_code,
-                    combined.trim()
-                )
-                .into());
+            // `ldapadd -c` continues past per-entry "Already exists (68)"
+            // errors, so a retry after a partial apply can converge without
+            // leaving the directory in a worse state than a virgin tree.
+            if ldapadd_only_already_exists(&combined) {
+                return Ok(());
             }
             // A real LDIF/schema error — surface it immediately.
             return Err(format!(
@@ -237,6 +235,22 @@ impl OpenLdapContainer {
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
         })
     }
+}
+
+/// True when `ldapadd -c` reported only benign "entry already exists" errors.
+/// Any other `ldap_*:` diagnostic line is treated as a real failure.
+fn ldapadd_only_already_exists(combined: &str) -> bool {
+    let mut saw_ldap_diag = false;
+    for line in combined.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains("ldap_add:") || trimmed.contains("ldap_modify:") {
+            saw_ldap_diag = true;
+            if !trimmed.contains("Already exists (68)") {
+                return false;
+            }
+        }
+    }
+    saw_ldap_diag && combined.contains("adding new entry")
 }
 
 struct ExecOutput {

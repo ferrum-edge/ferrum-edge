@@ -39,7 +39,7 @@ use crate::scaffolding::backends::{
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::Http3Client;
 use crate::scaffolding::harness::GatewayHarness;
-use crate::scaffolding::ports::{reserve_port, reserve_udp_port};
+use crate::scaffolding::ports::{reserve_port, reserve_refused_tcp_port, reserve_udp_port};
 use serde_json::json;
 use std::net::UdpSocket as StdUdpSocket;
 use std::time::Duration;
@@ -193,6 +193,30 @@ fn https_with_retry(port: u16, retry: serde_json::Value) -> String {
         "plugin_configs": [],
     });
     serde_yaml::to_string(&config).expect("yaml serialize")
+}
+
+/// Fail fast when a proxy-path assertion actually hit a Ferrum admin listener
+/// (port collision). The gateway under test configures no auth plugin, so a
+/// `401` with admin security headers means the backend port was occupied by
+/// another gateway's admin API — not a retry-semantics regression.
+fn assert_proxy_retry_response_not_admin_collision(resp: &reqwest::Response) {
+    let status = resp.status().as_u16();
+    let headers = resp.headers();
+    let via_ferrum = headers
+        .get("via")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("ferrum-edge"));
+    let admin_security_shape = headers.get("x-content-type-options").is_some()
+        && headers.get("cache-control").is_some()
+        && headers.get("x-frame-options").is_some();
+    if status == 401 && via_ferrum && admin_security_shape {
+        panic!(
+            "port collision: proxy request reached a Ferrum admin listener \
+             (got 401 with admin security headers at {}). This is a harness \
+             port-allocation race, not a retry_on_connect_failure regression.",
+            resp.url()
+        );
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -657,9 +681,10 @@ async fn retry_does_not_replay_streaming_request_body() {
 // inconsistent across the H3, gRPC, and direct-H2 paths. The new contract
 // funnels every dispatcher through the same `request_reached_wire` boundary.
 //
-// Setup: bind a TCP listener, drop it BEFORE starting the gateway, then
-// point the gateway at that port. The kernel returns ECONNREFUSED on every
-// connect attempt — the cleanest possible pre-wire transport failure
+// Setup: hold a bound-but-not-listening TCP port for the backend so the
+// kernel returns ECONNREFUSED on every connect attempt without a
+// bind-drop-rebind race (another test's admin listener cannot steal the
+// port). The cleanest possible pre-wire transport failure
 // (DnsLookupError / TlsError / handshake races are all unambiguous
 // `request_reached_wire == false` cases too, but ECONNREFUSED is the
 // least timing-sensitive). reqwest classifies it as
@@ -677,13 +702,12 @@ async fn retry_does_not_replay_streaming_request_body() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn retry_on_connect_failure_fires_with_empty_methods_and_statuses() {
-    // Reserve a port and immediately release it. The kernel will refuse
-    // every subsequent connect attempt to that port (assuming nothing
-    // else binds it in the meantime — vanishingly unlikely on the
-    // localhost-loopback address space the harness uses).
-    let reservation = reserve_port().await.expect("reserve port");
-    let backend_port = reservation.port;
-    drop(reservation);
+    // Bound-but-not-listening backend port: kernel ECONNREFUSED on every
+    // connect attempt and parallel tests cannot steal the port while this
+    // reservation is held (unlike reserve+drop, which let another gateway's
+    // admin listener occupy the backend port and return 401 through the proxy).
+    let dead_port_reservation = reserve_refused_tcp_port().expect("reserve refused backend port");
+    let backend_port = dead_port_reservation.port;
 
     let yaml = http_with_retry(
         backend_port,
@@ -734,6 +758,7 @@ async fn retry_on_connect_failure_fires_with_empty_methods_and_statuses() {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     };
+    assert_proxy_retry_response_not_admin_collision(&resp);
     assert_eq!(
         resp.status().as_u16(),
         502,

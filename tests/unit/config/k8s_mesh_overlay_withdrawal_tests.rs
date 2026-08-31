@@ -1455,11 +1455,17 @@ fn mesh_config_fields_are_accounted_for_in_overlay_ownership() {
         // rebuilt from the slice on every mesh apply, never Kubernetes-owned.
         egress_udp_destinations: _,
         external_udp_egress_routes: _,
-        // Authenticated inbound CONNECT termination scope (issue #4150):
-        // resolved per slice from the topology, never Kubernetes-owned.
+        // Authenticated inbound CONNECT termination scope (issue #4150) and
+        // the own-address port bound that narrows its loopback / own-local-IP
+        // arms (issue #4249): resolved per slice from the topology, never
+        // Kubernetes-owned.
         inbound_relay_destinations: _,
         inbound_relay_admits_accepted_local_address: _,
         inbound_relay_admits_loopback_namespace: _,
+        inbound_relay_own_address_ports: _,
+        // Live handle to the node-agent's enrolled-pod registry (issue #4249):
+        // installed by the mesh serving runtime, never Kubernetes-owned.
+        inbound_relay_node_local_registry: _,
     } = MeshConfig::default();
 
     // Every namespaced collection is visible to the ownership accounting.

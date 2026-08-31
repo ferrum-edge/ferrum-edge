@@ -57,10 +57,10 @@ use ferrum_edge::identity::workload_api::proto::{
 use ferrum_edge::modes::mesh::config::{
     AppProtocol, EastWestGateway, MeshConfig, MeshConsistentHash, MeshDestinationRule,
     MeshEndpoint, MeshLoadBalancer, MeshPolicy, MeshRule, MeshService, MeshSimpleLb,
-    MeshTrafficPolicy, MtlsMode, MultiClusterConfig, PeerAuthentication, PolicyAction, PolicyScope,
-    PolicyTargetAttachment, PrincipalMatch, Resolution, ServiceEntry, ServiceEntryLocation,
-    ServicePort, ServiceTargetPort, TrustBundle, TrustBundleSet, Workload, WorkloadPort,
-    WorkloadRef, WorkloadSelector,
+    MeshTrafficPolicy, MeshWaypointServiceRef, MtlsMode, MultiClusterConfig, PeerAuthentication,
+    PolicyAction, PolicyScope, PolicyTargetAttachment, PrincipalMatch, Resolution, ServiceEntry,
+    ServiceEntryLocation, ServicePort, ServiceTargetPort, TrustBundle, TrustBundleSet, Workload,
+    WorkloadPort, WorkloadRef, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::proxy::ConfigApplyOutcome;
@@ -525,6 +525,40 @@ fn topology_relay_workload_v4(topology: &str) -> Ipv4Addr {
 /// terminator must listen on every local address of the reserved HBONE port.
 fn ambient_dest_hbone_listen_override(port: u16) -> (&'static str, String) {
     ("FERRUM_MESH_HBONE_LISTEN_ADDR", format!("0.0.0.0:{port}"))
+}
+
+/// Kubernetes UUID leaf for host-netns Ambient dest fixtures that enroll the
+/// advertised workload address in the node-agent registry (issue #4249).
+/// Registry `spiffe_id=` requires a UUID; an alphanumeric leaf retracts the
+/// enrolled-destination index and the dest relay then refuses the CONNECT.
+const AMBIENT_DEST_RELAY_POD_UID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+/// Publish a node-agent registry leaf so an Ambient dest terminator whose HBONE
+/// listener is reached at `127.0.0.1` still admits a CONNECT `:authority`
+/// naming the advertised non-loopback workload address (issue #4249).
+///
+/// Ambient with a configured registry directory treats the enrolled-pod index
+/// as AUTHORITATIVE for the inventory arm. [`spawn_mesh_gateway`] always points
+/// `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR` at an empty `node-waypoint-pods/`
+/// dir, so without this leaf `destination_is_node_local_enrolled` refuses every
+/// inventory destination (`AddressNotTerminated`) even though the slice
+/// declares the dest as local. Same-cluster, host-netns UDP-dest, and
+/// third-workload refusal fixtures avoid this by dialing the workload IP on a
+/// `0.0.0.0` HBONE bind (own-address arm); cross-cluster fixtures dial
+/// `127.0.0.1` and therefore need enrollment. Write the leaf before spawning
+/// the dest gateway so the startup `reconcile_once` sees it. UDP dest and the
+/// third-workload datagram sibling must not enroll: a matching `ipv4=` makes
+/// `open_hbone_udp_relay_socket` enter the enrolled pod netns, which a
+/// host-netns echo fixture does not have.
+fn publish_ambient_dest_relay_enrollment(temp: &TempDir, ipv4: &str, spiffe_id: &str) {
+    let registry_dir = temp.path().join("node-waypoint-pods");
+    std::fs::create_dir_all(&registry_dir).expect("create ambient dest pod registry");
+    let pod_uid = AMBIENT_DEST_RELAY_POD_UID;
+    std::fs::write(
+        registry_dir.join(pod_uid),
+        format!("/sys/fs/cgroup/kubepods/{pod_uid}\nspiffe_id={spiffe_id}\nipv4={ipv4}\n"),
+    )
+    .expect("publish ambient dest pod registry enrollment");
 }
 
 /// Bind an ephemeral listener for a fixture-owned server (a control plane, an
@@ -1223,6 +1257,24 @@ fn third_workload_refusal_exercises_synthesis_time_guard() {
         drive.contains("observe_third_workload_backend_hits("),
         "zero backend hits must come from the bounded observation helper, \
          which reports a dead backend as inconclusive rather than as zero"
+    );
+    // Own-address arm (issue #4249): HBONE on 0.0.0.0, dial B's advertised IP.
+    // Enrollment would take the inventory arm and then have the datagram
+    // sibling enter a pod netns the host-netns echo does not have.
+    assert!(
+        drive.contains("ambient_dest_hbone_listen_override("),
+        "B's HBONE must bind 0.0.0.0 so a CONNECT dialed at B's advertised IP \
+         takes the own-address arm"
+    );
+    assert!(
+        !drive.contains("Ipv4Addr::LOCALHOST"),
+        "HBONE must be dialed at B's advertised workload IP, not 127.0.0.1, so \
+         the accepted local address matches the CONNECT authority"
+    );
+    assert!(
+        !drive.contains("publish_ambient_dest_relay_enrollment("),
+        "do not enroll B — this is a host-netns fixture; enrollment would make \
+         the datagram sibling enter a pod netns the echo does not have"
     );
 
     let slice_header = "\nfn third_workload_refusal_slice(";
@@ -7569,6 +7621,7 @@ fn cross_cluster_ambient_dest_slice(
     c_spiffe: &str,
     backend_port: u16,
     workload_address: &str,
+    pod_uid: &str,
     b_local_ca_pem: &str,
     a_ca_pem: &str,
 ) -> MeshSlice {
@@ -7601,7 +7654,7 @@ fn cross_cluster_ambient_dest_slice(
             weight: None,
             locality: None,
             service_account: Some("svc-c".to_string()),
-            pod_uid: None,
+            pod_uid: Some(pod_uid.to_string()),
             node_waypoint: None,
             remote_provenance: false,
         }],
@@ -7867,6 +7920,7 @@ async fn drive_ambient_cross_cluster_egress(
             c_spiffe,
             backend_port,
             &workload_address,
+            AMBIENT_DEST_RELAY_POD_UID,
             &b_ca_pem,
             &a_ca_for_c_federation,
         ))
@@ -7887,6 +7941,12 @@ async fn drive_ambient_cross_cluster_egress(
             &b_ca_for_a_federation,
         ))
         .await;
+
+        // Issue #4249: C's HBONE is reached at 127.0.0.1, so the CONNECT
+        // authority (non-loopback workload IP) takes the inventory arm, which
+        // the empty spawn-helper registry would refuse. Enroll the dest before
+        // C starts so the startup reconcile sees it.
+        publish_ambient_dest_relay_enrollment(&temp_c, &workload_address, c_spiffe);
 
         // Gateway C (dest, Ambient): HBONE relay → echo backend.
         let mut child_c = spawn_mesh_gateway(
@@ -8308,6 +8368,7 @@ async fn try_start_ambient_cross_cluster_fixture(
         c_spiffe,
         backend_port,
         workload_address,
+        AMBIENT_DEST_RELAY_POD_UID,
         &b_ca_pem,
         &a_ca_for_c_federation,
     ))
@@ -8328,6 +8389,12 @@ async fn try_start_ambient_cross_cluster_fixture(
         &b_ca_for_a_federation,
     ))
     .await;
+
+    // Issue #4249: C's HBONE is reached at 127.0.0.1, so the CONNECT
+    // authority (non-loopback workload IP) takes the inventory arm, which
+    // the empty spawn-helper registry would refuse. Enroll the dest before
+    // C starts so the startup reconcile sees it.
+    publish_ambient_dest_relay_enrollment(&temp_c, workload_address, c_spiffe);
 
     // Gateway C (dest, Ambient): HBONE relay → the app backend.
     let mut child_c = spawn_mesh_gateway(
@@ -9744,6 +9811,7 @@ fn udp_dest_slice(
     b_spiffe: &str,
     udp_port: u16,
     workload_address: &str,
+    pod_uid: &str,
 ) -> MeshSlice {
     let b_id = SpiffeId::new(b_spiffe).expect("b SPIFFE id");
     let trust_domain = TrustDomain::new("cluster.local").expect("trust domain");
@@ -9772,7 +9840,7 @@ fn udp_dest_slice(
             weight: None,
             locality: None,
             service_account: Some("svc-b".to_string()),
-            pod_uid: None,
+            pod_uid: Some(pod_uid.to_string()),
             node_waypoint: None,
             remote_provenance: false,
         }],
@@ -9875,18 +9943,18 @@ async fn read_one_framed_reply(
 /// Open mTLS H2 to B, send a `udp` CONNECT + one framed `ping`, return
 /// (status, optional framed reply).
 async fn drive_one_udp_connect(
+    hbone_ip: Ipv4Addr,
     hbone_port: u16,
     authority: &str,
     client_svid: &GeneratedGatewaySvid,
 ) -> Result<(u16, Option<Vec<u8>>), String> {
-    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", hbone_port))
+    let tcp = tokio::net::TcpStream::connect((hbone_ip, hbone_port))
         .await
         .map_err(|e| format!("connect B: {e}"))?;
     let _ = tcp.set_nodelay(true);
     let connector = tokio_rustls::TlsConnector::from(udp_dest_client_config(client_svid));
-    let server_name = rustls::pki_types::ServerName::IpAddress(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)).into(),
-    );
+    let server_name =
+        rustls::pki_types::ServerName::IpAddress(std::net::IpAddr::V4(hbone_ip).into());
     // Bound the handshakes: if the HBONE port is bound but the TLS server wedges
     // (or a regression binds a non-TLS listener), an unbounded handshake await
     // would hang the ignored test forever before reaching the later timeouts.
@@ -9992,11 +10060,18 @@ async fn drive_udp_dest_connect(
             b_spiffe,
             udp_port,
             &workload_address,
+            AMBIENT_DEST_RELAY_POD_UID,
         ))
         .await;
         let ports_b = reserve_mesh_ports().await;
         let hbone_port = ports_b.hbone;
 
+        // Same-cluster Ambient dest shape (issue #4249): bind HBONE on 0.0.0.0
+        // and dial the advertised workload IP so the CONNECT takes the
+        // own-address arm. Do not enroll that IP — enrollment is what the
+        // inventory arm needs when HBONE is reached at 127.0.0.1, but
+        // `open_hbone_udp_relay_socket` then enters the enrolled pod netns,
+        // and this host-netns echo has none (502).
         let mut child_b = spawn_mesh_gateway(
             &temp_b,
             MeshGatewaySpawnOptions {
@@ -10016,6 +10091,7 @@ async fn drive_udp_dest_connect(
                         "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
                         svids.b.trust_bundle_path.clone(),
                     ),
+                    ambient_dest_hbone_listen_override(hbone_port),
                 ],
             },
         );
@@ -10040,7 +10116,8 @@ async fn drive_udp_dest_connect(
         };
         let authority = format!("{workload_address}:{dial_port}");
 
-        let outcome = drive_one_udp_connect(hbone_port, &authority, &client_svid).await;
+        let outcome =
+            drive_one_udp_connect(workload_ip, hbone_port, &authority, &client_svid).await;
 
         let logs = captured_output(&temp_b);
         kill_child(&mut child_b);
@@ -10573,8 +10650,11 @@ async fn drive_inbound_relay_third_workload_refusal(
     };
     // Ambient refuses the loopback namespace (#4315). B's own dest and C must
     // both be non-loopback so a control 200 and a C 404 are attributable to
-    // ownership, not to loopback-namespace denial.
-    let b_ip = IpAddr::V4(fixture_non_loopback_local_v4());
+    // ownership, not to loopback-namespace denial. `b_hbone_ip` is the address
+    // the client dials for B's HBONE so the accepted local address matches
+    // the CONNECT authority (own-address arm).
+    let b_hbone_ip = fixture_non_loopback_local_v4();
+    let b_ip = IpAddr::V4(b_hbone_ip);
     let c_ip = discover_bindable_non_loopback_local_ip().await?;
 
     let mut last_failure = String::new();
@@ -10617,6 +10697,13 @@ async fn drive_inbound_relay_third_workload_refusal(
         let ports_b = reserve_mesh_ports().await;
         let hbone_port = ports_b.hbone;
 
+        // Same-cluster Ambient dest shape (issue #4249): bind HBONE on 0.0.0.0
+        // and dial B's advertised workload IP so the own-destination control
+        // CONNECT takes the own-address arm. Do not enroll that IP — enrollment
+        // is what the inventory arm needs when HBONE is reached at 127.0.0.1,
+        // but `open_hbone_udp_relay_socket` then enters the enrolled pod netns,
+        // and this host-netns echo (shared by the datagram sibling) has none
+        // (502).
         let mut child_b = spawn_mesh_gateway(
             &temp_b,
             MeshGatewaySpawnOptions {
@@ -10636,6 +10723,7 @@ async fn drive_inbound_relay_third_workload_refusal(
                         "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
                         svids.b.trust_bundle_path.clone(),
                     ),
+                    ambient_dest_hbone_listen_override(hbone_port),
                 ],
             },
         );
@@ -10665,6 +10753,7 @@ async fn drive_inbound_relay_third_workload_refusal(
         let control = match flavor {
             ThirdWorkloadConnectFlavor::ByteStream => {
                 drive_one_waypoint_byte_connect(
+                    b_hbone_ip,
                     hbone_port,
                     &control_authority,
                     &svids.a,
@@ -10673,7 +10762,7 @@ async fn drive_inbound_relay_third_workload_refusal(
                 .await
             }
             ThirdWorkloadConnectFlavor::Datagram => {
-                drive_one_udp_connect(hbone_port, &control_authority, &svids.a).await
+                drive_one_udp_connect(b_hbone_ip, hbone_port, &control_authority, &svids.a).await
             }
         };
 
@@ -10717,13 +10806,15 @@ async fn drive_inbound_relay_third_workload_refusal(
 
         // CONNECT names C, a dest B does not terminate for. Synthesis 404s
         // before either HBONE handler runs. When this host has only one
-        // non-loopback IPv4, B and C share that address and inventory refuses
-        // C as PortNotDeclared (C's port lives only on C's SPIFFE); distinct
-        // addresses refuse as AddressNotTerminated. Both are synthesis 404,
-        // and C is not loopback so the 404 is not the #4315 namespace refusal.
+        // non-loopback IPv4, B and C share that address and the own-address
+        // arm refuses C as PortNotDeclared (C's port lives only on C's
+        // SPIFFE); distinct addresses miss the own-address arm and inventory
+        // refuses as AddressNotTerminated. Both are synthesis 404, and C is
+        // not loopback so the 404 is not the #4315 namespace refusal.
         let authority = SocketAddr::new(c_ip, c_port).to_string();
         let connect = match flavor {
             ThirdWorkloadConnectFlavor::ByteStream => drive_one_waypoint_byte_connect(
+                b_hbone_ip,
                 hbone_port,
                 &authority,
                 &svids.a,
@@ -10732,7 +10823,7 @@ async fn drive_inbound_relay_third_workload_refusal(
             .await
             .map(|(status, _)| status),
             ThirdWorkloadConnectFlavor::Datagram => {
-                drive_one_udp_connect(hbone_port, &authority, &svids.a)
+                drive_one_udp_connect(b_hbone_ip, hbone_port, &authority, &svids.a)
                     .await
                     .map(|(status, _)| status)
             }
@@ -11895,7 +11986,18 @@ fn target_refs_waypoint_slice(
         // read only by GatewayClass ownership validation and DestinationRule
         // tier arbitration, and this slice carries no DestinationRules.
         istio_root_namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
+        waypoint_name: Some(WAYPOINT_TARGET_REFS_NAME.to_string()),
         waypoint_gateway_class: Some("istio-waypoint".to_string()),
+        service_waypoint_bound_services: vec![
+            MeshWaypointServiceRef {
+                namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
+                name: "reviews".to_string(),
+            },
+            MeshWaypointServiceRef {
+                namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
+                name: "ratings".to_string(),
+            },
+        ],
         workloads: vec![
             waypoint_destination_workload("reviews", reviews_port, workload_address),
             waypoint_destination_workload("ratings", ratings_port, workload_address),
@@ -11952,22 +12054,23 @@ async fn read_relayed_bytes(
     .map_err(|_| "timed out reading relayed bytes".to_string())?
 }
 
-/// Open mTLS H2 to the waypoint, send a MARKER-LESS (byte-stream) HBONE CONNECT
-/// to `authority`, write `payload`, and return (status, echoed bytes).
+/// Open mTLS H2 to `hbone_ip:hbone_port`, send a MARKER-LESS (byte-stream)
+/// HBONE CONNECT to `authority`, write `payload`, and return (status, echoed
+/// bytes).
 async fn drive_one_waypoint_byte_connect(
+    hbone_ip: Ipv4Addr,
     hbone_port: u16,
     authority: &str,
     client_svid: &GeneratedGatewaySvid,
     payload: &[u8],
 ) -> Result<(u16, Option<Vec<u8>>), String> {
-    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", hbone_port))
+    let tcp = tokio::net::TcpStream::connect((hbone_ip, hbone_port))
         .await
         .map_err(|e| format!("connect waypoint: {e}"))?;
     let _ = tcp.set_nodelay(true);
     let connector = tokio_rustls::TlsConnector::from(udp_dest_client_config(client_svid));
-    let server_name = rustls::pki_types::ServerName::IpAddress(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)).into(),
-    );
+    let server_name =
+        rustls::pki_types::ServerName::IpAddress(std::net::IpAddr::V4(hbone_ip).into());
     let tls = tokio::time::timeout(Duration::from_secs(10), connector.connect(server_name, tcp))
         .await
         .map_err(|_| "client TLS handshake timed out".to_string())?
@@ -12104,6 +12207,7 @@ async fn drive_waypoint_target_refs(
         }
 
         let reviews = drive_one_waypoint_byte_connect(
+            Ipv4Addr::LOCALHOST,
             hbone_port,
             &format!("{workload_address}:{reviews_port}"),
             &svids.a,
@@ -12111,6 +12215,7 @@ async fn drive_waypoint_target_refs(
         )
         .await;
         let ratings = drive_one_waypoint_byte_connect(
+            Ipv4Addr::LOCALHOST,
             hbone_port,
             &format!("{workload_address}:{ratings_port}"),
             &svids.a,
@@ -12422,6 +12527,38 @@ impl Drop for LiveGatewayChild {
     }
 }
 
+/// Registry leaves that publish `spiffe_id=` are identity-bound: the production
+/// strict snapshot constructs `UdpSourceIdentity::new`, which requires a
+/// Kubernetes UUID. A merely path-safe alphanumeric token is a valid registry
+/// filename but retracts the enrolled-destination index.
+#[cfg(target_os = "linux")]
+fn require_identity_bound_pod_uid(pod_uid: &str) -> Result<(), String> {
+    ferrum_edge::modes::mesh::node_waypoint::parse_pod_uid(pod_uid)
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "registry spiffe_id= requires a Kubernetes UUID pod UID, \
+                 not a path-safe alphanumeric leaf: {error}"
+            )
+        })
+}
+
+/// Drift guard for identity-bound live registry helpers. An alphanumeric leaf
+/// with `spiffe_id=` is the exact fixture shape that timed out the enrolled-
+/// destination live gate; fail at construction instead of after 30s of HBONE 404s.
+#[cfg(target_os = "linux")]
+#[test]
+fn identity_bound_registry_helpers_reject_non_uuid_pod_uid() {
+    assert!(
+        require_identity_bound_pod_uid("functional-udp-enrolled-destination-pod").is_err(),
+        "the alphanumeric dest-pod fixture must fail at setup when paired with spiffe_id="
+    );
+    assert!(
+        require_identity_bound_pod_uid("dddddddd-dddd-4ddd-8ddd-dddddddddddd").is_ok(),
+        "a Kubernetes UUID must remain valid identity-binding evidence"
+    );
+}
+
 /// A pod-shaped network namespace plus a synthetic cgroup directory. Production
 /// cgroup resolution only needs `cgroup.procs`, so this lets the real manager and
 /// backend resolve `/proc/<pid>/ns/net` without mutating the runner's cgroup tree.
@@ -12543,6 +12680,9 @@ impl LivePodNetns {
         pod_uid: &str,
         spiffe_id: Option<&str>,
     ) -> Result<PathBuf, String> {
+        if spiffe_id.is_some() {
+            require_identity_bound_pod_uid(pod_uid)?;
+        }
         std::fs::create_dir_all(registry_dir)
             .map_err(|error| format!("create pod registry: {error}"))?;
         let path = registry_dir.join(pod_uid);
@@ -13012,9 +13152,16 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
 
     const VIP: &str = "192.0.2.40";
     const UNROUTABLE_VIP: &str = "192.0.2.41";
+    // Source capture publishes cgroup-only (no `spiffe_id=`): a path-safe
+    // alphanumeric leaf is the production registry grammar, not an identity
+    // binding. The destination entry below publishes identity and must be a UUID.
     const SOURCE_POD_UID: &str = "functional-udp-source-capture-pod";
-    const DEST_POD_UID: &str = "functional-udp-enrolled-destination-pod";
-    const ECHO_HOST: &str = "enrolled-udp-echo.live.ferrum.test";
+    // Registry filenames ARE the pod UIDs. `publish_enrolled` writes `spiffe_id=`,
+    // so the strict complete-snapshot reader constructs `UdpSourceIdentity::new`
+    // and requires a Kubernetes UUID. An alphanumeric token is a safe registry
+    // leaf but retracts the enrolled-destination index (Gateway B then 404s the
+    // UDP CONNECT and this live gate times out).
+    const DEST_POD_UID: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
     let capture_port = ferrum_edge::capture::DEFAULT_UDP_OUTBOUND_PORT;
     let source = match LiveVethPod::spawn_indexed(8) {
         Ok(pod) => pod,
@@ -13090,26 +13237,37 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
     let svids = generate_two_gateway_svids(temp_b.path(), a_spiffe, b_spiffe);
     let node_a = "functional-live-udp-source-a";
     let node_b = "functional-live-udp-source-b";
-    let a_dns_overrides = format!(r#"{{"{ECHO_HOST}":"127.0.0.1"}}"#);
-    let b_dns_overrides = format!(r#"{{"{ECHO_HOST}":"{}"}}"#, destination.pod_ip());
-    let cp_a = start_static_mesh_cp(live_source_capture_slice(
+    // Issue #4249: the destination workload is declared by its ENROLLED POD
+    // ADDRESS, not by a DNS name. Gateway B's inbound relay guard is bounded by
+    // the node-agent registry it was given (`dest_registry`), which is
+    // authoritative for an Ambient proxy, and an authoritative registry refuses
+    // a declared NAME outright — the guard never resolves one, so nothing it
+    // checked would still bind the socket the relay opens. Declaring the pod
+    // address instead keeps this live gate proving the REAL binding end to end:
+    // B admits the CONNECT only because its registry currently enrols exactly
+    // that address for `DEST_POD_UID` under `b_spiffe`, and the same address is
+    // what the relay dials into the destination pod's netns.
+    let workload_address = destination.pod_ip().to_string();
+    let mut slice_a = live_source_capture_slice(
         node_a,
         b_spiffe,
-        ECHO_HOST,
+        &workload_address,
         VIP,
         echo_port,
         AppProtocol::Udp,
-    ))
-    .await;
-    let cp_b = start_static_mesh_cp(live_source_capture_slice(
+    );
+    slice_a.workloads[0].pod_uid = Some(DEST_POD_UID.to_string());
+    let mut slice_b = live_source_capture_slice(
         node_b,
         b_spiffe,
-        ECHO_HOST,
+        &workload_address,
         VIP,
         echo_port,
         AppProtocol::Udp,
-    ))
-    .await;
+    );
+    slice_b.workloads[0].pod_uid = Some(DEST_POD_UID.to_string());
+    let cp_a = start_static_mesh_cp(slice_a).await;
+    let cp_b = start_static_mesh_cp(slice_b).await;
 
     let ports_b = reserve_mesh_ports().await;
     let b_hbone_port = ports_b.hbone;
@@ -13137,7 +13295,6 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
                     "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR",
                     dest_registry.path().display().to_string(),
                 ),
-                ("FERRUM_DNS_OVERRIDES", b_dns_overrides),
             ],
         },
     ));
@@ -13146,6 +13303,23 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
         "UDP destination HBONE listener did not bind\n{}",
         captured_output(&temp_b)
     );
+
+    // Issue #4249: gateway B terminates for the enrolled destination pod but
+    // runs in the HOST netns, while the pod address gateway A now names routes
+    // into the pod's own netns. Model the node's Ambient inbound redirect so the
+    // CONNECT reaches the terminator, exactly as a real node steers
+    // `pod-ip:15008` into its ztunnel. Installed before gateway A starts and
+    // removed on drop.
+    let installed_redirect = LiveHbonePodRedirect::install(destination.pod_ip(), b_hbone_port);
+    let _hbone_pod_redirect = match installed_redirect {
+        Ok(redirect) => redirect,
+        Err(error) => {
+            skip_or_fail_live_source_capture(&format!(
+                "cannot install enrolled-destination HBONE redirect: {error}"
+            ));
+            return;
+        }
+    };
 
     // Disabled-mode negative: the same enrolled pod produces no rules and no
     // capture socket. This is an independent fixture ownership generation;
@@ -13231,7 +13405,6 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
                 ("FERRUM_MESH_CAPTURE_UDP_PORT", capture_port.to_string()),
                 ("FERRUM_MESH_IP6TABLES_ENABLED", "false".to_string()),
                 ("FERRUM_MESH_EGRESS_HBONE_PORT", b_hbone_port.to_string()),
-                ("FERRUM_DNS_OVERRIDES", a_dns_overrides),
             ],
         },
     ));
@@ -13504,6 +13677,7 @@ impl LiveVethPod {
         pod_uid: &str,
         spiffe_id: &str,
     ) -> Result<PathBuf, String> {
+        require_identity_bound_pod_uid(pod_uid)?;
         std::fs::create_dir_all(registry_dir)
             .map_err(|error| format!("create enrolled destination registry: {error}"))?;
         let path = registry_dir.join(pod_uid);
@@ -13515,6 +13689,73 @@ impl LiveVethPod {
         std::fs::write(&path, contents)
             .map_err(|error| format!("publish enrolled destination registry entry: {error}"))?;
         Ok(path)
+    }
+}
+
+/// Model a node's Ambient inbound redirect for the two-gateway live fixtures
+/// (issue #4249).
+///
+/// A real Ambient node steers traffic aimed at an enrolled pod's HBONE port
+/// into the ztunnel that terminates for that pod, before the packet ever
+/// reaches the pod. In this fixture the terminator (gateway B) runs in the HOST
+/// netns on `127.0.0.1:<hbone port>` while the enrolled pod address routes over
+/// the veth into the pod's own netns, so the same redirect is what lets the
+/// destination be named by its REGISTRY-ENROLLED ADDRESS rather than by a DNS
+/// name the inbound relay guard would (correctly) refuse.
+///
+/// Fixture-owned and exact: one `nat OUTPUT` rule scoped to a single address and
+/// the run's reserved ephemeral HBONE port, deleted on drop.
+#[cfg(target_os = "linux")]
+struct LiveHbonePodRedirect {
+    pod_ip: std::net::Ipv4Addr,
+    port: u16,
+}
+
+#[cfg(target_os = "linux")]
+impl LiveHbonePodRedirect {
+    fn install(pod_ip: std::net::Ipv4Addr, port: u16) -> Result<Self, String> {
+        let redirect = Self { pod_ip, port };
+        // Idempotent: clear any leftover from an aborted earlier run first.
+        let _ = redirect.apply("-D");
+        redirect.apply("-A")?;
+        Ok(redirect)
+    }
+
+    fn apply(&self, op: &str) -> Result<(), String> {
+        let port = self.port.to_string();
+        let args = vec![
+            "-t".to_string(),
+            "nat".to_string(),
+            op.to_string(),
+            "OUTPUT".to_string(),
+            "-p".to_string(),
+            "tcp".to_string(),
+            "-d".to_string(),
+            self.pod_ip.to_string(),
+            "--dport".to_string(),
+            port.clone(),
+            "-j".to_string(),
+            "REDIRECT".to_string(),
+            "--to-ports".to_string(),
+            port,
+        ];
+        let status = Command::new("iptables")
+            .args(&args)
+            .status()
+            .map_err(|error| format!("run iptables {op} for the HBONE pod redirect: {error}"))?;
+        if !status.success() {
+            return Err(format!(
+                "iptables {op} for the HBONE pod redirect failed with {status}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LiveHbonePodRedirect {
+    fn drop(&mut self) {
+        let _ = self.apply("-D");
     }
 }
 
@@ -13652,6 +13893,7 @@ impl LiveHostUdpVethPod {
         pod_uid: &str,
         spiffe_id: &str,
     ) -> Result<PathBuf, String> {
+        require_identity_bound_pod_uid(pod_uid)?;
         std::fs::create_dir_all(registry_dir)
             .map_err(|error| format!("create host-udp registry: {error}"))?;
         let path = registry_dir.join(pod_uid);

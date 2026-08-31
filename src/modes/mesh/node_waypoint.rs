@@ -1293,6 +1293,44 @@ impl NodeWaypointIdentitySummary {
     }
 }
 
+/// Byte cap on a node-agent registry leaf name. Kubernetes `metadata.uid`
+/// values are 36-byte hyphenated UUIDs; this matches the CNI pod-UID field cap
+/// so a name the node-agent will not claim as ownership cannot be a registry key.
+const MAX_POD_REGISTRY_UID_BYTES: usize = 256;
+
+/// Return whether `pod_uid` is a canonical registry leaf name the node-agent may
+/// publish and strict consumers may admit as a production pod entry.
+///
+/// Accepted names are non-empty, at most 256 bytes, start with an ASCII
+/// alphanumeric, and continue with ASCII alphanumerics, hyphen, or underscore.
+/// Kubernetes `metadata.uid` values satisfy this, as do the alphanumeric-hyphen
+/// tokens fixtures use. Path separators, `..`, NULs, whitespace, control
+/// characters, and other punctuation are unsafe.
+///
+/// Hidden dot-prefixed names (`.ready`, `.udp-ready`, `.pod-registry-entry.tmp.*`)
+/// are **not** safe pod UIDs. Directory enumerators must skip those as registry
+/// control entries rather than treating them as pods or as snapshot errors.
+pub fn is_safe_pod_registry_uid(pod_uid: &str) -> bool {
+    if pod_uid.is_empty() || pod_uid.len() > MAX_POD_REGISTRY_UID_BYTES {
+        return false;
+    }
+    if pod_uid.contains('/')
+        || pod_uid.contains('\\')
+        || pod_uid.contains("..")
+        || pod_uid.contains('\0')
+    {
+        return false;
+    }
+    let mut chars = pod_uid.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 pub fn parse_pod_uid(raw: &str) -> Result<[u8; 16], String> {
     let uuid = uuid::Uuid::parse_str(raw)
         .map_err(|error| format!("invalid Kubernetes pod UID '{raw}': {error}"))?;
