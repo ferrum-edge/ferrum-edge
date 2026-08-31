@@ -3193,12 +3193,101 @@ async fn a_replayable_upload_with_only_trailers_is_still_pumped_and_still_waterm
             .await,
         "an unpolled upload must not fire the backend write watermark"
     );
-    // Once the transport takes the terminal trailers frame there is nothing
-    // left for the gateway to hand over, so the pump completes rather than
-    // stalling: the watermark bounds work that REMAINS, never a finished one.
+    // Once the transport takes the terminal trailers frame the pump publishes
+    // a clean EOS so hyper can read response headers. The join still holds an
+    // EOS holdover idle (issue #4411); dropping the join here cancels that
+    // wait the same way a header-wait win does.
     assert_eq!(
         probe.poll_transport_once(),
         ProbeReplayFrame::Trailers(vec![("grpc-status".to_string(), "0".to_string())])
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_fully_drained_buffered_upload_still_ends_the_header_wait_on_the_write_watermark() {
+    // Issue #4411: once hyper has taken every frame the kernel can absorb the
+    // whole POST without a peer `recv`. Completing the pump used to drop the
+    // write-timeout signal, so the header wait ran on to the read bound.
+    let frame = BufferedUploadPumpProbe::frame_size();
+    let mut probe = BufferedUploadPumpProbe::start(frame * 2, 800).expect("buffered pump");
+    loop {
+        match probe.poll_transport_once() {
+            ProbeTransportPoll::Data(_) => {}
+            ProbeTransportPoll::Pending => tokio::task::yield_now().await,
+            ProbeTransportPoll::Ended => break,
+            other => panic!("unexpected transport poll while draining: {other:?}"),
+        }
+    }
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await,
+        "kernel absorption must not disarm backend_write_timeout_ms"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_fully_drained_replayable_upload_still_ends_the_header_wait_on_the_write_watermark() {
+    let frame = ReplayableUploadPumpProbe::frame_size();
+    let mut probe = ReplayableUploadPumpProbe::start(frame * 2, &[], 800);
+    let frames = probe.drain_transport(64).await;
+    assert_eq!(
+        frames.last(),
+        Some(&ProbeReplayFrame::Ended),
+        "the transport must observe a clean EOS so response headers can be read: {frames:?}"
+    );
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await,
+        "kernel absorption must not disarm backend_write_timeout_ms on replayable uploads"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_progressing_buffered_upload_refreshes_the_write_watermark() {
+    // Partial consume must reset the idle; 400ms gaps under an 800ms bound
+    // must not 504. This is the #4074 / #4411 regression that matters most.
+    let frame = BufferedUploadPumpProbe::frame_size();
+    let frames = 4;
+    let mut probe = BufferedUploadPumpProbe::start(frame * frames, 800).expect("buffered pump");
+    let mut seen = 0;
+    while seen < frames {
+        loop {
+            match probe.poll_transport_once() {
+                ProbeTransportPoll::Data(_) => {
+                    seen += 1;
+                    break;
+                }
+                ProbeTransportPoll::Pending => tokio::task::yield_now().await,
+                other => panic!("unexpected transport poll while progressing: {other:?}"),
+            }
+        }
+        if seen < frames {
+            assert!(
+                probe
+                    .write_watermark_stays_dormant(Duration::from_millis(400))
+                    .await,
+                "slow-but-progressing consume must refresh backend_write_timeout_ms"
+            );
+        }
+    }
+    loop {
+        match probe.poll_transport_once() {
+            ProbeTransportPoll::Data(_) => {}
+            ProbeTransportPoll::Pending => tokio::task::yield_now().await,
+            ProbeTransportPoll::Ended => break,
+            other => panic!("unexpected transport poll draining EOS: {other:?}"),
+        }
+    }
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await,
+        "once consume stops, the EOS holdover must still bound the header wait"
     );
     assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
 }

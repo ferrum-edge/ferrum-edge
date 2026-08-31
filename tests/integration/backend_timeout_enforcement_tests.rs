@@ -1,7 +1,9 @@
-//! In-process HTTP-family backend timeout enforcement (#4055 / #4057).
+//! In-process HTTP-family backend timeout enforcement (#4055 / #4057 / #4411).
 //!
 //! `#4055` — a backend that accepts and never reads must surface a 504 write
 //! timeout near `backend_write_timeout_ms`, not hang until the client gives up.
+//! `#4411` — the same contract must hold when the POST fits in the local send
+//! buffer, so the upload pump reaches a clean EOS without socket backpressure.
 //! `#4057` — an SSE/chunked stall *after* headers must wait out
 //! `backend_read_timeout_ms` (idle-between-frames) instead of tearing the
 //! stream down immediately as `request_error`. Header-only stalls already 504
@@ -14,6 +16,7 @@
 use crate::scaffolding::backends::{
     HttpStep, RequestMatcher, ScriptedHttp1Backend, ScriptedTcpBackend, TcpStep,
 };
+use crate::scaffolding::clients::Http2Client;
 use crate::scaffolding::file_mode_yaml_for_backend_with;
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::reserve_port;
@@ -30,6 +33,14 @@ const READ_TIMEOUT_MS: u64 = 800;
 // that a backend which never reads eventually backpressures the upload pump.
 const BACKEND_RECEIVE_BUFFER_BYTES: usize = 1024;
 const UPLOAD_STALL_BYTES: usize = 8 * 1024 * 1024;
+// Issue #4411 repro size: 2 MiB fits in a typical loopback send buffer, so the
+// pump completes a clean EOS without socket backpressure. The header-wait
+// write bound must still fire.
+const KERNEL_ABSORB_UPLOAD_BYTES: usize = 2 * 1024 * 1024;
+// Large enough to backpressure against a 1 KiB receive window so the pump
+// stays in `reserve()` and genuine consume progress can refresh the idle.
+const PROGRESSING_UPLOAD_BYTES: usize = 256 * 1024;
+const PROGRESSING_READ_CHUNK: usize = 32 * 1024;
 const SSE_FIRST_EVENT: &[u8] = b"data: hello\r\n\n";
 
 fn assert_timeout_envelope(elapsed: Duration, timeout_ms: u64) {
@@ -336,6 +347,217 @@ async fn in_process_buffered_backend_write_timeout_zero_does_not_504() {
         }
         Ok(Err(err)) => {
             panic!("unexpected client error under buffered write-timeout=0: {err}");
+        }
+    }
+}
+
+fn http_200_ok_close() -> Vec<u8> {
+    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+}
+
+fn progressing_upload_script(body_len: usize) -> Vec<TcpStep> {
+    let mut steps = vec![TcpStep::ReadUntil(b"\r\n\r\n".to_vec())];
+    let mut remaining = body_len;
+    while remaining > 0 {
+        steps.push(TcpStep::Sleep(Duration::from_millis(200)));
+        let n = remaining.min(PROGRESSING_READ_CHUNK);
+        steps.push(TcpStep::ReadExact(n));
+        remaining -= n;
+    }
+    steps.push(TcpStep::Write(http_200_ok_close()));
+    steps
+}
+
+async fn post_upload(
+    harness: &GatewayHarness,
+    client: &reqwest::Client,
+    bytes: usize,
+) -> (reqwest::StatusCode, Option<String>, String, Duration) {
+    let started = Instant::now();
+    let resp = client
+        .post(harness.proxy_url("/api/twrite"))
+        .header("content-type", "application/octet-stream")
+        .header("expect", "")
+        .body(vec![b'x'; bytes])
+        .send()
+        .await
+        .expect("gateway returns a response");
+    let elapsed = started.elapsed();
+    let status = resp.status();
+    let header = gateway_error_header(resp.headers()).map(str::to_owned);
+    let body = resp.text().await.expect("body");
+    (status, header, body, elapsed)
+}
+
+// #4411: 2 MiB fits in a typical loopback send buffer. The pump reaches a
+// clean EOS without socket backpressure; the header-wait write bound must
+// still produce 504 near `backend_write_timeout_ms`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_process_kernel_absorb_write_timeout_maps_to_504() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
+        .step(TcpStep::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn");
+
+    let yaml =
+        file_mode_yaml_for_backend_with(backend_port, timeout_overrides(8_000, WRITE_TIMEOUT_MS));
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = harness.http_client().expect("client");
+    let (status, header, body, elapsed) = post_upload(
+        &harness,
+        client.as_reqwest(),
+        KERNEL_ABSORB_UPLOAD_BYTES,
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::GATEWAY_TIMEOUT,
+        "kernel-absorbed never-read POST must be 504, got {status} body={body}"
+    );
+    assert_eq!(
+        header.as_deref(),
+        Some("backend_timeout"),
+        "timeout must carry X-Gateway-Error=backend_timeout, body={body}"
+    );
+    assert_eq!(body, r#"{"error":"Backend timeout"}"#);
+    assert_timeout_envelope(elapsed, WRITE_TIMEOUT_MS);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_process_h2c_kernel_absorb_write_timeout_maps_to_504() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
+        .step(TcpStep::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn");
+
+    let yaml =
+        file_mode_yaml_for_backend_with(backend_port, timeout_overrides(8_000, WRITE_TIMEOUT_MS));
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = Http2Client::h2c_prior_knowledge().expect("h2c client");
+    let (status, header, body, elapsed) = post_upload(
+        &harness,
+        client.as_reqwest(),
+        KERNEL_ABSORB_UPLOAD_BYTES,
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::GATEWAY_TIMEOUT,
+        "h2c kernel-absorbed never-read POST must be 504, got {status} body={body}"
+    );
+    assert_eq!(
+        header.as_deref(),
+        Some("backend_timeout"),
+        "timeout must carry X-Gateway-Error=backend_timeout, body={body}"
+    );
+    assert_eq!(body, r#"{"error":"Backend timeout"}"#);
+    assert_timeout_envelope(elapsed, WRITE_TIMEOUT_MS);
+}
+
+// Slow-but-progressing reads must refresh the write watermark. 200ms gaps
+// under an 800ms bound must complete with 200, not 504.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_process_progressing_upload_is_not_killed_by_idle_write_timeout() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let mut backend = ScriptedTcpBackend::builder(reservation.into_listener())
+        .receive_buffer_size(BACKEND_RECEIVE_BUFFER_BYTES);
+    for step in progressing_upload_script(PROGRESSING_UPLOAD_BYTES) {
+        backend = backend.step(step);
+    }
+    let _backend = backend.spawn().expect("spawn");
+
+    let yaml =
+        file_mode_yaml_for_backend_with(backend_port, timeout_overrides(8_000, WRITE_TIMEOUT_MS));
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = harness.http_client().expect("client");
+    let (status, header, body, _elapsed) = post_upload(
+        &harness,
+        client.as_reqwest(),
+        PROGRESSING_UPLOAD_BYTES,
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "slow-but-progressing upload must not 504, got {status} \
+         x-gateway-error={header:?} body={body}"
+    );
+    assert_eq!(body, "ok");
+}
+
+// `backend_write_timeout_ms: 0` must still leave a kernel-absorbed never-read
+// POST unbounded at the 800ms watermark.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_process_kernel_absorb_write_timeout_zero_does_not_504() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
+        .step(TcpStep::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn");
+
+    let yaml = file_mode_yaml_for_backend_with(backend_port, timeout_overrides(8_000, 0));
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = harness.http_client().expect("client");
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_millis(1_500),
+        client
+            .as_reqwest()
+            .post(harness.proxy_url("/api/twrite"))
+            .header("content-type", "application/octet-stream")
+            .header("expect", "")
+            .body(vec![b'x'; KERNEL_ABSORB_UPLOAD_BYTES])
+            .send(),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    match result {
+        Err(_) => {
+            assert!(
+                elapsed >= Duration::from_millis(1_300),
+                "zero write timeout must not 504 at the 800ms watermark; \
+                 client gave up at {elapsed:?}"
+            );
+        }
+        Ok(Ok(resp)) => {
+            assert_ne!(
+                resp.status(),
+                reqwest::StatusCode::GATEWAY_TIMEOUT,
+                "backend_write_timeout_ms=0 must not produce a 504"
+            );
+        }
+        Ok(Err(err)) => {
+            panic!("unexpected client error under write-timeout=0: {err}");
         }
     }
 }

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- HTTP-family `backend_write_timeout_ms` again terminates a POST to a backend
+  that `accept()`s and never reads (issue #4411, regression of #4074). After
+  #4074 the upload pump armed on first transport consume and raced the
+  response-header wait, but once the kernel send buffer absorbed the body the
+  pump published a clean end-of-stream and dropped the write-timeout signal, so
+  HTTP/1.1 and prior-knowledge h2c hung until the client deadline. The join now
+  keeps an EOS holdover idle — still refreshed only on genuine consume progress,
+  still dormant through DNS/TCP/TLS acquisition, still disabled by `0` — so the
+  documented 504 / `X-Gateway-Error: backend_timeout` /
+  `error_class=read_write_timeout` contract holds when the peer never `recv`s.
+  Reqwest protocol-NACK replay is unchanged: buffered uploads still use
+  `send_buffered_upload_with_protocol_nack_replay` rather than wrapping the
+  body in a way that erases `try_clone()`.
+
 ### Security
 
 - **`request_mirror` denies cross-origin query credentials by default**

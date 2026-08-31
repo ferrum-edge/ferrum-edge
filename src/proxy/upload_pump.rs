@@ -69,6 +69,16 @@
 //! watermark can fire. That window is exactly the connect phase, which
 //! `backend_connect_timeout_ms` already bounds.
 //!
+//! Once the transport has consumed, the watermark must also survive a *clean*
+//! source end (issue #4411). A never-read origin still lets the local TCP send
+//! buffer absorb a small-or-medium POST; hyper then observes end-of-stream,
+//! the pump would otherwise publish [`UploadPumpOutcome::Completed`] and drop
+//! the write-timeout signal, and the response-header wait would run on to
+//! `backend_read_timeout_ms`. Closing the bridge for a clean EOS and handing
+//! the join a holdover idle — refreshed only by genuine consume progress
+//! before that EOS — keeps `backend_write_timeout_ms` on the header wait
+//! without treating "we queued a frame" as progress.
+//!
 //! The dispatcher holds an [`UploadPumpJoin`], whose
 //! [`cancel_and_join`](UploadPumpJoin::cancel_and_join) is an actual join: it
 //! resolves only after the task has published its outcome, which it does after
@@ -374,6 +384,16 @@ pub(crate) struct UploadPumpJoin {
     /// [`backend_write_watermark_expired`](UploadPumpJoin::backend_write_watermark_expired)
     /// turns into "never" rather than a spurious wake.
     write_timeout: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Fires when the pump has handed every source frame to the transport
+    /// *and* the write watermark is armed. The join then idles for
+    /// `write_timeout_ms` so a kernel send buffer that absorbed the whole
+    /// body cannot disarm the header-wait write bound (issue #4411).
+    eos_holdover: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Set when [`eos_holdover`](Self::eos_holdover) fires, then slept with
+    /// `sleep_until` so a dropped header-wait race can resume the same idle
+    /// rather than losing the bound.
+    eos_holdover_deadline: Option<tokio::time::Instant>,
+    write_timeout_ms: u64,
     /// Shared with the pump task and with [`UploadPumpSource`]'s abort guard.
     /// Read only as a FALLBACK, when the task published no outcome of its own
     /// because it was aborted — which is exactly what releasing the transport
@@ -466,18 +486,14 @@ impl UploadPumpJoin {
     ///
     /// [`cancel_and_join`]: Self::cancel_and_join
     pub(crate) async fn backend_write_watermark_expired(&mut self) {
-        loop {
-            match self.write_timeout.as_mut() {
-                Some(receiver) => {
-                    if await_oneshot_signal(receiver).await.is_ok() {
-                        return;
-                    }
-                    // Sender dropped without firing: this pump settled on some
-                    // other terminal and can never report a write timeout.
-                    self.write_timeout = None;
-                }
-                None => never().await,
-            }
+        tokio::select! {
+            biased;
+            () = write_timeout_fired(&mut self.write_timeout) => {}
+            () = eos_holdover_elapsed(
+                &mut self.eos_holdover,
+                &mut self.eos_holdover_deadline,
+                self.write_timeout_ms,
+            ) => {}
         }
     }
 
@@ -581,14 +597,26 @@ where
     let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
     let (write_timeout_tx, write_timeout_rx) = tokio::sync::oneshot::channel();
     // One channel, one owner. A pump with no write bound creates none at all,
-    // so `write_configured` and the arm condition can never disagree.
-    let (dispatcher_write_start, consumer_write_start, write_start_rx) = if write_timeout_ms == 0 {
-        (None, None, None)
+    // so `write_configured` and the arm condition can never disagree. The EOS
+    // holdover is the same bound: it exists only when a write watermark does.
+    let (
+        dispatcher_write_start,
+        consumer_write_start,
+        write_start_rx,
+        eos_holdover_tx,
+        eos_holdover_rx,
+    ) = if write_timeout_ms == 0 {
+        (None, None, None, None, None)
     } else {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let (eos_tx, eos_rx) = tokio::sync::oneshot::channel();
         match arm {
-            WriteWatermarkArm::Dispatcher => (Some(tx), None, Some(rx)),
-            WriteWatermarkArm::Consumer => (None, Some(tx), Some(rx)),
+            WriteWatermarkArm::Dispatcher => {
+                (Some(tx), None, Some(rx), Some(eos_tx), Some(eos_rx))
+            }
+            WriteWatermarkArm::Consumer => {
+                (None, Some(tx), Some(rx), Some(eos_tx), Some(eos_rx))
+            }
         }
     };
     let terminal = Arc::new(AtomicU8::new(PUMP_RUNNING));
@@ -604,6 +632,7 @@ where
             write_start_rx,
             terminal: task_terminal,
             write_timeout_tx,
+            eos_holdover_tx,
         })
         .await;
         let _ = finished_tx.send(outcome);
@@ -627,6 +656,9 @@ where
             write_start: dispatcher_write_start,
             finished: Some(finished_rx),
             write_timeout: Some(write_timeout_rx),
+            eos_holdover: eos_holdover_rx,
+            eos_holdover_deadline: None,
+            write_timeout_ms,
             terminal,
             cancel_on_drop: false,
         },
@@ -677,6 +709,72 @@ async fn await_oneshot_signal(
     std::future::poll_fn(|cx| std::future::Future::poll(Pin::new(&mut *receiver), cx)).await
 }
 
+/// Wait for the pump task's in-flight write-idle expiry.
+///
+/// A dropped sender is some other terminal: disarm and stay pending so this
+/// arm cannot fire spuriously. Cancel-safe.
+async fn write_timeout_fired(write_timeout: &mut Option<tokio::sync::oneshot::Receiver<()>>) {
+    loop {
+        match write_timeout.as_mut() {
+            Some(receiver) => {
+                if await_oneshot_signal(receiver).await.is_ok() {
+                    return;
+                }
+                *write_timeout = None;
+            }
+            None => never().await,
+        }
+    }
+}
+
+/// After the source is exhausted, idle `write_timeout_ms` so the header wait
+/// still observes `backend_write_timeout_ms` when the kernel absorbed the
+/// body (issue #4411).
+///
+/// The pump publishes this signal only once the write watermark is armed, so
+/// connection acquisition stays off the write clock. A dropped sender is a
+/// non-complete terminal: disarm and stay pending.
+///
+/// Cancel-safe: the deadline is stored on the join before any sleep, so a
+/// `select!` that loses the header-wait race (or a probe that observes
+/// dormancy) resumes the same idle instead of dropping the bound.
+async fn eos_holdover_elapsed(
+    eos_holdover: &mut Option<tokio::sync::oneshot::Receiver<()>>,
+    eos_holdover_deadline: &mut Option<tokio::time::Instant>,
+    write_timeout_ms: u64,
+) {
+    loop {
+        if let Some(at) = *eos_holdover_deadline {
+            tokio::time::sleep_until(at).await;
+            *eos_holdover_deadline = None;
+            return;
+        }
+        match eos_holdover.as_mut() {
+            Some(receiver) => match await_oneshot_signal(receiver).await {
+                Ok(()) => {
+                    *eos_holdover = None;
+                    if write_timeout_ms == 0 {
+                        never().await;
+                    } else {
+                        let deadline = tokio::time::Instant::now()
+                            .checked_add(Duration::from_millis(write_timeout_ms));
+                        match deadline {
+                            Some(at) => *eos_holdover_deadline = Some(at),
+                            // Instant overflow: fail closed; the bound has
+                            // elapsed as far as this join can represent.
+                            None => return,
+                        }
+                    }
+                }
+                Err(_) => {
+                    *eos_holdover = None;
+                }
+            },
+            None => never().await,
+        }
+    }
+}
+
 /// State moved into the gateway-owned upload task.
 ///
 /// Keeping the task controls together makes their shared lifecycle explicit:
@@ -691,6 +789,7 @@ struct UploadPumpTask<B> {
     write_start_rx: Option<tokio::sync::oneshot::Receiver<()>>,
     terminal: Arc<AtomicU8>,
     write_timeout_tx: tokio::sync::oneshot::Sender<()>,
+    eos_holdover_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 async fn run_upload_pump<B>(task: UploadPumpTask<B>) -> UploadPumpOutcome
@@ -706,7 +805,9 @@ where
         write_start_rx: mut write_start,
         terminal,
         write_timeout_tx,
+        mut eos_holdover_tx,
     } = task;
+    let mut sender = Some(sender);
     let mut cancel = Some(cancel_rx);
     // Absolute and armed once when a credential admitted the stream. Relayed
     // DATA, gRPC messages, and trailers never refresh it, and it is owned by
@@ -741,6 +842,11 @@ where
         {
             idle.as_mut().reset(at);
         }
+        let Some(sender_ref) = sender.as_ref() else {
+            // Sender is taken only on the clean-EOS path, which already
+            // broke `'pump`. Remaining `None` is a type-level remainder.
+            break 'pump UploadPumpOutcome::Completed;
+        };
         let permit = tokio::select! {
             biased;
             () = cancel_requested(&mut cancel) => break 'pump UploadPumpOutcome::Cancelled,
@@ -757,7 +863,7 @@ where
             () = write_idle_elapsed(&mut write_idle), if write_armed => {
                 break 'pump UploadPumpOutcome::WriteTimeout;
             }
-            reserved = sender.reserve() => match reserved {
+            reserved = sender_ref.reserve() => match reserved {
                 Ok(permit) => permit,
                 Err(_) => break 'pump UploadPumpOutcome::ConsumerGone,
             },
@@ -780,7 +886,39 @@ where
             };
         };
         match frame {
-            None => break UploadPumpOutcome::Completed,
+            None => {
+                // Last frame is already on the bridge. Close the sender so the
+                // transport observes a clean end-of-stream and can read
+                // response headers. Completing here used to drop the
+                // write-timeout signal, so a never-read origin whose kernel
+                // send buffer absorbed the body ran on to the read watermark
+                // (issue #4411). Hand the join a holdover idle instead.
+                drop(sender.take());
+                if !write_configured {
+                    break 'pump UploadPumpOutcome::Completed;
+                }
+                while !write_armed {
+                    tokio::select! {
+                        biased;
+                        () = cancel_requested(&mut cancel) => {
+                            break 'pump UploadPumpOutcome::Cancelled;
+                        }
+                        () = &mut expiry, if auth_armed => {
+                            if let Some((deadline, family, latch)) = plan.as_ref() {
+                                latch.record_once(deadline.termination, *family);
+                            }
+                            break 'pump UploadPumpOutcome::AuthorizationExpired;
+                        }
+                        () = signal_requested(&mut write_start) => {
+                            write_armed = true;
+                        }
+                    }
+                }
+                if let Some(eos) = eos_holdover_tx.take() {
+                    let _ = eos.send(());
+                }
+                break 'pump UploadPumpOutcome::Completed;
+            }
             Some(Ok(frame)) => permit.send(frame),
             Some(Err(_)) => break UploadPumpOutcome::SourceError,
         }

@@ -1273,12 +1273,14 @@ adapter, and buffered uploads (retries, body-processing policy, retry replays)
 by handing the collected buffer to the same pump in bounded slices; a backend
 that accepts and never reads
 surfaces as `504` / `X-Gateway-Error: backend_timeout` /
-`error_class=read_write_timeout`. `0` disables the write bound. Because the
-bound is idle rather than total, a buffered body is written in bounded slices
-and every slice that the backend takes re-arms it, so a large upload that is
-slow but continuously progressing is not timed out. Streaming
-pass-through uploads are otherwise unaffected by the buffered-upload collection
-deadline above.
+`error_class=read_write_timeout`. The watermark stays live through the
+response-header wait even after the local TCP send buffer has absorbed the
+body — completing the upload pump is not permission to disarm it. `0`
+disables the write bound. Because the bound is idle rather than total, a
+buffered body is written in bounded slices and every slice that the backend
+takes re-arms it, so a large upload that is slow but continuously progressing
+is not timed out. Streaming pass-through uploads are otherwise unaffected by
+the buffered-upload collection deadline above.
 
 The bound starts when the backend transport begins consuming the request body —
 the first moment a connection provably exists and the request head is written —
