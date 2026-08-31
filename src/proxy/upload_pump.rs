@@ -69,15 +69,23 @@
 //! watermark can fire. That window is exactly the connect phase, which
 //! `backend_connect_timeout_ms` already bounds.
 //!
-//! Once the transport has consumed, the watermark must also survive a *clean*
-//! source end (issue #4411). A never-read origin still lets the local TCP send
-//! buffer absorb a small-or-medium POST; hyper then observes end-of-stream and
-//! may immediately drop an exact-length body, aborting the pump before it can
-//! publish a response holdover. The terminal bridge frame now carries its
-//! source-end marker, so transport consumption records the holdover in shared
-//! join state before that drop. The holdover is refreshed only by genuine
-//! consume progress and keeps `backend_write_timeout_ms` on the header wait
-//! without treating "we queued a frame" as progress.
+//! Once the transport has consumed, a narrowly-scoped watermark must also
+//! survive a *clean* source end (issue #4411). A never-read origin can let the
+//! local TCP send buffer absorb a small-or-medium POST without ever making the
+//! pump wait for bridge capacity; hyper then observes end-of-stream and may
+//! immediately drop an exact-length body, aborting the pump before it can
+//! publish a response holdover. The terminal bridge frame therefore carries
+//! its source-end marker, so transport consumption records clean EOS in shared
+//! join state before that drop.
+//!
+//! The holdover arms only when the write watermark was live and the pump never
+//! observed transport backpressure. A `reserve()` poll that returns `Pending`
+//! is the precise backpressure signal; a permit returned on the first poll is
+//! not. Pending means the transport's peer receive window throttled the bridge,
+//! which is positive evidence that the peer was consuming the upload. Its
+//! absence plus a stalled response-head wait is the kernel-absorb signature.
+//! This keeps slow-but-progressing uploads on the pre-EOS idle bound instead of
+//! turning their final drain into a total post-upload deadline.
 //!
 //! The dispatcher holds an [`UploadPumpJoin`], whose
 //! [`cancel_and_join`](UploadPumpJoin::cancel_and_join) is an actual join: it
@@ -141,11 +149,18 @@ const PUMP_WRITE_TIMEOUT: u8 = 6;
 ///
 /// The transport can consume the terminal body frame and immediately drop its
 /// [`UploadPumpSource`] before the pump task is scheduled again. Keeping both
-/// facts here lets the join observe that consume without depending on the task
-/// surviving the source's abort guard (issue #4411).
+/// facts and the pump's backpressure history here lets the join make the
+/// holdover decision without depending on the task surviving the source's
+/// abort guard (issue #4411).
 struct UploadPumpWriteState {
     armed: AtomicBool,
     eos_consumed: AtomicBool,
+    /// Set when an armed pump polls `reserve()` to `Pending` rather than
+    /// receiving a permit immediately. That is transport receive-window
+    /// backpressure, hence positive evidence that the peer consumed upload
+    /// bytes. Its absence is required for the issue #4411 kernel-absorb
+    /// response holdover.
+    backpressured: AtomicBool,
     changed: tokio::sync::Notify,
 }
 
@@ -154,6 +169,7 @@ impl UploadPumpWriteState {
         Self {
             armed: AtomicBool::new(false),
             eos_consumed: AtomicBool::new(false),
+            backpressured: AtomicBool::new(false),
             changed: tokio::sync::Notify::new(),
         }
     }
@@ -170,8 +186,16 @@ impl UploadPumpWriteState {
         }
     }
 
+    fn record_backpressure(&self) {
+        if !self.backpressured.swap(true, Ordering::AcqRel) {
+            self.changed.notify_one();
+        }
+    }
+
     fn holdover_ready(&self) -> bool {
-        self.armed.load(Ordering::Acquire) && self.eos_consumed.load(Ordering::Acquire)
+        self.armed.load(Ordering::Acquire)
+            && self.eos_consumed.load(Ordering::Acquire)
+            && !self.backpressured.load(Ordering::Acquire)
     }
 }
 
@@ -468,9 +492,10 @@ pub(crate) struct UploadPumpJoin {
     /// Records transport consumption of clean EOS independently of the pump
     /// task, so the source's abort guard cannot drop the response holdover.
     write_state: Option<Arc<UploadPumpWriteState>>,
-    /// Set when [`write_state`](Self::write_state) reports both an armed
-    /// watermark and consumed EOS, then slept with `sleep_until` so a dropped
-    /// header-wait race can resume the same idle rather than losing the bound.
+    /// Set when [`write_state`](Self::write_state) reports an armed watermark,
+    /// consumed EOS, and no backpressure, then slept with `sleep_until` so a
+    /// dropped header-wait race can resume the same idle rather than losing
+    /// the bound.
     eos_holdover_deadline: Option<tokio::time::Instant>,
     write_timeout_ms: u64,
     /// Shared with the pump task and with [`UploadPumpSource`]'s abort guard.
@@ -706,6 +731,7 @@ where
             plan,
             write_timeout_ms,
             write_start_rx,
+            write_state: write_state.as_ref().map(Arc::clone),
             terminal: task_terminal,
             write_timeout_tx,
         })
@@ -803,15 +829,17 @@ async fn write_timeout_fired(write_timeout: &mut Option<tokio::sync::oneshot::Re
     }
 }
 
-/// After the source is exhausted, idle `write_timeout_ms` so the header wait
-/// still observes `backend_write_timeout_ms` when the kernel absorbed the
-/// body (issue #4411).
+/// After the source is exhausted without transport backpressure, idle
+/// `write_timeout_ms` so the header wait still observes
+/// `backend_write_timeout_ms` when the kernel absorbed the body (issue #4411).
 ///
 /// Shared state starts this idle only after the write watermark is armed AND
-/// the transport consumes clean EOS, so connection acquisition stays off the
-/// write clock. Recording those events independently also handles native gRPC,
-/// whose dispatcher can arm after the terminal body state is observable in a
-/// synthetic probe even though production arms before `send_request()`.
+/// the transport consumes clean EOS AND the pump has never awaited a full
+/// bridge since arming. That last condition keeps a receive-window-throttled,
+/// slow-but-progressing upload off the post-EOS holdover. Recording the events
+/// independently also handles native gRPC, whose dispatcher can arm after the
+/// terminal body state is observable in a synthetic probe even though
+/// production arms before `send_request()`.
 ///
 /// Cancel-safe: the deadline is stored on the join before any sleep, so a
 /// `select!` that loses the header-wait race (or a probe that observes
@@ -851,6 +879,31 @@ async fn eos_holdover_elapsed(
     }
 }
 
+/// Reserve one bridge slot and publish whether the armed pump had to yield.
+///
+/// The first poll is decisive and does not use elapsed time: `Ready` means a
+/// permit was immediately available, while `Pending` means the transport was
+/// applying backpressure. The future remains cancel-safe inside the pump's
+/// outer `select!`; dropping it loses no permit.
+async fn reserve_upload_capacity<'a, T>(
+    sender: &'a tokio::sync::mpsc::Sender<T>,
+    write_armed: bool,
+    write_state: Option<&UploadPumpWriteState>,
+) -> Result<tokio::sync::mpsc::Permit<'a, T>, tokio::sync::mpsc::error::SendError<()>> {
+    let mut reserve = std::pin::pin!(sender.reserve());
+    std::future::poll_fn(|cx| {
+        let poll = std::future::Future::poll(reserve.as_mut(), cx);
+        if poll.is_pending()
+            && write_armed
+            && let Some(write_state) = write_state
+        {
+            write_state.record_backpressure();
+        }
+        poll
+    })
+    .await
+}
+
 /// State moved into the gateway-owned upload task.
 ///
 /// Keeping the task controls together makes their shared lifecycle explicit:
@@ -863,6 +916,7 @@ struct UploadPumpTask<B> {
     plan: Option<RequestAuthLifetimePlan>,
     write_timeout_ms: u64,
     write_start_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+    write_state: Option<Arc<UploadPumpWriteState>>,
     terminal: Arc<AtomicU8>,
     write_timeout_tx: tokio::sync::oneshot::Sender<()>,
 }
@@ -878,6 +932,7 @@ where
         plan,
         write_timeout_ms,
         write_start_rx: mut write_start,
+        write_state,
         terminal,
         write_timeout_tx,
     } = task;
@@ -937,7 +992,11 @@ where
             () = write_idle_elapsed(&mut write_idle), if write_armed => {
                 break 'pump UploadPumpOutcome::WriteTimeout;
             }
-            reserved = sender_ref.reserve() => match reserved {
+            reserved = reserve_upload_capacity(
+                sender_ref,
+                write_armed,
+                write_state.as_deref(),
+            ) => match reserved {
                 Ok(permit) => permit,
                 Err(_) => break 'pump UploadPumpOutcome::ConsumerGone,
             },

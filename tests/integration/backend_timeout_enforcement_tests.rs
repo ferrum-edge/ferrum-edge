@@ -498,7 +498,8 @@ async fn in_process_h2c_kernel_absorb_write_timeout_maps_to_504() {
     assert_timeout_envelope(elapsed, WRITE_TIMEOUT_MS);
 }
 
-// Slow-but-progressing reads must refresh the write watermark. 200ms gaps
+// Slow-but-progressing reads must refresh the pre-EOS write watermark. The
+// pump's capacity waits also suppress the post-EOS holdover, so 200ms gaps
 // under an 800ms bound must complete with 200, not 504.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn in_process_progressing_upload_is_not_killed_by_idle_write_timeout() {

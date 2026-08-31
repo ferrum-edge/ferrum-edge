@@ -1274,27 +1274,29 @@ by handing the collected buffer to the same pump in bounded slices; a backend
 that accepts and never reads
 surfaces as `504` / `X-Gateway-Error: backend_timeout` /
 `error_class=read_write_timeout`. The watermark stays live through the
-response-header wait even after the local TCP send buffer has absorbed the
-body — completing the upload pump is not permission to disarm it. `0`
-disables the write bound. Because the bound is idle rather than total, a
-buffered body is written in bounded slices and every slice that the backend
-takes re-arms it, so a large upload that is slow but continuously progressing
-is not timed out. Streaming pass-through uploads are otherwise unaffected by
-the buffered-upload collection deadline above.
+response-header wait only when the local transport absorbed the whole body
+without backpressure after the watermark armed. The pump records backpressure
+when a bridge-capacity `reserve()` poll returns `Pending` instead of an immediate
+permit. That is evidence that the peer's receive window is consuming and
+throttling the upload. Once observed, backpressure prevents the post-EOS
+holdover from arming, while the existing pre-EOS idle still bounds any later
+upload stall. `0` disables the write bound. Because the bound is idle rather
+than total, a large upload that is slow but continuously progressing is not
+timed out. Streaming pass-through uploads are otherwise unaffected by the
+buffered-upload collection deadline above.
 
-**Sizing consequence.** Because the watermark stays live through the
-response-header wait, `backend_write_timeout_ms` is in practice also a ceiling
-on how long a backend may take to produce response headers *after* it has taken
-the whole body. Once the body is on the wire the gateway has no application-level
-read receipt: a peer that never called `recv()` and a peer that read the body and
-is still computing are indistinguishable to TCP, so the same watermark covers
-both. Both the write and read timeouts default to `30000` ms, so a route left at
-those defaults is unaffected: the read watermark already bounded the wait at 30
-seconds. A route is affected only when `backend_write_timeout_ms` is less than
-both the backend's slowest post-upload think time and the effective
-`backend_read_timeout_ms` or client deadline. Compare all three values. Set the
-write timeout at or above the slowest expected think time, or set it to `0` to
-disable the write bound and let the read/client deadline bound the response.
+**Post-EOS consequence.** On the no-backpressure kernel-absorb shape,
+`backend_write_timeout_ms` is also a ceiling on how long a backend may take to
+produce response headers after the transport consumes clean EOS. The gateway
+has no application-level read receipt there, so a peer that never called
+`recv()` and a peer whose upload was locally absorbed before it computes look
+the same. Both the write and read timeouts default to `30000` ms, so a route left
+at those defaults is unaffected: the read watermark already bounded the wait at
+30 seconds. Compare the write bound with expected think time only for routes
+whose uploads can be absorbed without backpressure. Deliberately, a backend
+that throttles the upload and then goes silent after the last byte is no longer
+caught by the write watermark; `backend_read_timeout_ms` still bounds that
+residual case.
 
 The bound starts when the backend transport begins consuming the request body —
 the first moment a connection provably exists and the request head is written —

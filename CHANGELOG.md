@@ -18,29 +18,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HTTP/1.1 and prior-knowledge h2c hung until the client deadline. The
   transport now records terminal-frame consumption in shared holdover state
   before hyper can drop the exact-length body and abort the pump task. The
-  holdover stays refreshed only on genuine consume progress, dormant through
-  DNS/TCP/TLS acquisition, and disabled by `0`, so the documented 504 /
-  `X-Gateway-Error: backend_timeout` /
-  `error_class=read_write_timeout` contract holds when the peer never `recv`s.
+  holdover arms only when the transport consumed clean EOS without the armed
+  pump ever waiting for bridge capacity. A `reserve()` poll that returns
+  `Pending`, rather than an immediate permit, is receive-window backpressure and
+  therefore evidence that the peer is consuming the upload; in that case the
+  pre-EOS idle bound remains authoritative and no post-EOS holdover is installed.
+  The absence of backpressure plus a stalled response-header wait is the
+  kernel-absorb signature. The bound remains dormant through DNS/TCP/TLS
+  acquisition and disabled by `0`, so the documented 504 /
+  `X-Gateway-Error: backend_timeout` / `error_class=read_write_timeout` contract
+  holds for that never-`recv` shape without killing slow-but-progressing uploads.
   Clean body completion is published before the bridge closes and is never
   rewritten by later response-wait cancellation or authorization expiry, so a
   native gRPC consumer cannot misread that closed bridge as a truncated upload.
   Reqwest protocol-NACK replay is unchanged: buffered uploads still use
   `send_buffered_upload_with_protocol_nack_replay` rather than wrapping the
   body in a way that erases `try_clone()`.
-  **Operator action**: because the watermark stays live through the
-  response-header wait, `backend_write_timeout_ms` is now in practice also a
-  ceiling on post-upload backend think time — the gateway gets no
-  application-level read receipt, so a peer that never called `recv()` and a
-  peer that read the body and is still computing are indistinguishable. Both
+  **Operator action**: only an upload absorbed without transport backpressure
+  carries `backend_write_timeout_ms` into the response-header wait. On that
+  shape it is also a ceiling on post-upload backend think time. Both
   `backend_write_timeout_ms` and `backend_read_timeout_ms` default to `30000`
-  ms, so a default-configured route is unaffected: its response-header wait
-  was already bounded at 30 seconds by the read watermark. The affected
-  population is routes where `backend_write_timeout_ms` is less than both the
-  backend's slowest post-upload think time and the effective
-  `backend_read_timeout_ms` or client deadline. Compare all three values. Raise
-  the write timeout above the slowest expected think time, or set it to `0` to
-  disable the write bound and let the read/client deadline bound the response.
+  ms, so a default-configured route is unaffected: its response-header wait was
+  already bounded at 30 seconds by the read watermark. Compare the write bound
+  with expected think time only for routes whose uploads can be locally
+  absorbed without backpressure. Deliberately, a backend that first throttles
+  the upload and then goes silent after the last byte is not caught by the
+  post-EOS write holdover; `backend_read_timeout_ms` still bounds that residual
+  case.
 
 ### Security
 

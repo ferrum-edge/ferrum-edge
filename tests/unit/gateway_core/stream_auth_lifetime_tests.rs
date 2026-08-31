@@ -3210,17 +3210,15 @@ async fn a_fully_drained_buffered_upload_still_ends_the_header_wait_on_the_write
     // whole POST without a peer `recv`. Completing the pump used to drop the
     // write-timeout signal, so the header wait ran on to the read bound.
     let frame = BufferedUploadPumpProbe::frame_size();
-    let mut probe = BufferedUploadPumpProbe::start(frame * 2, 800).expect("buffered pump");
-    for _ in 0..2 {
-        loop {
-            match probe.poll_transport_once() {
-                ProbeTransportPoll::Data(len) => {
-                    assert_eq!(len, frame);
-                    break;
-                }
-                ProbeTransportPoll::Pending => tokio::task::yield_now().await,
-                other => panic!("unexpected transport poll while draining: {other:?}"),
+    let mut probe = BufferedUploadPumpProbe::start(frame, 800).expect("buffered pump");
+    loop {
+        match probe.poll_transport_once() {
+            ProbeTransportPoll::Data(len) => {
+                assert_eq!(len, frame);
+                break;
             }
+            ProbeTransportPoll::Pending => tokio::task::yield_now().await,
+            other => panic!("unexpected transport poll while draining: {other:?}"),
         }
     }
     // Reqwest/hyper knows the exact Content-Length and can release its body as
@@ -3240,7 +3238,7 @@ async fn a_fully_drained_buffered_upload_still_ends_the_header_wait_on_the_write
 #[tokio::test(start_paused = true)]
 async fn a_fully_drained_replayable_upload_still_ends_the_header_wait_on_the_write_watermark() {
     let frame = ReplayableUploadPumpProbe::frame_size();
-    let mut probe = ReplayableUploadPumpProbe::start(frame * 2, &[], 800);
+    let mut probe = ReplayableUploadPumpProbe::start(frame, &[], 800);
     let frames = probe.drain_transport(64).await;
     assert_eq!(
         frames.last(),
@@ -3257,9 +3255,10 @@ async fn a_fully_drained_replayable_upload_still_ends_the_header_wait_on_the_wri
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_progressing_buffered_upload_refreshes_the_write_watermark() {
-    // Partial consume must reset the idle; 400ms gaps under an 800ms bound
-    // must not 504. This is the #4074 / #4411 regression that matters most.
+async fn a_progressing_buffered_upload_skips_the_eos_holdover_after_backpressure() {
+    // Partial consume must reset the pre-EOS idle; 400ms gaps under an 800ms
+    // bound must not 504. Waiting for capacity is also positive evidence that
+    // the peer is consuming, so it must suppress the post-EOS holdover.
     let frame = BufferedUploadPumpProbe::frame_size();
     let frames = 4;
     let mut probe = BufferedUploadPumpProbe::start(frame * frames, 800).expect("buffered pump");
@@ -3294,9 +3293,9 @@ async fn a_progressing_buffered_upload_refreshes_the_write_watermark() {
     }
     assert!(
         probe
-            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .write_watermark_stays_dormant(Duration::from_secs(30))
             .await,
-        "once consume stops, the EOS holdover must still bound the header wait"
+        "transport backpressure must suppress the post-EOS write holdover"
     );
     assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
 }

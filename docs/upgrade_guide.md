@@ -90,16 +90,16 @@ stale hand-authored pod-registry artifacts and let the node-agent regenerate
 every pod entry. Any external publisher must use only the documented leaf and
 body grammar; otherwise cleanup/finalize remains fail-closed.
 
-### `backend_write_timeout_ms` now also bounds the post-upload response-header wait (issue [#4411](https://github.com/ferrum-edge/ferrum-edge/issues/4411))
+### `backend_write_timeout_ms` now bounds no-backpressure post-upload waits (issue [#4411](https://github.com/ferrum-edge/ferrum-edge/issues/4411))
 
-`backend_write_timeout_ms` is documented to return `504` /
-`X-Gateway-Error: backend_timeout` when a backend accepts a request and never reads the body. After #4074 that stopped happening once the local TCP send buffer absorbed the whole body: the upload pump saw a clean end-of-stream, dropped the write-timeout signal, and the request ran on to `backend_read_timeout_ms` or the client's own deadline. The watermark now survives that clean end-of-stream and stays live through the response-header wait.
+**BREAKING.** `backend_write_timeout_ms` is documented to return `504` /
+`X-Gateway-Error: backend_timeout` when a backend accepts a request and never reads the body. After #4074 that stopped happening once the local TCP send buffer absorbed the whole body: the upload pump saw a clean end-of-stream, dropped the write-timeout signal, and the request ran on to `backend_read_timeout_ms` or the client's own deadline. The watermark now survives that clean end-of-stream and stays live through the response-header wait when the transport never applied backpressure.
 
-The consequence is that `backend_write_timeout_ms` is in practice also a ceiling on how long a backend may take to produce response headers *after* it has taken the whole body. Once the body is on the wire the gateway has no application-level read receipt — a peer that never called `recv()` and a peer that read the body and is still computing look identical to TCP — so one watermark necessarily covers both.
+That response holdover is deliberately narrow. It arms only when the pump never encountered transport backpressure after the write watermark armed. A bridge-capacity `reserve()` poll that returns `Pending`, rather than an immediate permit, records backpressure; the peer's receive window is then throttling the upload, which is positive evidence of consumption. The absence of backpressure plus a stalled response-header wait is the kernel-absorb signature.
 
-This fails **silently at cutover**: nothing refuses to load, and affected requests simply change from `200` to `504`.
+On that no-backpressure shape, `backend_write_timeout_ms` is also a ceiling on post-upload backend think time. This fails **silently at cutover**: nothing refuses to load, and an affected request can change from `200` to `504`.
 
-**Operator action:** both `backend_write_timeout_ms` and `backend_read_timeout_ms` default to `30000` ms, so a route left entirely at defaults is unaffected: the read watermark already bounded its response-header wait at 30 seconds. The affected population is routes where `backend_write_timeout_ms` is less than both the backend's slowest post-upload think time and the effective `backend_read_timeout_ms` or client deadline. Compare all three values for every request path that carries a body. Raise the write timeout above the slowest expected think time, or set it to `0` to disable the write bound and let the read/client deadline bound the response.
+**Operator action:** both `backend_write_timeout_ms` and `backend_read_timeout_ms` default to `30000` ms, so a route left entirely at defaults is unaffected: the read watermark already bounded its response-header wait at 30 seconds. Compare the write bound with expected think time only for routes whose uploads can be locally absorbed without backpressure. A backend that throttles an upload and then goes silent after the last byte is deliberately no longer caught by the post-EOS write watermark; `backend_read_timeout_ms` still bounds that residual case.
 
 ### HTTP/1.1 requests without a Host header are rejected with 400 (issue [#4390](https://github.com/ferrum-edge/ferrum-edge/issues/4390))
 
