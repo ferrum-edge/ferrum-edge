@@ -723,6 +723,9 @@ where
     let terminal = Arc::new(AtomicU8::new(PUMP_RUNNING));
     let task_terminal = Arc::clone(&terminal);
     let plan = plan.cloned();
+    // Clone for the task before the `async move` block captures the binding;
+    // the source and the join still need their own handles below.
+    let task_write_state = write_state.as_ref().map(Arc::clone);
     let handle = tokio::spawn(async move {
         let outcome = run_upload_pump(UploadPumpTask {
             body,
@@ -731,7 +734,7 @@ where
             plan,
             write_timeout_ms,
             write_start_rx,
-            write_state: write_state.as_ref().map(Arc::clone),
+            write_state: task_write_state,
             terminal: task_terminal,
             write_timeout_tx,
         })
