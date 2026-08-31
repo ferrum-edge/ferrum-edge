@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use crate::fips::approved::Sha256;
 use serde_json::Value;
 
+use crate::ebpf::pod_watcher::{EnrollmentDecision, evaluate_enrollment};
 use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
     AppProtocol, MeshService, NodeWaypointEndpoint, ServicePort, ServiceTargetPort, Workload,
@@ -93,10 +94,12 @@ struct CorePod {
     /// eBPF capture stamps. Empty when the pod object carried no UID.
     uid: String,
     labels: HashMap<String, String>,
+    annotations: HashMap<String, String>,
     service_account: String,
     addresses: Vec<String>,
     ports: Vec<WorkloadPort>,
     node_name: Option<String>,
+    host_network: bool,
     ready: bool,
     node_waypoint_proxy: bool,
 }
@@ -464,10 +467,12 @@ fn collect_pod(acc: &mut K8sAccumulator, object: &K8sObject) {
         name: object.metadata.name.clone(),
         uid: object.metadata.uid.clone(),
         labels: object.metadata.labels.clone(),
+        annotations: object.metadata.annotations.clone(),
         service_account: pod_service_account(object).to_string(),
         addresses,
         ports: pod_ports(object),
         node_name: object_node_name(object).map(ToOwned::to_owned),
+        host_network: pod_host_network(object),
         ready: pod_is_ready(object),
         node_waypoint_proxy: false,
     };
@@ -1165,12 +1170,13 @@ fn identity_only_workload_from_pod(
         .map_err(|e| invalid_resource_for_core_pod(pod, format!("invalid pod SPIFFE ID: {e}")))?;
     let node_name = nonempty_node_name(pod.node_name.as_deref());
     let locality = node_name.and_then(|node| acc.core.node_localities.get(node).cloned());
-    // Same node-local NodeWaypoint binding as service-backed workloads. These
-    // pods are the SOURCE identities a NodeWaypoint asserts over HBONE (the
-    // live harness src-a shape: ServiceAccount + capture, no Service). Without
-    // this, `node_waypoint_assertors_from_workloads` would omit them and the
-    // destination's fail-closed grant would 403 legitimate same-node traffic.
-    let node_waypoint = node_name.and_then(|node| node_waypoint_for_node(acc, node));
+    // Only ambient-enrolled pods are fronted by a NodeWaypoint. Merely sharing
+    // its node is not authority for that waypoint to assert this pod's identity.
+    let node_waypoint = if identity_only_pod_is_ambient_enrolled(acc, pod) {
+        node_name.and_then(|node| node_waypoint_for_node(acc, node))
+    } else {
+        None
+    };
 
     Ok(Workload {
         spiffe_id,
@@ -1180,9 +1186,10 @@ fn identity_only_workload_from_pod(
         },
         service_name: pod.name.clone(),
         service_namespace: None,
-        // Identity-only pods feed node-waypoint source identity, scoped authz,
-        // and the per-assertor HBONE inventory. They are not Service backends,
-        // so keep them out of direct Pod-IP routing and outbound registries.
+        // Enrolled identity-only pods feed node-waypoint source identity,
+        // scoped authz, and the per-assertor HBONE inventory. They are not
+        // Service backends, so keep them out of direct Pod-IP routing and
+        // outbound registries.
         addresses: Vec::new(),
         ports: Vec::new(),
         trust_domain: acc.options.trust_domain.clone(),
@@ -1196,6 +1203,22 @@ fn identity_only_workload_from_pod(
         node_waypoint,
         remote_provenance: false,
     })
+}
+
+fn identity_only_pod_is_ambient_enrolled(acc: &K8sAccumulator, pod: &CorePod) -> bool {
+    // Reuse the node-agent predicate so assertion grants cannot drift from
+    // capture enrollment (excluded namespaces, host-network, sidecar skip,
+    // opt-out / opt-in order).
+    matches!(
+        evaluate_enrollment(
+            &pod.labels,
+            &pod.annotations,
+            &pod.namespace,
+            &acc.options.excluded_namespaces,
+            pod.host_network,
+        ),
+        EnrollmentDecision::Enroll
+    )
 }
 
 fn node_waypoint_pod_candidate(

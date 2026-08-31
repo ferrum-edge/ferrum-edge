@@ -50,11 +50,11 @@ jobs:
           # non-blocking second opinion, so it tracks latest.
           tool: cargo-deny@0.19.9,cargo-audit
 
-      - name: cargo-deny (advisories, bans, sources)
+      - name: cargo-deny (advisories, bans, sources, licenses)
         # Same blocking policy as the per-PR gate, re-evaluated against the
-        # freshly-fetched advisory DB. A new advisory not time-boxed in
-        # deny.toml fails here even when no PR has opened.
-        run: cargo deny check advisories bans sources
+        # freshly-fetched advisory DB. A new advisory or disallowed license not
+        # time-boxed in deny.toml fails here even when no PR has opened.
+        run: cargo deny check advisories bans sources licenses
 
       - name: Advisory-exception expiry
         # Fails once any deny.toml [expires:] date has passed, so a time-boxed

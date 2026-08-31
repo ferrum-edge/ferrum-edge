@@ -64,6 +64,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `{"error":"Request is missing both :authority and Host"}` instead of being
   routed. Send `:authority` or Host.
 
+- **BREAKING — Enabled mesh injector cannot render an unauthenticatable fail-closed webhook**
+  (issue #4433). `injector.enabled=true` still defaults to `failurePolicy: Fail`,
+  but Helm now requires exactly one trust source: `injector.caBundle` (base64
+  PEM) or `injector.certManager.injectCaFrom` (`cert-manager.io/inject-ca-from`).
+  Neither, both, or a non-PEM `caBundle` fail render with an actionable message.
+  The chart never changes `failurePolicy` to `Ignore` to make a broken webhook
+  render. **Operator action:** set `injector.caBundle` or
+  `injector.certManager.injectCaFrom` before enabling the injector.
+
 - **`request_mirror` denies cross-origin query credentials by default**
   (issue #4295). Sensitive query pairs (`access_token`, `api_key`,
   delimiter-bounded `token`/`sig`/`signature` including `oauth_token` and
@@ -136,6 +145,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Identity-only NodeWaypoint assertion grants require ambient enrollment.**
+  Kubernetes pod discovery no longer lets a same-node identity-only pod
+  enter a NodeWaypoint's HBONE assertion inventory merely by sharing that
+  node. The pod must pass the node-agent ambient enrollment predicate
+  (`ferrum.io/mesh: enabled` or `ferrum.io/inject: true`, and not
+  host-network, sidecar-injected, or an excluded namespace).
+
 - **Injector inbound capture excludes kubelet HTTP and TCP probe ports**
   (issue #4431). `startupProbe` / `readinessProbe` / `livenessProbe` `httpGet`
   and `tcpSocket` ports on every container in the pod are unioned into the
@@ -144,6 +160,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   admission rather than leaving the probe captured. Explicit
   `excludeInboundPorts` annotations and `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS`
   still win.
+- **Outbound direct-H2 and native-gRPC `Host` now matches `:authority` on
+  non-default ports** (issue #4410). Ferrum previously stamped a hostname-only
+  `Host` (`127.0.0.1`) while Hyper derived `:authority` from the backend URI
+  including the port (`127.0.0.1:21212`). RFC 9113 §8.3.1 forbids that
+  disagreement; RFC-compliant H2 origins reset the stream and the client saw
+  502 `backend_error` or gRPC UNAVAILABLE(14). Default ports (80 for
+  `http`/`ws`, 443 for `https`/`wss`) are still omitted from both. When
+  `preserve_host_header` is true on the direct-H2 pool (and native-gRPC Direct
+  transport), the client Host is honoured by rewriting the outbound URI
+  authority so `:authority` agrees, but only after `split_request_authority`
+  admits it: userinfo (`user@host`, `user:pass@host:8443`), paths, empty or
+  whitespace-only values, unbracketed IPv6, and opaque `[not-an-ip]`
+  literals are ignored and both fields fall back to the backend URI
+  authority. Native-gRPC mesh-mTLS / HBONE dispatch keeps authority
+  resolution in `resolve_backend_uri`: a pinned `mesh.mtls_authority_host`
+  (and its mesh service port) wins over `preserve_host_header`, and Host is
+  then synced from that URI without a second preserve rewrite.
+  **Operator action**: on direct-H2 and native-gRPC Direct routes with
+  `preserve_host_header: true`, the backend's `:authority` changes from the
+  backend authority to the client's Host when that Host is a valid
+  authority; an invalid client Host is ignored. Many HTTP/2 servers
+  synthesize their `Host`/virtual-host decision from `:authority` and ignore
+  a separate `Host` header, so such a backend was previously routing on the
+  backend authority despite `preserve_host_header` being on, and will now
+  route on the client's Host — which is what the setting asks for. Re-check
+  backend virtual-host routing on those routes, or set
+  `preserve_host_header: false` to keep the backend authority in both
+  fields. Mesh-mTLS routes with a pinned service authority are unchanged:
+  the peer still sees the mesh service host and port.
 
 - **Linux GNU release ABI floor is now GLIBC_2.34** (issue #4301). Generic
   `ferrum-edge-linux-{x86_64,aarch64}` and `ferrum-cni-linux-{x86_64,aarch64}`
@@ -172,6 +217,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `libz.so.1`.
 
 ### Changed
+
+- CI `dependency-audit` jobs now run `cargo deny check licenses` alongside
+  advisories, bans, and sources (issue #4439). The `[licenses]` allowlist and
+  confidence threshold in `deny.toml` are blocking on every PR and in the weekly
+  `dependency-audit` workflow.
 
 - **BREAKING — injected Ferrum is a Kubernetes native sidecar**
   (issue #4430). The webhook now emits `ferrum-edge` under `spec.initContainers`
@@ -215,6 +265,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authored registry artifacts and let the node-agent regenerate every pod
   entry; do not publish custom leaf names or body lines outside the documented
   grammar.
+
+- **BREAKING — Ferrum-owned UDP policy CRD upgrades with the mesh chart**
+  (issue #4443). `UDPResponseAmplificationPolicy` moved from Helm's install-once
+  `charts/ferrum-mesh/crds/` directory to
+  `templates/crds-udpresponseamplificationpolicy.yaml` behind `crds.install`
+  (default `true`). `helm upgrade` now applies schema changes. The CRD is stamped
+  with `gateway.ferrum.io/crd-schema-version: v1alpha1-1`; compare that live
+  annotation to `crds.udpResponseAmplificationPolicy.schemaVersion`. Uninstall
+  keeps the CRD (`helm.sh/resource-policy: keep`). `crds.install=false` fails
+  render unless `crds.skipInstallAcknowledged=true`. **Operator action (existing
+  clusters that already have this CRD from `crds/`):** adopt it once with
+  `helm upgrade --take-ownership --set crds.adoptExisting=true`. Do not set
+  `crds.install=false` to skip the error — that leaves the cluster on a stale
+  schema.
 
 - **BREAKING — `FERRUM_TLS_OFFLOAD_THREADS` nonzero values fail startup**
   (issue #4294). TLS handshake offload is not implemented; a nonzero setting

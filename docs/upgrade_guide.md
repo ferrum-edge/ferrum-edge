@@ -90,6 +90,58 @@ stale hand-authored pod-registry artifacts and let the node-agent regenerate
 every pod entry. Any external publisher must use only the documented leaf and
 body grammar; otherwise cleanup/finalize remains fail-closed.
 
+### Ferrum-owned UDP policy CRD now upgrades with the mesh chart (issue [#4443](https://github.com/ferrum-edge/ferrum-edge/issues/4443))
+
+`UDPResponseAmplificationPolicy` moved out of Helm's install-once `crds/`
+directory into `charts/ferrum-mesh/templates/crds-udpresponseamplificationpolicy.yaml`
+gated by `crds.install` (default `true`). A cluster installed at an older chart
+version kept the obsolete schema through every successful `helm upgrade`
+because Helm never updates `crds/`. The live CRD is stamped with
+`gateway.ferrum.io/crd-schema-version: v1alpha1-1`. Compare:
+
+```bash
+kubectl get crd udpresponseamplificationpolicies.gateway.ferrum.io \
+  -o jsonpath='{.metadata.annotations.gateway\.ferrum\.io/crd-schema-version}'
+```
+
+Uninstall keeps the CRD (`helm.sh/resource-policy: keep`) so policy objects are
+not cascade-deleted. `crds.install=false` without
+`crds.skipInstallAcknowledged=true` fails render.
+
+A CRD that already exists from the former `crds/` directory is not in the Helm
+release. The first upgrade to this chart fails closed unless you adopt it.
+
+**Operator action:** before the first `helm upgrade` to this chart version on a
+cluster that already has `udpresponseamplificationpolicies.gateway.ferrum.io`:
+
+```bash
+helm upgrade <release> ./charts/ferrum-mesh -n <namespace> \
+  --take-ownership --set crds.adoptExisting=true
+```
+
+Helm 3.14+ is required for `--take-ownership`. After adoption, leave
+`crds.install=true` and drop `crds.adoptExisting`. Do not set
+`crds.install=false` to silence the error.
+
+### Enabled mesh injector requires a webhook CA trust source (issue [#4433](https://github.com/ferrum-edge/ferrum-edge/issues/4433))
+
+`injector.enabled=true` with empty `injector.caBundle` previously omitted
+`clientConfig.caBundle` while keeping `failurePolicy: Fail`. Kubernetes could
+not authenticate the webhook, so admission for the matched scope failed closed.
+Helm now requires exactly one of `injector.caBundle` (base64 PEM) or
+`injector.certManager.injectCaFrom` (`namespace/certificate-name`). The chart
+never changes `failurePolicy` to `Ignore` to make a broken webhook render.
+
+**Operator action:** set `injector.caBundle` or
+`injector.certManager.injectCaFrom` before enabling the injector. `helm
+template` / `helm upgrade` fail until one trust source is set.
+### `preserve_host_header` now sets `:authority` on direct-H2 and gRPC backends (issue [#4410](https://github.com/ferrum-edge/ferrum-edge/issues/4410))
+
+Ferrum's outbound direct-H2 and native-gRPC dispatch previously sent a hostname-only `Host` while Hyper derived `:authority` from the full backend URI including a non-default port. RFC 9113 §8.3.1 forbids that disagreement, so RFC-compliant HTTP/2 origins reset the stream and the client saw `502 backend_error` or gRPC `UNAVAILABLE`. Both fields now carry the same authority.
+
+Closing that gap changes what a backend observes when `preserve_host_header: true` on the direct-H2 pool and native-gRPC Direct transport. Previously `Host` carried the client's authority while `:authority` carried the backend's; now both carry the client's — but only when that Host is a valid request authority (`split_request_authority`: no userinfo, no path, bracketed IPv6, non-empty). An invalid client Host is ignored and both fields keep the backend URI authority. Native-gRPC mesh-mTLS dispatch does not let `preserve_host_header` override a pinned `mesh.mtls_authority_host`: the mesh service host and port stay in both `Host` and `:authority`.
+
+**Operator action:** on direct-H2 or native-gRPC Direct routes that set `preserve_host_header: true`, confirm the backend's virtual-host routing still selects the intended vhost now that `:authority` carries the client's Host. A client `Host` that is not a valid authority (userinfo, path, empty, unbracketed IPv6, opaque IP-literal) is ignored. Set `preserve_host_header: false` on those routes to keep the backend authority in both fields. Routes with `preserve_host_header` unset or false are unaffected, default-port backends (80 for `http`/`ws`, 443 for `https`/`wss`) still omit the port from both fields, and mesh-mTLS routes with a pinned service authority keep that authority.
 ### `backend_write_timeout_ms` now bounds no-backpressure post-upload waits (issue [#4411](https://github.com/ferrum-edge/ferrum-edge/issues/4411))
 
 **BREAKING.** `backend_write_timeout_ms` is documented to return `504` /

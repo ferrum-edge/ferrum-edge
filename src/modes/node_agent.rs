@@ -331,16 +331,7 @@ impl NodeAgentConfig {
                 .unwrap_or_else(|| DEFAULT_FALLBACK_MODE.to_string()),
         )?;
 
-        let extra_excluded: Vec<String> =
-            resolve_ferrum_var("FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES")
-                .map(|raw| {
-                    raw.split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default();
-        let excluded_namespaces = pod_watcher::build_excluded_namespaces(&extra_excluded);
+        let excluded_namespaces = pod_watcher::excluded_namespaces_from_env();
         let mut capture_contract = CaptureContract::new(
             env_config.node_agent_proxy_mode,
             capture_config.outbound_port,

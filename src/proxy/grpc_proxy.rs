@@ -3499,11 +3499,16 @@ impl<'a> GrpcDispatchTransport<'a> {
     /// Resolve the outbound request URI for this transport from the
     /// gateway-built `backend_url`.
     ///
-    /// The direct pool dials the URL's own authority, so it is parsed as-is. A
-    /// mesh transport instead dials a peer listener, and the request
-    /// `:authority` is what selects the destination on the far side, so only the
-    /// PATH and QUERY are taken from `backend_url` and the authority is
-    /// replaced:
+    /// The direct pool dials the URL's own authority, so it is parsed and then
+    /// `apply_outbound_h2_preserve_to_uri` makes that authority the final
+    /// `:authority` (validated client Host when `preserve_host_header` is on,
+    /// otherwise the backend URI with default ports omitted). A mesh transport
+    /// instead dials a peer listener, and the request `:authority` is what
+    /// selects the destination on the far side, so only the PATH and QUERY are
+    /// taken from `backend_url` and the authority is replaced — including a
+    /// pinned `mesh.mtls_authority_host`, which wins over
+    /// `preserve_host_header`. Call sites then only sync `Host` from this URI
+    /// and must not run a second preserve pass:
     ///
     /// * Sidecar mesh-mTLS routes on the peer sidecar's materialized inbound
     ///   route, which matches the destination SERVICE (see
@@ -3530,9 +3535,15 @@ impl<'a> GrpcDispatchTransport<'a> {
     ) -> Result<hyper::Uri, GrpcProxyError> {
         let (scheme, authority, what) = match self {
             Self::Direct(_) => {
-                return backend_url
+                let mut uri: hyper::Uri = backend_url
                     .parse()
-                    .map_err(|e| GrpcProxyError::Internal(format!("Invalid backend URL: {}", e)));
+                    .map_err(|e| GrpcProxyError::Internal(format!("Invalid backend URL: {}", e)))?;
+                crate::proxy::apply_outbound_h2_preserve_to_uri(
+                    &mut uri,
+                    preserve_host_header,
+                    client_host,
+                );
+                return Ok(uri);
             }
             Self::MeshMtls(mesh) => (
                 "https",
@@ -4320,10 +4331,12 @@ async fn proxy_grpc_streaming_dispatch(
     let proxy_headers = transport.proxy_headers_for_dispatch(proxy_headers);
     merge_proxy_headers_and_strip_for_grpc(&mut headers, proxy_headers.as_ref());
 
-    // Bind the request line to the selected transport BEFORE the Host override,
-    // mirroring `proxy_grpc_request_core` (issue #3284). The direct pool parses
-    // `backend_url` as-is; a mesh dispatch keeps its path/query and presents the
-    // authority its peer routes on. A failure here is pre-dial, so retain the
+    // Bind the request line to the selected transport BEFORE the Host sync,
+    // mirroring `proxy_grpc_request_core` (issue #3284). Direct parses
+    // `backend_url` and applies a validated preserve rewrite so the URI
+    // authority is already final; a mesh dispatch keeps its path/query and
+    // presents the authority its peer routes on (pinned mesh service host
+    // wins over preserve). A failure here is pre-dial, so retain the
     // unread frontend upload so the caller controls its termination relative to
     // the synthesized Trailers-Only response: response-body ownership on H2 and
     // post-HEADERS+FIN on H3 (#2057).
@@ -4340,7 +4353,7 @@ async fn proxy_grpc_streaming_dispatch(
         }
     };
 
-    // Apply per-route Host override AFTER the strip, mirroring
+    // Apply per-route Host AFTER the strip, mirroring
     // `proxy_grpc_request_core` and the plain HTTP path in
     // `proxy::proxy_to_backend`. Without this, an H2 or H3 frontend that
     // synthesized `host` from `:authority` would forward the client's
@@ -4349,12 +4362,13 @@ async fn proxy_grpc_streaming_dispatch(
     // strip set, so order vs strip is safe — but Host MUST be applied
     // after the synthesise step so it's not accidentally targeted by a
     // future strip predicate change.)
-    if !proxy.preserve_host_header
-        && let Some(target_host) = uri.host()
-        && let Ok(val) = hyper::header::HeaderValue::from_str(target_host)
-    {
-        headers.insert(hyper::header::HOST, val);
-    }
+    //
+    // RFC 9113 §8.3.1: Host must equal the `:authority` Hyper derives from
+    // this URI, including a non-default port. Authority was already resolved
+    // by `resolve_backend_uri` (mesh-mTLS / HBONE / Direct preserve). Sync
+    // Host from that URI and never rewrite it — a second preserve pass would
+    // clobber a pinned mesh service authority and drop the mesh service port.
+    crate::proxy::sync_outbound_h2_host_to_authority(&mut headers, &uri);
 
     // For the streaming path, send_request() covers both body upload and
     // response header wait. Unlike the buffered path (where body sends
@@ -4715,10 +4729,11 @@ pub(crate) async fn proxy_grpc_request_core(
     let proxy_headers = transport.proxy_headers_for_dispatch(proxy_headers);
     merge_proxy_headers_and_strip_for_grpc(&mut headers, proxy_headers.as_ref());
 
-    // Bind the request line to the selected transport BEFORE the Host override
-    // below, so a mesh dispatch presents (and, without `preserve_host_header`,
-    // echoes) the authority its peer routes on. The direct pool parses
-    // `backend_url` as-is (issue #3284).
+    // Bind the request line to the selected transport BEFORE the Host sync
+    // below. Mesh dispatch presents the authority its peer routes on (a
+    // pinned `mesh.mtls_authority_host` wins over preserve). Direct parses
+    // `backend_url` and applies a validated preserve rewrite so the URI
+    // authority is already final (issue #3284 / #4410).
     let client_host_header = headers
         .get(hyper::header::HOST)
         .and_then(|value| value.to_str().ok());
@@ -4728,21 +4743,18 @@ pub(crate) async fn proxy_grpc_request_core(
         client_host_header,
     )?;
 
-    // Apply per-route Host override AFTER the proxy_headers merge, mirroring
-    // the plain HTTP path in `proxy::proxy_to_backend`. Without this, an H2 or
+    // Apply per-route Host AFTER the proxy_headers merge, mirroring the
+    // plain HTTP path in `proxy::proxy_to_backend`. Without this, an H2 or
     // H3 frontend that synthesized `host` from `:authority` (see
-    // `src/http3/server.rs` and `src/proxy/mod.rs`) would forward the client's
-    // external authority to the gRPC backend even when
-    // `preserve_host_header == false`. With the override, the backend sees the
-    // upstream target host (taken from the parsed backend URL) in both
-    // `:authority` (set from the URI below) and `Host`, matching the plain
-    // HTTP non-preserve semantics.
-    if !proxy.preserve_host_header
-        && let Some(target_host) = uri.host()
-        && let Ok(val) = hyper::header::HeaderValue::from_str(target_host)
-    {
-        headers.insert(hyper::header::HOST, val);
-    }
+    // `src/http3/server.rs` and `src/proxy/mod.rs`) would forward the
+    // client's external authority to the gRPC backend even when
+    // `preserve_host_header == false`. RFC 9113 §8.3.1 requires Host to
+    // equal the `:authority` Hyper derives from this URI, including a
+    // non-default port. Authority was already resolved by
+    // `resolve_backend_uri`; sync Host from that URI and never rewrite it
+    // — a second preserve pass would clobber a pinned mesh service
+    // authority and drop the mesh service port.
+    crate::proxy::sync_outbound_h2_host_to_authority(&mut headers, &uri);
 
     // Carry forward the receipt-anchored absolute deadline from
     // `prepare_request_deadline` (parsed before before_proxy plugins and

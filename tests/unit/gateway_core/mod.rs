@@ -85,6 +85,7 @@ mod locality_lb_tests;
 mod mesh_bpf_metrics_contract_tests;
 mod mesh_dual_stack_capture_tests;
 mod mesh_host_udp_capture_plan_tests;
+mod mesh_injector_ca_crd_helm_tests;
 mod mesh_startup_rollback_tests;
 mod mesh_stream_lifecycle_tests;
 mod mesh_tls_reload_watch_tests;

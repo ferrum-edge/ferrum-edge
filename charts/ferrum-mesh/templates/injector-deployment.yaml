@@ -1,4 +1,8 @@
 {{- if .Values.injector.enabled }}
+{{- include "ferrum-mesh.validateInjectorTrust" . -}}
+{{- $injectorCa := .Values.injector.caBundle | toString | trim -}}
+{{- $injectorCm := .Values.injector.certManager | default dict -}}
+{{- $injectorInjectFrom := index $injectorCm "injectCaFrom" | default "" | toString | trim -}}
 {{- $tcpHandler := dict "tcpSocket" (dict "port" "webhook") -}}
 {{- $liveHandler := .Values.injector.probes.liveness.override | default dict -}}
 {{- if not $liveHandler }}{{- $liveHandler = $tcpHandler -}}{{- end -}}
@@ -99,6 +103,10 @@ metadata:
   labels:
     app.kubernetes.io/name: ferrum-mesh-injector
     app.kubernetes.io/instance: {{ .Release.Name }}
+  {{- if $injectorInjectFrom }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ $injectorInjectFrom | quote }}
+  {{- end }}
 webhooks:
   - name: sidecar-injector.ferrum.io
     admissionReviewVersions:
@@ -119,8 +127,8 @@ webhooks:
         namespace: {{ .Release.Namespace }}
         path: /mutate
         port: {{ .Values.injector.listenPort }}
-      {{- if .Values.injector.caBundle }}
-      caBundle: {{ .Values.injector.caBundle | quote }}
+      {{- if $injectorCa }}
+      caBundle: {{ $injectorCa | quote }}
       {{- end }}
     rules:
       - operations:

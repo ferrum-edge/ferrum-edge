@@ -134,23 +134,24 @@ zeroization). They are not untracked TODOs; they are carried as
 
 ## Enforcement controls
 
-### 1. Blocking advisory gate (`deny.toml` + CI)
+### 1. Blocking dependency gate (`deny.toml` + CI)
 
-`cargo deny check advisories bans sources` runs on **every PR**
+`cargo deny check advisories bans sources licenses` runs on **every PR**
 (`dependency-audit` job in `.github/workflows/ci.yml`) and is **blocking**: any
 RUSTSEC advisory in the resolved tree that is not explicitly time-boxed in
 `deny.toml` fails CI. `unmaintained`/`unsound` are set to `all` (not the 0.19
 default of `workspace`) so transitive advisories are blocking too, and
 `unused-ignored-advisory = "deny"` forces a stale exception to be deleted once
 its advisory is fixed/removed. `bans` (duplicate-version visibility) and
-`sources` (crates.io-only) run alongside. License checking is intentionally
-**not** in the gate yet — see the `deny.toml` header.
+`sources` (crates.io-only) run alongside. The `[licenses]` allowlist and
+`confidence-threshold` are **blocking** too: any dependency whose SPDX
+expression is outside the allowlist or below the confidence floor fails CI.
 
 Run locally:
 
 ```bash
 cargo install --locked cargo-deny
-cargo deny check advisories bans sources   # the gate
+cargo deny check advisories bans sources licenses   # the gate
 ```
 
 ### 2. Advisory exceptions are time-boxed
@@ -168,7 +169,21 @@ by a transitive parent (e.g. `mongodb` pins `hickory ^0.25`; the old AWS SDK
 chain pins `rustls-webpki ^0.101.7`, only present under the optional `secrets-aws`
 feature). Each entry documents the confinement and the upstream we are waiting on.
 
-### 3. Vendor drift guard
+### 3. License allowlist and exceptions
+
+The `[licenses]` section in `deny.toml` defines the SPDX allowlist and
+`confidence-threshold` enforced by the same `cargo deny` gate as advisories.
+Vendored path dependencies under `vendor/` are evaluated like any other crate;
+their upstream licenses (MIT, Apache-2.0, and similar permissive terms for the
+current patches) must fall within the allowlist or carry an explicit exception.
+
+Every `[licenses.exceptions]` entry must document an **owner**, a **rationale**,
+and an `[expires:YYYY-MM-DD]` token in the same style as `[advisories.ignore]`.
+`scripts/check_advisory_expiry.sh` enforces expiry for advisory exceptions only
+today — license-exception expiry is not yet automated and remains a documented
+follow-up.
+
+### 4. Vendor drift guard
 
 `tests/integration/vendor_integrity_tests.rs` hashes every governed file under
 `vendor/` and compares it to `vendor/VENDOR_INTEGRITY.sha256`. Known text paths
@@ -192,14 +207,15 @@ scripts/update_vendor_integrity.sh
 # i.e. UPDATE_VENDOR_INTEGRITY=1 cargo test --test integration_tests vendor_integrity
 ```
 
-### 4. Scheduled `dependency-audit` workflow
+### 5. Scheduled `dependency-audit` workflow
 
 `.github/workflows/dependency-audit.yml` runs weekly (Mon 05:30 UTC) and on
 demand:
 
-- **advisories** — re-runs the `cargo deny` gate against the freshly-fetched
-  advisory DB (catches new advisories with no PR), runs the expiry check, and
-  runs `cargo audit` as an independent second opinion.
+- **advisories and licenses** — re-runs the `cargo deny` gate (advisories, bans,
+  sources, and licenses) against the freshly-fetched advisory DB (catches new
+  advisories or license violations with no PR), runs the advisory expiry check,
+  and runs `cargo audit` as an independent second opinion.
 - **upstream-patch-status** — two steps. *Vendored-patch lifecycle parity* runs
   `scripts/check_vendored_patch_lifecycle.py`, which self-tests its validators
   and then verifies that every patch in `docs/vendored-patch-lifecycle.json`
@@ -218,7 +234,7 @@ that job is required to stay behind `mode == 'full'`,
 `docs/vendored-patch-lifecycle.json`, and `docs/upstream-*-patches/` on full CI —
 a governance-doc-only pull request cannot skip the gate that guards it.
 
-### 5. Behavioral regression tests for the patched behaviors
+### 6. Behavioral regression tests for the patched behaviors
 
 The patches fix runtime behavior; these tests guard that behavior independently
 of the vendor copy and must keep passing after retirement:

@@ -1139,14 +1139,14 @@ jobs:
           # a future cargo-deny release can't silently change gate behavior.
           tool: cargo-deny@0.19.9
 
-      - name: cargo-deny (advisories, bans, sources)
+      - name: cargo-deny (advisories, bans, sources, licenses)
         # BLOCKING dependency-security gate. A new RUSTSEC advisory not
-        # explicitly time-boxed in deny.toml fails the PR. License checks are
-        # intentionally outside this gate (see deny.toml header). The weekly
+        # explicitly time-boxed in deny.toml fails the PR. The `[licenses]`
+        # allowlist and confidence threshold are blocking too. The weekly
         # .github/workflows/dependency-audit.yml re-runs this plus the
         # advisory-patch-status check.
         # Policy: docs/dependency-policy.md.
-        run: cargo deny check advisories bans sources
+        run: cargo deny check advisories bans sources licenses
 
       - name: Advisory-exception expiry
         # cargo-deny accepts ignores without the repo's [expires:] convention, so
@@ -2197,6 +2197,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/ferrum-helm-results"
+          # Dummy base64 PEM header for injector webhook trust tests (#4433).
+          # Not a real CA; Kubernetes is not contacted during helm template.
+          INJECTOR_CA_BUNDLE='LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t'
           # Fail if any first-class values.yaml key is absent from values.schema.json.
           # PyYAML is installed from a hash-pinned requirements file into a temp
           # venv (PEP 668 / Cross-policy-safe; no unpinned pip fallback).
@@ -2699,6 +2702,7 @@ jobs:
           # injector.namespaceSelector is overridden.
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             --set injector.enabled=true \
+            --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
             --set injector.tls.secretName=ferrum-mesh-injector-tls \
             --show-only templates/injector-deployment.yaml \
             > "$RUNNER_TEMP/ferrum-helm-results/injector-webhook-self-exclusion.yaml"
@@ -2709,18 +2713,102 @@ jobs:
           grep -A20 'namespaceSelector:' "$RUNNER_TEMP/ferrum-helm-results/injector-webhook-self-exclusion.yaml" | grep -Eq '^ +- ferrum$'
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             --set injector.enabled=true \
+            --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
             --set injector.tls.secretName=ferrum-mesh-injector-tls \
             --set-json 'injector.namespaceSelector={"matchExpressions":[{"key":"kubernetes.io/metadata.name","operator":"NotIn","values":["kube-system"]}]}' \
             --show-only templates/injector-deployment.yaml \
             > "$RUNNER_TEMP/ferrum-helm-results/injector-webhook-ns-override.yaml"
           grep -A20 'namespaceSelector:' "$RUNNER_TEMP/ferrum-helm-results/injector-webhook-ns-override.yaml" | grep -Eq '^ +- ferrum$'
           grep -A20 'namespaceSelector:' "$RUNNER_TEMP/ferrum-helm-results/injector-webhook-ns-override.yaml" | grep -Eq '^ +- kube-system$'
+          # Injector webhook CA trust (#4433): an enabled injector cannot render a
+          # fail-closed webhook Kubernetes cannot authenticate. failurePolicy is
+          # never weakened to Ignore to make a broken config render.
+          if grep -Fq 'kind: MutatingWebhookConfiguration' "$RUNNER_TEMP/ferrum-helm-results/default-rendered.yaml"; then
+            echo "::error title=Default chart rendered the injector webhook::injector.enabled must default to false"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set injector.enabled=true --show-only templates/injector-deployment.yaml \
+            > "$RUNNER_TEMP/ferrum-helm-results/injector-no-ca.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/injector-no-ca.err"; then
+            echo "::error title=Enabled injector rendered without a CA source::injector.caBundle or injector.certManager.injectCaFrom is required"
+            exit 1
+          fi
+          grep -F 'injector.caBundle' "$RUNNER_TEMP/ferrum-helm-results/injector-no-ca.err"
+          grep -F 'injector.certManager.injectCaFrom' "$RUNNER_TEMP/ferrum-helm-results/injector-no-ca.err"
+          if grep -Fq 'kind: MutatingWebhookConfiguration' "$RUNNER_TEMP/ferrum-helm-results/injector-no-ca.out"; then
+            echo "::error title=Missing-CA injector still rendered a webhook::render must fail closed"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set injector.enabled=true \
+            --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
+            --show-only templates/injector-deployment.yaml \
+            > "$RUNNER_TEMP/ferrum-helm-results/injector-with-ca.yaml"
+          grep -Fq 'kind: MutatingWebhookConfiguration' "$RUNNER_TEMP/ferrum-helm-results/injector-with-ca.yaml"
+          grep -Fq "caBundle: \"${INJECTOR_CA_BUNDLE}\"" "$RUNNER_TEMP/ferrum-helm-results/injector-with-ca.yaml"
+          grep -Fq 'failurePolicy: Fail' "$RUNNER_TEMP/ferrum-helm-results/injector-with-ca.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set injector.enabled=true \
+            --set-string injector.certManager.injectCaFrom=ferrum/ferrum-mesh-injector \
+            --show-only templates/injector-deployment.yaml \
+            > "$RUNNER_TEMP/ferrum-helm-results/injector-cert-manager.yaml"
+          grep -Fq 'cert-manager.io/inject-ca-from: "ferrum/ferrum-mesh-injector"' "$RUNNER_TEMP/ferrum-helm-results/injector-cert-manager.yaml"
+          grep -Fq 'failurePolicy: Fail' "$RUNNER_TEMP/ferrum-helm-results/injector-cert-manager.yaml"
+          if grep -Fq 'caBundle:' "$RUNNER_TEMP/ferrum-helm-results/injector-cert-manager.yaml"; then
+            echo "::error title=cert-manager injector still inlined caBundle::exactly one trust source"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set injector.enabled=true \
+            --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
+            --set-string injector.certManager.injectCaFrom=ferrum/ferrum-mesh-injector \
+            --show-only templates/injector-deployment.yaml \
+            > "$RUNNER_TEMP/ferrum-helm-results/injector-both-trust.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/injector-both-trust.err"; then
+            echo "::error title=Conflicting injector trust sources rendered::exactly one of caBundle or injectCaFrom"
+            exit 1
+          fi
+          grep -F 'exactly one trust source' "$RUNNER_TEMP/ferrum-helm-results/injector-both-trust.err"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set injector.enabled=true --set injector.caBundle=not-valid-base64 \
+            --show-only templates/injector-deployment.yaml \
+            > "$RUNNER_TEMP/ferrum-helm-results/injector-bad-ca.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/injector-bad-ca.err"; then
+            echo "::error title=Malformed injector.caBundle rendered::base64 PEM is required"
+            exit 1
+          fi
+          grep -F 'BEGIN CERTIFICATE' "$RUNNER_TEMP/ferrum-helm-results/injector-bad-ca.err"
+          # UDP policy CRD upgrade path (#4443): templates/ so helm upgrade
+          # applies schema changes. Helm crds/ is install-once and must not
+          # ship this CRD.
+          grep -Fq 'kind: CustomResourceDefinition' "$RUNNER_TEMP/ferrum-helm-results/default-rendered.yaml"
+          grep -Fq 'udpresponseamplificationpolicies.gateway.ferrum.io' "$RUNNER_TEMP/ferrum-helm-results/default-rendered.yaml"
+          grep -Fq 'gateway.ferrum.io/crd-schema-version: "v1alpha1-1"' "$RUNNER_TEMP/ferrum-helm-results/default-rendered.yaml"
+          grep -Fq 'helm.sh/resource-policy: keep' "$RUNNER_TEMP/ferrum-helm-results/default-rendered.yaml"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set crds.install=false \
+            > "$RUNNER_TEMP/ferrum-helm-results/crd-skip-unacked.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/crd-skip-unacked.err"; then
+            echo "::error title=crds.install=false rendered without acknowledgement::skip must be explicit"
+            exit 1
+          fi
+          grep -F 'crds.skipInstallAcknowledged' "$RUNNER_TEMP/ferrum-helm-results/crd-skip-unacked.err"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set crds.install=false \
+            --set crds.skipInstallAcknowledged=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/crd-skip-acked.yaml"
+          if grep -Fq 'kind: CustomResourceDefinition' "$RUNNER_TEMP/ferrum-helm-results/crd-skip-acked.yaml"; then
+            echo "::error title=CRD rendered after skipInstallAcknowledged::crds.install=false must omit the CRD"
+            exit 1
+          fi
           # PodDisruptionBudget: data-path workloads with replicas >= 2 get
           # minAvailable protection; single-replica workloads skip PDB so drains
           # are not deadlocked.
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             --set eastWest.enabled=true \
             --set injector.enabled=true \
+            --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
             --set injector.tls.secretName=ferrum-mesh-injector-tls \
             --show-only templates/pdb.yaml \
             > "$RUNNER_TEMP/ferrum-helm-results/pdb-data-path.yaml"
@@ -2754,6 +2842,7 @@ jobs:
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             --set eastWest.enabled=true \
             --set injector.enabled=true \
+            --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
             --set injector.tls.secretName=ferrum-mesh-injector-tls \
             --show-only templates/east-west-gateway-deployment.yaml \
             > "$RUNNER_TEMP/ferrum-helm-results/east-west-spread.yaml"
@@ -2765,6 +2854,7 @@ jobs:
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             -f ./charts/ferrum-mesh/examples/development-values.yaml \
             --set injector.enabled=true \
+            --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
             --set injector.tls.secretName=ferrum-mesh-injector-tls \
             --set ca.enabled=true \
             --set eastWest.enabled=true \
@@ -2777,6 +2867,7 @@ jobs:
             --set controlPlane.probes.liveness.enabled=false \
             --set controlPlane.probes.readiness.enabled=false \
             --set injector.enabled=true \
+            --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
             --set injector.probes.startup.enabled=false \
             --set injector.probes.liveness.enabled=false \
             --set injector.probes.readiness.enabled=false \
@@ -3047,6 +3138,7 @@ jobs:
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             -f ./charts/ferrum-mesh/examples/development-values.yaml \
             --set injector.enabled=true \
+            --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
             --set injector.tls.secretName=ferrum-mesh-injector-tls \
             --set injector.probes.startup.override.exec.command[0]=/bin/startup-inj \
             --set ca.enabled=true \
@@ -3116,6 +3208,7 @@ jobs:
             --set ambient.enabled=true \
             --set nodeAgent.enabled=true \
             --set injector.enabled=true \
+            --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
             --set injector.tls.secretName=ferrum-mesh-injector-tls \
             --set observability.enabled=true \
             --set-string 'observability.metrics.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \

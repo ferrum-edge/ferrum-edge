@@ -123,6 +123,91 @@ pub mod _test_support {
         Some((url_authority, host))
     }
 
+    /// RFC 9113 §8.3.1 outbound `Host` / `:authority` pair the direct-H2
+    /// pool emits for `backend_url` via `apply_outbound_h2_host`.
+    ///
+    /// Returns `None` when `backend_url` is not a URI or has no authority.
+    /// `client_host` is the preserved inbound Host; ignored when
+    /// `preserve_host_header` is false. A preserved Host that fails
+    /// `split_request_authority` (userinfo, path, empty, unbracketed IPv6,
+    /// opaque IP-literal) is ignored and both fields fall back to the
+    /// backend URI authority.
+    pub fn outbound_h2_host_and_authority_for_test(
+        backend_url: &str,
+        preserve_host_header: bool,
+        client_host: Option<&str>,
+    ) -> Option<(String, String)> {
+        let mut uri: hyper::Uri = backend_url.parse().ok()?;
+        let mut headers = hyper::HeaderMap::new();
+        if let Some(host) = client_host {
+            headers.insert(
+                hyper::header::HOST,
+                hyper::header::HeaderValue::from_str(host).ok()?,
+            );
+        }
+        crate::proxy::apply_outbound_h2_host(&mut headers, &mut uri, preserve_host_header);
+        let host = headers.get(hyper::header::HOST)?.to_str().ok()?.to_string();
+        let authority = uri.authority()?.as_str().to_string();
+        Some((host, authority))
+    }
+
+    /// Native-gRPC mesh-mTLS outbound `Host` / `:authority` after
+    /// `mesh_mtls_dispatch_authority` plus Host-only sync.
+    ///
+    /// Mirrors `resolve_backend_uri` (MeshMtls) then
+    /// `sync_outbound_h2_host_to_authority`: a pinned `mesh.mtls_authority_host`
+    /// wins over `preserve_host_header`, and the mesh service port is kept
+    /// on both fields. Used to prove a second preserve pass cannot clobber
+    /// that authority.
+    pub fn mesh_mtls_outbound_host_and_authority_for_test(
+        preserve_host_header: bool,
+        client_host: Option<&str>,
+        mesh_authority_host: &str,
+        mesh_authority_port: Option<u16>,
+        dial_host: &str,
+        dial_port: u16,
+    ) -> Option<(String, String)> {
+        let mut tags = HashMap::new();
+        tags.insert(
+            crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_HOST_TAG.to_string(),
+            mesh_authority_host.to_string(),
+        );
+        if let Some(port) = mesh_authority_port {
+            tags.insert(
+                crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG.to_string(),
+                port.to_string(),
+            );
+        }
+        let target = crate::config::types::UpstreamTarget {
+            host: dial_host.to_string(),
+            port: dial_port,
+            service_port_policy_key: None,
+            weight: 100,
+            tags,
+            locality: None,
+            path: None,
+        };
+        let authority =
+            crate::proxy::mesh_mtls_dispatch_authority(&target, preserve_host_header, client_host);
+        let uri = hyper::Uri::builder()
+            .scheme("https")
+            .authority(authority.as_ref())
+            .path_and_query("/")
+            .build()
+            .ok()?;
+        let mut headers = hyper::HeaderMap::new();
+        if let Some(host) = client_host {
+            headers.insert(
+                hyper::header::HOST,
+                hyper::header::HeaderValue::from_str(host).ok()?,
+            );
+        }
+        crate::proxy::sync_outbound_h2_host_to_authority(&mut headers, &uri);
+        let host = headers.get(hyper::header::HOST)?.to_str().ok()?.to_string();
+        let uri_authority = uri.authority()?.as_str().to_string();
+        Some((host, uri_authority))
+    }
+
     /// Release an xDS node permit through the production last-stream cleanup
     /// fence. The closure runs while same-key registration is excluded, which
     /// lets external tests prove a departing generation cannot delete its

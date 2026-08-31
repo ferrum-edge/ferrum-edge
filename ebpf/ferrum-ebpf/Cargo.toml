@@ -3,6 +3,10 @@ name = "ferrum-ebpf"
 version = "0.1.0"
 edition = "2021"
 description = "Ferrum Edge eBPF programs for ambient mesh traffic capture"
+license = "PolyForm-Noncommercial-1.0.0"
+# Never published to crates.io; it ships only inside the ferrum-edge
+# binary/image, and cargo-deny's `licenses.private.ignore` keys off this.
+publish = false
 
 [dependencies]
 aya-ebpf = "0.1"

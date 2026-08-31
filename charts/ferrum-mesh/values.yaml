@@ -15,6 +15,22 @@ podDisruptionBudget:
   # minAvailable: null
   # maxUnavailable: 1
 
+# Ferrum-owned CRDs. These live in templates/ (not Helm's install-once crds/
+# directory) so `helm upgrade` applies schema changes. Uninstall keeps the CRD
+# (`helm.sh/resource-policy: keep`) so UDPResponseAmplificationPolicy objects
+# are not cascade-deleted. Compare the live annotation
+# gateway.ferrum.io/crd-schema-version to schemaVersion below.
+#
+# Existing clusters that installed the CRD from the former crds/ directory
+# must adopt it once: `helm upgrade --take-ownership --set crds.adoptExisting=true`.
+# See docs/upgrade_guide.md.
+crds:
+  install: true
+  skipInstallAcknowledged: false
+  adoptExisting: false
+  udpResponseAmplificationPolicy:
+    schemaVersion: v1alpha1-1
+
 controlPlane:
   # Disabled by default because CP mode requires an explicit database URL plus
   # operator-provided JWT secrets. Use examples/development-values.yaml for a
@@ -222,7 +238,15 @@ injector:
   # docs/mesh.md "Host-Network Pods Are Never Injected".
   requireAnnotation: true
   failurePolicy: Fail
+  # Exactly one trust source is required when enabled. A base64 PEM CA bundle
+  # (single line, no wrapping) or cert-manager CA injection. Empty caBundle with
+  # failurePolicy Fail is rejected at render — Kubernetes cannot authenticate
+  # the webhook, and this chart will not silently change failurePolicy to Ignore.
   caBundle: ""
+  certManager:
+    # namespace/certificate-name rendered as cert-manager.io/inject-ca-from.
+    # Mutually exclusive with caBundle.
+    injectCaFrom: ""
   # Additional namespaceSelector matchExpressions for the mutating webhook. The
   # chart always appends a NotIn rule for .Release.Namespace at render time so
   # injector/CP/CA pods in the release namespace are never gated on the webhook

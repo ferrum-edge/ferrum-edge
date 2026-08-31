@@ -241,11 +241,42 @@ another release's class.
 
 ### Gateway API CRDs (required)
 
-Ferrum does **not** ship upstream Gateway API CRDs in the Helm chart. The chart
-`crds/` directory contains only Ferrum-owned CRDs (for example
-`UDPResponseAmplificationPolicy`). Upstream Gateway API definitions are large,
-versioned independently, and must not live in Helm `crds/` — that directory is
-not upgraded on `helm upgrade` and cannot be removed on uninstall.
+Ferrum does **not** ship upstream Gateway API CRDs in the Helm chart. Upstream
+Gateway API definitions are large, versioned independently, and must be
+installed from the experimental channel below.
+
+Ferrum-owned `UDPResponseAmplificationPolicy` is **not** in Helm's install-once
+`crds/` directory. It is rendered from
+`charts/ferrum-mesh/templates/crds-udpresponseamplificationpolicy.yaml` when
+`crds.install=true` (the default) so `helm upgrade` applies schema changes.
+Uninstall keeps the CRD (`helm.sh/resource-policy: keep`) so policy objects are
+not cascade-deleted.
+
+The chart stamps the shipped schema onto the CRD as the annotation
+`gateway.ferrum.io/crd-schema-version`. Compare the live CRD to the chart
+(expected `v1alpha1-1`) — the jsonpath below escapes the dots in the key:
+
+```bash
+kubectl get crd udpresponseamplificationpolicies.gateway.ferrum.io \
+  -o jsonpath='{.metadata.annotations.gateway\.ferrum\.io/crd-schema-version}'
+```
+
+A mismatch is an operator failure. Leave `crds.install=true`, or apply the
+template YAML with `kubectl apply --server-side` and set
+`crds.skipInstallAcknowledged=true`. `crds.install=false` without that
+acknowledgement fails `helm template` / `helm upgrade`.
+
+Existing clusters that installed this CRD from the former
+`charts/ferrum-mesh/crds/` directory must adopt it once so Helm can update it.
+**Operator action:**
+
+```bash
+helm upgrade <release> ./charts/ferrum-mesh -n <namespace> \
+  --take-ownership --set crds.adoptExisting=true
+```
+
+Independent `ferrum-mesh` releases in one cluster share this cluster-scoped CRD.
+The first Helm-managed release owns it; later releases skip creating it.
 
 When `controlPlane.enabled=true` and `controlPlane.rbac.gatewayApi=true` (the
 default), the chart renders a cluster-scoped `GatewayClass` and a `ClusterRole`
@@ -398,6 +429,14 @@ The chart mounts the injector serving certificate through a Secret volume when
 the injector is enabled; the injector process does not read Kubernetes Secrets
 through the API, so the default service account does not need Secret RBAC for
 that mount.
+
+The API server authenticates the mutating webhook with `clientConfig.caBundle`.
+`injector.enabled=true` therefore requires **exactly one** trust source:
+`injector.caBundle` (single-line base64 PEM) or
+`injector.certManager.injectCaFrom` (`namespace/certificate-name`, rendered as
+`cert-manager.io/inject-ca-from`). Render fails when neither or both are set.
+The chart never changes `failurePolicy` from `Fail` to `Ignore` to make a
+webhook without a CA render.
 
 ## Mesh Workload Health Probes
 

@@ -90,6 +90,26 @@ pub fn parse_pod_ip(ip_str: &str) -> Option<std::net::Ipv4Addr> {
     ip_str.parse().ok()
 }
 
+/// The excluded-namespace set every ambient-enrollment caller must use.
+///
+/// `modes::node_agent` (capture enrollment) and the Kubernetes translator
+/// (identity-only NodeWaypoint assertion grants) both resolve the operator's
+/// `FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES` through this ONE function, so a
+/// namespace the node agent will not capture can never enter the HBONE
+/// assertion inventory because the two parses drifted.
+pub fn excluded_namespaces_from_env() -> HashSet<String> {
+    let extra: Vec<String> =
+        crate::config::conf_file::resolve_ferrum_var("FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES")
+            .map(|raw| {
+                raw.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+    build_excluded_namespaces(&extra)
+}
+
 /// Build the default set of excluded namespaces from the constant list plus
 /// any operator overrides.
 pub fn build_excluded_namespaces(extra: &[String]) -> HashSet<String> {

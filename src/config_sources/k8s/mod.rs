@@ -183,6 +183,12 @@ pub struct K8sTranslationOptions {
     /// Restore is node-scoped: only a trusted not-Ready or terminating
     /// replacement on that node may reattach the remembered endpoint.
     pub node_waypoint_inventory: NodeWaypointInventory,
+    /// Namespaces excluded from ambient enrollment. Matches the node-agent
+    /// capture skip set: `pod_watcher::DEFAULT_EXCLUDED_NAMESPACES` plus
+    /// `FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES`. Identity-only NodeWaypoint
+    /// assertion grants reuse this so a namespace the node agent will not
+    /// capture cannot enter the HBONE assertion inventory.
+    pub excluded_namespaces: HashSet<String>,
     source_namespaces: Option<HashSet<String>>,
     pod_source_namespaces: Option<HashSet<String>>,
 }
@@ -255,6 +261,7 @@ impl K8sTranslationOptions {
             mesh_sidecar_ingress_enforced: false,
             mesh_overlay_authority: false,
             node_waypoint_inventory: NodeWaypointInventory::new(),
+            excluded_namespaces: crate::ebpf::pod_watcher::excluded_namespaces_from_env(),
             source_namespaces: Some(source_namespaces),
             pod_source_namespaces: Some(pod_source_namespaces),
         }
@@ -299,6 +306,13 @@ impl K8sTranslationOptions {
     /// Share a process-lifetime NodeWaypoint inventory across translations.
     pub fn with_node_waypoint_inventory(mut self, inventory: NodeWaypointInventory) -> Self {
         self.node_waypoint_inventory = inventory;
+        self
+    }
+
+    /// Override the ambient-enrollment skip set. Production callers should
+    /// keep the `new()` default, which is the same set the node agent builds.
+    pub fn with_excluded_namespaces(mut self, namespaces: HashSet<String>) -> Self {
+        self.excluded_namespaces = namespaces;
         self
     }
 

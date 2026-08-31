@@ -1247,3 +1247,64 @@ Keep them byte-comparable with the gateway copies.
 {{- end -}}
 {{- if $found -}}true{{- end -}}
 {{- end -}}
+
+{{/*
+Enabled injector must have exactly one webhook trust source: a base64 PEM
+caBundle, or cert-manager.io/inject-ca-from. Empty caBundle plus failurePolicy
+Fail would render a webhook Kubernetes cannot authenticate. Never weaken
+failurePolicy to Ignore to make that configuration render.
+*/}}
+{{- define "ferrum-mesh.validateInjectorTrust" -}}
+{{- if .Values.injector.enabled -}}
+{{- $ca := .Values.injector.caBundle | toString | trim -}}
+{{- $cm := .Values.injector.certManager | default dict -}}
+{{- $injectFrom := index $cm "injectCaFrom" | default "" | toString | trim -}}
+{{- $hasCa := ne $ca "" -}}
+{{- $hasInject := ne $injectFrom "" -}}
+{{- if and $hasCa $hasInject -}}
+{{- fail "injector requires exactly one trust source: set injector.caBundle or injector.certManager.injectCaFrom, not both" -}}
+{{- end -}}
+{{- if not (or $hasCa $hasInject) -}}
+{{- fail "injector.enabled=true requires injector.caBundle (base64-encoded PEM CA) or injector.certManager.injectCaFrom (cert-manager.io/inject-ca-from namespace/certificate). An empty caBundle with failurePolicy Fail renders a webhook Kubernetes cannot authenticate. Do not set failurePolicy to Ignore to bypass this." -}}
+{{- end -}}
+{{- if $hasCa -}}
+{{- if not (regexMatch "^[A-Za-z0-9+/]+={0,2}$" $ca) -}}
+{{- fail "injector.caBundle must be SINGLE-LINE base64 of a PEM CA certificate (decoded value must contain BEGIN CERTIFICATE). Wrapped base64 is rejected because the rendered webhook would be invalid: produce it with `base64 -w0 < ca.crt` (macOS: `base64 < ca.crt | tr -d '\n'`)." -}}
+{{- end -}}
+{{- $decoded := $ca | b64dec -}}
+{{- if not (contains "BEGIN CERTIFICATE" $decoded) -}}
+{{- fail "injector.caBundle must be SINGLE-LINE base64 of a PEM CA certificate (decoded value must contain BEGIN CERTIFICATE). Wrapped base64 is rejected because the rendered webhook would be invalid: produce it with `base64 -w0 < ca.crt` (macOS: `base64 < ca.crt | tr -d '\n'`)." -}}
+{{- end -}}
+{{- end -}}
+{{- if $hasInject -}}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?/[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $injectFrom) -}}
+{{- fail "injector.certManager.injectCaFrom must be namespace/certificate-name (DNS-1123 labels)" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Ferrum-owned CRDs live in templates/ so helm upgrade applies schema changes.
+Helm's crds/ directory is install-once and would leave clusters on a stale
+UDPResponseAmplificationPolicy schema. Skipping install requires an explicit
+acknowledgement. An unmanaged CRD from the former crds/ directory must be
+adopted (crds.adoptExisting=true plus helm upgrade --take-ownership).
+*/}}
+{{- define "ferrum-mesh.validateCrds" -}}
+{{- $crds := .Values.crds | default dict -}}
+{{- $install := true -}}
+{{- if hasKey $crds "install" -}}
+{{- $install = $crds.install -}}
+{{- end -}}
+{{- $skipAck := false -}}
+{{- if hasKey $crds "skipInstallAcknowledged" -}}
+{{- $skipAck = $crds.skipInstallAcknowledged -}}
+{{- end -}}
+{{- if and (not $install) (not $skipAck) -}}
+{{- fail "crds.install=false leaves UDPResponseAmplificationPolicy unmanaged across helm upgrade. Set crds.install=true (default) so helm upgrade applies the CRD, or set crds.skipInstallAcknowledged=true after applying the chart CRD with kubectl apply --server-side. See docs/upgrade_guide.md." -}}
+{{- end -}}
+{{- if and $install $skipAck -}}
+{{- fail "crds.skipInstallAcknowledged=true is only valid when crds.install=false" -}}
+{{- end -}}
+{{- end -}}

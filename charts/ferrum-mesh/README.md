@@ -9,7 +9,7 @@ naming, labelling, secret, and validation conventions.
 | Component | Values key | Default | Notes |
 |-----------|------------|---------|-------|
 | Control plane | `controlPlane.enabled` | `false` | Requires DB + JWT secrets |
-| Injector webhook | `injector.enabled` | `false` | Requires TLS Secret |
+| Injector webhook | `injector.enabled` | `false` | Requires TLS Secret **and** exactly one CA trust source (`injector.caBundle` or `injector.certManager.injectCaFrom`) |
 | East-west gateway | `eastWest.enabled` | `false` | Cross-cluster SNI passthrough |
 | Mesh CA | `ca.enabled` | `false` | Fixed one replica in template |
 | Ambient proxy | `ambient.enabled` | `false` | Requires `nodeAgent.enabled` |
@@ -23,8 +23,36 @@ When `controlPlane.enabled=true` and `controlPlane.rbac.gatewayApi=true` (the
 default), this chart renders a cluster-scoped `GatewayClass` and Gateway API
 RBAC over `HTTPRoute`, `GRPCRoute`, `TCPRoute`, `TLSRoute`, `UDPRoute`,
 `ListenerSet`, and `XBackendTrafficPolicy`. Those upstream CRDs are **not**
-shipped in this chart's `crds/` directory (only Ferrum-owned CRDs such as
-`UDPResponseAmplificationPolicy` live there).
+shipped in this chart.
+
+Ferrum-owned `UDPResponseAmplificationPolicy` is rendered from
+`templates/crds-udpresponseamplificationpolicy.yaml` when `crds.install=true`
+(the default) so `helm upgrade` applies schema changes. Helm's special `crds/`
+directory is install-once and is **not** used for this CRD. Uninstall keeps the
+CRD (`helm.sh/resource-policy: keep`) so policy objects are not cascade-deleted.
+
+Compare the live CRD to the chart (expected `v1alpha1-1`):
+
+```bash
+kubectl get crd udpresponseamplificationpolicies.gateway.ferrum.io \
+  -o jsonpath='{.metadata.annotations.gateway\.ferrum\.io/crd-schema-version}'
+```
+
+A mismatch is an operator failure. Either leave `crds.install=true` so the
+next upgrade applies the template, or apply that YAML with
+`kubectl apply --server-side` and set `crds.skipInstallAcknowledged=true`.
+`crds.install=false` without that acknowledgement fails render.
+
+Existing clusters that installed this CRD from the former `crds/` directory
+must adopt it once. **Operator action:**
+
+```bash
+helm upgrade <release> ./charts/ferrum-mesh -n <namespace> \
+  --take-ownership --set crds.adoptExisting=true
+```
+
+Independent `ferrum-mesh` releases in one cluster share this cluster-scoped
+CRD. The first Helm-managed release owns it; later releases skip it.
 
 Install the **experimental** Gateway API channel at Ferrum's pinned version
 **before** `helm install`:
@@ -80,6 +108,25 @@ Workloads in other namespaces still receive admission calls; opt-in/out behavior
 is unchanged (`requireAnnotation`, pod annotations, and `ferrum.io/injection`
 labels). Extend `injector.namespaceSelector` for platform namespaces such as
 `gke-managed-system` or `openshift-*` before enabling broader injection.
+
+## Injector webhook CA trust
+
+`injector.enabled=true` defaults to `failurePolicy: Fail`. Kubernetes authenticates
+the webhook with `clientConfig.caBundle`. An empty bundle falls through to system
+roots, which do not trust a typical in-cluster serving certificate, so admission
+for the matched scope fails closed.
+
+The chart requires **exactly one** trust source when the injector is enabled:
+
+1. `injector.caBundle` — a single-line base64-encoded PEM CA that validates the
+   serving certificate in `injector.tls.secretName`; or
+2. `injector.certManager.injectCaFrom` — `namespace/certificate-name`, rendered as
+   `cert-manager.io/inject-ca-from` on the `MutatingWebhookConfiguration`.
+
+Render fails with an actionable message when neither or both are set, when
+`caBundle` is not valid base64 PEM, or when `injectCaFrom` is not
+`namespace/name`. The chart never changes `failurePolicy` to `Ignore` to make a
+broken configuration render.
 
 ## High availability and disruption
 

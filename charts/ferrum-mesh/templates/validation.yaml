@@ -1,4 +1,6 @@
 {{- include "ferrum-mesh.validateControlPlaneInputs" . -}}
+{{- include "ferrum-mesh.validateCrds" . -}}
+{{- include "ferrum-mesh.validateInjectorTrust" . -}}
 {{- include "ferrum-mesh.validateServingShutdowns" . -}}
 {{- include "ferrum-mesh.validateObservability" . -}}
 {{- if .Values.controlPlane.enabled -}}

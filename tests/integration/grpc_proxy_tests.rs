@@ -501,6 +501,64 @@ async fn start_mock_grpc_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) 
     (addr, handle)
 }
 
+/// h2c gRPC backend that echoes the inbound Host header and URI authority
+/// (Hyper reconstructs the latter from `:authority`) so RFC 9113 §8.3.1
+/// agreement can be asserted on the native-gRPC outbound path.
+async fn start_host_echoing_grpc_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(_) => break,
+            };
+            let _ = stream.set_nodelay(true);
+
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let builder = Http2ServerBuilder::new(TokioExecutor::new());
+                let service = service_fn(|req: Request<Incoming>| async move {
+                    let host = req
+                        .headers()
+                        .get(hyper::header::HOST)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let authority = req
+                        .uri()
+                        .authority()
+                        .map(|value| value.as_str().to_string())
+                        .unwrap_or_default();
+                    let body_bytes = req
+                        .into_body()
+                        .collect()
+                        .await
+                        .map(|collected| collected.to_bytes())
+                        .unwrap_or_default();
+                    Ok::<_, hyper::Error>(
+                        Response::builder()
+                            .status(200)
+                            .header("content-type", "application/grpc")
+                            .header("grpc-status", "0")
+                            .header("x-echo-host", host)
+                            .header("x-echo-authority", authority)
+                            .body(Full::new(body_bytes))
+                            .unwrap(),
+                    )
+                });
+                if let Err(e) = builder.serve_connection(io, service).await {
+                    eprintln!("Host-echo gRPC backend connection error: {}", e);
+                }
+            });
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    (addr, handle)
+}
+
 /// Start an h2c gRPC echo backend and expose the number of requests that
 /// reached its service. Prebuffer cancellation tests use the counter to prove
 /// an incomplete frontend upload never dispatches a partial primary request.
@@ -1970,6 +2028,156 @@ async fn test_grpc_body_forwarding() {
     assert_eq!(
         body, grpc_message,
         "Backend should echo the gRPC message body"
+    );
+}
+
+fn assert_outbound_h2_host_matches_authority(
+    backend_url: &str,
+    preserve_host_header: bool,
+    client_host: Option<&str>,
+    expected: &str,
+) {
+    let (host, authority) = ferrum_edge::_test_support::outbound_h2_host_and_authority_for_test(
+        backend_url,
+        preserve_host_header,
+        client_host,
+    )
+    .unwrap_or_else(|| panic!("expected authority for {backend_url}"));
+    assert_eq!(host, expected, "Host for {backend_url}");
+    assert_eq!(authority, expected, ":authority for {backend_url}");
+    assert_eq!(
+        host, authority,
+        "RFC 9113 §8.3.1: Host and :authority must agree for {backend_url}"
+    );
+}
+
+#[test]
+fn native_grpc_outbound_host_matches_authority_including_non_default_port() {
+    assert_outbound_h2_host_matches_authority(
+        "http://127.0.0.1:21213/grpc.Service/Method",
+        false,
+        Some("client.example:8443"),
+        "127.0.0.1:21213",
+    );
+    assert_outbound_h2_host_matches_authority(
+        "http://127.0.0.1:80/grpc.Service/Method",
+        false,
+        None,
+        "127.0.0.1",
+    );
+    assert_outbound_h2_host_matches_authority(
+        "https://127.0.0.1:443/grpc.Service/Method",
+        false,
+        None,
+        "127.0.0.1",
+    );
+    assert_outbound_h2_host_matches_authority(
+        "http://[::1]:8443/grpc.Service/Method",
+        false,
+        None,
+        "[::1]:8443",
+    );
+    assert_outbound_h2_host_matches_authority(
+        "https://[::1]:443/grpc.Service/Method",
+        false,
+        None,
+        "[::1]",
+    );
+    assert_outbound_h2_host_matches_authority(
+        "http://127.0.0.1:21213/grpc.Service/Method",
+        true,
+        Some("api.example.com"),
+        "api.example.com",
+    );
+    assert_outbound_h2_host_matches_authority(
+        "http://127.0.0.1:21213/grpc.Service/Method",
+        true,
+        Some("  api.example.com  "),
+        "api.example.com",
+    );
+    assert_outbound_h2_host_matches_authority(
+        "https://127.0.0.1:8443/grpc.Service/Method",
+        true,
+        Some("[::1]:8443"),
+        "[::1]:8443",
+    );
+
+    let fallback = "127.0.0.1:8443";
+    let backend = "https://127.0.0.1:8443/grpc.Service/Method";
+    for host in [
+        "user@host",
+        "user:pass@host:8443",
+        "host/evil",
+        "",
+        "   ",
+        "2001:db8::1",
+        "[not-an-ip]:1",
+    ] {
+        assert_outbound_h2_host_matches_authority(backend, true, Some(host), fallback);
+    }
+}
+
+#[test]
+fn native_grpc_mesh_mtls_pinned_authority_wins_over_preserve_host() {
+    let (host, authority) =
+        ferrum_edge::_test_support::mesh_mtls_outbound_host_and_authority_for_test(
+            true,
+            Some("attacker.example:9000"),
+            "reviews.default.svc",
+            Some(9080),
+            "10.0.0.5",
+            15006,
+        )
+        .expect("pinned mesh-mTLS authority");
+    assert_eq!(host, "reviews.default.svc:9080");
+    assert_eq!(authority, "reviews.default.svc:9080");
+    assert_eq!(
+        host, authority,
+        "RFC 9113 §8.3.1: mesh-mTLS Host and :authority must agree"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_grpc_backend_sees_matching_host_and_authority_on_non_default_port() {
+    let (backend_addr, _backend_handle) = start_host_echoing_grpc_backend().await;
+    let expected = format!("127.0.0.1:{}", backend_addr.port());
+
+    let proxy = create_grpc_proxy("grpc-host-auth", "/grpc", backend_addr.port());
+    let state = create_test_proxy_state(vec![proxy]);
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    // The client Host must AGREE with the `:authority` the helper emits from
+    // `gateway_addr`: since issue #4416 the inbound guard rejects an H2
+    // Host/`:authority` disagreement with 400 before routing, so a made-up
+    // client Host would never reach backend dispatch. Sending the gateway's own
+    // authority is what a conforming client does, and it still proves the
+    // outbound side REPLACES it — `x-echo-host` below must be the backend
+    // authority, not this one.
+    let client_host = gateway_addr.to_string();
+    let (status, headers, _body) = send_grpc_request(
+        gateway_addr,
+        "/grpc/my.Service/Echo",
+        b"",
+        &[("host", client_host.as_str())],
+    )
+    .await
+    .expect("gRPC request should succeed");
+
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("grpc-status").map(String::as_str),
+        Some("0"),
+        "native gRPC Host/:authority disagreement resets the stream"
+    );
+    assert_eq!(
+        headers.get("x-echo-host").map(String::as_str),
+        Some(expected.as_str()),
+        "preserve_host_header=false: Host must include the non-default backend port"
+    );
+    assert_eq!(
+        headers.get("x-echo-authority").map(String::as_str),
+        Some(expected.as_str()),
+        "Hyper :authority must include the same non-default port"
     );
 }
 

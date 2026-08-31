@@ -3,6 +3,10 @@ name = "ferrum-ebpf-common"
 version = "0.3.0"
 edition = "2021"
 description = "Shared types between Ferrum eBPF programs and userspace loader"
+license = "PolyForm-Noncommercial-1.0.0"
+# Never published to crates.io; it ships only inside the ferrum-edge
+# binary/image, and cargo-deny's `licenses.private.ignore` keys off this.
+publish = false
 
 [features]
 default = []

@@ -10,16 +10,18 @@ use bytes::Bytes;
 use ferrum_edge::backend_conn_limit::BackendConnectionLimiter;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy, ResolvedPortOverride,
+    AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, H2UpgradePolicy, Proxy,
+    ResolvedPortOverride,
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::grpc_proxy::GrpcConnectionPool;
 use ferrum_edge::proxy::http2_pool::{Http2ConnectionPool, Http2PoolError};
+use ferrum_edge::proxy::{ProxyState, handle_proxy_request};
 use hickory_resolver::proto::{
     op::Message,
     rr::{RData, Record, RecordType},
 };
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
@@ -1627,4 +1629,272 @@ fn rr_counters_insert_before_and_after_retire_for_grpc() {
     assert!(pool.contains_rr_counter(&current));
     assert!(pool.contains_rr_counter(&static_key));
     assert_eq!(pool.pool_size(), 0);
+}
+
+fn assert_outbound_h2_host_matches_authority(
+    backend_url: &str,
+    preserve_host_header: bool,
+    client_host: Option<&str>,
+    expected: &str,
+) {
+    let (host, authority) = ferrum_edge::_test_support::outbound_h2_host_and_authority_for_test(
+        backend_url,
+        preserve_host_header,
+        client_host,
+    )
+    .unwrap_or_else(|| panic!("expected authority for {backend_url}"));
+    assert_eq!(host, expected, "Host for {backend_url}");
+    assert_eq!(authority, expected, ":authority for {backend_url}");
+    assert_eq!(
+        host, authority,
+        "RFC 9113 §8.3.1: Host and :authority must agree for {backend_url}"
+    );
+}
+
+#[test]
+fn direct_h2_outbound_host_matches_authority_including_non_default_port() {
+    assert_outbound_h2_host_matches_authority(
+        "https://127.0.0.1:21212/h2tls",
+        false,
+        Some("client.example:8443"),
+        "127.0.0.1:21212",
+    );
+    assert_outbound_h2_host_matches_authority(
+        "https://127.0.0.1:443/h2tls",
+        false,
+        None,
+        "127.0.0.1",
+    );
+    assert_outbound_h2_host_matches_authority(
+        "http://127.0.0.1:80/h2tls",
+        false,
+        None,
+        "127.0.0.1",
+    );
+    assert_outbound_h2_host_matches_authority(
+        "https://[::1]:8443/h2tls",
+        false,
+        None,
+        "[::1]:8443",
+    );
+    assert_outbound_h2_host_matches_authority("https://[::1]:443/h2tls", false, None, "[::1]");
+    assert_outbound_h2_host_matches_authority(
+        "https://127.0.0.1:21212/h2tls",
+        true,
+        Some("api.example.com"),
+        "api.example.com",
+    );
+    assert_outbound_h2_host_matches_authority(
+        "https://127.0.0.1:21212/h2tls",
+        true,
+        Some("  api.example.com  "),
+        "api.example.com",
+    );
+    assert_outbound_h2_host_matches_authority(
+        "https://127.0.0.1:8443/h2tls",
+        true,
+        Some("[::1]:8443"),
+        "[::1]:8443",
+    );
+
+    let fallback = "127.0.0.1:8443";
+    let backend = "https://127.0.0.1:8443/h2tls";
+    for host in [
+        "user@host",
+        "user:pass@host:8443",
+        "host/evil",
+        "",
+        "   ",
+        "2001:db8::1",
+        "[not-an-ip]:1",
+    ] {
+        assert_outbound_h2_host_matches_authority(backend, true, Some(host), fallback);
+    }
+}
+
+#[test]
+fn direct_h2_mesh_mtls_pinned_authority_wins_over_preserve_host() {
+    let (host, authority) =
+        ferrum_edge::_test_support::mesh_mtls_outbound_host_and_authority_for_test(
+            true,
+            Some("attacker.example:9000"),
+            "reviews.default.svc",
+            Some(9080),
+            "10.0.0.5",
+            15006,
+        )
+        .expect("pinned mesh-mTLS authority");
+    assert_eq!(host, "reviews.default.svc:9080");
+    assert_eq!(authority, "reviews.default.svc:9080");
+    assert_eq!(
+        host, authority,
+        "RFC 9113 §8.3.1: mesh-mTLS Host and :authority must agree"
+    );
+}
+
+async fn start_h2_tls_host_echo_backend()
+-> Result<(tokio::task::JoinHandle<()>, u16), Box<dyn std::error::Error>> {
+    let cert_pem = include_str!("../certs/server.crt");
+    let key_pem = include_str!("../certs/server.key");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+
+    let mut cert_reader = cert_pem.as_bytes();
+    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
+        .filter_map(|cert| cert.ok())
+        .collect();
+    let mut key_reader = key_pem.as_bytes();
+    let private_key =
+        rustls_pemfile::private_key(&mut key_reader)?.ok_or("missing private key in test cert")?;
+
+    let provider = rustls::crypto::ring::default_provider();
+    let mut tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(certs, private_key)?;
+    tls_config.alpn_protocols = vec![b"h2".to_vec()];
+
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+    let handle = tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let tls_stream = match acceptor.accept(socket).await {
+                    Ok(stream) => stream,
+                    Err(_) => return,
+                };
+                let io = TokioIo::new(tls_stream);
+                let builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+                let service = service_fn(|req: Request<Incoming>| async move {
+                    let host = req
+                        .headers()
+                        .get(hyper::header::HOST)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let authority = req
+                        .uri()
+                        .authority()
+                        .map(|value| value.as_str().to_string())
+                        .unwrap_or_default();
+                    let response = Response::builder()
+                        .status(200)
+                        .header("x-echo-host", host)
+                        .header("x-echo-authority", authority)
+                        .body(Full::new(Bytes::from_static(b"ok")))
+                        .unwrap();
+                    Ok::<_, hyper::Error>(response)
+                });
+                let _ = builder.serve_connection(io, service).await;
+            });
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    Ok((handle, port))
+}
+
+async fn start_direct_h2_test_gateway(
+    state: ProxyState,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gateway");
+    let gateway_addr = listener.local_addr().expect("gateway addr");
+    let handle = tokio::spawn(async move {
+        loop {
+            let (stream, remote_addr) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(_) => break,
+            };
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = stream.set_nodelay(true);
+                let io = TokioIo::new(stream);
+                let mut builder =
+                    hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+                builder.http1().max_buf_size(state.max_header_size_bytes);
+                builder
+                    .http2()
+                    .max_header_list_size(state.max_header_size_bytes as u32);
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let state = state.clone();
+                    async move { handle_proxy_request(req, state, remote_addr, false, None, None).await }
+                });
+                let _ = builder.serve_connection_with_upgrades(io, svc).await;
+            });
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    (gateway_addr, handle)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_h2_backend_sees_matching_host_and_authority_on_non_default_port() {
+    let (_backend_handle, port) = start_h2_tls_host_echo_backend()
+        .await
+        .expect("start host-echo H2 TLS backend");
+    let expected = format!("127.0.0.1:{port}");
+
+    let mut proxy = create_test_proxy();
+    proxy.backend_host = "127.0.0.1".to_string();
+    proxy.backend_port = port;
+    proxy.backend_tls_verify_server_cert = false;
+    proxy.pool_enable_http2 = Some(true);
+    proxy.h2_upgrade_policy = Some(H2UpgradePolicy::Upgrade);
+
+    let dns_cache = create_dns_cache();
+    let env_config = ferrum_edge::config::EnvConfig {
+        tls_no_verify: true,
+        ..Default::default()
+    };
+    let config = GatewayConfig {
+        version: "1".to_string(),
+        proxies: vec![proxy],
+        loaded_at: chrono::Utc::now(),
+        ..Default::default()
+    };
+    let (state, _health_handles) =
+        ProxyState::new(config, dns_cache, env_config, None, None).expect("proxy state");
+    let (gateway_addr, _gateway_handle) = start_direct_h2_test_gateway(state).await;
+
+    let stream = tokio::net::TcpStream::connect(gateway_addr)
+        .await
+        .expect("connect gateway");
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .expect("h1 handshake");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/h2test")
+        .header("host", "client.example:9000")
+        .body(Full::new(Bytes::new()))
+        .expect("request");
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("gateway response");
+    assert_eq!(response.status(), 200, "direct-H2 dispatch should succeed");
+    let headers = response.headers();
+    assert_eq!(
+        headers
+            .get("x-echo-host")
+            .and_then(|value| value.to_str().ok()),
+        Some(expected.as_str()),
+        "preserve_host_header=false: Host must include the non-default backend port"
+    );
+    assert_eq!(
+        headers
+            .get("x-echo-authority")
+            .and_then(|value| value.to_str().ok()),
+        Some(expected.as_str()),
+        "Hyper :authority must include the same non-default port"
+    );
+    let _ = response.into_body().collect().await;
 }

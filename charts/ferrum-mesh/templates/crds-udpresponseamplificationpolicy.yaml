@@ -1,10 +1,54 @@
+{{- include "ferrum-mesh.validateCrds" . -}}
+{{- $crds := .Values.crds | default dict -}}
+{{- $install := true -}}
+{{- if hasKey $crds "install" -}}
+{{- $install = $crds.install -}}
+{{- end -}}
+{{- if $install -}}
+{{- $crdName := "udpresponseamplificationpolicies.gateway.ferrum.io" -}}
+{{- $existing := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" $crdName -}}
+{{- $ann := dict -}}
+{{- if and $existing $existing.metadata -}}
+{{- $ann = $existing.metadata.annotations | default dict -}}
+{{- end -}}
+{{- $owner := index $ann "meta.helm.sh/release-name" | default "" -}}
+{{- $foreign := and $existing $owner (ne $owner .Release.Name) -}}
+{{- $unmanaged := and $existing (not $owner) -}}
+{{- $adopt := false -}}
+{{- if hasKey $crds "adoptExisting" -}}
+{{- $adopt = $crds.adoptExisting -}}
+{{- end -}}
+{{- if $unmanaged -}}
+{{- if not $adopt -}}
+{{- fail "UDPResponseAmplificationPolicy CRD exists but is not Helm-managed (installed from the former charts/ferrum-mesh/crds/ directory). Operator action: helm upgrade --take-ownership --set crds.adoptExisting=true. See docs/upgrade_guide.md. Do not set crds.install=false; that leaves the cluster on a stale schema." -}}
+{{- end -}}
+{{- end -}}
+{{/* A CRD owned by ANOTHER Helm release is left alone: sharing one
+     cluster-scoped CRD across releases is ordinary Helm practice, and taking it
+     over here would fight that release on every upgrade. Rendering nothing is
+     therefore correct — but it must not be SILENT, because a release that
+     manages no CRD can sit on a stale schema, which is the drift crds.install
+     exists to prevent. NOTES.txt discloses the owning release on install and
+     upgrade; `helm template` cannot see ownership at all (lookup is empty), so
+     this is a live-cluster concern only. */}}
+{{- if not $foreign -}}
+{{- $schemaVersion := "v1alpha1-1" -}}
+{{- $policy := $crds.udpResponseAmplificationPolicy | default dict -}}
+{{- $wanted := index $policy "schemaVersion" | default $schemaVersion | toString -}}
+{{- if ne $wanted $schemaVersion -}}
+{{- fail (printf "crds.udpResponseAmplificationPolicy.schemaVersion must be %s to match the CRD this chart ships" $schemaVersion) -}}
+{{- end -}}
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   name: udpresponseamplificationpolicies.gateway.ferrum.io
   labels:
     app.kubernetes.io/name: ferrum-mesh
+    app.kubernetes.io/instance: {{ .Release.Name }}
     gateway.ferrum.io/policy: udp-amplification
+  annotations:
+    gateway.ferrum.io/crd-schema-version: {{ $schemaVersion | quote }}
+    helm.sh/resource-policy: keep
 spec:
   group: gateway.ferrum.io
   names:
@@ -103,3 +147,5 @@ spec:
                         items:
                           type: object
                           x-kubernetes-preserve-unknown-fields: true
+{{- end -}}
+{{- end -}}

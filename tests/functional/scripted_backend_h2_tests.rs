@@ -2290,13 +2290,15 @@ async fn bodyless_direct_h2_sse_response_is_governed() {
 // These tests pin both modes across both gRPC dispatch entry points:
 //
 //   - Test 8 — default (`preserve_host_header=false`), streaming fast path
-//     (`proxy_grpc_request_streaming`). Backend Host == upstream target.
+//     (`proxy_grpc_request_streaming`). Backend Host == upstream target
+//     authority (`host:port` when the port is not 80/443).
 //   - Test 9 — `preserve_host_header=true`, streaming fast path. Backend
 //     Host == client `:authority`.
 //   - Test 10 — default, buffered path via `proxy_grpc_request_core`
 //     (forced by configuring retries, which makes the body replayable so
 //     the gateway must collect it before dispatch). Backend Host == upstream
-//     target — the override fires symmetrically with the streaming path.
+//     target authority — the override fires symmetrically with the streaming
+//     path.
 //
 // All three drive the gateway via `GrpcClient::h2c`, which sends an H2
 // HEADERS frame with `:authority = 127.0.0.1:{gw_port}` and *no* explicit
@@ -2352,14 +2354,16 @@ async fn h2_grpc_preserve_false_overrides_client_authority_to_target_host() {
 
     let streams = backend.received_streams().await;
     assert_eq!(streams.len(), 1, "expected exactly one RPC at backend");
+    let expected_backend_host = format!("127.0.0.1:{backend_port}");
     let host_header = streams[0].header("host");
     assert_eq!(
         host_header,
-        Some("127.0.0.1"),
-        "preserve_host_header=false: backend Host should be the upstream target host (127.0.0.1), \
-         not the client's :authority. Without the override the synthesized Host (= client \
-         :authority `127.0.0.1:{gw_port}`) would leak to the gRPC backend. \
-         received headers: {:?}",
+        Some(expected_backend_host.as_str()),
+        "preserve_host_header=false: backend Host should be the upstream target authority \
+         (127.0.0.1:{backend_port}), matching Hyper's :authority. RFC 9113 §8.3.1 forbids \
+         a hostname-only Host when :authority carries the non-default port. Without the \
+         override the synthesized Host (= client :authority `127.0.0.1:{gw_port}`) would \
+         leak to the gRPC backend. received headers: {:?}",
         streams[0].headers
     );
 }
@@ -2461,13 +2465,15 @@ async fn h2_grpc_preserve_false_buffered_path_overrides_host_to_target() {
 
     let streams = backend.received_streams().await;
     assert_eq!(streams.len(), 1, "expected exactly one RPC at backend");
+    let expected_backend_host = format!("127.0.0.1:{backend_port}");
     let host_header = streams[0].header("host");
     assert_eq!(
         host_header,
-        Some("127.0.0.1"),
+        Some(expected_backend_host.as_str()),
         "preserve_host_header=false on the buffered gRPC path: backend Host should be \
-         the upstream target host (127.0.0.1). Drift between proxy_grpc_request_streaming \
-         and proxy_grpc_request_core would surface here. received headers: {:?}",
+         the upstream target authority (127.0.0.1:{backend_port}), matching Hyper's \
+         :authority. Drift between proxy_grpc_request_streaming and \
+         proxy_grpc_request_core would surface here. received headers: {:?}",
         streams[0].headers
     );
 }

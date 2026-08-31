@@ -70,6 +70,36 @@
         }
       }
     },
+    "crds": {
+      "type": "object",
+      "description": "Ferrum-owned CRD lifecycle. UDPResponseAmplificationPolicy is rendered from templates/ so helm upgrade applies schema changes. Helm's crds/ directory is install-once and is not used for this CRD.",
+      "additionalProperties": false,
+      "properties": {
+        "install": {
+          "type": "boolean",
+          "description": "Render the Ferrum-owned UDPResponseAmplificationPolicy CRD so helm upgrade can update it. Default true."
+        },
+        "skipInstallAcknowledged": {
+          "type": "boolean",
+          "description": "Required when install=false. Confirms the operator applied the CRD out of band and accepts that helm upgrade will not update it."
+        },
+        "adoptExisting": {
+          "type": "boolean",
+          "description": "Required once when adopting a CRD installed by an older chart's crds/ directory (no Helm release ownership). Pair with helm upgrade --take-ownership."
+        },
+        "udpResponseAmplificationPolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "schemaVersion": {
+              "type": "string",
+              "const": "v1alpha1-1",
+              "description": "Chart-owned schema marker stamped on the CRD as gateway.ferrum.io/crd-schema-version. Compare the live CRD annotation to this value."
+            }
+          }
+        }
+      }
+    },
     "gatewayClass": {
       "type": "object",
       "description": "Cluster-scoped GatewayClass Ferrum owns. Create is the install-time authority object; Ferrum never infers ownership from the class name spelling. Independent releases in one cluster must use unique names; Helm will not import another release's GatewayClass.",
@@ -358,7 +388,18 @@
           ]
         },
         "caBundle": {
-          "type": "string"
+          "type": "string",
+          "description": "Base64-encoded PEM CA that validates the injector webhook serving certificate. Mutually exclusive with certManager.injectCaFrom. Required (exactly one trust source) when injector.enabled=true."
+        },
+        "certManager": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "injectCaFrom": {
+              "type": "string",
+              "description": "cert-manager.io/inject-ca-from value (namespace/certificate-name). Mutually exclusive with caBundle. Empty disables the annotation."
+            }
+          }
         },
         "namespaceSelector": {
           "type": "object",

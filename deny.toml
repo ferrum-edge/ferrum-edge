@@ -6,13 +6,14 @@
 #
 # Run locally:
 #   cargo install --locked cargo-deny
-#   cargo deny check advisories bans sources   # the blocking gate (see CI)
-#   cargo deny check licenses                  # informational, not gated (yet)
+#   cargo deny check advisories bans sources licenses   # the blocking gate (see CI)
 #
-# CI runs `cargo deny check advisories bans sources` on every PR that touches a
-# dependency surface (Cargo.toml/Cargo.lock/deny.toml/vendor/**) and on a weekly
-# schedule (.github/workflows/dependency-audit.yml). The advisories check is
-# BLOCKING: a new RUSTSEC advisory that is not explicitly ignored below fails CI.
+# CI runs `cargo deny check advisories bans sources licenses` on every PR that
+# touches a dependency surface (Cargo.toml/Cargo.lock/deny.toml/vendor/**) and on
+# a weekly schedule (.github/workflows/dependency-audit.yml). The advisories and
+# licenses checks are BLOCKING: a new RUSTSEC advisory that is not explicitly
+# ignored below fails CI, and any dependency whose SPDX expression is outside the
+# allowlist (or below the confidence threshold) fails CI.
 #
 # Every [advisories.ignore] entry MUST carry a rationale and an
 # `[expires:YYYY-MM-DD]` token. scripts/check_advisory_expiry.sh (run by the
@@ -127,9 +128,10 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 [licenses]
-# Informational only — NOT part of the blocking CI gate (see header). Kept here
-# so `cargo deny check licenses` is usable and licenses can be promoted to the
-# gate later without a from-scratch policy.
+# Part of the blocking CI gate (see header). Every `[licenses.exceptions]` entry
+# MUST carry an owner, a rationale, and an `[expires:YYYY-MM-DD]` token in the
+# same style as `[advisories.ignore]`. scripts/check_advisory_expiry.sh does not
+# yet enforce license-exception expiry — track that as a follow-up.
 version = 2
 # The workspace crate itself is PolyForm-Noncommercial (non-SPDX-OSI); skip
 # evaluating first-party member licenses.
@@ -150,4 +152,13 @@ allow = [
     "Unlicense",
     "OpenSSL",
     "BSL-1.0",
+    # MIT No Attribution: MIT without the attribution clause, so strictly more
+    # permissive than the "MIT" already allowed above. OSI approved.
+    # Reached through borrow-or-share -> fluent-uri -> referencing.
+    "MIT-0",
+    # Community Data License Agreement Permissive 2.0. The license Mozilla's CA
+    # root store data ships under; it is a permissive DATA license with no
+    # copyleft and no attribution requirement, and it reaches us only as the
+    # baked-in root certificates in webpki-roots / webpki-root-certs.
+    "CDLA-Permissive-2.0",
 ]
