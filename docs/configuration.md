@@ -1282,6 +1282,19 @@ takes re-arms it, so a large upload that is slow but continuously progressing
 is not timed out. Streaming pass-through uploads are otherwise unaffected by
 the buffered-upload collection deadline above.
 
+**Sizing consequence.** Because the watermark stays live through the
+response-header wait, `backend_write_timeout_ms` is in practice also a ceiling
+on how long a backend may take to produce response headers *after* it has taken
+the whole body. Once the body is on the wire the gateway has no application-level
+read receipt: a peer that never called `recv()` and a peer that read the body and
+is still computing are indistinguishable to TCP, so the same watermark covers
+both. Set `backend_write_timeout_ms` at or above the slowest post-upload response
+latency you expect from the route's backend, or leave it `0` to disable the write
+bound and let `backend_read_timeout_ms` alone bound the response. A value below
+your backend's think time will return `504` /
+`X-Gateway-Error: backend_timeout` for requests that would otherwise have
+succeeded.
+
 The bound starts when the backend transport begins consuming the request body —
 the first moment a connection provably exists and the request head is written —
 not when the gateway prepares the upload. DNS resolution, TCP connect, and the

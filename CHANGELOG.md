@@ -9,8 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- HTTP-family `backend_write_timeout_ms` again terminates a POST to a backend
-  that `accept()`s and never reads (issue #4411, regression of #4074). After
+- **BREAKING — HTTP-family `backend_write_timeout_ms` again terminates a POST to
+  a backend that `accept()`s and never reads** (issue #4411, regression of
+  #4074). After
   #4074 the upload pump armed on first transport consume and raced the
   response-header wait, but once the kernel send buffer absorbed the body the
   pump published a clean end-of-stream and dropped the write-timeout signal, so
@@ -22,6 +23,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Reqwest protocol-NACK replay is unchanged: buffered uploads still use
   `send_buffered_upload_with_protocol_nack_replay` rather than wrapping the
   body in a way that erases `try_clone()`.
+  **Operator action**: because the watermark stays live through the
+  response-header wait, `backend_write_timeout_ms` is now in practice also a
+  ceiling on post-upload backend think time — the gateway gets no
+  application-level read receipt, so a peer that never called `recv()` and a
+  peer that read the body and is still computing are indistinguishable. Any
+  route whose `backend_write_timeout_ms` is below its backend's slowest
+  post-upload response latency will start returning `504` /
+  `X-Gateway-Error: backend_timeout` for requests that previously succeeded.
+  Raise it above that latency, or set it to `0` to disable the write bound and
+  let `backend_read_timeout_ms` alone bound the response.
 
 ### Security
 
