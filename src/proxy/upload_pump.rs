@@ -379,8 +379,8 @@ impl UploadPumpSource {
                         }
                         Err(code) => {
                             self.reported_error = true;
-                            let outcome = code_outcome(code)
-                                .unwrap_or(UploadPumpOutcome::ConsumerGone);
+                            let outcome =
+                                code_outcome(code).unwrap_or(UploadPumpOutcome::ConsumerGone);
                             return Poll::Ready(Some(Err(pump_terminal_error(outcome))));
                         }
                     }
@@ -681,16 +681,15 @@ where
     // One arm channel, one owner. A pump with no write bound creates neither
     // that channel nor shared holdover state, so `write_configured` and the arm
     // condition can never disagree.
-    let (dispatcher_write_start, consumer_write_start, write_start_rx) =
-        if write_timeout_ms == 0 {
-            (None, None, None)
-        } else {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            match arm {
-                WriteWatermarkArm::Dispatcher => (Some(tx), None, Some(rx)),
-                WriteWatermarkArm::Consumer => (None, Some(tx), Some(rx)),
-            }
-        };
+    let (dispatcher_write_start, consumer_write_start, write_start_rx) = if write_timeout_ms == 0 {
+        (None, None, None)
+    } else {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        match arm {
+            WriteWatermarkArm::Dispatcher => (Some(tx), None, Some(rx)),
+            WriteWatermarkArm::Consumer => (None, Some(tx), Some(rx)),
+        }
+    };
     let write_state = if write_timeout_ms == 0 {
         None
     } else {
