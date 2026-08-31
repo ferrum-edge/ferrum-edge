@@ -885,43 +885,52 @@ where
                 frame = http_body_util::BodyExt::frame(&mut body) => frame,
             };
         };
-        match frame {
-            None => {
-                // Last frame is already on the bridge. Close the sender so the
-                // transport observes a clean end-of-stream and can read
-                // response headers. Completing here used to drop the
-                // write-timeout signal, so a never-read origin whose kernel
-                // send buffer absorbed the body ran on to the read watermark
-                // (issue #4411). Hand the join a holdover idle instead.
-                drop(sender.take());
-                if !write_configured {
-                    break 'pump UploadPumpOutcome::Completed;
-                }
-                while !write_armed {
-                    tokio::select! {
-                        biased;
-                        () = cancel_requested(&mut cancel) => {
-                            break 'pump UploadPumpOutcome::Cancelled;
-                        }
-                        () = &mut expiry, if auth_armed => {
-                            if let Some((deadline, family, latch)) = plan.as_ref() {
-                                latch.record_once(deadline.termination, *family);
-                            }
-                            break 'pump UploadPumpOutcome::AuthorizationExpired;
-                        }
-                        () = signal_requested(&mut write_start) => {
-                            write_armed = true;
-                        }
-                    }
-                }
-                if let Some(eos) = eos_holdover_tx.take() {
-                    let _ = eos.send(());
-                }
-                break 'pump UploadPumpOutcome::Completed;
+        // `permit` borrows `sender` through `sender_ref`, and its `Drop` keeps
+        // that borrow live to the end of this `match`. Settle the match to a
+        // plain `bool` first so the permit is gone before the end-of-stream
+        // arm below needs `&mut sender` for `take()`.
+        let source_exhausted = match frame {
+            None => true,
+            Some(Ok(frame)) => {
+                permit.send(frame);
+                false
             }
-            Some(Ok(frame)) => permit.send(frame),
-            Some(Err(_)) => break UploadPumpOutcome::SourceError,
+            Some(Err(_)) => break 'pump UploadPumpOutcome::SourceError,
+        };
+        if !source_exhausted {
+            continue 'pump;
         }
+        // Last frame is already on the bridge. Close the sender so the
+        // transport observes a clean end-of-stream and can read response
+        // headers. Completing here used to drop the write-timeout signal, so a
+        // never-read origin whose kernel send buffer absorbed the body ran on
+        // to the read watermark (issue #4411). Hand the join a holdover idle
+        // instead.
+        drop(sender.take());
+        if !write_configured {
+            break 'pump UploadPumpOutcome::Completed;
+        }
+        while !write_armed {
+            tokio::select! {
+                biased;
+                () = cancel_requested(&mut cancel) => {
+                    break 'pump UploadPumpOutcome::Cancelled;
+                }
+                () = &mut expiry, if auth_armed => {
+                    if let Some((deadline, family, latch)) = plan.as_ref() {
+                        latch.record_once(deadline.termination, *family);
+                    }
+                    break 'pump UploadPumpOutcome::AuthorizationExpired;
+                }
+                () = signal_requested(&mut write_start) => {
+                    write_armed = true;
+                }
+            }
+        }
+        if let Some(eos) = eos_holdover_tx.take() {
+            let _ = eos.send(());
+        }
+        break 'pump UploadPumpOutcome::Completed;
     };
     // Publish BEFORE the sender drops: the transport side reads this exactly
     // when `poll_recv` observes the closed channel, and the channel close is
