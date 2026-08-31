@@ -881,12 +881,18 @@ where
                 frame = http_body_util::BodyExt::frame(&mut body) => frame,
             };
         };
-        // `permit` borrows `sender` through `sender_ref`, and its `Drop` keeps
-        // that borrow live to the end of this `match`. Settle the match to a
-        // plain `bool` first so the permit is gone before the end-of-stream
-        // arm below needs `&mut sender` for `take()`.
+        // `permit` borrows `sender` through `sender_ref`, and its binding scope
+        // is this whole loop body, so its `Drop` would keep that borrow live
+        // past the end-of-stream handling below, which needs `&mut sender` for
+        // `take()`. Release it explicitly on the path that does not send —
+        // the reserved slot goes back unused, exactly as it did when the arm
+        // simply fell out of scope — and settle the match to a plain `bool` so
+        // the permit is moved or dropped on every path.
         let source_exhausted = match frame {
-            None => true,
+            None => {
+                drop(permit);
+                true
+            }
             Some(Ok(frame)) => {
                 permit.send(frame);
                 false
