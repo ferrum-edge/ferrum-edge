@@ -6,6 +6,27 @@ This document describes how to safely upgrade Ferrum Edge between versions with 
 
 Every current `[Unreleased]` `BREAKING` changelog entry is listed here exactly once, with its issue number and the operator action that entry already states. Several of these fail **silently** at cutover (HMAC clients get `401`, WAF `literal` rules stop matching folded spellings, backends stop seeing client-supplied XFF hops) rather than refusing config load. Read this section before the per-mode procedures below.
 
+### `ferrum-gateway` `mode=cp` no longer starts the in-cluster K8s controller (issue [#4384](https://github.com/ferrum-edge/ferrum-edge/issues/4384))
+
+The `ferrum-edge` binary defaults `FERRUM_K8S_CONTROLLER_ENABLED` and
+`FERRUM_K8S_POD_DISCOVERY_ENABLED` to true whenever `KUBERNETES_SERVICE_HOST` is
+set, which is every in-cluster pod. `charts/ferrum-gateway` renders no
+`ClusterRole`, so those core watches (namespaces, services, secrets, configmaps,
+endpointslices) were rejected `403` on every list and retried for the life of the
+process.
+
+`k8sController.enabled` now defaults to `false`, and `mode=cp` renders both
+environment variables as `"false"`. Setting `k8sController.enabled=true` fails
+rendering with a message pointing at `charts/ferrum-mesh`, which already ships the
+matching RBAC — the chart will not render a controller it cannot grant. Both
+variable names are reserved, so `env` / `extraEnv` cannot re-enable the watch
+loops behind the first-class value.
+
+**Operator action:** if you were running this chart as a Kubernetes CRD
+controller, migrate to `charts/ferrum-mesh` (`controlPlane.enabled=true`).
+Database-backed CP + DP pairs need no change, and the documented
+`examples/cp-values.yaml` quickstart now matches the chart's grant surface.
+
 ### `backend_write_timeout_ms` now also bounds the post-upload response-header wait (issue [#4411](https://github.com/ferrum-edge/ferrum-edge/issues/4411))
 
 `backend_write_timeout_ms` is documented to return `504` /

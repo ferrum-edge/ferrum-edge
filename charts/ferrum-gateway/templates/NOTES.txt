@@ -42,6 +42,8 @@ CONTROL-PLANE MODE (read/write admin, no proxy, gRPC distribution)
   Configure it before serving DPs on the non-loopback listener; do not rely on
   plaintext outside local dev.
 {{- end }}
+- Kubernetes CRD watches are disabled (FERRUM_K8S_CONTROLLER_ENABLED=false).
+  Use the ferrum-mesh chart for Gateway API / Istio control planes.
 {{- end }}
 
 {{- if eq .Values.mode "dp" }}

@@ -41,6 +41,12 @@ cp:
     enabled: true
     type: ClusterIP
 
+# The in-cluster binary defaults FERRUM_K8S_CONTROLLER_ENABLED=true, but this
+# chart does not render ClusterRole grants. mode=cp therefore emits
+# FERRUM_K8S_CONTROLLER_ENABLED=false (and disables pod discovery). Kubernetes
+# CRD control planes belong on charts/ferrum-mesh. Setting
+# k8sController.enabled=true fails render rather than shipping 403 watch loops.
+
 # Production control planes should serve gRPC over TLS. Provide a Secret with
 # tls.crt/tls.key (and optionally ca.crt for mTLS) and enable it here:
 # tls:

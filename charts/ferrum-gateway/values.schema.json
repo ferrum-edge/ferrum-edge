@@ -11,6 +11,17 @@
       "description": "Ferrum binary mode rendered by this chart: database, file, cp, or dp. The enum also lists mesh/injector/node_agent/migrate so schema validation can emit an explicit chart-separation error instead of a silent unknown-key drop; template validation then rejects those modes with pointers to ferrum-mesh or the external migrate Job examples.",
       "enum": ["database", "file", "cp", "dp", "mesh", "injector", "node_agent", "migrate"]
     },
+    "k8sController": {
+      "type": "object",
+      "description": "CP-side Kubernetes CRD controller. Default false: ferrum-gateway does not render controller RBAC, so mode=cp emits FERRUM_K8S_CONTROLLER_ENABLED=false and FERRUM_K8S_POD_DISCOVERY_ENABLED=false. enabled=true fails render and points at the ferrum-mesh chart (the designated controller).",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Must stay false on this chart. true fails render: use charts/ferrum-mesh (controlPlane.rbac) instead of granting an un-RBAC'd in-cluster controller."
+        }
+      }
+    },
     "nameOverride": { "type": "string" },
     "fullnameOverride": { "type": "string" },
     "commonLabels": {

@@ -108,9 +108,10 @@ migrations; use the explicit Job for `status`, dry-run, and operator-controlled
   `https://`) fail at render, not at boot.
 - **Chart-managed env is protected.** Every `FERRUM_*` var the chart renders from
   first-class values (mode, DB, JWTs, ports, bind address, allowlist, TLS paths,
-  shutdown drain, DP URLs, gRPC plaintext opt-in, ...) is reserved: setting it
-  through `env` or `extraEnv` fails render, so the process can never drift from
-  the rendered probes/Services/ports. Their external-secret resolver suffixes
+  shutdown drain, DP URLs, gRPC plaintext opt-in, K8s controller/pod-discovery
+  switches, ...) is reserved: setting it through `env` or `extraEnv` fails
+  render, so the process can never drift from the rendered probes/Services/ports.
+  Their external-secret resolver suffixes
   (`_VAULT`/`_AWS`/`_AZURE`/`_GCP`/`_FILE`) are reserved too — a suffixed source
   of a managed base var (e.g. `FERRUM_ADMIN_JWT_SECRET_VAULT`) resolves into that
   base var and would collide with the chart's own source, aborting startup with
@@ -122,6 +123,12 @@ migrations; use the explicit Job for `status`, dry-run, and operator-controlled
   (`FERRUM_DB_URL`, `FERRUM_ADMIN_JWT_SECRET`, and
   `FERRUM_CP_DP_GRPC_JWT_SECRET`); other managed names such as `FERRUM_MODE`
   are rejected because the chart renders their direct value too.
+- **Kubernetes CRD controller is off.** `k8sController.enabled` defaults to
+  `false`. `mode=cp` renders `FERRUM_K8S_CONTROLLER_ENABLED=false` and
+  `FERRUM_K8S_POD_DISCOVERY_ENABLED=false` so the in-cluster binary default
+  cannot start un-granted core watches (issue #4384). Setting
+  `k8sController.enabled=true` fails render; use
+  [`ferrum-mesh`](../ferrum-mesh) instead.
 - **TLS and `_FILE` Secret mounts are non-root readable.** They default to mode
   `0440` with pod `fsGroup: 65532`, matching the distroless nonroot image. Both
   `secretVolumeDefaultMode` and `podSecurityContext` are overridable for images
@@ -273,6 +280,16 @@ label. The quickstart pair explicitly opts into plaintext ClusterIP gRPC for
 development. Production control planes should remove that opt-in, serve gRPC
 over TLS (`tls.cpGrpc` or a complete CP cert/key SOURCE pair), and have DPs pin
 CP trust (`tls.dpGrpc`).
+
+This chart's `mode=cp` is a database-backed config distributor, **not** a
+Kubernetes CRD controller. The binary defaults `FERRUM_K8S_CONTROLLER_ENABLED`
+to true in-cluster, but `ferrum-gateway` renders no ClusterRole — core watches
+would 403-retry for the life of the process. `k8sController.enabled` therefore
+defaults to `false` and `mode=cp` emits `FERRUM_K8S_CONTROLLER_ENABLED=false`
+plus `FERRUM_K8S_POD_DISCOVERY_ENABLED=false`. Setting `k8sController.enabled=true`
+fails render with a pointer to [`ferrum-mesh`](../ferrum-mesh) (`controlPlane.rbac`),
+which is the designated controller. Both env names are reserved so `env` /
+`extraEnv` cannot re-enable the watches.
 
 ## Explicit migrate mode (external Job)
 

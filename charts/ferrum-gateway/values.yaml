@@ -21,6 +21,26 @@
 # -----------------------------------------------------------------------------
 mode: file
 
+# -----------------------------------------------------------------------------
+# Kubernetes CRD controller (mode=cp). Default off.
+#
+# The binary defaults FERRUM_K8S_CONTROLLER_ENABLED and
+# FERRUM_K8S_POD_DISCOVERY_ENABLED to true whenever KUBERNETES_SERVICE_HOST is
+# set (every in-cluster pod). This chart does not render ClusterRole / Role /
+# RoleBinding, so those core watches (namespaces, services, secrets, configmaps,
+# endpointslices) 403-retry for the life of the process. The ferrum-mesh chart
+# is the designated Kubernetes CRD controller and already ships matching RBAC
+# (charts/ferrum-mesh/templates/control-plane-rbac.yaml).
+#
+# mode=cp therefore renders FERRUM_K8S_CONTROLLER_ENABLED=false and
+# FERRUM_K8S_POD_DISCOVERY_ENABLED=false. Setting enabled=true fails render
+# with a pointer to ferrum-mesh rather than shipping an un-granted controller.
+# Both env names are reserved so env/extraEnv cannot re-enable the watches
+# behind this value.
+# -----------------------------------------------------------------------------
+k8sController:
+  enabled: false
+
 # Optional name overrides (standard Helm convention).
 nameOverride: ""
 fullnameOverride: ""

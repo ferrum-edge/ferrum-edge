@@ -45,6 +45,7 @@ mod forwarded_ownership_parity_tests;
 mod frontend_h2_admission_tests;
 mod gateway_backend_lb_policy_tests;
 mod gateway_backend_ref_kinds_tests;
+mod gateway_k8s_controller_helm_tests;
 mod gateway_listener_plan_tests;
 mod gateway_listener_status_tests;
 mod gateway_metrics_alerts_helm_tests;

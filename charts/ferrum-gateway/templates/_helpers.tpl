@@ -701,6 +701,13 @@ Validation: fail render on missing/unsafe configuration.
 {{- else if not (has $mode (list "database" "file" "cp" "dp")) -}}
 {{- fail (printf "mode must be one of: database, file, cp, dp (got %q). The mesh, injector, and node_agent modes live in the ferrum-mesh chart, not this one. Explicit migrate mode is an external Job workflow, not a chart mode." $mode) -}}
 {{- end -}}
+{{/* Issue #4384: the binary defaults the in-cluster CRD controller on, but this
+     chart never renders ClusterRole grants. enabled=true would reproduce the
+     unbounded 403 watch loops behind a flag. ferrum-mesh is the designated
+     controller (controlPlane.rbac). */}}
+{{- if (.Values.k8sController | default dict).enabled -}}
+{{- fail "k8sController.enabled=true is not supported on the ferrum-gateway chart: this chart does not render the ClusterRole the in-cluster Kubernetes CRD controller needs (core namespace/service/secret/configmap/endpointslice watches 403-retry for the life of the process without it). Use the ferrum-mesh chart (charts/ferrum-mesh, controlPlane.rbac) instead. Leave k8sController.enabled=false (the default) so mode=cp renders FERRUM_K8S_CONTROLLER_ENABLED=false and FERRUM_K8S_POD_DISCOVERY_ENABLED=false." -}}
+{{- end -}}
 {{/* A generic secretFileMount emits <name>_FILE. Most chart-managed variables
      are also rendered directly, which gives the external-secret resolver two
      providers for the same base and aborts startup. Only the three first-class
@@ -977,7 +984,7 @@ Env assembly.
      probes, Services, ports, or Secret wiring from the running process, so both
      env passthroughs reject them. Keep this list the single source of truth. */}}
 {{- define "ferrum-gateway.reservedEnv" -}}
-FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRET FERRUM_CP_DP_GRPC_JWT_SECRET FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT FERRUM_DP_CP_GRPC_URLS FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS FERRUM_CP_GRPC_LISTEN_ADDR FERRUM_CP_NAMESPACES FERRUM_CP_REQUIRE_NAMESPACE_CLAIM FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH FERRUM_CP_DP_GRPC_JWT_KEY_ID FERRUM_DP_CP_GRPC_TOKEN_FILE FERRUM_FILE_CONFIG_PATH FERRUM_PROXY_HTTP_PORT FERRUM_PROXY_HTTPS_PORT FERRUM_ADMIN_HTTP_PORT FERRUM_ADMIN_HTTPS_PORT FERRUM_ADMIN_BIND_ADDRESS FERRUM_ADMIN_ALLOWED_CIDRS FERRUM_ALLOW_INSECURE_ADMIN_HTTP FERRUM_METRICS_BEARER_TOKEN FERRUM_METRICS_ALLOWED_CIDRS FERRUM_SHUTDOWN_DRAIN_SECONDS FERRUM_SHUTDOWN_PREDRAIN_SECONDS FERRUM_FRONTEND_TLS_CERT_PATH FERRUM_FRONTEND_TLS_KEY_PATH FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_ADMIN_TLS_CERT_PATH FERRUM_ADMIN_TLS_KEY_PATH FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_BACKEND_TLS_CLIENT_CERT_PATH FERRUM_BACKEND_TLS_CLIENT_KEY_PATH FERRUM_CP_GRPC_TLS_CERT_PATH FERRUM_CP_GRPC_TLS_KEY_PATH FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH FERRUM_DP_GRPC_TLS_CA_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH
+FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRET FERRUM_CP_DP_GRPC_JWT_SECRET FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT FERRUM_DP_CP_GRPC_URLS FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS FERRUM_CP_GRPC_LISTEN_ADDR FERRUM_CP_NAMESPACES FERRUM_CP_REQUIRE_NAMESPACE_CLAIM FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH FERRUM_CP_DP_GRPC_JWT_KEY_ID FERRUM_DP_CP_GRPC_TOKEN_FILE FERRUM_FILE_CONFIG_PATH FERRUM_PROXY_HTTP_PORT FERRUM_PROXY_HTTPS_PORT FERRUM_ADMIN_HTTP_PORT FERRUM_ADMIN_HTTPS_PORT FERRUM_ADMIN_BIND_ADDRESS FERRUM_ADMIN_ALLOWED_CIDRS FERRUM_ALLOW_INSECURE_ADMIN_HTTP FERRUM_METRICS_BEARER_TOKEN FERRUM_METRICS_ALLOWED_CIDRS FERRUM_SHUTDOWN_DRAIN_SECONDS FERRUM_SHUTDOWN_PREDRAIN_SECONDS FERRUM_FRONTEND_TLS_CERT_PATH FERRUM_FRONTEND_TLS_KEY_PATH FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_ADMIN_TLS_CERT_PATH FERRUM_ADMIN_TLS_KEY_PATH FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_BACKEND_TLS_CLIENT_CERT_PATH FERRUM_BACKEND_TLS_CLIENT_KEY_PATH FERRUM_CP_GRPC_TLS_CERT_PATH FERRUM_CP_GRPC_TLS_KEY_PATH FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH FERRUM_DP_GRPC_TLS_CA_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH FERRUM_K8S_CONTROLLER_ENABLED FERRUM_K8S_POD_DISCOVERY_ENABLED
 {{- end -}}
 
 {{- define "ferrum-gateway.modeEnv" -}}
@@ -1017,6 +1024,13 @@ FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRE
 - name: FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH
   value: {{ .Values.cp.trustBundlePath | quote }}
 {{- end }}
+{{/* Issue #4384: override the in-cluster binary default (true when
+     KUBERNETES_SERVICE_HOST is set). k8sController.enabled=true already failed
+     render, so this path always disables the un-granted controller. */}}
+- name: FERRUM_K8S_CONTROLLER_ENABLED
+  value: "false"
+- name: FERRUM_K8S_POD_DISCOVERY_ENABLED
+  value: "false"
 {{- end }}
 {{- if eq $mode "dp" }}
 - name: FERRUM_DP_CP_GRPC_URLS

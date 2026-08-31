@@ -3424,6 +3424,41 @@ jobs:
           grep -Fq 'name: FERRUM_DP_CP_GRPC_URLS' "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-rendered.yaml"
           grep -Fq 'http://ferrum-cp-ferrum-gateway-grpc.ferrum.svc:50051' "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-rendered.yaml"
           grep -Fq 'name: ferrum-cp-ferrum-gateway-grpc' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-rendered.yaml"
+          # Issue #4384: mode=cp must disable the in-cluster K8s controller (the
+          # binary defaults it on inside a pod) because this chart renders no
+          # ClusterRole. Opt-in must fail and point at ferrum-mesh; env cannot
+          # re-enable the watches because the names are reserved.
+          if ! grep -A1 'name: FERRUM_K8S_CONTROLLER_ENABLED' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-rendered.yaml" | grep -Fq 'value: "false"'; then
+            echo "::error title=Gateway CP left K8s controller default-on::mode=cp must render FERRUM_K8S_CONTROLLER_ENABLED=false"
+            exit 1
+          fi
+          if ! grep -A1 'name: FERRUM_K8S_POD_DISCOVERY_ENABLED' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-rendered.yaml" | grep -Fq 'value: "false"'; then
+            echo "::error title=Gateway CP left pod discovery default-on::mode=cp must render FERRUM_K8S_POD_DISCOVERY_ENABLED=false"
+            exit 1
+          fi
+          if grep -E '^kind: (ClusterRole|ClusterRoleBinding|Role|RoleBinding)$' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-rendered.yaml"; then
+            echo "::error title=Gateway CP must not render controller RBAC::ferrum-mesh is the designated Kubernetes CRD controller"
+            exit 1
+          fi
+          if helm template ferrum-cp ./charts/ferrum-gateway --namespace ferrum \
+            -f ./charts/ferrum-gateway/examples/cp-values.yaml \
+            --set k8sController.enabled=true \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/k8s-controller-opt-in.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/k8s-controller-opt-in.err"; then
+            echo "::error title=k8sController.enabled=true rendered successfully::must fail and point at ferrum-mesh rather than ship an un-granted controller"
+            exit 1
+          fi
+          grep -F 'k8sController.enabled=true is not supported' "$RUNNER_TEMP/ferrum-gateway-helm-results/k8s-controller-opt-in.err"
+          grep -F 'ferrum-mesh' "$RUNNER_TEMP/ferrum-gateway-helm-results/k8s-controller-opt-in.err"
+          if helm template ferrum-cp ./charts/ferrum-gateway --namespace ferrum \
+            -f ./charts/ferrum-gateway/examples/cp-values.yaml \
+            --set env.FERRUM_K8S_CONTROLLER_ENABLED=true \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/k8s-controller-env.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/k8s-controller-env.err"; then
+            echo "::error title=env.FERRUM_K8S_CONTROLLER_ENABLED rendered successfully::reserved first-class env must reject re-enabling the controller"
+            exit 1
+          fi
+          grep -F 'env.FERRUM_K8S_CONTROLLER_ENABLED is managed by first-class chart values' "$RUNNER_TEMP/ferrum-gateway-helm-results/k8s-controller-env.err"
           long_name="$(printf 'a%.0s' {1..63})"
           helm template ferrum-cp ./charts/ferrum-gateway --namespace ferrum \
             -f ./charts/ferrum-gateway/examples/cp-values.yaml \
