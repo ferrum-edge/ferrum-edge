@@ -611,12 +611,8 @@ where
         let (tx, rx) = tokio::sync::oneshot::channel();
         let (eos_tx, eos_rx) = tokio::sync::oneshot::channel();
         match arm {
-            WriteWatermarkArm::Dispatcher => {
-                (Some(tx), None, Some(rx), Some(eos_tx), Some(eos_rx))
-            }
-            WriteWatermarkArm::Consumer => {
-                (None, Some(tx), Some(rx), Some(eos_tx), Some(eos_rx))
-            }
+            WriteWatermarkArm::Dispatcher => (Some(tx), None, Some(rx), Some(eos_tx), Some(eos_rx)),
+            WriteWatermarkArm::Consumer => (None, Some(tx), Some(rx), Some(eos_tx), Some(eos_rx)),
         }
     };
     let terminal = Arc::new(AtomicU8::new(PUMP_RUNNING));

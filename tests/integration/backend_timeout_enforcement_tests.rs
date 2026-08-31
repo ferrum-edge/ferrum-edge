@@ -411,12 +411,8 @@ async fn in_process_kernel_absorb_write_timeout_maps_to_504() {
         .expect("spawn gateway");
 
     let client = harness.http_client().expect("client");
-    let (status, header, body, elapsed) = post_upload(
-        &harness,
-        client.as_reqwest(),
-        KERNEL_ABSORB_UPLOAD_BYTES,
-    )
-    .await;
+    let (status, header, body, elapsed) =
+        post_upload(&harness, client.as_reqwest(), KERNEL_ABSORB_UPLOAD_BYTES).await;
     assert_eq!(
         status,
         reqwest::StatusCode::GATEWAY_TIMEOUT,
@@ -450,12 +446,8 @@ async fn in_process_h2c_kernel_absorb_write_timeout_maps_to_504() {
         .expect("spawn gateway");
 
     let client = Http2Client::h2c_prior_knowledge().expect("h2c client");
-    let (status, header, body, elapsed) = post_upload(
-        &harness,
-        client.as_reqwest(),
-        KERNEL_ABSORB_UPLOAD_BYTES,
-    )
-    .await;
+    let (status, header, body, elapsed) =
+        post_upload(&harness, client.as_reqwest(), KERNEL_ABSORB_UPLOAD_BYTES).await;
     assert_eq!(
         status,
         reqwest::StatusCode::GATEWAY_TIMEOUT,
@@ -493,12 +485,8 @@ async fn in_process_progressing_upload_is_not_killed_by_idle_write_timeout() {
         .expect("spawn gateway");
 
     let client = harness.http_client().expect("client");
-    let (status, header, body, _elapsed) = post_upload(
-        &harness,
-        client.as_reqwest(),
-        PROGRESSING_UPLOAD_BYTES,
-    )
-    .await;
+    let (status, header, body, _elapsed) =
+        post_upload(&harness, client.as_reqwest(), PROGRESSING_UPLOAD_BYTES).await;
     assert_eq!(
         status,
         reqwest::StatusCode::OK,
