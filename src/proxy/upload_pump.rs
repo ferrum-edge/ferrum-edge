@@ -902,12 +902,23 @@ where
         if !source_exhausted {
             continue 'pump;
         }
-        // Last frame is already on the bridge. Close the sender so the
-        // transport observes a clean end-of-stream and can read response
-        // headers. Completing here used to drop the write-timeout signal, so a
-        // never-read origin whose kernel send buffer absorbed the body ran on
-        // to the read watermark (issue #4411). Hand the join a holdover idle
-        // instead.
+        // Last frame is already on the bridge. Publish clean BODY completion
+        // before closing the sender, so the transport can never observe a
+        // closed bridge while the terminal is still RUNNING. This is a
+        // write-once transition: cancellation or authorization expiry while
+        // this task waits to arm the RESPONSE holdover must not retroactively
+        // turn a delivered body into a transport error.
+        let _ = terminal.compare_exchange(
+            PUMP_RUNNING,
+            PUMP_COMPLETED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        // Close the sender so the transport observes that clean end-of-stream
+        // and can read response headers. Completing here used to drop the
+        // write-timeout signal, so a never-read origin whose kernel send buffer
+        // absorbed the body ran on to the read watermark (issue #4411). Hand
+        // the join a holdover idle instead.
         drop(sender.take());
         if !write_configured {
             break 'pump UploadPumpOutcome::Completed;
@@ -936,16 +947,26 @@ where
     };
     // Publish BEFORE the sender drops: the transport side reads this exactly
     // when `poll_recv` observes the closed channel, and the channel close is
-    // the synchronisation edge for this release store.
-    terminal.store(outcome_code(outcome), Ordering::Release);
+    // the synchronisation edge for this release transition. Clean BODY
+    // completion was already published before its sender closed, so a later
+    // RESPONSE-wait cancellation or authorization expiry cannot overwrite it.
+    let terminal_published = terminal
+        .compare_exchange(
+            PUMP_RUNNING,
+            outcome_code(outcome),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok();
     drop(sender);
     // Explicit, and the whole point of this module: the gateway stops owning
     // the inbound client body here, whatever the backend transport is doing.
     drop(body);
     // Published LAST, so a dispatcher woken by this signal already observes
     // the terminal state, the closed bridge, and a released client body. Only
-    // the write watermark publishes it; every other terminal drops the sender.
-    if outcome == UploadPumpOutcome::WriteTimeout {
+    // a write watermark that won terminal publication fires this signal; every
+    // other terminal drops the sender.
+    if outcome == UploadPumpOutcome::WriteTimeout && terminal_published {
         let _ = write_timeout_tx.send(());
     }
     outcome

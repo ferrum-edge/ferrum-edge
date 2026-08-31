@@ -20,6 +20,9 @@ use crate::scaffolding::clients::Http2Client;
 use crate::scaffolding::file_mode_yaml_for_backend_with;
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::reserve_port;
+use ferrum_edge::_test_support::{
+    GrpcBufferedUploadPumpProbe, ProbePumpOutcome, ProbeReplayFrame,
+};
 use futures_util::StreamExt;
 use serde_json::json;
 use std::time::{Duration, Instant};
@@ -42,6 +45,42 @@ const KERNEL_ABSORB_UPLOAD_BYTES: usize = 2 * 1024 * 1024;
 const PROGRESSING_UPLOAD_BYTES: usize = 256 * 1024;
 const PROGRESSING_READ_CHUNK: usize = 32 * 1024;
 const SSE_FIRST_EVENT: &[u8] = b"data: hello\r\n\n";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deferred_write_pump_publishes_clean_terminal_before_closing_bridge() {
+    // Native gRPC defers the write watermark until sender acquisition. A small
+    // unary body can reach source EOS while that arm is still dormant.
+    let mut probe = GrpcBufferedUploadPumpProbe::start(1, &[], 50);
+    assert!(probe.pumped(), "a live write bound must install the pump");
+
+    let frames = tokio::time::timeout(Duration::from_secs(2), probe.drain_transport(1024))
+        .await
+        .expect("deferred pump reaches a terminal transport frame");
+    assert_eq!(
+        frames,
+        vec![ProbeReplayFrame::Data(1), ProbeReplayFrame::Ended],
+        "a closed bridge after clean source EOS must never surface ConsumerGone"
+    );
+    assert!(
+        probe
+            .write_watermark_stays_dormant(Duration::from_millis(150))
+            .await,
+        "draining the transport must not arm the dispatcher-owned watermark"
+    );
+
+    // Cancellation now concerns only the response-wait holdover. It may settle
+    // the coordinator task, but it cannot rewrite the BODY terminal observed by
+    // the transport.
+    assert_eq!(
+        probe.cancel_and_join().await,
+        ProbePumpOutcome::Cancelled
+    );
+    assert_eq!(
+        probe.poll_transport_once(),
+        ProbeReplayFrame::Ended,
+        "response-wait cancellation must not retroactively error a completed body"
+    );
+}
 
 fn assert_timeout_envelope(elapsed: Duration, timeout_ms: u64) {
     let expected = Duration::from_millis(timeout_ms);

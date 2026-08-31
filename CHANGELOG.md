@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still dormant through DNS/TCP/TLS acquisition, still disabled by `0` — so the
   documented 504 / `X-Gateway-Error: backend_timeout` /
   `error_class=read_write_timeout` contract holds when the peer never `recv`s.
+  Clean body completion is published before the bridge closes and is never
+  rewritten by later response-wait cancellation or authorization expiry, so a
+  native gRPC consumer cannot misread that closed bridge as a truncated upload.
   Reqwest protocol-NACK replay is unchanged: buffered uploads still use
   `send_buffered_upload_with_protocol_nack_replay` rather than wrapping the
   body in a way that erases `try_clone()`.
