@@ -189,7 +189,7 @@ jobs:
           shared-key: "ci-coverage"
 
       - name: Install cargo-llvm-cov and cargo-nextest
-        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
         with:
           tool: cargo-llvm-cov,cargo-nextest
 
@@ -301,7 +301,7 @@ jobs:
 
       - name: Install cargo-llvm-cov
         if: needs.coverage-plan.outputs.mode != 'skip'
-        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
         with:
           tool: cargo-llvm-cov
 
