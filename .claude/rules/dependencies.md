@@ -36,6 +36,16 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 - The trusted-base `pr_ci_plan.py --self-test` rejects mutable or dynamic
   action refs, pipe-to-shell installers, and unverified tool downloads. The
   pull request's proposed policy is tested separately but never controls gates.
+- The trusted publication boundary freezes
+  `.github/scripts/verify_publication_gate.py` and
+  `.github/required-publication-checks.json` by whole-file digest, plus the
+  complete `main-publication-required-checks` job body in
+  `gateway-api-conformance.yml`. The trusted verifier compares those proposal
+  surfaces before inspecting candidate automation, and never executes the
+  candidate publication verifier. Changing any of the three protected
+  surfaces is a direct-to-`main` operation; `verify_required_ci.py` remains a
+  PR-mutable parity check, not the admission authority. See `docs/ci_cd.md` →
+  "Publish-blocking required checks".
 - A required live gate must decide its own relevance from a pinned trusted-base
   copy of `live_suite_path_filter.py`, never from the pull request's checkout.
   `verify_cross_build_policy.py` freezes that block byte-for-byte

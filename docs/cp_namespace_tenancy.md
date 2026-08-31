@@ -28,6 +28,11 @@ when neither new env var is set.
 | `FERRUM_DP_CP_GRPC_TOKEN_FILE` | unset | **DP / mesh / xDS client side.** Path to an externally issued bearer token presented instead of minting one. The node then holds no signing key at all. |
 | `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` | `false` | REST-plane counterpart (issue #2120): when `true`, namespace-scoped **admin API** routes require the admin JWT (signed with `FERRUM_ADMIN_JWT_SECRET`) to carry an `ns` claim authorizing the `X-Ferrum-Namespace` value; violations are 403. Same claim shapes as the gRPC plane. Without it, admin JWTs are global and the namespace header is only a routing selector — set both flags for tenancy enforcement on both planes. See `docs/admin_api.md`. |
 
+On Kubernetes, `charts/ferrum-gateway` exposes both tenancy flags as first-class
+values: `cp.requireNamespaceClaim` and `admin.requireNamespaceClaim` (default
+`false` each). Set both when adopting multi-tenant CP scope; enabling only the CP
+value does not constrain admin JWTs.
+
 Both vars live in `[cp_dp]` of `ferrum.conf` next to
 `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`. The scope is also surfaced in the
 CP startup logs (`CP mode: serving N namespaces: [...]`).

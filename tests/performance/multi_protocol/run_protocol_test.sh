@@ -216,8 +216,6 @@ start_gateway() {
         FERRUM_FRONTEND_H2_MAX_FRAME_SIZE=1048576
         # Server-side HTTP/2 tuning
         FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS=1000
-        # gRPC pool tuning (documented 3.8% throughput improvement)
-        FERRUM_GRPC_POOL_READY_WAIT_MS=1
         # HTTP/3 QUIC transport tuning (8 MiB stream, 32 MiB connection, 8 MiB send)
         FERRUM_HTTP3_MAX_STREAMS=1000
         FERRUM_HTTP3_STREAM_RECEIVE_WINDOW=8388608

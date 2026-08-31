@@ -23,7 +23,6 @@ FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE=33554432   # 32 MiB
 FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=true                  # default
 FERRUM_POOL_HTTP2_MAX_FRAME_SIZE=1048576                # default: 1 MiB
 FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS=1000
-FERRUM_GRPC_POOL_READY_WAIT_MS=1
 ```
 
 ### Per-Proxy Overrides
@@ -62,7 +61,6 @@ proxies:
 | `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` | `true` | Enable adaptive flow-control (BDP probing). Overrides fixed initial windows while enabled. Explicit window overrides auto-disable adaptive unless adaptive is also set explicitly |
 | `FERRUM_POOL_HTTP2_MAX_FRAME_SIZE` | `1048576` | Maximum backend HTTP/2 frame payload (bytes). Range: 16384–1048576. Default: 1 MiB |
 | `FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS` | `1000` | Max concurrent HTTP/2 streams per backend connection |
-| `FERRUM_GRPC_POOL_READY_WAIT_MS` | `1` | Milliseconds the dedicated gRPC pool waits for a free H2 stream before opening another backend connection |
 
 > **Frontend vs backend HTTP/2 windows**: the `FERRUM_POOL_HTTP2_*` settings above control the **backend** (gateway-to-upstream) connection pool. The **frontend** (client-to-gateway) HTTP/2 listener uses separate, conservative defaults: `FERRUM_FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE` (256 KiB), `FERRUM_FRONTEND_H2_INITIAL_CONNECTION_WINDOW_SIZE` (2 MiB), `FERRUM_FRONTEND_H2_MAX_FRAME_SIZE` (16 KiB). Raise the frontend values for benchmarking or trusted-network deployments. See [configuration.md](configuration.md) for the full reference.
 
@@ -156,11 +154,9 @@ pool_enable_http2: false  # HTTP/1.1 recommended for WebSockets
 pool_enable_http2: false  # Better compatibility with auth plugins
 ```
 
-## gRPC Saturation Tuning
+## gRPC Pool Saturation
 
-`FERRUM_GRPC_POOL_READY_WAIT_MS` only affects the dedicated `GrpcConnectionPool`. When all existing gRPC HTTP/2 senders are live but temporarily out of stream capacity, Ferrum waits this long before opening another backend connection.
-
-The default is `1ms`. In one back-to-back local multi-protocol benchmark comparison (`10s`, `200` concurrency, unary echo), `1ms` improved gRPC throughput by about `3.8%` versus `5ms` (`64,278` -> `66,734` requests/sec). Treat that as workload-specific guidance rather than a universal guarantee.
+The dedicated `GrpcConnectionPool` selects among shard senders with an immediate `now_or_never` readiness probe — there is no operator-configurable wait. When every shard is busy, callers queue on HTTP/2 readiness and stream-capacity backpressure instead of opening connections beyond the configured shard ring.
 
 ## Performance Impact
 

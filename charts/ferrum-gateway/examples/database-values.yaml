@@ -23,6 +23,7 @@ admin:
     existingSecret:
       name: ferrum-gateway-credentials
       key: admin-jwt-secret
+  # requireNamespaceClaim: true  # pair with cp.requireNamespaceClaim on multi-tenant CPs
 
 service:
   type: LoadBalancer

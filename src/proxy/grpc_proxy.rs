@@ -980,10 +980,8 @@ impl GrpcConnectionPool {
                         // never runs and the pool does NOT grow beyond the
                         // shard ring. Callers queue on H2 readiness /
                         // stream-cap backpressure instead of spawning a fresh
-                        // connection. The previous 1 ms `timeout(ready())`
-                        // serialized under burst concurrency and was the
-                        // largest contributor to gRPC p99 tail latency for
-                        // 100-concurrent 500 KB / 1 MB payloads.
+                        // connection. This immediate probe is intentional —
+                        // there is no operator-configurable wait on this path.
                         None => {}
                     }
                 }

@@ -278,7 +278,8 @@ jobs:
             listing="${destination}.ls-tree"
             workspace_listing="${destination}.workspace-ls-tree"
             if ! git ls-tree -rz --name-only "$commit" -- \
-              .github/scripts comparison scripts tests/k8s tests/performance \
+              .github/scripts .github/required-publication-checks.json \
+              comparison scripts tests/k8s tests/performance \
               Makefile makefile GNUmakefile package.json \
               justfile Justfile .justfile Taskfile.yml Taskfile.yaml > "$listing"; then
               echo "::error::automation tree enumeration failed" >&2
@@ -316,6 +317,9 @@ jobs:
           extract_automation "$proposed_commit" "$proposed_automation"
           extract_automation "$trusted_base" "$merge_base_automation"
 
+          # Proposed publication-gate code and inventory are materialized only
+          # as data. The trusted verifier refuses their byte drift before its
+          # later candidate-automation inspection and never executes them.
           # Both the executed verifier and every trusted baseline now come from
           # the pinned live trusted tip, so a Cross surface that only the newer
           # verifier recognizes is still enforced against this pull request.

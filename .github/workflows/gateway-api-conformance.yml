@@ -344,8 +344,9 @@ jobs:
   # publication exactly as the frozen entries do. Which contexts belong to which
   # half is not written here: `verify_publication_gate.py` reads the partition
   # from `.github/required-publication-checks.json`, and `verify_required_ci.py`
-  # checks parity on every pull request. Those files and this hosted job are
-  # PR-mutable; this is drift detection, not a trusted-policy freeze.
+  # checks parity on every pull request. The trusted-base Cross policy freezes
+  # both files by whole-file digest and freezes this complete job body; changing
+  # any of those protected surfaces is a direct-to-main operation.
   #
   # It is scoped to pushes to `main`, so it never allocates a runner on a pull
   # request, merge-group, scheduled, or manual run, and it reports `skipped`

@@ -125,7 +125,6 @@ Key environment variables set by the test runner:
 | `FERRUM_HTTP3_*` | (tuned) | H3/QUIC: 8 MiB stream, 32 MiB conn, 8 MiB send, 1000 max streams |
 | `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` | default `4` | QUIC connections per backend; override with `FERRUM_EXTRA_ENV` for experiments |
 | `FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS` | `120` | H3 pool idle eviction timeout |
-| `FERRUM_GRPC_POOL_READY_WAIT_MS` | `1` | gRPC pool sender wait before opening another backend H2 connection |
 | `FERRUM_POOL_CLEANUP_INTERVAL_SECONDS` | `30` | Pool cleanup sweep interval (all pools) |
 | `FERRUM_UDP_MAX_SESSIONS` | `10000` | Max concurrent UDP sessions per proxy |
 | `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | `10` | UDP session cleanup interval |
@@ -259,11 +258,6 @@ Prior results used GET requests to a fixed JSON endpoint (no request body, ~60-b
 > **Note:** Benchmark numbers vary between runs due to system load, thermal
 > throttling, and background processes. Focus on the overhead ratios and relative
 > comparisons rather than absolute RPS numbers.
-
-> Tuning note: in one back-to-back local comparison, lowering the gRPC pool
-> sender-ready wait from `5ms` to `1ms` improved gateway throughput by about
-> `3.8%` (`64,278` -> `66,734` requests/sec at `10s`, `200` concurrency).
-> Ferrum now defaults this knob to `1ms` via `FERRUM_GRPC_POOL_READY_WAIT_MS`.
 
 ## Envoy Comparison Mode
 

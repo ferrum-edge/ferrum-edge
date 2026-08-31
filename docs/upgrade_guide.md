@@ -264,6 +264,12 @@ TLS handshake offload is not implemented. A nonzero `FERRUM_TLS_OFFLOAD_THREADS`
 
 **Operator action:** leave `FERRUM_TLS_OFFLOAD_THREADS` unset, or set it to `0`. There is no configuration that enables offload; removing the variable is equivalent to the behaviour every prior release actually had.
 
+### `FERRUM_GRPC_POOL_READY_WAIT_MS` removed (issue [#4427](https://github.com/ferrum-edge/ferrum-edge/issues/4427))
+
+`FERRUM_GRPC_POOL_READY_WAIT_MS` was parsed, documented, and accepted by `run`/`validate`, but the gRPC pool selection path never read it. Ferrum uses an immediate `now_or_never` readiness probe when choosing among shard senders — there is no configurable wait, and reintroducing one would regress gRPC tail latency under burst concurrency.
+
+**Operator action:** remove `FERRUM_GRPC_POOL_READY_WAIT_MS` from your configuration; it never had a runtime effect. There is no replacement knob.
+
 ## Database Mode (`FERRUM_MODE=database`)
 
 This is the most involved upgrade because schema migrations may alter your database. The strategy is: clone the database, migrate the clone, validate with the new binary, then cut over.

@@ -185,6 +185,11 @@ admin:
   bindAddress: ""
   allowedCidrs: ""
   allowInsecureHttp: false
+  # Require a JWT `ns` claim on namespace-scoped admin routes
+  # (FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM). Set together with
+  # cp.requireNamespaceClaim for tenancy on both planes; enabling only the CP
+  # flag does not constrain admin JWTs.
+  requireNamespaceClaim: false
   # Admin JWT secret (FERRUM_ADMIN_JWT_SECRET). REQUIRED and >=32 chars for
   # database, cp, and dp modes. Optional for file (a random read-only secret is
   # generated at startup). A matching secretFileMounts entry may supply it via

@@ -111,6 +111,7 @@
           "description": "Comma-separated admin source allowlist using strict bare IP/CIDR syntax; malformed entries, empty comma segments, and bracketed IPv6 are rejected. Lists covering a whole family (including /0, mapped IPv6 /96 to IPv4 /0, and full-coverage unions) do not protect plaintext; computed exec probes require an entry containing their observed TCP source (for example 127.0.0.0/8, 127.0.0.1/32, or bare 127.0.0.1)."
         },
         "allowInsecureHttp": { "type": "boolean" },
+        "requireNamespaceClaim": { "type": "boolean" },
         "jwtSecret": {
           "type": "object",
           "description": "Required in database/cp/dp unless supplied by secretFileMounts name=FERRUM_ADMIN_JWT_SECRET.",

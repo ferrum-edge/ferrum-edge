@@ -43,6 +43,7 @@ mod error_response_headers_tests;
 mod exclusive_proxy_bind_tests;
 mod forwarded_ownership_parity_tests;
 mod frontend_h2_admission_tests;
+mod gateway_admin_namespace_claim_helm_tests;
 mod gateway_backend_lb_policy_tests;
 mod gateway_backend_ref_kinds_tests;
 mod gateway_k8s_controller_helm_tests;

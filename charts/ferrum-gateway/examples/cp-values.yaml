@@ -40,6 +40,15 @@ cp:
   service:
     enabled: true
     type: ClusterIP
+  # Multi-tenant CP: scope namespaces, mount a trust bundle, and set
+  # cp.requireNamespaceClaim: true together with admin.requireNamespaceClaim
+  # (below) so gRPC and admin planes both enforce JWT `ns` claims:
+  # namespaces: "prod,staging"
+  # requireNamespaceClaim: true
+  # trustBundlePath: /etc/ferrum/trust-bundle/credentials.json
+
+# admin:
+#   requireNamespaceClaim: true
 
 # The in-cluster binary defaults FERRUM_K8S_CONTROLLER_ENABLED=true, but this
 # chart does not render ClusterRole grants. mode=cp therefore emits

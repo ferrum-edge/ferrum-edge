@@ -2938,11 +2938,6 @@ pub struct EnvConfig {
     /// via black-hole detection if a smaller MTU is required. Legal range:
     /// [1200, 65527] (quinn's accepted bounds).
     pub http3_initial_mtu: u16,
-    /// Milliseconds the gRPC backend pool waits on a saturated HTTP/2 sender
-    /// for a free stream before opening a fresh connection (default: 1).
-    /// Lower values reduce queueing for unary gRPC under load. Set to 0 to
-    /// skip the wait and open a new backend connection immediately.
-    pub grpc_pool_ready_wait_ms: u64,
 
     // Connection pool warmup
     /// Pre-establish backend connections at startup (default: true).
@@ -3923,7 +3918,6 @@ impl Default for EnvConfig {
                 crate::http3::connect_udp::CONNECT_UDP_MAX_PAYLOAD_BYTES,
             h3_request_body_drain_ms: 50,
             http3_initial_mtu: 1500,
-            grpc_pool_ready_wait_ms: 1,
             pool_warmup_enabled: true,
             pool_warmup_concurrency: 500,
             pool_cleanup_interval_seconds: 30,
@@ -4516,7 +4510,6 @@ impl EnvConfig {
             http3_connect_udp_max_datagram_bytes: usize = "FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES" => crate::http3::connect_udp::CONNECT_UDP_MAX_PAYLOAD_BYTES, clamp(1usize, crate::http3::connect_udp::CONNECT_UDP_MAX_PAYLOAD_BYTES);
             h3_request_body_drain_ms: u64 = "FERRUM_H3_REQUEST_BODY_DRAIN_MS" => 50u64, clamp(0u64, 1000u64);
             http3_initial_mtu: u16 = "FERRUM_HTTP3_INITIAL_MTU" => 1500u16;
-            grpc_pool_ready_wait_ms: u64 = "FERRUM_GRPC_POOL_READY_WAIT_MS" => 1u64;
             pool_warmup_enabled: bool = "FERRUM_POOL_WARMUP_ENABLED" => true;
             pool_warmup_concurrency: usize = "FERRUM_POOL_WARMUP_CONCURRENCY" => 500usize, max(1usize);
             pool_cleanup_interval_seconds: u64 = "FERRUM_POOL_CLEANUP_INTERVAL_SECONDS" => 30u64;
@@ -5321,7 +5314,6 @@ impl EnvConfig {
             http3_connect_udp_max_datagram_bytes,
             h3_request_body_drain_ms,
             http3_initial_mtu,
-            grpc_pool_ready_wait_ms,
             pool_warmup_enabled,
             pool_warmup_concurrency,
             pool_cleanup_interval_seconds,

@@ -1724,11 +1724,44 @@ RELEASE_TOOLS_MANIFEST_CLOSED_FIELDS = (
     "steps",
 )
 
-# The main-branch publication gate is itself a release-integrity boundary. Its
-# complete job is frozen rather than selected fields so an ordinary pull
-# request cannot add `continue-on-error`, widen permissions, weaken a retry or
-# identity check, or otherwise change job semantics while preserving a partial
-# contract.
+# The hosted half of the main-branch publication gate is a release-integrity
+# boundary too. Freeze its complete job rather than selected fields so an
+# ordinary pull request cannot weaken or replace the proof while preserving a
+# partial structural contract.
+GATEWAY_PUBLICATION_WORKFLOW_FILENAME = "gateway-api-conformance.yml"
+GATEWAY_PUBLICATION_WORKFLOW_SOURCE = (
+    ".github/workflows/gateway-api-conformance.yml"
+)
+GATEWAY_MAIN_PUBLICATION_REQUIRED_CHECKS_JOB = r"""  main-publication-required-checks:
+    name: Main Publication Required Checks
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # The gate stops at its own deadline below, so this ceiling is only a
+    # backstop against a wedged runner.
+    timeout-minutes: 110
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Prove every publish-blocking required check passed for this SHA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUBLICATION_GATE_REPOSITORY: ${{ github.repository }}
+          PUBLICATION_GATE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # The commit and repository travel in the environment so this argv
+          # stays fully literal: a trusted-policy scan can read exactly what
+          # this step executes without resolving a shell expansion.
+          python3 .github/scripts/verify_publication_gate.py --self-test
+          python3 .github/scripts/verify_publication_gate.py --enforce main --deadline-seconds 6000
+"""
+
+# The main-branch publication gate inside `ci.yml` is itself a
+# release-integrity boundary. Its complete job is frozen for the same reason.
 CI_MAIN_PUBLISH_GATE_JOB = r"""  main-publish-gate:
     name: Main Publish Gate
     needs: [test, build-binaries]
@@ -1871,6 +1904,11 @@ CI_MAIN_PUBLISH_GATE_JOB = r"""  main-publish-gate:
 PUBLISH_EXACT_JOB_CONTRACTS = {
     "CI workflow": {
         "main-publish-gate": CI_MAIN_PUBLISH_GATE_JOB,
+    },
+    GATEWAY_PUBLICATION_WORKFLOW_SOURCE: {
+        "main-publication-required-checks": (
+            GATEWAY_MAIN_PUBLICATION_REQUIRED_CHECKS_JOB
+        ),
     },
     "release workflow": {
         "attest-release-images": RELEASE_ATTEST_RELEASE_IMAGES_JOB,
@@ -4014,6 +4052,14 @@ APPROVED_AUTOMATION_ROOTS = (
     "scripts/",
     "tests/k8s/",
     "tests/performance/",
+)
+# These publication-gate inputs are compared by their complete file digests,
+# independently of whether the targeted automation scan finds a Cross surface.
+# The JSON inventory sits outside the approved script roots, so the automation
+# loader admits this explicit file only to make the trusted comparison possible.
+PROTECTED_PUBLICATION_GATE_FILES = (
+    ".github/required-publication-checks.json",
+    ".github/scripts/verify_publication_gate.py",
 )
 # A repository program whose stdout becomes shell source is still executed in
 # its own language, but every edit can change the generated program. Carry this
@@ -12409,6 +12455,24 @@ def scan_workflow_collection_cross_surfaces(
     return errors
 
 
+def publication_gate_workflow_contract_errors(
+    workflows: dict[str, str],
+    source: str,
+) -> list[str]:
+    """Hold the hosted publication gate to its complete trusted job body."""
+
+    contents = workflows.get(GATEWAY_PUBLICATION_WORKFLOW_FILENAME)
+    if contents is None:
+        return [
+            f"{source}/{GATEWAY_PUBLICATION_WORKFLOW_FILENAME} must contain "
+            "the protected main-publication-required-checks job"
+        ]
+    return validate_publish_control_contract(
+        contents,
+        GATEWAY_PUBLICATION_WORKFLOW_SOURCE,
+    )
+
+
 def validate_workflow_collection(
     workflows: dict[str, str],
     source: str,
@@ -12422,6 +12486,7 @@ def validate_workflow_collection(
     """
 
     return [
+        *publication_gate_workflow_contract_errors(workflows, source),
         *live_suite_relevance_errors(workflows, source),
         *node_waypoint_relevance_errors(workflows, source),
         *required_check_name_ownership_errors(workflows, source),
@@ -13012,7 +13077,24 @@ def compare_pr_workflow_collection(
     request, regardless of what the base happened to carry.
     """
 
+    baseline_publication_workflow = merge_base_workflows.get(
+        GATEWAY_PUBLICATION_WORKFLOW_FILENAME,
+        "",
+    )
+    proposed_publication_workflow = proposed_workflows.get(
+        GATEWAY_PUBLICATION_WORKFLOW_FILENAME,
+        "",
+    )
     return [
+        *publication_gate_workflow_contract_errors(
+            proposed_workflows,
+            f"proposed {source}",
+        ),
+        *compare_pr_publish_control_contract(
+            baseline_publication_workflow,
+            proposed_publication_workflow,
+            GATEWAY_PUBLICATION_WORKFLOW_SOURCE,
+        ),
         *live_suite_relevance_errors(proposed_workflows, f"proposed {source}"),
         *node_waypoint_relevance_errors(proposed_workflows, f"proposed {source}"),
         *required_check_name_ownership_errors(
@@ -16867,6 +16949,41 @@ def protected_build_reachable_automation(
     return reachable, True
 
 
+def protected_publication_gate_file_errors(
+    merge_base_automation: dict[str, str],
+    proposed_automation: dict[str, str],
+    source: str,
+) -> list[str]:
+    """Freeze publication verifier and inventory bytes to the trusted base."""
+
+    errors: list[str] = []
+    for name in PROTECTED_PUBLICATION_GATE_FILES:
+        baseline = merge_base_automation.get(name)
+        proposed = proposed_automation.get(name)
+        if baseline is None:
+            if proposed is None:
+                # Focused scanner fixtures intentionally omit repository
+                # files outside the surface they exercise. Production loads
+                # both protected paths explicitly before this comparison.
+                continue
+            errors.append(f"merge-base {source}/{name} is missing")
+            continue
+        if proposed is None:
+            errors.append(
+                f"{source}/{name} is a protected publication-gate surface "
+                "and cannot be removed by a pull request"
+            )
+            continue
+        baseline_digest = hashlib.sha256(baseline.encode("utf-8")).digest()
+        proposed_digest = hashlib.sha256(proposed.encode("utf-8")).digest()
+        if baseline_digest != proposed_digest:
+            errors.append(
+                f"{source}/{name} is a protected publication-gate whole-file "
+                "surface and cannot be changed by a pull request"
+            )
+    return errors
+
+
 def compare_pr_automation_collection(
     merge_base_workflows: dict[str, str],
     proposed_workflows: dict[str, str],
@@ -16878,6 +16995,14 @@ def compare_pr_automation_collection(
 ) -> list[str]:
     """Reject new Cross surfaces in transitively invoked repository scripts."""
 
+    # Run the whole-file refusal before any reachability or executable-surface
+    # inspection of the proposal. Candidate publication enforcement is data to
+    # this trusted verifier and is never executed.
+    errors = protected_publication_gate_file_errors(
+        merge_base_automation,
+        proposed_automation,
+        source,
+    )
     baseline_sources = {
         **{
             f"workflows/{name}": contents
@@ -16903,7 +17028,8 @@ def compare_pr_automation_collection(
             f"proposed {source}",
         )
     )
-    errors = [*baseline_errors, *proposed_errors]
+    errors.extend(baseline_errors)
+    errors.extend(proposed_errors)
 
     # Narrow the FREEZE to automation that can execute in the trusted ARM64
     # cross-build. `scoped` is false whenever either revision's scope could not
@@ -25876,6 +26002,80 @@ pre_build = []
     ):
         failures.append("opaque shell stdin program edit was not rejected")
 
+    gateway_publication_workflow = (
+        "name: Gateway API Conformance fixture\n"
+        "on: [push]\n"
+        "jobs:\n"
+        + GATEWAY_MAIN_PUBLICATION_REQUIRED_CHECKS_JOB
+    )
+    if publication_gate_workflow_contract_errors(
+        {
+            GATEWAY_PUBLICATION_WORKFLOW_FILENAME: (
+                gateway_publication_workflow
+            )
+        },
+        "self-test workflow directory",
+    ):
+        failures.append("the hosted publication-gate job contract was rejected")
+
+    weakened_publication_job = gateway_publication_workflow.replace(
+        "    if: github.event_name == 'push' && "
+        "github.ref == 'refs/heads/main'\n",
+        "    if: always()\n",
+        1,
+    )
+    weakened_publication_errors = compare_pr_publish_control_contract(
+        gateway_publication_workflow,
+        weakened_publication_job,
+        GATEWAY_PUBLICATION_WORKFLOW_SOURCE,
+    )
+    if not weakened_publication_errors:
+        failures.append("a weakened hosted publication-gate job was not rejected")
+    elif not any(
+        "main-publication-required-checks" in error
+        for error in weakened_publication_errors
+    ):
+        failures.append(
+            "the weakened hosted publication-gate refusal did not name the job"
+        )
+
+    protected_publication_files = {
+        ".github/scripts/verify_publication_gate.py": (
+            "#!/usr/bin/env python3\nraise SystemExit(main())\n"
+        ),
+        ".github/required-publication-checks.json": (
+            '{"required_checks":["Tests","Merge Coverage"]}\n'
+        ),
+    }
+    protected_publication_mutations = {
+        ".github/scripts/verify_publication_gate.py": (
+            "#!/usr/bin/env python3\nraise SystemExit(0)\n"
+        ),
+        ".github/required-publication-checks.json": (
+            '{"required_checks":["Tests"]}\n'
+        ),
+    }
+    for protected_name, weakened_contents in protected_publication_mutations.items():
+        proposed_publication_files = dict(protected_publication_files)
+        proposed_publication_files[protected_name] = weakened_contents
+        protected_file_errors = protected_publication_gate_file_errors(
+            protected_publication_files,
+            proposed_publication_files,
+            "self-test automation directory",
+        )
+        if not protected_file_errors:
+            failures.append(
+                f"a weakened protected publication file {protected_name} was "
+                "not rejected"
+            )
+        elif not any(
+            protected_name in error for error in protected_file_errors
+        ):
+            failures.append(
+                f"the protected publication-file refusal did not name "
+                f"{protected_name}"
+            )
+
     ci_exact_publish_jobs = PUBLISH_EXACT_JOB_CONTRACTS["CI workflow"]
     ci_publish_contract = PUBLISH_CONTROL_CONTRACTS["CI workflow"]
     ci_publish_steps = PUBLISH_ARTIFACT_STEP_CONTRACTS["CI workflow"]["docker"]
@@ -28238,6 +28438,7 @@ pre_build = []
         **relevance_workflows,
         **node_waypoint_fixture,
         **isolated_fixture,
+        GATEWAY_PUBLICATION_WORKFLOW_FILENAME: gateway_publication_workflow,
     }
     ownership_prose_collection = {
         **complete_collection,
@@ -29796,6 +29997,27 @@ def load_automation_directory(
         errors.extend(failures)
         for name, contents in loaded.items():
             automation[f"{root_name}{name}"] = contents
+
+    # The publication inventory is not executable automation, but it controls
+    # which required checks authorize publication. Load it beside the verifier
+    # so both protected files receive the same trusted-base whole-file check.
+    for protected_name in PROTECTED_PUBLICATION_GATE_FILES:
+        if protected_name in automation:
+            continue
+        protected_path = path / protected_name
+        if protected_path.is_symlink() or not protected_path.is_file():
+            errors.append(
+                f"{label}/{protected_name} must be a non-symlink regular file"
+            )
+            continue
+        contents, failures = load_workflow(
+            protected_path,
+            f"{label}/{protected_name}",
+        )
+        errors.extend(failures)
+        if not failures:
+            assert contents is not None
+            automation[protected_name] = contents
 
     # Build-dispatcher manifests live at the repository root rather than in an
     # approved script root, but a workflow step reaches their recipes through

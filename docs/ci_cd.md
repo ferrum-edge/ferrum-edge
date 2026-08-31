@@ -261,19 +261,30 @@ request. With those checks unmodified, adding a required context without
 publication coverage fails policy CI, and an adversarial fixture exercises that
 case.
 
-This does **not** put both halves at the same tamper-resistance tier. The frozen
-three-context array and publisher dependencies are protected by
-`.github/scripts/verify_cross_build_policy.py`. The four
-`publication_gate_job` contexts are enforced by
-`.github/scripts/verify_publication_gate.py`,
-`.github/required-publication-checks.json`, and the
-`main-publication-required-checks` job, while their parity check lives in
-`.github/scripts/verify_required_ci.py`; all four surfaces are PR-mutable. A PR
-can therefore co-edit this enforcement and its self-checks. The publication
-step's `--self-test` invocation from the product SHA is a useful consistency
-check, not independent trusted-policy attestation. Extending the protected
-surface must land directly on `main`; it is tracked by
-[#4414](https://github.com/ferrum-edge/ferrum-edge/issues/4414).
+The enforcement now has two distinct trust tiers:
+
+- **Protected enforcement.** The trusted-base
+  `.github/scripts/verify_cross_build_policy.py` comparison freezes
+  `.github/scripts/verify_publication_gate.py` and
+  `.github/required-publication-checks.json` by whole-file digest. It also
+  freezes the complete `main-publication-required-checks` job body in
+  `.github/workflows/gateway-api-conformance.yml`, just like the exact
+  `main-publish-gate` job contract. A pull request cannot change any of those
+  three surfaces. The trusted comparison checks the exact hosted job before
+  the generic proposed-workflow scan, and checks the two whole-file digests
+  before proposed automation reachability or executable-surface inspection;
+  it treats candidate publication code only as data and never executes it.
+- **PR-mutable parity checks.** `.github/scripts/verify_required_ci.py` still
+  checks inventory, required-context, workflow, and hosted-job parity from the
+  proposed tree. Those checks remain useful drift and consistency evidence,
+  but they do not authorize a proposed change to the protected tier. The
+  publication step's product-SHA `--self-test` is likewise runtime consistency
+  evidence, not the trusted admission decision.
+
+Changing either frozen file or the frozen hosted job is a direct-to-`main`
+trusted-policy operation. Ordinary pull requests may still edit unrelated
+parts of `gateway-api-conformance.yml`; only the complete
+`main-publication-required-checks` body is frozen.
 
 #### What counts as evidence
 

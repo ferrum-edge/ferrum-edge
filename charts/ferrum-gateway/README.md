@@ -25,6 +25,15 @@ either an externally issued token (`dp.cpGrpcTokenFile`, no signing key on the
 node) or a per-tenant secret selected by `grpc.jwtKeyId`. See
 [docs/cp_namespace_tenancy.md](../../docs/cp_namespace_tenancy.md).
 
+Tenancy enforcement spans both planes: set **`cp.requireNamespaceClaim: true`**
+and **`admin.requireNamespaceClaim: true`** together so CP↔DP gRPC JWTs and
+namespace-scoped admin routes both require an `ns` claim. Enabling only the CP
+flag does **not** constrain admin JWTs — any valid admin token remains global
+and `X-Ferrum-Namespace` is only a routing selector until the admin flag is
+also true. Both values render in `database`, `file`, `cp`, and `dp` modes (any
+mode that serves the admin API) and are reserved so `env` / `extraEnv` cannot
+desync them.
+
 The `mode` value is first-class and required. `mesh` / `injector` / `node_agent`
 fail at template time with a pointer to [`ferrum-mesh`](../ferrum-mesh).
 `migrate` is **not** deployed by either chart — it fails with a pointer to the
