@@ -1162,8 +1162,8 @@ stripped of newlines and backticks before they are written.
   inputs change; plugin-only and admin-only PRs skip it before runner allocation.
   Manual `workflow_dispatch` runs, pushes to
   `main`, and fail-closed planner cases still run it. Service integration
-  likewise runs Consul, LDAP, Kafka, MySQL, OIDC, and OAuth2 introspection in
-  one independently reported invocation.
+  likewise runs Consul, LDAP, Kafka, MySQL, OIDC, OAuth2 introspection, and
+  ClickHouse in one independently reported invocation.
 - PKCS#11 SoftHSM smoke (`run_pkcs11`) compiles the `pkcs11` feature graph and
   runs the token signer plus certificate-pairing tests against SoftHSM. The
   planner schedules it for `src/tls/pkcs11.rs`, the TLS load/backend/source/reload

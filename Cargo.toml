@@ -67,7 +67,7 @@ path = "tests/secrets_functional/mod.rs"
 # is unavailable (graceful locally) and hard-fail in CI; see
 # `tests/service_integration/`. Run e.g.
 # `cargo test --test service_integration consul` (or `ldap` / `kafka` / `mysql` /
-# `oidc` / `oauth2_introspection`).
+# `oidc` / `oauth2_introspection` / `clickhouse`).
 [[test]]
 name = "service_integration"
 path = "tests/service_integration/mod.rs"

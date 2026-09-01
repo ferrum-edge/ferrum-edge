@@ -365,6 +365,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [upgrade_guide.md → Build-Out Database Upgrade](docs/upgrade_guide.md#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb),
   keep the old database for rollback, and do not rely on binary-only rollback
   against a database that received a new baseline.
+- **`api_chargeback_sink` ClickHouse JSONEachRow wire contract is gated in CI**
+  (issue #4441). A static integration test parses
+  `migrations/clickhouse/0001_charges.sql` and asserts the serializer's
+  emitted keys and JSON value kinds against the 25-column `ferrum.charges_raw`
+  table (native fully-populated rows and the identity projection). The Service
+  Integration job boots `clickhouse/clickhouse-server:24.8` and round-trips
+  HTTP, gRPC, stream, Unicode, max-integer, and durable-artifact replay
+  inserts. INSERT still uses `INSERT INTO <table> FORMAT JSONEachRow` without
+  an explicit column list: optional native fields and operator projections
+  emit different key subsets per row, so a fixed list would reject valid
+  sparse or projected batches. Extra JSON keys still fail the insert;
+  a missing native key still silently defaults its column — that drift is
+  what the static test rejects. Operators who rename or omit keys must keep
+  the destination table in sync.
 
 - **BREAKING — injected Ferrum is a Kubernetes native sidecar**
   (issue #4430). The webhook now emits `ferrum-edge` under `spec.initContainers`

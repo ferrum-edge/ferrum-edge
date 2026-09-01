@@ -26,6 +26,7 @@ their *failure* path, leaving the real client logic uncovered:
 | **MySQL** (`src/config/migrations/mod.rs`, `src/config/db_loader.rs`) | custom-plugin DDL plus tracking under MySQL's implicit-commit rules; cross-namespace `config_change_locks` exclusive-lock acquisition; V001 identity-column collation | SQLite covered atomic migration behavior; MySQL SQL was previously inspected only as strings | live MySQL 8.4: failure after committed V1 DDL, exact index reconstruction on retry, V2 index/tracker-gap recovery, SQLx Any text bindings used by `example_audit_plugin`, a bounded cross-namespace writer race proving zero ER_LOCK_DEADLOCK 1213, per-namespace sequence-lock isolation (issue #4130), and NFC/NFD consumer username inserts under `utf8mb4_0900_bin` (#2994) |
 | **OIDC** (`src/plugins/oidc_relying_party.rs`) | discovery, authorization-code + PKCE, JWKS/UserInfo/end-session, encrypted sessions, claim headers, idle/absolute expiry, refresh, logout | unit tests with wiremock IdP | live Ory Hydra: full browser challenge → callback session, state/correlation/nonce/issuer/audience/signature negatives (subject proven positively; `azp` multi-aud remains unit-covered), reserved-header protection, idle/absolute expiry with margin sleeps, refresh proven via token-facade `refresh_token` grant counter, RP logout (#3333) |
 | **OAuth2 introspection** (`src/plugins/oauth2_introspection.rs`) | RFC 7662 outbound introspect, discovery, cache, scope/role/audience, client auth, failure policy | unit tests with wiremock | live Hydra opaque tokens: active/inactive, scope/role/issuer/audience, `client_secret_basic` + `client_secret_post` request shaping observed on a non-secret facade, discovery facade (same-origin rewrite of admin introspect), cache hit/expiry proven by upstream-call counters without token-key leaks, timeout/malformed/oversized/wiremock-auth/unavailable → 503 (Hydra admin introspect does not enforce client auth) (#3333) |
+| **ClickHouse** (`src/plugins/api_chargeback_sink.rs`) | JSONEachRow INSERT of `ChargeEvent` against `migrations/clickhouse/0001_charges.sql` | static DDL/serializer contract in `tests/integration/api_chargeback_sink_tests.rs`; ignored env-URL round trip | live `clickhouse/clickhouse-server:24.8`: apply baseline DDL, plugin HTTP/gRPC/stream/Unicode inserts, max-integer serializer insert, compatible DDL re-apply + durable artifact replay, identity-projection insert (issue #4441) |
 
 ## Running locally
 
@@ -40,6 +41,7 @@ cargo test --test service_integration kafka
 cargo test --test service_integration mysql
 cargo test --test service_integration oidc
 cargo test --test service_integration oauth2_introspection
+cargo test --test service_integration clickhouse
 ```
 
 The MySQL custom-plugin recovery test requires the pedagogical example at
@@ -70,6 +72,7 @@ Every testcontainer in this suite that publishes a host port goes through
 | Redpanda | `9093` (advertised Kafka listener) |
 | MySQL | `3306` |
 | Hydra | `4444` (public) and `4445` (admin); login/consent URLs also consume unique host ports so they cannot collide with the mapped listeners |
+| ClickHouse | `8123` (HTTP interface used by `api_chargeback_sink`) |
 
 Docker auto-assignment and `127.0.0.1:0` both land inside
 `/proc/sys/net/ipv4/ip_local_port_range`. The probe socket is then released, an
@@ -99,17 +102,20 @@ under parallel jobs) and do not blanket-retry unrelated container errors.
 | Redpanda | `redpandadata/redpanda:v24.2.4` | Kafka API on external listener `127.0.0.1:<mapped-port>`; auto-topic-create disabled; readiness via librdkafka metadata; topics created with `rpk` |
 | MySQL | `mysql:8.4` | isolated `ferrum` database; readiness polled with the same SQLx Any driver used by migrations/runtime persistence |
 | Hydra | `oryd/hydra:v2.2.0` | `serve all --dev` with `DSN=memory`; host ports allocated outside the ephemeral range for public (4444) and admin (4445); opaque access tokens; clients seeded via admin API; login/consent accepted through admin challenge APIs (no external IdP). Readiness polled via OIDC discovery + admin API |
+| ClickHouse | `clickhouse/clickhouse-server:24.8` | HTTP on mapped `8123`; readiness polled via `/ping`; baseline `migrations/clickhouse/0001_charges.sql` applied as one HTTP POST per statement |
 
 Readiness is confirmed by **active polling** (Consul leader endpoint; LDAP
-`ldapadd` retry; Redpanda metadata fetch; a MySQL connection; Hydra discovery),
+`ldapadd` retry; Redpanda metadata fetch; a MySQL connection; Hydra discovery;
+ClickHouse `/ping`),
 not by matching a startup log line —
 so the helpers do not depend on which stream a given image logs to.
 
 ## CI
 
 `.github/workflows/ci.yml` job `test-service-integration` runs on
-`ubuntu-latest` (Docker available). Consul, LDAP, Kafka, MySQL, OIDC, and
-OAuth2 introspection run in one nextest `--no-fail-fast` invocation, which
+`ubuntu-latest` (Docker available). Consul, LDAP, Kafka, MySQL, OIDC,
+OAuth2 introspection, and ClickHouse run in one nextest `--no-fail-fast`
+invocation, which
 preserves per-test reporting and continues after one backend fails without
 allocating a second runner. It is wired into the `test` aggregation gate, so it
 blocks merge on failure. Hydra (or any provider) startup failure is a hard

@@ -181,6 +181,9 @@ cargo test --test service_integration ldap
 # OIDC relying party + OAuth2 introspection against Ory Hydra (#3333)
 cargo test --test service_integration oidc
 cargo test --test service_integration oauth2_introspection
+
+# ClickHouse JSONEachRow chargeback insert (issue #4441)
+cargo test --test service_integration clickhouse
 ```
 
 ### Performance Tests

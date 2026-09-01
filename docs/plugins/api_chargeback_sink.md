@@ -297,6 +297,61 @@ duplicate raw events are deduplicated before rollup aggregation. Monetary
 (in addition to namespace/consumer/proxy/time) so mixed-currency or
 multi-generation sinks never produce unitless rollups.
 
+### JSONEachRow wire contract
+
+The sink serializes each `ChargeEvent` as ClickHouse `JSONEachRow` and inserts
+with `INSERT INTO <table> FORMAT JSONEachRow` (no explicit column list).
+ClickHouse maps JSON object keys to physical column names. The native,
+unprojected row is the 25-column `ferrum.charges_raw` contract:
+
+| JSON key | JSON kind | ClickHouse type |
+|---|---|---|
+| `event_id` | string | `String` |
+| `received_at` | integer (Unix epoch nanoseconds) | `DateTime64(9, 'UTC')` |
+| `node_id` | string | `LowCardinality(String)` |
+| `namespace` | string | `LowCardinality(String)` |
+| `consumer_id` | string | `String` |
+| `consumer_name` | string, omitted when unset | `String` |
+| `proxy_id` | string | `String` |
+| `proxy_name` | string | `LowCardinality(String)` |
+| `route_id` | string, omitted when unset | `String` |
+| `status_code` | integer | `UInt16` |
+| `http_status_code` | integer, omitted when unset | `Nullable(UInt16)` |
+| `grpc_status` | integer, omitted when unset | `Nullable(UInt32)` |
+| `protocol` | string | `LowCardinality(String)` |
+| `call_count` | integer | `UInt64` |
+| `charge_call` | float | `Float64` |
+| `bytes_sent` | integer | `UInt64` |
+| `bytes_received` | integer | `UInt64` |
+| `charge_bytes_sent` | float | `Float64` |
+| `charge_bytes_received` | float | `Float64` |
+| `charge_total` | float | `Float64` |
+| `currency` | string | `LowCardinality(String)` |
+| `pricing_version` | string | `LowCardinality(String)` |
+| `request_id` | string, omitted when unset | `String` |
+| `trace_id` | string, omitted when unset | `String` |
+| `snapshot_id` | string, omitted when unset | `String` |
+
+A static integration test parses `migrations/clickhouse/0001_charges.sql` at
+compile time and asserts that exact key set, plus JSON-kind vs declared-type
+compatibility, against the serializer output for a fully populated native
+event and for the identity (order-only) projection. Hosted CI also boots
+`clickhouse/clickhouse-server:24.8` in the Service Integration job and
+round-trips HTTP, gRPC, stream (nullable statuses), Unicode, max-integer, and
+durable-artifact replay inserts. Adding, renaming, or retyping a native field
+without updating the DDL (or the other way around) fails required checks.
+
+The INSERT query does **not** list columns explicitly. Optional native fields
+use `skip_serializing_if = "Option::is_none"`, and operator `schema` /
+`schema_ref` projections may omit, rename, or inject keys per event. A fixed
+column list would reject those valid sparse and projected batches. Extra JSON
+keys that are not table columns still fail the insert (ClickHouse
+`input_format_skip_unknown_fields` defaults off). A native field whose JSON
+key is missing still silently defaults the physical column — that is the
+failure the static contract test is there to catch. Operators who rename or
+omit keys must keep the destination table in sync; Ferrum cannot inspect the
+remote schema.
+
 For HTTP-family events, `status_code` is the billable status used for pricing
 and rollups. `http_status_code` preserves the transport status, and
 `grpc_status` preserves the normalized final application code when the request

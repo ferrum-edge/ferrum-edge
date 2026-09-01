@@ -1,9 +1,9 @@
 //! Functional integration tests for Ferrum's external-middleware integrations
 //! that can only be validated against the REAL third-party software — a
 //! service registry, a directory server, a Kafka-compatible broker, a SQL
-//! database, and an OIDC/OAuth2 identity provider — imitated locally with free
-//! OSS containers (`testcontainers`/Docker). No managed or cloud service is
-//! ever used.
+//! database, an OIDC/OAuth2 identity provider, and ClickHouse — imitated
+//! locally with free OSS containers (`testcontainers`/Docker). No managed or
+//! cloud service is ever used.
 //!
 //! These exercise the REAL integration code paths against locally-run servers:
 //!
@@ -33,6 +33,9 @@
 //!     `oauth2_introspection` against opaque tokens: active/inactive, scope /
 //!     role / issuer / audience, client auth methods, discovery facade, cache,
 //!     and failure policy (#3333).
+//!   - **clickhouse** — ClickHouse HTTP. Applies
+//!     `migrations/clickhouse/0001_charges.sql` and round-trips
+//!     `api_chargeback_sink` JSONEachRow inserts (issue #4441).
 //!
 //! Container-backed tests self-skip (with a printed notice) when Docker is
 //! unavailable, so the suite is safe to run locally without Docker. In CI the
@@ -48,9 +51,11 @@
 //!   cargo test --test service_integration mysql
 //!   cargo test --test service_integration oidc
 //!   cargo test --test service_integration oauth2_introspection
+//!   cargo test --test service_integration clickhouse
 
 mod common;
 
+mod clickhouse;
 mod consul;
 mod host_port_allocation;
 mod kafka;

@@ -403,6 +403,9 @@ Family-specific notes:
   not control.
 - **`api_chargeback_sink`** projects the ClickHouse INSERT row, so renaming a
   field renames the column the row inserts into — the target table must agree.
+  The native (unprojected) JSONEachRow key set is gated against
+  `migrations/clickhouse/0001_charges.sql` in CI (issue #4441); see
+  `docs/plugins/api_chargeback_sink.md`.
   Mind the sort key in particular: the reference `ferrum.charges_raw` is a
   `ReplacingMergeTree` ordered by
   `(namespace, consumer_id, received_at, event_id)`, and that ordering is what
