@@ -2163,7 +2163,8 @@ fn ejection_cap_readmits_when_too_many_passively_ejected() {
         target_host_port_key(&targets[0]),
         ferrum_edge::health_check::PassiveEjection {
             ejected_at_ms: 100,
-            recover_at_ms: 100,
+            ejected_at_tick_ms: 100,
+            recover_at_tick_ms: 100,
             auto_recover: false,
             upstream_id: TEST_UPSTREAM.to_string(),
             host: targets[0].host.clone(),
@@ -2175,7 +2176,8 @@ fn ejection_cap_readmits_when_too_many_passively_ejected() {
         target_host_port_key(&targets[1]),
         ferrum_edge::health_check::PassiveEjection {
             ejected_at_ms: 200,
-            recover_at_ms: 200,
+            ejected_at_tick_ms: 200,
+            recover_at_tick_ms: 200,
             auto_recover: false,
             upstream_id: TEST_UPSTREAM.to_string(),
             host: targets[1].host.clone(),
@@ -2187,7 +2189,8 @@ fn ejection_cap_readmits_when_too_many_passively_ejected() {
         target_host_port_key(&targets[2]),
         ferrum_edge::health_check::PassiveEjection {
             ejected_at_ms: 300,
-            recover_at_ms: 300,
+            ejected_at_tick_ms: 300,
+            recover_at_tick_ms: 300,
             auto_recover: false,
             upstream_id: TEST_UPSTREAM.to_string(),
             host: targets[2].host.clone(),
@@ -2555,7 +2558,7 @@ fn passthrough_ejection_cap_scoped_to_candidate_pool_not_whole_upstream() {
     let in_pool: std::net::SocketAddr = "10.0.0.1:8080".parse().unwrap();
 
     // Helper: passthrough-select the in-subset orig-dst with the given passive
-    // ejections (host:port → ejected_at_ms) and a 25% cap scoped to subset v1.
+    // ejections (host:port → monotonic ejection tick) and a 25% cap scoped to subset v1.
     let dial_decision = |ejected: &[(&UpstreamTarget, u64)]| -> bool {
         let checker = HealthChecker::new();
         for (t, _) in ejected {
@@ -2574,13 +2577,14 @@ fn passthrough_ejection_cap_scoped_to_candidate_pool_not_whole_upstream() {
             .get("ferrum|test-proxy")
             .map(|e| e.clone())
             .expect("passive state should be created");
-        // Deterministic ejection timestamps (earliest = the in-pool target).
+        // Deterministic ejection ticks (earliest = the in-pool target).
         for (t, ts) in ejected {
             proxy_passive.unhealthy.insert(
                 target_host_port_key(t),
                 ferrum_edge::health_check::PassiveEjection {
                     ejected_at_ms: *ts,
-                    recover_at_ms: *ts,
+                    ejected_at_tick_ms: *ts,
+                    recover_at_tick_ms: *ts,
                     auto_recover: false,
                     upstream_id: "test-upstream".to_string(),
                     host: t.host.clone(),
@@ -3184,7 +3188,10 @@ fn least_latency_passive_recovery_does_not_restore_warmup_bias() {
 
     {
         let ps = checker.passive_health.get("ferrum|p1").unwrap();
-        ps.unhealthy.get_mut("host1:8080").unwrap().recover_at_ms = 1;
+        ps.unhealthy
+            .get_mut("host1:8080")
+            .unwrap()
+            .recover_at_tick_ms = 0;
     }
     checker.recover_due_passive_ejections();
     assert!(

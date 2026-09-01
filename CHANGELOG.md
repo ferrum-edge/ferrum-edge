@@ -310,6 +310,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gateway-side reason is `connect_udp_target_srv_tier_standby`. The live
   generation re-check stays configuration-only, so a health flap or a
   recovered primary cannot tear down an established tunnel.
+- Circuit-breaker OPEN timeouts and passive-health failure/ejection windows now
+  use process-monotonic time, so NTP corrections and VM wall-clock jumps cannot
+  freeze protection or release a backend early (issue #4436). Operator-facing
+  ejection timestamps remain Unix epoch milliseconds.
 
 - **Injector inbound capture excludes kubelet HTTP and TCP probe ports**
   (issue #4431). `startupProbe` / `readinessProbe` / `livenessProbe` `httpGet`

@@ -30,7 +30,10 @@ pub fn monotonic_now_ms() -> u64 {
     use std::time::Instant;
     static START: OnceLock<Instant> = OnceLock::new();
     let start = START.get_or_init(Instant::now);
-    start.elapsed().as_millis() as u64
+    // Saturate rather than wrap if the process survives for more than u64
+    // milliseconds (~584 million years). Callers handle unrepresentable future
+    // deadlines conservatively; the shared tick itself never jumps backwards.
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 // ── IP_BIND_ADDRESS_NO_PORT ─────────────────────────────────────────────────

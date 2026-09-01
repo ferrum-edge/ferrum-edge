@@ -927,7 +927,10 @@ fn test_passive_failure_ring_clears_on_timer_recovery() {
     assert_eq!(ring_len(&checker, TEST_PROXY, "backend1:8080"), 4);
     {
         let ps = checker.passive_health.get(&rk(TEST_PROXY)).unwrap();
-        ps.unhealthy.get_mut("backend1:8080").unwrap().recover_at_ms = 1;
+        ps.unhealthy
+            .get_mut("backend1:8080")
+            .unwrap()
+            .recover_at_tick_ms = 0;
     }
     checker.recover_due_passive_ejections();
     assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
@@ -967,6 +970,115 @@ fn test_passive_health_threshold_1_immediate_unhealthy() {
         is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
         "Threshold of 1 should mark unhealthy on first failure"
     );
+}
+
+#[test]
+fn wall_clock_jumps_do_not_change_passive_window_or_recovery_deadline() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = PassiveHealthCheck {
+        unhealthy_status_codes: vec![500],
+        unhealthy_threshold: 3,
+        unhealthy_window_seconds: 10,
+        healthy_after_seconds: 5,
+        max_ejection_percent: None,
+        gateway_error_codes: None,
+        split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
+    };
+
+    let report_at = |tick_ms, wall_ms| {
+        checker.report_response_at_for_test(
+            DEFAULT_NAMESPACE,
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+            tick_ms,
+            wall_ms,
+        );
+    };
+
+    // Backward and forward wall jumps cannot keep expired failures in the
+    // window: at tick 12_001 only that newest failure remains.
+    report_at(1_000, 50_000);
+    report_at(2_000, 1);
+    report_at(12_001, 9_000_000_000_000);
+    assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+
+    report_at(12_002, 2);
+    report_at(12_003, 77);
+    let (ejected_tick, recovery_tick, ejected_wall) = {
+        let proxy = checker.passive_health.get(&rk(TEST_PROXY)).unwrap();
+        let ejection = proxy.unhealthy.get("backend1:8080").unwrap();
+        (
+            ejection.ejected_at_tick_ms,
+            ejection.recover_at_tick_ms,
+            ejection.ejected_at_ms,
+        )
+    };
+    assert_eq!(ejected_tick, 12_003);
+    assert_eq!(recovery_tick, 17_003);
+    assert_eq!(ejected_wall, 77, "operator timestamp must follow wall time");
+
+    // Another qualifying failure cannot double-publish or move the deadline.
+    report_at(12_004, 99_000_000);
+    {
+        let proxy = checker.passive_health.get(&rk(TEST_PROXY)).unwrap();
+        let ejection = proxy.unhealthy.get("backend1:8080").unwrap();
+        assert_eq!(ejection.ejected_at_tick_ms, ejected_tick);
+        assert_eq!(ejection.recover_at_tick_ms, recovery_tick);
+        assert_eq!(ejection.ejected_at_ms, ejected_wall);
+    }
+
+    checker.recover_due_passive_ejections_at_for_test(17_002);
+    assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+    checker.recover_due_passive_ejections_at_for_test(17_003);
+    assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+    checker.recover_due_passive_ejections_at_for_test(17_003);
+    assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+}
+
+#[test]
+fn overflowing_passive_deadline_disables_timer_recovery() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = PassiveHealthCheck {
+        unhealthy_status_codes: vec![500],
+        unhealthy_threshold: 1,
+        unhealthy_window_seconds: 10,
+        healthy_after_seconds: 1,
+        max_ejection_percent: None,
+        gateway_error_codes: None,
+        split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
+    };
+
+    checker.report_response_at_for_test(
+        DEFAULT_NAMESPACE,
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+        u64::MAX - 500,
+        123,
+    );
+    {
+        let proxy = checker.passive_health.get(&rk(TEST_PROXY)).unwrap();
+        let ejection = proxy.unhealthy.get("backend1:8080").unwrap();
+        assert!(!ejection.auto_recover);
+        assert_eq!(ejection.recover_at_tick_ms, u64::MAX);
+        assert_eq!(ejection.ejected_at_ms, 123);
+    }
+
+    checker.recover_due_passive_ejections_at_for_test(u64::MAX);
+    assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 }
 
 // ─── Connection Error Tests ─────────────────────────────────────────────────
@@ -1825,7 +1937,7 @@ async fn per_port_only_passive_policy_recovers_via_entry_deadline() {
     {
         let ps = checker.passive_health.get(&rk("proxy-port")).unwrap();
         let mut entry = ps.unhealthy.get_mut("10.0.0.8:8443").unwrap();
-        entry.recover_at_ms = 1;
+        entry.recover_at_tick_ms = 0;
     }
     checker.recover_due_passive_ejections();
     assert!(
@@ -1873,7 +1985,7 @@ async fn subset_only_passive_policy_recovers_via_entry_deadline() {
     {
         let ps = checker.passive_health.get(&rk("proxy-sub")).unwrap();
         let mut entry = ps.unhealthy.get_mut("10.0.0.9:8080").unwrap();
-        entry.recover_at_ms = 1;
+        entry.recover_at_tick_ms = 0;
     }
     checker.recover_due_passive_ejections();
     assert!(!is_passive_unhealthy(
@@ -1924,18 +2036,21 @@ fn shared_endpoint_independent_cooldowns_across_proxies() {
     {
         let ps = checker.passive_health.get(&rk("proxy-a")).unwrap();
         let entry = ps.unhealthy.get("10.0.0.8:8443").unwrap();
-        assert_eq!(entry.recover_at_ms - entry.ejected_at_ms, 5_000);
+        assert_eq!(entry.recover_at_tick_ms - entry.ejected_at_tick_ms, 5_000);
     }
     {
         let ps = checker.passive_health.get(&rk("proxy-b")).unwrap();
         let entry = ps.unhealthy.get("10.0.0.8:8443").unwrap();
-        assert_eq!(entry.recover_at_ms - entry.ejected_at_ms, 300_000);
+        assert_eq!(entry.recover_at_tick_ms - entry.ejected_at_tick_ms, 300_000);
     }
 
     // Only A's deadline is due.
     {
         let ps = checker.passive_health.get(&rk("proxy-a")).unwrap();
-        ps.unhealthy.get_mut("10.0.0.8:8443").unwrap().recover_at_ms = 1;
+        ps.unhealthy
+            .get_mut("10.0.0.8:8443")
+            .unwrap()
+            .recover_at_tick_ms = 0;
     }
     checker.recover_due_passive_ejections();
     assert!(!is_passive_unhealthy(&checker, "proxy-a", "10.0.0.8:8443"));
@@ -1956,8 +2071,8 @@ async fn passive_recovery_deadline_survives_policy_reload() {
     let original_deadline = {
         let ps = checker.passive_health.get(&rk(TEST_PROXY)).unwrap();
         let entry = ps.unhealthy.get("backend1:8080").unwrap();
-        assert_eq!(entry.recover_at_ms - entry.ejected_at_ms, 30_000);
-        entry.recover_at_ms
+        assert_eq!(entry.recover_at_tick_ms - entry.ejected_at_tick_ms, 30_000);
+        entry.recover_at_tick_ms
     };
 
     let reloaded = make_upstream_passive_only("up1", vec![target.clone()], 1);
@@ -1965,7 +2080,10 @@ async fn passive_recovery_deadline_survives_policy_reload() {
 
     let after_reload = {
         let ps = checker.passive_health.get(&rk(TEST_PROXY)).unwrap();
-        ps.unhealthy.get("backend1:8080").unwrap().recover_at_ms
+        ps.unhealthy
+            .get("backend1:8080")
+            .unwrap()
+            .recover_at_tick_ms
     };
     assert_eq!(
         after_reload, original_deadline,
@@ -1978,7 +2096,10 @@ async fn passive_recovery_deadline_survives_policy_reload() {
 
     {
         let ps = checker.passive_health.get(&rk(TEST_PROXY)).unwrap();
-        ps.unhealthy.get_mut("backend1:8080").unwrap().recover_at_ms = 1;
+        ps.unhealthy
+            .get_mut("backend1:8080")
+            .unwrap()
+            .recover_at_tick_ms = 0;
     }
     checker.recover_due_passive_ejections();
     assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
@@ -2034,7 +2155,7 @@ async fn service_discovery_only_target_recovers_after_passive_ejection() {
         ps.unhealthy
             .get_mut("sd-only-b:8080")
             .unwrap()
-            .recover_at_ms = 1;
+            .recover_at_tick_ms = 0;
     }
     checker.recover_due_passive_ejections();
     assert!(
@@ -2774,7 +2895,10 @@ fn consecutive_mode_timer_recovery_cannot_retract_fresh_post_success_ejection() 
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
     {
         let ps = checker.passive_health.get(&rk(TEST_PROXY)).unwrap();
-        ps.unhealthy.get_mut("backend1:8080").unwrap().recover_at_ms = 1;
+        ps.unhealthy
+            .get_mut("backend1:8080")
+            .unwrap()
+            .recover_at_tick_ms = 0;
     }
     assert_eq!(
         consecutive_ejection_generation(&checker, TEST_PROXY, "backend1:8080"),
@@ -2806,7 +2930,10 @@ fn consecutive_mode_timer_recovery_cannot_retract_fresh_post_success_ejection() 
                 .passive_health
                 .get(&rk(TEST_PROXY))
                 .unwrap();
-            ps.unhealthy.get_mut("backend1:8080").unwrap().recover_at_ms = 1;
+            ps.unhealthy
+                .get_mut("backend1:8080")
+                .unwrap()
+                .recover_at_tick_ms = 0;
         }
         assert_eq!(
             consecutive_ejection_generation(&checker_for_hook, TEST_PROXY, "backend1:8080"),
@@ -2845,7 +2972,10 @@ fn consecutive_mode_timer_cannot_strand_republished_generation_after_remove() {
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
     {
         let ps = checker.passive_health.get(&rk(TEST_PROXY)).unwrap();
-        ps.unhealthy.get_mut("backend1:8080").unwrap().recover_at_ms = 1;
+        ps.unhealthy
+            .get_mut("backend1:8080")
+            .unwrap()
+            .recover_at_tick_ms = 0;
     }
     assert_eq!(
         consecutive_ejection_generation(&checker, TEST_PROXY, "backend1:8080"),

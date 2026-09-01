@@ -333,7 +333,7 @@ struct TargetHealth {
     /// Consecutive-mode packed generation + streak. Unused (stays 0) under
     /// native windowed policy.
     consecutive_state: AtomicU64,
-    /// Recent failure timestamps (epoch ms) for passive windowed counting.
+    /// Recent process-relative monotonic ticks for passive windowed counting.
     /// Bounded to MAX_RECENT_FAILURES_PER_TARGET entries.
     recent_failures: Mutex<RecentFailureRing>,
 }
@@ -531,16 +531,19 @@ mod recent_failure_ring_tests {
 /// timer to this entry.
 #[derive(Debug, Clone)]
 pub struct PassiveEjection {
-    /// Epoch ms when the target was marked unhealthy (used by max-ejection
-    /// readmit ordering and admin metrics).
+    /// Wall-clock Unix epoch ms when the target was marked unhealthy. This is
+    /// operator-facing diagnostics only and is never read by a state machine.
     pub ejected_at_ms: u64,
-    /// Epoch ms when the automatic recovery timer may clear this entry.
-    /// Equal to `ejected_at_ms` when `auto_recover` is false (unused).
-    pub recover_at_ms: u64,
+    /// Process-relative monotonic tick when the target was ejected. Used for
+    /// max-ejection readmit ordering; never exposed as a wall timestamp.
+    pub ejected_at_tick_ms: u64,
+    /// Process-relative monotonic tick when automatic recovery may clear this
+    /// entry. Equal to `ejected_at_tick_ms` when timer recovery is disabled.
+    pub recover_at_tick_ms: u64,
     /// Whether the automatic recovery scanner should clear this entry once
-    /// `recover_at_ms` is reached. `false` when the ejecting policy had
-    /// `healthy_after_seconds == 0` (timer recovery disabled; success-based
-    /// recovery still applies).
+    /// `recover_at_tick_ms` is reached. `false` when the ejecting policy had
+    /// `healthy_after_seconds == 0` or its deadline was unrepresentable (timer
+    /// recovery disabled; success-based recovery still applies).
     pub auto_recover: bool,
     /// Upstream that owned the dispatch when this target was ejected — used to
     /// reset least-latency warm-up state on timer/success recovery without a
@@ -563,18 +566,27 @@ impl PassiveEjection {
         upstream_id: &str,
         target: &UpstreamTarget,
         healthy_after_seconds: u64,
-        now_ms: u64,
+        ejected_at_tick_ms: u64,
+        ejected_at_ms: u64,
         consecutive_generation: Option<u64>,
     ) -> Self {
-        let auto_recover = healthy_after_seconds > 0;
-        let recover_at_ms = if auto_recover {
-            now_ms.saturating_add(healthy_after_seconds.saturating_mul(1000))
+        let recovery_delay_ms = healthy_after_seconds.saturating_mul(1000);
+        let (auto_recover, recover_at_tick_ms) = if healthy_after_seconds > 0 {
+            match ejected_at_tick_ms.checked_add(recovery_delay_ms) {
+                Some(deadline) => (true, deadline),
+                // A u64 monotonic tick spans ~584 million years. If the
+                // deadline is nevertheless unrepresentable, disable timer
+                // recovery for this ejection instead of wrapping or releasing
+                // protection early; a successful response can still recover it.
+                None => (false, u64::MAX),
+            }
         } else {
-            now_ms
+            (false, ejected_at_tick_ms)
         };
         Self {
-            ejected_at_ms: now_ms,
-            recover_at_ms,
+            ejected_at_ms,
+            ejected_at_tick_ms,
+            recover_at_tick_ms,
             auto_recover,
             upstream_id: upstream_id.to_owned(),
             host: target.host.clone(),
@@ -1577,6 +1589,37 @@ impl HealthChecker {
             status_code,
             connection_error,
             passive_config,
+            None,
+            ConsecutiveInterleaveHooks::none(),
+        );
+    }
+
+    /// Deterministic-clock variant used by external unit tests. Monotonic and
+    /// wall time are injected independently so tests can jump wall time without
+    /// perturbing passive-health state transitions.
+    #[doc(hidden)]
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn report_response_at_for_test(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+        upstream_id: &str,
+        target: &UpstreamTarget,
+        status_code: u16,
+        connection_error: bool,
+        passive_config: Option<&PassiveHealthCheck>,
+        monotonic_now_ms: u64,
+        wall_epoch_ms: u64,
+    ) {
+        self.report_response_inner(
+            namespace,
+            proxy_id,
+            upstream_id,
+            target,
+            status_code,
+            connection_error,
+            passive_config,
+            Some((monotonic_now_ms, wall_epoch_ms)),
             ConsecutiveInterleaveHooks::none(),
         );
     }
@@ -1605,6 +1648,7 @@ impl HealthChecker {
             status_code,
             connection_error,
             passive_config,
+            None,
             ConsecutiveInterleaveHooks {
                 after_failure_count: Some(hook),
                 after_ejection_insert: None,
@@ -1638,6 +1682,7 @@ impl HealthChecker {
             status_code,
             connection_error,
             passive_config,
+            None,
             ConsecutiveInterleaveHooks {
                 after_failure_count: None,
                 after_ejection_insert: Some(hook),
@@ -1670,6 +1715,7 @@ impl HealthChecker {
             status_code,
             connection_error,
             passive_config,
+            None,
             ConsecutiveInterleaveHooks {
                 after_failure_count: None,
                 after_ejection_insert: None,
@@ -1688,6 +1734,7 @@ impl HealthChecker {
         status_code: u16,
         connection_error: bool,
         passive_config: Option<&PassiveHealthCheck>,
+        injected_time: Option<(u64, u64)>,
         mut hooks: ConsecutiveInterleaveHooks<'_>,
     ) {
         let config = match passive_config {
@@ -1764,8 +1811,17 @@ impl HealthChecker {
                                     .consecutive_generation
                                     .is_some_and(|generation| generation >= my_generation)
                             });
-                        let published = !already_published
-                            && try_publish_consecutive_ejection(
+                        let published = if already_published {
+                            false
+                        } else {
+                            let (ejected_at_tick_ms, ejected_at_ms) =
+                                injected_time.unwrap_or_else(|| {
+                                    (
+                                        crate::socket_opts::monotonic_now_ms(),
+                                        wall_now_epoch_ms(),
+                                    )
+                                });
+                            try_publish_consecutive_ejection(
                                 &proxy_state,
                                 &state,
                                 buf.as_str(),
@@ -1773,11 +1829,13 @@ impl HealthChecker {
                                     upstream_id,
                                     target,
                                     config.healthy_after_seconds,
-                                    now_epoch_ms(),
+                                    ejected_at_tick_ms,
+                                    ejected_at_ms,
                                     Some(my_generation),
                                 ),
                                 my_generation,
-                            );
+                            )
+                        };
                         if published {
                             if let Some(hook) = hooks.after_ejection_insert.as_mut() {
                                 drop(buf);
@@ -1811,16 +1869,19 @@ impl HealthChecker {
                     }
                 } else {
                     state.consecutive_failures.fetch_add(1, Ordering::Relaxed);
-                    let now_ms = now_epoch_ms();
-                    let window_start =
-                        now_ms.saturating_sub(config.unhealthy_window_seconds * 1000);
+                    let now_tick_ms = injected_time.map_or_else(
+                        crate::socket_opts::monotonic_now_ms,
+                        |(tick_ms, _)| tick_ms,
+                    );
+                    let window_ms = config.unhealthy_window_seconds.saturating_mul(1000);
+                    let window_start = now_tick_ms.saturating_sub(window_ms);
                     // Per-target mutex: a handful of integer ops. Replaces the
                     // previous DashMap insert + full-window retain + cap-eviction
                     // sort on this path. Concurrent reporters for this same
                     // target serialize here so the in-window count is exact.
                     let failures_observed = {
                         let mut ring = state.lock_recent_failures();
-                        ring.record(now_ms, window_start) as u32
+                        ring.record(now_tick_ms, window_start) as u32
                     };
 
                     if failures_observed >= config.unhealthy_threshold
@@ -1835,7 +1896,9 @@ impl HealthChecker {
                                 upstream_id,
                                 target,
                                 config.healthy_after_seconds,
-                                now_epoch_ms(),
+                                now_tick_ms,
+                                injected_time
+                                    .map_or_else(wall_now_epoch_ms, |(_, wall_ms)| wall_ms),
                                 None,
                             ),
                         );
@@ -2116,8 +2179,8 @@ impl HealthChecker {
     /// Run one passive-recovery pass: clear every auto-recoverable ejection
     /// whose stored deadline has elapsed, scoped to that proxy entry only.
     ///
-    /// Deterministic external unit tests backdate `recover_at_ms` and call this
-    /// without sleeping the background scanner. The scanner itself invokes
+    /// Deterministic external unit tests backdate `recover_at_tick_ms` and call
+    /// this without sleeping the background scanner. The scanner itself invokes
     /// [`recover_due_passive_ejections_inner`] on cloned `Arc`s because the
     /// spawned task cannot hold `&self`. The binary target still treats unused
     /// `pub` methods as dead code, hence the narrow allow (same pattern as
@@ -2128,6 +2191,19 @@ impl HealthChecker {
         recover_due_passive_ejections_inner(
             &self.passive_health,
             self.lb_cache.as_ref(),
+            None,
+            PassiveRecoveryInterleaveHooks::none(),
+        );
+    }
+
+    /// Deterministic-clock recovery pass used by external unit tests.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn recover_due_passive_ejections_at_for_test(&self, monotonic_now_ms: u64) {
+        recover_due_passive_ejections_inner(
+            &self.passive_health,
+            self.lb_cache.as_ref(),
+            Some(monotonic_now_ms),
             PassiveRecoveryInterleaveHooks::none(),
         );
     }
@@ -2144,6 +2220,7 @@ impl HealthChecker {
         recover_due_passive_ejections_inner(
             &self.passive_health,
             self.lb_cache.as_ref(),
+            None,
             PassiveRecoveryInterleaveHooks {
                 after_scan: Some(hook),
                 after_consecutive_remove: None,
@@ -2164,6 +2241,7 @@ impl HealthChecker {
         recover_due_passive_ejections_inner(
             &self.passive_health,
             self.lb_cache.as_ref(),
+            None,
             PassiveRecoveryInterleaveHooks {
                 after_scan: None,
                 after_consecutive_remove: Some(hook),
@@ -2241,6 +2319,7 @@ impl HealthChecker {
                     recover_due_passive_ejections_inner(
                         &passive_health,
                         lb_cache.as_ref(),
+                        None,
                         PassiveRecoveryInterleaveHooks::none(),
                     );
                 }
@@ -2685,7 +2764,7 @@ impl HealthChecker {
                                     if is_retired() {
                                         return;
                                     }
-                                    entry.insert(now_epoch_ms());
+                                    entry.insert(wall_now_epoch_ms());
                                     true
                                 }
                             }
@@ -4110,8 +4189,8 @@ fn remove_due_consecutive_ejection(
         Entry::Occupied(occupied) => {
             let current = occupied.get();
             if !(current.auto_recover
-                && now >= current.recover_at_ms
-                && current.recover_at_ms == snapshotted.recover_at_ms
+                && now >= current.recover_at_tick_ms
+                && current.recover_at_tick_ms == snapshotted.recover_at_tick_ms
                 && current.consecutive_generation == Some(generation))
             {
                 return None;
@@ -4128,9 +4207,10 @@ fn remove_due_consecutive_ejection(
 fn recover_due_passive_ejections_inner(
     passive_health: &DashMap<String, Arc<ProxyHealthState>>,
     lb_cache: Option<&Arc<LoadBalancerCache>>,
+    injected_monotonic_now_ms: Option<u64>,
     mut hooks: PassiveRecoveryInterleaveHooks<'_>,
 ) {
-    let now = now_epoch_ms();
+    let now = injected_monotonic_now_ms.unwrap_or_else(crate::socket_opts::monotonic_now_ms);
 
     let any_unhealthy = passive_health
         .iter()
@@ -4150,7 +4230,7 @@ fn recover_due_passive_ejections_inner(
             .iter()
             .filter(|e| {
                 let ejection = e.value();
-                ejection.auto_recover && now >= ejection.recover_at_ms
+                ejection.auto_recover && now >= ejection.recover_at_tick_ms
             })
             .map(|e| (e.key().clone(), e.value().clone()))
             .collect();
@@ -4177,7 +4257,7 @@ fn recover_due_passive_ejections_inner(
         for (hp, ejection) in &to_recover {
             // Remove only the snapshotted publication. A newer consecutive
             // generation (or a windowed re-ejection with a different deadline)
-            // stays. Equality on both `recover_at_ms` and
+            // stays. Equality on both `recover_at_tick_ms` and
             // `consecutive_generation` closes the same-millisecond ABA the
             // deadline alone cannot distinguish.
             //
@@ -4192,8 +4272,8 @@ fn recover_due_passive_ejections_inner(
                     .unhealthy
                     .remove_if(hp, |_, current| {
                         current.auto_recover
-                            && now >= current.recover_at_ms
-                            && current.recover_at_ms == ejection.recover_at_ms
+                            && now >= current.recover_at_tick_ms
+                            && current.recover_at_tick_ms == ejection.recover_at_tick_ms
                             && current.consecutive_generation.is_none()
                     })
                     .map(|(_, current)| current)
@@ -4241,11 +4321,15 @@ fn recover_due_passive_ejections_inner(
     }
 }
 
-fn now_epoch_ms() -> u64 {
+/// Wall-clock diagnostic source for admin-visible unhealthy timestamps. No
+/// passive failure window, ejection ordering, or recovery transition reads it.
+fn wall_now_epoch_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 /// Public wrapper around [`grpc_probe`] for use in unit/integration tests.

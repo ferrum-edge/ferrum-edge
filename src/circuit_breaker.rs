@@ -75,6 +75,11 @@ pub struct CircuitBreaker {
     packed: AtomicU64,
     failure_count: AtomicU32,
     success_count: AtomicU32,
+    /// Process-relative monotonic tick of the failure that opened/reopened the
+    /// breaker. This is the only timestamp consulted for state transitions.
+    last_failure_tick_ms: AtomicU64,
+    /// Unix epoch milliseconds for diagnostics only. Never consulted for a
+    /// breaker state transition, so wall-clock jumps cannot change recovery.
     last_failure_epoch_ms: AtomicU64,
     config: CircuitBreakerConfig,
 }
@@ -95,6 +100,7 @@ impl CircuitBreaker {
             packed: AtomicU64::new(pack_full(0, STATE_CLOSED, 0)),
             failure_count: AtomicU32::new(0),
             success_count: AtomicU32::new(0),
+            last_failure_tick_ms: AtomicU64::new(0),
             last_failure_epoch_ms: AtomicU64::new(0),
             config,
         }
@@ -107,9 +113,22 @@ impl CircuitBreaker {
     /// `record_failure` so the in-flight counter is decremented correctly).
     /// Returns `Ok(false)` for normal closed-state admission.
     /// Returns `Err` if the circuit is open and the request must be rejected.
+    #[inline]
     pub fn can_execute(&self) -> Result<bool, CircuitOpenError> {
+        self.can_execute_inner(None)
+    }
+
+    /// Deterministic-clock variant used by external unit tests.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn can_execute_at_for_test(&self, monotonic_now_ms: u64) -> Result<bool, CircuitOpenError> {
+        self.can_execute_inner(Some(monotonic_now_ms))
+    }
+
+    #[inline]
+    fn can_execute_inner(&self, monotonic_now_ms: Option<u64>) -> Result<bool, CircuitOpenError> {
         // Acquire pairs with the Release in record_failure() when transitioning
-        // CLOSED → OPEN, ensuring visibility of last_failure_epoch_ms and
+        // CLOSED → OPEN, ensuring visibility of last_failure_tick_ms and
         // failure_count. Using Relaxed here would risk stale reads on ARM/weak-
         // memory architectures, allowing requests to leak through after the
         // circuit opens. The ~5-15ns cost of Acquire is acceptable given that
@@ -118,9 +137,11 @@ impl CircuitBreaker {
         match packed_state(packed) {
             STATE_CLOSED => Ok(false),
             STATE_OPEN => {
-                // Check if timeout has elapsed
-                let now = now_epoch_ms();
-                let last_failure = self.last_failure_epoch_ms.load(Ordering::Relaxed);
+                // OPEN recovery is elapsed-time state, so it uses the single
+                // process-local monotonic origin. The clock is read only in
+                // OPEN; the common CLOSED request path remains one atomic load.
+                let now = monotonic_now_ms.unwrap_or_else(crate::socket_opts::monotonic_now_ms);
+                let last_failure = self.last_failure_tick_ms.load(Ordering::Relaxed);
                 let timeout_ms = self.config.timeout_seconds.saturating_mul(1000);
 
                 if now.saturating_sub(last_failure) >= timeout_ms {
@@ -322,6 +343,36 @@ impl CircuitBreaker {
         connection_error: bool,
         is_half_open_probe: bool,
     ) {
+        self.record_failure_inner(status_code, connection_error, is_half_open_probe, None);
+    }
+
+    /// Deterministic-clock variant used by external unit tests. Wall time is
+    /// injected separately to prove it remains diagnostic-only.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn record_failure_at_for_test(
+        &self,
+        status_code: u16,
+        connection_error: bool,
+        is_half_open_probe: bool,
+        monotonic_now_ms: u64,
+        wall_epoch_ms: u64,
+    ) {
+        self.record_failure_inner(
+            status_code,
+            connection_error,
+            is_half_open_probe,
+            Some((monotonic_now_ms, wall_epoch_ms)),
+        );
+    }
+
+    fn record_failure_inner(
+        &self,
+        status_code: u16,
+        connection_error: bool,
+        is_half_open_probe: bool,
+        injected_time: Option<(u64, u64)>,
+    ) {
         if connection_error {
             if !self.config.trip_on_connection_errors {
                 // Filtered failure — release the probe slot without state transition
@@ -340,12 +391,15 @@ impl CircuitBreaker {
         }
 
         let packed = self.packed.load(Ordering::Acquire);
-        let failure_time = now_epoch_ms();
+        let (failure_tick_ms, failure_epoch_ms) = injected_time
+            .unwrap_or_else(|| (crate::socket_opts::monotonic_now_ms(), wall_now_epoch_ms()));
 
         match packed_state(packed) {
             STATE_CLOSED => {
+                self.last_failure_tick_ms
+                    .store(failure_tick_ms, Ordering::Relaxed);
                 self.last_failure_epoch_ms
-                    .store(failure_time, Ordering::Relaxed);
+                    .store(failure_epoch_ms, Ordering::Relaxed);
                 // A half-open probe whose failure arrives only AFTER the breaker
                 // has already left HALF_OPEN — a sibling reached the success
                 // threshold and closed it, or this is a stale straggler from a
@@ -427,15 +481,17 @@ impl CircuitBreaker {
                 }
             }
             STATE_HALF_OPEN => {
+                self.last_failure_tick_ms
+                    .store(failure_tick_ms, Ordering::Relaxed);
                 self.last_failure_epoch_ms
-                    .store(failure_time, Ordering::Relaxed);
+                    .store(failure_epoch_ms, Ordering::Relaxed);
                 self.reopen_after_probe_failure();
             }
             STATE_OPEN if is_half_open_probe => {
                 // A concurrent record_failure already reopened the circuit between
                 // our can_execute() (when it was HALF_OPEN) and now. Release our
                 // slot (a no-op if the reopen already cleared the count). Do not
-                // refresh last_failure_epoch_ms: the reopen that published OPEN
+                // refresh either failure timestamp: the reopen that published OPEN
                 // already started the recovery timeout.
                 self.release_half_open_slot();
             }
@@ -548,6 +604,13 @@ impl CircuitBreaker {
     #[allow(dead_code)]
     pub fn last_failure_epoch_ms(&self) -> u64 {
         self.last_failure_epoch_ms.load(Ordering::Relaxed)
+    }
+
+    /// Last state-machine failure tick (for deterministic tests).
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn last_failure_tick_ms_for_test(&self) -> u64 {
+        self.last_failure_tick_ms.load(Ordering::Relaxed)
     }
 
     /// Current state name (for metrics/logging).
@@ -856,9 +919,12 @@ impl CircuitBreakerCache {
     }
 }
 
-fn now_epoch_ms() -> u64 {
+/// Wall-clock diagnostic only; breaker transitions never read this value.
+fn wall_now_epoch_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }

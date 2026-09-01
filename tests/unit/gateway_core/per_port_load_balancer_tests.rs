@@ -941,7 +941,8 @@ fn port_passive_ejection_cap_uses_only_targets_on_selected_port() {
         target_host_port_key(&targets[0]),
         ferrum_edge::health_check::PassiveEjection {
             ejected_at_ms: 100,
-            recover_at_ms: 100,
+            ejected_at_tick_ms: 100,
+            recover_at_tick_ms: 100,
             auto_recover: false,
             upstream_id: "test-upstream".to_string(),
             host: targets[0].host.clone(),
@@ -953,7 +954,8 @@ fn port_passive_ejection_cap_uses_only_targets_on_selected_port() {
         target_host_port_key(&targets[1]),
         ferrum_edge::health_check::PassiveEjection {
             ejected_at_ms: 200,
-            recover_at_ms: 200,
+            ejected_at_tick_ms: 200,
+            recover_at_tick_ms: 200,
             auto_recover: false,
             upstream_id: "test-upstream".to_string(),
             host: targets[1].host.clone(),
@@ -1043,7 +1045,8 @@ fn port_passive_ejection_cap_uses_only_targets_on_selected_port_vec_path() {
         target_host_port_key(&targets[0]),
         ferrum_edge::health_check::PassiveEjection {
             ejected_at_ms: 100,
-            recover_at_ms: 100,
+            ejected_at_tick_ms: 100,
+            recover_at_tick_ms: 100,
             auto_recover: false,
             upstream_id: "test-upstream".to_string(),
             host: targets[0].host.clone(),
@@ -1055,7 +1058,8 @@ fn port_passive_ejection_cap_uses_only_targets_on_selected_port_vec_path() {
         target_host_port_key(&targets[1]),
         ferrum_edge::health_check::PassiveEjection {
             ejected_at_ms: 200,
-            recover_at_ms: 200,
+            ejected_at_tick_ms: 200,
+            recover_at_tick_ms: 200,
             auto_recover: false,
             upstream_id: "test-upstream".to_string(),
             host: targets[1].host.clone(),
@@ -1405,14 +1409,15 @@ fn passive_ctx_ejecting<'a>(
         .expect("passive health state created")
         .clone();
     for (i, t) in ejected.iter().enumerate() {
-        // Deterministic ascending eject timestamps so re-admission (oldest
+        // Deterministic ascending eject ticks so re-admission (oldest
         // first) is predictable.
-        let ejected_at_ms = 100 + i as u64;
+        let ejected_at_tick_ms = 100 + i as u64;
         proxy_state.unhealthy.insert(
             target_host_port_key(t),
             ferrum_edge::health_check::PassiveEjection {
-                ejected_at_ms,
-                recover_at_ms: ejected_at_ms,
+                ejected_at_ms: ejected_at_tick_ms,
+                ejected_at_tick_ms,
+                recover_at_tick_ms: ejected_at_tick_ms,
                 auto_recover: false,
                 upstream_id: "test-upstream".to_string(),
                 host: t.host.clone(),

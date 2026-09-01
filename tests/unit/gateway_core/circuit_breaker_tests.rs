@@ -116,6 +116,63 @@ fn test_half_open_probe_failure_reopens() {
 }
 
 #[test]
+fn wall_clock_jumps_do_not_change_breaker_recovery_cycles() {
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 2,
+        timeout_seconds: 10,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+
+    cb.record_failure_at_for_test(500, false, false, 1_000, 50_000);
+    assert_eq!(cb.last_failure_tick_ms_for_test(), 1_000);
+    assert_eq!(cb.last_failure_epoch_ms(), 50_000);
+    assert!(cb.can_execute_at_for_test(10_999).is_err());
+
+    // The boundary fires exactly once: the winner claims the sole probe slot,
+    // and a second observation at the same monotonic tick cannot double-fire.
+    assert_eq!(cb.can_execute_at_for_test(11_000).ok(), Some(true));
+    assert!(cb.can_execute_at_for_test(11_000).is_err());
+
+    // Jump wall time backwards while monotonic time continues from the exact
+    // half-open boundary. The wall value remains visible for diagnostics only.
+    cb.record_failure_at_for_test(500, false, true, 11_000, 1);
+    assert_eq!(cb.state_name(), "open");
+    assert_eq!(cb.last_failure_tick_ms_for_test(), 11_000);
+    assert_eq!(cb.last_failure_epoch_ms(), 1);
+    assert!(cb.can_execute_at_for_test(20_999).is_err());
+    assert_eq!(cb.can_execute_at_for_test(21_000).ok(), Some(true));
+    assert!(cb.can_execute_at_for_test(21_000).is_err());
+
+    // A forward wall jump likewise cannot skip the next OPEN interval.
+    cb.record_failure_at_for_test(500, false, true, 21_000, 9_000_000_000_000);
+    assert_eq!(cb.last_failure_epoch_ms(), 9_000_000_000_000);
+    assert!(cb.can_execute_at_for_test(30_999).is_err());
+    assert_eq!(cb.can_execute_at_for_test(31_000).ok(), Some(true));
+    assert!(cb.can_execute_at_for_test(31_000).is_err());
+}
+
+#[test]
+fn saturated_monotonic_tick_keeps_unrepresentable_breaker_wait_closed() {
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        timeout_seconds: 1,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+
+    cb.record_failure_at_for_test(500, false, false, u64::MAX - 500, 123);
+    assert!(cb.can_execute_at_for_test(u64::MAX).is_err());
+    assert_eq!(cb.state_name(), "open");
+}
+
+#[test]
 fn open_state_half_open_straggler_does_not_refresh_recovery_timeout() {
     let config = CircuitBreakerConfig {
         failure_threshold: 1,
