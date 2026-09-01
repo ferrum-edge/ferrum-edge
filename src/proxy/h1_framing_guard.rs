@@ -13,14 +13,56 @@
 //! beyond a known body boundary; this hard-bounds the fixed signal ring's
 //! producer lead without limiting reads wholly inside a body. The configured
 //! Hyper head-buffer limit bounds work on an unterminated head.
+//!
+//! Three shapes that Hyper would reject during parse (conflicting
+//! `Content-Length` values, HTTP/1.0 + `Transfer-Encoding`, invalid UTF-8 on
+//! the request line) are identified here and answered with a precomputed
+//! JSON `400` written directly to the socket. Hyper never sees those
+//! requests. A well-formed head takes the same in-place observe path and the
+//! same vectored writes as on `main`. Other Hyper parse failures the scanner
+//! cannot name stay Hyper's empty-bodied `400`.
 
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+/// Parse-reject reasons the inbound scanner can name with confidence.
+pub(super) const PARSE_HINT_NONE: u8 = 0;
+pub(super) const PARSE_HINT_CONFLICTING_CONTENT_LENGTH: u8 = 1;
+pub(super) const PARSE_HINT_HTTP10_TRANSFER_ENCODING: u8 = 2;
+
+/// Request-line version token whose presence makes `Transfer-Encoding` a
+/// protocol error. Length-bound so the window width cannot drift from it.
+const HTTP_10_VERSION: &[u8] = b"HTTP/1.0";
+pub(super) const PARSE_HINT_INVALID_REQUEST_TARGET_UTF8: u8 = 3;
+
+const JSON_CONFLICTING_CONTENT_LENGTH: &str =
+    r#"{"error":"Multiple Content-Length headers with conflicting values"}"#;
+const JSON_HTTP10_TRANSFER_ENCODING: &str =
+    r#"{"error":"HTTP/1.0 does not support Transfer-Encoding"}"#;
+const JSON_MALFORMED_HTTP_REQUEST: &str = r#"{"error":"Malformed HTTP request"}"#;
+
+const _: () = {
+    assert!(JSON_CONFLICTING_CONTENT_LENGTH.len() == 67);
+    assert!(JSON_HTTP10_TRANSFER_ENCODING.len() == 55);
+    assert!(JSON_MALFORMED_HTTP_REQUEST.len() == 34);
+};
+
+const ENVELOPE_CONFLICTING_CONTENT_LENGTH: &[u8] = b"HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 67\r\nconnection: close\r\nx-gateway-error: request_error\r\n\r\n{\"error\":\"Multiple Content-Length headers with conflicting values\"}";
+const ENVELOPE_HTTP10_TRANSFER_ENCODING: &[u8] = b"HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 55\r\nconnection: close\r\nx-gateway-error: request_error\r\n\r\n{\"error\":\"HTTP/1.0 does not support Transfer-Encoding\"}";
+const ENVELOPE_MALFORMED_HTTP_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 34\r\nconnection: close\r\nx-gateway-error: request_error\r\n\r\n{\"error\":\"Malformed HTTP request\"}";
+
+pub(super) fn envelope_for_hint(hint: u8) -> &'static [u8] {
+    match hint {
+        PARSE_HINT_CONFLICTING_CONTENT_LENGTH => ENVELOPE_CONFLICTING_CONTENT_LENGTH,
+        PARSE_HINT_HTTP10_TRANSFER_ENCODING => ENVELOPE_HTTP10_TRANSFER_ENCODING,
+        _ => ENVELOPE_MALFORMED_HTTP_REQUEST,
+    }
+}
 
 const H2_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const OBSERVED_READ_CAP: usize = 8 * 1024;
@@ -80,6 +122,7 @@ pub(super) struct H1FramingSignals {
     overflowed: AtomicBool,
     unknown: AtomicBool,
     observation_disabled: AtomicBool,
+    parse_reject_hint: AtomicU8,
 }
 
 impl H1FramingSignals {
@@ -91,7 +134,25 @@ impl H1FramingSignals {
             overflowed: AtomicBool::new(false),
             unknown: AtomicBool::new(false),
             observation_disabled: AtomicBool::new(false),
+            parse_reject_hint: AtomicU8::new(PARSE_HINT_NONE),
         }
+    }
+
+    fn store_parse_reject_hint(&self, hint: u8) {
+        if hint == PARSE_HINT_NONE {
+            return;
+        }
+        let _ = self.parse_reject_hint.compare_exchange(
+            PARSE_HINT_NONE,
+            hint,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn take_parse_reject_hint(&self) -> u8 {
+        self.parse_reject_hint
+            .swap(PARSE_HINT_NONE, Ordering::AcqRel)
     }
 
     fn conflict_ring(&self) -> &[AtomicU64; SIGNAL_WORDS] {
@@ -182,11 +243,43 @@ impl H1FramingSignals {
     }
 }
 
+enum ParseRejectWrite {
+    Idle,
+    Writing {
+        envelope: &'static [u8],
+        offset: usize,
+    },
+    Written,
+}
+
+impl ParseRejectWrite {
+    fn is_idle(&self) -> bool {
+        matches!(self, Self::Idle)
+    }
+}
+
 /// Transparent I/O adapter that observes HTTP/1 request framing before Hyper.
 pub(super) struct H1FramingGuardIo<T> {
     inner: T,
     scanner: WireScanner,
     signals: Arc<H1FramingSignals>,
+    parse_reject: ParseRejectWrite,
+    /// Whether Hyper has already written response bytes on this connection.
+    ///
+    /// The parse-reject envelope is written straight to `inner` from inside
+    /// `poll_read`, bypassing Hyper's write buffer. Hyper's HTTP/1 *server*
+    /// reads the next request head while an earlier response is still being
+    /// written (`should_read_first()` is true for servers, and the dispatch
+    /// loop polls read before flush), so on a keep-alive connection under
+    /// write backpressure a pipelined malformed request would splice the
+    /// envelope into the middle of the previous response.
+    ///
+    /// The envelope is therefore armed only before the first response byte —
+    /// the fresh-connection case, which is every real client that sends one
+    /// malformed request. A malformed request pipelined behind a response
+    /// falls back to Hyper's own empty-bodied `400`, the same documented
+    /// residual as the parse failures the scanner cannot name.
+    wrote_response_bytes: bool,
 }
 
 impl<T> H1FramingGuardIo<T> {
@@ -197,19 +290,77 @@ impl<T> H1FramingGuardIo<T> {
                 inner,
                 scanner: WireScanner::new(max_head_bytes),
                 signals: Arc::clone(&signals),
+                parse_reject: ParseRejectWrite::Idle,
+                wrote_response_bytes: false,
             },
             signals,
         )
     }
 }
 
-impl<T: AsyncRead + Unpin> AsyncRead for H1FramingGuardIo<T> {
+impl<T: AsyncWrite + Unpin> H1FramingGuardIo<T> {
+    fn begin_parse_reject(&mut self, hint: u8) {
+        if !self.parse_reject.is_idle() {
+            return;
+        }
+        tracing::warn!(
+            gateway_error = "request_error",
+            parse_reject_hint = hint,
+            "Rejected HTTP/1 request before Hyper parse"
+        );
+        self.signals.disable_observation();
+        self.parse_reject = ParseRejectWrite::Writing {
+            envelope: envelope_for_hint(hint),
+            offset: 0,
+        };
+    }
+
+    fn poll_write_envelope(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            let (envelope, offset) = match self.parse_reject {
+                ParseRejectWrite::Idle | ParseRejectWrite::Written => {
+                    return Poll::Ready(Ok(()));
+                }
+                ParseRejectWrite::Writing { envelope, offset } => {
+                    if offset >= envelope.len() {
+                        self.parse_reject = ParseRejectWrite::Written;
+                        return Poll::Ready(Ok(()));
+                    }
+                    (envelope, offset)
+                }
+            };
+            let wrote = ready!(Pin::new(&mut self.inner).poll_write(cx, &envelope[offset..],))?;
+            if wrote == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write HTTP/1 parse-reject envelope",
+                )));
+            }
+            match &mut self.parse_reject {
+                ParseRejectWrite::Writing { offset, .. } => {
+                    *offset += wrote;
+                }
+                _ => return Poll::Ready(Ok(())),
+            }
+        }
+    }
+
+    fn poll_finish_parse_reject(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        ready!(self.poll_write_envelope(cx))?;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for H1FramingGuardIo<T> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if !this.parse_reject.is_idle() {
+            return this.poll_finish_parse_reject(cx);
+        }
         this.scanner.disable_if_requested(&this.signals);
         let filled_before = buf.filled().len();
         let cap = this.scanner.read_cap(buf.remaining());
@@ -239,6 +390,24 @@ impl<T: AsyncRead + Unpin> AsyncRead for H1FramingGuardIo<T> {
                 this.scanner
                     .observe(&buf.filled()[filled_before..], &this.signals);
             }
+            if this.parse_reject.is_idle() {
+                let hint = this.signals.take_parse_reject_hint();
+                if hint != PARSE_HINT_NONE {
+                    if this.wrote_response_bytes {
+                        // See `wrote_response_bytes`: writing the envelope now
+                        // would interleave it with an in-flight response.
+                        tracing::debug!(
+                            parse_reject_hint = hint,
+                            "HTTP/1 parse reject after a response began; \
+                             deferring to Hyper's empty 400"
+                        );
+                    } else {
+                        buf.set_filled(filled_before);
+                        this.begin_parse_reject(hint);
+                        return this.poll_finish_parse_reject(cx);
+                    }
+                }
+            }
         }
         result
     }
@@ -250,15 +419,32 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for H1FramingGuardIo<T> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        let this = self.get_mut();
+        if !this.parse_reject.is_idle() {
+            ready!(this.poll_write_envelope(cx))?;
+            return Poll::Ready(Ok(buf.len()));
+        }
+        let wrote = ready!(Pin::new(&mut this.inner).poll_write(cx, buf))?;
+        if wrote > 0 {
+            this.wrote_response_bytes = true;
+        }
+        Poll::Ready(Ok(wrote))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        let this = self.get_mut();
+        if !this.parse_reject.is_idle() {
+            ready!(this.poll_write_envelope(cx))?;
+        }
+        Pin::new(&mut this.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        let this = self.get_mut();
+        if !this.parse_reject.is_idle() {
+            ready!(this.poll_write_envelope(cx))?;
+        }
+        Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 
     fn poll_write_vectored(
@@ -266,7 +452,17 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for H1FramingGuardIo<T> {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx, bufs)
+        let this = self.get_mut();
+        if !this.parse_reject.is_idle() {
+            ready!(this.poll_write_envelope(cx))?;
+            let total = bufs.iter().map(|slice| slice.len()).sum();
+            return Poll::Ready(Ok(total));
+        }
+        let wrote = ready!(Pin::new(&mut this.inner).poll_write_vectored(cx, bufs))?;
+        if wrote > 0 {
+            this.wrote_response_bytes = true;
+        }
+        Poll::Ready(Ok(wrote))
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -297,7 +493,7 @@ impl<T> MaybeH1FramingGuardIo<T> {
     }
 }
 
-impl<T: AsyncRead + Unpin> AsyncRead for MaybeH1FramingGuardIo<T> {
+impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for MaybeH1FramingGuardIo<T> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -479,7 +675,7 @@ impl H1StreamScanner {
         while offset < bytes.len() {
             let transition = match &mut self.state {
                 H1State::Head(head) => {
-                    let step = head.observe(bytes[offset]);
+                    let step = head.observe(bytes[offset], signals);
                     offset += 1;
                     match step {
                         HeadStep::Continue => None,
@@ -602,6 +798,45 @@ impl ContentLengthScanner {
     }
 }
 
+struct RequestLineUtf8 {
+    partial: [u8; 4],
+    partial_len: u8,
+    invalid: bool,
+}
+
+impl RequestLineUtf8 {
+    fn new() -> Self {
+        Self {
+            partial: [0; 4],
+            partial_len: 0,
+            invalid: false,
+        }
+    }
+
+    fn observe(&mut self, byte: u8) {
+        if self.invalid {
+            return;
+        }
+        let len = self.partial_len as usize;
+        if len >= self.partial.len() {
+            self.invalid = true;
+            return;
+        }
+        self.partial[len] = byte;
+        self.partial_len += 1;
+        let slice = &self.partial[..self.partial_len as usize];
+        match std::str::from_utf8(slice) {
+            Ok(_) => self.partial_len = 0,
+            Err(err) if err.error_len().is_none() => {}
+            Err(_) => self.invalid = true,
+        }
+    }
+
+    fn finish_ok(&self) -> bool {
+        !self.invalid && self.partial_len == 0
+    }
+}
+
 struct HeadScanner {
     max_bytes: usize,
     bytes_seen: usize,
@@ -618,6 +853,10 @@ struct HeadScanner {
     seen_content_length: bool,
     seen_transfer_encoding: bool,
     conflict: bool,
+    http10_request: bool,
+    request_line_utf8: RequestLineUtf8,
+    request_line_tail: [u8; 12],
+    request_line_tail_len: usize,
 }
 
 impl HeadScanner {
@@ -628,20 +867,24 @@ impl HeadScanner {
             request_line: true,
             line_has_data: false,
             pending_cr: false,
-            current_header: CurrentHeader::Other,
+            current_header: CurrentHeader::Name,
             name_len: 0,
-            content_length_candidate: false,
-            transfer_encoding_candidate: false,
+            content_length_candidate: true,
+            transfer_encoding_candidate: true,
             content_length_value: ContentLengthScanner::new(),
             canonical_content_length: None,
             content_length_valid: true,
             seen_content_length: false,
             seen_transfer_encoding: false,
             conflict: false,
+            http10_request: false,
+            request_line_utf8: RequestLineUtf8::new(),
+            request_line_tail: [0; 12],
+            request_line_tail_len: 0,
         }
     }
 
-    fn observe(&mut self, byte: u8) -> HeadStep {
+    fn observe(&mut self, byte: u8, signals: &H1FramingSignals) -> HeadStep {
         self.bytes_seen = self.bytes_seen.saturating_add(1);
         if self.bytes_seen > self.max_bytes {
             return HeadStep::Disable;
@@ -650,9 +893,10 @@ impl HeadScanner {
         if self.pending_cr {
             self.pending_cr = false;
             if byte == b'\n' {
-                return self.finish_line();
+                return self.finish_line(signals);
             }
             self.observe_line_byte(b'\r');
+            self.store_utf8_hint_if_invalid(signals);
         }
 
         match byte {
@@ -660,9 +904,10 @@ impl HeadScanner {
                 self.pending_cr = true;
                 HeadStep::Continue
             }
-            b'\n' => self.finish_line(),
+            b'\n' => self.finish_line(signals),
             _ => {
                 self.observe_line_byte(byte);
+                self.store_utf8_hint_if_invalid(signals);
                 HeadStep::Continue
             }
         }
@@ -670,7 +915,20 @@ impl HeadScanner {
 
     fn observe_line_byte(&mut self, byte: u8) {
         self.line_has_data = true;
-        if self.request_line || self.conflict {
+        if self.request_line {
+            self.request_line_utf8.observe(byte);
+            if self.request_line_tail_len < self.request_line_tail.len() {
+                self.request_line_tail[self.request_line_tail_len] = byte;
+                self.request_line_tail_len += 1;
+            } else {
+                self.request_line_tail.copy_within(1.., 0);
+                if let Some(slot) = self.request_line_tail.last_mut() {
+                    *slot = byte;
+                }
+            }
+            return;
+        }
+        if self.conflict {
             return;
         }
 
@@ -702,12 +960,15 @@ impl HeadScanner {
         }
     }
 
-    fn finish_line(&mut self) -> HeadStep {
+    fn finish_line(&mut self, signals: &H1FramingSignals) -> HeadStep {
         if !self.line_has_data {
             if self.request_line {
                 // httparse skips any run of CRLF or bare LF before the request
                 // line, so an empty leading line is not a request head.
                 return HeadStep::Continue;
+            }
+            if self.http10_request && self.seen_transfer_encoding {
+                signals.store_parse_reject_hint(PARSE_HINT_HTTP10_TRANSFER_ENCODING);
             }
             let framing = if self.seen_transfer_encoding {
                 BodyFraming::Chunked
@@ -730,6 +991,15 @@ impl HeadScanner {
 
         if self.request_line {
             self.request_line = false;
+            // `b"HTTP/1.0"` is 8 bytes: a 9-byte window can never compare
+            // equal to it, so `windows(9)` silently made this always false.
+            self.http10_request = self
+                .request_line_tail
+                .windows(HTTP_10_VERSION.len())
+                .any(|window| window.eq_ignore_ascii_case(HTTP_10_VERSION));
+            if !self.request_line_utf8.finish_ok() {
+                signals.store_parse_reject_hint(PARSE_HINT_INVALID_REQUEST_TARGET_UTF8);
+            }
         } else if matches!(self.current_header, CurrentHeader::ContentLength) && !self.conflict {
             match self.content_length_value.finish() {
                 Some(value)
@@ -738,8 +1008,16 @@ impl HeadScanner {
                 {
                     self.canonical_content_length = Some(value);
                 }
-                Some(_) | None => self.content_length_valid = false,
+                Some(_) => {
+                    self.content_length_valid = false;
+                    signals.store_parse_reject_hint(PARSE_HINT_CONFLICTING_CONTENT_LENGTH);
+                }
+                None => self.content_length_valid = false,
             }
+        }
+
+        if self.http10_request && self.seen_transfer_encoding {
+            signals.store_parse_reject_hint(PARSE_HINT_HTTP10_TRANSFER_ENCODING);
         }
 
         self.line_has_data = false;
@@ -747,7 +1025,14 @@ impl HeadScanner {
         self.name_len = 0;
         self.content_length_candidate = true;
         self.transfer_encoding_candidate = true;
+        self.request_line_tail_len = 0;
         HeadStep::Continue
+    }
+
+    fn store_utf8_hint_if_invalid(&self, signals: &H1FramingSignals) {
+        if self.request_line && self.request_line_utf8.invalid {
+            signals.store_parse_reject_hint(PARSE_HINT_INVALID_REQUEST_TARGET_UTF8);
+        }
     }
 }
 
@@ -970,6 +1255,7 @@ mod tests {
         results: Vec<H1FramingResult>,
         overflowed: bool,
         unknown: bool,
+        parse_reject_hint: u8,
     }
 
     fn scan(parts: &[&[u8]]) -> ScanOutcome {
@@ -992,6 +1278,7 @@ mod tests {
             results,
             overflowed: signals.overflowed.load(Ordering::Acquire),
             unknown: signals.unknown.load(Ordering::Acquire),
+            parse_reject_hint: signals.parse_reject_hint.load(Ordering::Acquire),
         }
     }
 
@@ -1201,5 +1488,172 @@ mod tests {
         assert_eq!(signals.consumed.load(Ordering::Acquire), 1);
         assert!(!signals.overflowed.load(Ordering::Acquire));
         assert!(!signals.unknown.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn parse_reject_hints_cover_known_hyper_parse_shapes() {
+        let conflicting = scan(&[
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nContent-Length: 0\r\n\r\n",
+        ]);
+        assert_eq!(
+            conflicting.parse_reject_hint,
+            PARSE_HINT_CONFLICTING_CONTENT_LENGTH
+        );
+
+        let http10_te = scan(&[b"GET / HTTP/1.0\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n"]);
+        assert_eq!(
+            http10_te.parse_reject_hint,
+            PARSE_HINT_HTTP10_TRANSFER_ENCODING
+        );
+
+        let latin1_target = scan(&[b"GET /\xE9 HTTP/1.1\r\nHost: a\r\n\r\n"]);
+        assert_eq!(
+            latin1_target.parse_reject_hint,
+            PARSE_HINT_INVALID_REQUEST_TARGET_UTF8
+        );
+    }
+
+    #[test]
+    fn valid_utf8_request_target_is_not_a_parse_reject() {
+        let cafe = scan(&[b"GET /caf\xC3\xA9 HTTP/1.1\r\nHost: a\r\n\r\n"]);
+        assert_eq!(cafe.parse_reject_hint, PARSE_HINT_NONE);
+        assert_eq!(cafe.results, [H1FramingResult::Clear]);
+    }
+
+    #[test]
+    fn handler_layer_shapes_do_not_publish_parse_reject_hints() {
+        let cl_te = scan(&[
+            b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nContent-Length: 6\r\n\r\n0\r\n\r\n",
+        ]);
+        assert_eq!(cl_te.parse_reject_hint, PARSE_HINT_NONE);
+        assert_eq!(cl_te.results, [H1FramingResult::Conflict]);
+
+        let dup_host = scan(&[b"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"]);
+        assert_eq!(dup_host.parse_reject_hint, PARSE_HINT_NONE);
+        assert_eq!(dup_host.results, [H1FramingResult::Clear]);
+    }
+
+    #[test]
+    fn parse_reject_envelopes_match_check_protocol_headers_bodies() {
+        fn envelope_body(envelope: &[u8]) -> &[u8] {
+            envelope
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|idx| &envelope[idx + 4..])
+                .expect("envelope must include a body")
+        }
+
+        let conflicting = envelope_for_hint(PARSE_HINT_CONFLICTING_CONTENT_LENGTH);
+        assert_eq!(
+            envelope_body(conflicting),
+            JSON_CONFLICTING_CONTENT_LENGTH.as_bytes()
+        );
+        let conflicting_text = std::str::from_utf8(conflicting).expect("utf-8 envelope");
+        assert!(conflicting_text.contains("content-type: application/json"));
+        assert!(conflicting_text.contains("x-gateway-error: request_error"));
+        assert!(conflicting_text.contains("connection: close"));
+
+        let http10_te = envelope_for_hint(PARSE_HINT_HTTP10_TRANSFER_ENCODING);
+        assert_eq!(
+            envelope_body(http10_te),
+            JSON_HTTP10_TRANSFER_ENCODING.as_bytes()
+        );
+
+        let malformed = envelope_for_hint(PARSE_HINT_INVALID_REQUEST_TARGET_UTF8);
+        assert_eq!(
+            envelope_body(malformed),
+            JSON_MALFORMED_HTTP_REQUEST.as_bytes()
+        );
+    }
+
+    /// Minimal duplex used to drive `H1FramingGuardIo` directly: `reads` are
+    /// handed out one chunk per `poll_read`, and everything written lands in
+    /// `written` so a test can prove exactly what reached the socket.
+    struct MockIo {
+        reads: std::collections::VecDeque<Vec<u8>>,
+        written: Vec<u8>,
+    }
+
+    impl MockIo {
+        fn new(reads: &[&[u8]]) -> Self {
+            Self {
+                reads: reads.iter().map(|chunk| chunk.to_vec()).collect(),
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl AsyncRead for MockIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if let Some(chunk) = self.reads.pop_front() {
+                buf.put_slice(&chunk);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for MockIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    const CONFLICTING_CL_HEAD: &[u8] =
+        b"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n";
+
+    /// Read the guard once per queued chunk and report what reached the socket.
+    fn drive(io_reads: &[&[u8]], preceding_response: Option<&[u8]>) -> Vec<u8> {
+        let (mut guard, _signals) =
+            H1FramingGuardIo::new(MockIo::new(io_reads), TEST_MAX_HEAD_BYTES);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+
+        if let Some(response) = preceding_response {
+            let wrote = Pin::new(&mut guard).poll_write(&mut cx, response);
+            assert!(matches!(wrote, Poll::Ready(Ok(n)) if n == response.len()));
+        }
+
+        let mut storage = [0u8; 4096];
+        for _ in 0..io_reads.len() {
+            let mut buf = ReadBuf::new(&mut storage);
+            let _ = Pin::new(&mut guard).poll_read(&mut cx, &mut buf);
+        }
+        guard.inner.written
+    }
+
+    #[test]
+    fn parse_reject_envelope_is_written_on_a_fresh_connection() {
+        let written = drive(&[CONFLICTING_CL_HEAD], None);
+        assert_eq!(
+            written, ENVELOPE_CONFLICTING_CONTENT_LENGTH,
+            "a malformed first request must get the JSON envelope"
+        );
+    }
+
+    #[test]
+    fn parse_reject_envelope_is_withheld_once_a_response_has_begun() {
+        let response = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
+        let written = drive(&[CONFLICTING_CL_HEAD], Some(response));
+        assert_eq!(
+            written, response,
+            "the envelope must never be spliced into an in-flight response; a \
+             malformed request pipelined behind one falls back to Hyper's 400"
+        );
     }
 }

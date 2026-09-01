@@ -244,6 +244,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `H3_NO_ERROR` (`0x0100`). `FERRUM_SHUTDOWN_DRAIN_SECONDS` semantics are
   unchanged. **Operator action**: none; planned restarts now drain HTTP/3 the
   same way as HTTP/1.1 and HTTP/2.
+- **HTTP/1.1 parser-layer 400s now return the JSON protocol-reject envelope**
+  (issue #4393). Conflicting `Content-Length`, HTTP/1.0 +
+  `Transfer-Encoding`, and an invalid UTF-8 request-target previously answered
+  `400 Bad Request` with an empty body because Hyper rejected them during
+  header parse, before `check_protocol_headers()` ran. The HTTP/1 framing
+  guard now detects those three shapes on the inbound head and writes a
+  static `400` with `Content-Type: application/json`, the matching
+  `{"error":"..."}` body, `X-Gateway-Error: request_error`, and
+  `Connection: close` directly on the connection so Hyper never sees the
+  request. Well-formed requests keep the existing observe path and vectored
+  writes. Other Hyper parse failures the guard cannot name stay empty-bodied
+  `400`s, as does a malformed request pipelined behind a response on a
+  keep-alive connection (the envelope is armed only before the connection's
+  first response byte, so it can never be spliced into an in-flight
+  response). Not marked **BREAKING**: status remains `400`, connection close
+  semantics are unchanged, and clients that ignored the body are unaffected;
+  only strict empty-body assertions need updating.
 
 - **Injector inbound capture excludes kubelet HTTP and TCP probe ports**
   (issue #4431). `startupProbe` / `readinessProbe` / `livenessProbe` `httpGet`

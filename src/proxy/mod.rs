@@ -50,6 +50,30 @@ pub mod gateway_listener;
 pub mod gateway_listener_status;
 pub mod grpc_proxy;
 mod h1_framing_guard;
+
+// `tests/` is a separate crate, so these are unreachable from the
+// `ferrum-edge` binary target and would otherwise be reported as dead code
+// there. They exist only so external tests can drive the production
+// envelope mapping instead of restating its bytes.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn envelope_for_hint_for_test(hint: u8) -> &'static [u8] {
+    h1_framing_guard::envelope_for_hint(hint)
+}
+
+#[doc(hidden)]
+#[allow(dead_code)]
+pub const PARSE_HINT_CONFLICTING_CONTENT_LENGTH_FOR_TEST: u8 =
+    h1_framing_guard::PARSE_HINT_CONFLICTING_CONTENT_LENGTH;
+#[doc(hidden)]
+#[allow(dead_code)]
+pub const PARSE_HINT_HTTP10_TRANSFER_ENCODING_FOR_TEST: u8 =
+    h1_framing_guard::PARSE_HINT_HTTP10_TRANSFER_ENCODING;
+#[doc(hidden)]
+#[allow(dead_code)]
+pub const PARSE_HINT_INVALID_REQUEST_TARGET_UTF8_FOR_TEST: u8 =
+    h1_framing_guard::PARSE_HINT_INVALID_REQUEST_TARGET_UTF8;
+
 /// Shared h2c (cleartext, prior-knowledge HTTP/2) peer-preface observation.
 /// Hyper's client handshake proves only the client half, so both h2c transports
 /// — the pooled gRPC path and the Unix-socket path — establish through here.

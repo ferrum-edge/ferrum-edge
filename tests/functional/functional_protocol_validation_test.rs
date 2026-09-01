@@ -729,21 +729,18 @@ async fn h3_get_with_startup_retry(
 async fn functional_protocol_validation_http10_plus_te_rejected() {
     let h = Harness::new(false).await;
 
+    const ERROR_BODY: &str = r#"{"error":"HTTP/1.0 does not support Transfer-Encoding"}"#;
     let req = b"GET / HTTP/1.0\r\n\
                 Host: example.com\r\n\
                 Transfer-Encoding: chunked\r\n\
                 \r\n";
     let resp = send_raw_h1(h.proxy_port, req).await;
 
-    // Either hyper rejects this at parse time (empty body) or the gateway's
-    // check_protocol_headers() produces its JSON body. In both cases status
-    // must be 4xx (never 2xx).
-    assert!(
-        resp.status_code >= 400 && resp.status_code < 500,
-        "expected 4xx rejection, got status={} body={}",
-        resp.status_code,
-        resp.body
-    );
+    assert_eq!(resp.status_code, 400, "body={}", resp.body);
+    assert_eq!(resp.body, ERROR_BODY);
+    assert_eq!(raw_header(&resp, "content-type"), Some("application/json"));
+    assert_eq!(raw_header(&resp, "x-gateway-error"), Some("request_error"));
+    assert_eq!(raw_header(&resp, "connection"), Some("close"));
 
     h.cleanup();
 }
@@ -915,6 +912,8 @@ async fn functional_protocol_validation_nonempty_rejected_chunk_closes_pipeline(
 async fn functional_protocol_validation_multiple_content_length_conflicting() {
     let h = Harness::new(false).await;
 
+    const ERROR_BODY: &str =
+        r#"{"error":"Multiple Content-Length headers with conflicting values"}"#;
     let req = b"POST / HTTP/1.1\r\n\
                 Host: example.com\r\n\
                 Content-Length: 5\r\n\
@@ -923,15 +922,11 @@ async fn functional_protocol_validation_multiple_content_length_conflicting() {
                 hello";
     let resp = send_raw_h1(h.proxy_port, req).await;
 
-    // hyper may reject malformed CL framing before the gateway's handler runs,
-    // producing an empty-bodied 4xx response. Either way the request MUST NOT
-    // be forwarded as a valid 2xx.
-    assert!(
-        resp.status_code >= 400 && resp.status_code < 500,
-        "expected 4xx rejection, got status={} body={}",
-        resp.status_code,
-        resp.body
-    );
+    assert_eq!(resp.status_code, 400, "body={}", resp.body);
+    assert_eq!(resp.body, ERROR_BODY);
+    assert_eq!(raw_header(&resp, "content-type"), Some("application/json"));
+    assert_eq!(raw_header(&resp, "x-gateway-error"), Some("request_error"));
+    assert_eq!(raw_header(&resp, "connection"), Some("close"));
 
     h.cleanup();
 }
@@ -969,6 +964,7 @@ async fn functional_protocol_validation_non_numeric_content_length() {
 async fn functional_protocol_validation_multiple_host_headers_rejected() {
     let h = Harness::new(false).await;
 
+    const ERROR_BODY: &str = r#"{"error":"Request contains multiple Host headers"}"#;
     let req = b"GET / HTTP/1.1\r\n\
                 Host: example.com\r\n\
                 Host: evil.com\r\n\
@@ -976,11 +972,64 @@ async fn functional_protocol_validation_multiple_host_headers_rejected() {
     let resp = send_raw_h1(h.proxy_port, req).await;
 
     assert_eq!(resp.status_code, 400, "body={}", resp.body);
-    assert!(
-        resp.body.to_lowercase().contains("multiple host"),
-        "unexpected body: {}",
-        resp.body
-    );
+    assert_eq!(resp.body, ERROR_BODY);
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_non_utf8_request_target_rejected() {
+    let h = Harness::new(false).await;
+
+    const ERROR_BODY: &str = r#"{"error":"Malformed HTTP request"}"#;
+    let req = b"GET /\xE9 HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+
+    assert_eq!(resp.status_code, 400, "body={}", resp.body);
+    assert_eq!(resp.body, ERROR_BODY);
+    assert_eq!(raw_header(&resp, "content-type"), Some("application/json"));
+    assert_eq!(raw_header(&resp, "x-gateway-error"), Some("request_error"));
+    assert_eq!(raw_header(&resp, "connection"), Some("close"));
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_handler_layer_te_cl_body_unchanged() {
+    let h = Harness::new(false).await;
+
+    const ERROR_BODY: &str =
+        r#"{"error":"Request contains both Content-Length and Transfer-Encoding headers"}"#;
+    let req = b"POST / HTTP/1.1\r\n\
+                Host: app.example\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Content-Length: 6\r\n\
+                \r\n\
+                0\r\n\r\n";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+    assert_eq!(resp.status_code, 400);
+    assert_eq!(resp.body, ERROR_BODY);
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_normal_h1_request_unaffected() {
+    let h = Harness::new(false).await;
+
+    let req = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+
+    assert_eq!(resp.status_code, 200, "body={}", resp.body);
+    // The header-echo backend answers `text/plain` only for `/large-response`;
+    // every other path echoes the request headers as JSON. The point of this
+    // test is that an admitted request still reaches the backend and carries no
+    // gateway envelope, so assert the backend's own content type.
+    assert_eq!(raw_header(&resp, "content-type"), Some("application/json"));
+    assert!(raw_header(&resp, "x-gateway-error").is_none());
 
     h.cleanup();
 }

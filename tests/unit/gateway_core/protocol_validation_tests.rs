@@ -1443,3 +1443,47 @@ fn hyper_headermap_normalizes_header_names() {
     // This means our check_protocol_headers checks (which use lowercase strings)
     // will always match regardless of how the client sent the header name.
 }
+
+// ============================================================================
+// HTTP/1 parse-error JSON envelopes (issue #4393)
+// ============================================================================
+
+#[test]
+fn h1_parse_envelope_bytes_match_check_protocol_headers_messages() {
+    use ferrum_edge::proxy::{
+        PARSE_HINT_CONFLICTING_CONTENT_LENGTH_FOR_TEST,
+        PARSE_HINT_HTTP10_TRANSFER_ENCODING_FOR_TEST,
+        PARSE_HINT_INVALID_REQUEST_TARGET_UTF8_FOR_TEST, envelope_for_hint_for_test,
+    };
+
+    fn envelope_body(envelope: &[u8]) -> &[u8] {
+        let idx = envelope
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("envelope must include a body");
+        &envelope[idx + 4..]
+    }
+
+    let conflicting = envelope_for_hint_for_test(PARSE_HINT_CONFLICTING_CONTENT_LENGTH_FOR_TEST);
+    assert_eq!(
+        std::str::from_utf8(envelope_body(conflicting)).expect("json body"),
+        r#"{"error":"Multiple Content-Length headers with conflicting values"}"#
+    );
+
+    let http10_te = envelope_for_hint_for_test(PARSE_HINT_HTTP10_TRANSFER_ENCODING_FOR_TEST);
+    assert_eq!(
+        std::str::from_utf8(envelope_body(http10_te)).expect("json body"),
+        r#"{"error":"HTTP/1.0 does not support Transfer-Encoding"}"#
+    );
+
+    let malformed = envelope_for_hint_for_test(PARSE_HINT_INVALID_REQUEST_TARGET_UTF8_FOR_TEST);
+    assert_eq!(
+        std::str::from_utf8(envelope_body(malformed)).expect("json body"),
+        r#"{"error":"Malformed HTTP request"}"#
+    );
+    assert!(
+        std::str::from_utf8(conflicting)
+            .expect("utf-8 envelope")
+            .contains("x-gateway-error: request_error")
+    );
+}
