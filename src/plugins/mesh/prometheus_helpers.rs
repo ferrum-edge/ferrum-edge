@@ -60,6 +60,14 @@ static MESH_CONFIG_REVISION_ADOPTIONS: AtomicU64 = AtomicU64::new(0);
 static MESH_SUBSCRIBE_AUDIENCE_REJECTIONS: LazyLock<
     DashMap<MeshSubscribeAudienceRejectKey, AtomicU64>,
 > = LazyLock::new(DashMap::new);
+/// Shared CP configuration-stream admission metrics (issue #4432). Both key
+/// segments are compile-time constants selected by the three server handlers.
+static CP_GRPC_STREAM_ADMISSION_REJECTIONS: LazyLock<
+    DashMap<(&'static str, &'static str), AtomicU64>,
+> = LazyLock::new(DashMap::new);
+static CP_GRPC_ACTIVE_STREAMS: AtomicU64 = AtomicU64::new(0);
+static CP_GRPC_ACTIVE_NODE_IDS: AtomicU64 = AtomicU64::new(0);
+static CP_GRPC_ADMISSION_OBSERVED: AtomicU64 = AtomicU64::new(0);
 static XDS_STREAMS_REJECTED: AtomicU64 = AtomicU64::new(0);
 /// Per-reason ADS admission rejections (issue #3741). The key is always a
 /// compile-time `XdsAdmissionRejection::metric_reason()` constant, so the series
@@ -922,6 +930,25 @@ pub fn increment_xds_stream_rejected() {
     XDS_STREAMS_REJECTED.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Count one shared CP gRPC stream refusal. `surface` and `reason` are closed
+/// enums at the call site; no namespace, subject, or node id is accepted here.
+pub fn increment_cp_grpc_stream_admission_rejection(surface: &'static str, reason: &'static str) {
+    CP_GRPC_STREAM_ADMISSION_REJECTIONS
+        .entry((surface, reason))
+        .or_insert_with(|| AtomicU64::new(0))
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn adjust_cp_grpc_active_streams(delta: i64) {
+    apply_admission_gauge_delta(&CP_GRPC_ACTIVE_STREAMS, delta);
+    CP_GRPC_ADMISSION_OBSERVED.store(1, Ordering::Relaxed);
+}
+
+pub(crate) fn adjust_cp_grpc_active_node_ids(delta: i64) {
+    apply_admission_gauge_delta(&CP_GRPC_ACTIVE_NODE_IDS, delta);
+    CP_GRPC_ADMISSION_OBSERVED.store(1, Ordering::Relaxed);
+}
+
 /// Count an ADS admission rejection by bounded reason (issue #3741).
 ///
 /// `reason` must be an `XdsAdmissionRejection::metric_reason()` constant. It is
@@ -957,6 +984,11 @@ pub(crate) fn adjust_xds_active_node_ids(delta: i64) {
 }
 
 fn apply_xds_admission_gauge_delta(gauge: &AtomicU64, delta: i64) {
+    apply_admission_gauge_delta(gauge, delta);
+    XDS_ADMISSION_OBSERVED.store(1, Ordering::Relaxed);
+}
+
+fn apply_admission_gauge_delta(gauge: &AtomicU64, delta: i64) {
     if delta == 0 {
         return;
     }
@@ -968,7 +1000,6 @@ fn apply_xds_admission_gauge_delta(gauge: &AtomicU64, delta: i64) {
             Some(current.saturating_sub(amount))
         });
     }
-    XDS_ADMISSION_OBSERVED.store(1, Ordering::Relaxed);
 }
 
 // This private helper cannot be exercised from the external test crate without
@@ -1454,6 +1485,46 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
                 cluster, trust_domain, gateway_ns_label, age
             ));
         }
+    }
+
+    if !CP_GRPC_STREAM_ADMISSION_REJECTIONS.is_empty() {
+        output.push_str(
+            "# HELP ferrum_cp_grpc_stream_admission_rejections_total Long-lived CP configuration streams rejected at admission, by bounded surface and reason.\n",
+        );
+        output.push_str("# TYPE ferrum_cp_grpc_stream_admission_rejections_total counter\n");
+        for entry in CP_GRPC_STREAM_ADMISSION_REJECTIONS.iter() {
+            let (surface, reason) = *entry.key();
+            output.push_str(&format!(
+                "ferrum_cp_grpc_stream_admission_rejections_total{{surface=\"{}\",reason=\"{}\"{}}} {}\n",
+                escape_label_value(surface),
+                escape_label_value(reason),
+                gateway_ns_label,
+                entry.value().load(Ordering::Relaxed)
+            ));
+        }
+    }
+
+    if CP_GRPC_ADMISSION_OBSERVED.load(Ordering::Relaxed) != 0 {
+        output.push_str(
+            "# HELP ferrum_cp_grpc_active_streams Currently active long-lived CP configuration streams across ConfigSync, MeshSubscribe, and ADS.\n",
+        );
+        output.push_str("# TYPE ferrum_cp_grpc_active_streams gauge\n");
+        render_mesh_process_metric(
+            output,
+            "ferrum_cp_grpc_active_streams",
+            CP_GRPC_ACTIVE_STREAMS.load(Ordering::Relaxed),
+            gateway_ns_label,
+        );
+        output.push_str(
+            "# HELP ferrum_cp_grpc_active_node_ids Distinct admitted CP configuration-stream node state keys.\n",
+        );
+        output.push_str("# TYPE ferrum_cp_grpc_active_node_ids gauge\n");
+        render_mesh_process_metric(
+            output,
+            "ferrum_cp_grpc_active_node_ids",
+            CP_GRPC_ACTIVE_NODE_IDS.load(Ordering::Relaxed),
+            gateway_ns_label,
+        );
     }
 
     let xds_streams_rejected = XDS_STREAMS_REJECTED.load(Ordering::Relaxed);

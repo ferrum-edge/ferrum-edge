@@ -136,6 +136,27 @@ by a retained credential with the same namespace policy. Removing that
 credential, or changing its trusted namespace ceiling, closes its existing
 streams. Invalid reloads retain the last accepted verifier.
 
+### Aggregate configuration-stream admission
+
+Listener connection caps (`FERRUM_CP_GRPC_MAX_CONNECTIONS` /
+`FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP`) and
+`FERRUM_CP_GRPC_MAX_STREAM_LIFETIME_SECONDS` do not bound how many long-lived
+ConfigSync, MeshSubscribe, or ADS streams an authenticated client may hold.
+Those RPCs share the layered xDS admission budgets
+(`FERRUM_XDS_MAX_TOTAL_STREAMS`, per-namespace, per-principal, per-node, and
+distinct-node cardinality; issue #4432). The permit is acquired **before**
+broadcast subscription, config filtering/serialization, registry insertion, or
+response-channel allocation, and is released by an RAII guard on every
+termination path. Capacity refusals are gRPC `RESOURCE_EXHAUSTED`.
+
+The same budgets apply on a control plane even when `FERRUM_XDS_ENABLED=false`,
+because native ConfigSync and MeshSubscribe still occupy the slots. Under
+`FERRUM_MESH_PRODUCTION_MODE=true`, a `0` (unbounded) value is refused at
+`ferrum-edge validate` and startup unless
+`FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS=true`. See
+[configuration.md](configuration.md) and
+[mesh.md → xDS ADS admission budgets](mesh.md#xds-ads-admission-budgets).
+
 Startup and that reload worker share one coherent-generation loader: the bundle
 document and every `secret_path` / `public_key_path` it names are read from a
 single filesystem generation, so a rotation can never pair one generation's
@@ -972,6 +993,7 @@ in a failover set must use the same value.
 | `FERRUM_CP_GRPC_MAX_CONNECTIONS` | No | Max concurrent CP gRPC connections, admitted **before** any TLS/mTLS handshake work is allocated and held through the served HTTP/2 session (default `1024`; `0` = unlimited) |
 | `FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP` | No | Max concurrent CP gRPC connections from one source IP (default `64`; `0` disables). Must not exceed `FERRUM_CP_GRPC_MAX_CONNECTIONS` |
 | `FERRUM_CP_GRPC_MAX_STREAM_LIFETIME_SECONDS` | No | Finite maximum bearer-authenticated configuration-stream lifetime (default `3600`; range `60..=86400`; cannot be disabled). The verified token deadline may close the stream earlier |
+| `FERRUM_XDS_MAX_TOTAL_STREAMS` | No | Shared process ceiling for concurrent ConfigSync, MeshSubscribe, and ADS streams (default `1024`). Enforced on the CP even when ADS is disabled. `0` is unbounded and refused under production posture without `FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS=true` |
 | `FERRUM_ADMIN_JWT_SECRET` | Yes | JWT secret for the Admin API |
 | `FERRUM_DB_TYPE` | Yes | Database type (`postgres`, `mysql`, `sqlite`, or `mongodb`) |
 | `FERRUM_DB_URL` | Yes | Database connection URL |

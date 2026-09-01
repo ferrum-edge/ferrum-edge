@@ -82,6 +82,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logs for the new UTF-32 / dual-endian body matches before using
   `default_rule_action: enforce` if application payloads legitimately use
   UTF-16 or UTF-32 and contain attack-shaped tokens.
+- **BREAKING — native ConfigSync and MeshSubscribe streams share the xDS
+  admission budgets** (issue #4432). `ConfigSync.Subscribe` and
+  `MeshConfigSync.MeshSubscribe` previously authenticated, subscribed to a
+  broadcast channel, filtered/cloned configuration, and retained stream state
+  with no process, namespace, principal, or node ceiling. They now acquire a
+  permit from the existing ADS admission controller **before** broadcast
+  subscription, snapshot serialization, registry insertion, or response-channel
+  allocation. Capacity refusals are gRPC `RESOURCE_EXHAUSTED`. The same
+  production posture applies: a `0` (unbounded) `FERRUM_XDS_MAX_*` budget is
+  refused at `ferrum-edge validate` and CP startup under
+  `FERRUM_MESH_PRODUCTION_MODE=true` unless
+  `FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS=true`, **including when
+  `FERRUM_XDS_ENABLED=false`**. **Operator action**: size
+  `FERRUM_XDS_MAX_TOTAL_STREAMS` (default 1024) and the per-namespace /
+  per-principal / per-node / distinct-node ceilings for native DP and mesh
+  subscribers as well as ADS; set finite values (or the explicit unsafe
+  override) before upgrading a production control plane that previously relied
+  on unbounded `0` limits.
+  A ConfigSync or MeshSubscribe recovery snapshot that cannot be prepared or
+  serialized now ends the stream with an `INTERNAL` status instead of silently
+  skipping that snapshot, so the data plane reconnects (and its permit is
+  released) rather than serving on with configuration the control plane could
+  not produce. A data plane that keeps failing recovery still reaches its
+  `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` fence.
 
 - **BREAKING — HTTP/2 and HTTP/3 requests without `:authority` or Host are rejected with 400**
   (issue #4416). RFC 9113 §8.3.1 and RFC 9114 §4.3.1 require a request to

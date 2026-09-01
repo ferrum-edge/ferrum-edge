@@ -5679,6 +5679,539 @@ async fn delta_broadcast_body_stays_parseable_by_a_legacy_removal_id_shape() {
     );
 }
 
+// ── Shared native CP gRPC admission (issue #4432) ─────────────────────────
+
+#[derive(Clone, Copy)]
+enum NativeAdmissionSurface {
+    ConfigSync,
+    MeshSubscribe,
+}
+
+struct NativeAdmissionHarness {
+    addr: SocketAddr,
+    admission: ferrum_edge::grpc::admission::CpGrpcAdmissionController,
+    config_tx: tokio::sync::broadcast::Sender<ferrum_edge::grpc::proto::ConfigUpdate>,
+    mesh_tx: tokio::sync::broadcast::Sender<ferrum_edge::grpc::mesh_server::MeshConfigBroadcast>,
+    dp_registry: Arc<ferrum_edge::grpc::cp_server::DpNodeRegistry>,
+    mesh_registry: Arc<ferrum_edge::grpc::mesh_registry::MeshNodeRegistry>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for NativeAdmissionHarness {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+async fn start_native_admission_harness(
+    limits: ferrum_edge::grpc::admission::CpGrpcAdmissionLimits,
+    max_stream_lifetime: Duration,
+) -> NativeAdmissionHarness {
+    let config = Arc::new(ArcSwap::new(Arc::new(create_test_mesh_config())));
+    let admission = ferrum_edge::grpc::admission::CpGrpcAdmissionController::new(limits);
+    let dp_registry = Arc::new(ferrum_edge::grpc::cp_server::DpNodeRegistry::new());
+    let mesh_registry = Arc::new(ferrum_edge::grpc::mesh_registry::MeshNodeRegistry::new());
+    let (cp_server, config_tx) = CpGrpcServer::builder(config.clone(), TEST_JWT_SECRET.to_string())
+        .channel_capacity(1)
+        .admission(admission.clone())
+        .registry(dp_registry.clone())
+        .max_stream_lifetime(max_stream_lifetime)
+        .build();
+    let (mesh_server, mesh_tx) = MeshGrpcServer::builder(config, TEST_JWT_SECRET.to_string())
+        .channel_capacity(1)
+        .admission(admission.clone())
+        .registry(mesh_registry.clone())
+        .max_stream_lifetime(max_stream_lifetime)
+        .build();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let handle = tokio::spawn(async move {
+        let _ = Server::builder()
+            .add_service(cp_server.into_service())
+            .add_service(mesh_server.into_service())
+            .serve_with_incoming(incoming)
+            .await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    NativeAdmissionHarness {
+        addr,
+        admission,
+        config_tx,
+        mesh_tx,
+        dp_registry,
+        mesh_registry,
+        handle,
+    }
+}
+
+async fn request_native_admission(
+    surface: NativeAdmissionSurface,
+    addr: SocketAddr,
+    subject: &str,
+) -> Result<(), tonic::Status> {
+    match surface {
+        NativeAdmissionSurface::ConfigSync => {
+            let token = dp_client::generate_dp_jwt_with_issuer(
+                TEST_JWT_SECRET,
+                subject,
+                TEST_DEFAULT_ISSUER,
+            )
+            .unwrap();
+            let mut client = connect_client_with_token!(addr, token);
+            client
+                .subscribe(tonic::Request::new(
+                    ferrum_edge::grpc::proto::SubscribeRequest {
+                        node_id: subject.to_string(),
+                        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+                        namespace: "ferrum".to_string(),
+                        real_ip_header: Some(String::new()),
+                        supports_heartbeat: true,
+                    },
+                ))
+                .await
+                .map(|_| ())
+        }
+        NativeAdmissionSurface::MeshSubscribe => {
+            let token = generate_local_mesh_jwt(subject);
+            let mut client = connect_mesh_client_with_token!(addr, token);
+            client
+                .mesh_subscribe(tonic::Request::new(
+                    ferrum_edge::grpc::proto::MeshSubscribeRequest {
+                        node_id: subject.to_string(),
+                        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+                        namespace: "ferrum".to_string(),
+                        workload_spiffe_id: String::new(),
+                        labels: HashMap::new(),
+                        waypoint_name: String::new(),
+                        ambient_udp_source_scoping: false,
+                        remote_discovery: false,
+                        node_waypoint_capture_scoping: false,
+                    },
+                ))
+                .await
+                .map(|_| ())
+        }
+    }
+}
+
+async fn open_configsync_stream(
+    addr: SocketAddr,
+    subject: &str,
+) -> tonic::Streaming<ferrum_edge::grpc::proto::ConfigUpdate> {
+    let channel =
+        tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{}", addr.port()))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+    let mut client = ferrum_edge::grpc::proto::config_sync_client::ConfigSyncClient::new(channel);
+    let mut request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
+        node_id: subject.to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "ferrum".to_string(),
+        real_ip_header: Some(String::new()),
+        supports_heartbeat: true,
+    });
+    let token =
+        dp_client::generate_dp_jwt_with_issuer(TEST_JWT_SECRET, subject, TEST_DEFAULT_ISSUER)
+            .unwrap();
+    request.metadata_mut().insert(
+        "authorization",
+        tonic::metadata::MetadataValue::try_from(format!("Bearer {token}")).unwrap(),
+    );
+    client.subscribe(request).await.unwrap().into_inner()
+}
+
+async fn open_mesh_subscribe_stream(
+    addr: SocketAddr,
+    subject: &str,
+) -> tonic::Streaming<ferrum_edge::grpc::proto::MeshConfigUpdate> {
+    let channel =
+        tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{}", addr.port()))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+    let mut client =
+        ferrum_edge::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient::new(channel);
+    let mut request = tonic::Request::new(ferrum_edge::grpc::proto::MeshSubscribeRequest {
+        node_id: subject.to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "ferrum".to_string(),
+        workload_spiffe_id: String::new(),
+        labels: HashMap::new(),
+        waypoint_name: String::new(),
+        ambient_udp_source_scoping: false,
+        remote_discovery: false,
+        node_waypoint_capture_scoping: false,
+    });
+    let token = generate_local_mesh_jwt(subject);
+    request.metadata_mut().insert(
+        "authorization",
+        tonic::metadata::MetadataValue::try_from(format!("Bearer {token}")).unwrap(),
+    );
+    client.mesh_subscribe(request).await.unwrap().into_inner()
+}
+
+fn native_limits_for(
+    rejection: ferrum_edge::grpc::admission::CpGrpcAdmissionRejection,
+) -> ferrum_edge::grpc::admission::CpGrpcAdmissionLimits {
+    use ferrum_edge::grpc::admission::CpGrpcAdmissionRejection as Rejection;
+
+    let mut limits = ferrum_edge::grpc::admission::CpGrpcAdmissionLimits {
+        max_total_streams: 64,
+        max_streams_per_namespace: 64,
+        max_streams_per_principal: 64,
+        max_streams_per_node: 64,
+        max_active_nodes: 64,
+        max_node_id_bytes: 253,
+        first_request_timeout: Duration::from_secs(30),
+    };
+    match rejection {
+        Rejection::TotalStreams => limits.max_total_streams = 1,
+        Rejection::NamespaceStreams => limits.max_streams_per_namespace = 1,
+        Rejection::PrincipalStreams => limits.max_streams_per_principal = 1,
+        Rejection::NodeStreams => limits.max_streams_per_node = 1,
+        Rejection::NodeCardinality => limits.max_active_nodes = 1,
+        other => panic!("unsupported native boundary reason: {other:?}"),
+    }
+    limits
+}
+
+fn native_prefill(
+    admission: &ferrum_edge::grpc::admission::CpGrpcAdmissionController,
+    rejection: ferrum_edge::grpc::admission::CpGrpcAdmissionRejection,
+) -> ferrum_edge::grpc::admission::CpGrpcStreamPermit {
+    use ferrum_edge::grpc::admission::CpGrpcAdmissionRejection as Rejection;
+
+    match rejection {
+        Rejection::TotalStreams => admission
+            .reserve_native_stream("other", "other", "other")
+            .unwrap(),
+        Rejection::NamespaceStreams => admission
+            .reserve_native_stream("ferrum", "other", "other")
+            .unwrap(),
+        Rejection::PrincipalStreams => admission
+            .reserve_native_stream("other", "native-node", "other")
+            .unwrap(),
+        Rejection::NodeStreams => admission
+            .reserve_native_stream("ferrum", "native-node", "native-node")
+            .unwrap(),
+        Rejection::NodeCardinality => admission
+            .reserve_native_stream("other", "other", "other")
+            .unwrap(),
+        other => panic!("unsupported native boundary reason: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_rpcs_enforce_every_layer_before_snapshot_or_stream_allocation() {
+    use ferrum_edge::grpc::admission::CpGrpcAdmissionRejection as Rejection;
+
+    for surface in [
+        NativeAdmissionSurface::ConfigSync,
+        NativeAdmissionSurface::MeshSubscribe,
+    ] {
+        for rejection in [
+            Rejection::TotalStreams,
+            Rejection::NamespaceStreams,
+            Rejection::PrincipalStreams,
+            Rejection::NodeStreams,
+            Rejection::NodeCardinality,
+        ] {
+            let harness = start_native_admission_harness(
+                native_limits_for(rejection),
+                Duration::from_secs(30),
+            )
+            .await;
+            let held = native_prefill(&harness.admission, rejection);
+            let status = request_native_admission(surface, harness.addr, "native-node")
+                .await
+                .expect_err("the saturated native admission layer must reject");
+            assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+            assert!(
+                status.message().contains("FERRUM_XDS_"),
+                "the enforcing shared budget should remain diagnosable: {status}"
+            );
+            assert_eq!(harness.admission.active_streams(), 1);
+            assert_eq!(harness.config_tx.receiver_count(), 0);
+            assert_eq!(harness.mesh_tx.receiver_count(), 0);
+            assert!(harness.dp_registry.is_empty());
+            assert!(harness.mesh_registry.is_empty());
+            drop(held);
+            wait_for_shared_active_streams(&harness.admission, 0).await;
+        }
+    }
+}
+
+async fn wait_for_shared_active_streams(
+    admission: &ferrum_edge::grpc::admission::CpGrpcAdmissionController,
+    expected: usize,
+) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if admission.active_streams() == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("shared stream admission occupancy did not settle");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_native_stream_flood_keeps_all_shared_state_bounded() {
+    let harness = start_native_admission_harness(
+        native_limits_for(ferrum_edge::grpc::admission::CpGrpcAdmissionRejection::TotalStreams),
+        Duration::from_secs(30),
+    )
+    .await;
+    let held = harness
+        .admission
+        .reserve_native_stream("ferrum", "holder", "holder")
+        .unwrap();
+
+    for index in 0..64usize {
+        let surface = if index % 2 == 0 {
+            NativeAdmissionSurface::ConfigSync
+        } else {
+            NativeAdmissionSurface::MeshSubscribe
+        };
+        let subject = format!("attempt-{index}");
+        let status = request_native_admission(surface, harness.addr, &subject)
+            .await
+            .expect_err("the total budget must reject every excess attempt");
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+    }
+
+    assert_eq!(harness.admission.active_streams(), 1);
+    assert_eq!(harness.admission.active_nodes(), 1);
+    assert_eq!(harness.admission.tracked_namespaces(), 1);
+    assert_eq!(harness.admission.tracked_principals(), 1);
+    assert_eq!(harness.config_tx.receiver_count(), 0);
+    assert_eq!(harness.mesh_tx.receiver_count(), 0);
+    assert!(harness.dp_registry.is_empty());
+    assert!(harness.mesh_registry.is_empty());
+    drop(held);
+    wait_for_shared_active_streams(&harness.admission, 0).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_stream_permits_release_on_normal_close_and_transport_reset() {
+    let harness = start_native_admission_harness(
+        ferrum_edge::grpc::admission::CpGrpcAdmissionLimits::default(),
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let mut config_stream = open_configsync_stream(harness.addr, "config-normal").await;
+    assert!(config_stream.message().await.unwrap().is_some());
+    assert_eq!(harness.admission.active_streams(), 1);
+    drop(config_stream);
+    wait_for_shared_active_streams(&harness.admission, 0).await;
+
+    let mut mesh_stream = open_mesh_subscribe_stream(harness.addr, "mesh-normal").await;
+    assert!(mesh_stream.message().await.unwrap().is_some());
+    assert_eq!(harness.admission.active_streams(), 1);
+    drop(mesh_stream);
+    wait_for_shared_active_streams(&harness.admission, 0).await;
+
+    // A second round on fresh HTTP/2 transports exercises the peer-reset path
+    // after an established response, not only an unpolled response drop.
+    let mut config_reset = open_configsync_stream(harness.addr, "config-reset").await;
+    assert!(config_reset.message().await.unwrap().is_some());
+    drop(config_reset);
+    wait_for_shared_active_streams(&harness.admission, 0).await;
+
+    let mut mesh_reset = open_mesh_subscribe_stream(harness.addr, "mesh-reset").await;
+    assert!(mesh_reset.message().await.unwrap().is_some());
+    drop(mesh_reset);
+    wait_for_shared_active_streams(&harness.admission, 0).await;
+    assert_eq!(harness.admission.active_nodes(), 0);
+    assert_eq!(harness.admission.tracked_namespaces(), 0);
+    assert_eq!(harness.admission.tracked_principals(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_stream_permits_release_on_authorization_lease_expiry() {
+    let harness = start_native_admission_harness(
+        ferrum_edge::grpc::admission::CpGrpcAdmissionLimits::default(),
+        Duration::from_millis(150),
+    )
+    .await;
+
+    let mut config_stream = open_configsync_stream(harness.addr, "config-expiry").await;
+    assert!(config_stream.message().await.unwrap().is_some());
+    let config_status = timeout(Duration::from_secs(5), config_stream.message())
+        .await
+        .expect("ConfigSync authorization lease should expire")
+        .expect_err("ConfigSync expiry should be terminal");
+    assert_eq!(config_status.code(), tonic::Code::Unauthenticated);
+    drop(config_stream);
+    wait_for_shared_active_streams(&harness.admission, 0).await;
+
+    let mut mesh_stream = open_mesh_subscribe_stream(harness.addr, "mesh-expiry").await;
+    assert!(mesh_stream.message().await.unwrap().is_some());
+    let mesh_status = timeout(Duration::from_secs(5), mesh_stream.message())
+        .await
+        .expect("MeshSubscribe authorization lease should expire")
+        .expect_err("MeshSubscribe expiry should be terminal");
+    assert_eq!(mesh_status.code(), tonic::Code::Unauthenticated);
+    drop(mesh_stream);
+    wait_for_shared_active_streams(&harness.admission, 0).await;
+    assert_eq!(harness.admission.active_nodes(), 0);
+}
+
+struct SeverableNativeAdmissionServer {
+    addr: SocketAddr,
+    admission: ferrum_edge::grpc::admission::CpGrpcAdmissionController,
+    runtime: Option<tokio::runtime::Runtime>,
+}
+
+impl SeverableNativeAdmissionServer {
+    fn sever(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+impl Drop for SeverableNativeAdmissionServer {
+    fn drop(&mut self) {
+        self.sever();
+    }
+}
+
+async fn start_severable_native_admission_server() -> SeverableNativeAdmissionServer {
+    let config = Arc::new(ArcSwap::new(Arc::new(create_test_mesh_config())));
+    let admission = ferrum_edge::grpc::admission::CpGrpcAdmissionController::new(
+        ferrum_edge::grpc::admission::CpGrpcAdmissionLimits::default(),
+    );
+    let (cp_server, _) = CpGrpcServer::builder(config.clone(), TEST_JWT_SECRET.to_string())
+        .admission(admission.clone())
+        .build();
+    let (mesh_server, _) = MeshGrpcServer::builder(config, TEST_JWT_SECRET.to_string())
+        .admission(admission.clone())
+        .build();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+    runtime.spawn(async move {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        if addr_tx.send(addr).is_err() {
+            return;
+        }
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        let _ = Server::builder()
+            .add_service(cp_server.into_service())
+            .add_service(mesh_server.into_service())
+            .serve_with_incoming(incoming)
+            .await;
+    });
+    let addr = addr_rx.await.unwrap();
+    SeverableNativeAdmissionServer {
+        addr,
+        admission,
+        runtime: Some(runtime),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_stream_permits_release_when_the_server_runtime_shuts_down() {
+    let mut server = start_severable_native_admission_server().await;
+    let mut config_stream = open_configsync_stream(server.addr, "config-shutdown").await;
+    let mut mesh_stream = open_mesh_subscribe_stream(server.addr, "mesh-shutdown").await;
+    assert!(config_stream.message().await.unwrap().is_some());
+    assert!(mesh_stream.message().await.unwrap().is_some());
+    assert_eq!(server.admission.active_streams(), 2);
+    assert_eq!(server.admission.active_nodes(), 2);
+
+    server.sever();
+    wait_for_shared_active_streams(&server.admission, 0).await;
+    assert_eq!(server.admission.active_nodes(), 0);
+    assert_eq!(server.admission.tracked_namespaces(), 0);
+    assert_eq!(server.admission.tracked_principals(), 0);
+    drop(config_stream);
+    drop(mesh_stream);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_stream_permits_survive_lag_recovery_then_release_on_close() {
+    // Successful lag recovery must keep the RAII permit (the stream is still
+    // live). Dropping the client afterwards must return occupancy to baseline.
+    let harness = start_native_admission_harness(
+        ferrum_edge::grpc::admission::CpGrpcAdmissionLimits::default(),
+        Duration::from_secs(30),
+    )
+    .await;
+    let snapshot = Arc::new(create_test_mesh_config());
+
+    let mut config_stream = open_configsync_stream(harness.addr, "config-lag").await;
+    assert!(config_stream.message().await.unwrap().is_some());
+    assert_eq!(harness.admission.active_streams(), 1);
+    for _ in 0..8 {
+        CpGrpcServer::broadcast_update(&harness.config_tx, snapshot.as_ref());
+    }
+    let _ = timeout(Duration::from_secs(5), config_stream.message()).await;
+    assert_eq!(harness.admission.active_streams(), 1);
+    drop(config_stream);
+    wait_for_shared_active_streams(&harness.admission, 0).await;
+
+    let mut mesh_stream = open_mesh_subscribe_stream(harness.addr, "mesh-lag").await;
+    assert!(mesh_stream.message().await.unwrap().is_some());
+    assert_eq!(harness.admission.active_streams(), 1);
+    for _ in 0..8 {
+        let _ = harness
+            .mesh_tx
+            .send(ferrum_edge::grpc::mesh_server::MeshConfigBroadcast::Full(
+                Arc::clone(&snapshot),
+            ));
+    }
+    let _ = timeout(Duration::from_secs(5), mesh_stream.message()).await;
+    assert_eq!(harness.admission.active_streams(), 1);
+    drop(mesh_stream);
+    wait_for_shared_active_streams(&harness.admission, 0).await;
+    assert_eq!(harness.admission.active_nodes(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_configsync_rejects_unsafe_node_id_before_allocation() {
+    let harness = start_native_admission_harness(
+        ferrum_edge::grpc::admission::CpGrpcAdmissionLimits::default(),
+        Duration::from_secs(30),
+    )
+    .await;
+    let token =
+        dp_client::generate_dp_jwt_with_issuer(TEST_JWT_SECRET, "dp", TEST_DEFAULT_ISSUER).unwrap();
+    let mut client = connect_client_with_token!(harness.addr, token);
+    let status = client
+        .subscribe(tonic::Request::new(
+            ferrum_edge::grpc::proto::SubscribeRequest {
+                node_id: "node\ninjected".to_string(),
+                ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+                namespace: "ferrum".to_string(),
+                real_ip_header: Some(String::new()),
+                supports_heartbeat: true,
+            },
+        ))
+        .await
+        .expect_err("unsafe node_id must fail closed before a stream exists");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        !status.message().contains("injected"),
+        "a rejection must never echo the client-supplied node_id: {status}"
+    );
+    assert_eq!(harness.admission.active_streams(), 0);
+    assert_eq!(harness.config_tx.receiver_count(), 0);
+    assert!(harness.dp_registry.is_empty());
+}
+
 // ── xDS ADS aggregate admission (issue #3741) ──────────────────────────────
 //
 // The per-node ceiling alone bounded nothing in aggregate: `Node.id` is chosen

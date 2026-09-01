@@ -2275,8 +2275,35 @@ pub async fn run(
     let mesh_registry = Arc::new(
         crate::grpc::mesh_registry::MeshNodeRegistry::new().with_drift(mesh_slice_drift.clone()),
     );
+    let stream_admission_limits = env_config.xds_admission_limits();
+    let mut unbounded_stream_scopes = stream_admission_limits.unbounded_scope_names();
+    if !env_config.xds_enabled {
+        unbounded_stream_scopes.retain(|name| *name != "FERRUM_XDS_FIRST_REQUEST_TIMEOUT_SECONDS");
+    }
+    if unbounded_stream_scopes.is_empty() {
+        info!(
+            max_total_streams = stream_admission_limits.max_total_streams,
+            max_streams_per_namespace = stream_admission_limits.max_streams_per_namespace,
+            max_streams_per_principal = stream_admission_limits.max_streams_per_principal,
+            max_streams_per_node = stream_admission_limits.max_streams_per_node,
+            max_active_nodes = stream_admission_limits.max_active_nodes,
+            max_node_id_bytes = stream_admission_limits.max_node_id_bytes,
+            first_request_timeout_seconds = stream_admission_limits.first_request_timeout.as_secs(),
+            "Shared CP gRPC configuration-stream admission budgets active"
+        );
+    } else {
+        warn!(
+            unbounded_scopes = %unbounded_stream_scopes.join(", "),
+            "CP gRPC configuration-stream admission has unbounded (0) budgets: one \
+             authenticated bearer can exhaust control-plane tasks, channels, and snapshot \
+             memory by cycling node ids. Set finite values for production."
+        );
+    }
+    let stream_admission =
+        crate::grpc::admission::CpGrpcAdmissionController::new(stream_admission_limits);
     let (grpc_server, update_tx) = CpGrpcServer::builder(config_arc.clone(), grpc_secret.clone())
         .channel_capacity(env_config.cp_broadcast_channel_capacity)
+        .admission(stream_admission.clone())
         .registry(dp_registry.clone())
         .verifier_store(cp_dp_verifier.clone())
         .max_stream_lifetime(max_stream_lifetime)
@@ -2289,6 +2316,7 @@ pub async fn run(
     let (mesh_grpc_server, mesh_update_tx) =
         MeshGrpcServer::builder(config_arc.clone(), grpc_secret.clone())
             .channel_capacity(env_config.cp_broadcast_channel_capacity)
+            .admission(stream_admission.clone())
             .registry(mesh_registry.clone())
             .drift(mesh_slice_drift.clone())
             .verifier_store(cp_dp_verifier.clone())
@@ -2318,32 +2346,6 @@ pub async fn run(
     }
     let xds_server = if env_config.xds_enabled {
         info!("FERRUM_XDS_ENABLED=true — mounting xDS ADS on the CP gRPC listener");
-        let xds_admission_limits = env_config.xds_admission_limits();
-        let unbounded_xds_scopes = xds_admission_limits.unbounded_scope_names();
-        if unbounded_xds_scopes.is_empty() {
-            info!(
-                max_total_streams = xds_admission_limits.max_total_streams,
-                max_streams_per_namespace = xds_admission_limits.max_streams_per_namespace,
-                max_streams_per_principal = xds_admission_limits.max_streams_per_principal,
-                max_streams_per_node = xds_admission_limits.max_streams_per_node,
-                max_active_nodes = xds_admission_limits.max_active_nodes,
-                max_node_id_bytes = xds_admission_limits.max_node_id_bytes,
-                first_request_timeout_seconds =
-                    xds_admission_limits.first_request_timeout.as_secs(),
-                "xDS ADS admission budgets active"
-            );
-        } else {
-            // `EnvConfig::validate()` already refused this combination under
-            // production posture unless the operator set the explicit unsafe
-            // override, so reaching here is either dev/test or an acknowledged
-            // risk. Either way it stays loud.
-            warn!(
-                unbounded_scopes = %unbounded_xds_scopes.join(", "),
-                "xDS ADS admission has unbounded (0) budgets: one authenticated bearer can \
-                 exhaust control-plane tasks, channels, and snapshot memory by cycling Node.id \
-                 values. Set finite values for production."
-            );
-        }
         Some(
             XdsAdsServer::with_sidecar_enforcement(
                 config_arc.clone(),
@@ -2362,7 +2364,9 @@ pub async fn run(
             .with_scope(cp_scope.clone())
             .with_require_namespace_claim(env_config.cp_require_namespace_claim)
             .with_namespace_broadcasts(broadcasts.clone())
-            .with_admission_limits(xds_admission_limits),
+            .with_admission_controller(
+                crate::xds::XdsAdmissionController::from_shared(stream_admission.clone()),
+            ),
         )
     } else {
         None

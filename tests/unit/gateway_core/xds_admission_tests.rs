@@ -95,6 +95,28 @@ fn unbounded_scope_names_lists_every_zeroed_budget() {
 }
 
 #[test]
+fn native_and_ads_draw_from_one_shared_controller() {
+    // Issue #4432: ConfigSync / MeshSubscribe / ADS must not split a flood
+    // across independent budgets. Occupying the only total slot via the native
+    // helper must refuse an ADS reservation with RESOURCE_EXHAUSTED semantics.
+    let limits = XdsAdmissionLimits {
+        max_total_streams: 1,
+        ..generous()
+    };
+    let shared = ferrum_edge::grpc::admission::CpGrpcAdmissionController::new(limits);
+    let ads = XdsAdmissionController::from_shared(shared.clone());
+    let _native = shared
+        .reserve_native_stream("ferrum", "dp", "node-native")
+        .expect("native occupies the only total slot");
+    let rejection = ads
+        .reserve_stream("ferrum", &principal_key("other"))
+        .expect_err("ADS must observe native occupancy on the shared budget");
+    assert_eq!(rejection, XdsAdmissionRejection::TotalStreams);
+    assert_eq!(ads.active_streams(), 0);
+    assert_eq!(shared.active_streams(), 1);
+}
+
+#[test]
 fn node_id_and_first_request_zeroes_are_unbounded_scopes_by_themselves() {
     let limits = XdsAdmissionLimits {
         max_node_id_bytes: 0,

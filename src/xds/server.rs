@@ -311,6 +311,14 @@ impl XdsAdsServer {
         self
     }
 
+    /// Install the ADS facade for the process-wide CP gRPC admission
+    /// controller. Production uses this so native and ADS methods cannot split
+    /// a flood across independent budgets.
+    pub fn with_admission_controller(mut self, admission: XdsAdmissionController) -> Self {
+        self.admission = admission;
+        self
+    }
+
     /// Override only the per-node concurrent ADS stream ceiling, keeping every
     /// other budget at its default. `0` disables that one cap (unbounded).
     /// Replaces the controller, so call this during setup before any stream is
@@ -2494,6 +2502,10 @@ fn record_xds_admission_rejection(
     );
     crate::plugins::mesh::prometheus_helpers::increment_xds_stream_rejected();
     crate::plugins::mesh::prometheus_helpers::increment_xds_stream_admission_rejection(
+        rejection.metric_reason(),
+    );
+    crate::plugins::mesh::prometheus_helpers::increment_cp_grpc_stream_admission_rejection(
+        "xds",
         rejection.metric_reason(),
     );
 }

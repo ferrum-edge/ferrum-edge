@@ -15,6 +15,10 @@ use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
+use super::admission::{
+    CpGrpcAdmissionController, CpGrpcAdmissionLimits, CpGrpcStreamPermit, CpGrpcStreamSurface,
+    record_native_rejection,
+};
 use super::auth::{
     AllowedNamespaces, AudienceRejectReason, AuthorizedResponseStream,
     DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS, GrpcAudiencePolicy, MESH_LOCAL_SUBSCRIBE_AUDIENCE,
@@ -46,6 +50,7 @@ pub enum MeshConfigBroadcast {
 
 struct TrackedMeshStream<S> {
     inner: Pin<Box<S>>,
+    _admission_permit: CpGrpcStreamPermit,
     registry: Arc<MeshNodeRegistry>,
     drift: Arc<MeshSliceDriftRegistry>,
     config: Arc<ArcSwap<GatewayConfig>>,
@@ -91,6 +96,7 @@ where
 
 pub struct MeshGrpcServer {
     config: Arc<ArcSwap<GatewayConfig>>,
+    admission: CpGrpcAdmissionController,
     /// Shared with the ConfigSync and xDS servers so native MeshSubscribe
     /// enforces the same namespace-bound verification credentials
     /// (advisory GHSA-3f2j-wwqw-grmg).
@@ -132,6 +138,7 @@ pub struct MeshGrpcServer {
 
 pub struct MeshGrpcServerBuilder {
     config: Arc<ArcSwap<GatewayConfig>>,
+    admission: CpGrpcAdmissionController,
     verifier: Arc<CpDpVerifierStore>,
     max_stream_lifetime: Duration,
     channel_capacity: usize,
@@ -152,6 +159,7 @@ impl MeshGrpcServerBuilder {
     fn new(config: Arc<ArcSwap<GatewayConfig>>, jwt_secret: String) -> Self {
         Self {
             config,
+            admission: CpGrpcAdmissionController::new(CpGrpcAdmissionLimits::default()),
             verifier: Arc::new(CpDpVerifierStore::new(CpDpVerifier::SharedSecret(
                 jwt_secret,
             ))),
@@ -173,6 +181,11 @@ impl MeshGrpcServerBuilder {
 
     pub fn channel_capacity(mut self, channel_capacity: usize) -> Self {
         self.channel_capacity = channel_capacity;
+        self
+    }
+
+    pub fn admission(mut self, admission: CpGrpcAdmissionController) -> Self {
+        self.admission = admission;
         self
     }
 
@@ -254,6 +267,7 @@ impl MeshGrpcServerBuilder {
         (
             MeshGrpcServer {
                 config: self.config,
+                admission: self.admission,
                 verifier: self.verifier,
                 max_stream_lifetime: self.max_stream_lifetime,
                 expected_issuer: self.expected_issuer,
@@ -329,6 +343,15 @@ impl MeshGrpcServer {
 
     pub fn into_service(self) -> MeshConfigSyncServer<Self> {
         MeshConfigSyncServer::new(self)
+    }
+
+    /// Shared admission controller, for asserting stream/node occupancy.
+    ///
+    /// Reachable only from the external `tests/` crate, so the bin target sees
+    /// it as dead — same as the constructors above.
+    #[allow(dead_code)]
+    pub fn admission(&self) -> CpGrpcAdmissionController {
+        self.admission.clone()
     }
 
     fn check_namespace(
@@ -718,6 +741,28 @@ impl MeshConfigSync for MeshGrpcServer {
                 "MeshSubscribe node_id must match the authenticated JWT subject",
             ));
         }
+        // All five layers must be held before broadcast subscription, slice
+        // filtering/serialization, drift or connection registry insertion, or
+        // response-stream allocation.
+        let admission_permit = match self.admission.reserve_native_stream(
+            &inner.namespace,
+            &identity.subject,
+            &inner.node_id,
+        ) {
+            Ok(permit) => permit,
+            Err(rejection) => {
+                record_native_rejection(CpGrpcStreamSurface::MeshSubscribe, rejection);
+                let status = rejection.into_native_status();
+                CpGrpcServer::audit_tenant_subscription(
+                    "MeshConfigSync.MeshSubscribe",
+                    "",
+                    &inner.namespace,
+                    "failure",
+                    status.message(),
+                );
+                return Err(status);
+            }
+        };
         let node_id = identity.subject.clone();
         CpGrpcServer::audit_tenant_subscription(
             "MeshConfigSync.MeshSubscribe",
@@ -888,7 +933,7 @@ impl MeshConfigSync for MeshGrpcServer {
                                 error = %e,
                                 "Failed to build mesh delta update"
                             );
-                            None
+                            Some(Err(e))
                         }
                     }
                 }
@@ -950,6 +995,7 @@ impl MeshConfigSync for MeshGrpcServer {
         let combined = initial_stream.chain(stream::select(stream, heartbeat_stream));
         let tracked = TrackedMeshStream {
             inner: Box::pin(combined),
+            _admission_permit: admission_permit,
             registry: self.registry.clone(),
             drift: self.drift.clone(),
             config: self.config.clone(),

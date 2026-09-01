@@ -290,9 +290,9 @@ fn test_xds_unbounded_budget_accepted_with_explicit_unsafe_override() {
 }
 
 #[test]
-fn test_xds_admission_limits_not_enforced_when_xds_disabled() {
-    // A control plane that never mounts ADS enforces nothing here, so an unused
-    // `0` must not fail validation.
+fn test_shared_stream_admission_limits_apply_when_xds_is_disabled_on_cp() {
+    // Native ConfigSync and MeshSubscribe share these budgets even when ADS is
+    // not mounted, so a production CP may not make them silently unbounded.
     with_env_vars(
         &[
             ("FERRUM_MODE", "file"),
@@ -303,9 +303,13 @@ fn test_xds_admission_limits_not_enforced_when_xds_disabled() {
         || {
             remove_var("FERRUM_XDS_ENABLED");
             remove_var("FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS");
-            let config = EnvConfig::from_env().unwrap();
+            let mut config = EnvConfig::from_env().unwrap();
             assert!(!config.xds_enabled);
-            assert!(config.validate_xds_admission_limits().is_ok());
+            config.mode = ferrum_edge::config::env_config::OperatingMode::ControlPlane;
+            let error = config
+                .validate_xds_admission_limits()
+                .expect_err("native CP streams must retain the shared finite budget");
+            assert!(error.contains("FERRUM_XDS_MAX_TOTAL_STREAMS"), "{error}");
         },
     );
 }

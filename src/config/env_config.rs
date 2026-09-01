@@ -2070,29 +2070,29 @@ pub struct EnvConfig {
     /// Capacity of the per-ADS-stream response queue between the request
     /// reader task and tonic response stream. Default: 32.
     pub xds_stream_channel_capacity: usize,
-    /// Maximum concurrent ADS streams the CP admits per node state key
+    /// Maximum concurrent long-lived CP configuration streams per node state key
     /// (namespace + authenticated principal + `Node.id`). A DP keeps a single
     /// stream; the default headroom tolerates brief reconnect overlap. `0`
-    /// disables the cap. Only meaningful when `xds_enabled` is true.
+    /// disables the cap. Shared by native ConfigSync, MeshSubscribe, and ADS.
     /// Default: 4.
     pub xds_max_streams_per_node: usize,
-    /// Maximum total concurrent ADS streams for this CP process, across SotW
-    /// and Delta and every namespace/principal/node. The outermost admission
-    /// budget: it bounds relay tasks, response channels, filtered config
-    /// snapshots, and broadcast subscribers regardless of how many unique
-    /// `Node.id` values a client invents. `0` disables the cap (refused under
-    /// production posture). Default: 1024.
+    /// Maximum total concurrent long-lived configuration streams for this CP
+    /// process, across ConfigSync, MeshSubscribe, SotW ADS, and Delta ADS.
+    /// The outermost admission budget: it bounds relay tasks, response
+    /// channels, filtered config snapshots, and broadcast subscribers
+    /// regardless of how many unique `Node.id` values a client invents. `0`
+    /// disables the cap (refused under production posture). Default: 1024.
     pub xds_max_total_streams: usize,
-    /// Maximum concurrent ADS streams per namespace/tenant. `0` disables the
+    /// Maximum concurrent configuration streams per namespace/tenant. `0` disables the
     /// cap (refused under production posture). Default: 512.
     pub xds_max_streams_per_namespace: usize,
-    /// Maximum concurrent ADS streams per authenticated principal (JWT `sub`).
+    /// Maximum concurrent configuration streams per authenticated principal (JWT `sub`).
     /// Fleets that share one credential across every DP present a single
     /// principal, so the default is deliberately generous. `0` disables the cap
     /// (refused under production posture). Default: 256.
     pub xds_max_streams_per_principal: usize,
-    /// Maximum distinct node state keys with at least one active ADS stream.
-    /// Bounds the node-scoped snapshot/nonce/identity/waypoint/scoping maps.
+    /// Maximum distinct node state keys with at least one active configuration
+    /// stream. Also bounds the ADS snapshot/nonce/identity/waypoint/scoping maps.
     /// A state key exists only while a stream holds it, so this only binds
     /// below `xds_max_total_streams` (or when that budget is unbounded); at the
     /// defaults the total-stream budget saturates first. `0` disables the cap
@@ -7694,8 +7694,8 @@ impl EnvConfig {
         std::cmp::max(self.http3_idle_timeout, tunnel_idle)
     }
 
-    /// The xDS ADS admission budgets this configuration resolves to
-    /// (issue #3741). Shared by `ferrum-edge validate` and CP startup so the
+    /// The shared CP configuration-stream admission budgets this configuration
+    /// resolves to (issues #3741 and #4432). Shared by `ferrum-edge validate` and CP startup so the
     /// two can never disagree about what the CP will actually enforce.
     pub fn xds_admission_limits(&self) -> crate::xds::admission::XdsAdmissionLimits {
         crate::xds::admission::XdsAdmissionLimits {
@@ -7711,24 +7711,29 @@ impl EnvConfig {
         }
     }
 
-    /// Refuse silently unbounded ADS admission budgets under production mesh
-    /// posture (issue #3741).
+    /// Refuse silently unbounded CP configuration-stream admission budgets
+    /// under production mesh posture (issues #3741 and #4432).
     ///
-    /// `0` on any ADS budget means "unbounded", which is exactly the posture
-    /// that let one authenticated bearer exhaust CP tasks, channels, snapshot
-    /// memory, and broadcast subscribers by cycling `Node.id` values. Under
+    /// `0` on any shared budget means "unbounded", which is exactly the
+    /// posture that let one authenticated bearer exhaust CP tasks, channels,
+    /// snapshot memory, and broadcast subscribers by cycling node ids. Under
     /// `FERRUM_MESH_PRODUCTION_MODE=true` that requires the visibly unsafe
     /// `FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS=true` acknowledgement; outside
     /// production it is permitted and warned about at startup.
     ///
-    /// Only meaningful when `FERRUM_XDS_ENABLED=true`: a CP that never mounts
-    /// ADS enforces nothing here, so an unused value must not fail validation.
+    /// Native ConfigSync and MeshSubscribe draw from these budgets even when
+    /// `FERRUM_XDS_ENABLED=false`, so a production control plane validates
+    /// them regardless of whether ADS is mounted. The ADS-only first-request
+    /// deadline is ignored while xDS is disabled.
     pub fn validate_xds_admission_limits(&self) -> Result<(), String> {
-        if !self.xds_enabled {
+        if !self.xds_enabled && !matches!(self.mode, OperatingMode::ControlPlane) {
             return Ok(());
         }
         let limits = self.xds_admission_limits();
-        let unbounded = limits.unbounded_scope_names();
+        let mut unbounded = limits.unbounded_scope_names();
+        if !self.xds_enabled {
+            unbounded.retain(|name| *name != "FERRUM_XDS_FIRST_REQUEST_TIMEOUT_SECONDS");
+        }
         if unbounded.is_empty() {
             return Ok(());
         }
@@ -7736,7 +7741,7 @@ impl EnvConfig {
             return Ok(());
         }
         Err(format!(
-            "FERRUM_MESH_PRODUCTION_MODE=true with FERRUM_XDS_ENABLED=true refuses unbounded xDS \
+            "FERRUM_MESH_PRODUCTION_MODE=true refuses unbounded CP gRPC configuration-stream \
              admission budgets, but these are set to 0 (unbounded): {}. A 0 value removes an \
              aggregate DoS boundary: one authenticated bearer can then exhaust control-plane \
              tasks, response channels, filtered config snapshots, and broadcast subscribers by \

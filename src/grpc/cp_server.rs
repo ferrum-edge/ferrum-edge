@@ -51,6 +51,10 @@ use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
+use super::admission::{
+    CpGrpcAdmissionController, CpGrpcAdmissionLimits, CpGrpcStreamPermit, CpGrpcStreamSurface,
+    record_native_rejection,
+};
 use super::auth::{
     AllowedNamespaces, AuthorizedResponseStream, DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS,
     StreamAuthSurface, VerifiedGrpcIdentity,
@@ -385,6 +389,7 @@ impl DpNodeRegistry {
 /// is dropped, the old drop will not remove the newer entry.
 struct TrackedStream<S> {
     inner: Pin<Box<S>>,
+    _admission_permit: CpGrpcStreamPermit,
     registry: Arc<DpNodeRegistry>,
     node_id: String,
     connected_at: DateTime<Utc>,
@@ -418,6 +423,7 @@ pub const DEFAULT_CP_DP_JWT_ISSUER: &str = "ferrum-edge-cp-dp";
 /// CP gRPC server state.
 pub struct CpGrpcServer {
     config: Arc<ArcSwap<GatewayConfig>>,
+    admission: CpGrpcAdmissionController,
     /// How inbound tokens are verified and what namespaces each credential is
     /// bound to. Shared with the mesh and xDS servers so all three
     /// configuration surfaces enforce one authorization source
@@ -551,6 +557,7 @@ impl CpGrpcServer {
     pub fn builder(config: Arc<ArcSwap<GatewayConfig>>, jwt_secret: String) -> CpGrpcServerBuilder {
         CpGrpcServerBuilder {
             config,
+            admission: CpGrpcAdmissionController::new(CpGrpcAdmissionLimits::default()),
             verifier: Arc::new(CpDpVerifierStore::new(CpDpVerifier::SharedSecret(
                 jwt_secret,
             ))),
@@ -562,6 +569,15 @@ impl CpGrpcServer {
             require_ns_claim: false,
             real_ip_header: None,
         }
+    }
+
+    /// Shared stream-admission controller. Production wires one controller
+    /// through the BUILDER (`.admission(...)`) into ConfigSync, MeshSubscribe,
+    /// and ADS; this getter exists so external tests can reach the same
+    /// controller, which is why the binary target sees it as dead code.
+    #[allow(dead_code)]
+    pub fn admission(&self) -> CpGrpcAdmissionController {
+        self.admission.clone()
     }
 
     #[allow(clippy::result_large_err)]
@@ -1936,6 +1952,7 @@ impl CpGrpcServer {
 /// setters in any order, then `.build()`.
 pub struct CpGrpcServerBuilder {
     config: Arc<ArcSwap<GatewayConfig>>,
+    admission: CpGrpcAdmissionController,
     verifier: Arc<CpDpVerifierStore>,
     max_stream_lifetime: Duration,
     channel_capacity: usize,
@@ -1947,6 +1964,11 @@ pub struct CpGrpcServerBuilder {
 }
 
 impl CpGrpcServerBuilder {
+    pub fn admission(mut self, admission: CpGrpcAdmissionController) -> Self {
+        self.admission = admission;
+        self
+    }
+
     pub fn channel_capacity(mut self, capacity: usize) -> Self {
         self.channel_capacity = capacity;
         self
@@ -2033,6 +2055,7 @@ impl CpGrpcServerBuilder {
         (
             CpGrpcServer {
                 config: self.config,
+                admission: self.admission,
                 verifier: self.verifier,
                 max_stream_lifetime: self.max_stream_lifetime,
                 expected_issuer: self.expected_issuer,
@@ -2113,6 +2136,28 @@ impl ConfigSync for CpGrpcServer {
                 return Err(status);
             }
         };
+        // The native request already carries its node id, so all five layers
+        // are acquired before broadcast subscription, snapshot filtering /
+        // serialization, registry insertion, or response-stream allocation.
+        let admission_permit =
+            match self
+                .admission
+                .reserve_native_stream(&dp_namespace, &identity.subject, &node_id)
+            {
+                Ok(permit) => permit,
+                Err(rejection) => {
+                    record_native_rejection(CpGrpcStreamSurface::ConfigSync, rejection);
+                    let status = rejection.into_native_status();
+                    Self::audit_tenant_subscription(
+                        "ConfigSync.Subscribe",
+                        "",
+                        &dp_namespace,
+                        "failure",
+                        status.message(),
+                    );
+                    return Err(status);
+                }
+            };
         // Register the receiver before loading the initial snapshot so a
         // concurrent CP broadcast is either captured by this stream or already
         // reflected in the loaded snapshot.
@@ -2201,9 +2246,11 @@ impl ConfigSync for CpGrpcServer {
                             error!(
                                 namespace = %recovery_namespace,
                                 failure_class,
-                                "Skipping ConfigSync recovery snapshot because gateway trust is unusable"
+                                "Terminating ConfigSync recovery because gateway trust is unusable"
                             );
-                            return None;
+                            return Some(Err(Status::internal(
+                                "Failed to prepare ConfigSync recovery snapshot",
+                            )));
                         }
                     };
                 match Self::config_json_for_dp(&filtered) {
@@ -2221,7 +2268,9 @@ impl ConfigSync for CpGrpcServer {
                     }
                     Err(e) => {
                         error!("Failed to serialize recovery snapshot: {}", e);
-                        None
+                        Some(Err(Status::internal(
+                            "Failed to serialize ConfigSync recovery snapshot",
+                        )))
                     }
                 }
             }
@@ -2253,6 +2302,7 @@ impl ConfigSync for CpGrpcServer {
         let combined = initial_stream.chain(stream::select(stream, heartbeat_stream));
         let tracked = TrackedStream {
             inner: Box::pin(combined),
+            _admission_permit: admission_permit,
             registry: self.registry.clone(),
             node_id,
             connected_at: now,

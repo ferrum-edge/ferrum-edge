@@ -49,6 +49,11 @@ identifiers and error strings do not remain in snapshots.
 `sources[].source_id` as an opaque returned digest and use that value, rather
 than a configured URI/path, in the `source_id` query filter; accept the new
 `recovered` outcome.
+### Native ConfigSync and MeshSubscribe share xDS stream admission (issue [#4432](https://github.com/ferrum-edge/ferrum-edge/issues/4432))
+
+Authenticated `ConfigSync.Subscribe` and `MeshConfigSync.MeshSubscribe` streams previously had no process, namespace, principal, or node ceiling. They now draw from the existing ADS admission controller (`FERRUM_XDS_MAX_TOTAL_STREAMS` and the per-namespace / per-principal / per-node / distinct-node ceilings). Excess streams are refused with gRPC `RESOURCE_EXHAUSTED` before a snapshot or response channel is allocated. Under `FERRUM_MESH_PRODUCTION_MODE=true`, a previously valid unbounded (`0`) configuration is refused at validate and CP startup unless `FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS=true`, including when ADS is disabled.
+
+**Operator action:** size the `FERRUM_XDS_MAX_*` budgets for native DP and mesh subscribers as well as ADS, and replace any production `0` (unbounded) values with finite ceilings or the explicit unsafe override before upgrading. Check the concrete defaults against your fleet first: `FERRUM_XDS_MAX_TOTAL_STREAMS` is **1024**, `FERRUM_XDS_MAX_STREAMS_PER_NAMESPACE` **512**, `FERRUM_XDS_MAX_STREAMS_PER_PRINCIPAL` **256**, and `FERRUM_XDS_MAX_STREAMS_PER_NODE` **4**. A CP that serves more DP and mesh subscribers than the total ceiling — or a fleet that shares one credential across more than 256 subscribers — starts refusing streams with `RESOURCE_EXHAUSTED` at that boundary, where before the upgrade every native stream was admitted. Raise the ceilings to match the fleet before cutover, not after the first refusal.
 
 ### Injected Ferrum is a Kubernetes native sidecar (issue [#4430](https://github.com/ferrum-edge/ferrum-edge/issues/4430))
 

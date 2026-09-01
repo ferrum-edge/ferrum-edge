@@ -1348,6 +1348,30 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_cp_grpc_active_node_ids",
+    "type": "gauge",
+    "help": "Distinct admitted CP configuration-stream node state keys.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_grpc_active_streams",
+    "type": "gauge",
+    "help": "Currently active long-lived CP configuration streams across ConfigSync, MeshSubscribe, and ADS.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_cp_grpc_max_connections",
     "type": "gauge",
     "help": "Configured CP gRPC connection cap (0 = unlimited).",
@@ -1380,6 +1404,20 @@
       "namespace"
     ],
     "subsystem": "cp_grpc",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_grpc_stream_admission_rejections_total",
+    "type": "counter",
+    "help": "Long-lived CP configuration streams rejected at admission, by bounded surface and reason.",
+    "labels": [
+      "surface",
+      "reason",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
     "export_surface": "/metrics",
     "bundled": "documented_only",
     "emission": "conditional"
