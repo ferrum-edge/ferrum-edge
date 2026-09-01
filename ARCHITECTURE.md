@@ -322,7 +322,7 @@ Distributes traffic across multiple backend targets within an upstream group:
 - Connection errors always count as passive health check failures
 - All-unhealthy fallback: routes to all targets rather than returning errors
 - `TargetSelection` carries `is_fallback` flag for downstream observability
-- Client-facing headers: `X-Gateway-Error` (connection_failure | backend_timeout | backend_error) and `X-Gateway-Upstream-Status: degraded`
+- Client-facing headers: `X-Gateway-Error` (connection_failure | backend_timeout | backend_error | circuit_breaker_open | overload | config_stale | concurrency_limit) and `X-Gateway-Upstream-Status: degraded`
 - See [docs/load_balancing.md](docs/load_balancing.md) for full configuration reference
 
 ### **4.1 Connection Pool (`src/connection_pool.rs`)**

@@ -56,6 +56,7 @@ FROZEN_FILTER_MODULES = {
         "integration::apply_incremental_outcome_tests",
         "integration::log_schema_integration_tests",
         "integration::log_schema_registry_tests",
+        "integration::gateway_error_class_observability_tests",
         "integration::deferred_log_tests",
     },
     MESH_ROUTING_SHARD: {

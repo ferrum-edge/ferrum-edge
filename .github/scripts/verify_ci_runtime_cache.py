@@ -3851,11 +3851,17 @@ def pin_errors(text: str, source: str) -> list[str]:
 
 
 def builder_arg_features_is_after_apt(dockerfile: str) -> bool:
-    marker = "FROM rust:latest AS builder\n"
-    start = dockerfile.find(marker)
-    if start < 0:
+    # The base is digest-pinned (`rust:<tag>@sha256:...`), so match the stage
+    # rather than one literal reference; a pin refresh must not silently turn
+    # this contract into a no-op by failing to find its marker.
+    match = re.search(
+        r"^FROM rust(?::[^\s@]+)?(?:@sha256:[0-9a-f]{64})? AS builder$",
+        dockerfile,
+        re.M,
+    )
+    if match is None:
         return False
-    rest = dockerfile[start + len(marker) :]
+    rest = dockerfile[match.end() :]
     next_from = rest.find("\nFROM ")
     body = rest if next_from < 0 else rest[:next_from]
     apt = body.find("apt-get update")
@@ -4894,6 +4900,24 @@ def self_test() -> int:
             "RUN apt-get update && apt-get install -y pkg-config\n"
         ),
         "self-test: ARG FEATURES before apt should fail",
+        failures,
+    )
+    require(
+        builder_arg_features_is_after_apt(
+            "FROM rust:latest@sha256:" + ("0" * 64) + " AS builder\n"
+            "RUN apt-get update && apt-get install -y pkg-config\n"
+            "ARG FEATURES\n"
+        ),
+        "self-test: digest-pinned builder base must still be recognized",
+        failures,
+    )
+    require(
+        not builder_arg_features_is_after_apt(
+            "FROM golang:1.24 AS builder\n"
+            "RUN apt-get update\n"
+            "ARG FEATURES\n"
+        ),
+        "self-test: a non-rust builder base must not satisfy the contract",
         failures,
     )
     sample = (

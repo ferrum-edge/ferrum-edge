@@ -716,6 +716,15 @@ async fn scripted_backend_stall_sheds_h3_frontend_request() {
         Some("Service overloaded"),
         "H3 rejection must expose the coarse overload reason; body={body}"
     );
+    assert_eq!(
+        response
+            .headers
+            .get("x-gateway-error")
+            .and_then(|value| value.to_str().ok()),
+        Some("overload"),
+        "H3 overload 503 must set X-Gateway-Error; headers={:?}",
+        response.headers
+    );
     assert!(response.body_error.is_none(), "response={response:?}");
     assert_eq!(
         backend.received_requests().await.len(),

@@ -644,6 +644,13 @@ fn representative_exposition() -> String {
         .insert("grpc_status".to_string(), "0".to_string());
     registry.record(&grpc_summary);
 
+    let mut failed = make_summary("contract-5xx-proxy");
+    failed.response_status_code = 503;
+    failed
+        .metadata
+        .insert("rejection_phase".to_string(), "overload".to_string());
+    registry.record(&failed);
+
     let mut mesh_http = make_summary("mesh-http");
     mesh_http.metadata.extend([
         ("mesh.source.workload".into(), "frontend".into()),
@@ -728,7 +735,9 @@ fn representative_exposition() -> String {
     registry.record_request_mirror_dispatched();
     registry.record_mesh_tcp_egress_connection("hbone", true);
     registry.record_mesh_tcp_egress_connection("mtls", false);
-    registry.record_stream(&make_stream_summary("stream-proxy", "tcp"));
+    let mut stream_err = make_stream_summary("stream-proxy", "tcp");
+    stream_err.error_class = Some(ferrum_edge::retry::ErrorClass::DnsLookupError);
+    registry.record_stream(&stream_err);
 
     let delta = Arc::new(DatabaseDeltaPollMetrics::default());
     delta.record_poll_completed();

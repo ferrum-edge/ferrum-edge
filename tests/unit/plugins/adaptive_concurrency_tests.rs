@@ -160,6 +160,10 @@ fn assert_generation_handoff_rejected_without_headers(decision: BackendAdmission
             ..
         } => {
             assert_eq!(status_code, 503);
+            assert_eq!(
+                headers.get("x-gateway-error").map(String::as_str),
+                Some("concurrency_limit"),
+            );
             assert!(
                 !headers.contains_key("x-adaptive-concurrency-limit"),
                 "a generation handoff has no truthful per-target limit"
@@ -229,10 +233,16 @@ fn adaptive_concurrency_rejects_when_limit_is_full_and_releases_on_drop() {
 
     match plugin.try_backend_admission(&ctx, &admission) {
         BackendAdmissionDecision::Reject {
-            status_code, body, ..
+            status_code,
+            body,
+            headers,
         } => {
             assert_eq!(status_code, 503);
             assert_eq!(body, br#"{"error":"Upstream concurrency limit reached"}"#);
+            assert_eq!(
+                headers.get("x-gateway-error").map(String::as_str),
+                Some("concurrency_limit"),
+            );
         }
         _ => panic!("second concurrent request should be rejected"),
     }

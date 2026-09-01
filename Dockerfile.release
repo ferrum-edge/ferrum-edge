@@ -5,7 +5,8 @@
 # built to the declared GLIBC_2.34 runtime floor (x86_64 from a digest-pinned
 # AlmaLinux 8.10 sysroot; ARM64 from the isolated Xenial Cross image) and
 # remain forward-compatible with this newer distroless libc.
-FROM gcr.io/distroless/cc-debian13:nonroot
+# Digest resolved 2026-08-31; the tag is kept for readability, the digest is authoritative.
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:c31ff9abcb1910f3ab25c7957bdaf0bfe12a01eb546e8df2282f1c8f682b606c
 
 ARG TARGETARCH
 

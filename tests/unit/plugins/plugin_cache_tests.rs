@@ -487,7 +487,7 @@ async fn run_tcp_connect_chain(
     true
 }
 
-fn make_plugin_config(
+pub(crate) fn make_plugin_config(
     id: &str,
     plugin_name: &str,
     scope: PluginScope,

@@ -10,7 +10,7 @@ use ferrum_edge::plugins::{
     Plugin, PluginHttpClient, PluginResult, RequestContext, key_auth::KeyAuth,
     oidc_relying_party::OidcRelyingParty, priority,
 };
-use ferrum_edge::proxy::run_authentication_phase;
+use ferrum_edge::proxy::run_authentication_phase_with_envelope;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -337,11 +337,12 @@ async fn earlier_single_mode_principal_prevents_later_oidc_refresh_and_slide() {
     let oidc_plugin: Arc<dyn Plugin> = oidc.clone();
 
     assert!(
-        run_authentication_phase(
+        run_authentication_phase_with_envelope(
             AuthMode::Single,
             &[key_auth_plugin, oidc_plugin],
             &mut ctx,
             &ConsumerIndex::new(&[create_test_consumer()]),
+            false,
         )
         .await
         .is_none()
@@ -545,11 +546,12 @@ async fn oidc_single_auth_scope_rejection_returns_rotated_refresh_cookie() {
     let mut ctx = ctx_with_session_cookie(&cookie);
 
     let plugin_for_phase: Arc<dyn Plugin> = plugin.clone();
-    let (status_code, _, headers) = run_authentication_phase(
+    let (status_code, _, headers) = run_authentication_phase_with_envelope(
         AuthMode::Single,
         &[plugin_for_phase],
         &mut ctx,
         &ConsumerIndex::new(&[]),
+        false,
     )
     .await
     .expect("scope-rejected OIDC session must reject");
@@ -689,11 +691,12 @@ async fn oidc_multi_auth_preserves_rotated_cookie_when_later_credential_rejects(
         .insert("x-api-key".to_string(), "invalid-api-key".to_string());
     let oidc_plugin: Arc<dyn Plugin> = oidc.clone();
 
-    let (status_code, body, mut response_headers) = run_authentication_phase(
+    let (status_code, body, mut response_headers) = run_authentication_phase_with_envelope(
         AuthMode::Multi,
         &[oidc_plugin, key_auth],
         &mut ctx,
         &consumer_index,
+        false,
     )
     .await
     .expect("later invalid API key must keep the request rejected");
@@ -820,11 +823,12 @@ async fn oidc_multi_auth_preserves_distinct_rejected_session_cookies() {
     let first_plugin: Arc<dyn Plugin> = first.clone();
     let second_plugin: Arc<dyn Plugin> = second.clone();
 
-    let (status_code, _, headers) = run_authentication_phase(
+    let (status_code, _, headers) = run_authentication_phase_with_envelope(
         AuthMode::Multi,
         &[first_plugin, second_plugin],
         &mut ctx,
         &ConsumerIndex::new(&[]),
+        false,
     )
     .await
     .expect("both scope-rejected sessions must reject");
@@ -930,11 +934,12 @@ async fn oidc_multi_auth_uses_later_same_name_rejected_session_cookie() {
     let first_plugin: Arc<dyn Plugin> = first;
     let second_plugin: Arc<dyn Plugin> = second.clone();
 
-    let (status_code, _, headers) = run_authentication_phase(
+    let (status_code, _, headers) = run_authentication_phase_with_envelope(
         AuthMode::Multi,
         &[first_plugin, second_plugin],
         &mut ctx,
         &ConsumerIndex::new(&[]),
+        false,
     )
     .await
     .expect("both scope-rejected sessions must reject");
@@ -1007,11 +1012,12 @@ async fn oidc_multi_auth_preserves_selected_rejection_cookie() {
     let first_plugin: Arc<dyn Plugin> = first.clone();
     let second_plugin: Arc<dyn Plugin> = second.clone();
 
-    let (status_code, _, mut headers) = run_authentication_phase(
+    let (status_code, _, mut headers) = run_authentication_phase_with_envelope(
         AuthMode::Multi,
         &[first_plugin, second_plugin],
         &mut ctx,
         &ConsumerIndex::new(&[]),
+        false,
     )
     .await
     .expect("the later browser challenge must reject");
@@ -1114,11 +1120,12 @@ async fn oidc_multi_auth_keeps_later_clear_for_shared_session_cookie() {
     let first_plugin: Arc<dyn Plugin> = first.clone();
     let second_plugin: Arc<dyn Plugin> = second;
 
-    let (status_code, _, headers) = run_authentication_phase(
+    let (status_code, _, headers) = run_authentication_phase_with_envelope(
         AuthMode::Multi,
         &[first_plugin, second_plugin],
         &mut ctx,
         &ConsumerIndex::new(&[]),
+        false,
     )
     .await
     .expect("the later browser challenge must reject");
@@ -1186,11 +1193,12 @@ async fn oidc_multi_auth_preserves_refresh_backoff_when_later_credential_rejects
         .headers
         .insert("x-api-key".to_string(), "invalid-api-key".to_string());
 
-    let (status_code, _, headers) = run_authentication_phase(
+    let (status_code, _, headers) = run_authentication_phase_with_envelope(
         AuthMode::Multi,
         &auth_plugins,
         &mut first_ctx,
         &consumer_index,
+        false,
     )
     .await
     .expect("later invalid API key must keep the request rejected");
@@ -1215,11 +1223,12 @@ async fn oidc_multi_auth_preserves_refresh_backoff_when_later_credential_rejects
     second_ctx
         .headers
         .insert("x-api-key".to_string(), "invalid-api-key".to_string());
-    let (status_code, _, headers) = run_authentication_phase(
+    let (status_code, _, headers) = run_authentication_phase_with_envelope(
         AuthMode::Multi,
         &auth_plugins,
         &mut second_ctx,
         &consumer_index,
+        false,
     )
     .await
     .expect("backed-off session and invalid API key must reject");
@@ -1274,11 +1283,12 @@ async fn oidc_multi_auth_discards_scope_rejection_refresh_cookie_on_later_succes
         .insert("x-api-key".to_string(), "test-api-key".to_string());
     let oidc_plugin: Arc<dyn Plugin> = oidc.clone();
 
-    let rejection = run_authentication_phase(
+    let rejection = run_authentication_phase_with_envelope(
         AuthMode::Multi,
         &[oidc_plugin, key_auth],
         &mut ctx,
         &consumer_index,
+        false,
     )
     .await;
     assert!(rejection.is_none(), "later key_auth must authenticate");
@@ -1373,11 +1383,12 @@ async fn oidc_multi_auth_discards_uncommitted_attempt_metadata() {
             .insert("x-api-key".to_string(), "test-api-key".to_string());
         let oidc_plugin: Arc<dyn Plugin> = oidc.clone();
 
-        let rejection = run_authentication_phase(
+        let rejection = run_authentication_phase_with_envelope(
             AuthMode::Multi,
             &[oidc_plugin, Arc::clone(&key_auth)],
             &mut ctx,
             &consumer_index,
+            false,
         )
         .await;
         assert!(rejection.is_none(), "later key_auth must authenticate");

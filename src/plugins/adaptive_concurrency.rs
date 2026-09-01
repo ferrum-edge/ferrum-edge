@@ -7,7 +7,7 @@
 //! saturated and healthy.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use serde_json::{Map, Value};
 
@@ -19,6 +19,14 @@ use crate::plugins::{
     BackendAdmissionContext, BackendAdmissionDecision, HTTP_FAMILY_PROTOCOLS, Plugin,
     PluginHttpClient, ProxyProtocol, RequestContext,
 };
+use crate::retry::OBS_CONCURRENCY_LIMIT;
+
+static CONCURRENCY_LIMIT_HEADERS: LazyLock<HashMap<String, String>> = LazyLock::new(|| {
+    HashMap::from([(
+        "x-gateway-error".to_string(),
+        OBS_CONCURRENCY_LIMIT.to_string(),
+    )])
+});
 
 pub struct AdaptiveConcurrency {
     config: Arc<AdaptiveConcurrencyConfig>,
@@ -101,7 +109,7 @@ impl Plugin for AdaptiveConcurrency {
                 limit,
                 expose_headers,
             }) => {
-                let mut headers = HashMap::new();
+                let mut headers = CONCURRENCY_LIMIT_HEADERS.clone();
                 if expose_headers {
                     headers.insert(
                         "x-adaptive-concurrency-limit".to_string(),
@@ -122,7 +130,7 @@ impl Plugin for AdaptiveConcurrency {
                 BackendAdmissionDecision::Reject {
                     status_code: 503,
                     body: br#"{"error":"Upstream concurrency limit reached"}"#.to_vec(),
-                    headers: HashMap::new(),
+                    headers: CONCURRENCY_LIMIT_HEADERS.clone(),
                 }
             }
         }

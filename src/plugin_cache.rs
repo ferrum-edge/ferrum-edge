@@ -7,9 +7,9 @@
 //!
 //! Each proxy gets a merged plugin list: global plugins + proxy-scoped plugins,
 //! sorted by priority. Pre-computed flags (`requires_response_body_buffering`,
-//! `requires_request_body_buffering`, `requires_ws_frame_hooks`, and
-//! protocol-scoped response-stream hooks) enable O(1)
-//! upper-bound decisions on the hot path instead of per-request plugin
+//! `requires_request_body_buffering`, `requires_ws_frame_hooks`,
+//! `uses_openai_auth_error_envelope`, and protocol-scoped response-stream hooks)
+//! enable O(1) upper-bound decisions on the hot path instead of per-request plugin
 //! iteration.
 //!
 //! Incremental updates via `apply_delta()` preserve unchanged proxy plugin
@@ -36,6 +36,7 @@ use crate::adaptive_concurrency::{
 use crate::config::types::PluginConfig;
 use crate::plugins::tcp_connection_throttle::{TcpConnectionThrottle, TcpConnectionThrottleState};
 use crate::plugins::utils::jwks_cache::{JwksRefreshRequirement, retain_active_requirements};
+use crate::plugins::utils::openai_error::proxy_has_openai_auth_error_envelope_plugin;
 use crate::plugins::utils::policy_digest::presentation_policy_digest;
 use crate::plugins::{
     Plugin, PluginFailurePolicy, PluginHttpClient, ProxyProtocol, ResponsePresentationPolicy,
@@ -2583,6 +2584,9 @@ type RequestBufferingMap = HashMap<String, bool>;
 /// Map from namespace-qualified proxy key to whether any plugin requires parsed
 /// WebSocket framing.
 type WsFrameMap = HashMap<String, bool>;
+/// Map from namespace-qualified proxy key to whether authentication rejects on
+/// that proxy should use the OpenAI nested error envelope.
+type OpenAiAuthErrorEnvelopeMap = HashMap<String, bool>;
 /// Map from the namespace-qualified proxy_group plugin config identity
 /// (`(namespace, plugin_config_id)`) to its shared plugin instance. Keying on a
 /// bare config id would share one stateful group instance between two tenants
@@ -5210,6 +5214,11 @@ pub(crate) struct PluginCacheInner {
     requires_ws_frame: WsFrameMap,
     /// Whether global-only plugins require parsed WebSocket framing (fallback).
     global_requires_ws_frame: bool,
+    /// Pre-computed: does any plugin on this proxy require OpenAI-shaped auth
+    /// rejects ahead of the AI gateway plugins?
+    openai_auth_error_envelope: OpenAiAuthErrorEnvelopeMap,
+    /// Whether global-only plugins require the OpenAI auth error envelope.
+    global_openai_auth_error_envelope: bool,
     /// Shared proxy-group plugin instances, keyed by plugin_config_id. Kept
     /// across incremental updates so rebuilt proxies can keep sharing state
     /// with unchanged proxies when the proxy-group config itself did not change.
@@ -5362,6 +5371,8 @@ impl PluginCacheInner {
         protocol_snapshot: ProtocolSnapshot,
         requires_ws_frame: WsFrameMap,
         global_requires_ws_frame: bool,
+        openai_auth_error_envelope: OpenAiAuthErrorEnvelopeMap,
+        global_openai_auth_error_envelope: bool,
         proxy_group_plugins: ProxyGroupInstanceMap,
         adaptive_concurrency_instances: AdaptiveConcurrencyInstanceMap,
         country_mmdb_instances: CountryMmdbPluginInstanceMap,
@@ -5383,6 +5394,8 @@ impl PluginCacheInner {
             protocol_snapshot,
             requires_ws_frame,
             global_requires_ws_frame,
+            openai_auth_error_envelope,
+            global_openai_auth_error_envelope,
             proxy_group_plugins,
             adaptive_concurrency_instances,
             country_mmdb_instances,
@@ -5793,6 +5806,14 @@ impl PluginCacheInner {
             .unwrap_or(self.global_requires_ws_frame)
     }
 
+    /// OpenAI nested auth-reject envelope requirement for a composed `proxy_key`.
+    pub(crate) fn uses_openai_auth_error_envelope(&self, proxy_key: &str) -> bool {
+        self.openai_auth_error_envelope
+            .get(proxy_key)
+            .copied()
+            .unwrap_or(self.global_openai_auth_error_envelope)
+    }
+
     /// Initial-response-header policy plugins for `(namespace, proxy_id)`.
     ///
     /// Namespace-aware entry point for request paths that need only this one
@@ -5856,6 +5877,7 @@ impl PluginCacheInner {
                 requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
                 requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
                 requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_key),
+                uses_openai_auth_error_envelope: self.uses_openai_auth_error_envelope(proxy_key),
                 enforced_request_body_limit: self
                     .get_enforced_request_body_limit(proxy_key, protocol),
                 enforced_response_body_limit: self
@@ -5913,6 +5935,7 @@ impl PluginCacheInner {
                 requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
                 requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
                 requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_key),
+                uses_openai_auth_error_envelope: self.uses_openai_auth_error_envelope(proxy_key),
                 enforced_request_body_limit: entry.phase.enforced_request_body_limit,
                 enforced_response_body_limit: entry.phase.enforced_response_body_limit,
             }
@@ -5945,6 +5968,7 @@ pub struct PluginCacheRequestView {
     requires_response_body_buffering: bool,
     requires_request_body_buffering: bool,
     requires_ws_frame_hooks: bool,
+    uses_openai_auth_error_envelope: bool,
     enforced_request_body_limit: Option<u64>,
     enforced_response_body_limit: Option<u64>,
 }
@@ -6102,6 +6126,12 @@ impl PluginCacheRequestView {
     /// Check parsed WebSocket relay requirement from this request view.
     pub fn requires_ws_frame_hooks(&self) -> bool {
         self.requires_ws_frame_hooks
+    }
+
+    /// Whether authentication rejects on this proxy should use the OpenAI
+    /// nested error envelope.
+    pub fn uses_openai_auth_error_envelope(&self) -> bool {
+        self.uses_openai_auth_error_envelope
     }
 
     /// Check whether any protocol-compatible plugin opted into response-stream
@@ -6292,6 +6322,8 @@ impl PluginCache {
             global_needs_req_buffering,
             ws_frame_map,
             global_needs_ws_frame,
+            openai_auth_error_envelope_map,
+            global_openai_auth_error_envelope,
             proxy_group_plugins,
             adaptive_concurrency_instances,
             country_mmdb_instances,
@@ -6322,6 +6354,8 @@ impl PluginCache {
             snapshot,
             ws_frame_map,
             global_needs_ws_frame,
+            openai_auth_error_envelope_map,
+            global_openai_auth_error_envelope,
             proxy_group_plugins,
             adaptive_concurrency_instances,
             country_mmdb_instances,
@@ -6414,9 +6448,17 @@ impl PluginCache {
                 inner.insert(proto, build_protocol_entry(plugins, proto));
             }
             protocol_snapshot.proxy.insert(proxy_key.clone(), inner);
-            grpc_web_proxy.insert(proxy_key, build_grpc_web_protocol_entry(plugins));
+            grpc_web_proxy.insert(proxy_key.clone(), build_grpc_web_protocol_entry(plugins));
         }
         protocol_snapshot.grpc_web_proxy = grpc_web_proxy;
+
+        let mut openai_auth_error_envelope = current.openai_auth_error_envelope.clone();
+        if let Some(plugins) = proxy_plugins.get(&proxy_key) {
+            openai_auth_error_envelope.insert(
+                proxy_key.clone(),
+                proxy_has_openai_auth_error_envelope_plugin(plugins),
+            );
+        }
 
         let next = Arc::new(PluginCacheInner::new(
             proxy_plugins,
@@ -6428,6 +6470,8 @@ impl PluginCache {
             protocol_snapshot,
             current.requires_ws_frame.clone(),
             current.global_requires_ws_frame,
+            openai_auth_error_envelope,
+            current.global_openai_auth_error_envelope,
             current.proxy_group_plugins.clone(),
             current.adaptive_concurrency_instances.clone(),
             current.country_mmdb_instances.clone(),
@@ -7329,11 +7373,14 @@ impl PluginCache {
         let mut new_buffering: BufferingMap = current.requires_buffering.clone();
         let mut new_req_buffering: RequestBufferingMap = current.requires_request_buffering.clone();
         let mut new_ws_frame: WsFrameMap = current.requires_ws_frame.clone();
+        let mut new_openai_auth_error_envelope: OpenAiAuthErrorEnvelopeMap =
+            current.openai_auth_error_envelope.clone();
         for resource in removed_proxy_ids {
             let key = resource.runtime_key();
             new_buffering.remove(&key);
             new_req_buffering.remove(&key);
             new_ws_frame.remove(&key);
+            new_openai_auth_error_envelope.remove(&key);
         }
         for proxy in &config.proxies {
             let proxy_key = proxy_runtime_key(proxy);
@@ -7349,8 +7396,12 @@ impl PluginCache {
                     plugins.iter().any(|p| p.requires_request_body_buffering()),
                 );
                 new_ws_frame.insert(
-                    proxy_key,
+                    proxy_key.clone(),
                     plugins.iter().any(|p| p.requires_websocket_framing()),
+                );
+                new_openai_auth_error_envelope.insert(
+                    proxy_key,
+                    proxy_has_openai_auth_error_envelope_plugin(plugins),
                 );
             }
         }
@@ -7472,6 +7523,11 @@ impl PluginCache {
         } else {
             current.global_requires_ws_frame
         };
+        let new_global_openai_auth_error_envelope = if global_plugins_changed {
+            proxy_has_openai_auth_error_envelope_plugin(&new_globals)
+        } else {
+            current.global_openai_auth_error_envelope
+        };
 
         // Extract before commit_reload so a duplicate-exporter failure cannot
         // leave the named-schema registry promoted against a rejected cache.
@@ -7547,6 +7603,8 @@ impl PluginCache {
             },
             new_ws_frame,
             new_global_requires_ws_frame,
+            new_openai_auth_error_envelope,
+            new_global_openai_auth_error_envelope,
             group_plugin_instances,
             adaptive_concurrency_instances,
             country_mmdb_instances,
@@ -7712,6 +7770,18 @@ impl PluginCache {
         })
     }
 
+    /// Check whether authentication rejects on this proxy should use the OpenAI
+    /// nested error envelope.
+    pub fn uses_openai_auth_error_envelope(&self, namespace: &str, proxy_id: &str) -> bool {
+        PROXY_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            write_namespaced_runtime_key(&mut key, namespace, proxy_id);
+            self.inner
+                .load()
+                .uses_openai_auth_error_envelope(key.as_str())
+        })
+    }
+
     /// Collect all hostnames that plugins will send traffic to.
     ///
     /// Iterates all cached plugin instances (global + per-proxy) and calls
@@ -7803,6 +7873,8 @@ impl PluginCache {
             RequestBufferingMap,
             bool,
             WsFrameMap,
+            bool,
+            OpenAiAuthErrorEnvelopeMap,
             bool,
             ProxyGroupInstanceMap,
             AdaptiveConcurrencyInstanceMap,
@@ -7928,6 +8000,8 @@ impl PluginCache {
         let mut req_buffering_map: RequestBufferingMap =
             HashMap::with_capacity(config.proxies.len());
         let mut ws_frame_map: WsFrameMap = HashMap::with_capacity(config.proxies.len());
+        let mut openai_auth_error_envelope_map: OpenAiAuthErrorEnvelopeMap =
+            HashMap::with_capacity(config.proxies.len());
 
         for proxy in &config.proxies {
             // Start with global plugins
@@ -8090,6 +8164,11 @@ impl PluginCache {
             let needs_ws_frame = merged.iter().any(|p| p.requires_websocket_framing());
             ws_frame_map.insert(proxy_runtime_key(proxy), needs_ws_frame);
 
+            let needs_openai_auth_error_envelope =
+                proxy_has_openai_auth_error_envelope_plugin(&merged);
+            openai_auth_error_envelope_map
+                .insert(proxy_runtime_key(proxy), needs_openai_auth_error_envelope);
+
             proxy_map.insert(proxy_runtime_key(proxy), Arc::new(merged));
         }
 
@@ -8183,6 +8262,8 @@ impl PluginCache {
         let global_needs_ws_frame = global_plugins
             .iter()
             .any(|p| p.requires_websocket_framing());
+        let global_openai_auth_error_envelope =
+            proxy_has_openai_auth_error_envelope_plugin(&global_plugins);
 
         Ok((
             proxy_map,
@@ -8193,6 +8274,8 @@ impl PluginCache {
             global_needs_req_buffering,
             ws_frame_map,
             global_needs_ws_frame,
+            openai_auth_error_envelope_map,
+            global_openai_auth_error_envelope,
             group_plugin_instances,
             adaptive_concurrency_instances,
             country_mmdb_instances,

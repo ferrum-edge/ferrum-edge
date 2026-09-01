@@ -56,17 +56,24 @@ pub(crate) fn escape_label_value(value: &str) -> String {
     escaped
 }
 
-/// Composite key for request counter: (proxy_id, method, status_code, grpc_status).
+/// Composite key for request counter: (proxy_id, method, status_code,
+/// grpc_status, error_class).
 ///
-/// `method` and `grpc_status` are normalized to bounded static label sets before
-/// insertion. Request-controlled extension methods and malformed gRPC status
-/// values can therefore never create unbounded registry keys.
+/// `method`, `grpc_status`, and `error_class` are normalized to bounded
+/// static label sets before insertion. Request-controlled extension methods,
+/// malformed gRPC status values, and error messages can therefore never
+/// create unbounded registry keys. `error_class` is omitted (`None`) on
+/// 2xx/3xx/4xx so the common success series is not multiplied.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CounterKey {
     pub proxy_id: Arc<str>,
     pub method: &'static str,
     pub status_code: u16,
     pub grpc_status: Option<&'static str>,
+    /// Closed HTTP metrics token: [`ErrorClass::as_str`] or a
+    /// gateway-authored token (`circuit_breaker_open` / `overload` /
+    /// `config_stale` / `concurrency_limit`). `None` on 2xx/3xx/4xx.
+    pub error_class: Option<&'static str>,
 }
 
 /// Bounded AI usage key. Provider is normalized to one of the compiled-in
@@ -155,14 +162,16 @@ pub struct ClientDisconnectKey {
 ///
 /// `cause` is the snake_case `DisconnectCause` variant (or `"unknown"` when
 /// `None`). `direction` is the snake_case `Direction` variant (or
-/// `"unknown"` when `None`). Both are bounded-cardinality enums so they are
-/// safe as Prometheus labels.
+/// `"unknown"` when `None`). `error_class` is [`ErrorClass::as_str`] when
+/// the stream summary carries a class, and omitted otherwise. All three are
+/// bounded-cardinality enums so they are safe as Prometheus labels.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StreamDisconnectKey {
     pub proxy_id: Arc<str>,
     pub protocol: Arc<str>,
     pub cause: &'static str,
     pub direction: &'static str,
+    pub error_class: Option<&'static str>,
 }
 
 /// Composite key for HBONE tunnel relay failures.
@@ -1107,6 +1116,7 @@ impl MetricsRegistry {
             protocol: Arc::from(summary.protocol.as_str()),
             cause: disconnect_cause_label(summary.disconnect_cause),
             direction: direction_label(summary.disconnect_direction),
+            error_class: summary.error_class.as_ref().map(ErrorClass::as_str),
         };
         self.stream_disconnect_counter
             .entry(disconnect_key)
@@ -2105,6 +2115,7 @@ impl MetricsRegistry {
             method: method_label(summary.http_method.as_str()),
             status_code: summary.response_status_code,
             grpc_status: grpc_status_label(&summary.metadata),
+            error_class: summary.metrics_error_class_label(),
         };
         self.request_counter
             .entry(counter_key)
@@ -3236,9 +3247,21 @@ impl MetricsRegistry {
             let count = entry.value().value.load(Ordering::Relaxed);
             let proxy_id = escape_label_value(&key.proxy_id);
             if let Some(grpc_status) = key.grpc_status {
+                if let Some(error_class) = key.error_class {
+                    output.push_str(&format!(
+                        "ferrum_requests_total{{proxy_id=\"{}\",method=\"{}\",status_code=\"{}\",grpc_status=\"{}\",error_class=\"{}\"{}}} {}\n",
+                        proxy_id, key.method, key.status_code, grpc_status, error_class, ns_label, count
+                    ));
+                } else {
+                    output.push_str(&format!(
+                        "ferrum_requests_total{{proxy_id=\"{}\",method=\"{}\",status_code=\"{}\",grpc_status=\"{}\"{}}} {}\n",
+                        proxy_id, key.method, key.status_code, grpc_status, ns_label, count
+                    ));
+                }
+            } else if let Some(error_class) = key.error_class {
                 output.push_str(&format!(
-                    "ferrum_requests_total{{proxy_id=\"{}\",method=\"{}\",status_code=\"{}\",grpc_status=\"{}\"{}}} {}\n",
-                    proxy_id, key.method, key.status_code, grpc_status, ns_label, count
+                    "ferrum_requests_total{{proxy_id=\"{}\",method=\"{}\",status_code=\"{}\",error_class=\"{}\"{}}} {}\n",
+                    proxy_id, key.method, key.status_code, error_class, ns_label, count
                 ));
             } else {
                 output.push_str(&format!(
@@ -4194,7 +4217,7 @@ impl MetricsRegistry {
         // error ratios are useful to operators even on well-behaved traffic.
         if !self.stream_disconnect_counter.is_empty() {
             output.push_str(
-                "# HELP ferrum_stream_disconnects_total Stream disconnects (TCP/UDP) by cause and direction.\n",
+                "# HELP ferrum_stream_disconnects_total Stream disconnects (TCP/UDP) by cause, direction, and optional error_class.\n",
             );
             output.push_str("# TYPE ferrum_stream_disconnects_total counter\n");
             for entry in self.stream_disconnect_counter.iter() {
@@ -4202,12 +4225,19 @@ impl MetricsRegistry {
                 let count = entry.value().value.load(Ordering::Relaxed);
                 let proxy_id = escape_label_value(&key.proxy_id);
                 let protocol = escape_label_value(&key.protocol);
-                // cause and direction are &'static str from bounded enums —
-                // no escaping needed (snake_case ASCII only).
-                output.push_str(&format!(
-                    "ferrum_stream_disconnects_total{{proxy_id=\"{}\",protocol=\"{}\",cause=\"{}\",direction=\"{}\"{}}} {}\n",
-                    proxy_id, protocol, key.cause, key.direction, ns_label, count
-                ));
+                // cause, direction, and error_class are &'static str from
+                // bounded enums — no escaping needed (snake_case ASCII only).
+                if let Some(error_class) = key.error_class {
+                    output.push_str(&format!(
+                        "ferrum_stream_disconnects_total{{proxy_id=\"{}\",protocol=\"{}\",cause=\"{}\",direction=\"{}\",error_class=\"{}\"{}}} {}\n",
+                        proxy_id, protocol, key.cause, key.direction, error_class, ns_label, count
+                    ));
+                } else {
+                    output.push_str(&format!(
+                        "ferrum_stream_disconnects_total{{proxy_id=\"{}\",protocol=\"{}\",cause=\"{}\",direction=\"{}\"{}}} {}\n",
+                        proxy_id, protocol, key.cause, key.direction, ns_label, count
+                    ));
+                }
             }
         }
 

@@ -4184,6 +4184,7 @@
       "method",
       "status_code",
       "grpc_status",
+      "error_class",
       "namespace"
     ],
     "subsystem": "prometheus_metrics",
@@ -4508,12 +4509,13 @@
   {
     "name": "ferrum_stream_disconnects_total",
     "type": "counter",
-    "help": "Stream disconnects (TCP/UDP) by cause and direction.",
+    "help": "Stream disconnects (TCP/UDP) by cause, direction, and optional error_class.",
     "labels": [
       "proxy_id",
       "protocol",
       "cause",
       "direction",
+      "error_class",
       "namespace"
     ],
     "subsystem": "stream",

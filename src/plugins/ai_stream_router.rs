@@ -224,6 +224,7 @@ use super::utils::body_transform::{is_event_stream_content_type, is_json_content
 use super::utils::content_encoding::{
     DecodeLimits, decode_content_encoding, parse_content_codings,
 };
+use super::utils::openai_error::openai_error_body;
 use super::{
     Plugin, PluginHttpClient, PluginResult, RequestContext, ResponseStreamAction,
     ResponseStreamInspector, ResponseStreamInspectorStage,
@@ -2674,14 +2675,7 @@ fn openai_error_response(
     param: Option<&str>,
     code: Option<&str>,
 ) -> PluginResult {
-    let body = json!({
-        "error": {
-            "message": message,
-            "type": error_type,
-            "param": param,
-            "code": code,
-        }
-    });
+    let body = openai_error_body(message, error_type, param, code);
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
     PluginResult::Reject {

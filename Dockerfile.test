@@ -22,7 +22,8 @@
 # layer so the second invocation is fast.
 
 # ── Stage 1: shared build base ──────────────────────────────────────────
-FROM rust:latest AS base
+# Digest resolved 2026-08-31; the tag is kept for readability, the digest is authoritative.
+FROM rust:latest@sha256:271849e998ffce5776454bbf98c5dc21baafc854ff8e566197908d3aca9a81e8 AS base
 
 RUN apt-get update && apt-get install -y \
     pkg-config \

@@ -351,6 +351,43 @@ reqwest/h3/tungstenite lineage needs an explicit path:
 6. Never silence an advisory without an expiry and a rationale — the expiry
    check will fail the weekly run otherwise (by design).
 
+## Base image pinning
+
+Production container images (`Dockerfile`, `Dockerfile.release`, and
+`Dockerfile.test`) must pin every external `FROM` base by registry digest, not
+by a mutable tag alone. Write the reference as `repo:tag@sha256:…`, the same form
+`IPROUTE2_BASE` already uses: the digest decides which bytes are pulled and the
+tag stays in the reference as documentation. A Dockerfile comment is a WHOLE line
+beginning with `#` — the parser has no inline-comment form — so a resolution note
+goes on its own line above the instruction, never after it:
+
+```dockerfile
+# Digest resolved YYYY-MM-DD; the tag is kept for readability, the digest is authoritative.
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:…
+# Digest resolved YYYY-MM-DD; the tag is kept for readability, the digest is authoritative.
+FROM rust:latest@sha256:… AS builder
+```
+
+`ARG` defaults that feed a `FROM ${VAR}` line follow the same rule. `scratch`
+and local stage aliases (`FROM builder`, `FROM runtime-common`, …) are exempt.
+Always resolve and pin the **manifest-list** digest (OCI image index), never a
+single-platform manifest, so multi-arch builds keep working.
+
+To refresh a base:
+
+1. Resolve the digest for the existing tag with `docker buildx imagetools inspect
+   <image>:<tag>` or the registry v2 API; confirm the media type is an image
+   index / manifest list.
+2. Update the `@sha256:` pin, the tag in the reference when the tag itself
+   changes, and the resolution date on the comment line above it.
+3. Land via PR and let hosted CI rebuild the Docker targets.
+
+`tests/unit/gateway_core/container_base_pinning_tests.rs` enforces digest pins
+and rejects an unpinned floating Rust channel (`latest`, `stable`, `nightly`,
+`beta`) on those Dockerfiles. It reads each line the way the Dockerfile parser
+does, so a note appended after an instruction is a failure rather than a
+silently accepted comment.
+
 ## CI Actions and Kubernetes tooling
 
 GitHub Actions and the kind / kubectl / Helm binaries used by live Kubernetes

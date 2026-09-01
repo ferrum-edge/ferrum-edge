@@ -212,6 +212,10 @@ use crate::modes::mesh::node_waypoint::{
     NodeWaypointIdentity, NodeWaypointIdentityError, NodeWaypointIdentityResolver, pod_uid_label,
 };
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
+use crate::plugins::utils::openai_error::{
+    OPENAI_CODE_INVALID_API_KEY, OPENAI_CODE_MISSING_API_KEY, OPENAI_INVALID_REQUEST_ERROR,
+    ferrum_flat_error_message, openai_error_body_bytes,
+};
 use crate::plugins::{
     BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
     RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext, TransactionSummary,
@@ -262,6 +266,22 @@ static CIRCUIT_BREAKER_OPEN_HEADERS: std::sync::LazyLock<HashMap<String, String>
         HashMap::from([(
             X_GATEWAY_ERROR_HEADER.to_string(),
             X_GATEWAY_ERROR_CIRCUIT_BREAKER_OPEN.to_string(),
+        )])
+    });
+
+static OVERLOAD_REJECT_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
+    std::sync::LazyLock::new(|| {
+        HashMap::from([(
+            X_GATEWAY_ERROR_HEADER.to_string(),
+            X_GATEWAY_ERROR_OVERLOAD.to_string(),
+        )])
+    });
+
+static CONFIG_STALE_REJECT_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
+    std::sync::LazyLock::new(|| {
+        HashMap::from([(
+            X_GATEWAY_ERROR_HEADER.to_string(),
+            X_GATEWAY_ERROR_CONFIG_STALE.to_string(),
         )])
     });
 
@@ -24144,13 +24164,17 @@ pub(crate) fn restore_authoritative_allow_header(
 /// historical `X-Gateway-Error` casing. HTTP header names are
 /// case-insensitive either way.
 pub(crate) const X_GATEWAY_ERROR_HEADER: &str = "x-gateway-error";
-pub(crate) const X_GATEWAY_ERROR_CONNECTION_FAILURE: &str = "connection_failure";
-pub(crate) const X_GATEWAY_ERROR_BACKEND_TIMEOUT: &str = "backend_timeout";
-pub(crate) const X_GATEWAY_ERROR_BACKEND_ERROR: &str = "backend_error";
+// The backend-path tokens (`connection_failure` / `backend_timeout` /
+// `backend_error`) have no alias here: those paths now take them straight from
+// `crate::retry::OBS_*` through `http_observability_error_class`, so a second
+// spelling would only be a place for the two to drift.
 /// Distinct from `backend_error`: the gateway never contacted a backend on
 /// this request, so reusing that bucket would make open-breaker 503s
 /// indistinguishable from a backend that actually returned 5xx.
-pub(crate) const X_GATEWAY_ERROR_CIRCUIT_BREAKER_OPEN: &str = "circuit_breaker_open";
+pub(crate) const X_GATEWAY_ERROR_CIRCUIT_BREAKER_OPEN: &str =
+    crate::retry::OBS_CIRCUIT_BREAKER_OPEN;
+pub(crate) const X_GATEWAY_ERROR_OVERLOAD: &str = crate::retry::OBS_OVERLOAD;
+pub(crate) const X_GATEWAY_ERROR_CONFIG_STALE: &str = crate::retry::OBS_CONFIG_STALE;
 
 /// RFC 9110 `Allow` for protocol-level 405s (TRACE and non-WebSocket CONNECT)
 /// that run before a proxy is matched, so no per-route `allowed_methods`
@@ -24166,15 +24190,7 @@ pub(crate) fn x_gateway_error_for_backend_failure(
     connection_error: bool,
     status: u16,
 ) -> Option<&'static str> {
-    if connection_error {
-        Some(X_GATEWAY_ERROR_CONNECTION_FAILURE)
-    } else if status == 504 {
-        Some(X_GATEWAY_ERROR_BACKEND_TIMEOUT)
-    } else if status >= 500 {
-        Some(X_GATEWAY_ERROR_BACKEND_ERROR)
-    } else {
-        None
-    }
+    crate::retry::http_observability_error_class(connection_error, status)
 }
 
 /// Insert or replace the gateway-owned `X-Gateway-Error` value after generic
@@ -24227,6 +24243,14 @@ pub(crate) fn insert_x_gateway_error_for_backend_failure(
 /// reject builder so the token is not assembled per request.
 pub(crate) fn circuit_breaker_open_reject_headers() -> HashMap<String, String> {
     CIRCUIT_BREAKER_OPEN_HEADERS.clone()
+}
+
+pub(crate) fn overload_reject_headers() -> HashMap<String, String> {
+    OVERLOAD_REJECT_HEADERS.clone()
+}
+
+pub(crate) fn config_stale_reject_headers() -> HashMap<String, String> {
+    CONFIG_STALE_REJECT_HEADERS.clone()
 }
 
 /// Whether `method` is in the route's configured `allowed_methods`.
@@ -28195,6 +28219,36 @@ pub fn request_is_authenticated(ctx: &RequestContext) -> bool {
 
 const MISSING_AUTHENTICATION_BODY: &[u8] = br#"{"error":"Authentication required"}"#;
 
+pub fn adapt_auth_reject_for_openai_envelope(
+    uses_envelope: bool,
+    status_code: u16,
+    body: Bytes,
+    headers: HashMap<String, String>,
+    missing_credential: bool,
+) -> (u16, Bytes, HashMap<String, String>) {
+    if !uses_envelope || status_code != 401 {
+        return (status_code, body, headers);
+    }
+    let adapted_body = if missing_credential {
+        openai_error_body_bytes(
+            "Authentication required",
+            OPENAI_INVALID_REQUEST_ERROR,
+            None,
+            Some(OPENAI_CODE_MISSING_API_KEY),
+        )
+    } else if let Some(message) = ferrum_flat_error_message(&body) {
+        openai_error_body_bytes(
+            &message,
+            OPENAI_INVALID_REQUEST_ERROR,
+            None,
+            Some(OPENAI_CODE_INVALID_API_KEY),
+        )
+    } else {
+        body
+    };
+    (status_code, adapted_body, headers)
+}
+
 fn missing_authentication_reject(
     auth_plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
@@ -28784,11 +28838,31 @@ fn attach_auth_rejection_set_cookie(
     }
 }
 
+/// Authentication phase without the AI-envelope adaptation.
+///
+/// This is the stable entry point the external `tests/` crate drives (52 call
+/// sites across seven modules). Production dispatch calls
+/// [`run_authentication_phase_with_envelope`] directly so it can pass the
+/// per-proxy OpenAI-envelope flag. `tests/` is a separate crate, so this is
+/// unreachable from the `ferrum-edge` binary target and would otherwise be
+/// reported as dead code there.
+#[allow(dead_code)]
 pub async fn run_authentication_phase(
     auth_mode: AuthMode,
     auth_plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     consumer_index: &ConsumerIndex,
+) -> Option<(u16, Bytes, HashMap<String, String>)> {
+    run_authentication_phase_with_envelope(auth_mode, auth_plugins, ctx, consumer_index, false)
+        .await
+}
+
+pub async fn run_authentication_phase_with_envelope(
+    auth_mode: AuthMode,
+    auth_plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    consumer_index: &ConsumerIndex,
+    uses_openai_auth_error_envelope: bool,
 ) -> Option<(u16, Bytes, HashMap<String, String>)> {
     // Mark every configured query credential location before multi-auth can
     // stop at the first successful mechanism. Presence is enough to redact:
@@ -28869,11 +28943,18 @@ pub async fn run_authentication_phase(
                 ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
                 None
             } else {
+                let used_missing_reject = server_reject.is_none() && last_reject.is_none();
                 let mut reject = server_reject
                     .or(last_reject)
                     .unwrap_or_else(|| missing_authentication_reject(auth_plugins, ctx));
                 attach_auth_rejection_set_cookie(ctx, &mut reject.2);
-                Some(reject)
+                Some(adapt_auth_reject_for_openai_envelope(
+                    uses_openai_auth_error_envelope,
+                    reject.0,
+                    reject.1,
+                    reject.2,
+                    used_missing_reject,
+                ))
             }
         }
         AuthMode::Single => {
@@ -28897,7 +28978,13 @@ pub async fn run_authentication_phase(
                         if let Some(reject) = plugin_result_into_reject_parts(reject) {
                             let mut reject = (reject.status_code, reject.body, reject.headers);
                             attach_auth_rejection_set_cookie(ctx, &mut reject.2);
-                            return Some(reject);
+                            return Some(adapt_auth_reject_for_openai_envelope(
+                                uses_openai_auth_error_envelope,
+                                reject.0,
+                                reject.1,
+                                reject.2,
+                                false,
+                            ));
                         }
                     }
                     PluginResult::Continue => {
@@ -28920,7 +29007,14 @@ pub async fn run_authentication_phase(
             {
                 None
             } else {
-                Some(missing_authentication_reject(auth_plugins, ctx))
+                let reject = missing_authentication_reject(auth_plugins, ctx);
+                Some(adapt_auth_reject_for_openai_envelope(
+                    uses_openai_auth_error_envelope,
+                    reject.0,
+                    reject.1,
+                    reject.2,
+                    true,
+                ))
             }
         }
     }
@@ -29045,9 +29139,10 @@ async fn handle_proxy_request_on_frontend_port(
                 "Gateway configuration stale",
             ));
         }
-        return Ok(build_response(
+        return Ok(build_response_with_gateway_error(
             StatusCode::SERVICE_UNAVAILABLE,
             r#"{"error":"Gateway configuration stale"}"#,
+            X_GATEWAY_ERROR_CONFIG_STALE,
         ));
     }
 
@@ -29124,9 +29219,10 @@ async fn handle_proxy_request_on_frontend_port(
                 "Service overloaded",
             ));
         }
-        return Ok(build_response(
+        return Ok(build_response_with_gateway_error(
             StatusCode::SERVICE_UNAVAILABLE,
             r#"{"error":"Service overloaded"}"#,
+            X_GATEWAY_ERROR_OVERLOAD,
         ));
     }
 
@@ -30601,11 +30697,12 @@ async fn handle_proxy_request_inner(
 
     {
         let auth_phase_start = Instant::now();
-        if let Some((status_code, body, headers)) = run_authentication_phase(
+        if let Some((status_code, body, headers)) = run_authentication_phase_with_envelope(
             proxy.auth_mode.clone(),
             &auth_plugins,
             &mut ctx,
             &consumer_index,
+            plugin_cache_view.uses_openai_auth_error_envelope(),
         )
         .await
         {
@@ -38543,7 +38640,8 @@ async fn handle_proxy_request_inner(
     // Add gateway error categorization headers so clients and ops teams
     // can distinguish different failure modes:
     //   X-Gateway-Error: connection_failure | backend_timeout | backend_error
-    //     | circuit_breaker_open (open-breaker 503s use the reject path)
+    //     | circuit_breaker_open | overload | config_stale | concurrency_limit
+    //     (open-breaker / overload / stale / concurrency 503s use reject paths)
     //   X-Gateway-Upstream-Status: degraded (when routing via all-unhealthy fallback)
     if let Some(value) = gateway_error_token {
         resp_builder = resp_builder.header("X-Gateway-Error", value);
@@ -46102,6 +46200,23 @@ fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
+        .body(ProxyBody::from_string(body))
+        .unwrap_or_else(|_| {
+            Response::new(ProxyBody::from_string(
+                r#"{"error":"Internal server error"}"#,
+            ))
+        })
+}
+
+fn build_response_with_gateway_error(
+    status: StatusCode,
+    body: &str,
+    error: &'static str,
+) -> Response<ProxyBody> {
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .header("X-Gateway-Error", error)
         .body(ProxyBody::from_string(body))
         .unwrap_or_else(|_| {
             Response::new(ProxyBody::from_string(

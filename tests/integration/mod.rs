@@ -62,6 +62,7 @@ mod gateway_api_backend_ref_kinds_tests;
 mod gateway_api_backend_tls_policy_tests;
 mod gateway_api_listenerset_tests;
 mod gateway_api_udproute_datapath_tests;
+mod gateway_error_class_observability_tests;
 mod gateway_hbone_pool_tests;
 mod gateway_listener_observability_tests;
 mod gateway_mesh_trust_retirement_tests;

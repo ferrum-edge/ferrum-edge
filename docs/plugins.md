@@ -1690,7 +1690,14 @@ Unknown top-level keys are rejected at construction (for example a misspelled `r
 extension/unknown method to `method="OTHER"`, keeping request-controlled method
 cardinality bounded. gRPC transactions retain the HTTP transport status and add
 the terminal numeric `grpc_status` (`0`–`16`, or `OTHER` for malformed/future
-codes), so application failures under HTTP 200 are distinguishable. The
+codes), so application failures under HTTP 200 are distinguishable. HTTP 5xx
+rows add an optional `error_class` label using granular `ErrorClass::as_str`
+(19 variants) or a gateway-authored token (`circuit_breaker_open`,
+`overload`, `config_stale`, `concurrency_limit`) when the rejection has no
+`ErrorClass`; 2xx/3xx/4xx omit the label so the common series is not
+multiplied. `X-Gateway-Error` stays on the coarser seven-token header set.
+`ferrum_stream_disconnects_total` adds the same optional
+`error_class` from `ErrorClass::as_str` (omitted when unset). The
 `ferrum_rate_limit_exceeded_total` process counter aggregates each rejection,
 UDP drop, and WebSocket policy close produced by `rate_limiting`,
 `ai_rate_limiter`, `ws_rate_limiting`, and `udp_rate_limiting`. Process-wide
@@ -5885,6 +5892,8 @@ Config fields named `stream`, `streaming_enabled`, or `enable_streaming` are sti
 **Model routing fails closed by default.** JSON POST requests with no final body, malformed/non-UTF-8 JSON, malformed supported tool/stop shapes, or no top-level string `model` field are rejected with an OpenAI-shaped `400`. Model identifiers are limited to 256 ASCII bytes and the characters used by ordinary provider IDs (`A-Z`, `a-z`, digits, `.`, `_`, `-`, `:`, `/`, `+`); traversal, URL userinfo/query/fragment syntax, whitespace, and controls are rejected. Requests whose valid `model` does not match any provider are rejected with an OpenAI-shaped `404`. Set `fail_on_missing_model: false` or `fail_on_no_matching_provider: false` only when intentional pass-through to the normal backend is required.
 
 **The fail-closed guarantee is scoped to HTTP JSON POSTs.** Other methods and non-JSON content types continue to the backend; native gRPC is outside the plugin's protocol set. `ai_federation` is therefore not an authorization boundary, and the backend must remain independently protected.
+
+**Authentication rejects share the OpenAI error envelope.** When `ai_federation` or `ai_stream_router` is effective on a proxy, gateway-authored authentication `401` responses from the shared authentication phase — missing credentials (`code: missing_api_key`) and invalid or unknown credentials from `key_auth`, `jwt_auth`, `jwks_auth`, `basic_auth`, `hmac_auth`, `ldap_auth`, `mtls_auth`, `oauth2_introspection`, and `oidc_relying_party` (`code: invalid_api_key`) — are rewritten to the same nested `{"error":{"message","type","param","code"}}` shape the AI plugins use for their own rejects. Status codes and `WWW-Authenticate` challenges are unchanged. Authorization rejects (`acl`, `rate_limiting`, and other `authorize`-phase plugins) and non-`401` authentication outcomes (for example `ldap_auth` dependency `500`s or oversized-principal `403`s) keep Ferrum's flat or plugin-specific bodies.
 
 **Final-body dispatch preserves admission ordering.** All `before_proxy` admission hooks and configured request-body transforms run before federation makes provider I/O. When route-sensitive backend-path policy is active, the gateway first pins the selected target, authorizes and charges its backend-effective method exactly once, and completes deferred `before_proxy` hooks; federation then runs before backend-only admission, circuit breaking, and transport. A `RejectBinary` from the final hook still replaces normal backend dispatch. Mixed-traffic proxies should use the explicit pass-through flags or isolate AI traffic on a dedicated proxy.
 

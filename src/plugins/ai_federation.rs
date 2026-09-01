@@ -113,6 +113,7 @@ use super::ai_stream_router::{
 };
 use super::utils::aws_sigv4;
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
+use super::utils::openai_error::openai_error_body;
 use super::utils::response_body::{BoundedReadError, read_response_body_bounded};
 use super::{
     AiUsageExport, EXTERNAL_OPERATION_COMPLETED_METADATA_KEY, Plugin, PluginHttpClient,
@@ -4060,22 +4061,6 @@ fn truncate_model_for_error(model: &str) -> String {
     }
     let truncated: String = model.chars().take(MAX_ECHOED_MODEL_CHARS).collect();
     format!("{truncated}… (truncated)")
-}
-
-fn openai_error_body(
-    message: &str,
-    error_type: &str,
-    param: Option<&str>,
-    code: Option<&str>,
-) -> Value {
-    json!({
-        "error": {
-            "message": message,
-            "type": error_type,
-            "param": param,
-            "code": code,
-        }
-    })
 }
 
 /// Normalize a provider response to OpenAI Chat Completions format.

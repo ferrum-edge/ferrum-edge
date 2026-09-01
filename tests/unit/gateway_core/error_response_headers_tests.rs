@@ -156,6 +156,46 @@ fn circuit_breaker_open_sites_use_distinct_token() {
 }
 
 #[test]
+fn overload_and_stale_config_sites_set_distinct_gateway_error() {
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    assert!(
+        proxy.contains("build_response_with_gateway_error("),
+        "H1/H2 gateway-authored 503 fences must share the X-Gateway-Error builder"
+    );
+    assert!(
+        proxy.contains("X_GATEWAY_ERROR_OVERLOAD"),
+        "H1/H2 overload 503 must attach overload"
+    );
+    assert!(
+        proxy.contains("X_GATEWAY_ERROR_CONFIG_STALE"),
+        "H1/H2 stale-config 503 must attach config_stale"
+    );
+
+    let h3 = include_str!("../../../src/http3/server.rs");
+    assert!(
+        h3.contains("overload_reject_headers()"),
+        "H3 overload 503 must start from the precomputed overload header snapshot"
+    );
+    assert!(
+        h3.contains("config_stale_reject_headers()"),
+        "H3 stale-config 503 must start from the precomputed stale-config header snapshot"
+    );
+}
+
+#[test]
+fn adaptive_concurrency_plugin_uses_concurrency_limit_token() {
+    let src = include_str!("../../../src/plugins/adaptive_concurrency.rs");
+    assert!(
+        src.contains("OBS_CONCURRENCY_LIMIT"),
+        "adaptive_concurrency 503 must intern the closed concurrency_limit token"
+    );
+    assert!(
+        src.contains("\"x-gateway-error\""),
+        "adaptive_concurrency 503 must set x-gateway-error"
+    );
+}
+
+#[test]
 fn h3_cross_protocol_classified_failures_keep_typed_gateway_error() {
     let cross = include_str!("../../../src/http3/cross_protocol.rs");
     let helper_definition = "fn reqwest_error_response_for_cross_protocol(";

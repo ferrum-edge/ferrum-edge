@@ -62,7 +62,7 @@ use crate::proxy::headers::{
 use crate::proxy::{
     ProxyState, apply_plugin_rejection_response, apply_reject_after_proxy_and_synthetic_body_hooks,
     log_pre_backend_rejected_request, log_rejected_request, log_rejected_request_with_path,
-    plugin_result_into_reject_parts, run_after_proxy_hooks, run_authentication_phase,
+    plugin_result_into_reject_parts, run_after_proxy_hooks, run_authentication_phase_with_envelope,
 };
 use crate::tls::{CrlList, TlsPolicy};
 
@@ -2307,16 +2307,28 @@ async fn handle_h3_request(
         .load(std::sync::atomic::Ordering::Relaxed)
     {
         record_h3_flavor_aware_reject(&state, http_flavor, 503);
-        send_h3_error_flavor_aware(
-            &mut stream,
-            http_flavor,
-            grpc_web_response_content_type,
-            http::StatusCode::SERVICE_UNAVAILABLE,
-            r#"{"error":"Service overloaded"}"#,
-            crate::proxy::grpc_proxy::grpc_status::UNAVAILABLE,
-            "Service overloaded",
-        )
-        .await?;
+        if grpc_web_response_content_type.is_some() {
+            send_h3_error_flavor_aware(
+                &mut stream,
+                http_flavor,
+                grpc_web_response_content_type,
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"Service overloaded"}"#,
+                crate::proxy::grpc_proxy::grpc_status::UNAVAILABLE,
+                "Service overloaded",
+            )
+            .await?;
+        } else {
+            send_h3_reject_flavor_aware(
+                &mut stream,
+                http_flavor,
+                StatusCode::SERVICE_UNAVAILABLE,
+                Bytes::from_static(br#"{"error":"Service overloaded"}"#),
+                &crate::proxy::overload_reject_headers(),
+                RejectBodyDisposition::WireBody,
+            )
+            .await?;
+        }
         return Ok(());
     }
 
@@ -2326,16 +2338,28 @@ async fn handle_h3_request(
     // already-accepted streams drain.
     if crate::dp_config_freshness::new_traffic_blocked() {
         record_h3_flavor_aware_reject(&state, http_flavor, 503);
-        send_h3_error_flavor_aware(
-            &mut stream,
-            http_flavor,
-            grpc_web_response_content_type,
-            http::StatusCode::SERVICE_UNAVAILABLE,
-            r#"{"error":"Gateway configuration stale"}"#,
-            crate::proxy::grpc_proxy::grpc_status::UNAVAILABLE,
-            "Gateway configuration stale",
-        )
-        .await?;
+        if grpc_web_response_content_type.is_some() {
+            send_h3_error_flavor_aware(
+                &mut stream,
+                http_flavor,
+                grpc_web_response_content_type,
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"Gateway configuration stale"}"#,
+                crate::proxy::grpc_proxy::grpc_status::UNAVAILABLE,
+                "Gateway configuration stale",
+            )
+            .await?;
+        } else {
+            send_h3_reject_flavor_aware(
+                &mut stream,
+                http_flavor,
+                StatusCode::SERVICE_UNAVAILABLE,
+                Bytes::from_static(br#"{"error":"Gateway configuration stale"}"#),
+                &crate::proxy::config_stale_reject_headers(),
+                RejectBodyDisposition::WireBody,
+            )
+            .await?;
+        }
         return Ok(());
     }
 
@@ -3486,11 +3510,12 @@ async fn handle_h3_request(
     let auth_plugins = plugin_cache_view.auth_plugins();
 
     let auth_phase_start = std::time::Instant::now();
-    if let Some((status_code, body, mut headers)) = run_authentication_phase(
+    if let Some((status_code, body, mut headers)) = run_authentication_phase_with_envelope(
         proxy.auth_mode.clone(),
         &auth_plugins,
         &mut ctx,
         &consumer_index,
+        plugin_cache_view.uses_openai_auth_error_envelope(),
     )
     .await
     {

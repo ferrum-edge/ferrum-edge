@@ -7477,6 +7477,31 @@ impl TransactionSummary {
         }
     }
 
+    /// Gateway-authored rejection phase (`circuit_breaker_open`,
+    /// `adaptive_concurrency`, …) when a plugin/fence stamped one. Used to
+    /// intern the HTTP metrics `error_class` token when there is no
+    /// [`crate::retry::ErrorClass`].
+    pub fn rejection_phase(&self) -> Option<&str> {
+        self.metadata.get("rejection_phase").map(String::as_str)
+    }
+
+    /// Closed `ferrum_requests_total{error_class}` label: granular
+    /// [`crate::retry::ErrorClass::as_str`] on 5xx when a class exists,
+    /// otherwise a gateway-authored token. `None` on 2xx/3xx/4xx.
+    pub fn metrics_error_class_label(&self) -> Option<&'static str> {
+        crate::retry::http_metrics_error_class(
+            self.error_class,
+            self.response_status_code,
+            self.rejection_phase(),
+        )
+    }
+
+    /// Access-log `error_class`: always the granular
+    /// [`crate::retry::ErrorClass::as_str`]. Omitted when unset.
+    pub fn serialized_error_class(&self) -> Option<&'static str> {
+        crate::retry::http_log_error_class(self.error_class)
+    }
+
     /// One authoritative terminal-failure predicate for transaction loggers.
     ///
     /// HTTP status filters remain independent: an upstream HTTP 5xx without a

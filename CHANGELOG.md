@@ -19,6 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or any `_VAULT`/`_AWS`/`_AZURE`/`_GCP`/`_FILE` suffixed form — through `env:`
   or `extraEnv:` fails template rendering. Move existing overrides to the new
   values; see [docs/upgrade_guide.md](docs/upgrade_guide.md).
+- **BREAKING — AI gateway routes return OpenAI-shaped authentication `401` bodies**
+  (issue #4408). Proxies with an effective `ai_federation` or `ai_stream_router`
+  plugin now rewrite gateway-authored authentication `401` responses to the same
+  nested OpenAI Chat Completions error envelope those plugins use for their own
+  rejects (`type: invalid_request_error`, `code: missing_api_key` or
+  `invalid_api_key`). Missing-credential and invalid-credential messages are
+  unchanged; only the JSON shape changes. Routes without an AI gateway plugin
+  still return Ferrum `{"error":"<string>"}`. **Operator action:** if you parse
+  authentication `401` bodies on AI routes with custom code that expects the flat
+  Ferrum shape, switch to `error.message` / `error.code` or use an OpenAI SDK.
 ### Fixed
 
 - **BREAKING — HTTP-family `backend_write_timeout_ms` again terminates a POST to
@@ -332,6 +342,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `preserve_host_header: false` to keep the backend authority in both
   fields. Mesh-mTLS routes with a pinned service authority are unchanged:
   the peer still sees the mesh service host and port.
+- **Gateway-authored HTTP 503s now set `X-Gateway-Error`** (issues #4396,
+  #4399). The DP stale-config fence (`config_stale`), overload/drain
+  `reject_new_requests` (`overload`), and `adaptive_concurrency` admission
+  shed (`concurrency_limit`) were using `build_response()` / empty header
+  maps and omitted the header that backend-failure 5xx already set. Existing
+  tokens `backend_error` / `connection_failure` / `backend_timeout` /
+  `circuit_breaker_open` keep their spellings.
 
 - **Linux GNU release ABI floor is now GLIBC_2.34** (issue #4301). Generic
   `ferrum-edge-linux-{x86_64,aarch64}` and `ferrum-cni-linux-{x86_64,aarch64}`
@@ -388,6 +405,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a missing native key still silently defaults its column — that drift is
   what the static test rejects. Operators who rename or omit keys must keep
   the destination table in sync.
+- **Production Dockerfiles pin container bases by manifest-list digest** (issue
+  #4444). `Dockerfile`, `Dockerfile.release`, and `Dockerfile.test` now record
+  `@sha256:` pins for distroless and Rust builder bases, with the mutable tag
+  preserved in a trailing comment. A unit policy test rejects unpinned external
+  `FROM` lines and unapproved floating Rust channels. SBOM/provenance recording,
+  scheduled digest-bump automation, and `rust-toolchain.toml` pinning remain
+  follow-up work.
 
 - **BREAKING — injected Ferrum is a Kubernetes native sidecar**
   (issue #4430). The webhook now emits `ferrum-edge` under `spec.initContainers`
@@ -401,6 +425,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Kubernetes 1.29+ (or 1.28 with the feature gate), then roll injected
   workloads so new pods pick up the native-sidecar shape; pods that still
   carry Ferrum in `spec.containers` must be recreated.
+
+- **`ferrum_requests_total` and `ferrum_stream_disconnects_total` gain
+  optional `error_class`** (issue #4397). HTTP uses granular
+  `ErrorClass::as_str` when a class exists (so `dns_lookup_error` is
+  distinguishable from `connection_refused`) and a gateway-authored token
+  (`circuit_breaker_open` / `overload` / `config_stale` /
+  `concurrency_limit`) when the rejection has no `ErrorClass`. 2xx/3xx/4xx
+  omit the label. Stream disconnects use `ErrorClass::as_str` (19 variants)
+  and omit the label when unset. The closed HTTP set is 23 compiled-in
+  `&'static str` values — never an error message. `X-Gateway-Error` keeps
+  the coarser seven-token header vocabulary.
+  **Operator action**: PromQL aggregations on 5xx `ferrum_requests_total`
+  must `without(error_class)` or include `error_class` in `by (...)`;
+  previously-single 502/503/504 series now split by granular class. 2xx
+  series are unchanged. Helm dashboards under `charts/` are not updated
+  in this change.
 
 - **BREAKING — `ferrum-gateway` `mode=cp` disables the in-cluster K8s controller**
   (issue #4384). The binary still defaults `FERRUM_K8S_CONTROLLER_ENABLED` and
