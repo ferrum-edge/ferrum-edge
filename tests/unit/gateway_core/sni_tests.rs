@@ -2051,3 +2051,181 @@ async fn extractor_stays_a_projection_of_the_typed_peek() {
         assert_eq!(flat, None, "{label}: the flat extractor still reports None");
     }
 }
+
+// ── StreamTransactionSummary taxonomy for SNI admission (issue #4407) ─────
+
+use ferrum_edge::_test_support::{
+    apply_circuit_breaker_outcome_for_test, classify_stream_error,
+    no_matching_sni_route_error_for_test, pre_copy_disconnect_cause_for_test,
+    pre_copy_disconnect_direction_for_test, sni_admission_refused_error_for_test,
+};
+use ferrum_edge::circuit_breaker::CircuitBreaker;
+use ferrum_edge::config::types::CircuitBreakerConfig;
+use ferrum_edge::plugins::{Direction, DisconnectCause, StreamTransactionSummary};
+use ferrum_edge::retry::ErrorClass;
+use std::collections::HashMap;
+
+/// Mirror the TCP accept-loop pre-copy summary for an SNI admission
+/// refusal: no backend was selected, so `backend_target` stays empty and
+/// cause/direction come from the typed `StreamSetupError`.
+fn sni_admission_summary(error: &anyhow::Error) -> StreamTransactionSummary {
+    let error_class = classify_stream_error(error);
+    let disconnect_cause = pre_copy_disconnect_cause_for_test(error, &error_class);
+    let disconnect_direction = pre_copy_disconnect_direction_for_test(error, &error_class);
+    StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
+        namespace: "ferrum".into(),
+        proxy_id: String::new(),
+        proxy_lifecycle_generation: None,
+        proxy_name: None,
+        client_ip: "127.0.0.1".into(),
+        consumer_username: None,
+        auth_method: None,
+        backend_target: String::new(),
+        backend_resolved_ip: None,
+        protocol: "tcp".into(),
+        listen_port: 21582,
+        duration_ms: 0.0,
+        bytes_sent: 0,
+        bytes_received: 0,
+        connection_error: Some(error.to_string()),
+        error_class: Some(error_class),
+        disconnect_direction: Some(disconnect_direction),
+        disconnect_cause: Some(disconnect_cause),
+        timestamp_connected: String::new(),
+        timestamp_disconnected: String::new(),
+        sni_hostname: None,
+        metadata: HashMap::new(),
+    }
+}
+
+fn assert_sni_admission_taxonomy(error: &anyhow::Error, expected_message: &str) {
+    assert_eq!(error.to_string(), expected_message);
+    let summary = sni_admission_summary(error);
+    assert_eq!(
+        summary.error_class,
+        Some(ErrorClass::DispatchPolicyRejected)
+    );
+    assert_eq!(
+        summary.disconnect_cause,
+        Some(DisconnectCause::GatewayPolicy)
+    );
+    assert_eq!(summary.disconnect_direction, Some(Direction::Unknown));
+    assert_eq!(summary.backend_target, "");
+    assert_eq!(summary.backend_resolved_ip, None);
+
+    // The live refuse site never looks up a breaker (no backend selected).
+    // Defence in depth: even if a later path recorded this class, it is
+    // health-neutral — including when `connection_error` is true.
+    let cb = CircuitBreaker::new(CircuitBreakerConfig::default());
+    apply_circuit_breaker_outcome_for_test(&cb, 0, true, summary.error_class, false);
+    assert_eq!(cb.failure_count(), 0);
+    assert_eq!(cb.state_name(), "closed");
+}
+
+#[test]
+fn sni_admission_not_tls_classifies_as_dispatch_policy_rejected() {
+    let error = sni_admission_refused_error_for_test(21582, SniRefusal::NotTls);
+    assert_sni_admission_taxonomy(
+        &error,
+        "SNI-routed stream listener on port 21582 refused connection (not_tls)",
+    );
+}
+
+#[test]
+fn sni_admission_timeout_classifies_as_dispatch_policy_rejected() {
+    let error = sni_admission_refused_error_for_test(
+        21582,
+        SniRefusal::Indeterminate(SniPeekFailure::Timeout),
+    );
+    assert_sni_admission_taxonomy(
+        &error,
+        "SNI-routed stream listener on port 21582 refused connection (timeout)",
+    );
+}
+
+#[test]
+fn sni_admission_oversized_classifies_as_dispatch_policy_rejected() {
+    let error = sni_admission_refused_error_for_test(
+        21582,
+        SniRefusal::Indeterminate(SniPeekFailure::Oversized),
+    );
+    assert_sni_admission_taxonomy(
+        &error,
+        "SNI-routed stream listener on port 21582 refused connection (oversized)",
+    );
+}
+
+#[test]
+fn sni_admission_eof_classifies_as_dispatch_policy_rejected() {
+    let error =
+        sni_admission_refused_error_for_test(21582, SniRefusal::Indeterminate(SniPeekFailure::Eof));
+    assert_sni_admission_taxonomy(
+        &error,
+        "SNI-routed stream listener on port 21582 refused connection (eof)",
+    );
+}
+
+#[test]
+fn sni_admission_truncated_classifies_as_dispatch_policy_rejected() {
+    let error = sni_admission_refused_error_for_test(
+        21582,
+        SniRefusal::Indeterminate(SniPeekFailure::Truncated),
+    );
+    assert_sni_admission_taxonomy(
+        &error,
+        "SNI-routed stream listener on port 21582 refused connection (truncated)",
+    );
+}
+
+#[test]
+fn sni_admission_malformed_classifies_as_dispatch_policy_rejected() {
+    let error = sni_admission_refused_error_for_test(
+        21582,
+        SniRefusal::Indeterminate(SniPeekFailure::Malformed),
+    );
+    assert_sni_admission_taxonomy(
+        &error,
+        "SNI-routed stream listener on port 21582 refused connection (malformed)",
+    );
+}
+
+#[test]
+fn sni_admission_unrepresentable_name_classifies_as_dispatch_policy_rejected() {
+    let error = sni_admission_refused_error_for_test(
+        21582,
+        SniRefusal::Indeterminate(SniPeekFailure::UnrepresentableName),
+    );
+    assert_sni_admission_taxonomy(
+        &error,
+        "SNI-routed stream listener on port 21582 refused connection (unrepresentable_server_name)",
+    );
+}
+
+#[test]
+fn sni_admission_io_error_classifies_as_dispatch_policy_rejected() {
+    let error =
+        sni_admission_refused_error_for_test(21582, SniRefusal::Indeterminate(SniPeekFailure::Io));
+    assert_sni_admission_taxonomy(
+        &error,
+        "SNI-routed stream listener on port 21582 refused connection (io_error)",
+    );
+}
+
+#[test]
+fn unmatched_sni_route_classifies_as_dispatch_policy_rejected() {
+    let error = no_matching_sni_route_error_for_test(21582);
+    assert_sni_admission_taxonomy(&error, "No matching SNI route for connection on port 21582");
+}
+
+#[test]
+fn untyped_refused_substring_still_classifies_as_connection_refused() {
+    // Defence: a bare anyhow whose Display contains "refused" is still a
+    // backend connect refusal. The typed SNI kind is what escapes that trap.
+    let untyped =
+        anyhow::anyhow!("SNI-routed stream listener on port 21582 refused connection (not_tls)");
+    assert_eq!(
+        classify_stream_error(&untyped),
+        ErrorClass::ConnectionRefused
+    );
+}

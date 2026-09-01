@@ -561,6 +561,12 @@ fn classify_stream_setup_kind(kind: crate::proxy::stream_error::StreamSetupKind)
         // typed kind carries the client-side attribution the class cannot.
         | StreamSetupKind::AuthorizationExpired
         | StreamSetupKind::ClientTrustWithdrawn => ErrorClass::RequestError,
+        // Opaque-TLS SNI admission is a terminal gateway decision before any
+        // backend dial (issue #4407). Mapping it through RequestError would
+        // keep the unmatched-SNI catch-all; mapping ConnectionRefused would
+        // keep the `"refused"` substring trap on the Display string. The
+        // typed kind is the only signal that yields DispatchPolicyRejected.
+        StreamSetupKind::SniAdmissionRefused => ErrorClass::DispatchPolicyRejected,
     }
 }
 

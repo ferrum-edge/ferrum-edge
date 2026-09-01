@@ -212,7 +212,7 @@ Counts transactions whose `error_class` (or HTTP `body_error_class`) matches one
 }
 ```
 
-Counts stream disconnects whose `disconnect_cause` matches one of `causes`. Stream-only (TCP / UDP / DTLS / WebSocket). Causes: `idle_timeout`, `recv_error`, `backend_error`, `graceful_shutdown`. WebSocket sessions derive the cause from their disconnect summary: clean closes map to `graceful_shutdown`, drain/read-write timeouts map to `idle_timeout`, backend-to-client failures map to `backend_error`, and client-side/unknown failures map to `recv_error`.
+Counts stream disconnects whose `disconnect_cause` matches one of `causes`. Stream-only (TCP / UDP / DTLS / WebSocket). Causes: `idle_timeout`, `recv_error`, `backend_error`, `graceful_shutdown`, `gateway_policy`. WebSocket sessions derive the cause from their disconnect summary: clean closes map to `graceful_shutdown`, drain/read-write timeouts map to `idle_timeout`, backend-to-client failures map to `backend_error`, and client-side/unknown failures map to `recv_error`.
 
 ### Cooldown and recovery
 

@@ -372,6 +372,43 @@ pub(crate) const STREAM_ERR_AUTHORIZATION_EXPIRED: &str =
 /// certificate, its subject, its serial, its issuer, or the generation.
 pub(crate) const STREAM_ERR_CLIENT_TRUST_WITHDRAWN: &str =
     "Frontend client trust withdrawn during setup";
+/// Opaque-TLS SNI listener admission refused the connection before any
+/// backend was selected (issue #4407). Display of the two production emits
+/// is the operator-stable wording (`SNI-routed stream listener on port …
+/// refused connection (…)` and `No matching SNI route for connection on
+/// port …`); this prefix is the shared `StreamSetupKind::prefix` token.
+pub(crate) const STREAM_ERR_SNI_ADMISSION_REFUSED: &str = "SNI-routed stream listener";
+
+/// Typed opaque-TLS SNI peek refusal. Display is the operator-stable
+/// `"SNI-routed stream listener on port {port} refused connection ({reason})"`
+/// wording so log pipelines keep matching; classification walks the kind,
+/// not the `"refused"` token (issue #4407).
+pub(crate) fn sni_admission_refused_error(
+    port: u16,
+    reason: super::sni::SniRefusal,
+) -> anyhow::Error {
+    StreamSetupError::with_message(
+        StreamSetupKind::SniAdmissionRefused,
+        format!(
+            "SNI-routed stream listener on port {} refused connection ({})",
+            port,
+            reason.as_str()
+        ),
+    )
+    .into()
+}
+
+/// Typed unmatched-SNI refusal (valid hello, no route, no catch-all).
+/// Display is the operator-stable `"No matching SNI route for connection
+/// on port {port}"` wording (issue #4407).
+pub(crate) fn no_matching_sni_route_error(port: u16) -> anyhow::Error {
+    StreamSetupError::with_message(
+        StreamSetupKind::SniAdmissionRefused,
+        format!("No matching SNI route for connection on port {}", port),
+    )
+    .into()
+}
+
 /// Fixed detail suffix for every client-trust setup fence.
 ///
 /// It states only what is true at EVERY fence. A withdrawal can land after a
@@ -1033,7 +1070,8 @@ pub fn relay_failure_is_client_facing(failure: &StreamFirstFailure) -> bool {
 /// **Typed-kind first.** When the error chain carries a [`StreamSetupError`]
 /// (the canonical wrapper at every construction site that previously emitted
 /// a `STREAM_ERR_*` prefix), its [`StreamSetupKind`] is the authoritative
-/// signal: `is_client_side()` decides `RecvError` vs `BackendError` directly.
+/// signal: `disconnect_cause()` decides `RecvError` vs `BackendError` vs
+/// `GatewayPolicy` directly.
 /// The class-based fallback below applies only when the chain has no
 /// typed setup error — for example, when the failure originated outside the
 /// proxy module or pre-dates the typed infrastructure.
@@ -1051,7 +1089,7 @@ pub fn relay_failure_is_client_facing(failure: &StreamFirstFailure) -> bool {
 /// prevents the silent "unhandled class → RecvError" drift — every
 /// backend-facing variant must be explicitly routed to `BackendError`, and
 /// every client-facing variant to `RecvError`.
-fn pre_copy_disconnect_cause(
+pub(crate) fn pre_copy_disconnect_cause(
     error: &anyhow::Error,
     class: &ErrorClass,
 ) -> crate::plugins::DisconnectCause {
@@ -1061,11 +1099,7 @@ fn pre_copy_disconnect_cause(
     // `StreamSetupError`, we know which side failed without inspecting
     // the message. Stays in lockstep with `pre_copy_disconnect_direction`.
     if let Some(setup_err) = find_stream_setup_error(error) {
-        return if setup_err.kind.is_client_side() {
-            DisconnectCause::RecvError
-        } else {
-            DisconnectCause::BackendError
-        };
+        return setup_err.kind.disconnect_cause();
     }
 
     match class {
@@ -1147,7 +1181,10 @@ fn pre_copy_disconnect_cause(
 /// Used by every TCP/UDP construction site that builds a
 /// `StreamTransactionSummary` with `disconnect_direction: Some(...)` so log
 /// consumers see consistent attribution across stream-family protocols.
-fn pre_copy_disconnect_direction(error: &anyhow::Error, class: &ErrorClass) -> Direction {
+pub(crate) fn pre_copy_disconnect_direction(
+    error: &anyhow::Error,
+    class: &ErrorClass,
+) -> Direction {
     if let Some(setup_err) = find_stream_setup_error(error) {
         return setup_err.kind.direction();
     }
@@ -3539,11 +3576,7 @@ async fn handle_tcp_connection_inner(
                     reason = reason.as_str(),
                     "Refused connection on SNI-routed stream listener"
                 );
-                return Err(anyhow::anyhow!(
-                    "SNI-routed stream listener on port {} refused connection ({})",
-                    stream_ctx.listen_port,
-                    reason.as_str()
-                ));
+                return Err(sni_admission_refused_error(stream_ctx.listen_port, reason));
             }
         }
     } else {
@@ -3571,10 +3604,7 @@ async fn handle_tcp_connection_inner(
                 if shared_port_uses_sni {
                     // A hostname that no tier claims and no declared catch-all
                     // absorbs is unroutable: close rather than pick a tenant.
-                    anyhow::anyhow!(
-                        "No matching SNI route for connection on port {}",
-                        stream_ctx.listen_port
-                    )
+                    no_matching_sni_route_error(stream_ctx.listen_port)
                 } else {
                     anyhow::anyhow!(
                         "No matching L4 stream_match proxy on port {}",
@@ -11126,6 +11156,23 @@ mod cause_direction_tests {
         assert_eq!(
             pre_copy_disconnect_direction(&e, &ErrorClass::RequestError),
             Direction::BackendToClient
+        );
+    }
+
+    #[test]
+    fn typed_sni_admission_refused_maps_to_gateway_policy_and_unknown_direction() {
+        let e = StreamSetupError::with_message(
+            StreamSetupKind::SniAdmissionRefused,
+            "SNI-routed stream listener on port 21582 refused connection (not_tls)",
+        )
+        .into();
+        assert_eq!(
+            pre_copy_disconnect_cause(&e, &ErrorClass::DispatchPolicyRejected),
+            DisconnectCause::GatewayPolicy
+        );
+        assert_eq!(
+            pre_copy_disconnect_direction(&e, &ErrorClass::DispatchPolicyRejected),
+            Direction::Unknown
         );
     }
 }

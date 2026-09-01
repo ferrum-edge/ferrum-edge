@@ -1142,6 +1142,7 @@ fn disconnect_cause_from_str(s: &str) -> Option<DisconnectCause> {
         "recv_error" => Some(DisconnectCause::RecvError),
         "backend_error" => Some(DisconnectCause::BackendError),
         "graceful_shutdown" => Some(DisconnectCause::GracefulShutdown),
+        "gateway_policy" => Some(DisconnectCause::GatewayPolicy),
         _ => None,
     }
 }

@@ -19173,11 +19173,16 @@ components:
 
     DisconnectCause:
       type: string
+      description: >-
+        Stream session termination cause. `gateway_policy` is a gateway
+        admission or dispatch-policy decision before any backend was
+        selected (for example opaque-TLS SNI fail-closed refusal).
       enum:
         - idle_timeout
         - recv_error
         - backend_error
         - graceful_shutdown
+        - gateway_policy
 
     OtelTracingConfig:
       type: object

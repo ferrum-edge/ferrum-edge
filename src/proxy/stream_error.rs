@@ -126,6 +126,16 @@ pub enum StreamSetupKind {
     /// about the upstream, so it never records a circuit-breaker or
     /// passive-health failure against it.
     ClientTrustWithdrawn,
+    /// Opaque-TLS SNI listener admission refused the connection before any
+    /// backend was selected, dialed, health-scored, or breaker-charged
+    /// (issue #4407). Covers not-TLS on an SNI port, ClientHello timeout /
+    /// overflow / EOF / truncation / malformation / unrepresentable
+    /// `server_name`, peek I/O failure, and a valid hello whose SNI matches
+    /// no route (and no catch-all). Gateway-local: `is_client_side` is true
+    /// so the class stays health-neutral, but [`Self::direction`] is
+    /// `Unknown` because no backend leg existed, and
+    /// [`Self::disconnect_cause`] is `GatewayPolicy` rather than `RecvError`.
+    SniAdmissionRefused,
 }
 
 impl StreamSetupKind {
@@ -147,7 +157,8 @@ impl StreamSetupKind {
             | Self::BackendMaxConnectionsExceeded
             | Self::UnsupportedStreamPolicy
             | Self::AuthorizationExpired
-            | Self::ClientTrustWithdrawn => None,
+            | Self::ClientTrustWithdrawn
+            | Self::SniAdmissionRefused => None,
         }
     }
 
@@ -172,6 +183,7 @@ impl StreamSetupKind {
                 | Self::ClientDisconnectedDuringAdmission
                 | Self::AuthorizationExpired
                 | Self::ClientTrustWithdrawn
+                | Self::SniAdmissionRefused
         )
     }
 
@@ -179,12 +191,35 @@ impl StreamSetupKind {
     ///
     /// Frontend-side failures classify as `ClientToBackend` (the client half
     /// of the relay is the originator). Backend-side failures classify as
-    /// `BackendToClient` (the backend half is the originator).
+    /// `BackendToClient` (the backend half is the originator). Opaque-TLS
+    /// SNI admission refusals classify as `Unknown`: no backend leg existed,
+    /// so attributing either copy direction would invent a socket that was
+    /// never opened (issue #4407).
     pub fn direction(self) -> crate::plugins::Direction {
+        if matches!(self, Self::SniAdmissionRefused) {
+            return crate::plugins::Direction::Unknown;
+        }
         if self.is_client_side() {
             crate::plugins::Direction::ClientToBackend
         } else {
             crate::plugins::Direction::BackendToClient
+        }
+    }
+
+    /// Cause attribution for [`crate::plugins::StreamTransactionSummary::disconnect_cause`].
+    ///
+    /// Most client-side kinds map to `RecvError` and most backend-side kinds
+    /// to `BackendError`. [`Self::SniAdmissionRefused`] is a gateway policy
+    /// decision with no backend, so it maps to `GatewayPolicy` rather than
+    /// overloading `RecvError` (a client-socket read) or `BackendError`.
+    pub fn disconnect_cause(self) -> crate::plugins::DisconnectCause {
+        if matches!(self, Self::SniAdmissionRefused) {
+            return crate::plugins::DisconnectCause::GatewayPolicy;
+        }
+        if self.is_client_side() {
+            crate::plugins::DisconnectCause::RecvError
+        } else {
+            crate::plugins::DisconnectCause::BackendError
         }
     }
 
@@ -225,6 +260,7 @@ impl StreamSetupKind {
             Self::ClientTrustWithdrawn => {
                 crate::proxy::tcp_proxy::STREAM_ERR_CLIENT_TRUST_WITHDRAWN
             }
+            Self::SniAdmissionRefused => crate::proxy::tcp_proxy::STREAM_ERR_SNI_ADMISSION_REFUSED,
         }
     }
 }
@@ -287,6 +323,17 @@ impl StreamSetupError {
         Self {
             kind,
             message: format!("{}: {}", kind.prefix(), detail),
+            source: None,
+        }
+    }
+
+    /// Build an error whose Display is exactly `message`, with no prefix
+    /// interpolation. Use when the production wording is already complete
+    /// (the two opaque-TLS SNI admission strings, issue #4407).
+    pub fn with_message(kind: StreamSetupKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
             source: None,
         }
     }
@@ -402,6 +449,7 @@ mod tests {
             None
         );
         assert_eq!(StreamSetupKind::UnsupportedStreamPolicy.tls_side(), None);
+        assert_eq!(StreamSetupKind::SniAdmissionRefused.tls_side(), None);
     }
 
     #[test]
@@ -412,10 +460,11 @@ mod tests {
             StreamSetupKind::FrontendTlsHandshake,
             StreamSetupKind::RejectedByPlugin,
             StreamSetupKind::ClientDisconnectedDuringAdmission,
+            StreamSetupKind::SniAdmissionRefused,
         ] {
             assert!(
                 kind.is_client_side(),
-                "{kind:?} should be client-side (RecvError-mapped)"
+                "{kind:?} should be client-side (health-neutral)"
             );
         }
         // Backend-side: backend setup or LB selection failures, plus
@@ -478,6 +527,29 @@ mod tests {
         assert_eq!(
             StreamSetupKind::UnsupportedStreamPolicy.prefix(),
             "Unsupported stream policy"
+        );
+        assert_eq!(
+            StreamSetupKind::SniAdmissionRefused.prefix(),
+            "SNI-routed stream listener"
+        );
+    }
+
+    #[test]
+    fn sni_admission_refused_is_gateway_policy_with_unknown_direction() {
+        let kind = StreamSetupKind::SniAdmissionRefused;
+        assert!(kind.is_client_side());
+        assert_eq!(kind.direction(), crate::plugins::Direction::Unknown);
+        assert_eq!(
+            kind.disconnect_cause(),
+            crate::plugins::DisconnectCause::GatewayPolicy
+        );
+        let err = StreamSetupError::with_message(
+            kind,
+            "SNI-routed stream listener on port 21582 refused connection (not_tls)",
+        );
+        assert_eq!(
+            format!("{err}"),
+            "SNI-routed stream listener on port 21582 refused connection (not_tls)"
         );
     }
 

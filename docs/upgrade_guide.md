@@ -59,6 +59,11 @@ Authenticated `ConfigSync.Subscribe` and `MeshConfigSync.MeshSubscribe` streams 
 Proxies with an effective `ai_federation` or `ai_stream_router` plugin now return OpenAI-shaped `{"error":{"message","type","param","code"}}` bodies for gateway-authored authentication `401`s (missing or invalid credentials from `key_auth`, JWT/JWKS/Basic/HMAC/LDAP/mTLS/OIDC/introspection plugins). Status codes and `WWW-Authenticate` are unchanged. Authorization-phase rejects (`acl`, `rate_limiting`, and other `authorize` plugins) and non-`401` authentication outcomes keep their existing bodies.
 
 **Operator action:** on AI gateway routes, read `error.message` / `error.code` (or use an OpenAI-compatible client) instead of parsing the flat `{"error":"<string>"}` shape for authentication failures.
+### Opaque-TLS SNI admission refusals classify as `dispatch_policy_rejected` / `gateway_policy` (issue [#4407](https://github.com/ferrum-edge/ferrum-edge/issues/4407))
+
+Fail-closed opaque-TLS SNI admission (plaintext on an SNI port, ClientHello timeout / incomplete / malformed hello, unmatched SNI with no catch-all) still RSTs the client and still does not dial or charge a backend. The `StreamTransactionSummary` taxonomy is what changed: those refusals previously logged `error_class=connection_refused` with `disconnect_cause=backend_error` / `disconnect_direction=backend_to_client` (or unmatched SNI as `request_error` / `recv_error`) even though `backend_target` was empty. They now log `error_class=dispatch_policy_rejected`, `disconnect_cause=gateway_policy`, and `disconnect_direction=unknown`. Real backend connect refusals remain `connection_refused`.
+
+**Operator action:** retarget alerts and dashboards that keyed opaque-TLS SNI scanner/plaintext/slow-hello noise on `connection_refused` or `backend_error` to `dispatch_policy_rejected` / `gateway_policy`.
 
 ### Injected Ferrum is a Kubernetes native sidecar (issue [#4430](https://github.com/ferrum-edge/ferrum-edge/issues/4430))
 

@@ -3312,6 +3312,49 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::classify_stream_error(error)
     }
 
+    /// Production typed emit for an opaque-TLS SNI peek refusal (issue #4407).
+    pub fn sni_admission_refused_error_for_test(
+        port: u16,
+        reason: crate::proxy::sni::SniRefusal,
+    ) -> anyhow::Error {
+        crate::proxy::tcp_proxy::sni_admission_refused_error(port, reason)
+    }
+
+    /// Production typed emit for unmatched SNI with no catch-all (issue #4407).
+    pub fn no_matching_sni_route_error_for_test(port: u16) -> anyhow::Error {
+        crate::proxy::tcp_proxy::no_matching_sni_route_error(port)
+    }
+
+    pub fn pre_copy_disconnect_cause_for_test(
+        error: &anyhow::Error,
+        class: &crate::retry::ErrorClass,
+    ) -> crate::plugins::DisconnectCause {
+        crate::proxy::tcp_proxy::pre_copy_disconnect_cause(error, class)
+    }
+
+    pub fn pre_copy_disconnect_direction_for_test(
+        error: &anyhow::Error,
+        class: &crate::retry::ErrorClass,
+    ) -> crate::plugins::Direction {
+        crate::proxy::tcp_proxy::pre_copy_disconnect_direction(error, class)
+    }
+
+    pub fn apply_circuit_breaker_outcome_for_test(
+        cb: &crate::circuit_breaker::CircuitBreaker,
+        response_status: u16,
+        connection_error: bool,
+        error_class: Option<crate::retry::ErrorClass>,
+        is_half_open_probe: bool,
+    ) {
+        crate::proxy::backend_dispatch::apply_circuit_breaker_outcome(
+            cb,
+            response_status,
+            connection_error,
+            error_class,
+            is_half_open_probe,
+        )
+    }
+
     /// Drive the production UDP setup-failure ownership + emit path.
     ///
     /// This is the same `UdpSetupProgress` value `spawn_new_session_datagram`

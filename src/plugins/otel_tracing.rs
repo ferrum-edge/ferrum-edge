@@ -3429,6 +3429,7 @@ const fn disconnect_cause_label(cause: DisconnectCause) -> &'static str {
         DisconnectCause::RecvError => "recv_error",
         DisconnectCause::BackendError => "backend_error",
         DisconnectCause::GracefulShutdown => "graceful_shutdown",
+        DisconnectCause::GatewayPolicy => "gateway_policy",
     }
 }
 

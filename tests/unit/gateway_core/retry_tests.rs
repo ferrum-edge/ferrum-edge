@@ -1277,6 +1277,22 @@ fn test_classify_boxed_error_typed_client_admission_disconnect() {
 }
 
 #[test]
+fn test_classify_boxed_error_typed_sni_admission_refused() {
+    // The Display still contains "refused", which the substring fallback
+    // maps to ConnectionRefused. The typed kind must win so operators do
+    // not treat SNI admission as a backend SYN/RST (issue #4407).
+    use ferrum_edge::proxy::stream_error::{StreamSetupError, StreamSetupKind};
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(StreamSetupError::with_message(
+        StreamSetupKind::SniAdmissionRefused,
+        "SNI-routed stream listener on port 21582 refused connection (not_tls)",
+    ));
+    assert_eq!(
+        classify_boxed_error(&*err),
+        ErrorClass::DispatchPolicyRejected
+    );
+}
+
+#[test]
 fn test_classify_boxed_error_typed_kind_survives_anyhow_context() {
     // Construction sites convert StreamSetupError to anyhow::Error via
     // .into() and may further .context(...) it before reaching the cause

@@ -687,6 +687,7 @@ Tags: `protocol`, `proxy`, `error`, `cause`, `direction`, `namespace` (plus any 
 - `recv_error`
 - `backend_error`
 - `graceful_shutdown`
+- `gateway_policy` (gateway terminated the session as an admission/policy decision before a backend was selected)
 - `unknown` (summary `disconnect_cause` is `None`)
 
 **`direction` tag values** (from `disconnect_direction`; both `None` and explicit `Unknown` serialize as `unknown`):
@@ -1070,7 +1071,7 @@ Only set when the gateway itself could not communicate with the backend (or when
 | `connection_error` | String or null | Error message if the connection failed |
 | `error_class` | String or null | Error classification; omitted from JSON when null |
 | `disconnect_direction` | String or null | Which half of the stream errored first: `"client_to_backend"`, `"backend_to_client"`, or `"unknown"`. Omitted when null |
-| `disconnect_cause` | String or null | Session termination cause: `"idle_timeout"`, `"recv_error"` (frontend recv failed), `"backend_error"` (backend recv failed), or `"graceful_shutdown"`. Disambiguates idle timeouts from recv errors (previously both presented as `error_class: null`). Omitted when null |
+| `disconnect_cause` | String or null | Session termination cause: `"idle_timeout"`, `"recv_error"` (frontend recv failed), `"backend_error"` (backend recv failed), `"graceful_shutdown"`, or `"gateway_policy"` (gateway admission/policy decision with no backend selected, issue #4407). Disambiguates idle timeouts from recv errors (previously both presented as `error_class: null`). Omitted when null |
 | `timestamp_connected` | String (RFC 3339) | Connection start time |
 | `timestamp_disconnected` | String (RFC 3339) | Connection end time |
 | `sni_hostname` | String or null | SNI from the frontend TLS/DTLS ClientHello for TCP TLS termination, DTLS termination, and TLS/DTLS passthrough; omitted from JSON when null |

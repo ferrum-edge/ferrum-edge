@@ -1012,6 +1012,7 @@ pub fn format_stream_metrics(
         Some(crate::plugins::DisconnectCause::RecvError) => "recv_error",
         Some(crate::plugins::DisconnectCause::BackendError) => "backend_error",
         Some(crate::plugins::DisconnectCause::GracefulShutdown) => "graceful_shutdown",
+        Some(crate::plugins::DisconnectCause::GatewayPolicy) => "gateway_policy",
         None => "unknown",
     };
     let direction_tag = match summary.disconnect_direction {

@@ -265,6 +265,8 @@ Candidates that also carry Istio `stream_match` L4 predicates are evaluated in d
 
 The last row is the security boundary: such a connection may have declared *any* tenant's hostname, so quietly sending it to the default route would be a cross-tenant downgrade. `FERRUM_STREAM_SNI_PLAINTEXT_FALLBACK` deliberately does **not** rescue it — it authorizes only the determinate non-TLS case, for ports intentionally shared with direct plaintext TCP clients.
 
+Every admission refusal above is a gateway decision before any backend is selected. The `StreamTransactionSummary` therefore reports `error_class=dispatch_policy_rejected`, `disconnect_cause=gateway_policy`, `disconnect_direction=unknown`, and an empty `backend_target`. It is not `connection_refused` / `backend_error` / `backend_to_client`: those labels are reserved for a real backend connect. The client still sees RST. The circuit breaker and passive health are not charged. Happy-path SNI routing is unchanged.
+
 A port whose candidates declare no `hosts` at all is not SNI-routed and none of this applies: it is a plain relay that accepts every connection. A lone `passthrough: true` listener there still peeks the ClientHello to populate `sni_hostname` for stream lifecycle plugins and logs, but that peek never gates admission; a lone ordinary `tcp` listener does not peek at all.
 
 **Conflict rejection.** Config admission rejects only what the ladder cannot resolve, so a tie inside one tier is an error while a cross-tier pair is not:

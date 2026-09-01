@@ -296,6 +296,7 @@ fn disconnect_cause_label(cause: Option<super::DisconnectCause>) -> &'static str
         Some(super::DisconnectCause::RecvError) => "recv_error",
         Some(super::DisconnectCause::BackendError) => "backend_error",
         Some(super::DisconnectCause::GracefulShutdown) => "graceful_shutdown",
+        Some(super::DisconnectCause::GatewayPolicy) => "gateway_policy",
         None => "unknown",
     }
 }

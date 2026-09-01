@@ -27,7 +27,7 @@ Every classifier funnels its result into [`crate::retry::ErrorClass`](../src/ret
 | `PortExhaustion` | EADDRNOTAVAIL — all ephemeral ports in use. | `false` (pre-wire) |
 | `ClientDisconnect` | Client gave up before the gateway could complete the response. | `true` (post-wire) |
 | `GracefulRemoteClose` | Peer closed the session cleanly: HTTP/3 `H3_NO_ERROR`/GOAWAY at the response read boundary, or RFC 6455 Close frame on a WebSocket. Excluded from H3 capability downgrades so a backend that closes after every response stays on H3. | `true` (post-wire) |
-| `DispatchPolicyRejected` | Terminal gateway decision before a backend dial, including egress/SNI policy, admission overflow, and final request-body hook rejection. It is non-retryable and backend-health-neutral. | `true` (gateway-local terminal) |
+| `DispatchPolicyRejected` | Terminal gateway decision before a backend dial, including egress/SNI policy, opaque-TLS SNI admission refusals (issue #4407), admission overflow, and final request-body hook rejection. It is non-retryable and backend-health-neutral. | `true` (gateway-local terminal) |
 | `BackendConnectionLimit` | The gateway refused to open a NEW physical backend connection because the destination is already at its DestinationRule `connectionPool.tcp.maxConnections` ceiling (`src/backend_conn_limit.rs`). Emitted by direct H2, gRPC, native H3, HBONE, and Sidecar mesh-mTLS. With `TrustWithdrawn` (the other gateway-side policy refusal) it is one of only two classes that are simultaneously pre-wire (so `retry_on_connect_failure` may rotate to another target with its own admission lane) and backend-health-neutral (`client_side_no_backend_signal`) — a saturated operator-configured ceiling is gateway policy, not evidence about the backend, so it must not trip the circuit breaker, ding passive health, penalize the load balancer, or shrink the adaptive-concurrency permit. The raw-TCP over-cap path records `cb.record_neutral()` for the same reason. The reqwest/HTTP-1.1 and WebSocket lanes instead answer `503` / `DispatchPolicyRejected` because they do not rotate. | `false` (pre-wire) |
 | `TrustWithdrawn` | An accepted gateway trust publication withdrew an authority, so a gateway-to-mesh TLS transport was refused (`src/proxy/mesh_trust_registry.rs`, issue #3859): either the connection was dialed under the outgoing trust generation and refused at registration, or a checked-out HBONE tunnel / mesh-mTLS sender was retired before it could open the next stream. Emitted by the HBONE and Sidecar mesh-mTLS pools and by native gRPC over either. Like `BackendConnectionLimit` it is simultaneously pre-wire (so `retry_on_connect_failure` may re-dial — and the redial succeeds, because the accepted generation is already published) and backend-health-neutral (`client_side_no_backend_signal`) — withdrawing a root is gateway policy, not evidence about the destination workload, so it must not trip the circuit breaker, ding passive health, penalize the load balancer, or shrink the adaptive-concurrency permit. The generic `ConnectionPoolError` would open breakers across every mesh destination live at the instant of a revocation. | `false` (pre-wire) |
 | `RequestError` | Catch-all for unclassified gateway-side rejections and unknown failure modes. | `true` (post-wire) |
@@ -91,6 +91,7 @@ pub enum StreamSetupKind {
     NoHealthyTargets,       // LB pool empty, empty subset, or no family-matching backends (backend-side)
     CircuitBreakerOpen,     // per-proxy passive-health circuit breaker is open (backend-side)
     BackendMaxConnectionsExceeded, // DestinationRule connectionPool.tcp.maxConnections cap hit at backend dial (backend-side)
+    SniAdmissionRefused,    // opaque-TLS SNI listener refused before any backend dial (gateway-local)
 }
 ```
 
@@ -105,6 +106,19 @@ consulted, so it stays `DispatchPolicyRejected` — non-retryable and neutral to
 backend health, matching the `record_neutral` circuit-breaker accounting the
 same call sites already perform. Typing it would let the typed walk override
 that classification.
+
+Opaque-TLS SNI listener admission refusals (not-TLS on an SNI port, ClientHello
+timeout / overflow / EOF / truncation / malformation / unrepresentable
+`server_name`, peek I/O failure, and a valid hello whose SNI matches no route)
+are typed as [`StreamSetupKind::SniAdmissionRefused`](../src/proxy/stream_error.rs).
+That kind maps to `ErrorClass::DispatchPolicyRejected`. Companion stream fields
+are `disconnect_cause=gateway_policy` (the gateway terminated the session; no
+backend socket existed) and `disconnect_direction=unknown`. Display wording is
+unchanged (`SNI-routed stream listener on port … refused connection (…)` /
+`No matching SNI route for connection on port …`); classification walks the
+typed kind so the word `refused` in that Display cannot match the substring
+fallback's `ConnectionRefused` token. The client still sees RST. No backend is
+selected, so the circuit breaker and passive health are not charged.
 
 ### UDP setup failures that never publish a session
 
@@ -257,7 +271,7 @@ Two summary types in [`src/plugins/mod.rs`](../src/plugins/mod.rs) carry classif
 | `disconnect_direction: Option<Direction>` | `pre_copy_disconnect_direction` (TCP) / `dtls_disconnect_direction` (UDP) | typed `StreamSetupKind` first, class fallback otherwise — populated for UDP/DTLS sessions on the same terms as TCP, so operators can tell which side tore down a DTLS session |
 | `connection_error: Option<String>` | `error.to_string()` | preserves the original message text alongside the typed class |
 
-`disconnect_cause` and `disconnect_direction` agree by construction: both consult the same typed kind (when present) and apply the same class-driven fallback (when absent). Adding a new `ErrorClass` variant requires updating both class-fallback arms in lockstep — the exhaustive `match` on `ErrorClass` makes this a compile error rather than a silent miscategorisation.
+`disconnect_cause` and `disconnect_direction` agree by construction: both consult the same typed kind (when present) and apply the same class-driven fallback (when absent). Typed kinds use [`StreamSetupKind::disconnect_cause`](../src/proxy/stream_error.rs) / [`StreamSetupKind::direction`](../src/proxy/stream_error.rs) as the single source of truth — opaque-TLS SNI admission is `GatewayPolicy` / `Unknown`, not `BackendError` / `BackendToClient`. Adding a new `ErrorClass` variant requires updating both class-fallback arms in lockstep — the exhaustive `match` on `ErrorClass` makes this a compile error rather than a silent miscategorisation.
 
 ## HTTP observability vocabulary (`X-Gateway-Error`)
 

@@ -7147,6 +7147,11 @@ pub enum DisconnectCause {
     BackendError,
     /// Clean shutdown initiated by either peer (e.g., FIN, graceful close frame).
     GracefulShutdown,
+    /// The gateway terminated the session as an admission or dispatch-policy
+    /// decision before a backend was selected, dialed, or health-scored
+    /// (issue #4407). Distinct from [`Self::RecvError`] (a client-socket read
+    /// failed) and [`Self::BackendError`] (a backend socket failed).
+    GatewayPolicy,
 }
 
 /// Shared latency sentinel for unknown or not-applicable observations.

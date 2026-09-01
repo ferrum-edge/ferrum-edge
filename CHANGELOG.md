@@ -418,6 +418,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FROM` lines and unapproved floating Rust channels. SBOM/provenance recording,
   scheduled digest-bump automation, and `rust-toolchain.toml` pinning remain
   follow-up work.
+- **BREAKING — opaque-TLS SNI admission refusals classify as
+  `dispatch_policy_rejected` / `gateway_policy`** (issue #4407). Plaintext,
+  unmatched SNI, ClientHello timeout, and every other fail-closed SNI peek
+  refusal on an opaque-TLS SNI group (`passthrough: true` + `hosts:`, or
+  ordinary opaque `tcp` with `hosts:`) still close the client with RST and
+  still do not select, dial, health-score, or breaker-charge a backend.
+  `StreamTransactionSummary` no longer reports those as
+  `error_class=connection_refused` with `disconnect_cause=backend_error` /
+  `disconnect_direction=backend_to_client` (or unmatched SNI as
+  `request_error` / `recv_error`). They now log
+  `error_class=dispatch_policy_rejected`, `disconnect_cause=gateway_policy`,
+  `disconnect_direction=unknown`, and an empty `backend_target`.
+  `connection_refused` remains a real backend connect refusal. **Operator
+  action**: retarget alerts and dashboards that keyed opaque-TLS SNI
+  scanner/plaintext/slow-hello noise on `connection_refused` or
+  `backend_error` to `dispatch_policy_rejected` / `gateway_policy`.
 
 - **BREAKING — injected Ferrum is a Kubernetes native sidecar**
   (issue #4430). The webhook now emits `ferrum-edge` under `spec.initContainers`

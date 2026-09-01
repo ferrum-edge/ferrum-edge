@@ -651,6 +651,7 @@ fn test_statsd_metric_docs_inventory_and_byte_directions() {
         "recv_error",
         "backend_error",
         "graceful_shutdown",
+        "gateway_policy",
         "client_to_backend",
         "backend_to_client",
         "max_retries",

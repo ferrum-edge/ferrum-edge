@@ -5503,11 +5503,7 @@ pub(crate) fn dtls_disconnect_cause(
     }
 
     if let Some(setup_err) = find_stream_setup_error(error) {
-        return if setup_err.kind.is_client_side() {
-            DisconnectCause::RecvError
-        } else {
-            DisconnectCause::BackendError
-        };
+        return setup_err.kind.disconnect_cause();
     }
 
     match class {

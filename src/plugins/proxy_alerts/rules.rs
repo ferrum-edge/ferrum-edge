@@ -825,6 +825,7 @@ fn disconnect_cause_str(c: DisconnectCause) -> &'static str {
         DisconnectCause::RecvError => "recv_error",
         DisconnectCause::BackendError => "backend_error",
         DisconnectCause::GracefulShutdown => "graceful_shutdown",
+        DisconnectCause::GatewayPolicy => "gateway_policy",
     }
 }
 

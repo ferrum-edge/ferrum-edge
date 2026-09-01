@@ -475,7 +475,11 @@ impl TransactionDebugger {
             || summary.disconnect_direction.is_some()
             || matches!(
                 summary.disconnect_cause,
-                Some(DisconnectCause::RecvError | DisconnectCause::BackendError)
+                Some(
+                    DisconnectCause::RecvError
+                        | DisconnectCause::BackendError
+                        | DisconnectCause::GatewayPolicy
+                )
             )
         {
             "stream_error"
@@ -1743,6 +1747,7 @@ const fn disconnect_cause_label(cause: DisconnectCause) -> &'static str {
         DisconnectCause::RecvError => "recv_error",
         DisconnectCause::BackendError => "backend_error",
         DisconnectCause::GracefulShutdown => "graceful_shutdown",
+        DisconnectCause::GatewayPolicy => "gateway_policy",
     }
 }
 
