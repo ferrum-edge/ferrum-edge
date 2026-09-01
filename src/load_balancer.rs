@@ -1617,6 +1617,27 @@ impl LoadBalancerCache {
         snapshot.upstream(namespace, upstream_id).cloned()
     }
 
+    /// Check whether a client-named target belongs to the currently reachable
+    /// RFC 2782 SRV priority tier without advancing any load-balancer cursor.
+    ///
+    /// An absent balancer is treated as eligible so CONNECT-UDP falls through
+    /// to membership screening. Balancers are published alongside their
+    /// upstreams; a missing balancer must not refuse a destination the
+    /// upstream index still lists.
+    pub fn is_srv_priority_eligible_from(
+        snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
+        upstream_id: &str,
+        host: &str,
+        port: u16,
+        health: Option<&HealthContext<'_>>,
+    ) -> bool {
+        snapshot
+            .balancer(namespace, upstream_id)
+            .map(|balancer| balancer.is_srv_priority_eligible(host, port, health))
+            .unwrap_or(true)
+    }
+
     /// Select a target from a pre-loaded snapshot.
     #[inline]
     pub fn select_target_from(
@@ -4110,6 +4131,32 @@ impl LoadBalancer {
             .get(idx)
             .copied()
             .unwrap_or(SRV_PRIORITY_NONE)
+    }
+
+    /// Membership-only counterpart to selection for protocols whose client
+    /// names the destination. An empty healthy set preserves selection's
+    /// all-unhealthy degraded fallback.
+    fn is_srv_priority_eligible(
+        &self,
+        host: &str,
+        port: u16,
+        health: Option<&HealthContext<'_>>,
+    ) -> bool {
+        if self.targets.len() <= MAX_BITSET_TARGETS {
+            let healthy = self.compute_health_bitset(health);
+            return healthy.is_empty()
+                || self.targets.iter().enumerate().any(|(idx, target)| {
+                    healthy.contains(idx)
+                        && target.port == port
+                        && target.host.eq_ignore_ascii_case(host)
+                });
+        }
+
+        let healthy = self.healthy_targets_vec(health);
+        healthy.is_empty()
+            || healthy
+                .iter()
+                .any(|(_, target)| target.port == port && target.host.eq_ignore_ascii_case(host))
     }
 
     /// Compute a stack-allocated bitset of healthy target indices in a single

@@ -619,13 +619,17 @@ impl AdmittedConnectUdpDestination {
 
 /// Why a client-named CONNECT-UDP destination was refused.
 ///
-/// Both variants produce the same client-visible 403 with the same body: a
+/// Every variant produces the same client-visible 403 with the same body: a
 /// probe must not learn from the refusal whether the destination exists in the
-/// route's configuration. They differ only in the gateway-side log/phase reason.
+/// route's configuration or which SRV priority tier is currently reachable.
+/// They differ only in the gateway-side log/phase reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectUdpDestinationRefusal {
     /// Not a destination this route is configured to reach.
     NotConfigured,
+    /// Configured, but its RFC 2782 SRV priority tier is not the reachable
+    /// tier right now: a lower-numbered tier still has a healthy member.
+    SrvPriorityTierNotActive,
     /// Configured, but reaching it requires a transport that a direct UDP
     /// socket cannot provide — HBONE, sidecar mTLS, cross-cluster east-west, or
     /// a Unix socket.
@@ -637,6 +641,7 @@ impl ConnectUdpDestinationRefusal {
     pub fn reason(self) -> &'static str {
         match self {
             Self::NotConfigured => "connect_udp_target_not_allowed",
+            Self::SrvPriorityTierNotActive => "connect_udp_target_srv_tier_standby",
             Self::TransportRequired(_) => "connect_udp_target_transport_required",
         }
     }
@@ -654,9 +659,13 @@ impl ConnectUdpDestinationRefusal {
 ///
 /// Two properties are deliberate:
 ///
-/// * No load-balancer selection is consulted. A CONNECT-UDP tunnel is admitted,
-///   never balanced, so an unrelated member's health, circuit-breaker state, or
-///   transport tags can neither authorize nor refuse the requested destination.
+/// * No load-balancer selection is performed and no selection cursor advances.
+///   When `health` is `Some`, admission reuses the balancer's health-aware
+///   RFC 2782 SRV priority boundary so a client cannot name a standby tier
+///   while a lower-numbered tier is still healthy. The live generation
+///   re-check passes `health: None` so that gate is not consulted: an
+///   operator failover tier is an admission boundary, but a transient health
+///   blip or a recovered primary must not kill an established tunnel.
 /// * The screening runs over EVERY matching target, not the first one. An
 ///   upstream may legitimately list one `host:port` more than once (differing
 ///   weights, localities, or subsets), and a direct duplicate must not launder a
@@ -666,6 +675,7 @@ pub fn admit_connect_udp_destination(
     lb_snapshot: &crate::load_balancer::LoadBalancerCacheInner,
     host: &str,
     port: u16,
+    health: Option<&crate::load_balancer::HealthContext<'_>>,
 ) -> Result<AdmittedConnectUdpDestination, ConnectUdpDestinationRefusal> {
     let Some(upstream_id) = proxy.upstream_id.as_deref() else {
         return if proxy.backend_port == port && proxy.backend_host.eq_ignore_ascii_case(host) {
@@ -703,24 +713,44 @@ pub fn admit_connect_udp_destination(
         }
     }
     match admitted {
-        Some(target) => Ok(AdmittedConnectUdpDestination::UpstreamTarget(Box::new(
-            target.clone(),
-        ))),
+        Some(target) => {
+            // SRV-tier eligibility is an admission-time gate. Passing
+            // `health: None` (the live re-check) skips it so a health flap
+            // cannot withdraw a tunnel that configuration still authorizes.
+            if health.is_some()
+                && !LoadBalancerCache::is_srv_priority_eligible_from(
+                    lb_snapshot,
+                    &proxy.namespace,
+                    upstream_id,
+                    host,
+                    port,
+                    health,
+                )
+            {
+                return Err(ConnectUdpDestinationRefusal::SrvPriorityTierNotActive);
+            }
+            Ok(AdmittedConnectUdpDestination::UpstreamTarget(Box::new(
+                target.clone(),
+            )))
+        }
         None => Err(ConnectUdpDestinationRefusal::NotConfigured),
     }
 }
 
 /// Boolean projection of [`admit_connect_udp_destination`] for callers that only
 /// need "is this still an admissible destination" — notably the live
-/// generation re-check, which fails the tunnel closed on any refusal, including
-/// a reload that newly tags the destination as requiring another transport.
+/// generation re-check, which fails the tunnel closed on a configuration
+/// refusal (destination left the upstream, or now requires another transport).
+/// Pass `health: None` there so health and SRV-tier eligibility are not
+/// consulted.
 pub fn destination_is_configured(
     proxy: &Proxy,
     lb_snapshot: &crate::load_balancer::LoadBalancerCacheInner,
     host: &str,
     port: u16,
+    health: Option<&crate::load_balancer::HealthContext<'_>>,
 ) -> bool {
-    admit_connect_udp_destination(proxy, lb_snapshot, host, port).is_ok()
+    admit_connect_udp_destination(proxy, lb_snapshot, host, port, health).is_ok()
 }
 
 /// Whether a live route still pins the tunnel's destination address the way the
@@ -1877,12 +1907,27 @@ pub(crate) async fn handle_h3_connect_udp(
     // target's own transport requirement is screened, so a destination that
     // must ride HBONE, sidecar mTLS, an east-west cross-cluster leg, or a Unix
     // socket is never tunnelled over a direct UDP dial.
-    let destination =
-        admit_connect_udp_destination(&proxy, &epoch.load_balancer, &target.host, target.port);
+    let upstream_id = proxy.upstream_id.as_deref();
+    let health_ctx = upstream_id.map(|upstream_id| {
+        crate::proxy::backend_dispatch::health_context_for_selection(
+            &proxy,
+            &state.health_checker,
+            &epoch.load_balancer,
+            upstream_id,
+            None,
+        )
+    });
+    let destination = admit_connect_udp_destination(
+        &proxy,
+        &epoch.load_balancer,
+        &target.host,
+        target.port,
+        health_ctx.as_ref(),
+    );
     let admitted = match destination {
         Ok(admitted) => admitted,
         Err(refusal) => {
-            // No target identity is echoed, and both refusal kinds share one
+            // No target identity is echoed, and every refusal kind shares one
             // status and body: a probe must learn neither the configured
             // destination set nor which of its members are directly dialable.
             warn!(
@@ -2884,16 +2929,20 @@ async fn relay(
                     ) {
                         break SessionEnd::RouteTargetPinChanged;
                     }
-                    // Re-runs the FULL admission, transport screening included,
-                    // so a reload that newly requires HBONE / mesh mTLS /
-                    // cross-cluster / Unix dispatch for this destination
-                    // withdraws the live direct-UDP tunnel instead of letting it
-                    // outlive the policy that would now refuse it.
+                    // Re-runs configuration + transport screening so a reload
+                    // that newly requires HBONE / mesh mTLS / cross-cluster
+                    // / Unix dispatch for this destination withdraws the live
+                    // direct-UDP tunnel instead of letting it outlive the
+                    // policy that would now refuse it. Health is deliberately
+                    // not consulted: CONNECT-UDP is admitted, never balanced,
+                    // and a transient health flap or a recovered primary SRV
+                    // tier must not tear down an already-established tunnel.
                     if !destination_is_configured(
                         live,
                         &current.load_balancer,
                         &target.host,
                         target.port,
+                        None,
                     ) {
                         break SessionEnd::RouteWithdrawn;
                     }

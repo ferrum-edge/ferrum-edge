@@ -8,6 +8,7 @@
 //! [`CapsuleDecoder`], and frames target datagrams with
 //! [`encode_udp_datagram_capsule`].
 
+use dashmap::DashMap;
 use ferrum_edge::_test_support::{
     H3AuthorizedHeadersWrite, await_authorized_headers_write_for_test,
     await_deadline_first_for_test, request_received_at_for_test,
@@ -26,7 +27,7 @@ use ferrum_edge::http3::connect_udp::{
     reconcile_authorization_teardown, resolve_send_half_close_command,
     strip_forbidden_capsule_protocol_response_fields, validate_connect_udp_request_shape,
 };
-use ferrum_edge::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
+use ferrum_edge::load_balancer::{HealthContext, LoadBalancerCache, LoadBalancerCacheInner};
 use ferrum_edge::plugins::RequestContext;
 use ferrum_edge::proxy::auth_lifetime::{
     ComposedAuthBound, StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination,
@@ -230,6 +231,14 @@ fn lb_cache(upstreams: Vec<Upstream>) -> LoadBalancerCache {
     LoadBalancerCache::new(&config)
 }
 
+fn all_healthy<'a>(active: &'a DashMap<String, u64>) -> HealthContext<'a> {
+    HealthContext {
+        active_unhealthy: active,
+        proxy_passive: None,
+        max_ejection_percent: None,
+    }
+}
+
 #[test]
 fn admits_only_the_configured_direct_backend() {
     let cache = lb_cache(Vec::new());
@@ -237,15 +246,34 @@ fn admits_only_the_configured_direct_backend() {
     let lb: &LoadBalancerCacheInner = &guard;
     let proxy = direct_proxy("dns.example", 853);
 
-    assert!(destination_is_configured(&proxy, lb, "dns.example", 853));
+    assert!(destination_is_configured(
+        &proxy,
+        lb,
+        "dns.example",
+        853,
+        None,
+    ));
     // Case-insensitive on the host, exact on the port.
-    assert!(destination_is_configured(&proxy, lb, "DNS.example", 853));
-    assert!(!destination_is_configured(&proxy, lb, "dns.example", 53));
+    assert!(destination_is_configured(
+        &proxy,
+        lb,
+        "DNS.example",
+        853,
+        None,
+    ));
+    assert!(!destination_is_configured(
+        &proxy,
+        lb,
+        "dns.example",
+        53,
+        None,
+    ));
     assert!(!destination_is_configured(
         &proxy,
         lb,
         "attacker.example",
-        853
+        853,
+        None,
     ));
 }
 
@@ -263,21 +291,30 @@ fn admits_any_target_of_the_referenced_upstream_and_nothing_else() {
         &proxy,
         lb,
         "relay-a.internal",
-        5353
+        5353,
+        None,
     ));
     assert!(destination_is_configured(
         &proxy,
         lb,
         "relay-b.internal",
-        5353
+        5353,
+        None,
     ));
     // The proxy's own backend_host is NOT admitted once an upstream governs it.
-    assert!(!destination_is_configured(&proxy, lb, "unused.example", 1));
+    assert!(!destination_is_configured(
+        &proxy,
+        lb,
+        "unused.example",
+        1,
+        None,
+    ));
     assert!(!destination_is_configured(
         &proxy,
         lb,
         "relay-a.internal",
-        53
+        53,
+        None,
     ));
 }
 
@@ -294,7 +331,8 @@ fn a_withdrawn_upstream_admits_nothing() {
         &proxy,
         lb,
         "relay-a.internal",
-        5353
+        5353,
+        None,
     ));
 }
 
@@ -336,7 +374,7 @@ fn a_transport_constrained_target_is_refused_even_when_a_sibling_is_directly_dia
     let lb: &LoadBalancerCacheInner = &guard;
     let proxy = upstream_proxy("mixed-pool");
 
-    let admitted = admit_connect_udp_destination(&proxy, lb, "direct.internal", 5353)
+    let admitted = admit_connect_udp_destination(&proxy, lb, "direct.internal", 5353, None)
         .expect("the direct member is tunnelable");
     match admitted {
         AdmittedConnectUdpDestination::UpstreamTarget(target) => {
@@ -347,7 +385,7 @@ fn a_transport_constrained_target_is_refused_even_when_a_sibling_is_directly_dia
     }
 
     assert_eq!(
-        admit_connect_udp_destination(&proxy, lb, "hbone.internal", 5353).unwrap_err(),
+        admit_connect_udp_destination(&proxy, lb, "hbone.internal", 5353, None,).unwrap_err(),
         ConnectUdpDestinationRefusal::TransportRequired(
             "HBONE dispatch required for this backend target"
         ),
@@ -358,7 +396,8 @@ fn a_transport_constrained_target_is_refused_even_when_a_sibling_is_directly_dia
         &proxy,
         lb,
         "hbone.internal",
-        5353
+        5353,
+        None,
     ));
 }
 
@@ -395,7 +434,7 @@ fn every_non_direct_transport_class_is_refused() {
     for host in ["mtls.internal", "xc.internal", "unix.internal"] {
         assert!(
             matches!(
-                admit_connect_udp_destination(&proxy, lb, host, 5353),
+                admit_connect_udp_destination(&proxy, lb, host, 5353, None),
                 Err(ConnectUdpDestinationRefusal::TransportRequired(_))
             ),
             "{host} requires a transport a direct UDP dial cannot provide"
@@ -427,7 +466,7 @@ fn a_direct_duplicate_cannot_launder_a_transport_constrained_sibling() {
 
     assert!(
         matches!(
-            admit_connect_udp_destination(&proxy, lb, "relay.internal", 5353),
+            admit_connect_udp_destination(&proxy, lb, "relay.internal", 5353, None,),
             Err(ConnectUdpDestinationRefusal::TransportRequired(_))
         ),
         "admission must fail closed across every matching target"
@@ -450,7 +489,7 @@ fn admission_returns_the_requested_member_never_a_balanced_one() {
 
     for _ in 0..8 {
         for host in ["relay-a.internal", "relay-b.internal"] {
-            let admitted = admit_connect_udp_destination(&proxy, lb, host, 5353)
+            let admitted = admit_connect_udp_destination(&proxy, lb, host, 5353, None)
                 .expect("every configured member is admissible");
             match admitted {
                 AdmittedConnectUdpDestination::UpstreamTarget(target) => {
@@ -463,6 +502,78 @@ fn admission_returns_the_requested_member_never_a_balanced_one() {
 }
 
 #[test]
+fn dns_sd_standby_tier_is_not_admitted_while_primary_is_healthy() {
+    let priority_tag = ferrum_edge::_test_support::srv_priority_tag_for_test();
+    let upstream = upstream_from_json(serde_json::json!({
+        "id": "dns-sd-pool",
+        "targets": [
+            {
+                "host": "primary.internal",
+                "port": 5353,
+                "tags": { (priority_tag): "10" }
+            },
+            {
+                "host": "standby.internal",
+                "port": 5353,
+                "tags": { (priority_tag): "20" }
+            }
+        ]
+    }));
+    let cache = lb_cache(vec![upstream]);
+    let guard = cache.load();
+    let proxy = upstream_proxy("dns-sd-pool");
+    let active = DashMap::new();
+    let health = all_healthy(&active);
+
+    assert!(
+        admit_connect_udp_destination(&proxy, &guard, "primary.internal", 5353, Some(&health),)
+            .is_ok()
+    );
+    assert_eq!(
+        admit_connect_udp_destination(&proxy, &guard, "standby.internal", 5353, Some(&health),)
+            .unwrap_err(),
+        ConnectUdpDestinationRefusal::SrvPriorityTierNotActive,
+    );
+    assert_eq!(
+        ConnectUdpDestinationRefusal::SrvPriorityTierNotActive.reason(),
+        "connect_udp_target_srv_tier_standby"
+    );
+    // Live re-check is configuration-only: a standby that was admitted
+    // while the primary was down must not be withdrawn when health is
+    // not consulted.
+    assert!(destination_is_configured(
+        &proxy,
+        &guard,
+        "standby.internal",
+        5353,
+        None,
+    ));
+}
+
+#[test]
+fn untagged_upstream_is_unaffected_by_srv_priority_admission() {
+    let cache = lb_cache(vec![upstream_with_targets(
+        "udp-pool",
+        &[("relay-a.internal", 5353), ("relay-b.internal", 5353)],
+    )]);
+    let guard = cache.load();
+    let proxy = upstream_proxy("udp-pool");
+    let active = DashMap::new();
+    let health = all_healthy(&active);
+
+    for host in ["relay-a.internal", "relay-b.internal"] {
+        assert!(
+            admit_connect_udp_destination(&proxy, &guard, host, 5353, Some(&health),).is_ok(),
+            "{host} has no SRV priority tags and must stay admissible"
+        );
+        assert!(
+            destination_is_configured(&proxy, &guard, host, 5353, None),
+            "{host} remains configured for the live re-check"
+        );
+    }
+}
+
+#[test]
 fn a_route_backend_destination_is_admitted_as_the_route_backend() {
     let cache = lb_cache(Vec::new());
     let guard = cache.load();
@@ -470,22 +581,27 @@ fn a_route_backend_destination_is_admitted_as_the_route_backend() {
     let proxy = direct_proxy("dns.example", 853);
 
     assert!(matches!(
-        admit_connect_udp_destination(&proxy, lb, "dns.example", 853),
+        admit_connect_udp_destination(&proxy, lb, "dns.example", 853, None,),
         Ok(AdmittedConnectUdpDestination::RouteBackend)
     ));
     assert_eq!(
-        admit_connect_udp_destination(&proxy, lb, "attacker.example", 853).unwrap_err(),
+        admit_connect_udp_destination(&proxy, lb, "attacker.example", 853, None,).unwrap_err(),
         ConnectUdpDestinationRefusal::NotConfigured
     );
 }
 
 #[test]
-fn both_refusal_kinds_carry_distinct_gateway_reasons() {
-    // The client-visible refusal is identical for both (403, one body), so the
-    // only place they may differ is the gateway-side log/phase token.
+fn every_refusal_kind_carries_a_distinct_gateway_reason() {
+    // The client-visible refusal is identical for every kind (403, one
+    // body), so the only place they may differ is the gateway-side
+    // log/phase token.
     assert_eq!(
         ConnectUdpDestinationRefusal::NotConfigured.reason(),
         "connect_udp_target_not_allowed"
+    );
+    assert_eq!(
+        ConnectUdpDestinationRefusal::SrvPriorityTierNotActive.reason(),
+        "connect_udp_target_srv_tier_standby"
     );
     assert_eq!(
         ConnectUdpDestinationRefusal::TransportRequired("HBONE dispatch required").reason(),

@@ -1065,13 +1065,21 @@ by pointing the proxy's upstream at the destinations they intend to expose.
 "Not load balanced" is structural, not incidental: the HTTP/3 handler runs no
 upstream selection at all for a CONNECT-UDP request
 (`UpstreamSelection::unselected()`), so no member the client did not name can
-authorize, refuse, or describe the tunnel. Concretely, an unrelated member's
-health, circuit-breaker state, or transport tags never decide a requested
-destination, no round-robin / least-connections cursor is advanced for a
-request that dials no HTTP backend, and no load-balancer connection is charged.
-The circuit breaker is not consulted at all — a tunnel is not a probe outcome,
-and an HTTP backend's failure history is not evidence about a UDP destination
-(the handler still releases any probe slot it is handed, as defence in depth).
+authorize, refuse, or describe the tunnel via a selection pick. No round-robin /
+least-connections cursor is advanced for a request that dials no HTTP backend,
+and no load-balancer connection is charged. The circuit breaker is not
+consulted at all — a tunnel is not a probe outcome, and an HTTP backend's
+failure history is not evidence about a UDP destination (the handler still
+releases any probe slot it is handed, as defence in depth).
+
+Admission does reuse the balancer's health-aware RFC 2782 SRV priority
+boundary, without advancing a cursor. A client that names a standby-tier
+`host:port` while a lower-numbered tier still has a healthy member is refused
+with the same 403 as an unconfigured destination; the gateway-side reason
+token is `connect_udp_target_srv_tier_standby`. An upstream with no SRV
+priority tags is unaffected. If every member is unhealthy, the same
+all-unhealthy degraded fallback as selection applies (every tagged member is
+eligible).
 
 Admission is bound to the exact requested member, which is what makes the
 transport screening sound: the matched target must be one a **direct UDP dial**
@@ -1079,15 +1087,21 @@ may reach. A destination tagged for HBONE, sidecar mTLS, cross-cluster
 east-west, or Unix-socket dispatch is refused, even when another member of the
 same upstream is directly dialable, and even when the same `host:port` also
 appears untagged — the whole matching set is screened, so a duplicate cannot
-launder a transport-constrained sibling. Both refusal kinds return the same 403
-and the same body, so the response discloses neither the configured destination
-set nor which of its members are directly dialable. The backend egress policy
-is likewise evaluated against the requested host and this route's effective
-`dns_override`, not against a selected backend.
+launder a transport-constrained sibling. All three refusal kinds —
+unconfigured (`connect_udp_target_not_allowed`), standby SRV tier
+(`connect_udp_target_srv_tier_standby`), and transport-required
+(`connect_udp_target_transport_required`) — return the same 403 and the same
+body, so the response discloses neither the configured destination set, which
+tier is reachable, nor which of its members are directly dialable. The backend
+egress policy is likewise evaluated against the requested host and this
+route's effective `dns_override`, not against a selected backend.
 
-The live generation re-check re-runs this same admission, transport screening
-included, so a reload that newly requires another transport for the destination
-withdraws the tunnel instead of letting it outlive the policy.
+The live generation re-check re-runs configuration and transport screening, not
+the health-aware SRV gate. A reload that newly requires another transport for
+the destination withdraws the tunnel instead of letting it outlive the policy;
+a transient health flap, a recovered primary SRV tier, or a passive ejection
+does not, because CONNECT-UDP is admitted, never balanced, and a live tunnel
+must not self-terminate on health state.
 
 Target resolution goes through the dial-time, policy-screened resolver, so the
 same backend IP policy that guards ordinary backend dialling guards the tunnel;
