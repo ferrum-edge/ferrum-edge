@@ -323,7 +323,7 @@ def main() -> int:
                     SCRIPT_DIR / "configs" / "http1_perf.yaml",
                     cert_dir,
                     {
-                        "FERRUM_POOL_MAX_IDLE_PER_HOST": "0",
+                        "FERRUM_POOL_MAX_IDLE_PER_HOST": "4",
                         "FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE": "false",
                     },
                 ),

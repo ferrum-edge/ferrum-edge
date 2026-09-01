@@ -225,7 +225,7 @@ start_ferrum() {
         -e "FERRUM_FRONTEND_TLS_KEY_PATH=/etc/ferrum/tls/key.pem" \
         -e "FERRUM_LOG_LEVEL=error" \
         -e "FERRUM_MAX_CONNECTIONS=0" \
-        -e "FERRUM_POOL_MAX_IDLE_PER_HOST=2000" \
+        -e "FERRUM_POOL_MAX_IDLE_PER_HOST=1024" \
         -e "FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true" \
         -e "FERRUM_POOL_WARMUP_ENABLED=true" \
         -e "FERRUM_TCP_IDLE_TIMEOUT_SECONDS=120" \

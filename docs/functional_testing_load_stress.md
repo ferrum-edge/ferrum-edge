@@ -318,7 +318,7 @@ The test configures the gateway with optimized connection pool settings matching
 
 | Env Var | Value | Purpose |
 |---------|-------|---------|
-| `FERRUM_POOL_MAX_IDLE_PER_HOST` | 1024 | Large idle pool — clamped to max allowed (prevents connection churn) |
+| `FERRUM_POOL_MAX_IDLE_PER_HOST` | 1024 | Large idle pool at the maximum allowed (prevents connection churn) |
 | `FERRUM_POOL_IDLE_TIMEOUT_SECONDS` | 120 | Keep connections alive longer |
 | `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE` | true | Reuse connections to backend |
 | `FERRUM_POOL_ENABLE_HTTP2` | Run 1: `false`, Run 2: `true` | Test runs both modes for comparison |

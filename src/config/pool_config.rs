@@ -1,7 +1,7 @@
 //! Global connection pool configuration.
 //! Provides env/ferrum.conf defaults and proxy-level overrides.
 
-use super::conf_file::resolve_ferrum_var;
+use super::conf_file::ConfFile;
 use super::types::{
     MAX_HTTP2_MAX_FRAME_SIZE, MAX_HTTP2_WINDOW_SIZE, MIN_HTTP2_MAX_FRAME_SIZE,
     MIN_HTTP2_WINDOW_SIZE,
@@ -23,7 +23,7 @@ pub const MIN_IDLE_PER_HOST: usize = 4;
 pub const MAX_IDLE_PER_HOST: usize = 1024;
 
 /// Global connection pool configuration from environment variables or ferrum.conf.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolConfig {
     pub max_idle_per_host: usize,
     pub idle_timeout_seconds: u64,
@@ -111,102 +111,232 @@ impl Default for PoolConfig {
     }
 }
 
+/// Resolve one pool setting: process env wins, then the supplied `ferrum.conf`.
+fn resolve_pool_var(conf: &ConfFile, key: &str) -> Option<String> {
+    match std::env::var(key) {
+        Ok(val) => Some(val),
+        Err(_) => conf.get(key).map(str::to_string),
+    }
+}
+
+/// Same shape as `EnvValue::parse_env` / `invalid_env_value` in `env_config`.
+fn invalid_pool_value(key: &str, raw: &str, expected: &str) -> String {
+    if crate::secrets::is_external_secret_key(key) {
+        return format!(
+            "Invalid {key} value {}. Expected {expected}",
+            crate::secrets::EXTERNAL_SECRET_PLACEHOLDER
+        );
+    }
+    format!("Invalid {key} value '{raw}'. Expected {expected}")
+}
+
+fn parse_pool_int<T: std::str::FromStr>(key: &str, raw: &str, expected: &str) -> Result<T, String> {
+    raw.trim()
+        .parse::<T>()
+        .map_err(|_| invalid_pool_value(key, raw, expected))
+}
+
+fn parse_pool_bool(key: &str, raw: &str) -> Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(invalid_pool_value(key, raw, "true, false, 1, or 0")),
+    }
+}
+
+fn optional_int<T: std::str::FromStr>(
+    conf: &ConfFile,
+    key: &str,
+    expected: &str,
+) -> Result<Option<T>, String> {
+    match resolve_pool_var(conf, key) {
+        Some(raw) => Ok(Some(parse_pool_int(key, &raw, expected)?)),
+        None => Ok(None),
+    }
+}
+
+fn optional_bool(conf: &ConfFile, key: &str) -> Result<Option<bool>, String> {
+    match resolve_pool_var(conf, key) {
+        Some(raw) => Ok(Some(parse_pool_bool(key, &raw)?)),
+        None => Ok(None),
+    }
+}
+
+fn range_err(
+    key: &str,
+    value: impl std::fmt::Display,
+    min: impl std::fmt::Display,
+    max: impl std::fmt::Display,
+) -> String {
+    format!("{key} must be between {min} and {max} (got {value})")
+}
+
+fn min_err(key: &str, value: impl std::fmt::Display, min: impl std::fmt::Display) -> String {
+    format!("{key} must be at least {min} (got {value})")
+}
+
 impl PoolConfig {
-    /// Create pool configuration from environment variables/ferrum.conf with defaults.
-    pub fn from_env() -> Self {
+    /// Create pool configuration from environment variables/`ferrum.conf`.
+    ///
+    /// Malformed numbers, malformed booleans, and out-of-range values are
+    /// errors that name the variable. This is the same parser `EnvConfig`
+    /// runs so `ferrum-edge validate` and `run` both refuse bad pool settings
+    /// (issue #4428).
+    pub fn from_env() -> Result<Self, String> {
+        let conf = ConfFile::load()?;
+        Self::from_env_with_conf(&conf)
+    }
+
+    /// Parse pool settings from process env overlaid on `conf`.
+    ///
+    /// Unset keys keep [`Self::default`]. A present value must parse and, for
+    /// ranged settings, fall inside the documented bounds.
+    pub fn from_env_with_conf(conf: &ConfFile) -> Result<Self, String> {
         let mut config = Self::default();
         // Track explicit operator intent separately from the shipped default so
         // we never treat "value happens to equal the default" as an override.
         let mut window_explicit = false;
         let mut adaptive_explicit = false;
 
-        // Read through `resolve_ferrum_var()` so values in ferrum.conf are
-        // honored anywhere the pool config is created outside EnvConfig.
-        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_MAX_IDLE_PER_HOST")
-            && let Ok(parsed) = val.parse::<usize>()
-        {
+        if let Some(parsed) = optional_int::<usize>(
+            conf,
+            "FERRUM_POOL_MAX_IDLE_PER_HOST",
+            "a valid usize integer",
+        )? {
+            if !(MIN_IDLE_PER_HOST..=MAX_IDLE_PER_HOST).contains(&parsed) {
+                return Err(range_err(
+                    "FERRUM_POOL_MAX_IDLE_PER_HOST",
+                    parsed,
+                    MIN_IDLE_PER_HOST,
+                    MAX_IDLE_PER_HOST,
+                ));
+            }
             config.max_idle_per_host = parsed;
         }
 
-        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_IDLE_TIMEOUT_SECONDS")
-            && let Ok(parsed) = val.parse::<u64>()
-        {
+        if let Some(parsed) = optional_int::<u64>(
+            conf,
+            "FERRUM_POOL_IDLE_TIMEOUT_SECONDS",
+            "a valid u64 integer",
+        )? {
             config.idle_timeout_seconds = parsed;
         }
 
-        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE") {
-            config.enable_http_keep_alive = val.parse::<bool>().unwrap_or(true);
+        if let Some(parsed) = optional_bool(conf, "FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE")? {
+            config.enable_http_keep_alive = parsed;
         }
 
-        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_ENABLE_HTTP2") {
-            config.enable_http2 = val.parse::<bool>().unwrap_or(true);
+        if let Some(parsed) = optional_bool(conf, "FERRUM_POOL_ENABLE_HTTP2")? {
+            config.enable_http2 = parsed;
         }
 
-        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST")
-            && let Ok(parsed) = val.parse::<usize>()
-        {
-            config.http2_connections_per_host = parsed.max(1);
+        if let Some(parsed) = optional_int::<usize>(
+            conf,
+            "FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST",
+            "a valid usize integer",
+        )? {
+            if parsed == 0 {
+                return Err(min_err(
+                    "FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST",
+                    parsed,
+                    1usize,
+                ));
+            }
+            config.http2_connections_per_host = parsed;
         }
 
-        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_TCP_KEEPALIVE_SECONDS")
-            && let Ok(parsed) = val.parse::<u64>()
-        {
+        if let Some(parsed) = optional_int::<u64>(
+            conf,
+            "FERRUM_POOL_TCP_KEEPALIVE_SECONDS",
+            "a valid u64 integer",
+        )? {
             config.tcp_keepalive_seconds = parsed;
         }
 
-        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS")
-            && let Ok(parsed) = val.parse::<u64>()
-        {
+        if let Some(parsed) = optional_int::<u64>(
+            conf,
+            "FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS",
+            "a valid u64 integer",
+        )? {
             config.http2_keep_alive_interval_seconds = parsed;
         }
 
-        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS")
-            && let Ok(parsed) = val.parse::<u64>()
-        {
+        if let Some(parsed) = optional_int::<u64>(
+            conf,
+            "FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS",
+            "a valid u64 integer",
+        )? {
             config.http2_keep_alive_timeout_seconds = parsed;
         }
 
-        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE")
-            && let Ok(parsed) = val.parse::<u32>()
-        {
-            config.http2_initial_stream_window_size =
-                parsed.clamp(MIN_HTTP2_WINDOW_SIZE, MAX_HTTP2_WINDOW_SIZE);
-            window_explicit = true;
-        }
-
-        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE")
-            && let Ok(parsed) = val.parse::<u32>()
-        {
-            config.http2_initial_connection_window_size =
-                parsed.clamp(MIN_HTTP2_WINDOW_SIZE, MAX_HTTP2_WINDOW_SIZE);
-            window_explicit = true;
-        }
-
-        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW") {
-            match val.parse::<bool>() {
-                Ok(parsed) => {
-                    config.http2_adaptive_window = parsed;
-                    adaptive_explicit = true;
-                }
-                Err(_) => tracing::warn!(
-                    value = %val,
-                    "invalid FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW; expected true or false - \
-                     keeping the resolved default"
-                ),
+        if let Some(parsed) = optional_int::<u32>(
+            conf,
+            "FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE",
+            "a valid u32 integer",
+        )? {
+            if !(MIN_HTTP2_WINDOW_SIZE..=MAX_HTTP2_WINDOW_SIZE).contains(&parsed) {
+                return Err(range_err(
+                    "FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE",
+                    parsed,
+                    MIN_HTTP2_WINDOW_SIZE,
+                    MAX_HTTP2_WINDOW_SIZE,
+                ));
             }
+            config.http2_initial_stream_window_size = parsed;
+            window_explicit = true;
         }
 
-        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_MAX_FRAME_SIZE")
-            && let Ok(parsed) = val.parse::<u32>()
-        {
-            config.http2_max_frame_size =
-                parsed.clamp(MIN_HTTP2_MAX_FRAME_SIZE, MAX_HTTP2_MAX_FRAME_SIZE);
+        if let Some(parsed) = optional_int::<u32>(
+            conf,
+            "FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE",
+            "a valid u32 integer",
+        )? {
+            if !(MIN_HTTP2_WINDOW_SIZE..=MAX_HTTP2_WINDOW_SIZE).contains(&parsed) {
+                return Err(range_err(
+                    "FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE",
+                    parsed,
+                    MIN_HTTP2_WINDOW_SIZE,
+                    MAX_HTTP2_WINDOW_SIZE,
+                ));
+            }
+            config.http2_initial_connection_window_size = parsed;
+            window_explicit = true;
         }
 
-        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS")
-            && let Ok(parsed) = val.parse::<u32>()
-        {
-            config.http2_max_concurrent_streams = Some(parsed.max(1));
+        if let Some(parsed) = optional_bool(conf, "FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW")? {
+            config.http2_adaptive_window = parsed;
+            adaptive_explicit = true;
+        }
+
+        if let Some(parsed) = optional_int::<u32>(
+            conf,
+            "FERRUM_POOL_HTTP2_MAX_FRAME_SIZE",
+            "a valid u32 integer",
+        )? {
+            if !(MIN_HTTP2_MAX_FRAME_SIZE..=MAX_HTTP2_MAX_FRAME_SIZE).contains(&parsed) {
+                return Err(range_err(
+                    "FERRUM_POOL_HTTP2_MAX_FRAME_SIZE",
+                    parsed,
+                    MIN_HTTP2_MAX_FRAME_SIZE,
+                    MAX_HTTP2_MAX_FRAME_SIZE,
+                ));
+            }
+            config.http2_max_frame_size = parsed;
+        }
+
+        if let Some(parsed) = optional_int::<u32>(
+            conf,
+            "FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS",
+            "a valid u32 integer",
+        )? {
+            if parsed == 0 {
+                return Err(min_err(
+                    "FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS",
+                    parsed,
+                    1u32,
+                ));
+            }
+            config.http2_max_concurrent_streams = Some(parsed);
         }
 
         config.apply_adaptive_window_precedence(
@@ -216,7 +346,8 @@ impl PoolConfig {
             true,
         );
 
-        // Validate HTTP/2 timeout is reasonable compared to HTTP read timeout
+        // Advisory only: any valid u64 is accepted. Sub-10s is unusually low
+        // next to the HTTP read timeout, but it is a deliberate operator value.
         if config.http2_keep_alive_timeout_seconds < 10 {
             tracing::warn!(
                 "HTTP/2 keep-alive timeout ({}s) is very low, consider increasing to 30-45s",
@@ -224,11 +355,7 @@ impl PoolConfig {
             );
         }
 
-        // Validate and clamp max_idle_per_host
-        config.max_idle_per_host =
-            Self::validate_max_idle_per_host(config.max_idle_per_host, "global");
-
-        config
+        Ok(config)
     }
 
     /// Apply proxy-level overrides to this global configuration
@@ -456,6 +583,10 @@ impl PoolConfig {
 
     /// Validate and clamp `max_idle_per_host` to the allowed range, logging
     /// a warning when the value is adjusted.
+    ///
+    /// Global env/`ferrum.conf` parsing ([`Self::from_env_with_conf`]) rejects
+    /// out-of-range values instead of clamping. This helper remains for
+    /// non-env call sites that still want a defensive clamp.
     pub fn validate_max_idle_per_host(value: usize, source: &str) -> usize {
         if value < MIN_IDLE_PER_HOST {
             tracing::warn!(

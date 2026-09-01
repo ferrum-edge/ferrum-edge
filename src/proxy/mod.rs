@@ -9075,8 +9075,11 @@ impl ProxyState {
             None
         };
         warn_if_websocket_idle_disabled(&config, env_config.websocket_idle_timeout_seconds);
-        // Create connection pools with global configuration from environment
-        let global_pool_config = PoolConfig::from_env();
+        // Create connection pools with global configuration from environment.
+        // `EnvConfig::from_env` already ran this parser, so a failure here is
+        // a hand-built `EnvConfig` or a raced env change; either way refuse
+        // to start rather than silently substituting defaults (issue #4428).
+        let global_pool_config = PoolConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
         let tls_policy_arc = tls_policy.map(Arc::new);
         warn_if_h3_backend_tls_policy_incompatible(&config, tls_policy_arc.as_deref());
         let crls = crate::tls::load_crls(env_config.tls_crl_file_path.as_deref())?;

@@ -438,6 +438,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   action**: retarget alerts and dashboards that keyed opaque-TLS SNI
   scanner/plaintext/slow-hello noise on `connection_refused` or
   `backend_error` to `dispatch_policy_rejected` / `gateway_policy`.
+- **BREAKING — malformed or out-of-range `FERRUM_POOL_*` settings refuse to start**
+  (issue #4428). `PoolConfig::from_env()` used to ignore failed numeric parses,
+  treat two boolean parse failures as `true`, and silently clamp several
+  out-of-range values, so `ferrum-edge validate` and `run` could not report the
+  mistake. Parsing now uses the same `EnvValue` rules as `EnvConfig`
+  (`Invalid FERRUM_* value '…'. Expected …`) and range errors name the
+  variable and the offending value. `validate` and `run` both fail closed.
+  Per-proxy YAML pool fields and pool-key composition are unchanged.
+  **Operator action**: fix typos (`flase` → `false`) and out-of-range values
+  before upgrade; `ferrum-edge validate` now exits non-zero on them. Accepted
+  booleans are `true`/`false`/`1`/`0` (case-insensitive). Ranges: idle per
+  host 4–1024; H2 connections per host ≥ 1; H2 concurrent streams ≥ 1;
+  stream/connection windows 65535–134217728; max frame 16384–1048576.
+  Unconstrained timers (`IDLE_TIMEOUT`, `TCP_KEEPALIVE`, H2 keep-alive
+  interval/timeout) accept any `u64`; a keep-alive timeout below 10s still
+  warns. `FERRUM_POOL_ENABLE_HTTP2=0` / `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=0`
+  now mean `false` instead of silently remaining `true`.
 
 - **BREAKING — injected Ferrum is a Kubernetes native sidecar**
   (issue #4430). The webhook now emits `ferrum-edge` under `spec.initContainers`

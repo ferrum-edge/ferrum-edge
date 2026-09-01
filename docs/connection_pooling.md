@@ -49,18 +49,18 @@ proxies:
 
 | Setting | Global Default | Description |
 |---------|----------------|-------------|
-| `FERRUM_POOL_MAX_IDLE_PER_HOST` | `64` | Maximum idle connections per backend host (min: 4, max: 1024) |
-| `FERRUM_POOL_IDLE_TIMEOUT_SECONDS` | `90` | Seconds before idle connections are closed |
-| `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE` | `true` | Enable HTTP keep-alive for connection reuse |
-| `FERRUM_POOL_ENABLE_HTTP2` | `true` | Enable HTTP/2 multiplexing when supported |
-| `FERRUM_POOL_TCP_KEEPALIVE_SECONDS` | `60` | TCP keep-alive interval in seconds |
-| `FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS` | `30` | HTTP/2 keep-alive ping interval in seconds |
-| `FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS` | `45` | HTTP/2 keep-alive timeout in seconds |
-| `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` | `8388608` | Backend HTTP/2 per-stream flow-control window (bytes). Default: 8 MiB. Inert while adaptive windowing remains enabled |
-| `FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE` | `33554432` | Backend HTTP/2 connection-level flow-control window (bytes). Default: 32 MiB. Inert while adaptive windowing remains enabled |
-| `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` | `true` | Enable adaptive flow-control (BDP probing). Overrides fixed initial windows while enabled. Explicit window overrides auto-disable adaptive unless adaptive is also set explicitly |
-| `FERRUM_POOL_HTTP2_MAX_FRAME_SIZE` | `1048576` | Maximum backend HTTP/2 frame payload (bytes). Range: 16384–1048576. Default: 1 MiB |
-| `FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS` | `1000` | Max concurrent HTTP/2 streams per backend connection |
+| `FERRUM_POOL_MAX_IDLE_PER_HOST` | `64` | Maximum idle connections per backend host. Must be between 4 and 1024 |
+| `FERRUM_POOL_IDLE_TIMEOUT_SECONDS` | `90` | Seconds before idle connections are closed. Any `u64`, including `0` |
+| `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE` | `true` | Enable HTTP keep-alive for connection reuse. Accepted: `true`/`false`/`1`/`0` |
+| `FERRUM_POOL_ENABLE_HTTP2` | `true` | Enable HTTP/2 multiplexing when supported. Accepted: `true`/`false`/`1`/`0` |
+| `FERRUM_POOL_TCP_KEEPALIVE_SECONDS` | `60` | TCP keep-alive interval in seconds. Any `u64`, including `0` |
+| `FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS` | `30` | HTTP/2 keep-alive ping interval in seconds. Any `u64`, including `0` |
+| `FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS` | `45` | HTTP/2 keep-alive timeout in seconds. Any `u64`, including `0`; values below 10 warn |
+| `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` | `8388608` | Backend HTTP/2 per-stream flow-control window (bytes). Default: 8 MiB. Must be between 65535 and 134217728 (128 MiB). Inert while adaptive windowing remains enabled |
+| `FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE` | `33554432` | Backend HTTP/2 connection-level flow-control window (bytes). Default: 32 MiB. Must be between 65535 and 134217728 (128 MiB). Inert while adaptive windowing remains enabled |
+| `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` | `true` | Enable adaptive flow-control (BDP probing). Overrides fixed initial windows while enabled. Explicit window overrides auto-disable adaptive unless adaptive is also set explicitly. Accepted: `true`/`false`/`1`/`0` |
+| `FERRUM_POOL_HTTP2_MAX_FRAME_SIZE` | `1048576` | Maximum backend HTTP/2 frame payload (bytes). Must be between 16384 and 1048576. Default: 1 MiB |
+| `FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS` | `1000` | Max concurrent HTTP/2 streams per backend connection. When set, must be ≥ 1 |
 
 > **Frontend vs backend HTTP/2 windows**: the `FERRUM_POOL_HTTP2_*` settings above control the **backend** (gateway-to-upstream) connection pool. The **frontend** (client-to-gateway) HTTP/2 listener uses separate, conservative defaults: `FERRUM_FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE` (256 KiB), `FERRUM_FRONTEND_H2_INITIAL_CONNECTION_WINDOW_SIZE` (2 MiB), `FERRUM_FRONTEND_H2_MAX_FRAME_SIZE` (16 KiB). Raise the frontend values for benchmarking or trusted-network deployments. See [configuration.md](configuration.md) for the full reference.
 
@@ -68,7 +68,7 @@ proxies:
 
 This is the single most important pool setting for performance and reliability. It controls how many idle backend connections are kept alive per host.
 
-**Safety bounds:** Minimum **4**, maximum **1024**. Values outside this range are clamped with a warning.
+**Safety bounds:** Minimum **4**, maximum **1024**. Values outside this range refuse to start (`ferrum-edge validate` and `run` both fail).
 
 ### Recommended Values by Workload
 

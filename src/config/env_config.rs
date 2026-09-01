@@ -4570,6 +4570,17 @@ impl EnvConfig {
             pool_warmup_enabled: bool = "FERRUM_POOL_WARMUP_ENABLED" => true;
             pool_warmup_concurrency: usize = "FERRUM_POOL_WARMUP_CONCURRENCY" => 500usize, max(1usize);
             pool_cleanup_interval_seconds: u64 = "FERRUM_POOL_CLEANUP_INTERVAL_SECONDS" => 30u64;
+        }
+
+        // Connection-pool sizes share EnvConfig parse/error semantics so
+        // `ferrum-edge validate` and `run` both refuse malformed values
+        // (issue #4428). ProxyState construction re-reads via
+        // `PoolConfig::from_env` using the same parser.
+        crate::config::PoolConfig::from_env_with_conf(conf)?;
+
+        env_config! {
+            conf = conf, mode = &mode;
+            [tls_continued]
             backend_capability_refresh_interval_secs: u64 = "FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS" => 86_400u64;
             router_cache_max_entries: usize = "FERRUM_ROUTER_CACHE_MAX_ENTRIES" => 0usize;
             tcp_idle_timeout_seconds: u64 = "FERRUM_TCP_IDLE_TIMEOUT_SECONDS" => 300u64;
