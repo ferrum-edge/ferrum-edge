@@ -1150,22 +1150,28 @@ pub async fn start_http3_listener_with_signal(
                         }
                         let state = Arc::clone(&state);
                         let adopted_quic = Arc::clone(&adopted_quic);
+                        let conn_shutdown = shutdown_rx.clone();
                         tokio::spawn(async move {
-                            let _conn_guard =
-                                crate::overload::ConnectionGuard::new(&state.overload);
-                            if let Err(e) = handle_h3_connection(
-                                connecting,
-                                state,
-                                handshake_timeout,
-                                frontend_listen_port,
-                                frontend_destination_ip,
-                                client_auth_configured,
-                                adopted_quic,
-                            )
-                            .await
-                            {
-                                debug!("HTTP/3 connection error: {}", e);
-                            }
+                            // Exactly one ConnectionGuard per spawned Incoming.
+                            // `handle_h3_connection` never constructs another, so
+                            // handshake refuse, handshake timeout, GOAWAY drain,
+                            // peer reset, and deadline `endpoint.close` all
+                            // release the counter once through this Drop.
+                            let overload = Arc::clone(&state.overload);
+                            run_h3_connection_with_guard(overload, async move {
+                                handle_h3_connection(
+                                    connecting,
+                                    state,
+                                    handshake_timeout,
+                                    frontend_listen_port,
+                                    frontend_destination_ip,
+                                    client_auth_configured,
+                                    adopted_quic,
+                                    conn_shutdown,
+                                )
+                                .await
+                            })
+                            .await;
                         });
                     }
                     None => {
@@ -1358,7 +1364,10 @@ pub async fn start_http3_listener_with_signal(
     // Finally, close any remaining connections cleanly. wait_idle() lets
     // peers receive the CONNECTION_CLOSE frame before the socket is
     // dropped — without it some clients see a transport-layer abort.
-    endpoint.close(quinn::VarInt::from_u32(0), b"shutdown");
+    endpoint.close(
+        quinn::VarInt::from_u32(H3_NO_ERROR_CLOSE_CODE),
+        H3_NO_ERROR_CLOSE_REASON,
+    );
     endpoint.wait_idle().await;
 
     Ok(())
@@ -1428,6 +1437,13 @@ pub(crate) fn h3_client_identity(addr: SocketAddr) -> (SocketAddr, Arc<str>) {
 const H3_TRUST_WITHDRAWN_ERROR_CODE: u32 = 0x010B;
 const H3_TRUST_WITHDRAWN_REASON: &[u8] = b"client certificate trust withdrawn";
 
+/// RFC 9114 §8.1 `H3_NO_ERROR` (0x0100). Used as the QUIC application close
+/// code after HTTP/3 graceful drain completes or the drain deadline expires
+/// (issue #4429). Code `0` is not an HTTP/3 no-error; it is a QUIC transport
+/// close that resets remaining streams rather than completing GOAWAY.
+pub(crate) const H3_NO_ERROR_CLOSE_CODE: u32 = 0x0100;
+pub(crate) const H3_NO_ERROR_CLOSE_REASON: &[u8] = b"shutdown";
+
 /// Terminate a QUIC connection whose client-certificate trust was withdrawn.
 ///
 /// `Connection::close` is quinn's ordinary application close: it emits a single
@@ -1445,6 +1461,105 @@ fn close_h3_connection_for_trust_withdrawal(connection: &quinn::Connection, peer
         peer = %peer,
         "Retiring established HTTP/3 connection: frontend client-certificate trust was withdrawn"
     );
+}
+
+/// Hold exactly one [`crate::overload::ConnectionGuard`] for the lifetime of
+/// an H3 connection task (issue #4429).
+///
+/// The accept-loop spawn is the only constructor. Handshake refuse, handshake
+/// timeout, GOAWAY drain, peer reset, and deadline force-close all return
+/// through here so the overload counter cannot double-decrement or leak.
+pub(crate) async fn run_h3_connection_with_guard<F>(
+    overload: Arc<crate::overload::OverloadState>,
+    fut: F,
+) where
+    F: std::future::Future<Output = Result<(), anyhow::Error>>,
+{
+    let _conn_guard = crate::overload::ConnectionGuard::new(&overload);
+    if let Err(e) = fut.await {
+        debug!("HTTP/3 connection error: {}", e);
+    }
+}
+
+/// Complete a 1-RTT QUIC handshake, aborting if process shutdown arrives
+/// before TLS finishes (issue #4429). Dropping `connecting` cancels the
+/// handshake; the spawn wrapper's ConnectionGuard still drops exactly once.
+async fn complete_h3_handshake(
+    connecting: quinn::Connecting,
+    handshake_timeout: Duration,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<quinn::Connection, anyhow::Error> {
+    if *shutdown_rx.borrow() {
+        return Err(anyhow::anyhow!(
+            "HTTP/3 handshake cancelled: gateway is draining"
+        ));
+    }
+    tokio::select! {
+        biased;
+        result = await_with_optional_timeout(
+            connecting,
+            handshake_timeout,
+        ) => {
+            match result {
+                Ok(Ok(connection)) => Ok(connection),
+                Ok(Err(error)) => Err(error.into()),
+                Err(_elapsed) => {
+                    warn!(
+                        "HTTP/3 handshake timed out after {:?}",
+                        handshake_timeout
+                    );
+                    Err(anyhow::anyhow!(
+                        "HTTP/3 handshake timed out after {:?}",
+                        handshake_timeout
+                    ))
+                }
+            }
+        }
+        _ = shutdown_rx.changed() => Err(anyhow::anyhow!(
+            "HTTP/3 handshake cancelled: gateway is draining"
+        )),
+    }
+}
+
+/// Send HTTP/3 GOAWAY with `max_requests = 0` so the peer stops opening new
+/// streams while already-accepted streams remain eligible to finish.
+///
+/// The vendored API (`h3::server::Connection::shutdown`) writes GOAWAY with
+/// `max_id = last_accepted_stream` (or the first request stream id when none
+/// have been accepted). Subsequent `accept()` calls reject newer streams with
+/// `H3_REQUEST_REJECTED`.
+///
+/// `accept()` yields `Ok(None)` — ending this connection task early — only
+/// once in-flight streams have completed **and** the peer has either sent its
+/// own GOAWAY or tried to open a stream past `max_id`. A peer that goes idle
+/// after receiving GOAWAY leaves `accept()` pending: the vendored
+/// `poll_accept_request_stream_internal` gates its `Ok(None)` on
+/// `recv_closing` (the peer's GOAWAY), not on `sent_closing` (ours). That case
+/// is terminated by the listener's `FERRUM_SHUTDOWN_DRAIN_SECONDS` deadline,
+/// which force-closes the endpoint with `H3_NO_ERROR` — so idle-after-GOAWAY
+/// connections are bounded, not leaked, but they do consume the full drain
+/// budget and log the `HTTP/3 drain timeout` warning.
+async fn send_h3_goaway(
+    h3_conn: &mut h3::server::Connection<h3_quinn::Connection, Bytes>,
+    peer: SocketAddr,
+) -> bool {
+    match h3_conn.shutdown(0).await {
+        Ok(()) => {
+            debug!(
+                peer = %peer,
+                "HTTP/3 GOAWAY sent; refusing new request streams"
+            );
+            true
+        }
+        Err(error) => {
+            warn!(
+                peer = %peer,
+                error = %error,
+                "HTTP/3 GOAWAY failed; closing connection"
+            );
+            false
+        }
+    }
 }
 
 /// Bind an HTTP/3 Incoming to the endpoint config stored before this scope's
@@ -1484,6 +1599,7 @@ async fn handle_h3_connection(
     frontend_destination_ip: Option<std::net::IpAddr>,
     client_auth_configured: bool,
     adopted_quic: Arc<arc_swap::ArcSwap<Option<Arc<quinn::ServerConfig>>>>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), anyhow::Error> {
     // 0-RTT is opt-in via `FERRUM_TLS_EARLY_DATA_METHODS` *and* is refused
     // outright when this listener does frontend client-certificate
@@ -1492,6 +1608,14 @@ async fn handle_h3_connection(
     // disables client early data for the same listener posture.
     let early_data_enabled =
         zero_rtt_admitted(!state.early_data_methods.is_empty(), client_auth_configured);
+
+    // The listener already stopped accepting, but this Incoming was queued
+    // before `set_server_config(None)`. Refuse it so a mid-handshake drain
+    // cannot occupy a connection slot, and so ConnectionGuard drops once.
+    if *shutdown_rx.borrow() {
+        connecting.refuse();
+        return Ok(());
+    }
 
     // Issue #3857. Capture the H3 client-trust generation BEFORE
     // `Incoming::accept_with`. quinn binds the `ServerConfig` — and therefore
@@ -1585,16 +1709,7 @@ async fn handle_h3_connection(
             }
             Err(connecting) => {
                 // No 0-RTT — fall back to full handshake.
-                match await_with_optional_timeout(connecting, handshake_timeout).await {
-                    Ok(result) => result?,
-                    Err(_elapsed) => {
-                        warn!("HTTP/3 handshake timed out after {:?}", handshake_timeout);
-                        return Err(anyhow::anyhow!(
-                            "HTTP/3 handshake timed out after {:?}",
-                            handshake_timeout
-                        ));
-                    }
-                }
+                complete_h3_handshake(connecting, handshake_timeout, &mut shutdown_rx).await?
             }
         }
     } else {
@@ -1607,16 +1722,7 @@ async fn handle_h3_connection(
                 "HTTP/3 listener was disabled before the queued handshake was admitted"
             ));
         };
-        match await_with_optional_timeout(connecting, handshake_timeout).await {
-            Ok(result) => result?,
-            Err(_elapsed) => {
-                warn!("HTTP/3 handshake timed out after {:?}", handshake_timeout);
-                return Err(anyhow::anyhow!(
-                    "HTTP/3 handshake timed out after {:?}",
-                    handshake_timeout
-                ));
-            }
-        }
+        complete_h3_handshake(connecting, handshake_timeout, &mut shutdown_rx).await?
     };
 
     let remote_addr = connection.remote_address();
@@ -1764,6 +1870,18 @@ async fn handle_h3_connection(
     let mut cached_addr = quinn_conn.remote_address();
     let (mut canonical_peer, mut socket_ip) = h3_client_identity(cached_addr);
 
+    // If shutdown already fired during handshake, send GOAWAY before the
+    // first accept so the peer sees it even when no request stream is
+    // pending. Keep polling `accept()` afterwards so in-flight streams
+    // (gRPC trailers, RFC 9220 WebSocket, CONNECT-UDP) can finish.
+    let mut h3_goaway_sent = false;
+    if *shutdown_rx.borrow() {
+        if !send_h3_goaway(&mut h3_conn, canonical_peer).await {
+            return Ok(());
+        }
+        h3_goaway_sent = true;
+    }
+
     loop {
         // A QUIC early-data request and the TLS Connected event can become
         // ready in the same scheduler turn. Poll request acceptance first so a
@@ -1776,13 +1894,19 @@ async fn handle_h3_connection(
         // down promptly instead of only when its next stream happens to arrive,
         // and the stream-admission check below closes the remaining window where
         // a stream was already ready when the withdrawal landed.
-        let (accepted, handshake_succeeded) =
+        // Issue #4429: process shutdown sends HTTP/3 GOAWAY (`shutdown(0)`) and
+        // keeps this loop running until `accept()` returns `Ok(None)` so
+        // already-accepted streams finish. Dropping `h3_conn` here would close
+        // with H3_NO_ERROR immediately and truncate in-flight work.
+        let (accepted, handshake_succeeded, send_goaway) =
             if let Some(completion_rx) = handshake_completion_rx.as_mut() {
                 tokio::select! {
                     biased;
-                    accepted = h3_conn.accept() => (Some(accepted), None),
+                    accepted = h3_conn.accept() => {
+                        (Some(accepted), None, false)
+                    }
                     completed = completion_rx => {
-                        (None, Some(completed.unwrap_or_default()))
+                        (None, Some(completed.unwrap_or_default()), false)
                     }
                     _ = async {
                         match client_trust_session.as_ref() {
@@ -1790,25 +1914,47 @@ async fn handle_h3_connection(
                             None => std::future::pending().await,
                         }
                     } => {
-                        close_h3_connection_for_trust_withdrawal(&quinn_conn, canonical_peer);
+                        close_h3_connection_for_trust_withdrawal(
+                            &quinn_conn,
+                            canonical_peer,
+                        );
                         break;
+                    }
+                    _ = shutdown_rx.changed(), if !h3_goaway_sent => {
+                        (None, None, true)
                     }
                 }
             } else {
                 tokio::select! {
                     biased;
-                    accepted = h3_conn.accept() => (Some(accepted), None),
+                    accepted = h3_conn.accept() => {
+                        (Some(accepted), None, false)
+                    }
                     _ = async {
                         match client_trust_session.as_ref() {
                             Some(session) => session.retired().await,
                             None => std::future::pending().await,
                         }
                     } => {
-                        close_h3_connection_for_trust_withdrawal(&quinn_conn, canonical_peer);
+                        close_h3_connection_for_trust_withdrawal(
+                            &quinn_conn,
+                            canonical_peer,
+                        );
                         break;
+                    }
+                    _ = shutdown_rx.changed(), if !h3_goaway_sent => {
+                        (None, None, true)
                     }
                 }
             };
+
+        if send_goaway {
+            if send_h3_goaway(&mut h3_conn, canonical_peer).await {
+                h3_goaway_sent = true;
+                continue;
+            }
+            break;
+        }
 
         if let Some(handshake_succeeded) = handshake_succeeded {
             handshake_completion_rx = None;
@@ -1876,6 +2022,7 @@ async fn handle_h3_connection(
                 let is_early_data = identity.is_early_data;
                 let peer_connection = peer_connection.clone();
                 let stream_client_trust = client_trust_session.clone();
+                let stream_shutdown = shutdown_rx.clone();
                 tokio::spawn(async move {
                     match resolver.resolve_request().await {
                         Ok((req, stream)) => {
@@ -1895,6 +2042,7 @@ async fn handle_h3_connection(
                                 is_early_data,
                                 peer_connection,
                                 stream_client_trust,
+                                stream_shutdown,
                             )
                             .await
                             {
@@ -1988,6 +2136,7 @@ async fn handle_h3_request(
     is_early_data: bool,
     peer_connection: crate::plugins::PeerConnectionSignal,
     client_trust_session: Option<crate::tls::ClientTrustSession>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), anyhow::Error> {
     let start_time = std::time::Instant::now();
 
@@ -2227,6 +2376,13 @@ async fn handle_h3_request(
     // outlives this request, terminates when the connection's client-certificate
     // trust decision is withdrawn.
     ctx.client_trust_session = client_trust_session;
+    // Process shutdown watch (issue #4429): H1/H2 pass this so RFC 8441
+    // WebSockets send Close 1001 on drain. H3 WebSocket (RFC 9220) uses the
+    // same `wait_for_websocket_session_stop` arbiter, so the connection's
+    // cloned receiver must travel with the request. CONNECT-UDP observes
+    // drain through `OverloadState` after the listener returns; already
+    // accepted tunnels keep relaying until GOAWAY drain or deadline close.
+    ctx.websocket_shutdown_rx = Some(shutdown_rx);
     // Lets deliberately parked work (injected fault delays) observe QUIC
     // connection close instead of holding this stream, its `RequestGuard`, and
     // its plugin snapshot until the timer expires.

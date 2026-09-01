@@ -1532,11 +1532,20 @@ impl PluginHttpClient {
         result
     }
 
+    /// Safe-method transport retry list. Independent of
+    /// [`crate::retry::request_reached_wire`]: GET/HEAD/OPTIONS may
+    /// replay some post-wire classes (`ConnectionReset`,
+    /// `ConnectionClosed`, …). `ConnectionPoolError` is pre-wire
+    /// (`request_reached_wire` is false) and must be here: hyper
+    /// `is_canceled` (issue #3578 / #4406) lands on this class, and a
+    /// dropped connection before dispatch is the same transient as the
+    /// `ConnectionReset` this list already retried.
     fn is_retryable_transport_error(error: &reqwest::Error) -> bool {
         matches!(
             classify_reqwest_error(error),
             ErrorClass::ConnectionTimeout
                 | ErrorClass::ConnectionRefused
+                | ErrorClass::ConnectionPoolError
                 | ErrorClass::ReadWriteTimeout
                 | ErrorClass::ConnectionReset
                 | ErrorClass::ConnectionClosed

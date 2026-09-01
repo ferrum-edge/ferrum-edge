@@ -1178,6 +1178,47 @@ impl Http3ConnectionStream {
             .map_err(|e| format!("send_data: {e}"))?;
         Ok(())
     }
+
+    /// Await response headers on this multiplexed stream.
+    pub async fn recv_response(
+        &mut self,
+    ) -> Result<(StatusCode, HeaderMap), Box<dyn std::error::Error + Send + Sync>> {
+        let resp = tokio::time::timeout(Duration::from_secs(30), self.stream.recv_response())
+            .await
+            .map_err(|_| "recv_response timed out")?
+            .map_err(|e| format!("recv_response: {e}"))?;
+        Ok((resp.status(), resp.headers().clone()))
+    }
+
+    /// Receive the next response DATA chunk without draining to EOF.
+    pub async fn recv_data(
+        &mut self,
+    ) -> Result<Option<Bytes>, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(mut chunk) =
+            tokio::time::timeout(Duration::from_secs(30), self.stream.recv_data())
+                .await
+                .map_err(|_| "recv_data timed out")?
+                .map_err(|e| format!("recv_data: {e}"))?
+        else {
+            return Ok(None);
+        };
+        let mut data = Vec::new();
+        while chunk.has_remaining() {
+            let take = chunk.chunk().to_vec();
+            data.extend_from_slice(&take);
+            chunk.advance(take.len());
+        }
+        Ok(Some(Bytes::from(data)))
+    }
+
+    /// Drain remaining DATA frames into one buffer.
+    pub async fn recv_body(&mut self) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
+        let mut body = Vec::new();
+        while let Some(chunk) = self.recv_data().await? {
+            body.extend_from_slice(&chunk);
+        }
+        Ok(Bytes::from(body))
+    }
 }
 
 /// A client-driven plain HTTP/3 response stream for slow-client and disconnect
@@ -1239,12 +1280,10 @@ impl Http3ResponseStream {
     /// Drain remaining DATA frames to EOF.
     pub async fn drain_body(&mut self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let mut total = 0usize;
-        loop {
-            match self.recv_data().await? {
-                Some(chunk) => total = total.saturating_add(chunk.len()),
-                None => return Ok(total),
-            }
+        while let Some(chunk) = self.recv_data().await? {
+            total = total.saturating_add(chunk.len());
         }
+        Ok(total)
     }
 }
 

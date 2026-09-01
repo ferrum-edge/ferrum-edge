@@ -1111,3 +1111,74 @@ async fn h3_grpc_streaming_enforces_max_request_size_incrementally() {
         Some("application/grpc")
     );
 }
+
+#[cfg(unix)]
+fn send_sigterm(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .output();
+}
+
+/// Issue #4429: an in-flight H3→gRPC response must deliver DATA and trailers
+/// after SIGTERM GOAWAY rather than truncating before `grpc-status`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+#[cfg(unix)]
+async fn h3_grpc_shutdown_completes_trailers_after_goaway() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let ca = TestCa::new("h3-grpc-drain-be").expect("ca");
+    let (be_cert, be_key) = ca.valid().expect("backend leaf");
+    let _backend = ScriptedGrpcBackend::builder_tls(backend_listener, &be_cert, &be_key)
+        .expect("backend tls")
+        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondMessage(Bytes::from_static(
+            b"before-goaway",
+        )))
+        .step(GrpcStep::Sleep(Duration::from_millis(1500)))
+        .step(GrpcStep::RespondStatus {
+            code: 0,
+            message: "drained-ok",
+        })
+        .spawn()
+        .expect("spawn backend");
+
+    let (harness, https_port) = spawn_h3_grpc_gateway(
+        backend_port,
+        &[("FERRUM_SHUTDOWN_DRAIN_SECONDS", "8".into())],
+    )
+    .await;
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/echo.Echo/Drain");
+    let mut stream = open_grpc_stream_with_retry(&client, &url).await;
+    stream
+        .send_message(b"ping")
+        .await
+        .expect("send grpc message");
+    stream.finish().await.expect("finish");
+
+    let (status, _) = stream.recv_response().await.expect("grpc headers");
+    assert_eq!(status.as_u16(), 200);
+
+    let pid = harness.pid().expect("binary gateway pid");
+    send_sigterm(pid);
+
+    let (body, trailers) = stream
+        .recv_body_and_trailers()
+        .await
+        .expect("gRPC trailers must survive GOAWAY drain");
+    assert!(
+        !body.is_empty(),
+        "in-flight gRPC DATA must not be truncated by drain"
+    );
+    let grpc_status = trailers.get("grpc-status").and_then(|v| v.to_str().ok());
+    assert_eq!(
+        grpc_status,
+        Some("0"),
+        "drain must not drop gRPC trailers, got {trailers:?}"
+    );
+}

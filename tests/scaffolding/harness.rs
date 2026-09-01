@@ -671,6 +671,14 @@ impl GatewayHarness {
         GatewayHarnessBuilder::default()
     }
 
+    /// OS PID of a binary-mode gateway subprocess. In-process mode has none.
+    pub fn pid(&self) -> Option<u32> {
+        match &self.backend {
+            Backend::Binary { gateway } => gateway.pid(),
+            Backend::InProcess(_) => None,
+        }
+    }
+
     /// The gateway's proxy-port base URL (e.g., `http://127.0.0.1:12345`).
     pub fn proxy_base_url(&self) -> &str {
         match &self.backend {

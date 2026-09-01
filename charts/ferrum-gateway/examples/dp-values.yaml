@@ -16,6 +16,13 @@ dp:
   # Single CP (simple) or comma-separated list for multi-CP failover.
   cpGrpcUrls: "http://ferrum-cp-ferrum-gateway-grpc.ferrum.svc:50051"
   # failoverPrimaryRetrySeconds: "300"
+  # Maximum applied-snapshot age while every CP is unreachable
+  # (FERRUM_DP_CONFIG_MAX_STALE_SECONDS). 0 disables the bound (unsafe); ""
+  # omits the env and takes the binary 3600s default.
+  # configMaxStaleSeconds: ""
+  # What happens to new traffic at the bound (FERRUM_DP_CONFIG_STALE_ACTION).
+  # Accepted values: fail_closed (default) or readiness_only. "" omits the env.
+  # configStaleAction: ""
 
 grpc:
   jwtSecret:

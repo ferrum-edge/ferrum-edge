@@ -257,71 +257,66 @@ impl Waf {
         // encoding specials retains the old raw/lossy path and does no new
         // per-request work. Eligibility was already decided before this
         // scanner runs; decoding must never widen the content-type, multipart,
-        // or binary body gates.
-        let utf16_text = self
-            .compiled
-            .request_body_text_rules_active
-            .then(|| normalize::decode_utf16_body(body, content_type))
-            .flatten();
-        let text = utf16_text
-            .as_deref()
-            .map(std::borrow::Cow::Borrowed)
-            .unwrap_or_else(|| String::from_utf8_lossy(body));
-        // The initial bytes scan saw the wire representation. A transcoded
-        // body also needs one scan of its UTF-8 view before layered decoding.
-        if let Some(decoded) = utf16_text.as_deref() {
+        // or binary body gates. UTF-32 is tried first: a UTF-32LE BOM is
+        // `FF FE 00 00` and would otherwise be stolen by the UTF-16LE BOM.
+        // Bare `charset=utf-16` / `utf-32` with no BOM does not invent an
+        // endianness; both endiannesses are decoded and each successful view
+        // is scanned, plus the raw/lossy view. Ordinary UTF-8 still allocates
+        // nothing here.
+        let transcoded_views = if self.compiled.request_body_text_rules_active {
+            normalize::decode_wide_charset_body_views(body, content_type)
+        } else {
+            normalize::WideCharsetViews::empty()
+        };
+        if transcoded_views.is_empty() || transcoded_views.include_lossy() {
+            let text = String::from_utf8_lossy(body);
+            self.scan_request_body_text_view(&mut outcome, text.as_ref(), subject);
+        }
+        for decoded in transcoded_views.iter() {
+            // The initial bytes scan saw the wire representation. A
+            // transcoded body also needs one scan of its UTF-8 view before
+            // layered decoding.
             self.scan_bytes_set(
                 &mut outcome,
                 self.compiled.body_bytes.as_ref(),
                 decoded.as_bytes(),
                 subject,
             );
+            self.scan_request_body_text_view(&mut outcome, decoded, subject);
         }
+        outcome
+    }
+
+    /// Layered decode, encoding specials, Luhn, and CIDR on one body-text view.
+    fn scan_request_body_text_view(
+        &self,
+        outcome: &mut ScanOutcome,
+        text: &str,
+        subject: ScanSubject<'_>,
+    ) {
         // Re-scan decoded forms so payloads hidden behind JSON `\uXXXX`,
         // HTML entities, or percent-encoding cannot evade the raw-byte set.
         // Lossy UTF-8 keeps one hostile byte from disabling text decoding for
         // the rest of an otherwise inspectable body. The same pass reports
         // whether an encoding stacked deeper than the decode cap remains.
-        let (variants, residual_encoding) =
-            normalize::decoded_variants_with_residual(text.as_ref());
+        let (variants, residual_encoding) = normalize::decoded_variants_with_residual(text);
         // Flag overlong-UTF8 / double-encoding / null-byte markers and the
         // beyond-cap residual in the body, mirroring the URL-side FE-ENCODING
         // check (markers `percent_decode_plus` cannot recover, and stacks the
         // layered decode cannot fully peel, are otherwise silent).
-        self.scan_body_encoding_specials(&mut outcome, text.as_ref(), residual_encoding, subject);
+        self.scan_body_encoding_specials(outcome, text, residual_encoding, subject);
         for variant in variants {
             self.scan_bytes_set(
-                &mut outcome,
+                outcome,
                 self.compiled.body_bytes.as_ref(),
                 variant.as_bytes(),
                 subject,
             );
-            self.scan_luhn_rules(
-                &mut outcome,
-                &variant,
-                &self.compiled.body_luhn_rules,
-                subject,
-            );
-            self.scan_cidr_rules(
-                &mut outcome,
-                &variant,
-                &self.compiled.body_cidr_rules,
-                subject,
-            );
+            self.scan_luhn_rules(outcome, &variant, &self.compiled.body_luhn_rules, subject);
+            self.scan_cidr_rules(outcome, &variant, &self.compiled.body_cidr_rules, subject);
         }
-        self.scan_luhn_rules(
-            &mut outcome,
-            text.as_ref(),
-            &self.compiled.body_luhn_rules,
-            subject,
-        );
-        self.scan_cidr_rules(
-            &mut outcome,
-            text.as_ref(),
-            &self.compiled.body_cidr_rules,
-            subject,
-        );
-        outcome
+        self.scan_luhn_rules(outcome, text, &self.compiled.body_luhn_rules, subject);
+        self.scan_cidr_rules(outcome, text, &self.compiled.body_cidr_rules, subject);
     }
 
     pub(super) fn run_response_header_scan(

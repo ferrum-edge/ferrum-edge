@@ -107,6 +107,12 @@
 //! pressure and `SIGTERM` drain while avoiding counting an established,
 //! long-lived upgraded socket as an active request.
 //!
+//! Process shutdown is observed through `RequestContext::websocket_shutdown_rx`
+//! (cloned from the H3 connection's process watch, issue #4429) so drain can
+//! emit Close `1001` (`Away`, `"gateway draining"`) during the H3 listener's
+//! GOAWAY window. `OverloadState::wait_for_drain_start` remains the backstop
+//! after `begin_shutdown_drain`.
+//!
 //! ## 0-RTT
 //!
 //! Extended CONNECT is NOT a default 0-RTT method — operators who
@@ -662,6 +668,12 @@ pub(crate) async fn handle_h3_websocket(
     // WebSocket session carries the QUIC connection's client-trust session into
     // the shared relay's stop arbiter.
     let ws_client_trust_session = ctx.client_trust_session.clone();
+    // Issue #4429: prefer the process shutdown watch cloned into this
+    // connection so drain can emit Close 1001 ("gateway draining") instead
+    // of waiting for the later `begin_drain` latch (which fires only after
+    // the H3 listener — and this session — have already returned).
+    let ws_shutdown_rx = ctx.websocket_shutdown_rx.clone();
+    let ws_shutdown_rx = ws_shutdown_rx.or_else(|| state.health_check_shutdown_rx.clone());
     let ws_session_deadline = crate::proxy::effective_websocket_session_deadline(
         &ctx,
         state.env_config.websocket_max_lifetime_seconds,
@@ -1754,7 +1766,7 @@ pub(crate) async fn handle_h3_websocket(
                 true,
                 ws_idle_tracker,
                 ws_session_deadline,
-                state.health_check_shutdown_rx.clone(),
+                ws_shutdown_rx.clone(),
                 Arc::clone(&state.overload),
                 crate::proxy::WsFragmentPolicy::from_env(&state.env_config),
                 &adaptive_buf,
@@ -1781,7 +1793,7 @@ pub(crate) async fn handle_h3_websocket(
                 true,
                 ws_idle_tracker,
                 ws_session_deadline,
-                state.health_check_shutdown_rx.clone(),
+                ws_shutdown_rx.clone(),
                 Arc::clone(&state.overload),
                 crate::proxy::WsFragmentPolicy::from_env(&state.env_config),
                 &adaptive_buf,

@@ -329,6 +329,7 @@ All in-memory caches are bounded to prevent unbounded memory growth under advers
 - Startup failover with externally provisioned backup config (`FERRUM_DB_CONFIG_BACKUP_PATH`)
 - Multi-URL database failover (`FERRUM_DB_FAILOVER_URLS`) with automatic ordered connection failover. MongoDB replica sets handle failover natively via the connection string
 - DP multi-CP failover (`FERRUM_DP_CP_GRPC_URLS`) — priority-ordered CP list with automatic failover and primary-preference retry
+- DP bounded last-known-good config (`FERRUM_DP_CONFIG_MAX_STALE_SECONDS`, default 3600; `FERRUM_DP_CONFIG_STALE_ACTION`, default `fail_closed`) — when every CP is lost and the applied snapshot reaches the bound, readiness degrades and new traffic is refused by default while in-flight work drains; partial CP loss and successful failover do not latch. See [docs/cp_dp_mode.md](docs/cp_dp_mode.md#bounded-last-known-good-configuration-age)
 - Multi-region high availability via shared database cluster — see [docs/multi_region_ha.md](docs/multi_region_ha.md)
 - Read replica support — SQL: `FERRUM_DB_READ_REPLICA_URL` offloads config polling reads. MongoDB: `readPreference=secondaryPreferred` in connection string (driver routes reads to secondaries automatically)
 - Graceful shutdown with active request draining (SIGTERM/SIGINT)

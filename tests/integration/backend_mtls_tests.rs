@@ -7,9 +7,23 @@ use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::env_config::{EnvConfig, OperatingMode};
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy};
 use ferrum_edge::connection_pool::ConnectionPool;
+use ferrum_edge::retry::{ErrorClass, classify_reqwest_error};
+use rustls::RootCertStore;
+use rustls::ServerConfig;
+use rustls_pemfile::{certs, private_key};
+use serde_json::json;
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::Once;
+use std::time::Duration;
 use tempfile::NamedTempFile;
+use tokio_rustls::TlsAcceptor;
+
+use crate::scaffolding::certs::TestCa;
+use crate::scaffolding::file_mode_yaml_for_backend_with;
+use crate::scaffolding::harness::GatewayHarness;
+use crate::scaffolding::ports::reserve_port;
 
 /// Create a test proxy with mTLS configuration
 fn create_test_mtls_proxy() -> Proxy {
@@ -459,4 +473,175 @@ async fn test_backend_ca_bundle_global_config() {
             }
         }
     }
+}
+
+// ── Issue #4406: anonymous proxy → origin that requires a client cert ────
+
+static INIT_CRYPTO: Once = Once::new();
+
+fn ensure_crypto_provider() {
+    INIT_CRYPTO.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+/// Origin that requires a client certificate. Handshake fails when the
+/// gateway presents none — the request never reaches HTTP.
+fn spawn_client_cert_required_origin(
+    listener: tokio::net::TcpListener,
+    cert_pem: &str,
+    key_pem: &str,
+    ca_pem: &str,
+) -> tokio::task::JoinHandle<()> {
+    let mut cert_reader = cert_pem.as_bytes();
+    let cert_chain: Vec<_> = certs(&mut cert_reader).filter_map(|c| c.ok()).collect();
+    let mut key_reader = key_pem.as_bytes();
+    let key = private_key(&mut key_reader)
+        .expect("parse key pem")
+        .expect("server private key");
+    let mut ca_reader = ca_pem.as_bytes();
+    let ca_certs: Vec<_> = certs(&mut ca_reader).filter_map(|c| c.ok()).collect();
+    let mut roots = RootCertStore::empty();
+    for ca in ca_certs {
+        roots.add(ca).expect("add client CA");
+    }
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::new(rustls::crypto::ring::default_provider()),
+    )
+    .build()
+    .expect("client cert verifier");
+    let config =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("tls versions")
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(cert_chain, key)
+            .expect("server cert");
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let _ = acceptor.accept(stream).await;
+            });
+        }
+    })
+}
+
+fn gateway_error_header(headers: &reqwest::header::HeaderMap) -> Option<&str> {
+    headers.get("x-gateway-error").and_then(|v| v.to_str().ok())
+}
+
+/// Anonymous HTTPS proxy against an origin that requires a client
+/// certificate: 502, pre-wire class, pre-wire gateway-error token.
+///
+/// Regression for issue #4406. Distinct from #4053 (HTTPS-to-plaintext
+/// already `tls_error`) and #4051 (omitted `close_notify` is not
+/// `tls_error`).
+///
+/// The live reqwest error on this path is hyper `Canceled` / connection
+/// not ready: rustls dies on the connection future and is **not** in the
+/// request chain, so the class is `ConnectionPoolError` (typed
+/// `is_canceled`), not `tls_error`. When a typed rustls handshake error
+/// *is* in the chain, it remains `tls_error`. Either way the failure is
+/// pre-wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anonymous_proxy_to_required_client_cert_origin_is_pre_wire() {
+    ensure_crypto_provider();
+    let ca = TestCa::new("issue-4406-mtls-ca").expect("test CA");
+    let (cert_pem, key_pem) = ca.valid().expect("server leaf");
+    let reservation = reserve_port().await.expect("reserve origin port");
+    let origin_port = reservation.port;
+    let _origin = spawn_client_cert_required_origin(
+        reservation.into_listener(),
+        &cert_pem,
+        &key_pem,
+        &ca.cert_pem,
+    );
+
+    let mut ca_file = NamedTempFile::new().expect("ca tempfile");
+    ca_file
+        .write_all(ca.cert_pem.as_bytes())
+        .expect("write ca pem");
+    let ca_path = ca_file.path().to_string_lossy().to_string();
+
+    let origin_url = format!("https://127.0.0.1:{origin_port}/ping");
+    let rustls_client = reqwest::Client::builder()
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(ca.cert_pem.as_bytes()).expect("reqwest CA"),
+        )
+        .http1_only()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("reqwest client");
+    let live_err = rustls_client
+        .get(&origin_url)
+        .send()
+        .await
+        .expect_err("origin must reject a client with no certificate");
+    let live_class = classify_reqwest_error(&live_err);
+    assert!(
+        matches!(
+            live_class,
+            ErrorClass::ConnectionPoolError | ErrorClass::TlsError
+        ),
+        "reqwest handshake without a client cert must be pre-wire \
+         (pool cancel or typed rustls), not connection_reset/refused; \
+         is_connect={} class={live_class:?} err={live_err:?}",
+        live_err.is_connect(),
+    );
+    assert_ne!(live_class, ErrorClass::ConnectionReset);
+    assert_ne!(live_class, ErrorClass::ConnectionRefused);
+    assert_ne!(live_class, ErrorClass::RequestError);
+    assert!(
+        !ferrum_edge::retry::request_reached_wire(live_class),
+        "backend mTLS handshake failure is pre-wire: retry_on_connect_failure \
+         may replay; nothing reached the origin application layer"
+    );
+
+    let yaml = file_mode_yaml_for_backend_with(
+        origin_port,
+        json!({
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_tls_verify_server_cert": true,
+            "backend_tls_server_ca_cert_path": ca_path,
+            "pool_enable_http2": false,
+        }),
+    );
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .spawn()
+        .await
+        .expect("spawn in-process gateway");
+    harness
+        .wait_healthy(Duration::from_secs(5))
+        .await
+        .expect("gateway healthy");
+
+    let client = harness.http_client().expect("client");
+    let resp = client
+        .get(&harness.proxy_url("/api/ping"))
+        .await
+        .expect("gateway returns a synthesized error");
+    assert_eq!(
+        resp.status,
+        reqwest::StatusCode::BAD_GATEWAY,
+        "body={}",
+        resp.body_text(),
+    );
+    // TlsError and ConnectionPoolError are both pre-wire, so the public
+    // token is connection_failure (not backend_error, which is the
+    // post-wire 502 token this misconfig previously emitted).
+    assert_eq!(
+        gateway_error_header(&resp.headers),
+        Some("connection_failure"),
+        "pre-wire handshake 502 must carry X-Gateway-Error=connection_failure"
+    );
 }

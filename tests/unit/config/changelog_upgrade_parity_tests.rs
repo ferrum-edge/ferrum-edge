@@ -8,6 +8,21 @@
 
 const CHANGELOG: &str = include_str!("../../../CHANGELOG.md");
 const UPGRADE_GUIDE: &str = include_str!("../../../docs/upgrade_guide.md");
+const MIGRATIONS_DOC: &str = include_str!("../../../docs/migrations.md");
+
+/// Present while build-out folds core schema into the editable `V001` baseline.
+const BUILD_OUT_BASELINE_POLICY_MARKER: &str = "folded into the current baseline schema (`V001`)";
+
+/// Phrases that imply an in-place or automatic **core database schema** migration
+/// workflow. Must stay absent from the upgrade guide while `MIGRATIONS_DOC`
+/// still states the build-out baseline-only policy above.
+const IN_PLACE_CORE_SCHEMA_MIGRATION_CLAIMS: &[&str] = &[
+    "auto-migrates forward",
+    "Let the new binary auto-migrate on startup",
+    "Run migrations in dry-run mode before applying",
+    "schema migrations may alter your database",
+    "pending migrations automatically on startup",
+];
 
 fn unreleased_section(changelog: &str) -> &str {
     let after_heading = changelog
@@ -167,5 +182,26 @@ fn unreleased_breaking_changelog_issues_appear_in_upgrade_guide() {
         "every Unreleased BREAKING changelog issue number must appear in \
          docs/upgrade_guide.md; missing: {}",
         missing_guidance.join(", ")
+    );
+}
+
+#[test]
+fn upgrade_guide_does_not_claim_in_place_migration_during_build_out() {
+    if !MIGRATIONS_DOC.contains(BUILD_OUT_BASELINE_POLICY_MARKER) {
+        return;
+    }
+
+    let violations: Vec<&str> = IN_PLACE_CORE_SCHEMA_MIGRATION_CLAIMS
+        .iter()
+        .copied()
+        .filter(|phrase| UPGRADE_GUIDE.contains(phrase))
+        .collect();
+
+    assert!(
+        violations.is_empty(),
+        "docs/upgrade_guide.md must not claim in-place/automatic core schema \
+         migration while docs/migrations.md states build-out baseline-only \
+         policy; found: {}",
+        violations.join(", ")
     );
 }

@@ -8,7 +8,11 @@ Ferrum Edge uses a versioned migration system that:
 
 - **Tracks applied database migrations** in a `_ferrum_migrations` table
 - **Versions configuration files** with a `version` field
-- **Auto-migrates on startup** (no manual intervention required for normal operation)
+- **Auto-migrates on startup** on a database whose applied `V001` checksum matches
+  the current binary (no manual intervention for that case). During build-out,
+  a changed baseline requires a fresh database — see
+  [Build-Out Schema Policy](#build-out-schema-policy) and
+  [upgrade_guide.md](upgrade_guide.md#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb).
 - **Provides a CLI mode** for operators who want explicit control
 
 ## Build-Out Schema Policy
@@ -22,7 +26,9 @@ database values are not required unless explicitly requested.
 
 Operationally, anyone running a build-out branch or recent `main` snapshot
 should treat core schema changes as requiring a fresh database or an explicit
-operator-managed rebuild of the affected tables. The versioned core migration
+operator-managed rebuild of the affected tables. The canonical procedure is
+[upgrade_guide.md → Build-Out Database Upgrade](upgrade_guide.md#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb).
+The versioned core migration
 guide below documents the migration framework and the post-stabilization path;
 it is not the default workflow for new core schema fields during build-out.
 Custom plugin migrations still use the plugin migration system because plugin
@@ -72,8 +78,9 @@ path, not for routine build-out schema work.
 - **Between tagged releases:** breaking schema / config / env / API changes are
   called out in that release's GitHub Release notes, keyed to the migration or
   the env/config surface that changed. Operators upgrade tag-to-tag using
-  [upgrade_guide.md](upgrade_guide.md) (back up → dry-run migrate → validate on
-  non-production ports → cut over).
+  [upgrade_guide.md](upgrade_guide.md) (during build-out:
+  [fresh-database rebuild](upgrade_guide.md#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb);
+  after the schema freeze: versioned forward migrations).
 - **On `main` / build-out branches:** there is no per-commit changelog promise.
   New `FERRUM_*` env vars land with `docs/configuration.md` + `ferrum.conf`
   updates in the same change, and schema-affecting changes update the `V001`

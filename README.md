@@ -396,6 +396,7 @@ See [docs/tcp_udp_proxy.md](docs/tcp_udp_proxy.md) for TCP/UDP/DTLS proxy config
 - **Retry**: Connection and HTTP-level retries with fixed/exponential backoff
 - **Service discovery**: DNS-SD, Kubernetes, and Consul providers
 - **Config caching**: All modes maintain in-memory config cache for resilience during source outages
+- **DP stale-config fence**: In `dp` mode, a data plane serves its last applied CP snapshot during outages, but when **every** control plane is unreachable and that snapshot ages past `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` (default 3600), the pod becomes unready and, by default (`FERRUM_DP_CONFIG_STALE_ACTION=fail_closed`), refuses new traffic on every protocol while existing connections drain. Partial CP loss and successful failover do not trigger the fence. See [docs/cp_dp_mode.md](docs/cp_dp_mode.md#bounded-last-known-good-configuration-age)
 - **Startup failover**: `FERRUM_DB_CONFIG_BACKUP_PATH` for DB outage recovery in Kubernetes
 - **Multi-URL failover**: `FERRUM_DB_FAILOVER_URLS` for database high availability
 
@@ -524,6 +525,7 @@ Ferrum also **won the E2E TLS /api/users test outright** — 29,808 req/s, the h
 | Docker deployment | [docs/docker.md](docs/docker.md) |
 | CI/CD pipeline | [docs/ci_cd.md](docs/ci_cd.md) |
 | Database migrations | [docs/migrations.md](docs/migrations.md) |
+| Upgrade procedure (build-out) | [docs/upgrade_guide.md](docs/upgrade_guide.md) |
 | Custom plugins | [CUSTOM_PLUGINS.md](CUSTOM_PLUGINS.md) |
 | Feature list | [FEATURES.md](FEATURES.md) |
 | OpenAPI spec | [openapi.yaml](openapi.yaml) |

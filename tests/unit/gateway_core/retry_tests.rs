@@ -1212,6 +1212,39 @@ fn test_classify_boxed_error_tls_close_without_notify_is_connection_closed() {
 }
 
 #[test]
+fn test_close_notify_eof_wrapping_rustls_stays_connection_closed() {
+    // Nearest false-positive to the handshake-rustls → TlsError change
+    // (#4051): omitted close_notify is UnexpectedEof whose Display names
+    // the rustls teardown, and get_ref() may hold a rustls::Error. The
+    // close_notify check must win before handshake-class rustls can steal
+    // it as tls_error.
+    use ferrum_edge::retry::TLS_CLOSE_WITHOUT_NOTIFY;
+    #[derive(Debug)]
+    struct CloseNotifyPayload(rustls::Error);
+    impl std::fmt::Display for CloseNotifyPayload {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "peer closed connection {TLS_CLOSE_WITHOUT_NOTIFY}: \
+                 https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
+            )
+        }
+    }
+    impl std::error::Error for CloseNotifyPayload {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+    let io_err = std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        CloseNotifyPayload(rustls::Error::HandshakeNotComplete),
+    );
+    let class = classify_boxed_error(&io_err);
+    assert_eq!(class, ErrorClass::ConnectionClosed);
+    assert_ne!(class, ErrorClass::TlsError);
+}
+
+#[test]
 fn test_classify_boxed_setup_error_handshake_alert_is_tls_error() {
     let rustls_err = rustls::Error::AlertReceived(rustls::AlertDescription::HandshakeFailure);
     assert_eq!(
@@ -1388,34 +1421,94 @@ fn test_classify_boxed_error_post_connect_rustls_is_post_wire() {
     // `classify_boxed_error` calls `classify_typed_chain` with
     // `phase_is_connect=false` because its callers (WebSocket session
     // forwarding, TCP relay mid-stream, response-body classification)
-    // are all post-handshake. A rustls error here means a record-layer
-    // failure mid-session (decrypt failed, unexpected alert, peer
-    // protocol violation). It MUST classify as a post-wire class so
-    // request_reached_wire returns true and `retry_on_connect_failure`
-    // does NOT replay non-idempotent requests whose bytes may already
-    // have crossed the encrypted channel.
-    let alert = rustls::AlertDescription::HandshakeFailure;
-    let err: Box<dyn std::error::Error + Send + Sync> =
-        Box::new(rustls::Error::AlertReceived(alert));
+    // are all post-handshake. A *record-layer* rustls error here
+    // (decrypt failed, oversized record) MUST classify as a post-wire
+    // class so request_reached_wire returns true and
+    // `retry_on_connect_failure` does NOT replay non-idempotent
+    // requests whose bytes may already have crossed the encrypted
+    // channel. Handshake-class rustls (CertificateRequired, etc.) is
+    // a different case — see the tests below.
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(rustls::Error::DecryptError);
     let class = classify_boxed_error(&*err);
     assert_eq!(
         class,
         ErrorClass::ConnectionReset,
-        "post-connect rustls errors must map to a mid-stream class"
+        "post-handshake rustls record-layer errors must map to a mid-stream class"
     );
     assert!(
         ferrum_edge::retry::request_reached_wire(class),
-        "post-connect rustls error must be post-wire (got {class:?}); \
+        "post-handshake rustls error must be post-wire (got {class:?}); \
          a pre-wire class would let retry_on_connect_failure replay \
          non-idempotent requests already on the wire"
     );
 }
 
 #[test]
+fn test_classify_boxed_error_post_connect_handshake_alert_is_tls_error() {
+    // Issue #4406: reqwest reports backend mTLS handshake failures with
+    // `is_connect() = false` (TCP already succeeded). A typed handshake
+    // alert must still be TlsError so retry_on_connect_failure can replay
+    // and operators grepping tls_error see the misconfig.
+    let alert = rustls::AlertDescription::CertificateRequired;
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        Box::new(rustls::Error::AlertReceived(alert));
+    let class = classify_boxed_error(&*err);
+    assert_eq!(class, ErrorClass::TlsError);
+    assert!(
+        !ferrum_edge::retry::request_reached_wire(class),
+        "handshake-class rustls must stay pre-wire so retry_on_connect_failure \
+         can replay; nothing reached the origin application layer"
+    );
+}
+
+#[test]
+fn test_classify_boxed_error_handshake_failure_alert_is_tls_error() {
+    let alert = rustls::AlertDescription::HandshakeFailure;
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        Box::new(rustls::Error::AlertReceived(alert));
+    let class = classify_boxed_error(&*err);
+    assert_eq!(class, ErrorClass::TlsError);
+    assert!(!ferrum_edge::retry::request_reached_wire(class));
+}
+
+#[test]
+fn test_classify_typed_chain_treats_hyper_is_canceled_as_pool_error() {
+    // Issue #4406 live reqwest path: hyper reports is_canceled with no
+    // rustls in the request chain. classify_typed_chain must map that
+    // typed flag to ConnectionPoolError (pre-wire). hyper::Error is not
+    // constructible here; this guards the arm, and the live reqwest
+    // handshake in backend_mtls_tests exercises the real error.
+    let src = include_str!("../../../src/retry.rs");
+    assert!(
+        src.contains("if hyper_err.is_canceled()")
+            && src.contains("// hyper 1.9 contract (issue #3578 rejected a downgrade)")
+            && src.contains("return Some(ErrorClass::ConnectionPoolError);"),
+        "classify_typed_chain must map hyper is_canceled to ConnectionPoolError"
+    );
+    assert!(
+        !src.contains("source_chain.contains(\"connection was not ready\")")
+            && !src.contains("error_str.contains(\"connection was not ready\")")
+            && !src.contains("debug_str.contains(\"connection was not ready\")"),
+        "must not classify by matching the hyper Display label"
+    );
+}
+
+#[test]
+fn test_classify_boxed_error_close_notify_alert_is_connection_closed() {
+    // #4051: CloseNotify is teardown, not a handshake. Must not become
+    // tls_error even when the typed rustls error is reachable.
+    let alert = rustls::AlertDescription::CloseNotify;
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        Box::new(rustls::Error::AlertReceived(alert));
+    let class = classify_boxed_error(&*err);
+    assert_eq!(class, ErrorClass::ConnectionClosed);
+    assert!(ferrum_edge::retry::request_reached_wire(class));
+}
+
+#[test]
 fn test_classify_boxed_error_post_connect_rustls_buried_in_chain() {
-    // The phase-gating must survive a wrapper in the source chain — the
-    // chain walker reaches the rustls error and applies the post-connect
-    // mapping just like the direct case.
+    // HandshakeNotComplete is handshake-class even through a wrapper —
+    // the chain walker reaches rustls and maps it to TlsError.
     #[derive(Debug)]
     struct Wrapper(rustls::Error);
     impl std::fmt::Display for Wrapper {
@@ -1429,6 +1522,26 @@ fn test_classify_boxed_error_post_connect_rustls_buried_in_chain() {
         }
     }
     let wrapped = Wrapper(rustls::Error::HandshakeNotComplete);
+    let class = classify_boxed_error(&wrapped);
+    assert_eq!(class, ErrorClass::TlsError);
+    assert!(!ferrum_edge::retry::request_reached_wire(class));
+}
+
+#[test]
+fn test_classify_boxed_error_post_connect_decrypt_buried_in_chain() {
+    #[derive(Debug)]
+    struct Wrapper(rustls::Error);
+    impl std::fmt::Display for Wrapper {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "outer wrapper: {}", self.0)
+        }
+    }
+    impl std::error::Error for Wrapper {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+    let wrapped = Wrapper(rustls::Error::DecryptError);
     let class = classify_boxed_error(&wrapped);
     assert_eq!(class, ErrorClass::ConnectionReset);
     assert!(ferrum_edge::retry::request_reached_wire(class));
@@ -1510,6 +1623,34 @@ fn test_post_connect_io_reset_without_rustls_is_connection_reset() {
     let io_err = std::io::Error::new(
         std::io::ErrorKind::ConnectionReset,
         "connection reset by peer",
+    );
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(io_err);
+    let class = classify_boxed_error(&*err);
+    assert_eq!(class, ErrorClass::ConnectionReset);
+    assert!(ferrum_edge::retry::request_reached_wire(class));
+}
+
+#[test]
+fn test_post_connect_io_reset_wrapping_handshake_rustls_is_tls_error() {
+    // tokio-rustls / reqwest wrap a missing-client-cert alert as
+    // io::ErrorKind::ConnectionReset with rustls in get_ref(), and
+    // reqwest's is_connect() is already false (issue #4406). Must not
+    // stay ConnectionReset.
+    let io_err = std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        rustls::Error::AlertReceived(rustls::AlertDescription::CertificateRequired),
+    );
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(io_err);
+    let class = classify_boxed_error(&*err);
+    assert_eq!(class, ErrorClass::TlsError);
+    assert!(!ferrum_edge::retry::request_reached_wire(class));
+}
+
+#[test]
+fn test_post_connect_io_reset_wrapping_decrypt_rustls_is_connection_reset() {
+    let io_err = std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        rustls::Error::DecryptError,
     );
     let err: Box<dyn std::error::Error + Send + Sync> = Box::new(io_err);
     let class = classify_boxed_error(&*err);

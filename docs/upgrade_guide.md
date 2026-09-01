@@ -1,10 +1,40 @@
 # Safe Upgrade Guide
 
-This document describes how to safely upgrade Ferrum Edge between versions with zero data loss and a clear rollback path. The approach varies by operating mode, but the core principle is the same: **validate the new version against a copy of your data before cutting over production traffic.**
+> **BUILD-OUT — in-place database migration and binary-only rollback are
+> unsupported.** Ferrum Edge is still in active build-out: core schema changes
+> are folded into the editable `V001` baseline instead of shipping forward
+> migrations (`V002`, `V003`, …). A database that already applied an earlier
+> `V001` checksum is **refused** at startup when the binary's baseline digest
+> differs ([migration history integrity](migrations.md#migration-history-integrity)).
+> There is no supported path to "upgrade in place" by pointing a new binary at
+> the production database, and rolling back by restarting the **old** binary
+> against a database that received a changed baseline is equally unsafe. During
+> build-out, treat every core schema change as requiring a **fresh database**
+> populated from a namespace-complete logical export. Keep the **old database
+> intact** as rollback: cut traffic back to the old binary on the old
+> database, not to an older binary on the new baseline. See
+> [Build-Out database upgrade](#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb)
+> and [migrations.md → Build-Out Schema Policy](migrations.md#build-out-schema-policy).
+> Tagged releases after the declared schema freeze will document additive
+> forward migrations; until then, follow the rebuild procedure below.
+
+This guide describes how to upgrade Ferrum Edge with zero configuration loss and
+a clear rollback path. The approach varies by operating mode, but the core
+principle is the same: **export logical configuration, validate the new binary
+against a fresh datastore (or config copy) on non-production ports, then cut
+over production traffic.** File-mode config version bumps still use in-memory or
+`FERRUM_MODE=migrate` config migration; that is separate from the database
+baseline contract above.
 
 ## Breaking Changes Since 0.9.0
 
 Every current `[Unreleased]` `BREAKING` changelog entry is listed here exactly once, with its issue number and the operator action that entry already states. Several of these fail **silently** at cutover (HMAC clients get `401`, WAF `literal` rules stop matching folded spellings, backends stop seeing client-supplied XFF hops) rather than refusing config load. Read this section before the per-mode procedures below.
+
+### Backend mTLS handshake without a client certificate is pre-wire (issue [#4406](https://github.com/ferrum-edge/ferrum-edge/issues/4406))
+
+An HTTPS origin that requires a client certificate previously logged `error_class=connection_reset` (or the `request_error` catch-all) and `X-Gateway-Error: backend_error` when the gateway presented none. That failure never reached HTTP. Typed rustls handshake errors still log `error_class=tls_error`. On the reqwest HTTP/1 path the rustls error is not in the request chain (hyper `is_canceled`), so the class is `connection_pool_error`. Both are pre-wire; `X-Gateway-Error` is `connection_failure`. `retry_on_connect_failure` replays regardless of method. The circuit breaker uses the connect-error path (`trip_on_connection_errors`) instead of a 502-status / post-wire reset charge. Plugin outbound HTTP (`FERRUM_PLUGIN_HTTP_MAX_RETRIES`) also retries `connection_pool_error` on GET/HEAD/OPTIONS; that list is not identical to `request_reached_wire`.
+
+**Operator action:** retarget alerts keyed on `connection_reset` / `backend_error` for this misconfig onto `tls_error` / `connection_pool_error` / `connection_failure`. If you set `trip_on_connection_errors: false` to ignore connect failures, this handshake will no longer trip the breaker via 502 in `failure_status_codes`. Configure `backend_tls_client_cert_path` / `backend_tls_client_key_path` (or stop requiring client certs on the origin).
 
 ### Injected Ferrum is a Kubernetes native sidecar (issue [#4430](https://github.com/ferrum-edge/ferrum-edge/issues/4430))
 
@@ -250,6 +280,21 @@ Staleness additionally requires the DP to have actually lost its authoritative C
 
 **Operator action:** set `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` and `FERRUM_DP_CONFIG_STALE_ACTION` before cutover so orchestrators and load balancers honor degraded readiness at the bound; do not rely on `0` except as a deliberate unsafe opt-in. After a CP outage, restore an authoritative CP and confirm an applied snapshot before steering new traffic back.
 
+**`ferrum-gateway` chart users (issue [#4438](https://github.com/ferrum-edge/ferrum-edge/issues/4438)):** both variables are now first-class chart values — `dp.configMaxStaleSeconds` and `dp.configStaleAction` — and are therefore **reserved**. Setting `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` or `FERRUM_DP_CONFIG_STALE_ACTION` (or any `_VAULT` / `_AWS` / `_AZURE` / `_GCP` / `_FILE` suffixed form) through `env:` or `extraEnv:` now **fails template rendering** instead of being applied, so an existing DP install that configured the fence that way will not upgrade until the values move. Translate directly:
+
+```yaml
+# before (now rejected)
+extraEnv:
+  - name: FERRUM_DP_CONFIG_STALE_ACTION
+    value: "readiness_only"
+
+# after
+dp:
+  configStaleAction: readiness_only
+```
+
+Leave either value as `""` (the chart default) to omit the env entirely and take the binary defaults (`3600` / `fail_closed`). An explicit `dp.configMaxStaleSeconds: 0` still renders, and remains the deliberately unsafe opt-in described above.
+
 ### `a2a_gateway` `endpoint.grpc_services` default and declared Agent Card wire layouts (issue [#3297](https://github.com/ferrum-edge/ferrum-edge/issues/3297))
 
 `endpoint.grpc_services` now defaults to the canonical A2A **0.3** service `a2a.v1.A2AService` (package `a2a.v1`, from `a2aproject/A2A` at tag `v0.3.0`) and A2A **1.0**'s `lf.a2a.v1.A2AService`. Every configured entry carries a declared Agent Card wire layout. The default 0.3 identity matches the card layout that default `endpoint.protocol_versions` (`0.3.0`) actually describes; retaining the 1.0 identity preserves method-policy enforcement for deployments that relied on the former default, while its schema prevents the 0.3 decoder from interpreting its renumbered card.
@@ -271,77 +316,98 @@ TLS handshake offload is not implemented. A nonzero `FERRUM_TLS_OFFLOAD_THREADS`
 **Operator action:** remove `FERRUM_GRPC_POOL_READY_WAIT_MS` from your configuration; it never had a runtime effect. There is no replacement knob.
 
 ## Database Mode (`FERRUM_MODE=database`)
+## Build-Out Database Upgrade (PostgreSQL, MySQL, SQLite, MongoDB)
 
-This is the most involved upgrade because schema migrations may alter your database. The strategy is: clone the database, migrate the clone, validate with the new binary, then cut over.
+Use this procedure whenever the target binary's `V001` baseline may differ from
+the database you are running today — which is the normal case on `main` and
+build-out branches. It moves **logical configuration** (not raw SQL rows) through
+the Admin API backup format documented in
+[admin_backup_restore.md](admin_backup_restore.md).
 
-### Step-by-Step
+A namespace-complete export includes, per authenticated namespace:
 
-#### 1. Backup Your Current Database
+| Resource | In `GET /backup` | Restored by `POST /restore` |
+|----------|------------------|-----------------------------|
+| Proxies (with plugin associations) | `proxies` | yes |
+| Consumers (credentials unredacted) | `consumers` | yes |
+| Plugin configs | `plugin_configs` | yes |
+| Upstreams | `upstreams` | yes |
+| API specs (compressed documents + ownership metadata) | `api_specs` | yes |
+| Gateway trust bundles | `gateway_trust_bundles` (full export only) | yes |
 
-Create a full copy of the production database. This copy serves two purposes: it's the migration target for the new version, and it's your rollback safety net.
+Partial `?resources=` exports are **not** sufficient for a build-out rebuild;
+use an unfiltered `GET /backup` per namespace. Multi-tenant deployments repeat
+the export/import pair for every namespace (set `X-Ferrum-Namespace` on both
+calls). Backup files contain live secrets — store them like database dumps.
+
+### Step-by-Step (all SQL backends and MongoDB)
+
+#### 1. Export a namespace-complete logical backup
+
+With the **current** binary still serving production, capture one full backup per
+namespace from the Admin API (database mode or CP). Do **not** delete or mutate
+the production database; it becomes the rollback artifact.
+
+```bash
+TOKEN="your-jwt-token"
+NS="production"   # omit the header when using the default namespace
+curl -s -H "Authorization: Bearer $TOKEN" \
+  -H "X-Ferrum-Namespace: $NS" \
+  http://localhost:9000/backup > "ferrum-backup-${NS}.json"
+
+# Record counts now — no secrets in this object
+jq '.counts' "ferrum-backup-${NS}.json"
+```
+
+The `counts` object reports `proxies`, `consumers`, `plugin_configs`,
+`upstreams`, `api_specs`, and `gateway_trust_bundles`. Confirm every resource
+class you expect is non-zero (or intentionally empty) before continuing.
+
+#### 2. Provision a fresh database from the current baseline
+
+Create an **empty** database (or MongoDB database name) that has never run
+Ferrum Edge. Point only a staging process at it while validating.
 
 ```bash
 # PostgreSQL
-pg_dump -Fc -h db-host -U ferrum ferrum_db > ferrum_backup_v1.dump
-createdb -h db-host -U ferrum ferrum_db_upgrade
-pg_restore -h db-host -U ferrum -d ferrum_db_upgrade ferrum_backup_v1.dump
+createdb -h db-host -U ferrum ferrum_db_new
 
 # MySQL
-mysqldump -h db-host -u ferrum -p ferrum_db > ferrum_backup_v1.sql
-mysql -h db-host -u ferrum -p -e "CREATE DATABASE ferrum_db_upgrade"
-mysql -h db-host -u ferrum -p ferrum_db_upgrade < ferrum_backup_v1.sql
+mysql -h db-host -u ferrum -p -e "CREATE DATABASE ferrum_db_new"
 
 # SQLite
-cp ferrum.db ferrum_upgrade.db
+rm -f /path/to/ferrum_staging.db   # or use a new path
+
+# MongoDB — use a new database name (for example ferrum_new)
 ```
 
-Alternatively, use the Admin API backup endpoint to capture the logical config:
+Initialize the current binary's `V001` baseline on the empty store. On SQL
+backends this creates `_ferrum_migrations` and applies the baseline schema; on
+MongoDB it creates indexes from the canonical plan.
 
 ```bash
-curl -s -H "Authorization: Bearer $TOKEN" \
-  http://localhost:9000/backup > ferrum-config-backup.json
-```
-
-#### 2. Run Migrations Against the Cloned Database
-
-Use the new Ferrum Edge binary in `migrate` mode to apply pending schema migrations to the clone. The original database is untouched.
-
-```bash
-# Dry run first — see what would change
-FERRUM_MODE=migrate \
-  FERRUM_MIGRATE_ACTION=up \
-  FERRUM_MIGRATE_DRY_RUN=true \
-  FERRUM_DB_TYPE=postgres \
-  FERRUM_DB_URL=postgres://ferrum:pass@db-host/ferrum_db_upgrade \
-  ./ferrum-edge-new
-
-# Apply migrations
 FERRUM_MODE=migrate \
   FERRUM_MIGRATE_ACTION=up \
   FERRUM_DB_TYPE=postgres \
-  FERRUM_DB_URL=postgres://ferrum:pass@db-host/ferrum_db_upgrade \
+  FERRUM_DB_URL=postgres://ferrum:pass@db-host/ferrum_db_new \
   ./ferrum-edge-new
 ```
 
-Check migration status to confirm everything applied cleanly:
+For MongoDB, set `FERRUM_DB_TYPE=mongodb`, `FERRUM_DB_URL`, and
+`FERRUM_MONGO_DATABASE`. If this step fails with a migration history integrity
+error, the target is not empty or not fresh — provision a new database name and
+retry. Do not attempt to "migrate" the production database in place.
+
+#### 3. Import, validate on staging ports, then cut over
+
+Start the new binary against the **fresh** database on non-production ports,
+import each backup, and exercise the gateway before switching production
+`FERRUM_DB_URL`.
 
 ```bash
-FERRUM_MODE=migrate \
-  FERRUM_MIGRATE_ACTION=status \
-  FERRUM_DB_TYPE=postgres \
-  FERRUM_DB_URL=postgres://ferrum:pass@db-host/ferrum_db_upgrade \
-  ./ferrum-edge-new
-```
-
-#### 3. Validate the New Version Against the Upgraded Database
-
-Start the new binary in `database` mode pointing at the cloned database. This lets you exercise the full proxy and admin API without touching production.
-
-```bash
-# Run new version against cloned DB on non-production ports
 FERRUM_MODE=database \
   FERRUM_DB_TYPE=postgres \
-  FERRUM_DB_URL=postgres://ferrum:pass@db-host/ferrum_db_upgrade \
+  FERRUM_DB_URL=postgres://ferrum:pass@db-host/ferrum_db_new \
   FERRUM_PROXY_HTTP_PORT=8100 \
   FERRUM_PROXY_HTTPS_PORT=8543 \
   FERRUM_ADMIN_HTTP_PORT=9100 \
@@ -349,13 +415,65 @@ FERRUM_MODE=database \
   ./ferrum-edge-new
 ```
 
-Validate:
+```bash
+# Import (destructive within the namespace — runs against the staging DB only)
+curl -s -X POST "http://localhost:9100/restore?confirm=true" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Ferrum-Namespace: $NS" \
+  -H "Content-Type: application/json" \
+  -d @"ferrum-backup-${NS}.json" | jq .
+```
 
-- **Health check**: `curl http://localhost:9100/health` — confirm `status: ok`
-- **Config loaded**: `curl -H "Authorization: Bearer $TOKEN" http://localhost:9100/proxies` — verify all proxies are present and correctly configured
-- **Proxy traffic**: send test requests through port 8100 to verify routing, plugin execution, and backend connectivity
-- **Admin API**: test CRUD operations against the staging instance
-- **Logs**: check for warnings or errors at `FERRUM_LOG_LEVEL=info`
+Verify import **without logging secrets**:
+
+- Compare `jq '.counts'` on the backup file to the `restored` object in the
+  restore response (`proxies`, `consumers`, `plugin_configs`, `upstreams`,
+  `api_specs`, `gateway_trust_bundles`).
+- Optionally cross-check list totals (pagination only, no credential bodies):
+  `curl -s -H "Authorization: Bearer $TOKEN" -H "X-Ferrum-Namespace: $NS" \
+  'http://localhost:9100/proxies?limit=1' | jq '.pagination.total'` (repeat for
+  `/consumers`, `/plugins/config`, `/upstreams`, and `GET /api-specs` as
+  needed).
+- Run `ferrum-edge validate` with the same env contract when validating file
+  overlays or sidecar config.
+- **Health**: `curl http://localhost:9100/health` — confirm `status: ok` and
+  `ready: true`.
+- **Proxy traffic**: send test requests through port 8100.
+- **Logs**: check for warnings or errors at `FERRUM_LOG_LEVEL=info`.
+
+Repeat export/import for every namespace. When staging validation passes, stop
+the production binary, point `FERRUM_DB_URL` at the validated fresh database (or
+swap connection strings / DNS), and start the new binary on production ports.
+Leave the **old database files or instance unchanged** — do not drop them until
+rollback is no longer required.
+
+#### 4. Rollback path
+
+If issues arise after cutover:
+
+1. **Stop** the new binary.
+2. **Repoint** the old binary at the **original, untouched production database**
+   (the one you exported from in step 1). Do not point the old binary at
+   `ferrum_db_new` / the fresh MongoDB database — its `V001` checksum and rows
+   belong to the new baseline only.
+3. **Restart** the old binary against the old database.
+
+The old binary + old database is a consistent pair. The backup JSON from step 1
+is a secondary recovery copy if the old database were damaged independently.
+
+> **Unsupported during build-out:** running `FERRUM_MODE=migrate` against the
+> production database to apply "pending" core schema changes, relying on startup
+> auto-migration against an existing `V001` row, or swapping only the binary
+> while keeping the same database after a baseline change.
+
+---
+
+## Database Mode (`FERRUM_MODE=database`)
+
+Database-mode upgrades during build-out follow
+[Build-Out Database Upgrade](#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb)
+above. The subsections below are **staging validation checks** to run on the
+fresh database after import and before production cutover.
 
 ### Protocol Hardening Checks
 
@@ -701,61 +819,15 @@ diagnostics only to an authenticated caller; `/live` stays unauthenticated and
 minimal. Update any collector that scrapes `/metrics` (or that relies on full
 `/health` / `/status` / `/overload` detail) to authenticate before upgrading.
 
-#### 4. Cut Over Production
-
-Once validation passes, stop the old binary and start the new one against the production database. The new binary will run any pending migrations automatically on startup (or you can run them explicitly first with `FERRUM_MODE=migrate`).
-
-```bash
-# Option A: Let the new binary auto-migrate on startup
-# Stop old binary, then:
-FERRUM_MODE=database \
-  FERRUM_DB_TYPE=postgres \
-  FERRUM_DB_URL=postgres://ferrum:pass@db-host/ferrum_db \
-  ./ferrum-edge-new
-
-# Option B: Explicit migration then start
-FERRUM_MODE=migrate \
-  FERRUM_MIGRATE_ACTION=up \
-  FERRUM_DB_TYPE=postgres \
-  FERRUM_DB_URL=postgres://ferrum:pass@db-host/ferrum_db \
-  ./ferrum-edge-new
-
-FERRUM_MODE=database \
-  FERRUM_DB_TYPE=postgres \
-  FERRUM_DB_URL=postgres://ferrum:pass@db-host/ferrum_db \
-  ./ferrum-edge-new
-```
-
-#### 5. Rollback Path
-
-If issues arise after cutting over:
-
-1. **Stop** the new binary
-2. **Restore** the original database from the backup taken in step 1:
-   ```bash
-   # PostgreSQL
-   dropdb -h db-host -U ferrum ferrum_db
-   createdb -h db-host -U ferrum ferrum_db
-   pg_restore -h db-host -U ferrum -d ferrum_db ferrum_backup_v1.dump
-
-   # MySQL
-   mysql -h db-host -u ferrum -p -e "DROP DATABASE ferrum_db; CREATE DATABASE ferrum_db"
-   mysql -h db-host -u ferrum -p ferrum_db < ferrum_backup_v1.sql
-
-   # SQLite
-   cp ferrum_original.db ferrum.db
-   ```
-3. **Restart** the old binary against the restored database
-
-The old binary + old database is a fully consistent state. No data is lost.
-
-> **Important**: Schema migrations are forward-only. You cannot run the old binary against a database that has been migrated to a newer schema. Always restore from the pre-migration backup when rolling back.
-
 ---
 
 ## Control Plane / Data Plane Mode (`FERRUM_MODE=cp` / `dp`)
 
-CP/DP upgrades follow the same database strategy for the CP, with the added consideration of rolling out DP nodes. The key property that makes this safe: **DPs cache their config in memory and continue serving traffic even if the CP is temporarily unavailable.**
+CP/DP upgrades use the same
+[build-out database rebuild](#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb)
+for the CP datastore, with the added consideration of rolling out DP nodes. The
+key property that makes this safe: **DPs cache their config in memory and
+continue serving traffic even if the CP is temporarily unavailable.**
 
 ### Helm Chart Runtime Defaults
 
@@ -845,7 +917,12 @@ You can verify versions via the authenticated `GET /admin/metrics` endpoint on a
 
 ### Upgrade Order
 
-Always upgrade in this order: **CP first, then DPs.** The CP manages the database and schema migrations. DPs are stateless proxies that receive config via gRPC. Version negotiation ensures that if you forget to upgrade a DP, it will refuse the incompatible config rather than silently applying a partial parse.
+Always upgrade in this order: **CP first, then DPs.** The CP owns the
+configuration database; during build-out that database is rebuilt with
+`GET /backup` / `POST /restore`, not in-place core schema migration. DPs are
+stateless proxies that receive config via gRPC. Version negotiation ensures that
+if you forget to upgrade a DP, it will refuse the incompatible config rather than
+silently applying a partial parse.
 
 ### Mixed-Version Wire Compatibility (Patch-Level Rollouts)
 
@@ -882,18 +959,22 @@ for new/new fleets. Still complete the CP-first, then DP rollout promptly.
 
 ### Step-by-Step
 
-#### 1. Backup the CP Database
+#### 1. Export and rebuild the CP database
 
-Same as database mode step 1 — clone the CP's database.
+Follow
+[Build-Out Database Upgrade](#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb):
+`GET /backup` from the running CP (per namespace), provision a fresh database
+with the new binary's `V001` baseline, `POST /restore` on staging, and keep the
+original CP database untouched for rollback.
 
-#### 2. Validate New CP Against Cloned Database
+#### 2. Validate new CP against the fresh database
 
-Run the new CP binary against the cloned database on staging ports:
+Run the new CP binary against the validated fresh database on staging ports:
 
 ```bash
 FERRUM_MODE=cp \
   FERRUM_DB_TYPE=postgres \
-  FERRUM_DB_URL=postgres://ferrum:pass@db-host/ferrum_db_upgrade \
+  FERRUM_DB_URL=postgres://ferrum:pass@db-host/ferrum_db_new \
   FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:50052 \
   FERRUM_ADMIN_HTTP_PORT=9100 \
   FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
@@ -915,23 +996,20 @@ FERRUM_MODE=dp \
 
 Verify the test DP receives the full config snapshot and proxies traffic correctly.
 
-#### 3. Upgrade the Production CP
+#### 3. Upgrade the production CP
 
-Stop the old CP, run migrations against the production database, and start the new CP.
+Stop the old CP, repoint `FERRUM_DB_URL` at the validated fresh database (or
+swap DNS/connection strings), and start the new CP. Do **not** run in-place
+`FERRUM_MODE=migrate` against the production CP database during build-out.
 
-During the CP restart window, existing DPs continue serving traffic with their cached config. No downtime for API consumers.
+During the CP restart window, existing DPs continue serving traffic with their
+cached config. No downtime for API consumers.
 
 ```bash
 # Stop old CP, then:
-FERRUM_MODE=migrate \
-  FERRUM_MIGRATE_ACTION=up \
-  FERRUM_DB_TYPE=postgres \
-  FERRUM_DB_URL=postgres://ferrum:pass@db-host/ferrum_db \
-  ./ferrum-edge-new
-
 FERRUM_MODE=cp \
   FERRUM_DB_TYPE=postgres \
-  FERRUM_DB_URL=postgres://ferrum:pass@db-host/ferrum_db \
+  FERRUM_DB_URL=postgres://ferrum:pass@db-host/ferrum_db_new \
   FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:50051 \
   FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
   FERRUM_CP_DP_GRPC_JWT_SECRET=change-me-to-a-32-character-grpc-secret \
@@ -972,12 +1050,20 @@ FERRUM_MODE=dp \
   ./ferrum-edge-new
 ```
 
-#### 5. Rollback Path
+#### 5. Rollback path
 
-- **DP rollback**: Stop the new DP binary, restart the old one. It reconnects to the CP and gets the current config via gRPC. DPs are stateless — rollback is instant.
-- **CP rollback**: Stop the new CP, restore the database from backup (step 1), restart the old CP. All DPs will reconnect and receive the old config. During the CP restart, DPs serve cached config.
+- **DP rollback**: Stop the new DP binary, restart the old one. It reconnects to
+  the CP and gets the current config via gRPC. DPs are stateless — rollback is
+  instant when the CP still serves a compatible config generation.
+- **CP rollback**: Stop the new CP, repoint the **old** CP binary at the
+  **original, untouched CP database** (the one exported in step 1), and restart.
+  Do not point the old CP at the fresh `ferrum_db_new` database. During the CP
+  restart, DPs serve cached config.
 
-> **Note**: If the new CP has already broadcast a migrated config to DPs, rolling back the CP means DPs will receive the old-schema config on reconnect. Since DPs are always overwritten by the CP's config on connect, this is safe — the old config format replaces whatever the DP had cached.
+> **Note**: DPs always overwrite their cache from the CP on reconnect. Rolling
+> back the CP database to the pre-upgrade instance therefore pushes the prior
+> config shape to DPs again; that is the supported rollback path during
+> build-out, not binary-only rollback against a changed baseline.
 
 ---
 
@@ -1058,17 +1144,21 @@ FERRUM_MODE=file \
 ### Pre-Upgrade Checklist
 
 - [ ] Read [Breaking Changes Since 0.9.0](#breaking-changes-since-090) and the release notes for breaking changes, deprecated fields, and new required fields
-- [ ] Back up your database (database/CP modes) or config file (file mode)
+- [ ] For database/CP modes during build-out: plan a
+      [fresh-database rebuild](#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb)
+      (`GET /backup` → fresh `V001` baseline → `POST /restore`); keep the old
+      database for rollback
+- [ ] Back up your config file (file mode) or export every namespace with
+      `GET /backup` (database/CP modes)
 - [ ] Back up your `ferrum.conf` if you use one — new versions may add env vars with different defaults
-- [ ] Use `GET /backup` to capture a logical config snapshot (database/CP modes)
-- [ ] Run migrations in dry-run mode before applying
 - [ ] Validate the new version on non-production ports before cutting over
 
 ### Version Compatibility
 
 | Component | Forward Compatible? | Backward Compatible? |
 |-----------|-------------------|---------------------|
-| Database schema | Yes (auto-migrates forward) | No (old binary cannot read new schema) |
+| Database schema (build-out) | No — rebuild fresh DB + `POST /restore` | No — old binary + old DB only |
+| Database schema (post-freeze tagged releases) | Yes (versioned forward migrations) | No (old binary cannot read new schema) |
 | Config file format | Yes (auto-migrates in memory) | Depends on version gap |
 | gRPC protocol (CP↔DP) | Same major.minor required (enforced at connect time) | Same major.minor required |
 | Admin API | Generally stable | Check release notes |
@@ -1077,7 +1167,7 @@ FERRUM_MODE=file \
 
 | Mode | Upgrade Downtime | With Load Balancer |
 |------|-----------------|-------------------|
-| Database (single instance) | Brief (binary restart) | Near-zero (drain + restart) |
+| Database (single instance) | Brief (cutover to fresh DB) | Near-zero (drain + restart) |
 | CP/DP | Zero for API consumers | Zero (rolling DP restart) |
 | File (single instance) | Brief (binary restart) | Near-zero (drain + restart) |
 

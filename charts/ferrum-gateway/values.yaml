@@ -344,6 +344,14 @@ dp:
   # 0 disables primary-CP retry and is rendered explicitly; "" (or null) omits the
   # env and takes the binary's 300s default.
   failoverPrimaryRetrySeconds: ""
+  # Maximum applied-snapshot age while every CP is unreachable
+  # (FERRUM_DP_CONFIG_MAX_STALE_SECONDS). 0 disables the bound (unsafe); "" (or
+  # null) omits the env and takes the binary's 3600s default.
+  configMaxStaleSeconds: ""
+  # What happens to new traffic at the bound (FERRUM_DP_CONFIG_STALE_ACTION).
+  # Accepted values: fail_closed (default) or readiness_only. "" (or null)
+  # omits the env and takes the binary's fail_closed default.
+  configStaleAction: ""
   # In-container path to an externally issued CP/DP bearer token
   # (FERRUM_DP_CP_GRPC_TOKEN_FILE). When set, this DP presents that token instead
   # of minting one, so it holds no signing key and cannot forge an authorization

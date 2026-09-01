@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`ferrum-gateway` exposes the DP stale-config fence** (issue #4438). Data
+  plane installs can set `dp.configMaxStaleSeconds` and
+  `dp.configStaleAction`, which render `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` and
+  `FERRUM_DP_CONFIG_STALE_ACTION` with the same defaults as the binary (3600 /
+  `fail_closed`). Architecture, README, FEATURES, and Kubernetes deployment docs
+  now describe the one-hour fail-closed bound when every CP is lost.
+  **BREAKING (chart)**: both variables are now reserved, so supplying them —
+  or any `_VAULT`/`_AWS`/`_AZURE`/`_GCP`/`_FILE` suffixed form — through `env:`
+  or `extraEnv:` fails template rendering. Move existing overrides to the new
+  values; see [docs/upgrade_guide.md](docs/upgrade_guide.md).
 ### Fixed
 
 - **BREAKING — HTTP-family `backend_write_timeout_ms` again terminates a POST to
@@ -48,6 +60,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   case.
 
 ### Security
+
+- **WAF inspects UTF-32LE/UTF-32BE request bodies** (issue #4455). A body
+  admitted by the existing content-type gates whose `charset` is `utf-32`,
+  `utf-32le`, or `utf-32be`, or that carries a UTF-32 BOM, is transcoded
+  into the same UTF-8 inspection view UTF-16 already uses, then scanned by
+  level-1 body rules. A bare `charset=utf-32` or `charset=utf-16` with no
+  BOM does not invent an endianness; both endiannesses are decoded and each
+  successful view is scanned, plus the existing raw/lossy view. UTF-32 BOMs
+  are recognized before UTF-16 BOMs so a UTF-32LE BOM (`FF FE 00 00`) is
+  not misdecoded as UTF-16LE; because that prefix is equally a UTF-16LE BOM
+  followed by `U+0000`, both readings are scanned unless the charset names
+  the UTF-32 family. Malformed, truncated, surrogate-range, or
+  out-of-range UTF-32 is not partially decoded; it retains the existing
+  raw/lossy scan. **Operator-visible**: a previously forwarded UTF-32
+  encoding of a blocked L1 payload (for example `UNION SELECT` as
+  `charset=utf-32le`, or the same payload as bare `charset=utf-32` /
+  `charset=utf-16` with no BOM) now returns 403 under the recommended
+  `mode: enforce` / `paranoia_level: 1` pack. Body content-type, multipart,
+  and binary gates are unchanged. **Operator action**: review WAF monitor
+  logs for the new UTF-32 / dual-endian body matches before using
+  `default_rule_action: enforce` if application payloads legitimately use
+  UTF-16 or UTF-32 and contain attack-shaped tokens.
 
 - **BREAKING — HTTP/2 and HTTP/3 requests without `:authority` or Host are rejected with 400**
   (issue #4416). RFC 9113 §8.3.1 and RFC 9114 §4.3.1 require a request to
@@ -146,12 +180,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **BREAKING — backend mTLS handshake without a client certificate is
+  pre-wire, not `connection_reset`** (issue #4406). An HTTPS origin that
+  requires a client certificate previously classified as post-wire
+  `connection_reset` (OpenSSL RST) or the `request_error` catch-all
+  (reqwest HTTP/1: hyper `Canceled`, no rustls in the request chain).
+  Typed rustls handshake / certificate / alert errors still classify as
+  `tls_error`. On the live reqwest path the rustls error dies with the
+  connection future, so that case is `connection_pool_error` — the same
+  hyper `is_canceled` pre-wire class as pooled H2 / gRPC
+  `DispatchCanceled` (issue #3578). Classification keys on the typed
+  flag, not the `"connection was not ready"` Display label. Connect-phase
+  RST/refused with no rustls still collapses to `connection_refused`.
+  Mid-stream RST with no handshake rustls stays `connection_reset`.
+  Omitted `close_notify` stays `connection_closed` (#4051).
+  HTTPS-to-plaintext stays `tls_error` (#4053). **Operator action**:
+  retarget alerts that grepped `error_class=connection_reset` or
+  `X-Gateway-Error: backend_error` for this misconfig onto `tls_error` /
+  `connection_pool_error` / `connection_failure`.
+  `retry_on_connect_failure` now replays regardless of method. The
+  circuit breaker charges the **connect-error** path
+  (`trip_on_connection_errors`, default on) instead of the 502-status /
+  post-wire reset path; operators who set
+  `trip_on_connection_errors: false` will no longer trip on this
+  handshake via a 502 in `failure_status_codes`. Passive health still
+  records a backend failure. Plugin outbound HTTP
+  (`FERRUM_PLUGIN_HTTP_MAX_RETRIES`) retries `connection_pool_error` on
+  GET/HEAD/OPTIONS so a hyper `is_canceled` drop still replays; that
+  list is not identical to `request_reached_wire`.
+
 - **Identity-only NodeWaypoint assertion grants require ambient enrollment.**
   Kubernetes pod discovery no longer lets a same-node identity-only pod
   enter a NodeWaypoint's HBONE assertion inventory merely by sharing that
   node. The pod must pass the node-agent ambient enrollment predicate
   (`ferrum.io/mesh: enabled` or `ferrum.io/inject: true`, and not
   host-network, sidecar-injected, or an excluded namespace).
+- **HTTP/3 graceful shutdown sends GOAWAY** (issue #4429). The H3 listener
+  already stopped accepting new QUIC handshakes on SIGTERM, but each accepted
+  connection was spawned without a shutdown receiver, never sent HTTP/3 GOAWAY,
+  and was later closed with QUIC application code `0`, which reset in-flight
+  streams. Each connection now clones the process shutdown watch, calls the
+  vendored `h3::server::Connection::shutdown(0)` API so the peer receives
+  GOAWAY, refuses new request streams with `H3_REQUEST_REJECTED`, and lets
+  already-accepted work finish — including gRPC trailers, RFC 9220 WebSocket
+  close frames, and CONNECT-UDP relays. After drain completes or
+  `FERRUM_SHUTDOWN_DRAIN_SECONDS` expires, remaining connections close with
+  `H3_NO_ERROR` (`0x0100`). `FERRUM_SHUTDOWN_DRAIN_SECONDS` semantics are
+  unchanged. **Operator action**: none; planned restarts now drain HTTP/3 the
+  same way as HTTP/1.1 and HTTP/2.
 
 - **Injector inbound capture excludes kubelet HTTP and TCP probe ports**
   (issue #4431). `startupProbe` / `readinessProbe` / `livenessProbe` `httpGet`
@@ -223,6 +299,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   advisories, bans, and sources (issue #4439). The `[licenses]` allowlist and
   confidence threshold in `deny.toml` are blocking on every PR and in the weekly
   `dependency-audit` workflow.
+- Document build-out database upgrades as export → fresh `V001` baseline →
+  `POST /restore`, not in-place schema migration (issue #4437). The upgrade guide
+  previously described cloning the production database and applying pending core
+  migrations, which contradicts the baseline-only build-out policy and checksum
+  refusal for changed `V001` digests. **Operator action**: during build-out,
+  follow
+  [upgrade_guide.md → Build-Out Database Upgrade](docs/upgrade_guide.md#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb),
+  keep the old database for rollback, and do not rely on binary-only rollback
+  against a database that received a new baseline.
 
 - **BREAKING — injected Ferrum is a Kubernetes native sidecar**
   (issue #4430). The webhook now emits `ferrum-edge` under `spec.initContainers`

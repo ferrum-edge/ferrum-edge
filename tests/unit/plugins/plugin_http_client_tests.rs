@@ -361,6 +361,32 @@ async fn test_execute_retries_safe_method_transport_failures() {
     server_task.await.unwrap();
 }
 
+#[test]
+fn test_plugin_http_retries_connection_pool_error() {
+    // Issue #4406: hyper is_canceled is ConnectionPoolError (pre-wire).
+    // Moving that case off ConnectionReset would drop plugin HTTP retries
+    // unless this predicate includes the new class. The live drop-server
+    // test keeps the expected attempt count at 3; this locks the arm.
+    let production = production_plugin_http_client_source();
+    let retry_pred = function_region(
+        production,
+        "fn is_retryable_transport_error(",
+        "impl Default for PluginHttpClient {",
+    );
+    let uncommented = uncommented_lines(retry_pred).join("\n");
+    assert!(
+        uncommented.contains("ErrorClass::ConnectionPoolError"),
+        "plugin HTTP must retry ConnectionPoolError (hyper is_canceled)"
+    );
+    assert!(
+        !ferrum_edge::retry::request_reached_wire(
+            ferrum_edge::retry::ErrorClass::ConnectionPoolError
+        ),
+        "ConnectionPoolError must stay pre-wire so retry_on_connect_failure \
+         and the plugin predicate agree on this class"
+    );
+}
+
 #[tokio::test]
 async fn test_execute_does_not_retry_http_status_failures() {
     let mock_server = MockServer::start().await;

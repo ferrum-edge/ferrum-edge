@@ -133,8 +133,9 @@ cost of more false positives. Loud rules retuned to `paranoia_min: 2` or `3`
 Attackers hide payloads behind encodings a raw-byte scan never sees. Before
 matching request and response bodies, the WAF also scans **decoded variants**:
 
-- UTF-16LE / UTF-16BE request bodies admitted by the body content-type gates,
-  using an explicit `charset` or a byte-order mark
+- UTF-16LE / UTF-16BE and UTF-32LE / UTF-32BE request bodies admitted by the
+  body content-type gates, using an explicit `charset` or a byte-order mark
+  (bare `utf-16` / `utf-32` without a BOM tries both endiannesses)
 - JSON / JavaScript unicode escapes — `\uXXXX`, `\u{...}`, `\xXX`
 - HTML entities — `&lt;`, `&#60;`, `&#x3c;`
 - Percent-encoding and `+`-as-space (form bodies)
@@ -145,14 +146,33 @@ So a `<script>` written as `<script>`, `&lt;script&gt;`, or
 escape decoders are content-type-agnostic (an attacker controls the declared
 `Content-Type`) and bounded to a small number of variants.
 
-UTF-16 transcoding does **not** decide whether a request body is scanned. The
-existing `body_content_types`, `inspect_multipart`, and `inspect_binary_body`
-gates run first and remain authoritative; an excluded body is not admitted
-merely because it declares a UTF-16 charset or carries a BOM. For an admitted
-body, UTF-8 continues to borrow the buffered bytes without allocating, while a
-valid UTF-16 view is allocated only within the already-applied
-`max_scan_bytes` bound. Malformed or truncated UTF-16 is never partially
-decoded or allowed to panic; it retains the existing raw/lossy inspection view.
+UTF-16 / UTF-32 transcoding does **not** decide whether a request body is
+scanned. The existing `body_content_types`, `inspect_multipart`, and
+`inspect_binary_body` gates run first and remain authoritative; an excluded
+body is not admitted merely because it declares a UTF-16 or UTF-32 charset or
+carries a BOM. For an admitted body, UTF-8 continues to borrow the buffered
+bytes without allocating, while a valid UTF-16 or UTF-32 view is allocated
+only within the already-applied `max_scan_bytes` bound. UTF-32 BOMs
+(`FF FE 00 00` little-endian, `00 00 FE FF` big-endian) are recognized
+**before** the 2-byte UTF-16 BOMs, because a UTF-32LE BOM also starts with
+the UTF-16LE mark `FF FE`. That prefix is genuinely ambiguous — it is a
+UTF-32LE BOM, and equally a UTF-16LE BOM followed by `U+0000` — so unless the
+charset names the UTF-32 family, **both** readings are scanned along with the
+raw/lossy view. Unicode makes UTF-32LE the correct decode, but a backend
+without UTF-32 support reads the same bytes as UTF-16LE, and committing to
+one reading would leave the other unscanned. A charset that does name UTF-32
+(`utf-32`, `utf-32le`, `utf-32be`) settles the width, and only the UTF-32
+reading is used. `00 00 FE FF` is not a UTF-16 BOM prefix and is
+unambiguous. Bare `charset=utf-16` / `charset=utf-32` with no
+BOM does not invent an endianness (IANA leaves both unspecified without a
+BOM). Both little-endian and big-endian decodes are attempted; each view
+that decodes cleanly is scanned by the request-body rules, and the existing
+raw/lossy view is still scanned. If neither endianness decodes, only the
+raw/lossy view remains. Malformed or truncated UTF-16 or UTF-32 — including
+a length that is not a multiple of the code-unit size, code units in the
+surrogate range `U+D800..=U+DFFF`, or UTF-32 units above `U+10FFFF` — is
+never partially decoded or allowed to panic; that endian is omitted and the
+raw/lossy inspection view is retained.
 
 Query matching is per decoded parameter value, not the raw whole URI. Query
 **values** (each `&`/`=`-split component — never the structural delimiters,

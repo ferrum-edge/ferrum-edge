@@ -589,6 +589,12 @@ readinessProbe:
 
 In DP mode, the pod can start before the Control Plane pushes config. The `httpGet` probe on `/health` will succeed once the admin API is listening, even before config is received. For most deployments this is acceptable — the DP returns 404 for unrouted paths until config arrives.
 
+#### Bounded stale config while every CP is lost
+
+A data plane keeps serving its last **applied** CP snapshot during control-plane outages, but that window is bounded. When **every** CP is unreachable and the applied snapshot reaches `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` (default **3600**), `/health` reports `ready: false` with `status: "unavailable"` so Kubernetes stops steering new traffic to the pod. Under the default `FERRUM_DP_CONFIG_STALE_ACTION=fail_closed`, new HTTP/1.1, HTTP/2, HTTP/3, TCP, UDP-session, and DTLS-session admissions are refused at the proxy boundary while already-accepted connections and in-flight requests drain normally. Partial CP loss (another CP remains authoritative) and successful multi-CP failover do **not** trigger the fence — only total CP authority loss combined with an aged applied snapshot does. Setting the bound to `0` restores unbounded serving as an explicit, deliberately unsafe opt-in.
+
+The `ferrum-gateway` chart exposes these as `dp.configMaxStaleSeconds` and `dp.configStaleAction` (omitted values keep the binary defaults above). Authenticated `/health` includes a fixed-cardinality `dp_config` object for operators who need the live reason and counters. See [cp_dp_mode.md](cp_dp_mode.md#bounded-last-known-good-configuration-age) for the full semantics, recovery requirements, and metrics.
+
 If your deployment requires at least one proxy before the pod becomes ready, use a sidecar or init container with curl to inspect the health response body:
 
 ```yaml
@@ -1038,6 +1044,11 @@ env:
   #   value: "https://cp-east:50051,https://cp-west:50051,https://cp-central:50051"
   # - name: FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS
   #   value: "300"
+  # Stale-config fence (chart: dp.configMaxStaleSeconds / dp.configStaleAction):
+  # - name: FERRUM_DP_CONFIG_MAX_STALE_SECONDS
+  #   value: "3600"
+  # - name: FERRUM_DP_CONFIG_STALE_ACTION
+  #   value: "fail_closed"
   - name: FERRUM_CP_DP_GRPC_JWT_SECRET
     valueFrom:
       secretKeyRef:

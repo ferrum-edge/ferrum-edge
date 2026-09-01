@@ -27,13 +27,20 @@ pub enum ErrorClass {
     ConnectionTimeout,
     /// TCP connect was refused by the backend (port not listening, firewall RST).
     ConnectionRefused,
-    /// TCP connection was reset by the backend (RST received mid-stream).
+    /// TCP connection was reset by the backend (RST received mid-stream,
+    /// after TLS handshake if any). A handshake that fails *after* TCP
+    /// connect is [`Self::TlsError`], not this class.
     ConnectionReset,
     /// TCP connection was closed cleanly by the backend before a response was sent.
     ConnectionClosed,
     /// DNS resolution failed — the backend hostname could not be resolved.
     DnsLookupError,
-    /// TLS handshake failed (certificate error, protocol mismatch, etc.).
+    /// TLS handshake failed (certificate error, protocol mismatch, missing
+    /// client certificate, ALPN, alert) when a typed `rustls::Error` is in
+    /// the chain. Pre-wire: nothing reached the origin's application layer.
+    /// Missing `close_notify` is teardown, not this class. A reqwest
+    /// handshake failure that hyper reports only as `is_canceled` (no rustls
+    /// on the request) is [`Self::ConnectionPoolError`] (issue #4406).
     TlsError,
     /// Backend read/write timed out — connection was established but the
     /// response was not received within the configured timeout.
@@ -60,6 +67,8 @@ pub enum ErrorClass {
     /// Request body exceeded the configured maximum size.
     RequestBodyTooLarge,
     /// Could not acquire or create an HTTP client from the connection pool.
+    /// Also the reqwest/H1 mapping of hyper `is_canceled` (the request was
+    /// never dispatched; issue #3578 / #4406).
     ConnectionPoolError,
     /// All ephemeral ports are exhausted — the OS returned EADDRNOTAVAIL.
     PortExhaustion,
@@ -458,26 +467,30 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
 /// 2. `tokio_tungstenite::tungstenite::Error` — `ConnectionClosed` /
 ///    `AlreadyClosed` → `GracefulRemoteClose`; `Protocol(_)` → `ProtocolError`.
 ///    Other variants (Io / Tls / Http / Url) wrap typed sources we keep walking.
-/// 3. `rustls::Error` — any rustls error in the chain → `TlsError`. Mirrors
-///    the [`crate::proxy::http2_pool::classify_chain_from`] template; since
+/// 3. `rustls::Error` — classified by [`classify_rustls_error`]. Handshake
+///    variants (certificate, ALPN, handshake alert) are always `TlsError`.
+///    Post-handshake record-layer failures stay `ConnectionReset` when
+///    `phase_is_connect` is false. Mirrors the
+///    [`crate::proxy::http2_pool::classify_chain_from`] template; since
 ///    every TLS path in the gateway flows through rustls, this catches
 ///    handshake / cert / alert errors without needing the lowercase `"tls"`
 ///    substring fallback that previously matched too aggressively.
 /// 4. `std::io::Error` — kind / `raw_os_error == EADDRNOTAVAIL` → port
-///    exhaustion / connect / reset / closed / timeout. `phase_is_connect`
-///    collapses connect-phase RSTs into `ConnectionRefused` so the unified
-///    `request_reached_wire` boundary stays consistent (a SYN-RST'd
-///    connection is functionally `ECONNREFUSED`, not a mid-stream reset).
-///    That collapse is skipped when a `rustls::Error` sits under the
-///    `io::Error`: TCP connected and the handshake then failed, so the
-///    class is `TlsError` (connect) / `ConnectionReset` (post-connect),
-///    not "refused". `UnexpectedEof` with rustls's missing-`close_notify`
-///    wording is `ConnectionClosed` (teardown, not handshake) and is
-///    matched *before* the typed rustls walk so a rustls payload cannot
-///    steal it as `TlsError`. Other post-connect `UnexpectedEof` maps to
-///    `ConnectionClosed` (backend FIN before a complete body).
+///    exhaustion / connect / reset / closed / timeout. Three-way boundary:
+///    (a) connect-phase RST with no rustls → `ConnectionRefused` (a SYN-RST
+///    is functionally `ECONNREFUSED`); (b) rustls handshake after TCP
+///    connected → `TlsError`, even when `phase_is_connect` is false
+///    because reqwest's `is_connect()` is TCP-only; (c) mid-stream RST
+///    with no handshake rustls → `ConnectionReset`. `UnexpectedEof` with
+///    rustls's missing-`close_notify` wording is `ConnectionClosed`
+///    (teardown, not handshake) and is matched *before* the typed rustls
+///    walk so a rustls payload cannot steal it as `TlsError`. Other
+///    post-connect `UnexpectedEof` maps to `ConnectionClosed` (backend
+///    FIN before a complete body).
 /// 5. `hyper::Error` — `is_timeout` → `ReadWriteTimeout`;
-///    `is_incomplete_message` → `ConnectionClosed`.
+///    `is_canceled` → `ConnectionPoolError` (request never dispatched;
+///    hyper 1.9 contract, issue #3578); `is_incomplete_message` →
+///    `ConnectionClosed`.
 ///
 /// Returns `None` only when the entire chain is exhausted with no typed
 /// match — callers fall back to substring matching at that point.
@@ -606,27 +619,8 @@ fn classify_typed_chain(
                 _ => {}
             }
         }
-        if err.downcast_ref::<rustls::Error>().is_some() {
-            // `rustls::Error` covers both setup-phase failures (handshake
-            // alert, certificate verify) AND post-connect record-layer
-            // failures (decrypt error, mid-stream alert, peer protocol
-            // violation). Phase-gate the class so post-connect rustls
-            // errors don't end up pre-wire — `request_reached_wire(TlsError)
-            // == false` would let `retry_on_connect_failure` replay a
-            // non-idempotent request whose bytes may already have crossed
-            // the wire under the encrypted channel. `ConnectionReset`
-            // (post-wire / mid-stream transport failure) is the closest
-            // semantic fit for a post-handshake TLS record failure: the
-            // encrypted channel can't be recovered and either side will
-            // tear down the TCP connection. Setup-phase contexts
-            // (`phase_is_connect=true`, exercised by
-            // `classify_reqwest_error::is_connect()` and the H2/H3 pool
-            // setup classifiers) keep the historical `TlsError` mapping.
-            return Some(if phase_is_connect {
-                ErrorClass::TlsError
-            } else {
-                ErrorClass::ConnectionReset
-            });
+        if let Some(rustls_err) = err.downcast_ref::<rustls::Error>() {
+            return Some(classify_rustls_error(rustls_err, phase_is_connect));
         }
         if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
             if matches!(io_err.raw_os_error(), Some(99) | Some(49) | Some(10049)) {
@@ -634,7 +628,7 @@ fn classify_typed_chain(
             }
             // Peer TCP FIN without TLS `close_notify` is ordinary teardown
             // (Python `ssl`, many clients), not a handshake failure. Check
-            // it *before* `rustls_error_in_chain`: a rustls payload in
+            // it *before* `rustls_error_from_chain`: a rustls payload in
             // `get_ref()` would otherwise steal this as `TlsError` /
             // `ConnectionReset` and override the close-notify substring
             // (the same class of bug as typing DNS over an egress-policy
@@ -648,17 +642,15 @@ fn classify_typed_chain(
             // rustls often surfaces as `io::Error` wrapping `rustls::Error`
             // in `get_ref()`. `source()` skips that payload and returns
             // the inner error's source instead. Walk `get_ref()` *before*
-            // mapping the io kind: a TLS handshake that fails after TCP
-            // connect can look like `ConnectionReset` ("peer closed the
-            // TLS record layer") and must not take the connect-phase RST
-            // → `ConnectionRefused` collapse. Distinguish by typed rustls
-            // presence, not by string matching on "tls" / "refused".
-            if rustls_error_in_chain(io_err as &(dyn std::error::Error + 'static)) {
-                return Some(if phase_is_connect {
-                    ErrorClass::TlsError
-                } else {
-                    ErrorClass::ConnectionReset
-                });
+            // mapping the io kind so the three-way boundary can run:
+            // handshake rustls → `TlsError`; post-handshake rustls →
+            // `ConnectionReset`; no rustls + connect-phase RST →
+            // `ConnectionRefused`. Typed rustls only — no Display match
+            // on "tls" / "refused".
+            if let Some(rustls_err) =
+                rustls_error_from_chain(io_err as &(dyn std::error::Error + 'static))
+            {
+                return Some(classify_rustls_error(rustls_err, phase_is_connect));
             }
             match io_err.kind() {
                 std::io::ErrorKind::TimedOut => {
@@ -672,9 +664,12 @@ fn classify_typed_chain(
                     return Some(ErrorClass::ConnectionRefused);
                 }
                 std::io::ErrorKind::ConnectionReset => {
-                    // Connect-phase RST is functionally ECONNREFUSED. See
-                    // CLAUDE.md "Connect-phase RST classification rule" and
-                    // `classify_reqwest_error`'s is_connect() branch.
+                    // Three-way boundary, case (a): connect-phase RST with
+                    // no rustls is functionally ECONNREFUSED. Handshake
+                    // rustls was already classified above. A post-connect
+                    // RST with no rustls stays ConnectionReset (case c) —
+                    // some mTLS stacks RST without an alert, and that is
+                    // indistinguishable from a mid-stream RST.
                     return Some(if phase_is_connect {
                         ErrorClass::ConnectionRefused
                     } else {
@@ -702,6 +697,13 @@ fn classify_typed_chain(
             if hyper_err.is_timeout() {
                 return Some(ErrorClass::ReadWriteTimeout);
             }
+            if hyper_err.is_canceled() {
+                // hyper 1.9 contract (issue #3578 rejected a downgrade): the
+                // request was never dispatched. Same class as pooled H2 /
+                // gRPC DispatchCanceled. Typed `is_canceled` only — do not
+                // match Display text such as "connection was not ready".
+                return Some(ErrorClass::ConnectionPoolError);
+            }
             if hyper_err.is_incomplete_message() {
                 return Some(ErrorClass::ConnectionClosed);
             }
@@ -726,10 +728,17 @@ fn classify_typed_chain(
 /// RST collapse would label a TLS handshake failure as
 /// `ConnectionRefused`.
 pub(crate) fn rustls_error_in_chain(e: &(dyn std::error::Error + 'static)) -> bool {
+    rustls_error_from_chain(e).is_some()
+}
+
+/// First `rustls::Error` in `e`'s chain, including `io::Error::get_ref()`.
+fn rustls_error_from_chain<'a>(
+    e: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a rustls::Error> {
     let mut current = Some(e);
     while let Some(err) = current {
-        if err.downcast_ref::<rustls::Error>().is_some() {
-            return true;
+        if let Some(rustls_err) = err.downcast_ref::<rustls::Error>() {
+            return Some(rustls_err);
         }
         if let Some(io_err) = err.downcast_ref::<std::io::Error>()
             && let Some(inner) = io_err.get_ref()
@@ -739,7 +748,79 @@ pub(crate) fn rustls_error_in_chain(e: &(dyn std::error::Error + 'static)) -> bo
         }
         current = err.source();
     }
-    false
+    None
+}
+
+/// Map a typed rustls error onto the three-way connect / handshake / reset
+/// boundary.
+///
+/// * Handshake-class rustls (certificate, ALPN, handshake alert, incomplete
+///   handshake) is always [`ErrorClass::TlsError`]. reqwest's `is_connect()`
+///   is TCP-only, so a backend that rejects a missing client certificate
+///   after TCP connect still lands here with `phase_is_connect = false`
+///   (issue #4406).
+/// * `AlertReceived(CloseNotify)` is teardown, not handshake — same class
+///   as omitted `close_notify` (#4051): [`ErrorClass::ConnectionClosed`].
+/// * Other rustls (decrypt, oversized record, mid-stream alert) stays
+///   [`ErrorClass::TlsError`] during connect/setup and
+///   [`ErrorClass::ConnectionReset`] after the handshake, so
+///   `retry_on_connect_failure` cannot replay a request whose bytes may
+///   already have crossed the encrypted channel.
+fn classify_rustls_error(err: &rustls::Error, phase_is_connect: bool) -> ErrorClass {
+    if matches!(
+        err,
+        rustls::Error::AlertReceived(rustls::AlertDescription::CloseNotify)
+    ) {
+        return ErrorClass::ConnectionClosed;
+    }
+    if phase_is_connect || rustls_error_is_handshake(err) {
+        ErrorClass::TlsError
+    } else {
+        ErrorClass::ConnectionReset
+    }
+}
+
+/// Typed handshake / certificate / ALPN rustls variants. Not Display text.
+fn rustls_error_is_handshake(err: &rustls::Error) -> bool {
+    use rustls::AlertDescription as Alert;
+    use rustls::Error::*;
+    match err {
+        InappropriateHandshakeMessage { .. }
+        | InvalidEncryptedClientHello(_)
+        | NoCertificatesPresented
+        | UnsupportedNameType
+        | PeerIncompatible(_)
+        | InvalidCertificate(_)
+        | InvalidCertRevocationList(_)
+        | HandshakeNotComplete
+        | NoApplicationProtocol => true,
+        AlertReceived(alert) => matches!(
+            *alert,
+            Alert::HandshakeFailure
+                | Alert::NoCertificate
+                | Alert::BadCertificate
+                | Alert::UnsupportedCertificate
+                | Alert::CertificateRevoked
+                | Alert::CertificateExpired
+                | Alert::CertificateUnknown
+                | Alert::UnknownCA
+                | Alert::AccessDenied
+                | Alert::CertificateRequired
+                | Alert::NoApplicationProtocol
+                | Alert::UnrecognisedName
+                | Alert::ProtocolVersion
+                | Alert::InsufficientSecurity
+                | Alert::InappropriateFallback
+                | Alert::MissingExtension
+                | Alert::UnsupportedExtension
+                | Alert::CertificateUnobtainable
+                | Alert::BadCertificateStatusResponse
+                | Alert::BadCertificateHashValue
+                | Alert::UnknownPSKIdentity
+                | Alert::EncryptedClientHelloRequired
+        ),
+        _ => false,
+    }
 }
 
 /// Pre-dial refusal emitted by `proxy::connect_websocket_backend` when the
@@ -1058,21 +1139,42 @@ pub fn reqwest_error_is_protocol_nack(e: &reqwest::Error) -> bool {
 ///
 /// Called on the error path only.
 ///
+/// **Connect / handshake / cancel / reset boundary.** reqwest's
+/// `is_connect()` is TCP-only. After TCP succeeds, a TLS handshake failure
+/// is still pre-wire. The cases:
+///
+/// 1. **Connect-phase TCP** (`is_connect() = true`, no rustls): RST /
+///    refused collapse to `ConnectionRefused` (a RST'd SYN is
+///    ECONNREFUSED). Unchanged.
+/// 2. **Handshake-phase** (typed `rustls::Error` handshake / cert / alert
+///    in the chain): `TlsError`, whether or not `is_connect()` is set.
+/// 3. **Pool cancel** (`hyper::Error::is_canceled()`, no rustls):
+///    `ConnectionPoolError`. Live backend-mTLS on the reqwest HTTP/1 path
+///    lands here: hyper-util completes the connector, the connection
+///    future then dies (TLS 1.3 post-handshake `CertificateRequired`),
+///    and the queued request is canceled with no rustls in the chain
+///    (issue #4406). Typed `is_canceled` only — not Display text.
+/// 4. **Post-handshake mid-stream** (`is_connect() = false`, no handshake
+///    rustls, not canceled): RST stays `ConnectionReset`. An origin that
+///    RSTs during handshake *without* rustls or `is_canceled` is
+///    indistinguishable from this case and stays `ConnectionReset`.
+///
 /// **Order:**
 /// 1. Port-exhaustion typed walk via [`is_port_exhaustion`].
 /// 2. `is_connect()` branch — pre-wire by construction:
 ///    - `is_timeout()` → `ConnectionTimeout`.
 ///    - [`classify_typed_chain`] with `phase_is_connect = true`. Connect-phase
 ///      RSTs collapse to `ConnectionRefused` unless a `rustls::Error` is in
-///      `io::Error::get_ref()` (then `TlsError` — TCP connected, handshake
-///      failed). rustls errors become `TlsError`; io errors map per-kind.
-///      Every class here MUST satisfy `request_reached_wire == false` so
+///      `io::Error::get_ref()` (then handshake `TlsError`, or post-handshake
+///      rustls still `TlsError` because this branch is setup). Every class
+///      here MUST satisfy `request_reached_wire == false` so
 ///      `retry_on_connect_failure` fires.
 ///    - DNS substring fallback (no typed DNS error from reqwest/hyper-util).
 ///    - Generic refused fallback.
 /// 3. `is_timeout()` (post-connect) → `ReadWriteTimeout`.
-/// 4. [`classify_typed_chain`] with `phase_is_connect = false` — mid-stream
-///    classification.
+/// 4. [`classify_typed_chain`] with `phase_is_connect = false` — handshake
+///    rustls still `TlsError` (case 2); hyper `is_canceled` is
+///    `ConnectionPoolError` (case 3); other mid-stream classification.
 /// 5. HTTP/2 protocol-error substring fallback (`h2` / `GOAWAY` / `RESET_STREAM`).
 pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
     if is_port_exhaustion(e) {
@@ -1135,7 +1237,9 @@ pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
         return ErrorClass::ReadWriteTimeout;
     }
 
-    // Mid-stream / post-connect: walk typed chain for io/hyper/rustls.
+    // Post-TCP: handshake rustls is still TlsError (reqwest is_connect()
+    // is TCP-only). hyper is_canceled is ConnectionPoolError (pre-wire,
+    // no rustls on this request). Other typed io/hyper/rustls is mid-stream.
     if let Some(class) = classify_typed_chain(StdError::source(e), false) {
         return class;
     }

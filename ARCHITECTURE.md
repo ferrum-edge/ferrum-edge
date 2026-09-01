@@ -407,11 +407,11 @@ Ferrum supports eight operating modes. The five core modes (Database, File, Cont
 
 ### **7.1 Data Source Resiliency**
 
-The gateway is designed to continue operating indefinitely when its data source becomes unavailable. Configuration is loaded into memory once and all request-path operations use the in-memory cache — no per-request database or file access.
+The gateway keeps serving from an in-memory configuration cache when its data source is temporarily unavailable. Database, file, and Control Plane modes can continue indefinitely with last-known-good config; **Data Plane mode is bounded** — once every Control Plane is lost and the last applied snapshot ages past `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` (default 3600), the DP becomes unready and refuses new traffic by default. Configuration is loaded into memory once and all request-path operations use that cache — no per-request database or file access.
 
 #### **How It Works**
 
-All modes store the active configuration in an `ArcSwap<GatewayConfig>` — a lock-free, atomically-swappable smart pointer. Every proxy request reads from this in-memory cache, never from the data source directly. Background tasks periodically attempt to refresh the config from the source, but failures only produce a log warning and never affect request handling.
+All modes store the active configuration in an `ArcSwap<GatewayConfig>` — a lock-free, atomically-swappable smart pointer. Every proxy request reads from this in-memory cache, never from the data source directly. Background tasks periodically attempt to refresh the config from the source. In database, file, and CP modes a refresh failure only produces a log warning and never affects request handling; in DP mode reconnects and CP failover preserve serving until total CP authority loss reaches the configured stale bound (see [docs/cp_dp_mode.md](docs/cp_dp_mode.md#bounded-last-known-good-configuration-age)).
 
 #### **Failure Behavior by Mode**
 
@@ -420,7 +420,7 @@ All modes store the active configuration in an `ArcSwap<GatewayConfig>` — a lo
 | **File** | YAML/JSON file | Config loaded once at startup. File can be deleted/corrupted afterward with zero impact. SIGHUP reload gracefully falls back to previous config on parse errors. |
 | **Database** | SQL database | Polling loop logs a warning and continues with cached config. Gateway serves traffic indefinitely with stale config until DB recovers. If `FERRUM_DB_FAILOVER_URLS` is configured, failover URLs are tried in order before marking the DB as unavailable. If `FERRUM_DB_READ_REPLICA_URL` is configured, polling reads are offloaded to the replica (falls back to primary if replica is unreachable). |
 | **Control Plane** | SQL database | Polling loop logs a warning. Does not broadcast stale updates to Data Planes. DPs retain their last known config. Admin API reads fall back to the in-memory cached config. |
-| **Data Plane** | Control Plane (gRPC) | Priority-ordered multi-CP failover (`FERRUM_DP_CP_GRPC_URLS`) with jittered exponential backoff (1s → 30s cap, ±25% jitter) between reconnect attempts. Continues serving traffic with cached config. Admin API reads served from cached config with `X-Data-Source: cached` header. |
+| **Data Plane** | Control Plane (gRPC) | Priority-ordered multi-CP failover (`FERRUM_DP_CP_GRPC_URLS`) with jittered exponential backoff (1s → 30s cap, ±25% jitter) between reconnect attempts. Serves the last **applied** snapshot while at least one CP remains authoritative or during intentional failover/reconnect handoffs. When **every** CP is lost and that snapshot reaches `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` (default 3600; `0` disables the bound as an explicit unsafe opt-in), readiness degrades (`/health` `ready: false`) and, under the default `FERRUM_DP_CONFIG_STALE_ACTION=fail_closed`, new HTTP/TCP/UDP/DTLS admissions are refused while in-flight work drains. `readiness_only` degrades readiness without blocking new traffic. Admin API reads served from cached config with `X-Data-Source: cached` header. See [docs/cp_dp_mode.md](docs/cp_dp_mode.md#bounded-last-known-good-configuration-age). |
 
 #### **Admin API Resilience**
 

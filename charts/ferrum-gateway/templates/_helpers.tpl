@@ -825,6 +825,18 @@ Validation: fail render on missing/unsafe configuration.
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- if eq $mode "dp" -}}
+{{/* Bounded stale-config fence (issue #3726 / #4438). */}}
+{{- $dpStale := .Values.dp | default dict -}}
+{{- $staleAction := $dpStale.configStaleAction | default "" | toString -}}
+{{- if and $staleAction (and (ne $staleAction "fail_closed") (ne $staleAction "readiness_only")) -}}
+{{- fail (printf "dp.configStaleAction must be 'fail_closed' or 'readiness_only', got %q" $staleAction) -}}
+{{- end -}}
+{{- $maxStale := $dpStale.configMaxStaleSeconds | default "" -}}
+{{- if and (ne ($maxStale | toString) "") (not (regexMatch "^[0-9]+$" ($maxStale | toString))) -}}
+{{- fail (printf "dp.configMaxStaleSeconds must be a non-negative integer, got %q" ($maxStale | toString)) -}}
+{{- end -}}
+{{- end -}}
 {{- if eq $mode "file" -}}
 {{- $file := .Values.file | default dict -}}
 {{- if and (not $file.inlineConfig) (not $file.existingConfigMap) -}}
@@ -984,7 +996,7 @@ Env assembly.
      probes, Services, ports, or Secret wiring from the running process, so both
      env passthroughs reject them. Keep this list the single source of truth. */}}
 {{- define "ferrum-gateway.reservedEnv" -}}
-FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRET FERRUM_CP_DP_GRPC_JWT_SECRET FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT FERRUM_DP_CP_GRPC_URLS FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS FERRUM_CP_GRPC_LISTEN_ADDR FERRUM_CP_NAMESPACES FERRUM_CP_REQUIRE_NAMESPACE_CLAIM FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH FERRUM_CP_DP_GRPC_JWT_KEY_ID FERRUM_DP_CP_GRPC_TOKEN_FILE FERRUM_FILE_CONFIG_PATH FERRUM_PROXY_HTTP_PORT FERRUM_PROXY_HTTPS_PORT FERRUM_ADMIN_HTTP_PORT FERRUM_ADMIN_HTTPS_PORT FERRUM_ADMIN_BIND_ADDRESS FERRUM_ADMIN_ALLOWED_CIDRS FERRUM_ALLOW_INSECURE_ADMIN_HTTP FERRUM_METRICS_BEARER_TOKEN FERRUM_METRICS_ALLOWED_CIDRS FERRUM_SHUTDOWN_DRAIN_SECONDS FERRUM_SHUTDOWN_PREDRAIN_SECONDS FERRUM_FRONTEND_TLS_CERT_PATH FERRUM_FRONTEND_TLS_KEY_PATH FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_ADMIN_TLS_CERT_PATH FERRUM_ADMIN_TLS_KEY_PATH FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_BACKEND_TLS_CLIENT_CERT_PATH FERRUM_BACKEND_TLS_CLIENT_KEY_PATH FERRUM_CP_GRPC_TLS_CERT_PATH FERRUM_CP_GRPC_TLS_KEY_PATH FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH FERRUM_DP_GRPC_TLS_CA_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH FERRUM_K8S_CONTROLLER_ENABLED FERRUM_K8S_POD_DISCOVERY_ENABLED FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM
+FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRET FERRUM_CP_DP_GRPC_JWT_SECRET FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT FERRUM_DP_CP_GRPC_URLS FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS FERRUM_DP_CONFIG_MAX_STALE_SECONDS FERRUM_DP_CONFIG_STALE_ACTION FERRUM_CP_GRPC_LISTEN_ADDR FERRUM_CP_NAMESPACES FERRUM_CP_REQUIRE_NAMESPACE_CLAIM FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH FERRUM_CP_DP_GRPC_JWT_KEY_ID FERRUM_DP_CP_GRPC_TOKEN_FILE FERRUM_FILE_CONFIG_PATH FERRUM_PROXY_HTTP_PORT FERRUM_PROXY_HTTPS_PORT FERRUM_ADMIN_HTTP_PORT FERRUM_ADMIN_HTTPS_PORT FERRUM_ADMIN_BIND_ADDRESS FERRUM_ADMIN_ALLOWED_CIDRS FERRUM_ALLOW_INSECURE_ADMIN_HTTP FERRUM_METRICS_BEARER_TOKEN FERRUM_METRICS_ALLOWED_CIDRS FERRUM_SHUTDOWN_DRAIN_SECONDS FERRUM_SHUTDOWN_PREDRAIN_SECONDS FERRUM_FRONTEND_TLS_CERT_PATH FERRUM_FRONTEND_TLS_KEY_PATH FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_ADMIN_TLS_CERT_PATH FERRUM_ADMIN_TLS_KEY_PATH FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_BACKEND_TLS_CLIENT_CERT_PATH FERRUM_BACKEND_TLS_CLIENT_KEY_PATH FERRUM_CP_GRPC_TLS_CERT_PATH FERRUM_CP_GRPC_TLS_KEY_PATH FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH FERRUM_DP_GRPC_TLS_CA_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH FERRUM_K8S_CONTROLLER_ENABLED FERRUM_K8S_POD_DISCOVERY_ENABLED FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM
 {{- end -}}
 
 {{- define "ferrum-gateway.modeEnv" -}}
@@ -1049,6 +1061,16 @@ FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRE
 - name: FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS
   value: {{ .Values.dp.failoverPrimaryRetrySeconds | quote }}
 {{- end }}
+{{/* Presence, not truthiness: configMaxStaleSeconds=0 disables the bound and
+     must render; empty string means "unset" (binary 3600s default). */}}
+{{- if and (not (kindIs "invalid" .Values.dp.configMaxStaleSeconds)) (ne (.Values.dp.configMaxStaleSeconds | toString) "") }}
+- name: FERRUM_DP_CONFIG_MAX_STALE_SECONDS
+  value: {{ .Values.dp.configMaxStaleSeconds | quote }}
+{{- end }}
+{{- if and (not (kindIs "invalid" .Values.dp.configStaleAction)) (ne (.Values.dp.configStaleAction | toString) "") }}
+- name: FERRUM_DP_CONFIG_STALE_ACTION
+  value: {{ .Values.dp.configStaleAction | quote }}
+{{- end }}
 {{- if .Values.dp.cpGrpcTokenFile }}
 - name: FERRUM_DP_CP_GRPC_TOKEN_FILE
   value: {{ .Values.dp.cpGrpcTokenFile | quote }}
@@ -1071,6 +1093,28 @@ FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRE
 {{- define "ferrum-gateway.cpGrpcPort" -}}
 {{- $ports := .Values.ports | default dict -}}
 {{- if hasKey $ports "cpGrpc" -}}{{- $ports.cpGrpc -}}{{- else -}}50051{{- end -}}
+{{- end -}}
+
+{{/* Effective DP stale-config bound for NOTES and operator messaging. */}}
+{{/* Presence, not truthiness: `default ""` would rewrite an explicit 0 (the
+     unsafe "no bound" opt-in) back to the 3600 default and make NOTES disagree
+     with the env var the deployment actually renders. */}}
+{{- define "ferrum-gateway.dpConfigMaxStaleSecondsEffective" -}}
+{{- $v := (.Values.dp | default dict).configMaxStaleSeconds -}}
+{{- if or (kindIs "invalid" $v) (eq ($v | toString) "") -}}
+3600
+{{- else -}}
+{{- $v -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "ferrum-gateway.dpConfigStaleActionEffective" -}}
+{{- $v := (.Values.dp | default dict).configStaleAction | default "" | toString -}}
+{{- if eq $v "" -}}
+fail_closed
+{{- else -}}
+{{- $v -}}
+{{- end -}}
 {{- end -}}
 
 {{/* FERRUM_CP_GRPC_LISTEN_ADDR. IPv6 literal binds MUST be bracketed: the runtime

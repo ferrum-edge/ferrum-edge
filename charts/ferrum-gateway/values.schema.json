@@ -279,6 +279,22 @@
             { "type": "string" },
             { "type": "null" }
           ]
+        },
+        "configMaxStaleSeconds": {
+          "description": "Maximum applied-snapshot age while every CP is unreachable (FERRUM_DP_CONFIG_MAX_STALE_SECONDS). 0 disables the bound (unsafe). Empty string or null omits the env and uses the binary default (3600).",
+          "oneOf": [
+            { "type": "integer", "minimum": 0 },
+            { "type": "string", "pattern": "^([0-9]+)?$" },
+            { "type": "null" }
+          ]
+        },
+        "configStaleAction": {
+          "description": "What happens to new traffic once configMaxStaleSeconds is exceeded (FERRUM_DP_CONFIG_STALE_ACTION). Empty string or null omits the env and uses fail_closed.",
+          "oneOf": [
+            { "type": "string", "enum": ["fail_closed", "readiness_only"] },
+            { "type": "string", "maxLength": 0 },
+            { "type": "null" }
+          ]
         }
       }
     },

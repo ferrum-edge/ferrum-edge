@@ -11,7 +11,7 @@ conventions so they feel like one product.
 | Database | `database` | yes | read/write | `database.*`, `admin.jwtSecret` (>=32) |
 | File | `file` | yes | read-only | `file.inlineConfig` or `file.existingConfigMap` |
 | Control plane | `cp` | no | read/write | `database.*`, `admin.jwtSecret`, `grpc.jwtSecret` (>=32) or `cp.trustBundlePath` |
-| Data plane | `dp` | yes | read-only | `dp.cpGrpcUrls`, `admin.jwtSecret`, `grpc.jwtSecret` (>=32) or `dp.cpGrpcTokenFile` |
+| Data plane | `dp` | yes | read-only | `dp.cpGrpcUrls`, `admin.jwtSecret`, `grpc.jwtSecret` (>=32) or `dp.cpGrpcTokenFile`; optional `dp.configMaxStaleSeconds` / `dp.configStaleAction` |
 
 ### Multi-tenant control planes
 
@@ -117,7 +117,7 @@ migrations; use the explicit Job for `status`, dry-run, and operator-controlled
   `https://`) fail at render, not at boot.
 - **Chart-managed env is protected.** Every `FERRUM_*` var the chart renders from
   first-class values (mode, DB, JWTs, ports, bind address, allowlist, TLS paths,
-  shutdown drain, DP URLs, gRPC plaintext opt-in, K8s controller/pod-discovery
+  shutdown drain, DP URLs, DP stale-config fence, gRPC plaintext opt-in, K8s controller/pod-discovery
   switches, ...) is reserved: setting it through `env` or `extraEnv` fails
   render, so the process can never drift from the rendered probes/Services/ports.
   Their external-secret resolver suffixes
@@ -299,6 +299,22 @@ plus `FERRUM_K8S_POD_DISCOVERY_ENABLED=false`. Setting `k8sController.enabled=tr
 fails render with a pointer to [`ferrum-mesh`](../ferrum-mesh) (`controlPlane.rbac`),
 which is the designated controller. Both env names are reserved so `env` /
 `extraEnv` cannot re-enable the watches.
+
+### Data plane stale-config fence
+
+`mode=dp` installs expose the bounded last-known-good configuration window that
+the binary enforces when every control plane is lost:
+
+| Value | Env var | Default when omitted |
+|-------|---------|------------------------|
+| `dp.configMaxStaleSeconds` | `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` | `3600` (`0` disables the bound as an unsafe opt-in and is rendered explicitly) |
+| `dp.configStaleAction` | `FERRUM_DP_CONFIG_STALE_ACTION` | `fail_closed` (`readiness_only` degrades readiness without refusing new traffic) |
+
+Both names are reserved so `env` / `extraEnv` cannot emit a second, conflicting
+entry. `helm template` / `helm lint` reject unknown `configStaleAction` spellings
+and non-integer `configMaxStaleSeconds` values. `NOTES.txt` prints the effective
+bound and action for DP installs. See
+[cp_dp_mode.md](../../docs/cp_dp_mode.md#bounded-last-known-good-configuration-age).
 
 ## Explicit migrate mode (external Job)
 

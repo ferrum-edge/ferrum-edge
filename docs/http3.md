@@ -5,6 +5,7 @@ Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxi
 ## Table of Contents
 
 - [Listener and enablement](#listener-and-enablement)
+- [Graceful shutdown and GOAWAY](#graceful-shutdown-and-goaway)
 - [Dispatch model](#dispatch-model)
 - [Native H3 fast path](#native-h3-fast-path)
 - [Cross-protocol bridge](#cross-protocol-bridge)
@@ -60,6 +61,57 @@ keeps the HTTPS TCP/H1/H2 listener and disables only QUIC/H3 for that port —
 `Alt-Svc` is omitted until a live QUIC task exists again. See
 [gateway_api_conformance.md](gateway_api_conformance.md) (HTTP/3 on Gateway
 listener ports).
+
+## Graceful shutdown and GOAWAY
+
+HTTP/3 now matches H1/H2 graceful shutdown (issue #4429). The QUIC listener
+still stops accepting new handshakes when the process shutdown watch fires,
+but each already-accepted connection is spawned with a clone of that watch.
+
+On drain the connection task calls the vendored
+`h3::server::Connection::shutdown(0)` API, which writes an HTTP/3 GOAWAY whose
+last stream ID is the last request already accepted. The peer therefore:
+
+- learns that the gateway is going away (GOAWAY, not a silent QUIC reset)
+- has new request streams refused with `H3_REQUEST_REJECTED`
+- can finish already-accepted streams, including gRPC trailers, RFC 9220
+  WebSocket close frames, and RFC 9298 CONNECT-UDP capsule relays
+
+The accept loop keeps polling after GOAWAY until `accept()` returns `Ok(None)`
+or `FERRUM_SHUTDOWN_DRAIN_SECONDS` expires. Only then does the listener close
+remaining QUIC connections with the canonical HTTP/3 no-error code
+`H3_NO_ERROR` (`0x0100`) and reason `shutdown`. The previous
+`CONNECTION_CLOSE` with application code `0` is gone: that QUIC transport
+close reset remaining work instead of completing GOAWAY.
+
+Which of those two terminals a connection takes depends on the peer:
+
+- A peer that reacts to GOAWAY — by closing, sending its own GOAWAY, or trying
+  to open a stream past `max_id` — lets `accept()` return `Ok(None)` as soon as
+  its in-flight streams finish. The connection task ends, quinn's
+  `open_connections()` falls, and drain completes early.
+- A peer that simply goes idle after GOAWAY leaves `accept()` pending. The
+  vendored `h3` server gates its `Ok(None)` on having *received* a GOAWAY, not
+  on having sent one, so an in-flight-free but silent connection is not
+  self-terminating. It is bounded by the drain deadline rather than leaked:
+  the listener logs `HTTP/3 drain timeout — forcing endpoint close` and closes
+  the endpoint with `H3_NO_ERROR`. Expect planned restarts to spend the full
+  `FERRUM_SHUTDOWN_DRAIN_SECONDS` when such peers are connected.
+
+`FERRUM_SHUTDOWN_DRAIN_SECONDS` semantics are unchanged. The H3 listener still
+bounds its own `endpoint.open_connections()` wait with that budget, then the
+serving mode's `begin_shutdown_drain` / `wait_for_drain` waits on
+`OverloadState` (`ConnectionGuard` / `RequestGuard`). Each H3 Incoming is
+registered with exactly one `ConnectionGuard` in the accept-loop spawn
+wrapper; handshake refuse, handshake timeout, GOAWAY completion, peer reset,
+and deadline force-close all drop that guard once. H3 WebSocket sessions still
+take a fresh session `ConnectionGuard` after the request guard is released,
+and they observe the cloned process shutdown watch so drain can emit Close
+`1001` (`Away`, `"gateway draining"`) rather than dropping the close frame.
+
+CONNECT-UDP tunnels that were already accepted keep relaying for the H3
+listener drain window. New CONNECT-UDP streams after GOAWAY are refused.
+`src/http3/connect_udp.rs` is otherwise unchanged.
 
 ## Dispatch model
 
