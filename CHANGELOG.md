@@ -208,6 +208,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`FERRUM_PLUGIN_HTTP_MAX_RETRIES`) retries `connection_pool_error` on
   GET/HEAD/OPTIONS so a hyper `is_canceled` drop still replays; that
   list is not identical to `request_reached_wire`.
+- **TLS source refreshes no longer block Tokio workers or listener reconciliation locks**
+  (issue #4434). All runtime filesystem/provider materialization and synchronous
+  TLS rebuilds use one process-wide bounded blocking executor with a five-second
+  maximum end-to-end deadline. Stream TLS material is fully prepared before the
+  listener map is locked, and deadline failures retain the last-known-good
+  listener/config generation.
+
+- **BREAKING — Persistent TLS source failures no longer rewrite the event ring
+  every poll** (issue #4435). Watchers keep counting every failed attempt but
+  persist only first/changed failure-class, recovery, and regression
+  transitions. Ring appends no longer clone the deque, and stored source
+  identities are bounded digests that exclude URIs, credentials, provider
+  payloads, and raw labels. **Operator action**: consumers of
+  `GET /admin/tls/events` must treat `sources[].source_id` as an opaque returned
+  digest and use that value, rather than a configured URI/path, in the
+  `source_id` query filter; accept the new `recovered` outcome.
 
 - **Identity-only NodeWaypoint assertion grants require ambient enrollment.**
   Kubernetes pod discovery no longer lets a same-node identity-only pod

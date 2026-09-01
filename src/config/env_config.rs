@@ -126,6 +126,56 @@ pub const MIN_TLS_MAX_MATERIAL_SIZE_BYTES: usize = 1;
 /// admission bound.
 pub const HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES: usize = 4 * 1024 * 1024;
 
+/// Settings key for the process-wide TLS source blocking-work concurrency cap.
+pub const TLS_SOURCE_MAX_BLOCKING_CONCURRENCY_KEY: &str =
+    "FERRUM_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY";
+/// Default TLS source blocking-work concurrency cap.
+pub const DEFAULT_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY: usize = 8;
+/// Hard maximum TLS source blocking-work concurrency cap.
+pub const HARD_MAX_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY: usize = 256;
+/// Settings key for the end-to-end TLS source load deadline.
+pub const TLS_SOURCE_LOAD_TIMEOUT_SECONDS_KEY: &str = "FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS";
+/// Default end-to-end TLS source load deadline. This matches the documented
+/// post-drain cleanup budget, so refresh work is abandoned within that window.
+pub const DEFAULT_TLS_SOURCE_LOAD_TIMEOUT_SECONDS: u64 = 5;
+/// Hard maximum end-to-end TLS source load deadline.
+/// A refresh may not outlive the documented five-second background cleanup
+/// budget after graceful drain.
+pub const HARD_MAX_TLS_SOURCE_LOAD_TIMEOUT_SECONDS: u64 = 5;
+
+/// Pure parse/validation for the TLS source execution policy.
+pub fn parse_tls_source_execution_policy(
+    concurrency_raw: Option<&str>,
+    timeout_raw: Option<&str>,
+) -> Result<(usize, u64), String> {
+    let concurrency = match concurrency_raw {
+        None => DEFAULT_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY,
+        Some(value) => value.trim().parse::<usize>().map_err(|_| {
+            format!("{TLS_SOURCE_MAX_BLOCKING_CONCURRENCY_KEY} must be a whole number")
+        })?,
+    };
+    if concurrency == 0 || concurrency > HARD_MAX_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY {
+        return Err(format!(
+            "{TLS_SOURCE_MAX_BLOCKING_CONCURRENCY_KEY} must be between 1 and \
+             {HARD_MAX_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY}"
+        ));
+    }
+
+    let timeout_seconds = match timeout_raw {
+        None => DEFAULT_TLS_SOURCE_LOAD_TIMEOUT_SECONDS,
+        Some(value) => value.trim().parse::<u64>().map_err(|_| {
+            format!("{TLS_SOURCE_LOAD_TIMEOUT_SECONDS_KEY} must be a whole number of seconds")
+        })?,
+    };
+    if timeout_seconds == 0 || timeout_seconds > HARD_MAX_TLS_SOURCE_LOAD_TIMEOUT_SECONDS {
+        return Err(format!(
+            "{TLS_SOURCE_LOAD_TIMEOUT_SECONDS_KEY} must be between 1 and \
+             {HARD_MAX_TLS_SOURCE_LOAD_TIMEOUT_SECONDS} seconds"
+        ));
+    }
+    Ok((concurrency, timeout_seconds))
+}
+
 /// Pure parse/validation for `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`.
 ///
 /// Used by [`EnvConfig`] and [`crate::tls::source::effective_tls_max_material_size_bytes`]
@@ -3092,6 +3142,11 @@ pub struct EnvConfig {
     /// Kubernetes Secrets, managed store, and ACME store). Default and hard
     /// maximum are both 4 MiB; `0` is rejected (not unlimited). (default: 4194304)
     pub tls_max_material_size_bytes: usize,
+    /// Process-wide cap on concurrent blocking TLS source work. (default: 8)
+    pub tls_source_max_blocking_concurrency: usize,
+    /// End-to-end deadline for one TLS source resolution, including admission
+    /// to the blocking-work budget. (default: 5 seconds)
+    pub tls_source_load_timeout_seconds: u64,
     /// Per-response Kubernetes/Consul discovery success-body ceiling in bytes.
     /// Default 4 MiB, hard maximum 16 MiB; `0` is rejected (not unlimited).
     pub service_discovery_max_response_body_bytes: usize,
@@ -3945,6 +4000,8 @@ impl Default for EnvConfig {
             tls_curves: None,
             tls_session_cache_size: 4096,
             tls_max_material_size_bytes: DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES,
+            tls_source_max_blocking_concurrency: DEFAULT_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY,
+            tls_source_load_timeout_seconds: DEFAULT_TLS_SOURCE_LOAD_TIMEOUT_SECONDS,
             service_discovery_max_response_body_bytes:
                 DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES,
             service_discovery_max_error_body_bytes: DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES,
@@ -4553,6 +4610,17 @@ impl EnvConfig {
                 crate::tls::source::MaterialError::InvalidSource { details, .. } => details,
                 other => other.to_string(),
             })?;
+
+        let (tls_source_max_blocking_concurrency, tls_source_load_timeout_seconds) =
+            parse_tls_source_execution_policy(
+                resolve_var(conf, TLS_SOURCE_MAX_BLOCKING_CONCURRENCY_KEY).as_deref(),
+                resolve_var(conf, TLS_SOURCE_LOAD_TIMEOUT_SECONDS_KEY).as_deref(),
+            )?;
+        crate::tls::source::install_tls_source_execution_policy(
+            tls_source_max_blocking_concurrency,
+            tls_source_load_timeout_seconds,
+        )
+        .map_err(|error| error.to_string())?;
 
         let discovery_body_limits = parse_discovery_body_limits(
             resolve_var(conf, SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY).as_deref(),
@@ -5341,6 +5409,8 @@ impl EnvConfig {
             tls_curves,
             tls_session_cache_size,
             tls_max_material_size_bytes,
+            tls_source_max_blocking_concurrency,
+            tls_source_load_timeout_seconds,
             service_discovery_max_response_body_bytes,
             service_discovery_max_error_body_bytes,
             service_discovery_body_budget_bytes,

@@ -61,7 +61,7 @@ use crate::identity::SvidBundle;
 use crate::tls::events::{record_load_error, record_rebuild_error, record_rotation_success};
 use crate::tls::source::subscription::{
     MaterialFingerprintEntry, WatchedMaterialSource, material_fingerprint,
-    record_refresh_for_entries, source_poll_interval,
+    material_fingerprint_async, record_refresh_for_entries, source_poll_interval,
 };
 use crate::tls::source::{CertSource, MaterialKind, SourceScheme};
 use crate::tls::spiffe::SpiffeTlsError;
@@ -236,6 +236,8 @@ pub struct GatewaySvidSourceFailure {
     pub label: &'static str,
     pub kind: MaterialKind,
     pub scheme: SourceScheme,
+    /// Fixed-cardinality class retained by transition dedup and event records.
+    pub failure_class: &'static str,
     /// Already-redacted loader error: `MaterialError`'s producers withhold
     /// provider references before the error is constructed.
     pub error: String,
@@ -365,6 +367,7 @@ impl GatewaySvidSourceTracker {
                         label: source.watched.label,
                         kind: source.watched.kind,
                         scheme: configured_scheme(&source.watched.source),
+                        failure_class: error.failure_class(),
                         error: error.to_string(),
                     });
                 }
@@ -400,6 +403,72 @@ impl GatewaySvidSourceTracker {
             };
         };
 
+        let outcome = self.classify_complete_set(current);
+        GatewaySvidPollReport {
+            outcome,
+            refreshed,
+            failures,
+        }
+    }
+
+    /// Async runtime equivalent of [`Self::poll`]. Source reads use the shared
+    /// bounded/deadlined TLS source executor, so a stalled provider cannot park
+    /// the Tokio worker that owns the SVID cadence.
+    pub async fn poll_async(&mut self, now: Instant) -> GatewaySvidPollReport {
+        let mut refreshed = Vec::new();
+        let mut failures = Vec::new();
+
+        for source in &mut self.sources {
+            let due = match source.due_at {
+                None => source.last.is_none(),
+                Some(due_at) => due_at <= now,
+            };
+            if !due {
+                continue;
+            }
+            if let Some(interval) = source.cadence.interval() {
+                source.due_at = Some(now + interval);
+            }
+            match material_fingerprint_async(&source.watched).await {
+                Ok(entry) => {
+                    refreshed.push(entry.clone());
+                    source.last = Some(entry);
+                    source.unavailable = false;
+                }
+                Err(error) => {
+                    source.unavailable = true;
+                    failures.push(GatewaySvidSourceFailure {
+                        label: source.watched.label,
+                        kind: source.watched.kind,
+                        scheme: configured_scheme(&source.watched.source),
+                        failure_class: error.failure_class(),
+                        error: error.to_string(),
+                    });
+                }
+            }
+        }
+
+        if !failures.is_empty() {
+            return GatewaySvidPollReport {
+                outcome: GatewaySvidPollOutcome::SourceUnavailable,
+                refreshed,
+                failures,
+            };
+        }
+        if self.sources.iter().any(|source| source.unavailable) {
+            return GatewaySvidPollReport {
+                outcome: GatewaySvidPollOutcome::Idle,
+                refreshed,
+                failures,
+            };
+        }
+        let Some(current) = self.current_fingerprints() else {
+            return GatewaySvidPollReport {
+                outcome: GatewaySvidPollOutcome::Idle,
+                refreshed,
+                failures,
+            };
+        };
         let outcome = self.classify_complete_set(current);
         GatewaySvidPollReport {
             outcome,
@@ -603,18 +672,18 @@ pub async fn run_gateway_svid_source_rotation_loop(
             return;
         }
 
-        let report = tracker.poll(Instant::now());
+        let report = tracker.poll_async(Instant::now()).await;
         match report.outcome {
             GatewaySvidPollOutcome::Idle | GatewaySvidPollOutcome::Baseline => {}
             GatewaySvidPollOutcome::SourceUnavailable => {
                 record_source_failures(&sources, &report.failures, &mut reporter);
             }
             GatewaySvidPollOutcome::Unchanged => {
-                note_recovery(&mut reporter);
+                note_recovery(&mut reporter, &sources);
                 record_refresh_for_entries(GATEWAY_SVID_SURFACE, &report.refreshed, "unchanged");
             }
             GatewaySvidPollOutcome::Changed => {
-                reload_and_publish(&sources, &mut tracker, publish.as_ref(), &mut reporter);
+                reload_and_publish(&sources, &mut tracker, publish.as_ref(), &mut reporter).await;
             }
         }
 
@@ -657,7 +726,7 @@ pub async fn run_gateway_svid_source_rotation_loop(
 #[derive(Default)]
 struct FailureReporter {
     /// Labels of the sources that could not be read on the last reported pass.
-    unavailable: Option<Vec<&'static str>>,
+    unavailable: Option<Vec<(&'static str, &'static str)>>,
     /// Candidate fingerprints of the last reported unpublishable reload.
     rebuild: Option<Vec<MaterialFingerprintEntry>>,
 }
@@ -666,11 +735,14 @@ impl FailureReporter {
     /// `true` when this exact set of unreadable sources is not already
     /// reported.
     fn arm_unavailable(&mut self, failures: &[GatewaySvidSourceFailure]) -> bool {
-        let labels = failures.iter().map(|f| f.label).collect::<Vec<_>>();
-        if self.unavailable.as_deref() == Some(labels.as_slice()) {
+        let classes = failures
+            .iter()
+            .map(|failure| (failure.label, failure.failure_class))
+            .collect::<Vec<_>>();
+        if self.unavailable.as_deref() == Some(classes.as_slice()) {
             return false;
         }
-        self.unavailable = Some(labels);
+        self.unavailable = Some(classes);
         true
     }
 
@@ -690,15 +762,19 @@ impl FailureReporter {
     }
 
     /// Disarm on recovery. `true` when a failure was actually pending.
-    fn clear(&mut self) -> bool {
+    fn clear(&mut self) -> (bool, bool) {
         let had_unavailable = self.unavailable.take().is_some();
         let had_rebuild = self.rebuild.take().is_some();
-        had_unavailable || had_rebuild
+        (had_unavailable, had_rebuild)
     }
 }
 
-fn note_recovery(reporter: &mut FailureReporter) {
-    if reporter.clear() {
+fn note_recovery(reporter: &mut FailureReporter, sources: &GatewaySvidSourceSet) {
+    let (had_unavailable, had_rebuild) = reporter.clear();
+    if had_unavailable {
+        crate::tls::events::record_load_recovery(GATEWAY_SVID_SURFACE, sources.watched_sources());
+    }
+    if had_unavailable || had_rebuild {
         info!("Gateway SVID source watcher recovered source access");
     }
 }
@@ -733,7 +809,8 @@ fn record_source_failures(
         }
     }
     let detail = describe_failures(failures);
-    record_load_error(GATEWAY_SVID_SURFACE, &failed, &detail);
+    let failure_classes = describe_failure_classes(failures);
+    record_load_error(GATEWAY_SVID_SURFACE, &failed, &failure_classes);
     warn!(
         error = %detail,
         "Gateway SVID source could not be read; keeping the current SVID material \
@@ -741,10 +818,10 @@ fn record_source_failures(
     );
 }
 
-fn reload_and_publish(
+async fn reload_and_publish(
     sources: &GatewaySvidSourceSet,
     tracker: &mut GatewaySvidSourceTracker,
-    publish: &dyn Fn(SvidBundle) -> u64,
+    publish: &(dyn Fn(SvidBundle) -> u64 + Send + Sync),
     reporter: &mut FailureReporter,
 ) {
     let entries = tracker.current_fingerprints().unwrap_or_default();
@@ -752,9 +829,18 @@ fn reload_and_publish(
     // between the fingerprint pass and this load, the committed fingerprints
     // are older than the published material, so the next pass compares unequal
     // and reloads again — a redundant rotation, never a stale identity.
-    match sources.load_bundle() {
+    let sources_for_load = sources.clone();
+    let load_result = match crate::tls::source::run_tls_source_blocking_result(move || {
+        sources_for_load.load_bundle()
+    })
+    .await
+    {
+        Ok(result) => result.map_err(anyhow::Error::new),
+        Err(error) => Err(anyhow::Error::new(error)),
+    };
+    match load_result {
         Ok(bundle) => {
-            note_recovery(reporter);
+            note_recovery(reporter, sources);
             let spiffe_id = bundle.spiffe_id.to_string();
             let revision = publish(bundle);
             tracker.commit();
@@ -797,4 +883,12 @@ fn describe_failures(failures: &[GatewaySvidSourceFailure]) -> String {
         rendered.push(format!("{}: {}", failure.label, failure.error));
     }
     rendered.join("; ")
+}
+
+fn describe_failure_classes(failures: &[GatewaySvidSourceFailure]) -> String {
+    let mut rendered = Vec::with_capacity(failures.len());
+    for failure in failures {
+        rendered.push(format!("{}:{}", failure.label, failure.failure_class));
+    }
+    rendered.join(",")
 }

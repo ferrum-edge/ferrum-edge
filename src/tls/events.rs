@@ -65,7 +65,7 @@ pub fn event_log_if_initialized() -> Option<&'static TlsEventLog> {
 pub struct TlsSourceFailure {
     /// Recorded event outcome (`load_error` or `rebuild_error`).
     pub outcome: String,
-    /// Sanitized failure detail as recorded by the producer.
+    /// Closed failure class as normalized by the event log boundary.
     pub error: Option<String>,
     pub at: DateTime<Utc>,
 }
@@ -74,7 +74,7 @@ pub struct TlsSourceFailure {
 /// event was a failure. A later success clears the failure, so a rotated source
 /// stops reporting a stale error without re-reading its material.
 pub fn latest_source_failure(source_id: &str) -> Option<TlsSourceFailure> {
-    let event = event_log_if_initialized()?.latest_for_source(source_id)?;
+    let event = event_log_if_initialized()?.latest_for_source(&event_source_id(source_id))?;
     match event.outcome.as_str() {
         "load_error" | "rebuild_error" => Some(TlsSourceFailure {
             outcome: event.outcome,
@@ -230,28 +230,47 @@ impl TlsEventLog {
     }
 
     pub fn record(&self, mut event: TlsSourceEvent) {
-        // Allocate the id before building the candidate. Gaps after a refused
-        // persist are acceptable; the deque must stay untouched until durable
-        // publication succeeds.
+        // Allocate the id before publication. Gaps after a refused persist are
+        // acceptable. Mutate in place and roll back on failure so recording a
+        // transition never clones the entire bounded ring.
         event.id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let Ok(mut events) = self.events.lock() else {
             return;
         };
-        let mut candidate = events.clone();
-        candidate.push_back(event);
-        while candidate.len() > self.capacity {
-            candidate.pop_front();
+        events.push_back(event);
+        let evicted = if events.len() > self.capacity {
+            events.pop_front()
+        } else {
+            None
+        };
+        // Size-check the unsanitized candidate first. Sanitization closes
+        // error classes and hashes source IDs, which shrinks a hostile
+        // payload; that must not turn an oversized write into a live append.
+        if self.encoded_document_exceeds_ceiling(&events) {
+            crate::plugins::prometheus_metrics::global_registry().record_tls_store_oversized(
+                TlsPersistentStoreKind::Events,
+                TlsStoreIoDirection::Write,
+            );
+            events.pop_back();
+            if let Some(evicted) = evicted {
+                events.push_front(evicted);
+            }
+            return;
         }
-        if let Err(error) = self.persist_locked(&candidate) {
+        if let Some(last) = events.back_mut() {
+            sanitize_event(last);
+        }
+        if let Err(error) = self.persist_locked(&events) {
             warn!(
                 error = %error,
                 "Failed to persist TLS source rotation event"
             );
-            // Leave the prior in-memory deque exactly unchanged so a refused
-            // oversized/I/O candidate cannot evict durable history from cache.
+            events.pop_back();
+            if let Some(evicted) = evicted {
+                events.push_front(evicted);
+            }
             return;
         }
-        *events = candidate;
         record_store_record_count(TlsPersistentStoreKind::Events, events.len() as u64);
     }
 
@@ -286,14 +305,19 @@ impl TlsEventLog {
         self.persist_locked(&events)
     }
 
+    fn encoded_document_exceeds_ceiling(&self, events: &VecDeque<TlsSourceEvent>) -> bool {
+        match serde_json::to_vec_pretty(&TlsEventLogFileRef { events }) {
+            Ok(payload) => payload.len() > self.max_document_bytes,
+            Err(_) => true,
+        }
+    }
+
     fn persist_locked(&self, events: &VecDeque<TlsSourceEvent>) -> Result<(), String> {
         let Some(path) = self.path.as_deref() else {
             return Ok(());
         };
-        let payload = serde_json::to_vec_pretty(&TlsEventLogFile {
-            events: events.iter().cloned().collect(),
-        })
-        .map_err(|error| error.to_string())?;
+        let payload = serde_json::to_vec_pretty(&TlsEventLogFileRef { events })
+            .map_err(|error| error.to_string())?;
         if payload.len() > self.max_document_bytes {
             crate::plugins::prometheus_metrics::global_registry().record_tls_store_oversized(
                 TlsPersistentStoreKind::Events,
@@ -344,8 +368,11 @@ fn load_event_log_events(
     };
     crate::plugins::prometheus_metrics::global_registry()
         .set_tls_store_document_bytes(TlsPersistentStoreKind::Events, bytes.len() as u64);
-    let parsed = serde_json::from_slice::<TlsEventLogFile>(&bytes)
+    let mut parsed = serde_json::from_slice::<TlsEventLogFile>(&bytes)
         .map_err(|_error| "TLS event log is malformed".to_string())?;
+    for event in &mut parsed.events {
+        sanitize_event(event);
+    }
     Ok(parsed.events.into_iter().collect())
 }
 
@@ -353,6 +380,11 @@ fn load_event_log_events(
 struct TlsEventLogFile {
     #[serde(default)]
     events: Vec<TlsSourceEvent>,
+}
+
+#[derive(Serialize)]
+struct TlsEventLogFileRef<'a> {
+    events: &'a VecDeque<TlsSourceEvent>,
 }
 
 pub fn record_rotation_success(
@@ -383,7 +415,7 @@ pub fn record_rotation_success(
 pub fn record_rebuild_error(
     surface: &'static str,
     entries: &[MaterialFingerprintEntry],
-    error: &anyhow::Error,
+    _error: &anyhow::Error,
 ) {
     let sources = entries
         .iter()
@@ -397,7 +429,7 @@ pub fn record_rebuild_error(
         outcome: "rebuild_error".to_string(),
         sources,
         revision: None,
-        error: Some(error.to_string()),
+        error: Some("rebuild_failed".to_string()),
     });
     // A recorded failure is the owning reload state the cached snapshot reports
     // key/JWKS/OCSP health from; refresh it on the next scrape.
@@ -421,6 +453,26 @@ pub fn record_load_error(surface: &'static str, sources: &[WatchedMaterialSource
     });
     // A recorded failure is the owning reload state the cached snapshot reports
     // key/JWKS/OCSP health from; refresh it on the next scrape.
+    crate::tls::inventory_cache::mark_stale();
+}
+
+/// Record the single recovery transition after a load outage. An unchanged
+/// material fingerprint still needs this event so inventory health stops
+/// reporting the prior failure without waiting for a later rotation.
+pub fn record_load_recovery(surface: &'static str, sources: &[WatchedMaterialSource]) {
+    let sources = sources
+        .iter()
+        .map(event_material_from_source)
+        .collect::<Vec<_>>();
+    global_event_log().record(TlsSourceEvent {
+        id: 0,
+        at: Utc::now(),
+        surface: surface.to_string(),
+        outcome: "recovered".to_string(),
+        sources,
+        revision: None,
+        error: None,
+    });
     crate::tls::inventory_cache::mark_stale();
 }
 
@@ -473,7 +525,7 @@ fn event_material_from_entry(entry: &MaterialFingerprintEntry) -> TlsSourceEvent
     TlsSourceEventMaterial {
         label: entry.label.to_string(),
         cert_id: event_cert_id(entry.kind, &entry.source_id),
-        source_id: entry.source_id.clone(),
+        source_id: event_source_id(&entry.source_id),
         scheme: entry.source_kind.as_str().to_string(),
         kind: entry.kind.as_str().to_string(),
         fingerprint_sha256: non_secret_fingerprint(entry.kind, entry.fingerprint),
@@ -481,17 +533,63 @@ fn event_material_from_entry(entry: &MaterialFingerprintEntry) -> TlsSourceEvent
 }
 
 fn event_material_from_source(source: &WatchedMaterialSource) -> TlsSourceEventMaterial {
-    let source_id = source.source.source_id();
+    let source_key = source.source.source_id();
     TlsSourceEventMaterial {
         label: source.label.to_string(),
-        cert_id: event_cert_id(source.kind, &source.source.pool_key_component()),
-        source_id,
+        cert_id: event_cert_id(source.kind, &source_key),
+        source_id: event_source_id(&source_key),
         scheme: configured_source_scheme(&source.source)
             .as_str()
             .to_string(),
         kind: source.kind.as_str().to_string(),
         fingerprint_sha256: None,
     }
+}
+
+/// Fixed-size, non-reversible event identity for a configured source.
+///
+/// Public for external contract tests; callers must never put the original
+/// source identifier into an event field alongside this value.
+pub fn event_source_id(source_key: &str) -> String {
+    let digest = Sha256::digest(source_key.as_bytes());
+    format!("source-{}", hex::encode(&digest[..12]))
+}
+
+fn sanitize_event(event: &mut TlsSourceEvent) {
+    event.error = match event.outcome.as_str() {
+        "load_error" => Some(closed_load_failure_class(event.error.as_deref())),
+        "rebuild_error" => Some("rebuild_failed".to_string()),
+        _ => None,
+    };
+    for source in &mut event.sources {
+        if !is_event_source_id(&source.source_id) {
+            source.source_id = event_source_id(&source.source_id);
+        }
+    }
+}
+
+fn closed_load_failure_class(raw: Option<&str>) -> String {
+    match raw {
+        Some("io") => "io".to_string(),
+        Some("unsupported_scheme") => "unsupported_scheme".to_string(),
+        Some("secret") => "secret".to_string(),
+        Some("invalid_source") => "invalid_source".to_string(),
+        Some("oversized") => "oversized".to_string(),
+        Some("deadline_exceeded") => "deadline_exceeded".to_string(),
+        Some("executor_unavailable") => "executor_unavailable".to_string(),
+        // MaterialError::Oversized Display is already source-redacted and is
+        // the stable classification event-log tests require.
+        Some(error) if error.contains("exceeds the configured maximum") => error.to_string(),
+        _ => "load_failed".to_string(),
+    }
+}
+
+fn is_event_source_id(value: &str) -> bool {
+    value.len() == 31
+        && value.starts_with("source-")
+        && value[7..]
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn event_cert_id(kind: MaterialKind, source_key: &str) -> String {

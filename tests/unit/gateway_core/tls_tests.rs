@@ -10,6 +10,7 @@ use ferrum_edge::tls::{
 };
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 use std::sync::Once;
+use std::time::Duration;
 use tempfile::TempDir;
 
 static INIT_CRYPTO: Once = Once::new();
@@ -100,6 +101,35 @@ fn malformed_certificate_record() -> &'static str {
 
 fn default_env_config() -> EnvConfig {
     EnvConfig::default()
+}
+
+#[test]
+fn tls_source_execution_policy_defaults_and_bounds_are_fail_closed() {
+    use ferrum_edge::config::env_config::{
+        DEFAULT_TLS_SOURCE_LOAD_TIMEOUT_SECONDS, DEFAULT_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY,
+        HARD_MAX_TLS_SOURCE_LOAD_TIMEOUT_SECONDS, HARD_MAX_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY,
+        parse_tls_source_execution_policy,
+    };
+
+    assert_eq!(
+        parse_tls_source_execution_policy(None, None).expect("default policy"),
+        (
+            DEFAULT_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY,
+            DEFAULT_TLS_SOURCE_LOAD_TIMEOUT_SECONDS,
+        )
+    );
+    let hard_max = parse_tls_source_execution_policy(Some("256"), Some("5")).expect("hard maxima");
+    assert_eq!(
+        hard_max,
+        (
+            HARD_MAX_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY,
+            HARD_MAX_TLS_SOURCE_LOAD_TIMEOUT_SECONDS,
+        )
+    );
+    assert!(parse_tls_source_execution_policy(Some("0"), Some("1")).is_err());
+    assert!(parse_tls_source_execution_policy(Some("1"), Some("0")).is_err());
+    assert!(parse_tls_source_execution_policy(Some("not-a-number"), Some("1")).is_err());
+    assert!(parse_tls_source_execution_policy(Some("1"), Some("6")).is_err());
 }
 
 // ── check_cert_expiry tests ────────────────────────────────────────────────
@@ -1063,4 +1093,109 @@ fn test_h3_client_verifier_rejects_revoked_cert() {
         "expected a revocation error, got: {}",
         err
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stalled_tls_source_work_does_not_stall_tokio_heartbeat() {
+    use ferrum_edge::tls::source::TlsSourceExecutor;
+    use std::sync::{Arc, Condvar, Mutex};
+
+    let executor = TlsSourceExecutor::new(1, Duration::from_secs(1)).expect("executor");
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let operation_release = Arc::clone(&release);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+    let operation = tokio::spawn(async move {
+        executor
+            .run_blocking(move || {
+                started_tx
+                    .send(())
+                    .map_err(|_| ferrum_edge::tls::source::MaterialError::ExecutorUnavailable)?;
+                let (lock, condition) = &*operation_release;
+                let ready = lock
+                    .lock()
+                    .map_err(|_| ferrum_edge::tls::source::MaterialError::ExecutorUnavailable)?;
+                let _ready = condition
+                    .wait_while(ready, |ready| !*ready)
+                    .map_err(|_| ferrum_edge::tls::source::MaterialError::ExecutorUnavailable)?;
+                Ok(())
+            })
+            .await
+    });
+
+    started_rx.await.expect("blocking operation started");
+    tokio::time::timeout(Duration::from_millis(100), tokio::task::yield_now())
+        .await
+        .expect("the single Tokio worker must remain responsive");
+
+    let (lock, condition) = &*release;
+    *lock.lock().expect("release lock") = true;
+    condition.notify_one();
+    operation
+        .await
+        .expect("operation task")
+        .expect("operation result");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tls_source_executor_bounds_admission_and_deadline() {
+    use ferrum_edge::tls::source::{MaterialError, TlsSourceExecutor};
+    use std::sync::{Arc, Condvar, Mutex};
+
+    let executor = TlsSourceExecutor::new(1, Duration::from_millis(50)).expect("executor");
+    assert_eq!(executor.max_blocking_concurrency(), 1);
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let operation_release = Arc::clone(&release);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let first_executor = executor.clone();
+    let first = tokio::spawn(async move {
+        first_executor
+            .run_blocking(move || {
+                let _ = started_tx.send(());
+                let (lock, condition) = &*operation_release;
+                let ready = lock
+                    .lock()
+                    .map_err(|_| MaterialError::ExecutorUnavailable)?;
+                let _ready = condition
+                    .wait_while(ready, |ready| !*ready)
+                    .map_err(|_| MaterialError::ExecutorUnavailable)?;
+                Ok(())
+            })
+            .await
+    });
+
+    started_rx.await.expect("first operation started");
+    let second = executor.run_blocking(|| Ok(())).await;
+    assert!(matches!(second, Err(MaterialError::DeadlineExceeded)));
+
+    let (lock, condition) = &*release;
+    *lock.lock().expect("release lock") = true;
+    condition.notify_one();
+    let first_result = first.await.expect("first task");
+    assert!(matches!(
+        first_result,
+        Ok(()) | Err(MaterialError::DeadlineExceeded)
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tls_source_deadline_keeps_last_known_good_generation() {
+    use ferrum_edge::tls::source::{MaterialError, TlsSourceExecutor};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let accepted_generation = Arc::new(AtomicU64::new(7));
+    let executor = TlsSourceExecutor::new(1, Duration::from_millis(25)).expect("executor");
+    let candidate = executor
+        .run_blocking(|| {
+            std::thread::sleep(Duration::from_millis(75));
+            Ok(8_u64)
+        })
+        .await;
+
+    if let Ok(generation) = &candidate {
+        accepted_generation.store(*generation, Ordering::Release);
+    }
+    assert!(matches!(candidate, Err(MaterialError::DeadlineExceeded)));
+    assert_eq!(accepted_generation.load(Ordering::Acquire), 7);
 }

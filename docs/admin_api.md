@@ -192,7 +192,7 @@ curl -H "Authorization: Bearer $TOKEN" \
   "http://localhost:9000/admin/tls/events?surface=proxy_https&limit=100"
 ```
 
-The event log is bounded and persisted under `FERRUM_TLS_MANAGED_STORE_PATH` as `tls-events.json`, so recent rotation history survives process restarts. It records successful rotations, source load failures, and rebuild failures with non-secret source identifiers and fingerprints for non-key material. No-op refresh polls are not stored as events; they are counted in `/metrics` through `ferrum_tls_source_refresh_total`; rotation outcomes, source fetch latency, and bounded fetch failure reasons are exposed as `ferrum_tls_cert_rotations_total`, `ferrum_tls_source_fetch_duration_seconds`, and `ferrum_tls_source_fetch_failures_total`.
+The event log is bounded and persisted under `FERRUM_TLS_MANAGED_STORE_PATH` as `tls-events.json`, so recent rotation history survives process restarts. It records successful rotations plus source failure transitions: first fixed failure class, changed class, recovery, and later regression. Repeated identical failures and no-op refresh polls are not stored; every attempt is still counted in `/metrics` through `ferrum_tls_source_refresh_total`. Returned `source_id` values are fixed-size non-reversible digests; use that returned value for the `source_id` filter. Configured source URIs, credentials, provider payloads, private-key fingerprints, and raw error strings never enter the ring. Rotation outcomes, source fetch latency, and bounded fetch failure reasons are exposed as `ferrum_tls_cert_rotations_total`, `ferrum_tls_source_fetch_duration_seconds`, and `ferrum_tls_source_fetch_failures_total`.
 
 ## TLS Forced Rotation
 

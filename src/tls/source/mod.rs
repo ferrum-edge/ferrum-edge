@@ -12,11 +12,13 @@ use futures_util::stream::BoxStream;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use zeroize::Zeroizing;
 
 /// Immutable process snapshot of the validated TLS material byte ceiling.
@@ -27,6 +29,16 @@ use zeroize::Zeroizing;
 /// repeated value fails closed. Absent until install (or first effective read
 /// before EnvConfig) — never a mutable test override.
 static TLS_MAX_MATERIAL_SIZE_BYTES: OnceLock<usize> = OnceLock::new();
+
+#[derive(Clone)]
+pub struct TlsSourceExecutor {
+    blocking_limit: Arc<Semaphore>,
+    max_blocking_concurrency: usize,
+    deadline: Duration,
+}
+
+static TLS_SOURCE_EXECUTION_POLICY: OnceLock<TlsSourceExecutor> = OnceLock::new();
+static TLS_SOURCE_RUNTIME: OnceLock<Result<tokio::runtime::Handle, String>> = OnceLock::new();
 
 /// TLS material kind expected from a source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -273,8 +285,9 @@ impl CertSourceUri {
     /// form that is safe to put in an operator-facing error or log record.
     ///
     /// [`Self::source_id`] is an *identity*: it keys TLS inventory entries and
-    /// event filters (`tls::events`), so it must stay distinguishing and is not
-    /// redacted in place. But it is also what the `MaterialError` variants
+    /// is the input to the non-reversible event ID (`tls::events`), so it must
+    /// stay distinguishing and is not redacted in place. But it is also what
+    /// the `MaterialError` variants
     /// interpolate, and their `Display` reaches `validate` output and startup
     /// logs. For a `vault://`/`aws://`/`azure://`/`gcp://` source that means the
     /// full secret path, ARN, or Key Vault URL was printed even though the
@@ -567,6 +580,43 @@ pub enum MaterialError {
         kind: MaterialKind,
         max_bytes: usize,
     },
+    /// The closed failure class used when admission or resolution exceeds the
+    /// configured end-to-end source deadline. It intentionally carries no URI,
+    /// provider response, credential, or other attacker-shaped detail.
+    #[error("TLS material source resolution timed out")]
+    DeadlineExceeded,
+    /// The closed failure class used when bounded execution infrastructure is
+    /// unavailable. Details from task panics/channel failures are withheld.
+    #[error("TLS material source executor is unavailable")]
+    ExecutorUnavailable,
+}
+
+impl MaterialError {
+    /// Fixed-cardinality failure class safe for metrics, transition dedup, and
+    /// the persisted event ring.
+    pub fn failure_class(&self) -> &'static str {
+        match self {
+            Self::Io { .. } => "io",
+            Self::UnsupportedScheme { .. } => "unsupported_scheme",
+            Self::Secret { .. } => "secret",
+            Self::InvalidSource { .. } => "invalid_source",
+            Self::Oversized { .. } => "oversized",
+            Self::DeadlineExceeded => "deadline_exceeded",
+            Self::ExecutorUnavailable => "executor_unavailable",
+        }
+    }
+
+    /// Event-log payload for a load failure.
+    ///
+    /// Closed classes for every variant except oversized, whose redacted
+    /// Display (`exceeds the configured maximum`) is the stable classification
+    /// the event log already documents. Dedup still keys on [`Self::failure_class`].
+    pub fn event_detail(&self) -> String {
+        match self {
+            Self::Oversized { .. } => self.to_string(),
+            _ => self.failure_class().to_string(),
+        }
+    }
 }
 
 pub struct MaterializedMaterial {
@@ -730,6 +780,194 @@ pub fn load_material_blocking_with(
             scheme: uri.scheme.as_str(),
         }),
     }
+}
+
+impl TlsSourceExecutor {
+    /// Build an isolated executor policy. Production installs one process-wide;
+    /// the public constructor exists so deterministic tests can use a private
+    /// semaphore and paused Tokio clock without mutating global state.
+    pub fn new(max_blocking_concurrency: usize, deadline: Duration) -> Result<Self, MaterialError> {
+        let max_deadline = Duration::from_secs(
+            crate::config::env_config::HARD_MAX_TLS_SOURCE_LOAD_TIMEOUT_SECONDS,
+        );
+        if max_blocking_concurrency == 0
+            || max_blocking_concurrency
+                > crate::config::env_config::HARD_MAX_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY
+            || deadline.is_zero()
+            || deadline > max_deadline
+        {
+            return Err(MaterialError::InvalidSource {
+                source_id: "tls-source-executor".to_string(),
+                details: "TLS source execution policy is outside the supported bounds".to_string(),
+            });
+        }
+        Ok(Self {
+            blocking_limit: Arc::new(Semaphore::new(max_blocking_concurrency)),
+            max_blocking_concurrency,
+            deadline,
+        })
+    }
+
+    /// Execute blocking source work without occupying a Tokio worker. The
+    /// deadline includes semaphore admission. Once admitted, the owned permit
+    /// moves into the blocking closure, so timing out the waiter cannot release
+    /// capacity while an abandoned OS operation is still running.
+    pub async fn run_blocking<T, F>(&self, operation: F) -> Result<T, MaterialError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, MaterialError> + Send + 'static,
+    {
+        self.run_blocking_result(operation).await?
+    }
+
+    /// Variant that preserves a caller-owned error type. This lets TLS
+    /// rebuild closures run on the same executor without flattening their
+    /// validation diagnostics into an executor failure.
+    pub async fn run_blocking_result<T, E, F>(
+        &self,
+        operation: F,
+    ) -> Result<Result<T, E>, MaterialError>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        F: FnOnce() -> Result<T, E> + Send + 'static,
+    {
+        let deadline = tokio::time::Instant::now() + self.deadline;
+        let permit =
+            tokio::time::timeout_at(deadline, Arc::clone(&self.blocking_limit).acquire_owned())
+                .await
+                .map_err(|_| MaterialError::DeadlineExceeded)?
+                .map_err(|_| MaterialError::ExecutorUnavailable)?;
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            operation()
+        });
+        let result = tokio::time::timeout_at(deadline, task)
+            .await
+            .map_err(|_| MaterialError::DeadlineExceeded)?
+            .map_err(|_| MaterialError::ExecutorUnavailable)?;
+        Ok(result)
+    }
+
+    /// Process-wide blocking admission bound. Reinstall equality uses this
+    /// getter so the bin target and tests share one reader.
+    pub fn max_blocking_concurrency(&self) -> usize {
+        self.max_blocking_concurrency
+    }
+
+    pub fn deadline(&self) -> Duration {
+        self.deadline
+    }
+}
+
+/// Install the immutable process-wide TLS source execution policy.
+pub fn install_tls_source_execution_policy(
+    max_blocking_concurrency: usize,
+    timeout_seconds: u64,
+) -> Result<(), MaterialError> {
+    let candidate = TlsSourceExecutor::new(
+        max_blocking_concurrency,
+        Duration::from_secs(timeout_seconds),
+    )?;
+    if let Some(existing) = TLS_SOURCE_EXECUTION_POLICY.get() {
+        return if existing.max_blocking_concurrency() == candidate.max_blocking_concurrency()
+            && existing.deadline() == candidate.deadline()
+        {
+            Ok(())
+        } else {
+            Err(MaterialError::InvalidSource {
+                source_id: "tls-source-executor".to_string(),
+                details: "TLS source execution policy is already installed with a different value"
+                    .to_string(),
+            })
+        };
+    }
+    match TLS_SOURCE_EXECUTION_POLICY.set(candidate.clone()) {
+        Ok(()) => Ok(()),
+        Err(_) => match TLS_SOURCE_EXECUTION_POLICY.get() {
+            Some(existing) => {
+                if existing.max_blocking_concurrency() == candidate.max_blocking_concurrency()
+                    && existing.deadline() == candidate.deadline()
+                {
+                    Ok(())
+                } else {
+                    Err(MaterialError::InvalidSource {
+                        source_id: "tls-source-executor".to_string(),
+                        details: "TLS source execution policy install raced with a different value"
+                            .to_string(),
+                    })
+                }
+            }
+            None => Err(MaterialError::ExecutorUnavailable),
+        },
+    }
+}
+
+fn effective_tls_source_executor() -> Result<TlsSourceExecutor, MaterialError> {
+    if let Some(executor) = TLS_SOURCE_EXECUTION_POLICY.get() {
+        return Ok(executor.clone());
+    }
+    let (max_blocking_concurrency, timeout_seconds) =
+        crate::config::env_config::parse_tls_source_execution_policy(
+            crate::config::conf_file::resolve_ferrum_var(
+                crate::config::env_config::TLS_SOURCE_MAX_BLOCKING_CONCURRENCY_KEY,
+            )
+            .as_deref(),
+            crate::config::conf_file::resolve_ferrum_var(
+                crate::config::env_config::TLS_SOURCE_LOAD_TIMEOUT_SECONDS_KEY,
+            )
+            .as_deref(),
+        )
+        .map_err(|details| MaterialError::InvalidSource {
+            source_id: "tls-source-executor".to_string(),
+            details,
+        })?;
+    let candidate = TlsSourceExecutor::new(
+        max_blocking_concurrency,
+        Duration::from_secs(timeout_seconds),
+    )?;
+    match TLS_SOURCE_EXECUTION_POLICY.set(candidate.clone()) {
+        Ok(()) => Ok(candidate),
+        Err(_) => TLS_SOURCE_EXECUTION_POLICY
+            .get()
+            .cloned()
+            .ok_or(MaterialError::ExecutorUnavailable),
+    }
+}
+
+pub(crate) async fn run_tls_source_blocking_result<T, E, F>(
+    operation: F,
+) -> Result<Result<T, E>, MaterialError>
+where
+    T: Send + 'static,
+    E: Send + 'static,
+    F: FnOnce() -> Result<T, E> + Send + 'static,
+{
+    effective_tls_source_executor()?
+        .run_blocking_result(operation)
+        .await
+}
+
+/// Materialize one source on the shared bounded blocking executor.
+pub async fn load_material(
+    source: &CertSource,
+    fallback_kind: MaterialKind,
+) -> Result<MaterializedMaterial, MaterialError> {
+    let max_bytes = effective_tls_max_material_size_bytes()?;
+    load_material_with(source, fallback_kind, max_bytes).await
+}
+
+/// Materialize one source with an explicit byte ceiling on the shared bounded
+/// blocking executor and under the configured end-to-end deadline.
+pub async fn load_material_with(
+    source: &CertSource,
+    fallback_kind: MaterialKind,
+    max_bytes: usize,
+) -> Result<MaterializedMaterial, MaterialError> {
+    let source = source.clone();
+    effective_tls_source_executor()?
+        .run_blocking(move || load_material_blocking_with(&source, fallback_kind, max_bytes))
+        .await
 }
 
 /// Validate an explicit TLS material byte ceiling before any read, conversion,
@@ -1323,34 +1561,21 @@ fn resolve_k8s_secret_reference_blocking(
     namespace: String,
     name: String,
 ) -> Result<FetchedK8sSecret, String> {
-    std::thread::Builder::new()
-        .name("tls-k8s-secret-source-loader".to_string())
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| {
-                    format!("failed to create TLS Kubernetes Secret loader runtime: {error}")
-                })?;
-            runtime.block_on(async move {
-                let client = kube::Client::try_default()
-                    .await
-                    .map_err(|error| format!("failed to create Kubernetes client: {error}"))?;
-                let secrets: kube::Api<k8s_openapi::api::core::v1::Secret> =
-                    kube::Api::namespaced(client, &namespace);
-                let secret = secrets.get(&name).await.map_err(|error| {
-                    format!("failed to fetch Kubernetes Secret {namespace}/{name}: {error}")
-                })?;
-                let data = secret.data.unwrap_or_default();
-                Ok(FetchedK8sSecret {
-                    data,
-                    resource_version: secret.metadata.resource_version,
-                })
-            })
+    resolve_on_tls_source_runtime(async move {
+        let client = kube::Client::try_default()
+            .await
+            .map_err(|error| format!("failed to create Kubernetes client: {error}"))?;
+        let secrets: kube::Api<k8s_openapi::api::core::v1::Secret> =
+            kube::Api::namespaced(client, &namespace);
+        let secret = secrets.get(&name).await.map_err(|error| {
+            format!("failed to fetch Kubernetes Secret {namespace}/{name}: {error}")
+        })?;
+        let data = secret.data.unwrap_or_default();
+        Ok(FetchedK8sSecret {
+            data,
+            resource_version: secret.metadata.resource_version,
         })
-        .map_err(|error| format!("failed to spawn TLS Kubernetes Secret loader thread: {error}"))?
-        .join()
-        .map_err(|_| "TLS Kubernetes Secret loader thread panicked".to_string())?
+    })
 }
 
 // Each arm gates a DISTINCT `cfg!(feature = ...)`, so the
@@ -1375,22 +1600,64 @@ fn resolve_secret_reference_blocking(
     identifier: String,
     key: String,
 ) -> Result<crate::secrets::ResolvedSecret, String> {
-    std::thread::Builder::new()
-        .name("tls-secret-source-loader".to_string())
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| format!("failed to create TLS secret loader runtime: {error}"))?;
-            runtime.block_on(crate::secrets::resolve_external_reference(
-                &scheme,
-                &identifier,
-                &key,
-            ))
-        })
-        .map_err(|error| format!("failed to spawn TLS secret loader thread: {error}"))?
-        .join()
-        .map_err(|_| "TLS secret loader thread panicked".to_string())?
+    resolve_on_tls_source_runtime(async move {
+        crate::secrets::resolve_external_reference(&scheme, &identifier, &key).await
+    })
+}
+
+fn tls_source_runtime_handle() -> Result<tokio::runtime::Handle, String> {
+    match TLS_SOURCE_RUNTIME.get_or_init(|| {
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("tls-source-runtime".to_string())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(format!(
+                            "failed to create shared TLS source runtime: {error}"
+                        )));
+                        return;
+                    }
+                };
+                if ready_tx.send(Ok(runtime.handle().clone())).is_err() {
+                    return;
+                }
+                runtime.block_on(std::future::pending::<()>());
+            })
+            .map_err(|error| format!("failed to spawn shared TLS source runtime: {error}"))?;
+        ready_rx
+            .recv()
+            .map_err(|_| "shared TLS source runtime exited during initialization".to_string())?
+    }) {
+        Ok(handle) => Ok(handle.clone()),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn resolve_on_tls_source_runtime<T, F>(future: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T, String>> + Send + 'static,
+{
+    let handle = tls_source_runtime_handle()?;
+    let deadline = effective_tls_source_executor()
+        .map_err(|_| "TLS source execution policy is unavailable".to_string())?
+        .deadline();
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let task = handle.spawn(async move {
+        let _ = result_tx.send(future.await);
+    });
+    match result_rx.recv_timeout(deadline) {
+        Ok(result) => result,
+        Err(_) => {
+            task.abort();
+            Err("TLS source resolution deadline exceeded".to_string())
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -1403,12 +1670,9 @@ impl MaterialLoader for FileLoader {
     }
 
     async fn load(&self, uri: &CertSourceUri) -> Result<MaterializedMaterial, MaterialError> {
-        let path = uri_file_path(&uri.identifier).ok_or_else(|| MaterialError::InvalidSource {
-            source_id: uri.redacted_source_id(),
-            details: "file URI has no path".to_string(),
-        })?;
+        let source = CertSource::Uri(uri.clone());
         let max_bytes = effective_tls_max_material_size_bytes()?;
-        load_file_material_with(Path::new(&path), uri.kind, max_bytes)
+        load_material_with(&source, uri.kind, max_bytes).await
     }
 
     async fn watch(&self, _uri: &CertSourceUri) -> Result<MaterialWatch, MaterialError> {

@@ -231,6 +231,98 @@ async fn dynamic_tls_listener_serves_rotated_cert_after_slot_swap() {
         .expect("listener should return cleanly");
 }
 
+#[test]
+fn repeated_tls_source_failures_record_only_transitions_but_count_every_attempt() {
+    use chrono::TimeZone;
+    use ferrum_edge::tls::events::{
+        TlsEventFilter, TlsEventLog, TlsSourceEvent, TlsSourceEventMaterial, event_source_id,
+    };
+    use ferrum_edge::tls::source::subscription::{
+        LoadFailureTransitionTracker, WatchedMaterialSource, record_refresh_for_sources,
+    };
+    use ferrum_edge::tls::source::{CertSource, MaterialKind};
+
+    const SURFACE: &str = "issue_4435_transition_test";
+    let source = CertSource::parse(
+        "vault://user:password@provider/secret/path?token=credential&kind=cert",
+        MaterialKind::Cert,
+    );
+    let watched = vec![WatchedMaterialSource::new(
+        "gateway_svid_cert",
+        source.clone(),
+        MaterialKind::Cert,
+    )];
+    let raw_source_id = source.source_id();
+    let expected_source_id = event_source_id(&raw_source_id);
+    let cert_id = "cert-transition-test".to_string();
+    let at = chrono::Utc
+        .timestamp_opt(1_700_000_000, 0)
+        .single()
+        .expect("fixed timestamp");
+    let event = |outcome: &str, error: Option<&str>| TlsSourceEvent {
+        id: 0,
+        at,
+        surface: SURFACE.to_string(),
+        outcome: outcome.to_string(),
+        sources: vec![TlsSourceEventMaterial {
+            label: "gateway_svid_cert".to_string(),
+            cert_id: cert_id.clone(),
+            source_id: raw_source_id.clone(),
+            scheme: "vault".to_string(),
+            kind: "cert".to_string(),
+            fingerprint_sha256: None,
+        }],
+        revision: None,
+        error: error.map(str::to_string),
+    };
+
+    let log = TlsEventLog::new(1024);
+    let mut transitions = LoadFailureTransitionTracker::default();
+    for _ in 0..1_000 {
+        record_refresh_for_sources(SURFACE, &watched, "load_error");
+        if transitions.observe_failure("deadline_exceeded") {
+            log.record(event("load_error", Some("deadline_exceeded")));
+        }
+    }
+
+    let first_snapshot = log.list(&TlsEventFilter::default());
+    assert_eq!(first_snapshot.len(), 1);
+    assert_eq!(first_snapshot[0].sources[0].source_id, expected_source_id);
+    let metrics = ferrum_edge::plugins::prometheus_metrics::global_registry().render_uncached();
+    let counter = metrics
+        .lines()
+        .find(|line| {
+            line.contains("surface=\"issue_4435_transition_test\"")
+                && line.contains("outcome=\"load_error\"")
+        })
+        .expect("refresh counter series");
+    assert!(counter.ends_with(" 1000"), "unexpected counter: {counter}");
+
+    record_refresh_for_sources(SURFACE, &watched, "load_error");
+    assert!(transitions.observe_failure("secret"));
+    log.record(event("load_error", Some("secret")));
+    assert!(transitions.observe_recovery());
+    log.record(event("recovered", None));
+    record_refresh_for_sources(SURFACE, &watched, "load_error");
+    assert!(transitions.observe_failure("deadline_exceeded"));
+    log.record(event("load_error", Some("deadline_exceeded")));
+
+    let snapshot = log.list(&TlsEventFilter::default());
+    assert_eq!(snapshot.len(), 4);
+    assert_eq!(snapshot[0].outcome, "load_error");
+    assert_eq!(snapshot[1].error.as_deref(), Some("secret"));
+    assert_eq!(snapshot[2].outcome, "recovered");
+    assert_eq!(snapshot[3].outcome, "load_error");
+
+    let serialized = serde_json::to_string(&snapshot).expect("serialize event snapshot");
+    for secret in ["user", "password", "secret/path", "token", "credential"] {
+        assert!(
+            !serialized.contains(secret),
+            "event snapshot leaked secret fragment {secret}: {serialized}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // HTTP/3 accepted-candidate binding (issue #3857)
 // ---------------------------------------------------------------------------

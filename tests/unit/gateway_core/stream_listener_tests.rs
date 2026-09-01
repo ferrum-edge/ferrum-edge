@@ -35,6 +35,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
+const STREAM_LISTENER_SOURCE: &str = include_str!("../../../src/proxy/stream_listener.rs");
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -108,6 +110,34 @@ fn create_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
     };
     proxy.resolved_tls = BackendTlsConfig::from_proxy(&proxy);
     proxy
+}
+
+#[test]
+fn stream_listener_material_preparation_precedes_lock_without_await_in_critical_section() {
+    let reconcile = STREAM_LISTENER_SOURCE
+        .split_once("pub async fn reconcile(&self)")
+        .map(|(_, reconcile)| reconcile)
+        .expect("reconcile implementation");
+    let preparation = reconcile
+        .find("let backend_tls_reload_key = if prepares_backend_tls")
+        .expect("reconciliation prepares backend TLS material");
+    let lock_text = "let listeners = self.listeners.lock().await;";
+    let lock = reconcile
+        .find(lock_text)
+        .expect("reconciliation listener-map lock");
+    assert!(
+        preparation < lock,
+        "TLS preparation must precede the listener-map lock"
+    );
+
+    let after_lock = &reconcile[lock + lock_text.len()..];
+    let drop = after_lock
+        .find("drop(listeners);")
+        .expect("listener-map guard is explicitly dropped");
+    assert!(
+        !after_lock[..drop].contains(".await"),
+        "the listener-map MutexGuard must never cross an await"
+    );
 }
 
 fn constrain_to_loopback(proxy: &mut Proxy) {

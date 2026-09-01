@@ -13,7 +13,7 @@ use ferrum_edge::identity::svid_source_watch::{
     GatewaySvidSourceSet, GatewaySvidSourceTracker, GatewaySvidWatchConfig, gateway_svid_cadence,
     gateway_svid_rotation_equivalent, run_gateway_svid_source_rotation_loop,
 };
-use ferrum_edge::tls::events::{TlsEventFilter, global_event_log};
+use ferrum_edge::tls::events::{TlsEventFilter, event_source_id, global_event_log};
 use ferrum_edge::tls::source::subscription::MaterialFingerprintEntry;
 use ferrum_edge::tls::source::{CertSource, MaterialKind, SourceScheme};
 use rcgen::{
@@ -130,11 +130,13 @@ fn poll_at(tracker: &mut GatewaySvidSourceTracker, start: Instant, secs: u64) ->
 
 /// Recorded `tls::events` entries naming `source_id` with `outcome`.
 ///
-/// The process-wide event log is shared by every test in this binary, so the
-/// count is scoped to one temp-directory source identity and one outcome.
+/// The ring stores a non-reversible digest, never the configured path, so the
+/// lookup uses [`event_source_id`]. The process-wide event log is shared by
+/// every test in this binary; the count is scoped to one temp-directory source
+/// identity and one outcome.
 fn event_count(source_id: &str, outcome: &str) -> usize {
     let filter = TlsEventFilter {
-        source_id: Some(source_id.to_string()),
+        source_id: Some(event_source_id(source_id)),
         outcome: Some(outcome.to_string()),
         ..Default::default()
     };

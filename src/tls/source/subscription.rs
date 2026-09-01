@@ -6,7 +6,7 @@
 //! not churn TLS configs or connection pools.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::fips::approved::Sha256;
@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 
 use super::{
     CertSource, MaterialError, MaterialKind, SourceScheme, k8s_secret_watch_target,
-    load_material_blocking_with,
+    load_material_blocking_with, load_material_with,
 };
 
 pub const DEFAULT_SECRET_REFRESH_INTERVAL_SECS: u64 = 300;
@@ -277,6 +277,13 @@ pub fn material_fingerprint(
     material_fingerprint_with(watched, max_bytes)
 }
 
+pub async fn material_fingerprint_async(
+    watched: &WatchedMaterialSource,
+) -> Result<MaterialFingerprintEntry, MaterialError> {
+    let max_bytes = super::effective_tls_max_material_size_bytes()?;
+    material_fingerprint_async_with(watched, max_bytes).await
+}
+
 /// Fingerprint one configured source using an explicit material byte ceiling.
 pub fn material_fingerprint_with(
     watched: &WatchedMaterialSource,
@@ -331,6 +338,63 @@ pub fn material_fingerprint_with(
     })
 }
 
+/// Async source-set fingerprinting for every runtime watcher. All filesystem,
+/// provider, Kubernetes, ACME, and managed-store work is admitted through the
+/// one bounded/deadlined source executor in [`super::load_material_with`].
+pub async fn material_set_fingerprint_async_with(
+    sources: &[WatchedMaterialSource],
+    max_bytes: usize,
+) -> Result<MaterialSetFingerprint, MaterialError> {
+    let mut entries = Vec::with_capacity(sources.len());
+    for watched in sources {
+        entries.push(material_fingerprint_async_with(watched, max_bytes).await?);
+    }
+    Ok(MaterialSetFingerprint { entries })
+}
+
+/// Async per-source fingerprinting used by independently scheduled surfaces
+/// such as the gateway SVID tracker.
+pub async fn material_fingerprint_async_with(
+    watched: &WatchedMaterialSource,
+    max_bytes: usize,
+) -> Result<MaterialFingerprintEntry, MaterialError> {
+    if let Some(entry) = opaque_key_fingerprint_entry(watched) {
+        return Ok(entry);
+    }
+    let configured_scheme = configured_source_scheme(&watched.source);
+    let started = Instant::now();
+    let material = match load_material_with(&watched.source, watched.kind, max_bytes).await {
+        Ok(material) => material,
+        Err(error) => {
+            let registry = crate::plugins::prometheus_metrics::global_registry();
+            registry.record_tls_source_fetch_duration(
+                configured_scheme.as_str(),
+                watched.kind.as_str(),
+                started.elapsed().as_secs_f64(),
+            );
+            registry.record_tls_source_fetch_failure(
+                configured_scheme.as_str(),
+                watched.kind.as_str(),
+                error.failure_class(),
+            );
+            return Err(error);
+        }
+    };
+    crate::plugins::prometheus_metrics::global_registry().record_tls_source_fetch_duration(
+        material.source_kind.as_str(),
+        material.kind.as_str(),
+        started.elapsed().as_secs_f64(),
+    );
+    Ok(MaterialFingerprintEntry {
+        label: watched.label,
+        source_id: watched.source.source_id(),
+        fingerprint: material.fingerprint,
+        version: material.version,
+        source_kind: material.source_kind,
+        kind: material.kind,
+    })
+}
+
 fn opaque_key_fingerprint_entry(
     watched: &WatchedMaterialSource,
 ) -> Option<MaterialFingerprintEntry> {
@@ -354,12 +418,33 @@ fn opaque_key_fingerprint_entry(
 }
 
 fn material_error_reason(error: &MaterialError) -> &'static str {
-    match error {
-        MaterialError::Io { .. } => "io",
-        MaterialError::UnsupportedScheme { .. } => "unsupported_scheme",
-        MaterialError::Secret { .. } => "secret",
-        MaterialError::InvalidSource { .. } => "invalid_source",
-        MaterialError::Oversized { .. } => "oversized",
+    error.failure_class()
+}
+
+/// Fixed-size transition latch for one configured watcher. It retains only a
+/// closed failure class, never a source URI, provider response, credential, or
+/// attacker-controlled error string.
+#[derive(Default)]
+pub struct LoadFailureTransitionTracker {
+    last_class: Option<&'static str>,
+}
+
+impl LoadFailureTransitionTracker {
+    /// Returns true for the first failure (`last_class` is `None`) and for a
+    /// materially changed closed failure class. Repeats of the same class are
+    /// suppressed. Every caller still records attempt/failure counters before
+    /// consulting this transition latch.
+    pub fn observe_failure(&mut self, failure_class: &'static str) -> bool {
+        if self.last_class == Some(failure_class) {
+            return false;
+        }
+        self.last_class = Some(failure_class);
+        true
+    }
+
+    /// Returns true once when a failed watcher recovers.
+    pub fn observe_recovery(&mut self) -> bool {
+        self.last_class.take().is_some()
     }
 }
 
@@ -367,6 +452,18 @@ fn material_error_reason(error: &MaterialError) -> &'static str {
 pub type MaterialSetRebuildFn = Box<dyn Fn() -> Result<(), anyhow::Error> + Send + Sync + 'static>;
 pub type MaterialSetAsyncRebuildFn =
     Box<dyn Fn() -> BoxFuture<'static, Result<(), anyhow::Error>> + Send + Sync + 'static>;
+type SharedMaterialSetRebuildFn =
+    Arc<dyn Fn() -> Result<(), anyhow::Error> + Send + Sync + 'static>;
+
+async fn run_material_set_rebuild(
+    rebuild: &SharedMaterialSetRebuildFn,
+) -> Result<(), anyhow::Error> {
+    let rebuild = Arc::clone(rebuild);
+    match super::run_tls_source_blocking_result(move || rebuild()).await {
+        Ok(result) => result,
+        Err(error) => Err(anyhow::Error::new(error)),
+    }
+}
 
 /// Configuration for [`spawn_material_set_reload_task`].
 pub struct MaterialSetReloadConfig {
@@ -681,7 +778,7 @@ async fn run_material_set_reload_loop(
         max_material_bytes,
         ready_tx,
     } = config;
-
+    let rebuild: SharedMaterialSetRebuildFn = Arc::from(rebuild);
     if sources.is_empty() {
         info!(
             surface,
@@ -701,11 +798,18 @@ async fn run_material_set_reload_loop(
         "TLS material source reload watcher started"
     );
 
-    let mut last_fingerprint = match material_set_fingerprint_with(&sources, max_material_bytes) {
+    let mut load_failures = LoadFailureTransitionTracker::default();
+    let mut last_fingerprint = match material_set_fingerprint_async_with(
+        &sources,
+        max_material_bytes,
+    )
+    .await
+    {
         Ok(fingerprint) => Some(fingerprint),
         Err(error) => {
             record_refresh_for_sources(surface, &sources, "load_error");
-            crate::tls::events::record_load_error(surface, &sources, &error.to_string());
+            load_failures.observe_failure(error.failure_class());
+            crate::tls::events::record_load_error(surface, &sources, &error.event_detail());
             warn!(
                 surface,
                 error = %error,
@@ -714,7 +818,6 @@ async fn run_material_set_reload_loop(
             None
         }
     };
-    let mut last_load_failed = last_fingerprint.is_none();
 
     // Deterministic readiness: force/tick handling starts only after the
     // initial fingerprint baseline is established, so callers cannot race the
@@ -761,27 +864,32 @@ async fn run_material_set_reload_loop(
             }
         }
 
-        let next_fingerprint = match material_set_fingerprint_with(&sources, max_material_bytes) {
+        let next_fingerprint = match material_set_fingerprint_async_with(
+            &sources,
+            max_material_bytes,
+        )
+        .await
+        {
             Ok(fingerprint) => {
-                if last_load_failed {
+                if load_failures.observe_recovery() {
+                    crate::tls::events::record_load_recovery(surface, &sources);
                     info!(
                         surface,
                         "TLS material source watcher recovered source access"
                     );
-                    last_load_failed = false;
                 }
                 fingerprint
             }
             Err(error) => {
                 record_refresh_for_sources(surface, &sources, "load_error");
-                crate::tls::events::record_load_error(surface, &sources, &error.to_string());
-                if !last_load_failed {
+                if load_failures.observe_failure(error.failure_class()) {
+                    crate::tls::events::record_load_error(surface, &sources, &error.event_detail());
                     warn!(
                         surface,
                         error = %error,
-                        "TLS material source watcher could not load source bytes; keeping current material (silenced until load succeeds again)"
+                        "TLS material source watcher could not load source bytes; keeping current \
+                         material (silenced until the failure class changes or access recovers)"
                     );
-                    last_load_failed = true;
                 }
                 continue;
             }
@@ -792,7 +900,7 @@ async fn run_material_set_reload_loop(
             continue;
         }
 
-        match rebuild() {
+        match run_material_set_rebuild(&rebuild).await {
             Ok(()) => {
                 let event_entries = next_fingerprint.entries.clone();
                 record_refresh_for_entries(surface, &next_fingerprint.entries, "rotated");
@@ -859,11 +967,18 @@ async fn run_async_material_set_reload_loop(
         "TLS material source reload watcher started"
     );
 
-    let mut last_fingerprint = match material_set_fingerprint_with(&sources, max_material_bytes) {
+    let mut load_failures = LoadFailureTransitionTracker::default();
+    let mut last_fingerprint = match material_set_fingerprint_async_with(
+        &sources,
+        max_material_bytes,
+    )
+    .await
+    {
         Ok(fingerprint) => Some(fingerprint),
         Err(error) => {
             record_refresh_for_sources(surface, &sources, "load_error");
-            crate::tls::events::record_load_error(surface, &sources, &error.to_string());
+            load_failures.observe_failure(error.failure_class());
+            crate::tls::events::record_load_error(surface, &sources, &error.event_detail());
             warn!(
                 surface,
                 error = %error,
@@ -872,7 +987,6 @@ async fn run_async_material_set_reload_loop(
             None
         }
     };
-    let mut last_load_failed = last_fingerprint.is_none();
     let mut last_rebuild_failure: Option<MaterialSetFingerprint> = None;
 
     if reconcile_startup {
@@ -946,27 +1060,32 @@ async fn run_async_material_set_reload_loop(
             }
         }
 
-        let next_fingerprint = match material_set_fingerprint_with(&sources, max_material_bytes) {
+        let next_fingerprint = match material_set_fingerprint_async_with(
+            &sources,
+            max_material_bytes,
+        )
+        .await
+        {
             Ok(fingerprint) => {
-                if last_load_failed {
+                if load_failures.observe_recovery() {
+                    crate::tls::events::record_load_recovery(surface, &sources);
                     info!(
                         surface,
                         "TLS material source watcher recovered source access"
                     );
-                    last_load_failed = false;
                 }
                 fingerprint
             }
             Err(error) => {
                 record_refresh_for_sources(surface, &sources, "load_error");
-                crate::tls::events::record_load_error(surface, &sources, &error.to_string());
-                if !last_load_failed {
+                if load_failures.observe_failure(error.failure_class()) {
+                    crate::tls::events::record_load_error(surface, &sources, &error.event_detail());
                     warn!(
                         surface,
                         error = %error,
-                        "TLS material source watcher could not load source bytes; keeping current material (silenced until load succeeds again)"
+                        "TLS material source watcher could not load source bytes; keeping current \
+                         material (silenced until the failure class changes or access recovers)"
                     );
-                    last_load_failed = true;
                 }
                 continue;
             }
@@ -1027,9 +1146,10 @@ async fn run_dynamic_material_set_reload_loop(
         rebuild,
         max_material_bytes,
     } = config;
+    let rebuild: SharedMaterialSetRebuildFn = Arc::from(rebuild);
 
     let mut last_fingerprint: Option<MaterialSetFingerprint> = None;
-    let mut last_load_failed = false;
+    let mut load_failures = LoadFailureTransitionTracker::default();
     let mut last_source_signature: Option<Vec<(MaterialKind, String)>> = None;
     let mut k8s_targets = Vec::new();
     let mut k8s_handles = Vec::new();
@@ -1059,7 +1179,7 @@ async fn run_dynamic_material_set_reload_loop(
             );
             last_source_signature = Some(source_signature);
             last_fingerprint = None;
-            last_load_failed = false;
+            load_failures = LoadFailureTransitionTracker::default();
         }
 
         let interval =
@@ -1073,27 +1193,32 @@ async fn run_dynamic_material_set_reload_loop(
             continue;
         }
 
-        let next_fingerprint = match material_set_fingerprint_with(&sources, max_material_bytes) {
+        let next_fingerprint = match material_set_fingerprint_async_with(
+            &sources,
+            max_material_bytes,
+        )
+        .await
+        {
             Ok(fingerprint) => {
-                if last_load_failed {
+                if load_failures.observe_recovery() {
+                    crate::tls::events::record_load_recovery(surface, &sources);
                     info!(
                         surface,
                         "TLS material source watcher recovered source access"
                     );
-                    last_load_failed = false;
                 }
                 fingerprint
             }
             Err(error) => {
                 record_refresh_for_sources(surface, &sources, "load_error");
-                crate::tls::events::record_load_error(surface, &sources, &error.to_string());
-                if !last_load_failed {
+                if load_failures.observe_failure(error.failure_class()) {
+                    crate::tls::events::record_load_error(surface, &sources, &error.event_detail());
                     warn!(
                         surface,
                         error = %error,
-                        "TLS material source watcher could not load source bytes; keeping current material (silenced until load succeeds again)"
+                        "TLS material source watcher could not load source bytes; keeping current \
+                         material (silenced until the failure class changes or access recovers)"
                     );
-                    last_load_failed = true;
                 }
                 if !wait_material_set_reload_tick(interval, &mut shutdown_rx, &mut force_rx).await {
                     cleanup_dynamic_reload(surface, &mut k8s_handles);
@@ -1121,7 +1246,7 @@ async fn run_dynamic_material_set_reload_loop(
             continue;
         }
 
-        match rebuild() {
+        match run_material_set_rebuild(&rebuild).await {
             Ok(()) => {
                 let event_entries = next_fingerprint.entries.clone();
                 record_refresh_for_entries(surface, &next_fingerprint.entries, "rotated");
@@ -1239,7 +1364,9 @@ pub fn record_refresh_for_entries(
     }
 }
 
-fn record_refresh_for_sources(
+/// Record one counter increment per configured source for every attempted
+/// refresh, including repeated failures that do not create another event.
+pub fn record_refresh_for_sources(
     surface: &'static str,
     sources: &[WatchedMaterialSource],
     outcome: &'static str,

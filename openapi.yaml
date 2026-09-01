@@ -449,8 +449,11 @@ paths:
       summary: List recent TLS source rotation events
       description: |
         Returns bounded persisted history for TLS source watcher outcomes.
-        Events are emitted for successful rotations and source/rebuild failures;
-        no-op refresh polls are counted in Prometheus but are not stored here.
+        Events are emitted for successful rotations and source/rebuild failure
+        transitions (first/changed class, recovery, and later regression);
+        repeated no-op or identical-failure polls are counted in Prometheus but
+        are not stored here. Source identities are bounded non-reversible
+        digests and never contain configured URIs or credentials.
         The bounded history is persisted under `FERRUM_TLS_MANAGED_STORE_PATH`
         so recent rotation events survive process restarts.
       tags: [TLS]
@@ -466,7 +469,7 @@ paths:
           required: false
           schema:
             type: string
-          description: Filter to events whose source identifier matches exactly.
+          description: Filter to events whose returned digested source ID matches exactly.
         - name: surface
           in: query
           required: false
@@ -478,7 +481,7 @@ paths:
           required: false
           schema:
             type: string
-            enum: [rotated, load_error, rebuild_error]
+            enum: [rotated, load_error, rebuild_error, recovered]
         - name: since
           in: query
           required: false
@@ -8451,7 +8454,7 @@ components:
           type: string
         outcome:
           type: string
-          enum: [rotated, load_error, rebuild_error]
+          enum: [rotated, load_error, rebuild_error, recovered]
         sources:
           type: array
           items:
@@ -8462,7 +8465,7 @@ components:
           description: Surface revision after a successful rotation.
         error:
           type: string
-          description: Non-secret error string for failed load or rebuild events.
+          description: Closed non-secret failure class for failed load or rebuild events.
 
     TlsSourceEventMaterial:
       type: object
@@ -8476,7 +8479,8 @@ components:
           description: Stable event source ID derived from material kind and non-secret source identity.
         source_id:
           type: string
-          description: Non-secret source identifier. Inline PEM is redacted.
+          pattern: '^source-[0-9a-f]{24}$'
+          description: Fixed-size non-reversible digest of the configured source identity; never a URI, path, credential, or provider payload.
         scheme:
           type: string
           examples: [file, vault, aws, azure, gcp, k8s, acme, managed, pkcs11]
