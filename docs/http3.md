@@ -1416,14 +1416,20 @@ frame ceiling through `h3::client::builder()` as well; `h3::client::new` keeps
 the unbounded upstream default and is not used on those constructors. A
 malicious or compromised H3 backend can declare an enormous HEADERS, unknown,
 CONTROL, or PUSH frame the same way a frontend client can; QUIC flow control
-does not bound accumulation on either side. Backend clients deliberately do
-not set `max_field_section_size`: `FERRUM_MAX_HEADER_SIZE_BYTES` is documented
-as a request-header policy, not an H3-only backend response-header limit.
+does not bound accumulation on either side. Backend clients also set a distinct
+decoded response field-section ceiling to the smaller of the buffered
+non-`DATA` frame ceiling and 1 MiB − 1. The buffered-frame ceiling is twice
+the frontend request policy; the absolute cap keeps QPACK's 32-byte-per-field accounting from
+producing enough decoded fields to panic `http::HeaderMap` at its fixed
+32,768-entry limit when an operator configures a very large request limit.
+This preserves response headroom without leaving QPACK expansion or decoded
+field count effectively unbounded.
 
 | Value | Source | Effect |
 |---|---|---|
 | Frontend `SETTINGS_MAX_FIELD_SECTION_SIZE` | `FERRUM_MAX_HEADER_SIZE_BYTES`, floored at 16 KiB, clamped into the QUIC varint range | Advertised to the client, and enforced by frontend QPACK decoding. Before this the listener advertised `VarInt::MAX` (2^62-1) while enforcing the configured limit only after a complete decode. |
 | Buffered non-`DATA` frame ceiling | 2x the frontend field-section size | On frontend and pooled backend connections, a frame whose **declared** payload length exceeds it is refused before a single payload byte is buffered. |
+| Backend decoded response field-section ceiling | The smaller of the buffered non-`DATA` frame ceiling and 1 MiB − 1 | On pooled backend connections, QPACK decoding stops before a compact response can expand into enough fields to exceed `http::HeaderMap`'s 32,768-entry capacity (QPACK accounts 32 bytes per decoded field). |
 
 **Failure posture.** The refusal happens as soon as the frame's type and length
 varints are decoded — before the payload is stored and before the decoder arms

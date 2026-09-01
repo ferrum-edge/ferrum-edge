@@ -81,6 +81,14 @@ pub const H3_MIN_FIELD_SECTION_SIZE: usize = 16 * 1024;
 /// while still bounding what one stream can buffer.
 const H3_BUFFERED_FRAME_LEN_HEADROOM: u64 = 2;
 
+/// Absolute decoded-size cap for an H3 backend response field section.
+///
+/// QPACK accounts at least 32 bytes per decoded field, so keeping this below
+/// `32 * 32_768` also keeps the decoded field count below `HeaderMap`'s fixed
+/// 32,768-entry capacity even when the operator configures a very large request
+/// header policy.
+pub const H3_BACKEND_RESPONSE_FIELD_SECTION_SIZE_CAP: u64 = 1024 * 1024 - 1;
+
 /// The `SETTINGS_MAX_FIELD_SECTION_SIZE` the HTTP/3 frontend advertises, in
 /// bytes, derived from `FERRUM_MAX_HEADER_SIZE_BYTES` (issue #4261).
 ///
@@ -113,6 +121,18 @@ pub fn h3_max_buffered_frame_len(max_header_size_bytes: usize) -> u64 {
     h3_max_field_section_size(max_header_size_bytes)
         .saturating_mul(H3_BUFFERED_FRAME_LEN_HEADROOM)
         .min(QUIC_VARINT_MAX_U64)
+}
+
+/// Decoded field-section ceiling for responses received from H3 backends.
+///
+/// This is deliberately distinct from the frontend request-header policy: an
+/// upstream response may legitimately be larger than the configured request
+/// limit. It must nevertheless be finite because QPACK can expand a compact
+/// encoded block into enough fields to exceed `http::HeaderMap`'s capacity.
+/// Using the already-bounded non-`DATA` frame ceiling preserves that response
+/// headroom while stopping hostile expansion during QPACK decoding.
+pub fn h3_backend_response_max_field_section_size(max_header_size_bytes: usize) -> u64 {
+    h3_max_buffered_frame_len(max_header_size_bytes).min(H3_BACKEND_RESPONSE_FIELD_SECTION_SIZE_CAP)
 }
 
 /// Refuse a `FERRUM_MAX_HEADER_SIZE_BYTES` the HTTP/3 frontend could not

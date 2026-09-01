@@ -2234,13 +2234,18 @@ impl Http3ConnectionPool {
         // Hostile H3 backends can over-declare HEADERS/CONTROL/PUSH the same
         // way an unauthenticated frontend client can. Opt into the same
         // declared-frame ceiling the H3 listener uses, derived from
-        // FERRUM_MAX_HEADER_SIZE_BYTES. Do not set max_field_section_size here:
-        // that variable governs request headers, not backend responses.
+        // FERRUM_MAX_HEADER_SIZE_BYTES. Keep the decoded response field-section
+        // ceiling distinct from the request-header policy while bounding QPACK
+        // expansion from a hostile backend.
         // Computed once per connection setup from already-validated config:
         // plain integer reads, no request-path lock or allocation.
         // `h3::client::new` keeps the unbounded upstream frame-decoder default.
         let h3_max_buffered_frame_len =
             crate::http3::config::h3_max_buffered_frame_len(self.env_config.max_header_size_bytes);
+        let h3_backend_response_max_field_section_size =
+            crate::http3::config::h3_backend_response_max_field_section_size(
+                self.env_config.max_header_size_bytes,
+            );
 
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
@@ -2303,6 +2308,7 @@ impl Http3ConnectionPool {
                     // this pool and suppress failover to a later DNS address.
                     let quic_conn = connection.clone();
                     let (mut driver, send_request) = h3::client::builder()
+                        .max_field_section_size(h3_backend_response_max_field_section_size)
                         .max_buffered_frame_len(h3_max_buffered_frame_len)
                         .build(h3_quinn::Connection::new(connection))
                         .await
@@ -2395,6 +2401,10 @@ impl Http3ConnectionPool {
         // connection setup; see that constructor for the rationale.
         let h3_max_buffered_frame_len =
             crate::http3::config::h3_max_buffered_frame_len(self.env_config.max_header_size_bytes);
+        let h3_backend_response_max_field_section_size =
+            crate::http3::config::h3_backend_response_max_field_section_size(
+                self.env_config.max_header_size_bytes,
+            );
 
         // DestinationRule `connectionPool.tcp.maxConnections`. A QUIC
         // connection is a physical backend connection, so reserve the slot
@@ -2457,6 +2467,7 @@ impl Http3ConnectionPool {
                     // this pool and suppress failover to a later DNS address.
                     let quic_conn = connection.clone();
                     let (mut driver, send_request) = h3::client::builder()
+                        .max_field_section_size(h3_backend_response_max_field_section_size)
                         .max_buffered_frame_len(h3_max_buffered_frame_len)
                         .build(h3_quinn::Connection::new(connection))
                         .await

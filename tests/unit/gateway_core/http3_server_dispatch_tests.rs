@@ -5015,6 +5015,29 @@ fn h3_buffered_frame_ceiling_leaves_the_graceful_431_reachable() {
     assert!(h3_max_buffered_frame_len(usize::MAX) > 0);
 }
 
+/// Backend response QPACK decoding has finite headroom above the frontend
+/// request policy rather than inheriting the vendored `VarInt::MAX` default.
+#[test]
+fn h3_backend_response_field_section_size_is_finite_and_distinct() {
+    use ferrum_edge::http3::config::{
+        H3_BACKEND_RESPONSE_FIELD_SECTION_SIZE_CAP, QUIC_VARINT_MAX_U64,
+        h3_backend_response_max_field_section_size, h3_max_buffered_frame_len,
+        h3_max_field_section_size,
+    };
+
+    let request_limit = h3_max_field_section_size(32_768);
+    let response_limit = h3_backend_response_max_field_section_size(32_768);
+    assert!(response_limit > request_limit);
+    assert_eq!(response_limit, h3_max_buffered_frame_len(32_768));
+    assert_ne!(response_limit, QUIC_VARINT_MAX_U64);
+    assert_eq!(
+        h3_backend_response_max_field_section_size(usize::MAX),
+        H3_BACKEND_RESPONSE_FIELD_SECTION_SIZE_CAP
+    );
+    let max_fields = h3_backend_response_max_field_section_size(usize::MAX) / 32;
+    assert!(max_fields < 32_768);
+}
+
 /// A header policy whose derived H3 limits could not be represented as QUIC
 /// varints is a configuration error, not something silently clamped into a
 /// bound the operator never asked for.
@@ -5092,9 +5115,8 @@ fn h3_listener_builder_binds_frame_bounds_to_the_header_policy() {
 /// ceiling, so a hostile or compromised upstream cannot accumulate an
 /// over-declared HEADERS, CONTROL, PUSH, or unknown frame.
 ///
-/// `FERRUM_MAX_HEADER_SIZE_BYTES` is documented as a request-header policy, so
-/// the backend client must not also turn it into an H3-only decoded response
-/// header limit. `h3::client::new` is the unbounded frame-decoder default.
+/// The decoded backend response limit is deliberately wider than the request
+/// policy, but remains finite so compact QPACK cannot overflow HeaderMap.
 #[test]
 fn h3_backend_client_builder_binds_frame_ceiling_without_response_policy_drift() {
     let src = include_str!("../../../src/http3/client.rs");
@@ -5136,13 +5158,15 @@ fn h3_backend_client_builder_binds_frame_ceiling_without_response_policy_drift()
         );
         assert!(
             collapsed.contains("h3::client::builder()")
+                && collapsed.contains(
+                    ".max_field_section_size(h3_backend_response_max_field_section_size)"
+                )
                 && collapsed.contains(".max_buffered_frame_len(h3_max_buffered_frame_len)"),
             "{fn_name} must opt into the bounded client builder: {body}"
         );
         assert!(
-            !collapsed.contains(".max_field_section_size("),
-            "{fn_name} must not repurpose the request-header policy as an \
-             H3-only backend response-header limit: {body}"
+            collapsed.contains("crate::http3::config::h3_backend_response_max_field_section_size("),
+            "{fn_name} must use the distinct bounded response field-section policy: {body}"
         );
         assert!(
             !collapsed.contains("h3::client::new("),
