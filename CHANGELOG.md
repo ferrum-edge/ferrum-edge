@@ -311,14 +311,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bump. Root `README.md` quickstart prose now matches its copy/paste example
   about pinning releases versus using the mutable `latest` tag for evaluation.
 
-- **Injector inbound capture excludes kubelet HTTP and TCP probe ports**
-  (issue #4431). `startupProbe` / `readinessProbe` / `livenessProbe` `httpGet`
-  and `tcpSocket` ports on every container in the pod are unioned into the
-  inbound exclusion set (named ports resolve against that container's
-  `ports`). `exec` and `grpc` probes are skipped. Unresolved named ports fail
-  admission rather than leaving the probe captured. Explicit
-  `excludeInboundPorts` annotations and `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS`
-  still win.
+- **Injector application probe ports remain captured.** The injector no longer
+  creates automatic inbound exclusions for Kubernetes `httpGet` or `tcpSocket`
+  probe ports. A destination-port-wide iptables `RETURN` also bypasses mesh
+  enforcement for ordinary Service and Pod-IP traffic on the same port.
+  Explicit `excludeInboundPorts` annotations and
+  `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS` remain available for ports that
+  intentionally carry no protected application traffic.
 - **Outbound direct-H2 and native-gRPC `Host` now matches `:authority` on
   non-default ports** (issue #4410). Ferrum previously stamped a hostname-only
   `Host` (`127.0.0.1`) while Hyper derived `:authority` from the backend URI

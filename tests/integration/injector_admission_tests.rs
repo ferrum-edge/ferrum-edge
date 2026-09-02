@@ -317,39 +317,8 @@ fn injected_sidecar_learns_when_ipv6_capture_rules_are_installed() {
     );
 }
 
-fn admission_denied_message(pod: Value) -> String {
-    let review = json!({
-        "apiVersion": "admission.k8s.io/v1",
-        "kind": "AdmissionReview",
-        "request": {
-            "uid": "pod-denied",
-            "namespace": "payments",
-            "kind": {"group": "", "version": "v1", "kind": "Pod"},
-            "resource": {"group": "", "version": "v1", "resource": "pods"},
-            "object": pod
-        }
-    });
-    let response = admission_response(
-        review.to_string().as_bytes(),
-        &injector_config(CaptureMode::Iptables),
-    )
-    .expect("admission response");
-    assert_eq!(
-        response.pointer("/response/allowed"),
-        Some(&Value::Bool(false)),
-        "admission must fail closed rather than emit a captured-probe patch"
-    );
-    response
-        .pointer("/response/status/message")
-        .and_then(Value::as_str)
-        .expect("denial message")
-        .to_string()
-}
-
-/// Issue #4431: kubelet HTTP probe ports are inbound-excluded so a liveness
-/// probe to the Pod IP is not redirected onto Ferrum's service-host routes.
 #[test]
-fn admission_excludes_named_and_numeric_http_probe_ports() {
+fn admission_keeps_application_probe_ports_captured() {
     let pod = json!({
         "metadata": {
             "labels": {"ferrum.io/mesh": "enabled"}
@@ -364,45 +333,16 @@ fn admission_excludes_named_and_numeric_http_probe_ports() {
                     "httpGet": {"path": "/livez", "port": "http"}
                 },
                 "readinessProbe": {
-                    "httpGet": {"path": "/readyz", "port": 9090}
-                },
-                "startupProbe": {
-                    "exec": {"command": ["true"]}
+                    "tcpSocket": {"port": 9090}
                 }
             }]
         }
     });
     let script = init_container_script(&injected_patch_ops(pod, |_| {}));
-    assert!(
-        script.contains("--dport 8080 -j RETURN"),
-        "named http probe port must resolve and be excluded:\n{script}"
-    );
-    assert!(
-        script.contains("--dport 9090 -j RETURN"),
-        "numeric HTTP probe port must be excluded:\n{script}"
-    );
-}
-
-#[test]
-fn admission_rejects_unresolved_named_probe_port() {
-    let pod = json!({
-        "metadata": {
-            "labels": {"ferrum.io/mesh": "enabled"}
-        },
-        "spec": {
-            "serviceAccountName": "api",
-            "containers": [{
-                "name": "app",
-                "image": "app:test",
-                "livenessProbe": {
-                    "httpGet": {"path": "/livez", "port": "metrics"}
-                }
-            }]
-        }
-    });
-    let message = admission_denied_message(pod);
-    assert!(
-        message.contains("names port 'metrics'"),
-        "denial must name the unresolved probe port: {message}"
-    );
+    for port in [8080, 9090] {
+        assert!(
+            !script.contains(&format!("--dport {port} -j RETURN")),
+            "probe port {port} must remain captured so application traffic cannot bypass mesh enforcement:\n{script}"
+        );
+    }
 }

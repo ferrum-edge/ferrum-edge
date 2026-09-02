@@ -83,12 +83,6 @@ const SIDECAR_STARTUP_PROBE_PERIOD_SECONDS: u64 = 2;
 const SIDECAR_STARTUP_PROBE_FAILURE_THRESHOLD: u64 = 150;
 const SIDECAR_READINESS_PROBE_PERIOD_SECONDS: u64 = 5;
 const SIDECAR_READINESS_PROBE_FAILURE_THRESHOLD: u64 = 3;
-const CONTAINER_PROBE_FIELDS: [&str; 3] = ["startupProbe", "readinessProbe", "livenessProbe"];
-const POD_CONTAINER_LIST_POINTERS: [&str; 3] = [
-    "/spec/containers",
-    "/spec/initContainers",
-    "/spec/ephemeralContainers",
-];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretKeyRef {
@@ -1707,189 +1701,9 @@ fn exclude_inbound_ports_for_pod(config: &InjectorConfig, pod: &Value) -> Result
         .map_err(|e| format!("invalid {key}: {e}"))?;
         ports.extend(annotation_ports);
     }
-    ports.extend(inbound_probe_ports_for_pod(pod)?);
     ports.sort_unstable();
     ports.dedup();
     Ok(ports)
-}
-
-/// HTTP `httpGet` and TCP `tcpSocket` probe ports on every container in the
-/// pod, resolved against that container's named `ports` when the probe uses
-/// a name. `exec` and `grpc` probes are skipped: they have no HTTP/TCP
-/// kubelet port to exclude. Unresolved or ambiguous names fail admission
-/// rather than leaving the probe captured by the inbound catch-all.
-fn inbound_probe_ports_for_pod(pod: &Value) -> Result<Vec<u16>, String> {
-    let mut ports = Vec::new();
-    for pointer in POD_CONTAINER_LIST_POINTERS {
-        let Some(containers) = pod.pointer(pointer).and_then(Value::as_array) else {
-            continue;
-        };
-        for container in containers {
-            collect_container_probe_ports(container, &mut ports)?;
-        }
-    }
-    Ok(ports)
-}
-
-fn collect_container_probe_ports(container: &Value, ports: &mut Vec<u16>) -> Result<(), String> {
-    let container_name = container_display_name(container);
-    for probe_field in CONTAINER_PROBE_FIELDS {
-        let Some(probe) = container.get(probe_field) else {
-            continue;
-        };
-        if let Some(port) =
-            inbound_exclusion_port_for_probe(container, container_name, probe_field, probe)?
-        {
-            ports.push(port);
-        }
-    }
-    Ok(())
-}
-
-fn container_display_name(container: &Value) -> &str {
-    container
-        .get("name")
-        .and_then(Value::as_str)
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or("<unnamed>")
-}
-
-fn inbound_exclusion_port_for_probe(
-    container: &Value,
-    container_name: &str,
-    probe_field: &str,
-    probe: &Value,
-) -> Result<Option<u16>, String> {
-    if let Some(http_get) = probe.get("httpGet") {
-        return resolve_probe_handler_port(
-            container,
-            container_name,
-            probe_field,
-            "httpGet",
-            http_get,
-        )
-        .map(Some);
-    }
-    if let Some(tcp_socket) = probe.get("tcpSocket") {
-        return resolve_probe_handler_port(
-            container,
-            container_name,
-            probe_field,
-            "tcpSocket",
-            tcp_socket,
-        )
-        .map(Some);
-    }
-    Ok(None)
-}
-
-fn resolve_probe_handler_port(
-    container: &Value,
-    container_name: &str,
-    probe_field: &str,
-    handler: &str,
-    handler_value: &Value,
-) -> Result<u16, String> {
-    let Some(port) = handler_value.get("port") else {
-        return Err(format!(
-            "container '{container_name}' {probe_field}.{handler} is missing port; \
-refusing injection"
-        ));
-    };
-    match port {
-        Value::Number(number) => json_u16_port(number).ok_or_else(|| {
-            format!(
-                "container '{container_name}' {probe_field}.{handler} port is not \
-an integer in 1-65535; refusing injection"
-            )
-        }),
-        Value::String(raw) => {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                return Err(format!(
-                    "container '{container_name}' {probe_field}.{handler} port is \
-empty; refusing injection"
-                ));
-            }
-            if trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
-                parse_numeric_probe_port(trimmed).ok_or_else(|| {
-                    format!(
-                        "container '{container_name}' {probe_field}.{handler} port \
-'{trimmed}' is not an integer in 1-65535; refusing injection"
-                    )
-                })
-            } else {
-                resolve_named_container_port(container, container_name, probe_field, trimmed)
-            }
-        }
-        _ => Err(format!(
-            "container '{container_name}' {probe_field}.{handler} port must be a \
-number or name; refusing injection"
-        )),
-    }
-}
-
-fn json_u16_port(number: &serde_json::Number) -> Option<u16> {
-    number
-        .as_u64()
-        .and_then(|value| u16::try_from(value).ok())
-        .filter(|port| *port != 0)
-}
-
-fn parse_numeric_probe_port(raw: &str) -> Option<u16> {
-    raw.parse::<u16>().ok().filter(|port| *port != 0)
-}
-
-fn resolve_named_container_port(
-    container: &Value,
-    container_name: &str,
-    probe_field: &str,
-    port_name: &str,
-) -> Result<u16, String> {
-    let unresolved = || {
-        format!(
-            "container '{container_name}' {probe_field} names port '{port_name}' \
-which is not declared in that container's ports; refusing injection so the \
-kubelet probe is not captured by inbound mesh redirect"
-        )
-    };
-    let Some(declared_ports) = container.get("ports").and_then(Value::as_array) else {
-        return Err(unresolved());
-    };
-    let mut resolved = None;
-    for declared in declared_ports {
-        if declared.get("name").and_then(Value::as_str) != Some(port_name) {
-            continue;
-        }
-        let Some(container_port) = declared
-            .get("containerPort")
-            .and_then(json_value_port_number)
-        else {
-            return Err(format!(
-                "container '{container_name}' port '{port_name}' has a \
-containerPort that is not an integer in 1-65535; refusing injection"
-            ));
-        };
-        match resolved {
-            Some(existing) if existing != container_port => {
-                return Err(format!(
-                    "container '{container_name}' declares port name '{port_name}' \
-on more than one containerPort; refusing injection"
-                ));
-            }
-            Some(_) => {}
-            None => resolved = Some(container_port),
-        }
-    }
-    resolved.ok_or_else(unresolved)
-}
-
-fn json_value_port_number(value: &Value) -> Option<u16> {
-    match value {
-        Value::Number(number) => json_u16_port(number),
-        Value::String(raw) => parse_numeric_probe_port(raw.trim()),
-        _ => None,
-    }
 }
 
 fn json_response(status: StatusCode, value: Value) -> Response<Full<Bytes>> {
@@ -3757,81 +3571,19 @@ mod tests {
     }
 
     #[test]
-    fn patch_excludes_numeric_http_and_tcp_probe_ports() {
-        let pod = json!({
-            "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
-            "spec": {
-                "containers": [
-                    {
-                        "name": "app",
-                        "image": "app:test",
-                        "livenessProbe": {
-                            "httpGet": {"path": "/livez", "port": 8080}
-                        },
-                        "readinessProbe": {
-                            "httpGet": {"path": "/readyz", "port": 8081}
-                        }
-                    },
-                    {
-                        "name": "metrics",
-                        "image": "metrics:test",
-                        "startupProbe": {
-                            "tcpSocket": {"port": 9090}
-                        }
-                    }
-                ],
-                "initContainers": [
-                    {
-                        "name": "migrate",
-                        "image": "migrate:test",
-                        "readinessProbe": {
-                            "httpGet": {"path": "/healthz", "port": "9091"}
-                        }
-                    }
-                ],
-                "ephemeralContainers": [
-                    {
-                        "name": "debug",
-                        "image": "debug:test",
-                        "livenessProbe": {
-                            "tcpSocket": {"port": 9092}
-                        }
-                    }
-                ]
-            }
-        });
-        let config = test_config(true, CaptureMode::Iptables);
-        let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let commands = patch_named_container(&patch, "ferrum-edge-init")
-            .expect("init container")
-            .pointer("/args/0")
-            .and_then(Value::as_str)
-            .expect("iptables plan");
-        for port in [8080, 8081, 9090, 9091, 9092] {
-            assert!(
-                commands.contains(&format!("--dport {port} -j RETURN")),
-                "probe port {port} must be excluded from inbound capture:\n{commands}"
-            );
-        }
-    }
-
-    #[test]
-    fn patch_resolves_named_http_probe_ports_against_container_ports() {
+    fn patch_keeps_application_probe_ports_captured() {
         let pod = json!({
             "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
             "spec": {
                 "containers": [{
                     "name": "app",
                     "image": "app:test",
-                    "ports": [
-                        {"containerPort": 8080, "name": "http"},
-                        {"containerPort": 9090, "name": "admin"}
-                    ],
+                    "ports": [{"containerPort": 8080, "name": "http"}],
                     "livenessProbe": {
                         "httpGet": {"path": "/livez", "port": "http"}
                     },
                     "readinessProbe": {
-                        "httpGet": {"path": "/readyz", "port": "admin"}
+                        "tcpSocket": {"port": 9090}
                     }
                 }]
             }
@@ -3845,109 +3597,10 @@ mod tests {
             .expect("iptables plan");
         for port in [8080, 9090] {
             assert!(
-                commands.contains(&format!("--dport {port} -j RETURN")),
-                "named probe port must resolve to {port}:\n{commands}"
+                !commands.contains(&format!("--dport {port} -j RETURN")),
+                "probe port {port} must remain captured so application traffic cannot bypass mesh enforcement:\n{commands}"
             );
         }
-    }
-
-    #[test]
-    fn patch_does_not_exclude_exec_or_grpc_probe_ports() {
-        let pod = json!({
-            "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
-            "spec": {
-                "containers": [{
-                    "name": "app",
-                    "image": "app:test",
-                    "livenessProbe": {
-                        "exec": {"command": ["true"]}
-                    },
-                    "readinessProbe": {
-                        "grpc": {"port": 50051}
-                    }
-                }]
-            }
-        });
-        let config = test_config(true, CaptureMode::Iptables);
-        let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let commands = patch_named_container(&patch, "ferrum-edge-init")
-            .expect("init container")
-            .pointer("/args/0")
-            .and_then(Value::as_str)
-            .expect("iptables plan");
-        assert!(
-            !commands.contains("--dport 50051 -j RETURN"),
-            "gRPC probes are not HTTP/TCP kubelet ports and must not be excluded:\n{commands}"
-        );
-    }
-
-    #[test]
-    fn patch_unions_probe_ports_with_explicit_inbound_exclusions() {
-        let pod = json!({
-            "metadata": {
-                "labels": {"ferrum.io/mesh": "enabled"},
-                "annotations": {
-                    "traffic.sidecar.istio.io/excludeInboundPorts": "22, 8080"
-                }
-            },
-            "spec": {
-                "containers": [{
-                    "name": "app",
-                    "image": "app:test",
-                    "livenessProbe": {
-                        "httpGet": {"path": "/livez", "port": 8080}
-                    },
-                    "readinessProbe": {
-                        "httpGet": {"path": "/readyz", "port": 9090}
-                    }
-                }]
-            }
-        });
-        let mut config = test_config(true, CaptureMode::Iptables);
-        config.exclude_inbound_ports = vec![22, 15090];
-        let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let commands = patch_named_container(&patch, "ferrum-edge-init")
-            .expect("init container")
-            .pointer("/args/0")
-            .and_then(Value::as_str)
-            .expect("iptables plan");
-        for port in [22, 8080, 9090, 15090] {
-            assert!(
-                commands.contains(&format!("--dport {port} -j RETURN")),
-                "explicit and probe exclusions must both remain for {port}:\n{commands}"
-            );
-        }
-    }
-
-    #[test]
-    fn patch_rejects_unresolved_named_probe_port() {
-        let pod = json!({
-            "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
-            "spec": {
-                "containers": [{
-                    "name": "app",
-                    "image": "app:test",
-                    "ports": [{"containerPort": 8080, "name": "http"}],
-                    "livenessProbe": {
-                        "httpGet": {"path": "/livez", "port": "metrics"}
-                    }
-                }]
-            }
-        });
-        let err = build_sidecar_patch_for_namespace(
-            &pod,
-            &test_config(true, CaptureMode::Iptables),
-            None,
-        )
-        .expect_err("unresolved named probe port must fail closed");
-        assert!(
-            err.contains("names port 'metrics'"),
-            "error must name the unresolved probe port: {err}"
-        );
-        assert!(
-            err.contains("refusing injection"),
-            "unresolved names must fail admission, not capture the probe: {err}"
-        );
     }
 
     #[test]

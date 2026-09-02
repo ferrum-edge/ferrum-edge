@@ -3737,7 +3737,7 @@ Keep all three nonzero on any injector reachable beyond the API server; a nonzer
 - **`dryRun`:** the patch-only webhook has no side effects, so a `dryRun: true` request returns the identical computed patch without implying any side effect.
 - **`spec.hostNetwork: true`:** never injected — see [Host-Network Pods Are Never Injected](#host-network-pods-are-never-injected) below.
 
-These complement the existing boundary checks: the body-size limit (returns `413`), reserved-container-name conflicts (`ferrum-edge` / `ferrum-edge-init`) refuse injection, a pod with no application containers is refused (a native sidecar is not a sufficient `spec.containers` entry), unresolved named kubelet probe ports are refused, and invalid port/CIDR annotations are rejected with a webhook error that names the offending annotation.
+These complement the existing boundary checks: the body-size limit (returns `413`), reserved-container-name conflicts (`ferrum-edge` / `ferrum-edge-init`) refuse injection, a pod with no application containers is refused (a native sidecar is not a sufficient `spec.containers` entry), and invalid port/CIDR annotations are rejected with a webhook error that names the offending annotation.
 
 **Self-exclusion (bootstrap deadlock).** A self-hosted mutating webhook with `failurePolicy: Fail` must not intercept its own replacement pods: when every injector replica is down, admission calls fail and pod `CREATE` in the release namespace is rejected until an operator deletes the `MutatingWebhookConfiguration`. The `charts/ferrum-mesh` chart therefore renders two guards on `sidecar-injector.ferrum.io`:
 
@@ -3841,13 +3841,15 @@ The injector supports per-pod capture overrides via annotations. The Istio annot
 
 Port-list annotations merge with their Ferrum aliases; exclude lists also merge with the applicable injector-level defaults. `includeOutboundPorts` is annotation-only and narrows outbound REDIRECT rules to the listed TCP destination ports when the include CIDR list is only the implicit catch-all. If `includeOutboundIPRanges` is also explicit, the rule sets are additive: all ports inside the explicit CIDRs are captured, plus the listed ports to any destination. The `*` wildcard means all outbound ports to any destination, even when explicit include CIDRs are also present. Outbound exclude ports still win because their RETURN rules are emitted first. CIDR annotations are validated at admission time -- invalid ports or CIDRs are rejected with a webhook error that names the offending annotation, so a typo cannot silently produce a broken iptables plan.
 
-**Kubelet probe ports (issue [#4431](https://github.com/ferrum-edge/ferrum-edge/issues/4431)).** Inbound capture also excludes TCP ports used by `startupProbe` / `readinessProbe` / `livenessProbe` on every container in the pod (`containers`, `initContainers`, and `ephemeralContainers`):
-
-- `httpGet` and `tcpSocket` probes contribute their port.
-- `exec` and `grpc` probes are skipped — they have no HTTP/TCP kubelet port to exclude.
-- A named probe port is resolved against **that container's** `ports[].name` → `containerPort`. Numeric strings (`"8080"`) are treated as numbers.
-- An unresolved or ambiguous name fails admission rather than leaving the probe captured by the inbound catch-all (kubelet probes the Pod IP by default; Ferrum's inbound HTTP routes are service-host based, so a captured liveness probe 404/503s and restarts a healthy container).
-- Operator annotations and `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS` still win: probe ports are unioned with those lists and deduplicated.
+**Kubelet probe ports.** Application `startupProbe` / `readinessProbe` /
+`livenessProbe` declarations do not create automatic inbound port exclusions.
+An iptables destination-port exclusion cannot distinguish a kubelet probe from
+ordinary Service or Pod-IP traffic, so automatically excluding a shared
+application port would bypass mesh mTLS and authorization for every client on
+that port. Prefer an `exec` probe that checks the application over loopback when
+the probe must avoid capture. Explicit operator-configured inbound exclusions
+remain available, but operators must ensure excluded ports do not carry
+protected application traffic.
 
 **Pod-restart caveat (injector / iptables init container):** annotations consumed by the `injector` mode are evaluated at pod admission time only. Existing pods retain their previous iptables capture rules until restart; bouncing affected workloads is required for previously-ignored annotations to take effect in the init-container path. The eBPF capture path lifts this restriction for `includeOutboundPorts` -- see below.
 

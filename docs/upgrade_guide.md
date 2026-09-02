@@ -76,7 +76,11 @@ Connection-pool environment settings previously ignored failed numeric parses, t
 
 The injector no longer appends Ferrum as an ordinary `spec.containers` entry. New pods receive a native sidecar (`spec.initContainers` with `restartPolicy: Always`) and exec probes against loopback `/health`. That is also what unblocks Kubernetes Job completion. **Minimum Kubernetes version is 1.29** (native sidecars enabled by default; 1.28 needs `SidecarContainers=true`). There is no ordinary-container fallback: the webhook always emits the native-sidecar shape, and a cluster older than that will reject the patched Pod.
 
-HTTP `httpGet` and TCP `tcpSocket` kubelet probe ports are now inbound-excluded automatically (issue [#4431](https://github.com/ferrum-edge/ferrum-edge/issues/4431)); unresolved named probe ports fail admission.
+Application kubelet probe ports remain captured. Ferrum does not automatically
+exclude `httpGet` or `tcpSocket` destination ports because the resulting
+iptables rule would also let ordinary traffic on a shared application port
+bypass mesh mTLS and authorization. Prefer an `exec` probe over loopback when
+an application probe must avoid capture.
 
 **Operator action:** run the injector only on Kubernetes 1.29+ (or 1.28 with the `SidecarContainers` feature gate), then roll every injected Deployment/StatefulSet/DaemonSet/Job so replacement pods receive the new shape. Pods that still carry `ferrum-edge` in `spec.containers` will be refused on re-admission until they are recreated.
 
