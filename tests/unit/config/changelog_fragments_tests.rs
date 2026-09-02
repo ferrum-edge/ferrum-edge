@@ -294,9 +294,10 @@ fn fragment_helpers_match_the_documented_rules() {
     assert!(link_targets("no links here").is_empty());
     assert!(link_targets("unterminated [a](https://x").is_empty());
 
+    // The section ends where "\n## " begins, so one newline of body remains.
     assert_eq!(
         unreleased_section("## [Unreleased]\n\n## [1.0.0]\n"),
-        Some("\n\n")
+        Some("\n")
     );
     assert_eq!(unreleased_section("# Changelog\n"), None);
 }
