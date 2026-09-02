@@ -53,6 +53,17 @@ paths:
 - Proxy hot path: `cargo build --bin ferrum-edge && cargo test --test functional_tests <filter> -- --ignored`
 - Multi-protocol perf: build once with `cargo build --release`, then `bash tests/performance/multi_protocol/run_protocol_test.sh {http1|http1-tls|http2|http3|ws|grpc|tcp|tcp-tls|udp|udp-dtls|all} [--duration N] [--concurrency N] [--skip-build]`
 
+## Changelog Fragments
+
+- Unreleased changelog entries are files under `changelog.d/`, not edits to
+  `CHANGELOG.md`'s `## [Unreleased]` section, so concurrent PRs do not conflict
+  there (issue #4487). See `changelog.d/README.md`.
+- Validate a fragment with `python3 -I scripts/assemble_changelog.py --check`
+  and preview the rendered section with `--preview`. Neither compiles Rust.
+- CI enforces the same rules through `changelog_fragments_tests` and
+  `changelog_upgrade_parity_tests` in `tests/unit/config/`, inside the required
+  `Tests` aggregate: `cargo test --test unit_tests changelog`.
+
 ## Coverage
 
 - Coverage is opt-in and not part of the normal local-test loop. Run when investigating untested code paths or after adding tests for a new module.

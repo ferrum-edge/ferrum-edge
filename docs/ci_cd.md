@@ -3326,7 +3326,9 @@ git tag v0.3.0
 ### Prerequisites
 
 - Modify `Cargo.toml` with new version
-- Move the relevant `CHANGELOG.md` entries from `Unreleased` to the new version heading
+- Assemble the `changelog.d/` fragments into the new version heading with
+  `scripts/assemble_changelog.py --release` (step 2 below); `CHANGELOG.md`'s
+  `Unreleased` section is empty between releases and is not hand-edited
 - Successful `CI` and `Coverage` workflow runs for the exact commit that will be tagged
 - GitHub repo with Actions enabled
 - Write permission to repository
@@ -3340,21 +3342,47 @@ git tag v0.3.0
 $EDITOR Cargo.toml
 ```
 
-**2. Commit Changes**
+**2. Assemble the Changelog Fragments**
+
+Unreleased entries live as one file per change under `changelog.d/` so that
+concurrent pull requests do not conflict in `CHANGELOG.md`
+(see [changelog.d/README.md](../changelog.d/README.md)). Assemble them into the
+release:
 
 ```bash
-git add Cargo.toml
+# Preview first: the rendered [Unreleased] section plus upgrade-guide blocks.
+python3 -I scripts/assemble_changelog.py --preview
+
+# Rewrite CHANGELOG.md and docs/upgrade_guide.md, then delete the fragments.
+python3 -I scripts/assemble_changelog.py --release 0.2.0
+
+# Verify: the section is rendered and no fragments remain.
+python3 -I scripts/assemble_changelog.py --check
+git status --short changelog.d CHANGELOG.md docs/upgrade_guide.md
+```
+
+The command renders the non-empty Keep a Changelog sections under a new
+`## [0.2.0] - <date>` heading below a fresh empty `## [Unreleased]`, inserts each
+`<ref>.upgrade.md` block into `docs/upgrade_guide.md` under
+`## Breaking changes in 0.2.0`, updates the compare-link references at the bottom
+of `CHANGELOG.md`, and deletes the consumed fragments. Use `--date YYYY-MM-DD` to
+override the release date. Running it again with no fragments left is a no-op.
+
+**3. Commit Changes**
+
+```bash
+git add Cargo.toml CHANGELOG.md docs/upgrade_guide.md changelog.d
 git commit -m "chore: bump version to 0.2.0"
 git push origin main
 ```
 
-**3. Wait for CI to Pass**
+**4. Wait for CI to Pass**
 
 - Push to main triggers CI and Coverage
 - Wait for both workflows to pass for the exact commit you will tag
 - Check GitHub Actions tab for status
 
-**4. Create and Push Version Tag**
+**5. Create and Push Version Tag**
 
 ```bash
 # Create tag pointing to HEAD
@@ -3364,7 +3392,7 @@ git tag -a v0.2.0 -m "Release version 0.2.0"
 git push origin v0.2.0
 ```
 
-**5. Release Triggered Automatically**
+**6. Release Triggered Automatically**
 
 - GitHub Actions detects tag matching `v*`
 - Release pipeline starts automatically
@@ -3373,7 +3401,7 @@ git push origin v0.2.0
 - Binaries built for all platforms
 - Release created with checksums
 
-**6. Verify Release**
+**7. Verify Release**
 
 ```bash
 # GitHub CLI

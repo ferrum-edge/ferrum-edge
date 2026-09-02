@@ -133,4 +133,6 @@ Canonical env docs: `docs/configuration.md`. Runtime parsing: `src/config/env_co
 
 ## PR And Commit Workflow
 
+Never edit `CHANGELOG.md`'s `## [Unreleased]` section or append to `docs/upgrade_guide.md` in a PR. A user-visible change adds one changelog fragment instead: `changelog.d/<ref>.<section>.md`, holding exactly one top-level Markdown bullet, where `<ref>` is the issue number (or `pr<N>`) and `<section>` is `added`/`changed`/`deprecated`/`removed`/`fixed`/`security`. A breaking change also adds `changelog.d/<ref>.upgrade.md` with its upgrade-guide block. Validate with `python3 -I scripts/assemble_changelog.py --check`; `scripts/assemble_changelog.py --release` assembles the fragments at release time. See `changelog.d/README.md`.
+
 When code changes are complete, targeted tests are green, and docs/specs are updated, push the branch and open a PR unless the user said otherwise or the work is intentionally local/exploratory. PRs need summary, changes, and test plan. Commit messages use concise imperative mood. Branch names conventionally use `feature/...`, `fix/...`, or `claude/...`; do not rename the current branch without explicit instruction.

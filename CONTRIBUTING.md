@@ -117,8 +117,33 @@ For new plugins, see [CUSTOM_PLUGINS.md](CUSTOM_PLUGINS.md) for the plugin devel
 Ferrum Edge is in active build-out, so breaking changes are permitted without
 legacy compatibility shims. Any breaking change to configuration shapes,
 environment variables, schema, defaults, or other user-facing behavior **must**
-add an entry under the appropriate heading in `CHANGELOG.md`'s `Unreleased`
-section in the same pull request.
+ship changelog and upgrade guidance in the same pull request.
+
+Unreleased entries are **changelog fragments**, not edits to `CHANGELOG.md`.
+Add one file per change under [`changelog.d/`](changelog.d/README.md):
+
+```
+changelog.d/<ref>.<section>.md
+```
+
+`<ref>` is the issue number (`4487`) or `pr<N>` when there is no issue, and
+`<section>` is one of `added`, `changed`, `deprecated`, `removed`, `fixed`,
+`security`, or `upgrade`. The body is exactly one top-level Markdown bullet in
+the house style already used in `CHANGELOG.md`. A breaking change also ships
+`changelog.d/<ref>.upgrade.md` with its `docs/upgrade_guide.md` block instead of
+editing that file directly.
+
+`CHANGELOG.md`'s `## [Unreleased]` section stays empty between releases; the
+fragments are assembled into it at release time. This is why two pull requests
+touching no common source file no longer conflict in the changelog.
+
+```bash
+python3 -I scripts/assemble_changelog.py --preview   # render what will ship
+python3 -I scripts/assemble_changelog.py --check     # the fragment rules
+```
+
+The same rules run in CI as `changelog_fragments_tests` and
+`changelog_upgrade_parity_tests` in the required `Tests` check.
 
 ## Testing
 

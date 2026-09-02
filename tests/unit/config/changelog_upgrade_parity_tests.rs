@@ -1,12 +1,18 @@
-//! Unreleased CHANGELOG `BREAKING` entries must appear in the upgrade guide.
+//! Unreleased `BREAKING` changelog entries must ship upgrade guidance.
 //!
-//! `include_str!` inspection only — no runtime. The test parses the current
-//! `[Unreleased]` section, extracts issue numbers from each `BREAKING` bullet,
-//! and requires every such number in `docs/upgrade_guide.md`. A future
-//! `BREAKING` entry without a citation, or without upgrade guidance, fails CI.
-//! The count of entries is not hard-coded.
+//! Unreleased entries live as one file per change under `changelog.d/` rather
+//! than in `CHANGELOG.md`'s shared `[Unreleased]` block (issue #4487), so this
+//! contract reads the fragments: every `BREAKING` changelog fragment must cite
+//! an issue number, and every such number must appear either in the released
+//! `docs/upgrade_guide.md` or in a `changelog.d/<ref>.upgrade.md` fragment
+//! awaiting the next release. A `BREAKING` entry without a citation, or without
+//! upgrade guidance, fails CI. The count of entries is not hard-coded.
+//!
+//! `include_str!` / `std::fs` inspection only — no runtime.
 
-const CHANGELOG: &str = include_str!("../../../CHANGELOG.md");
+use std::fs;
+use std::path::PathBuf;
+
 const UPGRADE_GUIDE: &str = include_str!("../../../docs/upgrade_guide.md");
 const MIGRATIONS_DOC: &str = include_str!("../../../docs/migrations.md");
 
@@ -24,41 +30,52 @@ const IN_PLACE_CORE_SCHEMA_MIGRATION_CLAIMS: &[&str] = &[
     "pending migrations automatically on startup",
 ];
 
-fn unreleased_section(changelog: &str) -> &str {
-    let after_heading = changelog
-        .split("## [Unreleased]")
-        .nth(1)
-        .expect("CHANGELOG.md must contain an ## [Unreleased] section");
-    match after_heading.find("\n## [") {
-        Some(end) => &after_heading[..end],
-        None => after_heading,
-    }
+fn fragment_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("changelog.d")
 }
 
-/// Top-level Keep-a-Changelog bullets (`- ` at column 0), including wrapped lines.
-fn top_level_bullets(section: &str) -> Vec<&str> {
-    let mut bullets = Vec::new();
-    let mut start: Option<usize> = None;
-    let mut offset = 0;
-    for line in section.lines() {
-        let line_start = offset;
-        offset += line.len() + 1;
-        if line.starts_with("- ")
-            && let Some(prev) = start.replace(line_start)
-        {
-            bullets.push(section[prev..line_start].trim_end());
+/// `changelog.d/` fragment file names, sorted, excluding the directory's README.
+fn fragment_names() -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(fragment_dir())
+        .expect("changelog.d/ must exist")
+        .map(|entry| entry.expect("readable changelog.d/ entry"))
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".md") && name != "README.md")
+        .collect();
+    names.sort();
+    names
+}
+
+fn read_fragment(name: &str) -> String {
+    fs::read_to_string(fragment_dir().join(name))
+        .unwrap_or_else(|err| panic!("changelog.d/{name} must be readable: {err}"))
+        .replace("\r\n", "\n")
+}
+
+/// Changelog bullets awaiting release: every fragment but the `.upgrade.md` ones.
+fn unreleased_bullets() -> Vec<String> {
+    fragment_names()
+        .iter()
+        .filter(|name| !name.ends_with(".upgrade.md"))
+        .map(|name| read_fragment(name).trim_end().to_string())
+        .collect()
+}
+
+/// The released upgrade guide plus every `changelog.d/<ref>.upgrade.md` fragment.
+fn upgrade_guidance() -> String {
+    let mut guidance = String::from(UPGRADE_GUIDE);
+    for name in fragment_names() {
+        if name.ends_with(".upgrade.md") {
+            guidance.push('\n');
+            guidance.push_str(&read_fragment(&name));
         }
     }
-    if let Some(prev) = start {
-        bullets.push(section[prev..].trim_end());
-    }
-    bullets
+    guidance
 }
 
 fn is_breaking_bullet(bullet: &str) -> bool {
-    bullet
-        .strip_prefix("- ")
-        .is_some_and(|rest| rest.trim_start().starts_with("**BREAKING"))
+    bullet.contains("**BREAKING")
 }
 
 /// Issue numbers from the first `(issue #N)` / `(issues #A / #B)` citation.
@@ -67,12 +84,12 @@ fn breaking_issue_numbers(bullet: &str) -> Result<Vec<u32>, String> {
     let lower = head.to_ascii_lowercase();
     let citation_at = lower.find("(issue").ok_or_else(|| {
         let title = bullet.lines().next().unwrap_or(bullet);
-        format!("Unreleased BREAKING entry has no issue number: {title}")
+        format!("Unreleased BREAKING fragment has no issue number: {title}")
     })?;
     let after_open = &head[citation_at..];
     let close = after_open.find(')').ok_or_else(|| {
         let title = bullet.lines().next().unwrap_or(bullet);
-        format!("Unreleased BREAKING entry has an unclosed issue citation: {title}")
+        format!("Unreleased BREAKING fragment has an unclosed issue citation: {title}")
     })?;
     let citation = &after_open[..close];
     let mut numbers = Vec::new();
@@ -87,12 +104,12 @@ fn breaking_issue_numbers(bullet: &str) -> Result<Vec<u32>, String> {
             if j == i + 1 {
                 let title = bullet.lines().next().unwrap_or(bullet);
                 return Err(format!(
-                    "Unreleased BREAKING entry issue citation is missing digits: {title}"
+                    "Unreleased BREAKING fragment issue citation is missing digits: {title}"
                 ));
             }
             let n: u32 = citation[i + 1..j].parse().map_err(|_| {
                 let title = bullet.lines().next().unwrap_or(bullet);
-                format!("Unreleased BREAKING entry issue citation is not a number: {title}")
+                format!("Unreleased BREAKING fragment issue citation is not a number: {title}")
             })?;
             if !numbers.contains(&n) {
                 numbers.push(n);
@@ -105,7 +122,7 @@ fn breaking_issue_numbers(bullet: &str) -> Result<Vec<u32>, String> {
     if numbers.is_empty() {
         let title = bullet.lines().next().unwrap_or(bullet);
         return Err(format!(
-            "Unreleased BREAKING entry issue citation contains no #NNNN: {title}"
+            "Unreleased BREAKING fragment issue citation contains no #NNNN: {title}"
         ));
     }
     Ok(numbers)
@@ -160,18 +177,18 @@ fn upgrade_guide_issue_reference_matcher_is_token_exact() {
 }
 
 #[test]
-fn unreleased_breaking_changelog_issues_appear_in_upgrade_guide() {
-    let unreleased = unreleased_section(CHANGELOG);
+fn unreleased_breaking_changelog_issues_appear_in_upgrade_guidance() {
+    let guidance = upgrade_guidance();
     let mut missing_guidance = Vec::new();
 
-    for bullet in top_level_bullets(unreleased) {
-        if !is_breaking_bullet(bullet) {
+    for bullet in unreleased_bullets() {
+        if !is_breaking_bullet(&bullet) {
             continue;
         }
-        let numbers = breaking_issue_numbers(bullet).unwrap_or_else(|err| panic!("{err}"));
+        let numbers = breaking_issue_numbers(&bullet).unwrap_or_else(|err| panic!("{err}"));
         for number in numbers {
-            if !upgrade_guide_cites_issue(UPGRADE_GUIDE, number) {
-                let title = bullet.lines().next().unwrap_or(bullet);
+            if !upgrade_guide_cites_issue(&guidance, number) {
+                let title = bullet.lines().next().unwrap_or(&bullet);
                 missing_guidance.push(format!("#{number} ({title})"));
             }
         }
@@ -179,8 +196,9 @@ fn unreleased_breaking_changelog_issues_appear_in_upgrade_guide() {
 
     assert!(
         missing_guidance.is_empty(),
-        "every Unreleased BREAKING changelog issue number must appear in \
-         docs/upgrade_guide.md; missing: {}",
+        "every BREAKING changelog.d/ fragment issue number must appear in \
+         docs/upgrade_guide.md or in a changelog.d/<ref>.upgrade.md fragment; \
+         missing: {}",
         missing_guidance.join(", ")
     );
 }
