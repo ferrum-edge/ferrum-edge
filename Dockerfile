@@ -128,17 +128,29 @@ COPY ebpf ./ebpf
 # Declare FEATURES only after the shared apt + manifest layers so the default
 # `cloud-secrets` image and the `cloud-secrets,ebpf` image reuse that work.
 ARG FEATURES
+ARG TARGETARCH
+
+# Issue #4602: the release profile is fat LTO with a single codegen unit, and
+# the final `ferrum-edge` bin-crate compile under that profile exhausts the
+# hosted arm64 runner ("cannot allocate memory" after 57 minutes in the v0.9.0
+# release run). Images built from source on arm64 therefore use thin LTO with
+# parallel codegen units; the amd64 image and the native release binaries keep
+# the fat-LTO profile. Both cargo invocations below must see the same profile
+# or the dependency cache layer is invalidated by the fingerprint change.
+ENV FERRUM_ARM64_RELEASE_PROFILE_ENV="CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16"
 
 # Create a dummy main.rs to build dependencies only
 RUN mkdir src && \
     echo 'fn main() { println!("dummy"); }' > src/main.rs && \
+    if [ "${TARGETARCH}" = "arm64" ]; then export ${FERRUM_ARM64_RELEASE_PROFILE_ENV}; fi && \
     cargo build --features "${FEATURES}" --release 2>/dev/null || true && \
     rm -rf src
 
 # ── Build the real binary ───────────────────────────────────────────────
 COPY src ./src
 # Touch main.rs so cargo knows it changed (not the dummy)
-RUN touch src/main.rs && cargo build --features "${FEATURES}" --release
+RUN if [ "${TARGETARCH}" = "arm64" ]; then export ${FERRUM_ARM64_RELEASE_PROFILE_ENV}; fi && \
+    touch src/main.rs && cargo build --features "${FEATURES}" --release
 
 # Stage 2: common distroless runtime. It intentionally has no shell, package
 # manager, eBPF ELF, or `ip` executable.
