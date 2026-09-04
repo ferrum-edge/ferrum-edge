@@ -442,6 +442,35 @@ fn admission_rewrites_application_probes_to_the_sidecar_probe_port() {
 }
 
 #[test]
+fn admission_keeps_unowned_pre_rewritten_probe_port_captured() {
+    let pod = json!({
+        "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
+        "spec": {
+            "serviceAccountName": "api",
+            "containers": [{
+                "name": "app",
+                "image": "app:test",
+                "readinessProbe": {
+                    "httpGet": {
+                        "path": "/app-probe/app/readinessProbe",
+                        "port": 15020
+                    }
+                }
+            }]
+        }
+    });
+    let ops = injected_patch_ops(pod, |_| {});
+
+    assert_eq!(sidecar_env_value(&ops, "FERRUM_MESH_APP_PROBES"), None);
+    assert_eq!(sidecar_env_value(&ops, "FERRUM_MESH_APP_PROBE_PORT"), None);
+    let script = init_container_script(&ops);
+    assert!(
+        !script.contains("--dport 15020 -j RETURN"),
+        "an application may own an unregistered probe port, so it must stay captured:\n{script}"
+    );
+}
+
+#[test]
 fn admission_rejects_unresolved_named_probe_port() {
     let pod = json!({
         "metadata": {

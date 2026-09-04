@@ -1766,50 +1766,16 @@ fn exclude_inbound_ports_for_pod(config: &InjectorConfig, pod: &Value) -> Result
     // RETURN for it does not let anything bypass the mesh (issue #4533).
     // Application ports are NEVER excluded: a destination-port-wide RETURN for
     // an app port would also let ordinary Service / Pod-IP traffic skip mesh
-    // mTLS and `mesh_authz`. The port is excluded only when the sidecar will
-    // serve at least one probe on it — a pod with no HTTP/TCP/gRPC probes (or
-    // one that opted out) starts no probe listener, so nothing needs a RETURN.
-    if rewrite_app_probes_enabled(pod) && pod_has_app_probes_to_serve(pod) {
+    // mTLS and `mesh_authz`. The port is excluded only when the sidecar has a
+    // validated probe registration and will therefore bind the probe listener.
+    // A merely pre-rewritten probe without its recorded original must remain
+    // captured because the sidecar cannot serve it.
+    if !app_probe_rewrite_for_pod(pod)?.probes.is_empty() {
         ports.push(DEFAULT_APP_PROBE_PORT);
     }
     ports.sort_unstable();
     ports.dedup();
     Ok(ports)
-}
-
-/// Whether any application container carries a kubelet probe the sidecar's
-/// probe server serves: an `httpGet` / `tcpSocket` / `grpc` handler, whether
-/// still in its original shape or already rewritten to the probe port.
-///
-/// This decides whether the probe port needs an inbound-capture RETURN. Unlike
-/// [`app_probe_rewrite_for_pod`] it does not depend on the injected sidecar's
-/// record of the original handlers being present, so the init container comes
-/// out identical on first injection and on reinvocation of an injected pod.
-/// `exec` probes run inside the container and are never served.
-fn pod_has_app_probes_to_serve(pod: &Value) -> bool {
-    for pointer in APP_PROBE_CONTAINER_LIST_POINTERS {
-        let Some(containers) = pod.pointer(pointer).and_then(Value::as_array) else {
-            continue;
-        };
-        for container in containers {
-            let container_name = container_display_name(container);
-            if container_name == SIDECAR_CONTAINER_NAME || container_name == INIT_CONTAINER_NAME {
-                continue;
-            }
-            for probe_field in CONTAINER_PROBE_FIELDS {
-                let Some(probe) = container.get(probe_field).and_then(Value::as_object) else {
-                    continue;
-                };
-                if ["httpGet", "tcpSocket", "grpc"]
-                    .iter()
-                    .any(|handler| probe.contains_key(*handler))
-                {
-                    return true;
-                }
-            }
-        }
-    }
-    false
 }
 
 /// Whether kubelet application probes are rewritten for this pod.
