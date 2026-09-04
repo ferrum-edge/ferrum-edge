@@ -1289,9 +1289,10 @@ pub async fn start_dp_client_with_stream_timings(
                     // admission controller, and its message names the exact
                     // saturated budget (see `CpGrpcAdmissionRejection::
                     // into_native_status`). Reporting it as a dead CP would be
-                    // wrong twice: the operator loses the only actionable
-                    // detail, and the stale fence latches on a control plane
-                    // that is demonstrably alive.
+                    // wrong for telemetry: the operator would lose the
+                    // actionable refusal detail. Reachability does not,
+                    // however, mean this DP retains configuration authority;
+                    // a refused stream cannot deliver updates.
                     error!(
                         cp_url = %cp_url,
                         cp_index = backoff.current_cp_index + 1,
@@ -1302,24 +1303,17 @@ pub async fn start_dp_client_with_stream_timings(
                          gRPC stream admission budget is saturated. Raise the budget named in \
                          the status message (the sizing unit is one stream per DP or per mesh \
                          workload) or add CP replicas. Last-known-good configuration keeps \
-                         serving and this DP keeps retrying",
+                         serving only within the configured maximum stale age while this DP \
+                         keeps retrying",
                         backoff.current_cp_index + 1,
                         cp_count,
                         cp_url
                     );
                     crate::dp_config_freshness::record_cp_admission_refused();
-                    // `authority_retained = true` routes to
-                    // `record_cp_reconnecting()` instead of
-                    // `record_cp_authority_lost()`, so an admission refusal
-                    // cannot latch the configured max-stale bound.
-                    //
-                    // This protects a RUNNING DP only. A DP that has never
-                    // connected is already `CpAuthority::Lost` (the tracker
-                    // starts there and `record_cp_reconnecting` only promotes
-                    // from `Connected` — `dp_config_freshness.rs`), so a cold
-                    // start that never got seated still degrades on schedule
-                    // and is not masked by this branch.
-                    update_state_disconnected(&connection_state, cp_url, is_primary, true);
+                    // Preserve the distinct refusal telemetry and retry
+                    // disposition, but record authority loss so a sustained
+                    // refusal cannot bypass the configured max-stale bound.
+                    update_state_disconnected(&connection_state, cp_url, is_primary, false);
                     ConfigSyncAttemptOutcome::AdmissionRefused
                 } else {
                     error!(

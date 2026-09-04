@@ -626,36 +626,34 @@ fn the_snapshot_projection_carries_no_unbounded_identifiers() {
     assert!(CP_AUTHORITY_LABELS.contains(&snapshot.cp_authority));
 }
 
-// ── CP admission refusal is not authority loss (issue #4531) ───────────────
+// ── CP admission refusal telemetry and authority loss ───────────────────
 
-/// A `RESOURCE_EXHAUSTED` refusal proves the CP is alive and answering, so the
-/// DP client routes it to `record_cp_reconnecting` rather than
-/// `record_cp_authority_lost`. A previously-connected DP must therefore stay at
-/// `Reconnecting` and must NOT latch the max-stale bound, while an ordinary
-/// transport error on the same tracker still does.
+/// A `RESOURCE_EXHAUSTED` refusal proves the CP is alive, but the refused
+/// stream cannot deliver configuration. The DP client therefore records the
+/// refusal metric and authority loss so the max-stale bound remains effective.
 #[test]
-fn admission_refusal_keeps_a_connected_dp_reconnecting_without_latching() {
+fn admission_refusal_latches_a_connected_dp_at_the_max_stale_bound() {
     let epoch = epoch();
     let freshness = DpConfigFreshness::new_at(epoch, MAX_STALE, StaleAction::FailClosed);
     freshness.record_cp_connected_at(epoch);
     freshness.record_snapshot_applied_at(epoch);
 
-    // The refusal path: count it, then record a reconnect (authority retained).
+    // The refusal path retains distinct telemetry while recording authority loss.
     freshness.record_cp_admission_refused();
-    freshness.record_cp_reconnecting_at(at(epoch, 1));
+    freshness.record_cp_authority_lost_at(at(epoch, 1));
 
     let snapshot = freshness.evaluate_at(at(epoch, MAX_STALE.as_secs() + 60));
-    assert_eq!(snapshot.cp_authority, "reconnecting");
+    assert_eq!(snapshot.cp_authority, "lost");
     assert_eq!(snapshot.cp_admission_refused_total, 1);
     assert!(
-        !snapshot.stale,
-        "an admission refusal must not latch the max-stale bound: the CP answered"
+        snapshot.stale,
+        "an admission refusal must latch the max-stale bound when no stream exists"
     );
-    assert!(!snapshot.new_traffic_blocked);
+    assert!(snapshot.new_traffic_blocked);
 }
 
-/// The compensating signal is monotonic and independent of every other counter,
-/// so a suppressed authority loss stays visible on `/metrics`.
+/// The refusal signal is monotonic and independent of every other counter, so
+/// the admission cause remains visible on `/metrics` alongside authority loss.
 #[test]
 fn admission_refusal_counter_is_monotonic_and_independent() {
     let epoch = epoch();
