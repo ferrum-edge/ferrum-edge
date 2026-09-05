@@ -4589,8 +4589,7 @@ async fn handle_h3_request(
                 )
                 .await;
                 plugin_execution_ns += hook_start.elapsed().as_nanos() as u64;
-                let http_status =
-                    StatusCode::from_u16(reject_status).unwrap_or(terminal.status());
+                let http_status = StatusCode::from_u16(reject_status).unwrap_or(terminal.status());
                 run_h3_reject_response_committed_hooks(
                     &plugins,
                     &mut ctx,
