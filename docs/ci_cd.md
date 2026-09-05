@@ -1455,6 +1455,62 @@ rust-cache producer/consumer sites keep their existing fork-only `save-if`
 contract — that workflow's caching architecture is generation-pinned
 separately (PR #3889).
 
+**Rust-cache quota diet (#4643, part 2).** The editable direct rust-cache
+calls in `ci.yml` (`build-binaries`, `build-ebpf`) and the six on-demand
+benchmark workflows now save only on
+`github.event_name == 'push' && github.ref == 'refs/heads/main'`. Because the
+benchmark workflows only have `workflow_dispatch` triggers, they restore
+existing entries but publish no new ones, including on manual `main` runs.
+Their existing keys remain isolated; they do not gain a new cache producer.
+The binary producer retains separate `release` and `prbuild` keys, so its
+PR/merge-group builds cannot restore the release-profile cache and will
+compile cold once old `prbuild` entries expire.
+
+Lanes that cache useful Cargo targets stop also archiving the bounded 2 GiB
+`.cache/sccache` directory. Comparison, connection-saturation, and
+gateways-protocol benchmarks compile their host tools in nested workspaces
+and build the gateway in Docker; their default root `target/` archive never
+covered those host tools. They now set `cache-targets: "false"`, retaining
+only Cargo downloads and the compiler-cache restore path. No new shared
+sccache service or credential export is introduced.
+
+| Lane / shared key | Expected archive after the diet (not yet measured) |
+|---|---|
+| `build-<target>-release` | Cargo downloads + target dependencies; previous archive minus its compressed sccache subset (up to 2 GiB before compression) |
+| `build-<target>-prbuild` | 0 new bytes; PR and merge-group saves disabled |
+| `ci-ebpf-programs` | Cargo downloads + `ebpf/target`; previous archive minus its compressed sccache subset, when the existing cache step runs |
+| `ci-perf-bench`, `ci-payload-bench`, `ci-scale-bench` | 0 new bytes on dispatch; restore paths are Cargo downloads + root target dependencies |
+| `ci-comparison-bench`, `ci-connection-saturation`, `ci-gateways-protocol-bench` | 0 new bytes on dispatch; restore paths are Cargo downloads + sccache, without root target |
+
+This is a partial quota reduction, not evidence that the repository fits
+under 10 GB. The frozen `setup-rust-ci` action still archives both target and
+sccache for Unit Tests (`ci-test`), Lint (`ci-lint`), Build Test Artifacts,
+coverage, and its other callers; it exposes neither `cache-targets` nor
+`cache-directories` nor `save-if` overrides. Changing that common policy
+requires a trusted direct-to-`main` generation. The frozen `fuzz-smoke` lane
+(reported at about 4.3 GB) still needs shrinking/splitting through a separate
+policy generation. FIPS, release publication, and `ci-perf` (#4090) keep
+their existing arrangements. Existing large entries are left to LRU expiry.
+
+To measure, capture this inventory before and after a subsequent `main`
+push, then again after a PR run based on that push (retain the output with
+the run IDs and head SHAs):
+
+```bash
+gh api --paginate 'repos/ferrum-edge/ferrum-edge/actions/caches?per_page=100' \
+  --jq '.actions_caches[] | [.id, .ref, .key, .size_in_bytes, .created_at, .last_accessed_at] | @tsv'
+```
+
+Compare the **same entry IDs** across snapshots: entries created before the
+later `main` push must still exist afterward and show `last_accessed_at` >
+`created_at` after the PR restore. Sum `size_in_bytes` across all pages and
+refs, including BuildKit caches, against the 10 GB repository quota; group
+by lane to replace the estimates above with measured compressed sizes. A
+newly created replacement key is not survival evidence. Confirm `Restored
+from cache key …` in Unit Tests, Lint, and Build Test Artifacts logs, and
+record Unit Tests' precompile duration. Keep #4643 open until that evidence
+is observed; no local execution can establish these acceptance criteria.
+
 #### 5c. CNI Install Lifecycle Live Workflow
 
 **Runs**: `ubuntu-24.04`
