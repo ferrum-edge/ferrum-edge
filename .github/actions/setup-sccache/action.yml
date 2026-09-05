@@ -128,10 +128,20 @@ runs:
           fi
         }
 
-        install_root="$(mktemp -d "${RUNNER_TEMP}/ferrum-sccache-bin.XXXXXX")"
+        # The install root must be the same path on every run. The wrapper
+        # path is published as RUSTC_WRAPPER / CARGO_BUILD_RUSTC_WRAPPER, and
+        # Swatinem/rust-cache hashes the value of every CARGO* and RUST*
+        # variable into its cache key; a mktemp suffix here made every key
+        # unique, so no rust-cache lane could ever restore. RUNNER_TEMP is
+        # private to this job and wiped between jobs; the root is recreated
+        # from scratch so no pre-existing file can survive into the verified
+        # install. The download scratch directory stays randomized because
+        # nothing exports it.
+        install_root="${RUNNER_TEMP}/ferrum-sccache-bin"
         install_dir="${install_root}/bin"
         work_dir="$(mktemp -d "${RUNNER_TEMP}/ferrum-sccache.XXXXXX")"
         archive="${work_dir}/sccache.tar.gz"
+        rm -rf "$install_root"
         mkdir -p "$install_dir"
         trap 'rm -rf "$work_dir"' EXIT
 

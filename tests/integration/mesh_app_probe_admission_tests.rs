@@ -125,7 +125,7 @@ async fn a_partial_header_flood_cannot_exceed_the_connection_ceiling() {
 
     // Per-IP disabled: every client here is 127.0.0.1, so the global cap has to
     // be the dimension under test.
-    let admission = Arc::new(AppProbeAdmission::new(CEILING, 0, 0));
+    let admission = Arc::new(AppProbeAdmission::new(CEILING, 0, 0, None));
     let running = start_probe_server(
         Arc::clone(&admission),
         r#"{"app/livenessProbe":{"httpGet":{"path":"/livez","port":1,"scheme":"HTTP"},"timeoutSeconds":1}}"#,
@@ -192,7 +192,7 @@ async fn a_valid_probe_flood_cannot_exceed_the_active_probe_budget() {
 
     // Connection caps off; only the probe budget is under test. A 3s probe
     // timeout keeps the first probes in flight for the whole measurement.
-    let admission = Arc::new(AppProbeAdmission::new(0, 0, BUDGET));
+    let admission = Arc::new(AppProbeAdmission::new(0, 0, BUDGET, None));
     let running = start_probe_server(
         Arc::clone(&admission),
         &format!(
