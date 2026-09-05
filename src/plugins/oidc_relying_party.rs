@@ -1837,7 +1837,7 @@ impl OidcRelyingParty {
             .await
             .map_err(|_| r#"{"error":"Token refresh response parse failed"}"#.to_string())?;
         if !token.token_type.eq_ignore_ascii_case("bearer") {
-            return Err(r#"{"error":"Invalid refresh token type"}"#.to_string());
+            return Err(r#"{"error":"Invalid refresh token type"}"#.to_string().into());
         }
         let existing_claims_expires_at = stored_claims_expires_at(payload);
         let expires_at = expires_at_for_token(&token, now, self.session.ttl);
