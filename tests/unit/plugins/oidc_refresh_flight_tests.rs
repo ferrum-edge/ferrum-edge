@@ -80,9 +80,18 @@ fn cap_reached_join_evicts_the_oldest_completed_record_and_never_a_live_flight()
     // eviction. The live flight is older than both records but is untouchable:
     // evicting it would let a second leader submit the same token.
     let newcomer = lead(&flights, 4);
-    assert!(flights.contains(&key(1)), "the live flight is never evicted");
-    assert!(!flights.contains(&key(2)), "the oldest completed record is evicted");
-    assert!(flights.contains(&key(3)), "the newer completed record stays");
+    assert!(
+        flights.contains(&key(1)),
+        "the live flight is never evicted"
+    );
+    assert!(
+        !flights.contains(&key(2)),
+        "the oldest completed record is evicted"
+    );
+    assert!(
+        flights.contains(&key(3)),
+        "the newer completed record stays"
+    );
     assert!(flights.contains(&key(4)));
     assert_eq!(flights.flight_count(), 3);
     assert!(
@@ -92,7 +101,11 @@ fn cap_reached_join_evicts_the_oldest_completed_record_and_never_a_live_flight()
 
     drop(newcomer);
     drop(live);
-    assert_eq!(flights.flight_count(), 1, "only the retained record remains");
+    assert_eq!(
+        flights.flight_count(),
+        1,
+        "only the retained record remains"
+    );
 }
 
 #[test]
@@ -101,7 +114,11 @@ fn eviction_pass_with_only_live_flights_removes_nothing() {
     let first = lead(&flights, 1);
     let second = lead(&flights, 2);
     flights.evict_completed();
-    assert_eq!(flights.flight_count(), 2, "live flights are not eviction candidates");
+    assert_eq!(
+        flights.flight_count(),
+        2,
+        "live flights are not eviction candidates"
+    );
 
     // Even over the cap, a new generation still gets its leader: the bound
     // limits retained records, not in-flight transitions.
@@ -122,7 +139,10 @@ fn completed_record_inside_retention_is_adopted_and_an_expired_one_is_replaced()
     assert_eq!(flights.flight_count(), 2);
 
     assert!(
-        matches!(flights.join(key(1)), OidcRefreshFlightJoinForTest::Completed),
+        matches!(
+            flights.join(key(1)),
+            OidcRefreshFlightJoinForTest::Completed
+        ),
         "a record inside retention is adopted instead of re-submitting the token"
     );
 
@@ -151,9 +171,15 @@ async fn published_outcome_reaches_a_waiting_follower_and_stays_adoptable() {
     leader
         .publish_completed_ago(Duration::ZERO)
         .expect("the monotonic clock represents now");
-    assert_eq!(follower.wait().await, OidcRefreshFlightWaitForTest::Published);
+    assert_eq!(
+        follower.wait().await,
+        OidcRefreshFlightWaitForTest::Published
+    );
     assert!(
-        matches!(flights.join(key(1)), OidcRefreshFlightJoinForTest::Completed),
+        matches!(
+            flights.join(key(1)),
+            OidcRefreshFlightJoinForTest::Completed
+        ),
         "a published leader retains its record for late arrivals"
     );
 }
@@ -170,8 +196,14 @@ async fn cancelled_leader_frees_the_slot_and_a_follower_re_elects() {
     // remove the slot so the follower observes the closed channel and can take
     // over as the single replacement leader.
     drop(leader);
-    assert!(!flights.contains(&key(1)), "a cancelled leader frees its slot");
-    assert_eq!(follower.wait().await, OidcRefreshFlightWaitForTest::LeaderGone);
+    assert!(
+        !flights.contains(&key(1)),
+        "a cancelled leader frees its slot"
+    );
+    assert_eq!(
+        follower.wait().await,
+        OidcRefreshFlightWaitForTest::LeaderGone
+    );
     let replacement = lead(&flights, 1);
     assert_eq!(flights.flight_count(), 1);
     drop(replacement);
@@ -187,7 +219,10 @@ async fn follower_wait_times_out_without_stealing_the_live_flight() {
 
     // The clock is paused, so the only way the wait finishes is the follower
     // bound firing: nothing is ever published and the sender stays alive.
-    assert_eq!(follower.wait().await, OidcRefreshFlightWaitForTest::TimedOut);
+    assert_eq!(
+        follower.wait().await,
+        OidcRefreshFlightWaitForTest::TimedOut
+    );
     assert!(
         is_follower(&flights.join(key(1))),
         "a timed-out follower leaves the live leader in place"

@@ -584,7 +584,11 @@ struct RefreshFlightMap {
 
 impl RefreshFlightMap {
     fn new(shard_amount: usize) -> Self {
-        Self::with_limits(shard_amount, REFRESH_FLIGHT_RETENTION, MAX_RETAINED_REFRESH_FLIGHTS)
+        Self::with_limits(
+            shard_amount,
+            REFRESH_FLIGHT_RETENTION,
+            MAX_RETAINED_REFRESH_FLIGHTS,
+        )
     }
 
     /// Construct with explicit limits. Production always goes through `new`;
