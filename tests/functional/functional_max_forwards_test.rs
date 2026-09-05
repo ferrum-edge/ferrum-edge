@@ -444,7 +444,10 @@ async fn assert_origin_saw(
     case: &str,
 ) {
     let requests = harness.origin.requests_for(path).await;
-    assert!(!requests.is_empty(), "{case}: the origin must be contacted for {path}");
+    assert!(
+        !requests.is_empty(),
+        "{case}: the origin must be contacted for {path}"
+    );
     for request in &requests {
         assert_eq!(request.method, method, "{case}: {request:?}");
         assert_eq!(
@@ -508,7 +511,11 @@ async fn assert_frontend(harness: &MaxForwardsHarness, frontend: Frontend) {
     let path = format!("/hop/{label}/malformed");
     let response = send(harness, frontend, Method::OPTIONS, &path, &malformed).await;
     assert_local_answer(&response, StatusCode::BAD_REQUEST, &case);
-    assert_eq!(response.body.as_ref(), br#"{"error":"Invalid Max-Forwards header"}"#, "{case}");
+    assert_eq!(
+        response.body.as_ref(),
+        br#"{"error":"Invalid Max-Forwards header"}"#,
+        "{case}"
+    );
     assert_no_origin_request(harness, &path, &case).await;
 
     // Repeated field lines: not a list field, refused even when they agree.
@@ -558,8 +565,16 @@ async fn assert_frontend(harness: &MaxForwardsHarness, frontend: Frontend) {
     ];
     let response = send(harness, frontend, Method::OPTIONS, &path, &preflight).await;
     assert_local_answer(&response, StatusCode::NO_CONTENT, &case);
-    assert_eq!(header(&response, "access-control-allow-origin"), ORIGIN, "{case}");
-    assert_eq!(header(&response, "access-control-allow-methods"), "PUT", "{case}");
+    assert_eq!(
+        header(&response, "access-control-allow-origin"),
+        ORIGIN,
+        "{case}"
+    );
+    assert_eq!(
+        header(&response, "access-control-allow-methods"),
+        "PUT",
+        "{case}"
+    );
     assert_no_origin_request(harness, &path, &case).await;
 
     // `Allow` on the final-recipient answer reflects the route's methods.

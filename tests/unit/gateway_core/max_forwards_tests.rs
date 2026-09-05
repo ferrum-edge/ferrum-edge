@@ -32,8 +32,14 @@ fn parse_accepts_one_decimal_with_optional_whitespace() {
 
 #[test]
 fn parse_saturates_instead_of_overflowing() {
-    assert_eq!(parse_max_forwards("4294967295"), Some(MAX_FORWARDS_RECIPIENT_MAX));
-    assert_eq!(parse_max_forwards("4294967296"), Some(MAX_FORWARDS_RECIPIENT_MAX));
+    assert_eq!(
+        parse_max_forwards("4294967295"),
+        Some(MAX_FORWARDS_RECIPIENT_MAX)
+    );
+    assert_eq!(
+        parse_max_forwards("4294967296"),
+        Some(MAX_FORWARDS_RECIPIENT_MAX)
+    );
     let huge = "9".repeat(4096);
     assert_eq!(parse_max_forwards(&huge), Some(MAX_FORWARDS_RECIPIENT_MAX));
 }
@@ -97,7 +103,11 @@ fn positive_budgets_are_decremented_exactly_once_in_place() {
             MaxForwardsDecision::Decremented,
             "{received:?}"
         );
-        assert_eq!(ctx[MAX_FORWARDS_HEADER], forwarded.to_string(), "{received:?}");
+        assert_eq!(
+            ctx[MAX_FORWARDS_HEADER],
+            forwarded.to_string(),
+            "{received:?}"
+        );
         assert_eq!(ctx.len(), 1, "{received:?}");
     }
 }
@@ -105,7 +115,10 @@ fn positive_budgets_are_decremented_exactly_once_in_place() {
 #[test]
 fn oversized_budget_forwards_the_recipient_maximum_minus_one() {
     let mut ctx = options_headers(&"9".repeat(40));
-    assert_eq!(decide_options_max_forwards(&mut ctx), MaxForwardsDecision::Decremented);
+    assert_eq!(
+        decide_options_max_forwards(&mut ctx),
+        MaxForwardsDecision::Decremented
+    );
     assert_eq!(ctx[MAX_FORWARDS_HEADER], "4294967294");
 }
 
@@ -173,18 +186,33 @@ fn malformed_and_repeated_fields_are_refused_without_forwarding_or_reset() {
 
 #[test]
 fn terminal_outcomes_have_fixed_bounded_responses() {
-    assert_eq!(MaxForwardsTerminal::FinalRecipient.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        MaxForwardsTerminal::FinalRecipient.status(),
+        StatusCode::NO_CONTENT
+    );
     assert!(MaxForwardsTerminal::FinalRecipient.body().is_empty());
-    assert_eq!(MaxForwardsTerminal::Malformed.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(MaxForwardsTerminal::Malformed.body().as_ref(), MAX_FORWARDS_INVALID_BODY);
-    assert_eq!(MAX_FORWARDS_INVALID_BODY, br#"{"error":"Invalid Max-Forwards header"}"#);
+    assert_eq!(
+        MaxForwardsTerminal::Malformed.status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        MaxForwardsTerminal::Malformed.body().as_ref(),
+        MAX_FORWARDS_INVALID_BODY
+    );
+    assert_eq!(
+        MAX_FORWARDS_INVALID_BODY,
+        br#"{"error":"Invalid Max-Forwards header"}"#
+    );
 }
 
 #[test]
 fn final_recipient_allow_uses_route_methods_or_the_protocol_level_list() {
     let route = vec!["get".to_string(), " options ".to_string()];
     let headers = max_forwards_response_headers(MaxForwardsTerminal::FinalRecipient, Some(&route));
-    assert_eq!(headers.get("allow").map(String::as_str), Some("GET, OPTIONS"));
+    assert_eq!(
+        headers.get("allow").map(String::as_str),
+        Some("GET, OPTIONS")
+    );
     assert_eq!(headers.len(), 1);
 
     let headers = max_forwards_response_headers(MaxForwardsTerminal::FinalRecipient, None);
