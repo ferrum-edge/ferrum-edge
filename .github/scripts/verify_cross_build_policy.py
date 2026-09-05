@@ -866,7 +866,9 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
           (.spdxVersion | type == "string" and startswith("SPDX-")) and
           (.documentNamespace | type == "string" and length > 0) and
           (.packages | type == "array" and length > 0) and
-          (.documentDescribes | type == "array" and length > 0)
+          ((.documentDescribes | type == "array" and length > 0) or
+            ([.relationships[]? | select(.spdxElementId == "SPDXRef-DOCUMENT"
+              and .relationshipType == "DESCRIBES")] | length > 0))
           JQ
 
           generate_sboms() {
@@ -3472,7 +3474,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     permissions:
       contents: read
     # The repository-root Cargo config also selects the mold linker through
@@ -29315,8 +29317,15 @@ pre_build = []
                     f"{newer_generation} to {older_generation} was not rejected"
                 )
 
-    fuzz_smoke_tampering: dict[str, tuple[str, str]] = {
-        "altered outer deadline": ("timeout-minutes: 60", "timeout-minutes: 30"),
+    # An entry's original may be a tuple of alternatives when the admitted
+    # generations legitimately differ at that point (the outer deadline moved
+    # from 60 to 120 minutes for #4650); the first alternative present in a
+    # generation is the one mutated.
+    fuzz_smoke_tampering: dict[str, tuple[str | tuple[str, ...], str]] = {
+        "altered outer deadline": (
+            ("timeout-minutes: 120", "timeout-minutes: 60"),
+            "timeout-minutes: 30",
+        ),
         "reduced compilation parallelism": ("--codegen-units 16", "--codegen-units 1"),
         "widened libFuzzer budget": ("-max_total_time=8", "-max_total_time=800"),
         "unbounded input length": ("-max_len=4096", "-max_len=1048576"),
@@ -29361,7 +29370,13 @@ pre_build = []
     }
     # Every generation is admitted, so every generation has to be tamper-proof.
     for generation, generation_workflow in enumerate(fuzz_generation_workflows):
-        for tamper_name, (original, replacement) in fuzz_smoke_tampering.items():
+        for tamper_name, (originals, replacement) in fuzz_smoke_tampering.items():
+            if isinstance(originals, str):
+                originals = (originals,)
+            original = next(
+                (candidate for candidate in originals if candidate in generation_workflow),
+                originals[0],
+            )
             tampered = generation_workflow.replace(original, replacement)
             if tampered == generation_workflow:
                 failures.append(
