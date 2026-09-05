@@ -146,6 +146,16 @@ impl ConnLimiter {
     /// == 0` disables the per-IP cap. With both zero the limiter only tracks the
     /// `active` gauge and never rejects.
     pub fn new(max_connections: usize, max_connections_per_ip: usize) -> Self {
+        Self::with_per_ip_map(max_connections, max_connections_per_ip, DashMap::new())
+    }
+
+    /// Shared body of both constructors: everything except the per-IP map,
+    /// whose sharding is the one thing the two differ on.
+    fn with_per_ip_map(
+        max_connections: usize,
+        max_connections_per_ip: usize,
+        per_ip_active: DashMap<IpAddr, u32>,
+    ) -> Self {
         let semaphore = if max_connections > 0 {
             // Clamp to the tokio semaphore ceiling so an absurd operator value
             // can't panic `Semaphore::new`.
@@ -158,7 +168,7 @@ impl ConnLimiter {
             semaphore,
             max_connections,
             max_connections_per_ip,
-            per_ip_active: DashMap::new(),
+            per_ip_active,
             active: AtomicU64::new(0),
             rejected_max_connections: AtomicU64::new(0),
             rejected_max_connections_per_ip: AtomicU64::new(0),
@@ -184,10 +194,11 @@ impl ConnLimiter {
         shard_amount_override: usize,
     ) -> Self {
         let shards = crate::util::sharding::pool_shard_amount(shard_amount_override);
-        Self {
-            per_ip_active: DashMap::with_capacity_and_shard_amount(0, shards),
-            ..Self::new(max_connections, max_connections_per_ip)
-        }
+        Self::with_per_ip_map(
+            max_connections,
+            max_connections_per_ip,
+            DashMap::with_capacity_and_shard_amount(0, shards),
+        )
     }
 
     /// Convenience constructor for an uncapped limiter. Used by the external
