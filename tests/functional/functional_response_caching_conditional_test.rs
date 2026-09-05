@@ -200,10 +200,7 @@ async fn functional_response_caching_conditional_eligibility_h1_h2_h3() {
     let reservation = reserve_port().await.expect("reserve origin port");
     let backend_port = reservation.port;
     let hits = Arc::new(AtomicUsize::new(0));
-    let origin = tokio::spawn(serve_origin(
-        reservation.into_listener(),
-        Arc::clone(&hits),
-    ));
+    let origin = tokio::spawn(serve_origin(reservation.into_listener(), Arc::clone(&hits)));
     let (mut gateway, https_port) = spawn_gateway(backend_port).await;
     let h1 = reqwest::Client::builder()
         .http1_only()
@@ -220,7 +217,10 @@ async fn functional_response_caching_conditional_eligibility_h1_h2_h3() {
     let frontends = [
         ("h1", Frontend::Tcp(h1, Version::HTTP_11)),
         ("h2", Frontend::Tcp(h2, Version::HTTP_2)),
-        ("h3", Frontend::H3(Http3Client::insecure().expect("H3 client"))),
+        (
+            "h3",
+            Frontend::H3(Http3Client::insecure().expect("H3 client")),
+        ),
     ];
 
     for (protocol, frontend) in frontends {

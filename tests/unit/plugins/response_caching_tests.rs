@@ -2331,10 +2331,7 @@ async fn test_conditional_wildcard_cache_miss_reaches_origin() {
             PluginResult::Continue
         ));
         assert_status(&plugin, &ctx, "MISS");
-        assert_eq!(
-            headers.get("if-none-match").map(String::as_str),
-            Some("*")
-        );
+        assert_eq!(headers.get("if-none-match").map(String::as_str), Some("*"));
     }
 }
 
