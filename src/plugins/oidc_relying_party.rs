@@ -621,12 +621,13 @@ impl RefreshFlightMap {
     /// let a second leader submit the same token.
     fn evict_completed(&self) {
         let now = Instant::now();
-        self.flights.retain(|_, slot| match slot.rx.borrow().as_ref() {
-            Some(record) => {
-                now.saturating_duration_since(record.completed_at) < REFRESH_FLIGHT_RETENTION
-            }
-            None => true,
-        });
+        self.flights
+            .retain(|_, slot| match slot.rx.borrow().as_ref() {
+                Some(record) => {
+                    now.saturating_duration_since(record.completed_at) < REFRESH_FLIGHT_RETENTION
+                }
+                None => true,
+            });
         if self.flights.len() < MAX_RETAINED_REFRESH_FLIGHTS {
             return;
         }
@@ -1716,7 +1717,10 @@ impl OidcRelyingParty {
                                 plugin = "oidc_relying_party",
                                 "OIDC token refresh rejected as invalid_grant; the spent refresh token is not re-sealed and the freshness gate decides whether the existing session may keep serving"
                             );
-                            (RefreshOutcome::UNCHANGED, RefreshFlightResult::SpentCredential)
+                            (
+                                RefreshOutcome::UNCHANGED,
+                                RefreshFlightResult::SpentCredential,
+                            )
                         }
                         Err(RefreshFailure::Other(error)) => {
                             warn!(
