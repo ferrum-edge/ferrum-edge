@@ -1228,7 +1228,11 @@ fn contested_namespace_fallback_certificate_is_the_same_in_every_snapshot_order(
         );
         (
             defaults[0].gateway.clone(),
-            result.config.frontend_tls_cert_path.clone().unwrap_or_default(),
+            result
+                .config
+                .frontend_tls_cert_path
+                .clone()
+                .unwrap_or_default(),
         )
     };
 

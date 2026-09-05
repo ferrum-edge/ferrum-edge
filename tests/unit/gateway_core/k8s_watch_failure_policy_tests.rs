@@ -13,7 +13,9 @@
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
-use ferrum_edge::k8s_controller::metrics::{IDLE_RECONCILE_LOG_INTERVAL, should_log_idle_reconcile};
+use ferrum_edge::k8s_controller::metrics::{
+    IDLE_RECONCILE_LOG_INTERVAL, should_log_idle_reconcile,
+};
 use ferrum_edge::k8s_controller::watcher::{
     FORBIDDEN_WATCH_HOLD, K8S_WATCH_IDLE_RELIST_SECS_DEFAULT, RELIST_DIVERGENCE_LOG_LIMIT,
     RelistDivergence, WatchErrorClass, WatchFailureStreak, WatchFailureTransition,
@@ -173,7 +175,11 @@ fn relist_divergence_names_vanished_and_appeared_objects_in_sorted_order() {
 
 #[test]
 fn identical_object_sets_are_not_a_divergence() {
-    let objects = [identity("ns", "b"), identity("ns", "a"), identity("", "cluster")];
+    let objects = [
+        identity("ns", "b"),
+        identity("ns", "a"),
+        identity("", "cluster"),
+    ];
     let mut reordered = objects.to_vec();
     reordered.reverse();
 

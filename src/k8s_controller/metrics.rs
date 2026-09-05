@@ -223,7 +223,12 @@ pub fn should_log_idle_reconcile(last_logged_ms: &AtomicU64, now_ms: u64) -> boo
         return false;
     }
     last_logged_ms
-        .compare_exchange(previous, now_ms.max(1), Ordering::Relaxed, Ordering::Relaxed)
+        .compare_exchange(
+            previous,
+            now_ms.max(1),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        )
         .is_ok()
 }
 
