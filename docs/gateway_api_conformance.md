@@ -790,9 +790,16 @@ the timing is. Two causes look identical in the suite output:
   window and starve live status updates behind it.
 - **A watch that stopped delivering.** The controller keeps reconciling with a
   frozen object set, so reconciles stay fast and the route never appears in any
-  plan at all. Look for `ferrum_k8s_controller_watch_idle_relists_total` and the
+  plan at all. Look for `ferrum_k8s_controller_watch_idle_relists_total`, for a
+  `Relisted … store disagrees with the generation it replaced` warning — it
+  names the objects the watch missed and advances
+  `ferrum_k8s_controller_watch_relist_missed_deletes_total` /
+  `_missed_adds_total`, which is the proof of a missed event — and for the
   `FERRUM_K8S_WATCH_IDLE_RELIST_SECS` recovery described in
-  [`docs/mesh.md`](mesh.md).
+  [`docs/mesh.md`](mesh.md). The lab sets that window to 20 s so a stale scope
+  is repaired inside the black-box probe budget. A scope the API server refuses
+  with HTTP 403 logs once at error level and is held two minutes between
+  attempts; `ferrum_k8s_controller_watch_errors_total` counts the attempts.
 
 Reconcile latency under CPU contention is a third shape and shows up as *many*
 slow reconciles plus node pressure in `top-nodes.txt` / `nodes.describe.txt`,

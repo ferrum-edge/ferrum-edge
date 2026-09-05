@@ -251,6 +251,13 @@ deploy_control_plane() {
   done
   kubectl create namespace "$CP_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
   create_frontend_tls_secret
+  # FERRUM_K8S_WATCH_IDLE_RELIST_SECS, not FERRUM_K8S_FULL_SYNC_INTERVAL_SECS, is
+  # the bound on watch staleness: a full sync re-reconciles the SAME reflector
+  # store. The black-box phases delete the upstream conformance objects and apply
+  # their own seconds later, and a scope still holding a deleted Gateway or route
+  # keeps serving it (issue #4491). Keep the window well inside the black-box
+  # probe budgets rather than at the 300s production default; this matches the
+  # standalone gateway_api_data_plane_conformance.sh control-plane deployment.
   # Harness owns GatewayClass/ferrum create/delete/recreate out of band; Helm must
   # not claim or recreate the cluster-scoped object (chart default is create=true).
   helm upgrade --install ferrum "$ROOT_DIR/charts/ferrum-mesh" \
@@ -281,6 +288,7 @@ deploy_control_plane() {
     --set controlPlane.env.FERRUM_K8S_WATCH_MESH_CONFIG=false \
     --set controlPlane.env.FERRUM_K8S_POD_DISCOVERY_ENABLED=true \
     --set controlPlane.env.FERRUM_K8S_FULL_SYNC_INTERVAL_SECS=15 \
+    --set controlPlane.env.FERRUM_K8S_WATCH_IDLE_RELIST_SECS=20 \
     --set observability.enabled=true \
     --set observability.alerts.enabled=false \
     --set observability.dashboards.enabled=false \

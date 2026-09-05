@@ -27,7 +27,8 @@ use ferrum_edge::_test_support::{
     K8sWatchScopeForTest, k8s_watch_idle_relist_jitter_millis as jitter_millis,
     k8s_watch_scope_for_test,
 };
-use kube::runtime::watcher::Event;
+use ferrum_edge::k8s_controller::watcher::FORBIDDEN_WATCH_HOLD;
+use kube::runtime::watcher::{self, Event};
 use tokio::sync::watch;
 
 const GROUP: &str = "gateway.networking.k8s.io";
@@ -365,4 +366,159 @@ async fn watcher_task_still_returns_on_shutdown_mid_relist() {
         .await
         .expect("watcher must observe shutdown while relisting")
         .expect("watcher task");
+}
+
+/// Issue #4491: the proof a black-box "deleted route kept serving" failure
+/// cannot produce on its own. Generation 0 lists two routes and then goes
+/// silent while one is deleted and another created in Kubernetes; the relist
+/// repairs the store and must SAY so — as missed events, distinguishable from
+/// the ordinary quiet relist a healthy scope also performs.
+#[tokio::test(start_paused = true)]
+async fn relist_reports_objects_that_changed_without_a_watch_event() {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (harness, task) = scope(2, IDLE_RELIST_SECS, shutdown_rx);
+    let watcher = tokio::spawn(task);
+
+    list(&harness, 0, &["blackbox-tcp-delete", "blackbox-tcp-main"]);
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(harness.watch_relist_missed_deletes(), 0);
+    assert_eq!(harness.watch_relist_missed_adds(), 0);
+
+    // The watch is stale: `blackbox-tcp-delete` is deleted and
+    // `blackbox-tcp-late` created, and neither event arrives.
+    tokio::time::sleep(PAST_IDLE_WINDOW).await;
+    list(&harness, 1, &["blackbox-tcp-main", "blackbox-tcp-late"]);
+    tokio::time::sleep(SETTLE).await;
+
+    assert_eq!(
+        harness.visible_names().await,
+        vec!["blackbox-tcp-late", "blackbox-tcp-main"],
+        "the relist repairs the store"
+    );
+    assert_eq!(
+        harness.watch_relist_missed_deletes(),
+        1,
+        "the withdrawal no Delete event announced is counted"
+    );
+    assert_eq!(
+        harness.watch_relist_missed_adds(),
+        1,
+        "the creation no Apply event announced is counted"
+    );
+    assert_eq!(harness.watch_idle_relists(), 1);
+
+    let _ = shutdown_tx.send(true);
+    watcher.await.expect("watcher task");
+}
+
+/// A delete the watch DID deliver is not a divergence: the retiring store had
+/// already dropped the object, so the authoritative list agrees with it and
+/// the relist stays an ordinary quiet one.
+#[tokio::test(start_paused = true)]
+async fn a_delivered_delete_is_not_reported_as_missed_on_relist() {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (harness, task) = scope(2, IDLE_RELIST_SECS, shutdown_rx);
+    let watcher = tokio::spawn(task);
+
+    list(&harness, 0, &["blackbox-tcp-delete", "blackbox-tcp-main"]);
+    tokio::time::sleep(SETTLE).await;
+    harness.emit(
+        0,
+        Event::Delete(harness.object(NAMESPACE, "blackbox-tcp-delete")),
+    );
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(harness.visible_names().await, vec!["blackbox-tcp-main"]);
+
+    tokio::time::sleep(PAST_IDLE_WINDOW).await;
+    list(&harness, 1, &["blackbox-tcp-main"]);
+    tokio::time::sleep(SETTLE).await;
+
+    assert_eq!(harness.visible_names().await, vec!["blackbox-tcp-main"]);
+    assert_eq!(
+        harness.watch_idle_relists(),
+        1,
+        "the quiet scope still relisted"
+    );
+    assert_eq!(
+        harness.watch_relist_missed_deletes(),
+        0,
+        "an observed delete must not be reported as missed"
+    );
+    assert_eq!(harness.watch_relist_missed_adds(), 0);
+
+    let _ = shutdown_tx.send(true);
+    watcher.await.expect("watcher task");
+}
+
+fn forbidden_error() -> watcher::Error {
+    let refusal = kube::core::Status::failure(
+        "tcproutes.gateway.networking.k8s.io is forbidden: the control plane cannot list them",
+        "Forbidden",
+    );
+    watcher::Error::InitialListFailed(kube::Error::Api(Box::new(refusal.with_code(403))))
+}
+
+/// An authorization refusal holds the scope (issue #4491). kube-rs's backoff
+/// cannot see the error class, so the watcher itself parks the stream for
+/// `FORBIDDEN_WATCH_HOLD` before polling it again. Relisting is disabled here
+/// so the hold is the only timer in play, and the list the API server would
+/// deliver once RBAC is fixed is queued right behind the refusal: it must not
+/// land until the hold expires.
+#[tokio::test(start_paused = true)]
+async fn a_forbidden_scope_is_held_before_its_stream_is_polled_again() {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (harness, task) = scope(1, 0, shutdown_rx);
+    let watcher = tokio::spawn(task);
+
+    harness.emit_error(0, forbidden_error());
+    list(&harness, 0, &["blackbox-tcp-main"]);
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(harness.watch_errors(), 1, "the refusal is counted");
+    assert!(
+        harness.visible_names().await.is_empty(),
+        "the stream must not be polled while the scope is held"
+    );
+
+    tokio::time::sleep(FORBIDDEN_WATCH_HOLD / 2).await;
+    assert!(
+        harness.visible_names().await.is_empty(),
+        "half the hold is still the hold"
+    );
+
+    tokio::time::sleep(FORBIDDEN_WATCH_HOLD / 2 + SETTLE).await;
+    assert_eq!(
+        harness.visible_names().await,
+        vec!["blackbox-tcp-main"],
+        "once the hold expires the queued list lands and the scope recovers"
+    );
+    assert_eq!(harness.watch_errors(), 1);
+
+    let _ = shutdown_tx.send(true);
+    watcher.await.expect("watcher task");
+}
+
+/// Every other failure is left to kube-rs's backoff inside the stream: the
+/// watcher counts it and keeps polling, so the very next item lands.
+#[tokio::test(start_paused = true)]
+async fn an_ordinary_watch_error_is_counted_but_not_held() {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (harness, task) = scope(1, 0, shutdown_rx);
+    let watcher = tokio::spawn(task);
+
+    harness.emit_error(
+        0,
+        watcher::Error::WatchFailed(kube::Error::LinesCodecMaxLineLengthExceeded),
+    );
+    list(&harness, 0, &["blackbox-tcp-main"]);
+    tokio::time::sleep(SETTLE).await;
+
+    assert_eq!(harness.watch_errors(), 1);
+    assert_eq!(
+        harness.visible_names().await,
+        vec!["blackbox-tcp-main"],
+        "no hold applies to a transport failure"
+    );
+
+    let _ = shutdown_tx.send(true);
+    watcher.await.expect("watcher task");
 }

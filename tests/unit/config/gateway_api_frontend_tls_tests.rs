@@ -1181,3 +1181,78 @@ fn namespace_filter_leaves_operator_material_alone() {
         "material with no owning Gateway namespace is the operator's, not a tenant's"
     );
 }
+
+/// Issue #4491: a stale reflector store can hand the translator a Gateway that
+/// Kubernetes already deleted, so two Gateways claim the namespace's fallback
+/// certificate slot. The winner must be the same whichever order the snapshot
+/// lists them in, and it is decided by the Gateway API tiebreak — the older
+/// resource — never by informer, store, or hash-map order.
+#[test]
+fn contested_namespace_fallback_certificate_is_the_same_in_every_snapshot_order() {
+    let stale = created_at(
+        gateway(
+            "ferrum",
+            "conformance-infra",
+            vec![https_listener("https", 443, None, &["cert-stale"])],
+        ),
+        "2026-01-01T00:00:00Z",
+    );
+    let live = created_at(
+        gateway(
+            "ferrum",
+            "blackbox",
+            vec![https_listener("https", 443, None, &["cert-live"])],
+        ),
+        "2026-06-01T00:00:00Z",
+    );
+    let stale_secret = tls_secret("cert-stale", "ferrum");
+    let live_secret = tls_secret("cert-live", "ferrum");
+
+    let fallback_for = |objects: &[K8sObject]| -> (String, String) {
+        let result = translate(objects);
+        let defaults: Vec<&FrontendTlsCertificateSource> = result
+            .config
+            .frontend_tls_certificate_sources
+            .iter()
+            .filter(|source| source.default_certificate)
+            .collect();
+        assert_eq!(
+            defaults.len(),
+            1,
+            "exactly one fallback certificate per namespace"
+        );
+        assert_eq!(
+            result.config.frontend_tls_certificate_sources.len(),
+            2,
+            "both Gateways keep serving their own certificate"
+        );
+        (
+            defaults[0].gateway.clone(),
+            result.config.frontend_tls_cert_path.clone().unwrap_or_default(),
+        )
+    };
+
+    let stale_first = fallback_for(&[
+        stale.clone(),
+        live.clone(),
+        stale_secret.clone(),
+        live_secret.clone(),
+    ]);
+    let live_first = fallback_for(&[live, stale, live_secret, stale_secret]);
+
+    assert_eq!(
+        stale_first, live_first,
+        "the fallback winner must not depend on snapshot order"
+    );
+    assert_eq!(
+        stale_first.0, "conformance-infra",
+        "the older Gateway takes the contested slot (Gateway API oldest-wins tiebreak)"
+    );
+    assert!(
+        stale_first
+            .1
+            .starts_with("k8s://ferrum/cert-stale#tls.crt?sha256="),
+        "the legacy fallback projection tracks that winner: {}",
+        stale_first.1
+    );
+}

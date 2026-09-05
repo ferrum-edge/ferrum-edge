@@ -1,4 +1,6 @@
-use std::collections::HashSet;
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -40,6 +42,22 @@ impl CrdResourceStore {
             .state()
             .iter()
             .map(|obj| dynamic_object_to_k8s_object(obj.as_ref(), &self.api_version, &self.kind))
+            .collect()
+    }
+
+    /// `(namespace, name)` of every object in the store — an empty namespace
+    /// for cluster-scoped objects — read without converting the objects, so a
+    /// relist divergence check stays cheap on large scopes (issue #4491).
+    pub fn object_identities(&self) -> Vec<(String, String)> {
+        self.store
+            .state()
+            .iter()
+            .map(|object| {
+                (
+                    object.metadata.namespace.clone().unwrap_or_default(),
+                    object.metadata.name.clone().unwrap_or_default(),
+                )
+            })
             .collect()
     }
 
@@ -195,6 +213,21 @@ impl ResourceStoreSet {
         self.stores.clone()
     }
 
+    /// The store currently registered for one `(api_version, kind, scope)`.
+    pub fn store_for_scope(
+        &self,
+        api_version: &str,
+        kind: &str,
+        scope: &str,
+    ) -> Option<Arc<CrdResourceStore>> {
+        self.stores
+            .iter()
+            .find(|store| {
+                store.api_version == api_version && store.kind == kind && store.scope == scope
+            })
+            .cloned()
+    }
+
     /// Identity of every currently registered scope.
     ///
     /// The revision tracker's aggregation set (issue #3611). Callers pin it and
@@ -215,16 +248,37 @@ impl ResourceStoreSet {
             .collect()
     }
 
+    /// Every object across every registered store, deduplicated and in a
+    /// deterministic order (issue #4491).
+    ///
+    /// The reconciler translates this list, so it must not depend on anything
+    /// incidental: a reflector store iterates a hash map, and a scope whose
+    /// stream ended re-registers at the end of the store list. One Kubernetes
+    /// object watched under several served API versions (`Gateway` v1 and
+    /// v1beta1, `TLSRoute` v1 and v1alpha2) is kept once, under the
+    /// lexicographically smallest `apiVersion` — the GA version on every alias
+    /// pair Ferrum watches — and the result is ordered by group, kind,
+    /// namespace, and name. The same cluster state, including a stale store
+    /// that still holds a deleted object, therefore always yields the same
+    /// snapshot and the same translation.
     pub fn snapshot_all(&self) -> Vec<K8sObject> {
-        let mut objects = Vec::new();
-        let mut seen = HashSet::new();
+        let mut chosen: HashMap<ResourceIdentity, K8sObject> = HashMap::new();
         for store in &self.stores {
             for object in store.snapshot() {
-                if seen.insert(resource_identity(&object)) {
-                    objects.push(object);
+                match chosen.entry(resource_identity(&object)) {
+                    Entry::Vacant(slot) => {
+                        slot.insert(object);
+                    }
+                    Entry::Occupied(mut slot) => {
+                        if object.api_version < slot.get().api_version {
+                            slot.insert(object);
+                        }
+                    }
                 }
             }
         }
+        let mut objects: Vec<K8sObject> = chosen.into_values().collect();
+        objects.sort_by(compare_resource_order);
         objects
     }
 
@@ -245,17 +299,33 @@ impl ResourceStoreSet {
     }
 }
 
-fn resource_identity(object: &K8sObject) -> (String, String, String, String) {
-    let group = object
-        .api_version
-        .split_once('/')
-        .map_or("", |(group, _version)| group);
+/// `(group, kind, namespace, name)`: one Kubernetes object, whichever served
+/// API version delivered it.
+type ResourceIdentity = (String, String, String, String);
+
+fn resource_identity(object: &K8sObject) -> ResourceIdentity {
     (
-        group.to_string(),
+        api_group(&object.api_version).to_string(),
         object.kind.clone(),
         object.metadata.namespace.clone(),
         object.metadata.name.clone(),
     )
+}
+
+fn api_group(api_version: &str) -> &str {
+    api_version
+        .split_once('/')
+        .map_or("", |(group, _version)| group)
+}
+
+/// Deterministic reconcile order: group, kind, namespace, name. Identities are
+/// unique after deduplication, so this is a total order over the snapshot.
+fn compare_resource_order(left: &K8sObject, right: &K8sObject) -> CmpOrdering {
+    api_group(&left.api_version)
+        .cmp(api_group(&right.api_version))
+        .then_with(|| left.kind.cmp(&right.kind))
+        .then_with(|| left.metadata.namespace.cmp(&right.metadata.namespace))
+        .then_with(|| left.metadata.name.cmp(&right.metadata.name))
 }
 
 #[cfg(test)]

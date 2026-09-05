@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -613,6 +613,219 @@ impl RelistPolicy {
 /// generation is ever started).
 const MIN_RELIST_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a watch scope the API server refused with HTTP 403 is held before
+/// its stream is polled again (issue #4491).
+///
+/// kube-rs's `DefaultBackoff` already spaces retries of *any* failure
+/// exponentially (0.8 s doubling to a 30 s cap, jittered, reset after two
+/// quiet minutes), so a scope that can never succeed is not a hot loop. An
+/// authorization refusal is different in kind, though: it is an operator's
+/// RBAC gap on a served kind, it does not heal on its own, and every retry is
+/// a full list attempt the API server audits and refuses. Two minutes keeps
+/// that at one attempt per hold — a RoleBinding fix is picked up within the
+/// window — while the idle relist (`FERRUM_K8S_WATCH_IDLE_RELIST_SECS`) stays
+/// the only other thing that touches the scope.
+pub const FORBIDDEN_WATCH_HOLD: Duration = Duration::from_secs(120);
+
+/// Coarse class of one watch stream error, chosen for retry and logging policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchErrorClass {
+    /// The API server refused the list or watch with HTTP 403 (`Forbidden`):
+    /// an RBAC gap on a served kind. Held for [`FORBIDDEN_WATCH_HOLD`] on top
+    /// of kube-rs's backoff between attempts.
+    Forbidden,
+    /// Every other failure — transport, timeout, `410 Gone`, malformed event.
+    /// kube-rs's own backoff paces these.
+    Other,
+}
+
+impl WatchErrorClass {
+    /// Extra hold this watcher imposes before the stream is polled again, on
+    /// top of the backoff kube-rs applies inside the stream.
+    pub fn hold(self) -> Option<Duration> {
+        match self {
+            Self::Forbidden => Some(FORBIDDEN_WATCH_HOLD),
+            Self::Other => None,
+        }
+    }
+
+    /// Closed-set label for logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Forbidden => "forbidden",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Classify one `watcher` stream error.
+///
+/// Only the API server's own `Status` can say `Forbidden`; it arrives either
+/// wrapped in a `kube::Error::Api` from the list/watch request or as an inline
+/// watch `Status` event. Everything else — including errors whose source is
+/// not a `Status` at all — is [`WatchErrorClass::Other`].
+pub fn classify_watch_error(error: &watcher::Error) -> WatchErrorClass {
+    let forbidden = match error {
+        watcher::Error::InitialListFailed(source)
+        | watcher::Error::WatchStartFailed(source)
+        | watcher::Error::WatchFailed(source) => {
+            matches!(source, kube::Error::Api(status) if status.is_forbidden())
+        }
+        watcher::Error::WatchError(status) => status.is_forbidden(),
+        _ => false,
+    };
+    if forbidden {
+        WatchErrorClass::Forbidden
+    } else {
+        WatchErrorClass::Other
+    }
+}
+
+/// What one recorded watch failure means for logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchFailureTransition {
+    /// First failure after a healthy stretch.
+    Entered(WatchErrorClass),
+    /// The failure class changed mid-streak (for example a transport error
+    /// that turned into a 403 once the request reached the API server).
+    Changed {
+        from: WatchErrorClass,
+        to: WatchErrorClass,
+    },
+    /// Same class again; `attempts` counts the whole streak.
+    Repeated {
+        class: WatchErrorClass,
+        attempts: u64,
+    },
+}
+
+/// Consecutive-failure state of one watch scope (issue #4491).
+///
+/// Kept across relist generations so a scope that cannot succeed announces
+/// its fault once, at error level, and then only when the fault changes or
+/// the watch recovers — not once per backoff step and not again on every
+/// idle relist. Repeats stay visible at debug level with the attempt count.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WatchFailureStreak {
+    failures: u64,
+    class: Option<WatchErrorClass>,
+}
+
+impl WatchFailureStreak {
+    /// Record one failed attempt and say how it should be logged.
+    pub fn record_failure(&mut self, class: WatchErrorClass) -> WatchFailureTransition {
+        self.failures = self.failures.saturating_add(1);
+        let transition = match self.class {
+            None => WatchFailureTransition::Entered(class),
+            Some(previous) if previous != class => WatchFailureTransition::Changed {
+                from: previous,
+                to: class,
+            },
+            Some(_) => WatchFailureTransition::Repeated {
+                class,
+                attempts: self.failures,
+            },
+        };
+        self.class = Some(class);
+        transition
+    }
+
+    /// A delivered event ends the streak. Returns how many attempts had
+    /// failed first, so recovery is logged exactly once, or `None` when the
+    /// scope was already healthy.
+    pub fn record_success(&mut self) -> Option<u64> {
+        if self.failures == 0 {
+            return None;
+        }
+        let failed = self.failures;
+        *self = Self::default();
+        Some(failed)
+    }
+
+    /// Consecutive failures recorded since the last delivered event.
+    pub fn failures(&self) -> u64 {
+        self.failures
+    }
+}
+
+/// `(namespace, name)` of one watched object; cluster-scoped objects carry an
+/// empty namespace.
+pub type ObjectIdentity = (String, String);
+
+/// How many object names one relist-divergence warning spells out before
+/// summarizing the rest as a count.
+pub const RELIST_DIVERGENCE_LOG_LIMIT: usize = 16;
+
+/// Objects whose presence differs between a scope's last-known store and the
+/// authoritative list that replaced it (issue #4491).
+///
+/// A healthy stream leaves both sets identical, because every creation and
+/// withdrawal reached the store as an event before the relist. A difference
+/// is therefore the proof a black-box "deleted route kept serving" failure
+/// cannot produce on its own: the watch missed an event. The one benign
+/// source of a small divergence is an object that changed inside the relist's
+/// own list window, after the previous generation was frozen.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RelistDivergence {
+    /// Held by the previous generation, absent from the authoritative list:
+    /// withdrawn without a `Delete` event reaching this process. Sorted.
+    pub vanished: Vec<String>,
+    /// Present in the authoritative list, unknown to the previous generation:
+    /// created without an `Apply` event reaching this process. Sorted.
+    pub appeared: Vec<String>,
+}
+
+impl RelistDivergence {
+    pub fn is_empty(&self) -> bool {
+        self.vanished.is_empty() && self.appeared.is_empty()
+    }
+}
+
+/// Compare a retiring store's object set with the relisted one.
+pub fn relist_divergence(
+    previous: &[ObjectIdentity],
+    relisted: &[ObjectIdentity],
+) -> RelistDivergence {
+    let previous: BTreeSet<&ObjectIdentity> = previous.iter().collect();
+    let relisted: BTreeSet<&ObjectIdentity> = relisted.iter().collect();
+    RelistDivergence {
+        vanished: previous
+            .difference(&relisted)
+            .map(|identity| render_object_identity(identity))
+            .collect(),
+        appeared: relisted
+            .difference(&previous)
+            .map(|identity| render_object_identity(identity))
+            .collect(),
+    }
+}
+
+fn render_object_identity((namespace, name): &ObjectIdentity) -> String {
+    if namespace.is_empty() {
+        name.clone()
+    } else {
+        format!("{namespace}/{name}")
+    }
+}
+
+/// Join up to [`RELIST_DIVERGENCE_LOG_LIMIT`] identities for one log field and
+/// say how many more were omitted, so a mass divergence cannot turn one log
+/// line into a dump of the whole scope.
+pub fn render_object_list(identities: &[String]) -> String {
+    let shown = identities
+        .iter()
+        .take(RELIST_DIVERGENCE_LOG_LIMIT)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let omitted = identities.len().saturating_sub(RELIST_DIVERGENCE_LOG_LIMIT);
+    if omitted == 0 {
+        shown
+    } else {
+        format!("{shown} (+{omitted} more)")
+    }
+}
+
 /// Wall-clock ceiling on one authoritative-boundary read (issue #3611).
 ///
 /// The read gates the start of a watcher generation, so an API server that
@@ -810,6 +1023,13 @@ pub(crate) async fn run_watcher_generations<S, F>(
     let mut refresh_requests = revision.subscribe_evidence_refresh();
     refresh_requests.mark_unchanged();
     let mut initial_writer = Some(initial_writer);
+    // Issue #4491: failure state outlives a generation, so an idle relist of a
+    // scope that still cannot list does not re-announce the same fault.
+    let mut failure_streak = WatchFailureStreak::default();
+    // Whether the store registered for this scope has ever completed an
+    // initial list. A relist diff against a store that never listed would
+    // report every object as "appeared without an event".
+    let mut live_store_listed = false;
 
     loop {
         // `pending` is `Some` only for a replacement generation, i.e. exactly
@@ -860,6 +1080,9 @@ pub(crate) async fn run_watcher_generations<S, F>(
         let generation_start = tokio::time::Instant::now();
         let mut last_event = generation_start;
         let mut refresh_requested = false;
+        // `Some` while an authorization refusal holds this stream unpolled
+        // (issue #4491). Per generation: a relist is a fresh attempt.
+        let mut stream_hold: Option<tokio::time::Instant> = None;
 
         loop {
             let idle_deadline = match pending.as_ref() {
@@ -944,10 +1167,25 @@ pub(crate) async fn run_watcher_generations<S, F>(
                 _ = refresh_requests.changed(), if !refresh_requested => {
                     refresh_requested = true;
                 }
-                item = stream.try_next() => {
+                // The hold expired; the next iteration polls the stream again
+                // (kube-rs's own backoff may still be running inside it).
+                _ = sleep_until_or_pending(stream_hold), if stream_hold.is_some() => {
+                    stream_hold = None;
+                }
+                item = stream.try_next(), if stream_hold.is_none() => {
                     match item {
                         Ok(Some(event)) => {
                             last_event = tokio::time::Instant::now();
+                            if let Some(failed_attempts) = failure_streak.record_success() {
+                                info!(
+                                    kind = %target.kind,
+                                    api_version = %target.api_version,
+                                    scope = %target.scope,
+                                    failed_attempts,
+                                    "{} recovered; the watch is delivering again",
+                                    target.watcher_label
+                                );
+                            }
                             // Issue #4491: a black-box "the withdrawn route is
                             // still served" failure cannot tell a stalled watch
                             // from a reconcile that ran and published. Count
@@ -973,6 +1211,7 @@ pub(crate) async fn run_watcher_generations<S, F>(
                             let Some(store) = pending.take() else {
                                 if matches!(event, watcher::Event::InitDone) {
                                     revision.commit_list(&scope_key);
+                                    live_store_listed = true;
                                 }
                                 change_notifier.notify_change();
                                 continue;
@@ -984,8 +1223,29 @@ pub(crate) async fn run_watcher_generations<S, F>(
                                 pending = Some(store);
                                 continue;
                             }
-                            let replaced = {
+                            // The reflector applied `InitDone` to this writer
+                            // before yielding it, so the replacement's store
+                            // already holds the complete authoritative list.
+                            let relisted = store.object_identities();
+                            let (replaced, divergence) = {
                                 let mut set = store_set.lock().await;
+                                // Issue #4491: the generation about to retire is
+                                // frozen (its stream was dropped when the relist
+                                // began), so what it still holds versus what the
+                                // authoritative list says exists is exactly the
+                                // set of events the watch missed.
+                                let divergence = live_store_listed
+                                    .then(|| {
+                                        set.store_for_scope(
+                                            &target.api_version,
+                                            &target.kind,
+                                            &target.scope,
+                                        )
+                                    })
+                                    .flatten()
+                                    .map(|previous| {
+                                        relist_divergence(&previous.object_identities(), &relisted)
+                                    });
                                 let replaced = set
                                     .replace_or_add_store_for_scope_without_notify(store);
                                 // Commit the generation's revision evidence while
@@ -999,16 +1259,49 @@ pub(crate) async fn run_watcher_generations<S, F>(
                                 // publication (issue #3611).
                                 revision.commit_list(&scope_key);
                                 set.notify_change();
-                                replaced
+                                (replaced, divergence)
                             };
-                            debug!(
-                                kind = %target.kind,
-                                api_version = %target.api_version,
-                                scope = %target.scope,
-                                replaced,
-                                "Relisted {} store is live",
-                                target.watcher_label
-                            );
+                            live_store_listed = true;
+                            match divergence {
+                                Some(divergence) if !divergence.is_empty() => {
+                                    metrics
+                                        .watch_relist_missed_deletes
+                                        .fetch_add(
+                                            divergence.vanished.len() as u64,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                    metrics
+                                        .watch_relist_missed_adds
+                                        .fetch_add(
+                                            divergence.appeared.len() as u64,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                    warn!(
+                                        kind = %target.kind,
+                                        api_version = %target.api_version,
+                                        scope = %target.scope,
+                                        replaced,
+                                        vanished = divergence.vanished.len(),
+                                        appeared = divergence.appeared.len(),
+                                        vanished_objects = %render_object_list(&divergence.vanished),
+                                        appeared_objects = %render_object_list(&divergence.appeared),
+                                        "Relisted {} store disagrees with the generation it \
+                                         replaced: these objects changed without a watch event \
+                                         reaching this process",
+                                        target.watcher_label
+                                    );
+                                }
+                                _ => {
+                                    debug!(
+                                        kind = %target.kind,
+                                        api_version = %target.api_version,
+                                        scope = %target.scope,
+                                        replaced,
+                                        "Relisted {} store is live",
+                                        target.watcher_label
+                                    );
+                                }
+                            }
                         }
                         Ok(None) => {
                             error!(
@@ -1047,15 +1340,58 @@ pub(crate) async fn run_watcher_generations<S, F>(
                         Err(e) => {
                             // The stream applies `DefaultBackoff` before it is
                             // polled again, so a watch that can never succeed
-                            // logs (and re-lists) at most once per backoff step
-                            // rather than as fast as this task is scheduled.
-                            error!(
-                                kind = %target.kind,
-                                api_version = %target.api_version,
-                                scope = %target.scope,
-                                error = %e,
-                                "Watch error; the stream backs off before retrying"
-                            );
+                            // retries at most once per backoff step rather than
+                            // as fast as this task is scheduled. Issue #4491
+                            // adds two things on top: an authorization refusal
+                            // holds the stream for `FORBIDDEN_WATCH_HOLD`, and
+                            // the fault is logged at error level once per state
+                            // change instead of once per attempt.
+                            metrics
+                                .watch_errors
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let class = classify_watch_error(&e);
+                            if let Some(hold) = class.hold() {
+                                stream_hold = Some(tokio::time::Instant::now() + hold);
+                            }
+                            match failure_streak.record_failure(class) {
+                                WatchFailureTransition::Entered(_)
+                                | WatchFailureTransition::Changed { .. } => match class {
+                                    WatchErrorClass::Forbidden => error!(
+                                        kind = %target.kind,
+                                        api_version = %target.api_version,
+                                        scope = %target.scope,
+                                        error = %e,
+                                        class = class.as_str(),
+                                        hold_secs = FORBIDDEN_WATCH_HOLD.as_secs(),
+                                        "{} refused by the API server with HTTP 403 (RBAC gap \
+                                         on a served kind); holding this scope between attempts \
+                                         and logging again only when the failure changes or the \
+                                         watch recovers",
+                                        target.watcher_label
+                                    ),
+                                    WatchErrorClass::Other => error!(
+                                        kind = %target.kind,
+                                        api_version = %target.api_version,
+                                        scope = %target.scope,
+                                        error = %e,
+                                        class = class.as_str(),
+                                        "{} watch error; the stream backs off before retrying, \
+                                         and this is logged again only when the failure changes \
+                                         or the watch recovers",
+                                        target.watcher_label
+                                    ),
+                                },
+                                WatchFailureTransition::Repeated { attempts, .. } => debug!(
+                                    kind = %target.kind,
+                                    api_version = %target.api_version,
+                                    scope = %target.scope,
+                                    error = %e,
+                                    class = class.as_str(),
+                                    attempts,
+                                    "{} watch error repeated",
+                                    target.watcher_label
+                                ),
+                            }
                         }
                     }
                 }

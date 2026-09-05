@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use tracing::info;
 
@@ -42,6 +43,26 @@ pub struct ControllerMetrics {
     /// controller never saw it" from "the controller published and the data
     /// plane still serves the old route".
     pub config_publications: AtomicU64,
+    /// Watch stream errors across every watched scope (issue #4491): refused
+    /// initial lists, failed watch starts, mid-stream failures, and API-server
+    /// `Status` errors. kube-rs backs the stream off between attempts and the
+    /// watcher logs the fault once per transition, so this counter is the
+    /// per-attempt view: a steady rise is a scope that cannot succeed — most
+    /// often an RBAC gap on a served kind.
+    pub watch_errors: AtomicU64,
+    /// Objects an authoritative relist found missing from the store it
+    /// replaced (issue #4491): withdrawals no `Delete` event delivered. This is
+    /// the proof of a missed delete, as opposed to a delete that was observed
+    /// and reconciled. A small count on a churning scope can also be an object
+    /// deleted inside the relist's own list window.
+    pub watch_relist_missed_deletes: AtomicU64,
+    /// Objects an authoritative relist found that the store it replaced never
+    /// held: creations no `Apply` event delivered.
+    pub watch_relist_missed_adds: AtomicU64,
+    /// Monotonic millisecond stamp of the last rate-limited idle-reconcile log
+    /// line (issue #4491). Bookkeeping for [`should_log_idle_reconcile`], not a
+    /// metric; deliberately absent from [`MetricsSnapshot`].
+    pub idle_reconcile_last_logged_ms: AtomicU64,
     /// Successful Gateway API route parent-status patches.
     pub route_status_publications: AtomicU64,
     /// Milliseconds from the patched route's Kubernetes `creationTimestamp` to
@@ -108,6 +129,10 @@ impl ControllerMetrics {
             watch_idle_relists: AtomicU64::new(0),
             watch_deletes: AtomicU64::new(0),
             config_publications: AtomicU64::new(0),
+            watch_errors: AtomicU64::new(0),
+            watch_relist_missed_deletes: AtomicU64::new(0),
+            watch_relist_missed_adds: AtomicU64::new(0),
+            idle_reconcile_last_logged_ms: AtomicU64::new(0),
             route_status_publications: AtomicU64::new(0),
             last_route_status_publish_latency_ms: AtomicU64::new(0),
             status_request_timeouts: AtomicU64::new(0),
@@ -131,6 +156,9 @@ impl ControllerMetrics {
             watch_idle_relists: self.watch_idle_relists.load(Ordering::Relaxed),
             watch_deletes: self.watch_deletes.load(Ordering::Relaxed),
             config_publications: self.config_publications.load(Ordering::Relaxed),
+            watch_errors: self.watch_errors.load(Ordering::Relaxed),
+            watch_relist_missed_deletes: self.watch_relist_missed_deletes.load(Ordering::Relaxed),
+            watch_relist_missed_adds: self.watch_relist_missed_adds.load(Ordering::Relaxed),
             route_status_publications: self.route_status_publications.load(Ordering::Relaxed),
             last_route_status_publish_latency_ms: self
                 .last_route_status_publish_latency_ms
@@ -157,6 +185,9 @@ pub struct MetricsSnapshot {
     pub watch_idle_relists: u64,
     pub watch_deletes: u64,
     pub config_publications: u64,
+    pub watch_errors: u64,
+    pub watch_relist_missed_deletes: u64,
+    pub watch_relist_missed_adds: u64,
     pub route_status_publications: u64,
     pub last_route_status_publish_latency_ms: u64,
     pub status_request_timeouts: u64,
@@ -168,6 +199,39 @@ pub struct MetricsSnapshot {
     pub istio_status_not_found: u64,
     pub istio_status_unsupported: u64,
     pub istio_status_missing_uid: u64,
+}
+
+/// Minimum spacing between `info`-level log lines for reconciles that changed
+/// nothing (issue #4491).
+///
+/// `Reconciliation complete` is emitted only when a reconcile swaps
+/// configuration, so before this a missed delete and a quiet cluster produced
+/// identical logs. One line per interval carrying the watch counters keeps the
+/// idle case visible without turning a 15 s full-sync into a log firehose.
+pub const IDLE_RECONCILE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Whether an idle reconcile observed at `now_ms` (any monotonic millisecond
+/// clock) should log at info level, given the stamp of the last such line.
+///
+/// Claims the slot when it answers `true`, so two callers reading the same
+/// stamp cannot both log. A zero stamp means "never logged", so the stored
+/// stamp is floored at one.
+pub fn should_log_idle_reconcile(last_logged_ms: &AtomicU64, now_ms: u64) -> bool {
+    let interval_ms = u64::try_from(IDLE_RECONCILE_LOG_INTERVAL.as_millis()).unwrap_or(u64::MAX);
+    let previous = last_logged_ms.load(Ordering::Relaxed);
+    if previous != 0 && now_ms.saturating_sub(previous) < interval_ms {
+        return false;
+    }
+    last_logged_ms
+        .compare_exchange(previous, now_ms.max(1), Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+/// Milliseconds since the first call in this process, from a monotonic clock.
+pub fn monotonic_now_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Milliseconds from `creation_rfc3339` to `published_unix_ms`.
