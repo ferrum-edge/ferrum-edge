@@ -39,8 +39,8 @@ use tracing::{debug, warn};
 use super::utils::body_transform::is_json_content_type;
 use super::utils::json_escape::escape_json_string;
 use super::utils::sse::{
-    SseReassembler, SseTextKind, is_text_event_stream_media_type, original_response_is_event_stream,
-    parse_sse_data_frames, parse_sse_data_frames_checked,
+    SseReassembler, SseTextKind, is_text_event_stream_media_type,
+    original_response_is_event_stream, parse_sse_data_frames, parse_sse_data_frames_checked,
 };
 use super::utils::synthetic_response::{
     request_method_omits_response_body, synthetic_response_omits_body,

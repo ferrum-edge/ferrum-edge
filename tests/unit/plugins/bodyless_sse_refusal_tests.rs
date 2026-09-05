@@ -101,11 +101,13 @@ async fn assert_no_content_matrix(plugin: &dyn Plugin) {
                         status,
                         &response_headers,
                     ));
-                    assert!(plugin.should_release_response_body_before_content_type_rewrite(
-                        &ctx,
-                        status,
-                        &response_headers,
-                    ));
+                    assert!(
+                        plugin.should_release_response_body_before_content_type_rewrite(
+                            &ctx,
+                            status,
+                            &response_headers,
+                        )
+                    );
                 }
                 assert!(
                     matches!(
@@ -162,11 +164,14 @@ async fn genuine_sse_refusal_preserves_original_header_provenance() {
     for plugin in policies() {
         for live_type in ["text/event-stream", "application/json"] {
             let mut ctx = context("GET");
-            ctx.headers.insert("accept".into(), "text/event-stream".into());
+            ctx.headers
+                .insert("accept".into(), "text/event-stream".into());
             assert!(plugin.should_buffer_response_body(&ctx));
             stamp_original_response_metadata_for_test(&mut ctx, 200, &headers("text/event-stream"));
             let mut response_headers = headers(live_type);
-            let result = plugin.after_proxy(&mut ctx, 200, &mut response_headers).await;
+            let result = plugin
+                .after_proxy(&mut ctx, 200, &mut response_headers)
+                .await;
             let expected_status = if plugin.name() == "waf" { 403 } else { 502 };
             assert!(
                 matches!(result, PluginResult::Reject { status_code, .. }
@@ -211,7 +216,8 @@ async fn composed_policies_preserve_no_content_status_and_header_hooks() {
         let mut ctx = context(method);
         let mut response_headers = headers("text/event-stream");
         assert!(
-            !run_after_proxy_hooks_for_test(&plugins, &mut ctx, status, &mut response_headers).await
+            !run_after_proxy_hooks_for_test(&plugins, &mut ctx, status, &mut response_headers)
+                .await
         );
         assert_eq!(
             response_headers.get("x-checked").map(String::as_str),
