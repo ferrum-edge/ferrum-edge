@@ -1107,7 +1107,9 @@ async fn saturated_batch_poll_cycle(
         Err(error) => {
             let message = error.to_string();
             if !(message.contains("reached limit") && message.contains("forcing full reload")) {
-                return Err(format!("incremental poll failed for another reason: {message}"));
+                return Err(format!(
+                    "incremental poll failed for another reason: {message}"
+                ));
             }
             let (config, sequence) =
                 database_mode_load_full_config_with_sequence_for_test(db, "ferrum")
@@ -1214,13 +1216,17 @@ async fn saturated_change_log_fallback_converges_within_two_poll_cycles() {
         .await
         .expect("cycle 1 must publish");
     let builds_during_reload = plugin_http_client_builds_for_test() - builds_before;
-    assert!(fell_back, "a saturated change batch must route through the full-reload fallback");
+    assert!(
+        fell_back,
+        "a saturated change batch must route through the full-reload fallback"
+    );
     assert_eq!(
         cursor.sequence, watermark,
         "the fallback reload must commit the watermark it read as the accepted cursor"
     );
     assert_eq!(
-        apply.accepted_cursor(), LiveApplyCursor::new(topology_epoch, watermark),
+        apply.accepted_cursor(),
+        LiveApplyCursor::new(topology_epoch, watermark),
         "the live-apply status must report the reload's cursor as accepted"
     );
 
@@ -1240,11 +1246,13 @@ async fn saturated_change_log_fallback_converges_within_two_poll_cycles() {
 
     let served = proxy_state.current_config();
     assert_eq!(
-        served.proxies.len(), SATURATED_BATCH_PROXIES,
+        served.proxies.len(),
+        SATURATED_BATCH_PROXIES,
         "the reload must serve every proxy of the wave"
     );
     assert_eq!(
-        served.plugin_configs.len(), 2 * SATURATED_BATCH_PROXIES,
+        served.plugin_configs.len(),
+        2 * SATURATED_BATCH_PROXIES,
         "the reload must serve every plugin config of the wave"
     );
 
@@ -1274,11 +1282,15 @@ async fn saturated_change_log_fallback_converges_within_two_poll_cycles() {
     let fell_back = saturated_batch_poll_cycle(&db, &proxy_state, &apply, &mut cursor)
         .await
         .expect("cycle 3 must publish");
-    assert!(!fell_back, "a single post-reload write must apply incrementally");
+    assert!(
+        !fell_back,
+        "a single post-reload write must apply incrementally"
+    );
     assert_eq!(cursor.sequence, after_watermark);
     assert_eq!(apply.accepted_sequence(), after_watermark);
     assert_eq!(
-        proxy_state.current_config().proxies.len(), SATURATED_BATCH_PROXIES + 1,
+        proxy_state.current_config().proxies.len(),
+        SATURATED_BATCH_PROXIES + 1,
         "the incremental poll after the fallback must publish the new proxy"
     );
 }
