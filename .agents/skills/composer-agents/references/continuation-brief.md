@@ -5,6 +5,11 @@ Resume the existing worktree and branch named in the dispatch prompt. Follow eve
 controller-defined stopping point, final reporting, and the prohibition on merging. The
 orchestrator must provide absolute paths to both briefs; do not use this continuation brief alone.
 
+Do not run local builds, tests, benchmarks, `cargo check`, or `cargo clippy`, including through
+wrappers. Follow the remote CI validation policy in `agent-brief.md`: use failed remote job logs
+to drive fixes and matching pushed-head CI results to confirm them. Formatting and source/diff
+inspection are allowed. Report pending CI honestly and preserve the assigned stopping point.
+
 ## Implement directly
 
 Complete the assigned continuation work and validation yourself in this session. Do not stop at

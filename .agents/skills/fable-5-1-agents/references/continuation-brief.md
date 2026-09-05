@@ -5,6 +5,11 @@ Resume the existing worktree and branch named in the dispatch prompt. Follow all
 controller-defined stopping point, final reporting, safeguard notices, and the prohibition on
 merging.
 
+Do not run local builds, tests, benchmarks, `cargo check`, or `cargo clippy`, including through
+wrappers. Follow the remote CI validation policy in `agent-brief.md`: use failed remote job logs
+to drive fixes and matching pushed-head CI results to confirm them. Formatting and source/diff
+inspection are allowed. Report pending CI honestly and preserve the assigned stopping point.
+
 ## Implement directly
 
 Complete the assigned continuation work and validation yourself in this session. Do not stop at
