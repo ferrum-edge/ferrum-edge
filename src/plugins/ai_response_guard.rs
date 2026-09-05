@@ -39,8 +39,11 @@ use tracing::{debug, warn};
 use super::utils::body_transform::is_json_content_type;
 use super::utils::json_escape::escape_json_string;
 use super::utils::sse::{
-    SseReassembler, SseTextKind, is_text_event_stream_media_type,
-    original_response_is_event_stream, parse_sse_data_frames, parse_sse_data_frames_checked,
+    SseReassembler, SseTextKind, is_text_event_stream_media_type, original_response_is_event_stream,
+    parse_sse_data_frames, parse_sse_data_frames_checked,
+};
+use super::utils::synthetic_response::{
+    request_method_omits_response_body, synthetic_response_omits_body,
 };
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -3081,6 +3084,9 @@ impl Plugin for AiResponseGuard {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+        if request_method_omits_response_body(&ctx.method) {
+            return false;
+        }
         // A native-gRPC response is buffered only for a method the operator
         // enrolled: an un-enrolled method has no decodable contract, so pinning
         // it to the buffered path would cost streaming for no enforcement.
@@ -3101,33 +3107,36 @@ impl Plugin for AiResponseGuard {
     fn should_release_response_body_under_retries(
         &self,
         ctx: &RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
             && !ctx.is_native_grpc_request()
-            && original_response_is_event_stream(ctx, response_headers)
+            && (synthetic_response_omits_body(&ctx.method, response_status)
+                || original_response_is_event_stream(ctx, response_headers))
     }
 
     fn should_release_response_body_before_content_type_rewrite(
         &self,
         ctx: &RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
             && !ctx.is_native_grpc_request()
-            && original_response_is_event_stream(ctx, response_headers)
+            && (synthetic_response_omits_body(&ctx.method, response_status)
+                || original_response_is_event_stream(ctx, response_headers))
     }
 
     fn should_buffer_response_body_for_content_type(
         &self,
         ctx: &RequestContext,
         content_type: Option<&str>,
-        _response_status: u16,
+        response_status: u16,
         _response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
+            && !synthetic_response_omits_body(&ctx.method, response_status)
             && (ctx.is_native_grpc_request()
                 || !content_type.is_some_and(is_text_event_stream_media_type))
     }
@@ -3135,11 +3144,12 @@ impl Plugin for AiResponseGuard {
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         if !ctx.is_native_grpc_request()
             && self.should_buffer_response_body(ctx)
+            && !synthetic_response_omits_body(&ctx.method, response_status)
             && original_response_is_event_stream(ctx, response_headers)
         {
             // This plugin's buffered SSE parser cannot safely decide an
@@ -3162,6 +3172,10 @@ impl Plugin for AiResponseGuard {
         response_headers: &mut HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        if synthetic_response_omits_body(&ctx.method, response_status) {
+            return PluginResult::Continue;
+        }
+
         // Native gRPC framing has its own descriptor-based contract; the
         // JSON/SSE/text document model below never applies to it.
         if ctx.is_native_grpc_request() {

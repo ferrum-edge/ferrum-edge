@@ -43,6 +43,9 @@ use self::stream::{
     StreamWafConfig, TLS_CLIENT_HELLO_MIN_PREFIX, looks_like_tls_client_hello, parse_stream_config,
 };
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
+use super::utils::synthetic_response::{
+    request_method_omits_response_body, synthetic_response_omits_body,
+};
 use super::{
     ALL_PROTOCOLS, HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext,
     ResponseTrailerPolicy, StreamBytesKind, StreamConnectionContext, UdpDatagramContext,
@@ -1564,7 +1567,7 @@ impl Plugin for Waf {
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         if self.active {
@@ -1597,6 +1600,7 @@ impl Plugin for Waf {
             }
         }
         if self.should_buffer_response_body(ctx)
+            && !synthetic_response_omits_body(&ctx.method, response_status)
             && original_response_is_event_stream(ctx, response_headers)
         {
             return self.handle_unbounded_response_stream(ctx);
@@ -1650,7 +1654,9 @@ impl Plugin for Waf {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        self.requires_response_body_buffering() && !self.exemptions.request_short_circuits(ctx)
+        self.requires_response_body_buffering()
+            && !request_method_omits_response_body(&ctx.method)
+            && !self.exemptions.request_short_circuits(ctx)
     }
 
     fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
@@ -1660,28 +1666,30 @@ impl Plugin for Waf {
     fn should_release_response_body_under_retries(
         &self,
         ctx: &RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
-            && original_response_is_event_stream(ctx, response_headers)
+            && (synthetic_response_omits_body(&ctx.method, response_status)
+                || original_response_is_event_stream(ctx, response_headers))
     }
 
     fn should_release_response_body_before_content_type_rewrite(
         &self,
         ctx: &RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
-            && original_response_is_event_stream(ctx, response_headers)
+            && (synthetic_response_omits_body(&ctx.method, response_status)
+                || original_response_is_event_stream(ctx, response_headers))
     }
 
     fn should_buffer_response_body_for_content_type(
         &self,
         ctx: &RequestContext,
         content_type: Option<&str>,
-        _response_status: u16,
+        response_status: u16,
         _response_headers: &HashMap<String, String>,
     ) -> bool {
         // Narrow the pre-flight buffering decision once the response
@@ -1690,6 +1698,7 @@ impl Plugin for Waf {
         // would be buffered and then skipped by `on_final_response_body`, so let
         // the proxy stream it instead of collecting bytes nothing will inspect.
         self.should_buffer_response_body(ctx)
+            && !synthetic_response_omits_body(&ctx.method, response_status)
             && !content_type.is_some_and(is_text_event_stream_media_type)
             && self.response_body_eligible_for_scan(content_type)
     }
@@ -1803,14 +1812,16 @@ impl Plugin for Waf {
     async fn finalize_client_visible_response_body(
         &self,
         ctx: &mut RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
         if self.active {
             ctx.ensure_waf_metadata_initialized();
         }
-        if !self.should_buffer_response_body(ctx) {
+        if !self.should_buffer_response_body(ctx)
+            || synthetic_response_omits_body(&ctx.method, response_status)
+        {
             return PluginResult::Continue;
         }
         if !self.response_body_eligible_for_scan(

@@ -63,6 +63,9 @@ use tracing::{debug, warn};
 use crate::util::json_dup_keys::{self, JsonScanMemo};
 
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
+use super::utils::synthetic_response::{
+    request_method_omits_response_body, synthetic_response_omits_body,
+};
 use super::utils::validation_diagnostics::{
     SafeFieldNames, bound_detail, safe_keyword, safe_location, schema_violation_detail,
     xml_error_category,
@@ -2644,19 +2647,6 @@ fn response_reject(msg: &str) -> PluginResult {
     }
 }
 
-/// `true` when HTTP itself says this exchange carries no response content, so an
-/// empty buffered response body is the protocol's answer rather than a missing
-/// representation.
-///
-/// These are the ONLY response-side no-body exemptions. An ordinary
-/// body-bearing success such as `200` is not exempt merely because the backend
-/// returned zero bytes (`GHSA-2vmr-ww8r-mww3`).
-fn response_has_no_content_by_protocol(method: &str, status: u16) -> bool {
-    method.eq_ignore_ascii_case("HEAD")
-        || (100..200).contains(&status)
-        || matches!(status, 204 | 205 | 304)
-}
-
 /// `true` when an empty gRPC reply is a legitimate terminal error response:
 /// the hook-visible header map carries one unambiguous non-zero terminal status
 /// and no message frame is sent.
@@ -2955,11 +2945,11 @@ impl Plugin for BodyValidator {
         self.has_response_validation
     }
 
-    fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
+    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         // Request Accept is only client intent. Keep ordinary backend JSON/XML
         // and protobuf responses on the validator path until response headers
         // prove that the backend selected an event stream.
-        self.has_response_validation
+        self.has_response_validation && !request_method_omits_response_body(&ctx.method)
     }
 
     fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
@@ -2969,38 +2959,40 @@ impl Plugin for BodyValidator {
     fn should_release_response_body_under_retries(
         &self,
         ctx: &RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
         // Once headers prove the representation is outside JSON/XML/gRPC
         // validation scope (or is an unbounded event stream), retries must not
         // keep pinning it on the buffered path. Matching types stay buffered.
         self.should_buffer_response_body(ctx)
-            && !self.response_body_requires_buffering_for_media_type(
-                ctx,
-                response_headers.get("content-type").map(String::as_str),
-            )
+            && (synthetic_response_omits_body(&ctx.method, response_status)
+                || !self.response_body_requires_buffering_for_media_type(
+                    ctx,
+                    response_headers.get("content-type").map(String::as_str),
+                ))
     }
 
     fn should_release_response_body_before_content_type_rewrite(
         &self,
         ctx: &RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
-        // Only genuine SSE is safe to release before the Content-Type relabel
-        // guard: `after_proxy` fails closed on it. Non-matching downloads still
-        // go through the ordinary content-type refinement, which refuses
-        // release when a later hook may rewrite Content-Type.
+        // No-content responses cannot acquire a body through a Content-Type
+        // rewrite. Genuine SSE is also safe to release here: `after_proxy`
+        // fails closed on it. Non-matching downloads still go through ordinary
+        // refinement, which refuses release when a later hook may relabel them.
         self.should_buffer_response_body(ctx)
-            && original_response_is_event_stream(ctx, response_headers)
+            && (synthetic_response_omits_body(&ctx.method, response_status)
+                || original_response_is_event_stream(ctx, response_headers))
     }
 
     fn should_buffer_response_body_for_content_type(
         &self,
         ctx: &RequestContext,
         content_type: Option<&str>,
-        _response_status: u16,
+        response_status: u16,
         _response_headers: &HashMap<String, String>,
     ) -> bool {
         // Narrow the pre-flight vote after backend headers arrive: release
@@ -3008,16 +3000,18 @@ impl Plugin for BodyValidator {
         // keeping matching JSON/XML and applicable gRPC protobuf responses
         // buffered for validation.
         self.should_buffer_response_body(ctx)
+            && !synthetic_response_omits_body(&ctx.method, response_status)
             && self.response_body_requires_buffering_for_media_type(ctx, content_type)
     }
 
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         if self.should_buffer_response_body(ctx)
+            && !synthetic_response_omits_body(&ctx.method, response_status)
             && original_response_is_event_stream(ctx, response_headers)
         {
             return PluginResult::Reject {
@@ -3088,7 +3082,7 @@ impl Plugin for BodyValidator {
         // The ONLY no-body exemptions are the ones HTTP itself defines. An
         // ordinary body-bearing success (200, 201, …) that arrives empty is a
         // validation failure, not an exemption (`GHSA-2vmr-ww8r-mww3`).
-        if body.is_empty() && response_has_no_content_by_protocol(&ctx.method, response_status) {
+        if synthetic_response_omits_body(&ctx.method, response_status) {
             return PluginResult::Continue;
         }
 
