@@ -3,4 +3,4 @@ name: ferrum-mesh
 description: Ferrum Edge service mesh control-plane, injector, ambient node, CA, and observability scaffolding
 type: application
 version: 0.1.0
-appVersion: "0.9.2"
+appVersion: "0.9.3"
