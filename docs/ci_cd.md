@@ -630,7 +630,10 @@ aarch64 archives actually used by callers) and does **not** invoke
 refuses to continue if those variables are present in a `run:` environment
 (values are never printed). The installer publishes an empty
 `FERRUM_SCCACHE_BIN` sentinel first, then sets `RUSTC_WRAPPER` to that
-checksum-verified path only; it never puts sccache on `PATH`. It persists
+checksum-verified path only; it never puts sccache on `PATH`. The install
+root is the fixed, job-private `${RUNNER_TEMP}/ferrum-sccache-bin`, removed
+and recreated before the verified copy: rust-cache hashes the wrapper path
+into its key, and a randomized root made every lane unrestorable (#4643). It persists
 `SCCACHE_GHA_ENABLED` as empty so a later step cannot re-enable the
 credential-bearing GHA backend. Install failure clears the rustc wrapper and
 continues uncached. Compiler outputs use a 2 GiB local directory persisted by
@@ -1526,11 +1529,14 @@ pass-through to Swatinem/rust-cache; omitting it leaves rust-cache's default
 workspace, and do not add unrelated workspaces, `cache-all-crates`, or extra
 `cache-directories` here.
 
-The checksum-pinned installer deliberately gives every hosted job a fresh
-runner-private wrapper path. Swatinem/rust-cache hashes every non-empty
-`RUST*` and `CARGO*` variable into its environment key, so hashing that path
-would prevent an otherwise equivalent `ci-perf` job from restoring the cache
-seeded by `main`. The `performance-regression` invocation therefore sets
+Until issue #4643 the checksum-pinned installer gave every hosted job a
+fresh `mktemp` wrapper path; it now installs to the fixed
+`${RUNNER_TEMP}/ferrum-sccache-bin/bin/sccache` path, recreated from scratch
+on every job. Swatinem/rust-cache hashes every non-empty `RUST*` and `CARGO*`
+variable into its environment key, so a per-run path prevented every lane
+(not only `ci-perf`) from restoring the cache seeded by `main`. The
+`performance-regression` handling below predates that fix and is kept as a
+belt-and-braces guard for its own lane. The `performance-regression` invocation therefore sets
 `RUSTC_WRAPPER` and `CARGO_BUILD_RUSTC_WRAPPER` to empty values only on the
 `setup-rust-ci` composite step. That step scope makes the nested rust-cache
 action omit the runner-unique values while `setup-sccache` still publishes its
@@ -1648,6 +1654,16 @@ cannot see); macOS x86_64 and macOS ARM64 run `cargo check --profile
 pr-build` because queue binaries are never published. Pushes to `main`
 build optimized `release` binaries for Linux x86_64, Linux ARM64, macOS
 x86_64, macOS ARM64, and Windows x86_64.
+
+Both Apple cells export `MACOSX_DEPLOYMENT_TARGET` at job level (`10.12` for
+x86_64, `11.0` for ARM64, rustc's own defaults) in `ci.yml` and
+`release.yml`. Without it, cc-rs, cmake, and configure-driven native crates
+(`ring`, `aws-lc-sys`, `rdkafka-sys`, `tikv-jemalloc-sys`, `zstd-sys`,
+`libsqlite3-sys`) default to the runner SDK version, so the published binary
+declared a 10.12 floor while its C objects were built for macOS 26.5
+(issue #4644; ld64.lld logged it as "has version 26.5.0, which is newer than
+target minimum of 10.12.0" for every object). rustc reads the same variable,
+so raising the floor later moves Rust and C code together.
 
 The x86_64 GNU cell of `build-binaries` does NOT compile on the runner. It
 runs `.github/scripts/build_linux_gnu_sysroot.sh`, which builds inside the
