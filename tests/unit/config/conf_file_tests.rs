@@ -275,6 +275,61 @@ fn test_parse_quoted_values() {
 }
 
 #[test]
+fn test_parse_quoted_values_with_comments() {
+    for quote in ['"', '\''] {
+        for suffix in ["", "   ", " # comment", "\t# comment", "#comment"] {
+            let input = format!("FERRUM_MODE = {quote}file{quote}{suffix}");
+            let conf = ConfFile::parse(&input).unwrap();
+            assert_eq!(conf.get("FERRUM_MODE"), Some("file"));
+        }
+    }
+}
+
+#[test]
+fn test_parse_quoted_values_preserve_literal_content() {
+    for quote in ['"', '\''] {
+        let other_quote = if quote == '"' { '\'' } else { '"' };
+        for literal in [
+            String::new(),
+            "  aaaa # suffix  ".to_string(),
+            format!("héllo {other_quote}world{other_quote}"),
+            r"C:\path\with\backslashes\".to_string(),
+        ] {
+            let input = format!("KEY = {quote}{literal}{quote} # trailing comment");
+            let conf = ConfFile::parse(&input).unwrap();
+            assert_eq!(conf.get("KEY"), Some(literal.as_str()));
+        }
+    }
+}
+
+#[test]
+fn test_parse_unclosed_quotes_name_key_and_line_without_value() {
+    for value in ["\"", "'", "\"secret # suffix", "'secret # suffix", "\"secret'"] {
+        let input = format!("# comment\n\nFERRUM_ADMIN_JWT_SECRET = {value}\nKEY = next");
+        let err = ConfFile::parse(&input).unwrap_err();
+        assert_eq!(
+            err,
+            "Invalid conf file syntax at line 3: unclosed quote for key 'FERRUM_ADMIN_JWT_SECRET'"
+        );
+    }
+}
+
+#[test]
+fn test_parse_rejects_text_after_closing_quote() {
+    for quote in ['"', '\''] {
+        for trailing in ["unexpected", " unexpected # comment", " 'second value'"] {
+            let input = format!("\nKEY = {quote}secret{quote}{trailing}");
+            let err = ConfFile::parse(&input).unwrap_err();
+            assert_eq!(
+                err,
+                "Invalid conf file syntax at line 2: \
+                 unexpected text after closing quote for key 'KEY'"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_parse_no_spaces() {
     let conf = ConfFile::parse("KEY=value").unwrap();
     assert_eq!(conf.get("KEY"), Some("value"));
@@ -284,6 +339,8 @@ fn test_parse_no_spaces() {
 fn test_parse_inline_comments() {
     let conf = ConfFile::parse("KEY = value # this is a comment").unwrap();
     assert_eq!(conf.get("KEY"), Some("value"));
+    let conf = ConfFile::parse("KEY = value#literal\t#literal # comment").unwrap();
+    assert_eq!(conf.get("KEY"), Some("value#literal\t#literal"));
 }
 
 #[test]
