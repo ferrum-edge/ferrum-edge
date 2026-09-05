@@ -492,22 +492,32 @@ impl Drop for AppProbePermit {
 /// from inbound mesh capture, so every peer that can reach the Pod IP reaches
 /// it unauthenticated. Admission therefore has to happen in the accept loop,
 /// before a task, an HTTP state machine, or a loopback probe exists.
-///
-/// Deliberately NOT gated on the process overload state
-/// (`overload.reject_new_connections`), unlike the data-plane accept loops.
-/// The rewritten probes are the application container's own liveness and
-/// readiness probes: refusing them while the *sidecar* is in critical overload
-/// would have kubelet restart a healthy application for a fault it did not
-/// cause. The connection cap, per-source share, and active-probe budget already
-/// bound what a flood on this listener can cost the process, so shedding here
-/// would buy no resources and would convert sidecar pressure into an
-/// application outage.
-#[derive(Debug)]
 pub struct AppProbeAdmission {
     /// Global + per-source-IP connection cap. Default DashMap sharding: this is
     /// a low-rate management surface, matching the admin / CP gRPC listeners.
     limiter: Arc<ConnLimiter>,
     budget: Arc<AppProbeBudget>,
+    /// Process overload state, when the listener runs inside a mesh proxy.
+    /// `None` for standalone construction in tests.
+    overload: Option<Arc<crate::overload::OverloadState>>,
+    rejected_overload: AtomicU64,
+}
+
+impl std::fmt::Debug for AppProbeAdmission {
+    /// Hand-written because `OverloadState` is a process-wide hot-atomic block
+    /// with no `Debug`, and printing it here would be noise anyway: the useful
+    /// content is the configured ceilings and the live occupancy.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let limits = self.limiter.snapshot();
+        f.debug_struct("AppProbeAdmission")
+            .field("max_connections", &limits.max_connections)
+            .field("max_connections_per_ip", &limits.max_connections_per_ip)
+            .field("active_connections", &limits.active_connections)
+            .field("max_active_probes", &self.budget.max())
+            .field("active_probes", &self.budget.active())
+            .field("overload_tracked", &self.overload.is_some())
+            .finish()
+    }
 }
 
 impl Default for AppProbeAdmission {
@@ -516,6 +526,7 @@ impl Default for AppProbeAdmission {
             DEFAULT_APP_PROBE_MAX_CONNECTIONS,
             DEFAULT_APP_PROBE_MAX_CONNECTIONS_PER_IP,
             DEFAULT_APP_PROBE_MAX_ACTIVE_PROBES,
+            None,
         )
     }
 }
@@ -525,19 +536,26 @@ impl AppProbeAdmission {
         max_connections: usize,
         max_connections_per_ip: usize,
         max_active_probes: usize,
+        overload: Option<Arc<crate::overload::OverloadState>>,
     ) -> Self {
         Self {
             limiter: Arc::new(ConnLimiter::new(max_connections, max_connections_per_ip)),
             budget: Arc::new(AppProbeBudget::new(max_active_probes)),
+            overload,
+            rejected_overload: AtomicU64::new(0),
         }
     }
 
     /// Build from the resolved environment configuration.
-    pub fn from_env_config(env_config: &crate::config::EnvConfig) -> Self {
+    pub fn from_env_config(
+        env_config: &crate::config::EnvConfig,
+        overload: Option<Arc<crate::overload::OverloadState>>,
+    ) -> Self {
         Self::new(
             env_config.mesh_app_probe_max_connections,
             env_config.mesh_app_probe_max_connections_per_ip,
             env_config.mesh_app_probe_max_active_probes,
+            overload,
         )
     }
 
@@ -546,16 +564,55 @@ impl AppProbeAdmission {
         &self.budget
     }
 
+    /// Whether the process is shedding new connections. Checked at the same
+    /// accept-loop boundary the ordinary proxy listener checks it.
+    fn shedding(&self) -> bool {
+        self.overload.as_ref().is_some_and(|overload| {
+            overload
+                .reject_new_connections
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
+    }
+
     /// Admit one accepted socket, or say why not. Called before any clone,
-    /// task, or HTTP state exists. The only refusals are the connection cap
-    /// and the per-source share; see the type docs for why overload is not one.
-    pub fn try_admit(&self, peer: IpAddr) -> Result<ConnPermit, ConnRejectReason> {
-        self.limiter.try_acquire(peer)
+    /// task, or HTTP state exists.
+    pub fn try_admit(&self, peer: IpAddr) -> Result<ConnPermit, AppProbeAdmissionRejection> {
+        if self.shedding() {
+            self.rejected_overload.fetch_add(1, Ordering::Relaxed);
+            return Err(AppProbeAdmissionRejection::Overload);
+        }
+        self.limiter
+            .try_acquire(peer)
+            .map_err(AppProbeAdmissionRejection::Limit)
+    }
+
+    /// Connections refused because the process was in critical overload.
+    pub fn rejected_overload(&self) -> u64 {
+        self.rejected_overload.load(Ordering::Relaxed)
     }
 
     /// Snapshot the connection limiter for metrics.
     pub fn limiter_snapshot(&self) -> crate::util::conn_limit::ConnLimiterSnapshot {
         self.limiter.snapshot()
+    }
+}
+
+/// Why an accepted probe socket was refused. Bounded, never attacker-derived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppProbeAdmissionRejection {
+    /// The process is in critical overload and admits no new connection.
+    Overload,
+    /// A connection cap was reached.
+    Limit(ConnRejectReason),
+}
+
+impl AppProbeAdmissionRejection {
+    /// Stable log/metric label.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Overload => "overload",
+            Self::Limit(reason) => reason.as_label(),
+        }
     }
 }
 
@@ -686,6 +743,7 @@ refused in the accept loop before any task or HTTP state was allocated, by reaso
     );
     output.push_str("# TYPE ferrum_mesh_app_probe_rejected_connections_total counter\n");
     for (reason, value) in [
+        ("overload", admission.rejected_overload()),
         ("max_connections", limits.rejected_max_connections),
         (
             "max_connections_per_ip",
@@ -885,6 +943,7 @@ pub fn bind_app_probe_listener(port: u16) -> Result<TcpListener, anyhow::Error> 
 /// listener at all.
 pub fn start_from_env(
     env_config: &crate::config::EnvConfig,
+    overload: Option<Arc<crate::overload::OverloadState>>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<Option<tokio::task::JoinHandle<()>>, anyhow::Error> {
     let port = app_probe_port_from_env().map_err(|e| anyhow::anyhow!(e))?;
@@ -895,7 +954,7 @@ pub fn start_from_env(
         );
         return Ok(None);
     }
-    let admission = Arc::new(AppProbeAdmission::from_env_config(env_config));
+    let admission = Arc::new(AppProbeAdmission::from_env_config(env_config, overload));
     let server = AppProbeServer::from_env_with_admission(Arc::clone(&admission))
         .map_err(|e| anyhow::anyhow!(e))?;
     if server.is_empty() {
