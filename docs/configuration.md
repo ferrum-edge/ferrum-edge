@@ -254,8 +254,15 @@ replica-set pollers read ordered `config_changes` rows/documents after the
 accepted cursor, collapse each resource to the final operation in the batch, and
 point-load only those changed IDs. Delete records carry removals, so normal
 incremental polling does not scan every runtime collection or table ID.
-Retained-history gaps and saturated change batches force the same authoritative
-full-reload path.
+Retained-history gaps, saturated change batches (10,000 or more unread
+`config_changes` rows for the namespace), and consumer changes (which rehydrate
+quarantined credentials) force the same authoritative full-reload path. The
+reload records the change-log watermark it read before loading as its accepted
+cursor, so rows committed while it ran are picked up by the next incremental
+poll, and its validation cost is linear in cheap per-row work: the plugin
+validation sweep builds one screening client per reload rather than one per
+plugin config, so a 30k-proxy full reload finishes well inside the time bulk
+provisioning needs to append another saturated batch (issue #4116).
 
 Repeated rejected database deltas use bounded backoff and low-cardinality
 metrics. After `FERRUM_DB_REJECTED_DELTA_FULL_RELOAD_THRESHOLD` identical
