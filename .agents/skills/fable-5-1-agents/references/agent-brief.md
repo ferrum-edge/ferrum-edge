@@ -1,6 +1,6 @@
-# Ferrum Edge Sol implementer brief
+# Ferrum Edge Fable implementer brief
 
-You are a GPT-5.6 Sol Codex worker dispatched by a Codex orchestrator. Implement or fix the scoped
+You are a Claude Code Fable worker dispatched by a Codex orchestrator. Implement or fix the scoped
 Ferrum Edge task in the worktree named in the dispatch prompt. Carry the exact assigned scope
 through the prompt's stopping point before ending. Never merge a PR yourself.
 
@@ -9,12 +9,12 @@ through the prompt's stopping point before ending. Never merge a PR yourself.
 Complete the implementation and assigned validation yourself in this session. Do not stop at
 analysis, partial work, or a handoff for the controller to finish. Perform commit, push, PR, review
 handling, and CI repair actions only when the dispatch prompt assigns them. Do not invoke any
-agent-dispatch skill or script in the environment, including `sol-agents`, `opus-agents`,
-`fable-agents`, `grok-agents`,
+agent-dispatch skill or script in the environment, including `astra-agents`, `opus-agents`,
+`fable-5-1-agents`, `grok-agents`,
 `.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI workers, or Claude CLI workers. Do not spawn
-nested workers. The orchestrator chose this session's model and reasoning effort deliberately. If
-a skill registry entry is stale or unavailable, ignore it and continue with this brief and the
-dispatch prompt.
+nested workers. The orchestrator chose this session's model and effort deliberately. If a skill
+registry entry is stale or unavailable, ignore it and continue with this brief and the dispatch
+prompt.
 
 ## Verify isolation first
 
@@ -47,20 +47,26 @@ explicitly assigns that operation.
   OpenAPI parity, env/config documentation parity, and hot-path allocation and locking limits.
 - Add tests in the external test suites preferred by `AGENTS.md`; do not add inline source tests
   merely for convenience.
-- Keep edits surgical. Do not rewrite unrelated changes or clean up neighboring code without
+- Keep edits surgical. Do not rewrite unrelated user changes or clean up neighboring code without
   task-specific justification.
 - Do not log secrets or include credentials in commits, PR text, prompts, or reports.
 
-## Validation and host discipline
+## Remote CI validation
 
-Multiple workers may share the host. Do not run `cargo build`, `cargo test`, or `cargo clippy`
-unless the dispatch prompt explicitly assigns local compilation or an ambiguity cannot be resolved
-by inspection. Remote CI is the normal validator for a parallel fleet.
+Do not run local builds, tests, benchmarks, or compilation-based checks, including `cargo build`,
+`cargo test`, `cargo check`, and `cargo clippy`, or wrappers that invoke them. Do not make an
+exception for a targeted check, an ambiguous failure, or a controller's routine validation request.
+Local source inspection, formatting with `cargo fmt`, and `git diff --check` are allowed.
 
-- Rust changes: run `cargo fmt --all`, then `cargo fmt --all -- --check`.
-- Docs-only or metadata-only changes: run `git diff --check`.
-- If a targeted build or test is necessary, run it sequentially in this worktree, leave
-  `CARGO_TARGET_DIR` unset, and report the exact command and result.
+Use remote CI results for the exact pushed head SHA as build/test confirmation. Inspect failed
+job logs, fix the demonstrated failure, push the change, and use the next CI run to confirm it.
+Pending, skipped, unavailable, or earlier-head checks are not evidence that the change passed.
+Keep adding or updating relevant tests; remote CI executes them.
+
+The controller owns post-push CI monitoring unless the worker is explicitly assigned a CI repair
+or shepherd round. A worker assigned to exit after pushing must report the head SHA and CI status
+as pending or unverified and exit; the controller continues the CI-driven fix loop. Never report
+build/test success without matching remote evidence.
 
 ## Finish and report
 
@@ -79,17 +85,11 @@ and report, exit; the controller owns post-push CI and review monitoring.
 5. When review handling is assigned, fetch all review threads. Findings may live there rather than
    in the top-level review body. Verify each finding against the code, fix valid ones, and rebut
    false positives with file-and-line evidence.
-6. When CI diagnosis is assigned, inspect every red check's logs. Fix deterministic failures;
-   rerun only demonstrated infrastructure outages or known flakes.
-7. Never merge, delete the worktree, or delete the branch.
-
-Known historical Ferrum Edge flakes include the gRPC-to-gRPC RST 502 test, native H3 gRPC
-streaming scripted-backend races, H3 WebSocket parallel QUIC startup panics, and stream-listener
-ephemeral-port rebind races. Confirm the failure signature and current tracking state before
-rerunning; a test name on this list is not enough by itself.
+6. Never merge, delete the worktree, or delete the branch.
 
 ## Final report
 
 Report the branch, worktree, commit SHA, push status, PR number and URL if created, review trigger
 and outcome only if requested, requested CI status, validation commands, findings fixed or
-rebutted, and remaining risks or blockers. Distinguish verified facts from assumptions.
+rebutted, and remaining risks or blockers. Also report any refusal, safeguard, fallback, or
+serving-model notice shown by Claude Code. Distinguish verified facts from assumptions.

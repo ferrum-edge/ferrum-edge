@@ -1,11 +1,11 @@
 ---
-name: sol-agents
-description: Dispatch and orchestrate external GPT-5.6 Sol Codex CLI agents for Ferrum Edge issues, PRs, review-feedback fixes, CI repair, and shepherding, with optional fast mode only when the user explicitly requests it. Use when the user asks Codex or GPT to delegate to Sol or Codex CLI workers, run multiple GPT-5.6 Sol agents, select medium/high/xhigh reasoning effort, resume interrupted Sol runs, or drive agent-owned branches and PRs. Do not use for Codex-native collaboration subagents or ordinary single-agent work.
+name: astra-agents
+description: Dispatch and orchestrate external GPT-6 Astra Codex CLI agents for Ferrum Edge issues, PRs, review-feedback fixes, CI repair, and shepherding, with optional fast mode only when the user explicitly requests it. Use when the user asks Codex or GPT to delegate to Astra or Codex CLI workers, run multiple GPT-6 Astra agents, select low/medium/high/xhigh/max/ultra reasoning effort, resume interrupted Astra runs, or drive agent-owned branches and PRs. Do not use for Codex-native collaboration subagents or ordinary single-agent work.
 ---
 
-# Sol agents
+# Astra agents
 
-Act as the Codex orchestrator. Treat external GPT-5.6 Sol Codex CLI processes as implementation
+Act as the Codex orchestrator. Treat external GPT-6 Astra Codex CLI processes as implementation
 workers. Own task decomposition, worktree isolation, effort selection, liveness, independent diff
 review, and the final merge recommendation. Require each worker to carry its assigned scope through
 the stopping point in the prompt. Never accept a worker's report without checking the repository
@@ -14,8 +14,28 @@ and GitHub state yourself.
 **Guard: do not use this skill when you are yourself a dispatched worker.** If the session prompt
 references this skill's `agent-brief.md` or `continuation-brief.md`, says "YOU are the implementer,"
 or assigns an existing worktree and findings to fix, implement directly in the current session.
-Do not recursively dispatch another Sol or Opus worker. The orchestrator selected this session's
+Do not recursively dispatch another Astra or Opus worker. The orchestrator selected this session's
 model and reasoning effort deliberately.
+
+## Remote CI validation
+
+Do not run local builds, tests, benchmarks, or compilation-based checks, including `cargo build`,
+`cargo test`, `cargo check`, and `cargo clippy`, or wrappers that invoke them. Do not make an
+exception for a targeted check, an ambiguous failure, or a controller's routine validation request.
+Local source inspection, formatting with `cargo fmt`, and `git diff --check` are allowed.
+
+Use remote CI results for the exact pushed head SHA as build/test confirmation. Inspect failed
+job logs, fix the demonstrated failure, push the change, and use the next CI run to confirm it.
+Pending, skipped, unavailable, or earlier-head checks are not evidence that the change passed.
+Keep adding or updating relevant tests; remote CI executes them.
+
+The controller owns post-push CI monitoring unless the worker is explicitly assigned a CI repair
+or shepherd round. A worker assigned to exit after pushing must report the head SHA and CI status
+as pending or unverified and exit; the controller continues the CI-driven fix loop. Never report
+build/test success without matching remote evidence.
+
+Include the no-local-build/test rule and remote CI confirmation requirement in every dispatch
+prompt, including continuation prompts and any permitted nested delegation.
 
 ## Preflight
 
@@ -29,10 +49,11 @@ model and reasoning effort deliberately.
    - `codex` on `PATH`.
 3. Confirm that the installed CLI supports `--model`, `--config`, `--sandbox`, `--cd`, and reading
    a prompt from stdin with `-`. If the user explicitly requests fast mode, also confirm the
-   bundled model catalog lists the `priority` service tier for `gpt-5.6-sol`.
-4. Use the pinned model `gpt-5.6-sol`. Stop and report the exact error if authentication, model
+   bundled model catalog lists the `priority` service tier for `gpt-6-astra`.
+4. Use the pinned model `gpt-6-astra`. Stop and report the exact error if authentication, model
    access, requested effort, or requested service tier is rejected. Do not silently substitute
-   another model, effort, or service tier.
+   another model, effort, or service tier. Confirm the installed model catalog advertises the
+   selected effort (including `ultra`) before dispatch.
 5. Use `danger-full-access` only for a trusted repository task where the user's requested workflow
    authorizes implementation. Worktree isolation prevents git collisions; it is not a host sandbox.
 
@@ -51,6 +72,7 @@ Do not discard unexplained changes in an existing worktree; reconstruct and pres
 
 ## Select effort deliberately
 
+- `low`: use for simple, mechanical work with minimal reasoning needs.
 - `medium`: use for easier tasks and quick singular code fixes — a single-file change, a mechanical
   refactor, a documentation correction, or a review finding with an obvious and contained fix.
 - `high`: default. Use for challenging multi-step coding across interconnected components, where the
@@ -58,6 +80,11 @@ Do not discard unexplained changes in an existing worktree; reconstruct and pres
 - `xhigh`: reserve for very high-stakes tasks that need lots of thinking — security boundaries,
   concurrency and lifecycle bugs, protocol correctness, difficult root-cause analysis, or repeated
   failure at `high`. Prefer one focused `xhigh` worker over a fleet of them.
+
+- `max`: use for the hardest problems requiring more reasoning than `xhigh`.
+- `ultra`: use when explicitly requested for maximum reasoning with automatic task delegation.
+  This is a Codex harness option advertised by the installed model catalog, not an API effort.
+  Allow Codex-managed automatic delegation at this level; do not invoke external dispatch skills.
 
 Honor an explicit user choice and record the selected level beside each worker. Keep the effort
 stable across initial and continuation rounds unless evidence or the user justifies changing it.
@@ -78,7 +105,7 @@ one long-lived execution session:
 <ABS_SKILL_DIR>/scripts/dispatch-agent.sh \
   --worktree <ABS_WORKTREE> \
   --prompt-file <ABS_PROMPT_FILE> \
-  --effort <medium|high|xhigh>
+  --effort <low|medium|high|xhigh|max|ultra>
 ```
 
 `--fast` is an opt-in controller flag. Append it only when the user explicitly requests fast mode
@@ -86,7 +113,7 @@ for the dispatch or fleet. Never infer it from urgency, deadlines, task size, or
 Omit it for every other run, including continuations unless they remain within the same explicit
 request. Record the selected mode beside each worker.
 
-The launcher pins `gpt-5.6-sol`, the reasoning effort, `danger-full-access`, the verified worktree
+The launcher pins `gpt-6-astra`, the reasoning effort, `danger-full-access`, the verified worktree
 root, and stdin prompt mode. It pins `service_tier="default"` normally and selects the model's Fast
 `priority` tier only with `--fast`. The prompt file reaches EOF cleanly, avoiding the non-TTY hang
 caused by a prompt argument with open stdin. Delete the temporary prompt after the worker exits.
@@ -107,8 +134,9 @@ Do not stop at analysis, partial implementation, or a handoff for someone else t
 commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
 for a separate review-bot pass unless explicitly assigned. After the final requested push and
 report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
-skills or scripts (including sol-agents, opus-agents, fable-agents, grok-agents, or any
-.agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
+skills or scripts (including astra-agents, opus-agents, fable-agents, grok-agents, or any
+.agents/skills/*/scripts/dispatch-agent.sh), and do not manually spawn nested workers.
+Codex-managed automatic delegation is permitted only when the controller explicitly selected `ultra`.
 ```
 
 This prevents a worker from replacing the selected model or effort through nested delegation.
@@ -175,5 +203,11 @@ into prompts. Never put credentials, tokens, cookies, or secrets in prompts or w
 - An explicitly requested review receives no response: verify the trigger, bot identity,
   availability, and head SHA before posting another trigger.
 - Model, effort, or service-tier mismatch: stop the worker, record the exact diagnostic, correct
-  the launch contract, and relaunch. Never claim `medium`, `high`, `xhigh`, `gpt-5.6-sol`, or fast
-  mode without launch evidence.
+  the launch contract, and relaunch. Never claim a selected effort, `gpt-6-astra`, or fast mode without launch evidence.
+
+## Model contract source
+
+The installed Codex `models_cache.json` entry for `gpt-6-astra` advertises
+`low`, `medium`, `high`, `xhigh`, `max`, and `ultra` (verified 2026-09-05).
+The [API model page](https://developers.openai.com/api/docs/models/gpt-6-astra)
+lists API efforts through `max`; `ultra` is specific to the Codex harness.

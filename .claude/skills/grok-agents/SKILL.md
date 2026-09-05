@@ -15,6 +15,26 @@ references `agent-brief.md` / `continuation-brief.md`, says "YOU are the impleme
 you an existing worktree and findings to fix, implement directly. Do not recursively dispatch
 another Grok worker.
 
+## Remote CI validation
+
+Do not run local builds, tests, benchmarks, or compilation-based checks, including `cargo build`,
+`cargo test`, `cargo check`, and `cargo clippy`, or wrappers that invoke them. Do not make an
+exception for a targeted check, an ambiguous failure, or a controller's routine validation request.
+Local source inspection, formatting with `cargo fmt`, and `git diff --check` are allowed.
+
+Use remote CI results for the exact pushed head SHA as build/test confirmation. Inspect failed
+job logs, fix the demonstrated failure, push the change, and use the next CI run to confirm it.
+Pending, skipped, unavailable, or earlier-head checks are not evidence that the change passed.
+Keep adding or updating relevant tests; remote CI executes them.
+
+The controller owns post-push CI monitoring unless the worker is explicitly assigned a CI repair
+or shepherd round. A worker assigned to exit after pushing must report the head SHA and CI status
+as pending or unverified and exit; the controller continues the CI-driven fix loop. Never report
+build/test success without matching remote evidence.
+
+Include the no-local-build/test rule and remote CI confirmation requirement in every dispatch
+prompt, including continuation prompts and any permitted nested delegation.
+
 ## Dispatch command (exact shape)
 
 Resolve the absolute path to this repository's `.agents/skills/grok-agents` directory, write a
@@ -60,7 +80,7 @@ orchestrators share one source of truth.
 
 Every prompt must also PIN THE WORKER'S ROLE:
 "YOU are the implementer: write, commit, and push the changes yourself in this session.
-Do NOT invoke agent-dispatch skills (grok-agents, sol-agents, opus-agents, fable-agents,
+Do NOT invoke agent-dispatch skills (grok-agents, astra-agents, opus-agents, fable-agents,
 .agents/skills/*/scripts/dispatch-agent.sh) and do NOT spawn nested workers."
 
 Then append the mode block:

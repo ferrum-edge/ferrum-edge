@@ -1,0 +1,4 @@
+interface:
+  display_name: "GPT-6 Astra Agents"
+  short_description: "Orchestrate GPT-6 Astra coding agents"
+  default_prompt: "Use $astra-agents to dispatch GPT-6 Astra Codex agents for this Ferrum Edge task."

@@ -17,6 +17,26 @@ or assigns an existing worktree and findings to fix, implement directly in the c
 Do not recursively dispatch another Composer, Grok, Sol, Opus, or Fable worker. The orchestrator
 selected this session's model deliberately.
 
+## Remote CI validation
+
+Do not run local builds, tests, benchmarks, or compilation-based checks, including `cargo build`,
+`cargo test`, `cargo check`, and `cargo clippy`, or wrappers that invoke them. Do not make an
+exception for a targeted check, an ambiguous failure, or a controller's routine validation request.
+Local source inspection, formatting with `cargo fmt`, and `git diff --check` are allowed.
+
+Use remote CI results for the exact pushed head SHA as build/test confirmation. Inspect failed
+job logs, fix the demonstrated failure, push the change, and use the next CI run to confirm it.
+Pending, skipped, unavailable, or earlier-head checks are not evidence that the change passed.
+Keep adding or updating relevant tests; remote CI executes them.
+
+The controller owns post-push CI monitoring unless the worker is explicitly assigned a CI repair
+or shepherd round. A worker assigned to exit after pushing must report the head SHA and CI status
+as pending or unverified and exit; the controller continues the CI-driven fix loop. Never report
+build/test success without matching remote evidence.
+
+Include the no-local-build/test rule and remote CI confirmation requirement in every dispatch
+prompt, including continuation prompts and any permitted nested delegation.
+
 ## Preflight
 
 1. Read `AGENTS.md`, the relevant `.claude/rules/*.md`, and the issue or PR before dispatching.
@@ -98,7 +118,7 @@ Do not stop at analysis, partial implementation, or a handoff for someone else t
 commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
 for a separate review-bot pass unless explicitly assigned. After the final requested push and
 report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
-skills or scripts (including composer-agents, grok-agents, sol-agents, opus-agents, fable-agents,
+skills or scripts (including composer-agents, grok-agents, astra-agents, opus-agents, fable-agents,
 or any .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
 ```
 

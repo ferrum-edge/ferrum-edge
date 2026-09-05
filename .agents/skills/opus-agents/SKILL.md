@@ -12,12 +12,32 @@ point in the prompt. Never accept a worker's report without checking the reposit
 state yourself.
 
 **Guard: do NOT use this skill when you are yourself a dispatched worker.** If your session
-prompt says you were dispatched by an orchestrator — it references the `sol-agents` briefs
+prompt says you were dispatched by an orchestrator — it references the `astra-agents` briefs
 (`agent-brief.md` / `continuation-brief.md`), says "YOU are the implementer", or hands you an
 existing worktree and findings to fix — then this skill does not apply: implement directly in
 your session. Your model and reasoning effort were chosen deliberately by the dispatching
 orchestrator; delegating to an Opus worker silently substitutes different hands at a different
 effort. This skill is only for sessions where the USER asked Codex to delegate to Claude.
+
+## Remote CI validation
+
+Do not run local builds, tests, benchmarks, or compilation-based checks, including `cargo build`,
+`cargo test`, `cargo check`, and `cargo clippy`, or wrappers that invoke them. Do not make an
+exception for a targeted check, an ambiguous failure, or a controller's routine validation request.
+Local source inspection, formatting with `cargo fmt`, and `git diff --check` are allowed.
+
+Use remote CI results for the exact pushed head SHA as build/test confirmation. Inspect failed
+job logs, fix the demonstrated failure, push the change, and use the next CI run to confirm it.
+Pending, skipped, unavailable, or earlier-head checks are not evidence that the change passed.
+Keep adding or updating relevant tests; remote CI executes them.
+
+The controller owns post-push CI monitoring unless the worker is explicitly assigned a CI repair
+or shepherd round. A worker assigned to exit after pushing must report the head SHA and CI status
+as pending or unverified and exit; the controller continues the CI-driven fix loop. Never report
+build/test success without matching remote evidence.
+
+Include the no-local-build/test rule and remote CI confirmation requirement in every dispatch
+prompt, including continuation prompts and any permitted nested delegation.
 
 ## Preflight
 
@@ -117,7 +137,7 @@ Do not stop at analysis, partial implementation, or a handoff for someone else t
 commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
 for a separate review-bot pass unless explicitly assigned. After the final requested push and
 report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
-skills or scripts (including sol-agents, opus-agents, fable-agents, grok-agents, or any
+skills or scripts (including astra-agents, opus-agents, fable-agents, grok-agents, or any
 .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
 ```
 

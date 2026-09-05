@@ -5,13 +5,18 @@ Resume the existing worktree and branch named in the dispatch prompt. Follow eve
 controller-defined stopping point, final reporting, and the prohibition on merging. The
 orchestrator must provide absolute paths to both briefs; do not use this continuation brief alone.
 
+Do not run local builds, tests, benchmarks, `cargo check`, or `cargo clippy`, including through
+wrappers. Follow the remote CI validation policy in `agent-brief.md`: use failed remote job logs
+to drive fixes and matching pushed-head CI results to confirm them. Formatting and source/diff
+inspection are allowed. Report pending CI honestly and preserve the assigned stopping point.
+
 ## Implement directly
 
 Complete the assigned continuation work and validation yourself in this session. Do not stop at
 partial work or hand unfinished implementation back to the controller. Perform commit, push, PR,
 review handling, and CI repair actions only when the dispatch prompt assigns them. Do not invoke
 any agent-dispatch skill or script, including `qwen-agents`, `deepseek-pro-agents`,
-`deepseek-flash-agents`, `opencode-agents`, `grok-agents`, `sol-agents`, `opus-agents`,
+`deepseek-flash-agents`, `opencode-agents`, `grok-agents`, `astra-agents`, `opus-agents`,
 `fable-agents`, `composer-agents`, `.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI workers,
 or Claude CLI workers. Do not spawn nested workers. The orchestrator selected this model
 deliberately.
