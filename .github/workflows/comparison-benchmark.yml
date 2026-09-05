@@ -70,7 +70,10 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: "ci-comparison-bench"
+          # Host builds use a nested workspace; root target/ has no reuse here.
+          cache-targets: "false"
           cache-directories: ${{ github.workspace }}/.cache/sccache
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Install system dependencies
         run: |
