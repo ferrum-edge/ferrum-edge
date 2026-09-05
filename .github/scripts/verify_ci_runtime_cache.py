@@ -57,6 +57,19 @@ FIPS_DOC = REPO_ROOT / "docs" / "fips.md"
 COVERAGE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "coverage.yml"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
+# Only the PR-editable direct sites; frozen composites/FIPS/fuzz/perf retain
+# their separately governed contracts. True means compiler-cache-only reuse.
+DIRECT_CACHE_DIET_JOBS = (
+    ("ci.yml", "build-binaries", False),
+    ("ci.yml", "build-ebpf", False),
+    ("perf-benchmark.yml", "benchmark", False),
+    ("payload-size-benchmark.yml", "benchmark", False),
+    ("scale-benchmark.yml", "scale-benchmark", False),
+    ("comparison-benchmark.yml", "comparison", True),
+    ("connection-saturation-benchmark.yml", "saturation", True),
+    ("gateways-protocol-benchmark.yml", "benchmark", True),
+)
+
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 RUST_TOOLCHAIN = "dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8"
 RUST_CACHE = "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"
@@ -3362,6 +3375,37 @@ def check_rust_cache_trusted_main_save_if(
         )
 
 
+def check_direct_rust_cache_diet(
+    job: str,
+    source: str,
+    failures: list[str],
+    *,
+    compiler_only: bool,
+) -> None:
+    blocks = rust_cache_with_blocks(job)
+    require(len(blocks) == 1, f"{source} must keep one pinned rust-cache site", failures)
+    for block in blocks:
+        saves = re.findall(r"(?m)^\s*save-if:([^\n]*)$", block)
+        require(
+            [value.strip() for value in saves]
+            == ["${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"],
+            f"{source} must save only on pushes to main",
+            failures,
+        )
+        if compiler_only:
+            require(
+                re.findall(r"(?m)^\s*cache-targets:([^\n]*)$", block) == [' "false"'],
+                f"{source} must not archive the unused root target",
+                failures,
+            )
+        else:
+            require(
+                not with_has_key(block, "cache-directories"),
+                f"{source} must not duplicate sccache alongside target dependencies",
+                failures,
+            )
+
+
 def buildkit_cache_key(scope: str) -> str:
     return (
         f"{scope}-{BUILDKIT_CACHE_SCHEMA}-"
@@ -5021,6 +5065,52 @@ def check_dockerfile(failures: list[str]) -> None:
 
 def self_test() -> int:
     failures: list[str] = []
+    direct_cache = (
+        f"      - uses: {RUST_CACHE}\n"
+        "        with:\n"
+        "          shared-key: diet-test\n"
+        "          save-if: ${{ github.event_name == 'push' && "
+        "github.ref == 'refs/heads/main' }}\n"
+    )
+    for compiler_only in (False, True):
+        good_cache = direct_cache
+        if compiler_only:
+            good_cache += (
+                '          cache-targets: "false"\n'
+                "          cache-directories: ${{ github.workspace }}/.cache/sccache\n"
+            )
+        good_failures: list[str] = []
+        check_direct_rust_cache_diet(
+            good_cache, "self-test-direct-diet", good_failures, compiler_only=compiler_only
+        )
+        require(not good_failures, "self-test: valid direct cache diet must pass", failures)
+        mutations = [
+            good_cache.replace("github.event_name == 'push'", "github.event_name != 'push'"),
+            good_cache.replace("refs/heads/main", "refs/heads/feature"),
+            good_cache + "          save-if: true\n",
+            good_cache.replace(f"      - uses: {RUST_CACHE}\n", ""),
+        ]
+        if compiler_only:
+            mutations.append(
+                good_cache.replace('cache-targets: "false"', 'cache-targets: "true"')
+            )
+        else:
+            mutations.append(
+                good_cache + "          cache-directories: ${{ github.workspace }}/.cache/sccache\n"
+            )
+        for mutation in mutations:
+            mutation_failures: list[str] = []
+            check_direct_rust_cache_diet(
+                mutation,
+                "self-test-direct-diet-mutation",
+                mutation_failures,
+                compiler_only=compiler_only,
+            )
+            require(
+                bool(mutation_failures),
+                "self-test: direct cache save/archive regression must fail",
+                failures,
+            )
     require(
         builder_arg_features_is_after_apt(
             "FROM rust:latest AS builder\n"
@@ -8522,6 +8612,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     check_shared_actions(failures)
     check_performance_cache_wrapper_key(ci, "ci.yml", failures)
+    for filename, job_name, compiler_only in DIRECT_CACHE_DIET_JOBS:
+        workflow = (CI_WORKFLOW.parent / filename).read_text(encoding="utf-8")
+        check_direct_rust_cache_diet(
+            extract_job(workflow, job_name),
+            f"{filename}/{job_name}",
+            failures,
+            compiler_only=compiler_only,
+        )
     check_docs_and_coverage(failures)
     check_dockerfile(failures)
     for failure in failures:
