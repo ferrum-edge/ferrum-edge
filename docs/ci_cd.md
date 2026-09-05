@@ -3462,6 +3462,10 @@ sha256sum -c ferrum-edge-*.sha256
 
 If automatic release fails:
 
+Before building on each host, complete the
+[one-time bootstrap](../CONTRIBUTING.md#one-time-local-bootstrap), including its platform
+requirements or explicit wrapper/system-linker fallback.
+
 ```bash
 # Build binaries manually with the same release features as CI. Install protoc
 # for every host first. Linux hosts also need libcurl4-openssl-dev, Windows

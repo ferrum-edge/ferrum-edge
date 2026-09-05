@@ -53,15 +53,23 @@ On Kubernetes, map each mode to its chart or external contract in
 
 - **Rust** toolchain — latest stable (the repo pins `channel = "stable"` via `rust-toolchain.toml`; rustup will auto-install on first `cargo` invocation). CI runs clippy with `-D warnings` against the current stable, so local toolchains MUST be at parity.
 - **protoc** (Protocol Buffers compiler) for gRPC code generation — install `protobuf-compiler` or set `PROTOC` to the executable path
+- **sccache and platform linker tools** — required by `.cargo/config.toml`; complete the
+  [one-time bootstrap](CONTRIBUTING.md#one-time-local-bootstrap) before building.
 - **Database** (optional): PostgreSQL, MySQL, SQLite, or MongoDB (for database and CP modes)
 
 ## Installation
 
 ### From Source
 
+The bootstrap below requires Homebrew on macOS or apt-based Linux. The fast-linker
+configuration covers x86_64 and ARM64 GNU/Linux and macOS. For other platforms, manual
+installation, or building without sccache and fast linkers, follow the
+[platform limits and fallback instructions](CONTRIBUTING.md#one-time-local-bootstrap).
+
 ```bash
 git clone https://github.com/ferrum-edge/ferrum-edge.git
 cd ferrum-edge
+./scripts/install-build-deps.sh
 cargo build --release
 
 # Install to PATH
