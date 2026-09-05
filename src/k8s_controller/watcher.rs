@@ -669,9 +669,9 @@ pub fn classify_watch_error(error: &watcher::Error) -> WatchErrorClass {
         watcher::Error::InitialListFailed(source)
         | watcher::Error::WatchStartFailed(source)
         | watcher::Error::WatchFailed(source) => {
-            matches!(source, kube::Error::Api(status) if status.is_forbidden())
+            matches!(source, kube::Error::Api(status) if status_is_forbidden(status))
         }
-        watcher::Error::WatchError(status) => status.is_forbidden(),
+        watcher::Error::WatchError(status) => status_is_forbidden(status),
         _ => false,
     };
     if forbidden {
@@ -679,6 +679,15 @@ pub fn classify_watch_error(error: &watcher::Error) -> WatchErrorClass {
     } else {
         WatchErrorClass::Other
     }
+}
+
+/// `Forbidden` by the API server's stated reason, or by a bare HTTP 403 when
+/// the `Status` carries no reason at all. kube-core's `is_forbidden` consults
+/// only the textual reason (apimachinery's `ReasonForError` rule), so a proxy
+/// or an older server that answers with just the code would otherwise be
+/// retried at the stream's ordinary cadence.
+fn status_is_forbidden(status: &kube::core::Status) -> bool {
+    status.is_forbidden() || (status.reason.is_empty() && status.code == 403)
 }
 
 /// What one recorded watch failure means for logging.
