@@ -124,6 +124,7 @@ mod ktls_live_kernel_tests;
 /// the syscall wrappers are Linux-only.
 #[allow(dead_code)] // Several code points/helpers are exercised only by tests.
 pub mod ktls_record;
+pub mod max_forwards;
 mod mesh_egress_observability;
 pub mod mesh_mtls_pool;
 mod mesh_tcp_egress;
@@ -31689,6 +31690,62 @@ async fn handle_proxy_request_inner(
     {
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
         refresh_backend_gateway_assertion_headers(&ctx, headers);
+    }
+    // RFC 9110 §7.6.2 `Max-Forwards` on OPTIONS (issue #4647). One checked,
+    // bounded hop-budget decision, taken here — after authentication,
+    // authorization, the `cors` plugin's local preflight answer, and every
+    // `before_proxy` transform, and before any transport (reqwest, direct H2,
+    // H3 client, HBONE, mesh mTLS, WebSocket) can contact the origin. A
+    // decremented budget is written into the authoritative outbound map, so
+    // every retry attempt and every raw/materialized merge below forwards the
+    // reduced value and the client's original can never reappear. The native
+    // HTTP/3 frontend (`src/http3/server.rs`) applies the same helper at the
+    // same point in its ladder — keep both call sites in sync. Free for every
+    // non-OPTIONS request; one map lookup for OPTIONS without the field.
+    match max_forwards::apply_options_max_forwards(
+        &method,
+        &mut owned_proxy_headers,
+        &mut ctx.headers,
+    ) {
+        max_forwards::MaxForwardsDecision::Forward
+        | max_forwards::MaxForwardsDecision::Decremented => {}
+        max_forwards::MaxForwardsDecision::Terminal(terminal) => {
+            let reject = boxed_finalize_reject_response(
+                &plugins,
+                &mut ctx,
+                terminal.status(),
+                terminal.body(),
+                max_forwards::max_forwards_response_headers(
+                    terminal,
+                    proxy.allowed_methods.as_deref(),
+                ),
+                is_grpc_request,
+                grpc_web_response_content_type.is_none(),
+            )
+            .await;
+            apply_grpc_reject_metadata(&mut ctx, &reject);
+            let grpc_web_response = boxed_build_grpc_web_reject_response(
+                &plugins,
+                &mut ctx,
+                grpc_web_response_content_type,
+                &reject,
+            )
+            .await;
+            boxed_log_rejected_request(
+                &plugins,
+                &ctx,
+                reject.http_status.as_u16(),
+                start_time,
+                max_forwards::MAX_FORWARDS_REJECTION_PHASE,
+                plugin_execution_ns,
+            )
+            .await;
+            record_request(&state, reject.http_status.as_u16());
+            if let Some(response) = grpc_web_response {
+                return Ok(response);
+            }
+            return Ok(build_response_from_normalized_reject(reject));
+        }
     }
     // Egress baggage strip — operator-configured key prefixes are removed
     // from the outbound `baggage` header. Default empty list is a no-op.

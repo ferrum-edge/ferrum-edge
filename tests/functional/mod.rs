@@ -75,6 +75,7 @@ mod functional_load_stress_test;
 mod functional_load_testing_replay_test;
 mod functional_logging_plugins_test;
 mod functional_logging_test;
+mod functional_max_forwards_test;
 mod functional_mcp_aggregate_sse_test;
 mod functional_mcp_gateway_batch_test;
 mod functional_mesh_mode_test;

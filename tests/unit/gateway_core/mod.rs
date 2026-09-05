@@ -90,6 +90,7 @@ mod load_balancer_srv_priority_tests;
 mod load_balancer_tests;
 mod load_balancer_wrr_concurrency_tests;
 mod locality_lb_tests;
+mod max_forwards_tests;
 mod mesh_app_probe_tests;
 mod mesh_bpf_metrics_contract_tests;
 mod mesh_dual_stack_capture_tests;
