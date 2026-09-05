@@ -61,7 +61,7 @@ orchestrators share one source of truth.
 
 Every prompt must also PIN THE WORKER'S ROLE:
 "YOU are the implementer: write, commit, and push the changes yourself in this session.
-Do NOT invoke agent-dispatch skills (composer-agents, grok-agents, sol-agents, opus-agents,
+Do NOT invoke agent-dispatch skills (composer-agents, grok-agents, astra-agents, opus-agents,
 fable-agents, .agents/skills/*/scripts/dispatch-agent.sh) and do NOT spawn nested workers."
 
 Then append the mode block:

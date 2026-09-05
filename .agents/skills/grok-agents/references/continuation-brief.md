@@ -10,7 +10,7 @@ orchestrator must provide absolute paths to both briefs; do not use this continu
 Complete the assigned continuation work and validation yourself in this session. Do not stop at
 partial work or hand unfinished implementation back to the controller. Perform commit, push, PR,
 review handling, and CI repair actions only when the dispatch prompt assigns them. Do not invoke
-any agent-dispatch skill or script, including `grok-agents`, `sol-agents`, `opus-agents`,
+any agent-dispatch skill or script, including `grok-agents`, `astra-agents`, `opus-agents`,
 `fable-agents`,
 `.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI workers, or Claude CLI workers. Do not spawn
 nested workers. The orchestrator selected this model deliberately.

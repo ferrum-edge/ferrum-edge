@@ -11,7 +11,7 @@ Complete the implementation and assigned validation yourself in this session. Do
 analysis, partial work, or a handoff for the controller to finish. Perform commit, push, PR, review
 handling, and CI repair actions only when the dispatch prompt assigns them. Do not invoke any
 agent-dispatch skill or script in the environment, including `composer-agents`, `grok-agents`,
-`sol-agents`, `opus-agents`, `fable-agents`, `.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI
+`astra-agents`, `opus-agents`, `fable-agents`, `.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI
 workers, or Claude CLI workers. Do not spawn nested workers. The orchestrator chose this session's
 model deliberately. If a skill registry entry is stale or unavailable, ignore it and continue
 with this brief and the dispatch prompt.

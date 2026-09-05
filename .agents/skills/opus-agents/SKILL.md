@@ -12,7 +12,7 @@ point in the prompt. Never accept a worker's report without checking the reposit
 state yourself.
 
 **Guard: do NOT use this skill when you are yourself a dispatched worker.** If your session
-prompt says you were dispatched by an orchestrator — it references the `sol-agents` briefs
+prompt says you were dispatched by an orchestrator — it references the `astra-agents` briefs
 (`agent-brief.md` / `continuation-brief.md`), says "YOU are the implementer", or hands you an
 existing worktree and findings to fix — then this skill does not apply: implement directly in
 your session. Your model and reasoning effort were chosen deliberately by the dispatching
@@ -117,7 +117,7 @@ Do not stop at analysis, partial implementation, or a handoff for someone else t
 commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
 for a separate review-bot pass unless explicitly assigned. After the final requested push and
 report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
-skills or scripts (including sol-agents, opus-agents, fable-agents, grok-agents, or any
+skills or scripts (including astra-agents, opus-agents, fable-agents, grok-agents, or any
 .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
 ```
 

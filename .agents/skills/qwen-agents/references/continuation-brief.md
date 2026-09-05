@@ -11,7 +11,7 @@ Complete the assigned continuation work and validation yourself in this session.
 partial work or hand unfinished implementation back to the controller. Perform commit, push, PR,
 review handling, and CI repair actions only when the dispatch prompt assigns them. Do not invoke
 any agent-dispatch skill or script, including `qwen-agents`, `deepseek-pro-agents`,
-`deepseek-flash-agents`, `opencode-agents`, `grok-agents`, `sol-agents`, `opus-agents`,
+`deepseek-flash-agents`, `opencode-agents`, `grok-agents`, `astra-agents`, `opus-agents`,
 `fable-agents`, `composer-agents`, `.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI workers,
 or Claude CLI workers. Do not spawn nested workers. The orchestrator selected this model
 deliberately.
