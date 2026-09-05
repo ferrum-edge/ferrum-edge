@@ -3565,6 +3565,8 @@ docker pull ghcr.io/ferrum-edge/ferrum-edge:1.2
 
 The Docker `latest` tag tracks the latest successful `main` publish, not necessarily the newest stable version tag. The `main-<sha>` tag uses the full commit SHA from `github.sha`.
 
+Publishing logs in to both registries before pushing, so a green publish job never proves that a first-time user can pull anonymously. The `anonymous-pull-smoke` job in `ci.yml` therefore runs after `docker-manifest` on every `main` push with an empty `DOCKER_CONFIG` (`scripts/smoke_anonymous_pull.sh`): it acquires an anonymous pull token, resolves the `main-<sha>` manifest, pulls the image, and runs `ferrum-edge version --json`. The Docker Hub path is the documented install path and fails the job when it is not anonymously consumable; the GHCR path is checked in `--warn-only` mode until the `ferrum-edge` package's visibility is set to public in the organization's package settings (a GHCR package inherits no visibility from the source repository; a private package answers anonymous token requests with `401`). The same script can be run by hand against any published reference, for example `bash scripts/smoke_anonymous_pull.sh docker.io/ferrumedge/ferrum-edge:v0.9.2`.
+
 The GHCR path is `ghcr.io/${{ github.repository }}` in the workflows, so it auto-tracks the GitHub repository owner/name if the repository is moved or forked. The Docker Hub repo `ferrumedge/ferrum-edge` is hardcoded in both `ci.yml` and `release.yml`; forks must edit that `name=` value (and configure their own `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`) before Docker Hub pushes will succeed.
 
 ## Image Signatures, SBOMs, and Provenance

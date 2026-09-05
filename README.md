@@ -92,8 +92,13 @@ Published Linux GNU artifacts (`ferrum-edge-linux-x86_64`, `ferrum-cni-linux-x86
 
 ### Docker
 
+Images are published to Docker Hub (`docker.io/ferrumedge/ferrum-edge`, anonymously
+pullable) and to GitHub Container Registry (`ghcr.io/ferrum-edge/ferrum-edge`). Use the
+Docker Hub path unless you have confirmed the GHCR package is visible to you: a GHCR
+package that is not public returns `401 Unauthorized` to an anonymous `docker pull`.
+
 ```bash
-docker pull ghcr.io/ferrum-edge/ferrum-edge:latest
+docker pull docker.io/ferrumedge/ferrum-edge:latest
 
 docker run -d --name ferrum-edge \
   -p 8000:8000 \
@@ -103,7 +108,7 @@ docker run -d --name ferrum-edge \
   -e FERRUM_ADMIN_JWT_SECRET="please-change-me-to-a-32+character-secret" \
   -e FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1 \
   -v ferrum_data:/data \
-  ghcr.io/ferrum-edge/ferrum-edge:latest
+  docker.io/ferrumedge/ferrum-edge:latest
 ```
 
 > **Admin API exposure.** The admin API is a management plane. Both admin
