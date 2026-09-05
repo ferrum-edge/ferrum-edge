@@ -117,7 +117,16 @@ docker run -d \
 
 ### Volume Mounts
 
-For persistent data, mount a volume:
+Both the source-built default image (`Dockerfile`) and the prebuilt release
+image (`Dockerfile.release`) provide `/data` owned by UID/GID `65532:65532`.
+Docker copies that ownership into a fresh named or anonymous volume mounted
+there, so the SQLite quickstart can create its database as the default non-root
+user. Existing volumes retain their existing permissions.
+
+Mount storage explicitly, as in the SQLite quickstart above. The images do not
+declare `VOLUME`, preserving the existing contract that commands such as
+`version` and non-SQLite deployments do not allocate anonymous data volumes.
+For persistent data, create and mount a named volume:
 
 ```bash
 # Create a named volume
@@ -126,6 +135,39 @@ docker volume create ferrum_data
 # Mount volume in container
 docker run -v ferrum_data:/data ferrum-edge:latest
 ```
+
+This mount-only example still needs the database environment variables shown
+in Basic Usage. **Bind mounts** do not inherit image directory ownership: the
+operator must create the host directory and chown it to `65532:65532` before
+mounting it at `/data`. See [Permission Denied](#permission-denied).
+
+Kubernetes volumes also rely on storage permissions rather than Docker's volume
+copy-up. The gateway Helm chart already sets UID/GID and `fsGroup` to `65532`;
+SQLite needs a writable PVC mounted at `/data` because the container root
+filesystem is read-only. See the
+[SQLite storage example](kubernetes_deployment.md#sqlite-storage).
+
+### SQLite Volume Smoke Test
+
+On a Docker-capable CI runner with Bash and Python 3 (including `sqlite3`), run
+the standalone check against each built image or a published image digest:
+
+```bash
+bash scripts/smoke_sqlite_volume.sh ferrum-edge:source-smoke
+bash scripts/smoke_sqlite_volume.sh ferrum-edge:release-smoke
+bash scripts/smoke_sqlite_volume.sh docker.io/ferrumedge/ferrum-edge@sha256:<published-digest>
+```
+
+The script creates a fresh anonymous `/data` volume, runs SQLite migration as
+the image's default non-root user, verifies the database file, starts database
+mode, probes `/live` and readiness, restarts the gateway, and checks that the
+original migration records persist in a valid SQLite database. It removes its
+containers, volume, and temporary snapshots on exit.
+
+CI wiring is a follow-up: the existing production default-image smoke is inline
+in `.github/workflows/node-waypoint-ebpf-live.yml`, not in an extensible smoke
+script. This change leaves the production Dockerfile workflow jobs untouched;
+the new script is not yet an automated CI gate.
 
 ### Health Check
 
@@ -604,10 +646,14 @@ docker logs ferrum-edge
 
 ### Permission Denied
 
-The container runs as numeric UID/GID 65532 by default. Ensure volume permissions:
+The default gateway container runs as numeric UID/GID 65532. Fresh Docker
+volumes mounted at `/data` inherit the correct ownership from the image. For
+bind mounts, or existing volumes created with incompatible ownership, the
+operator must repair storage permissions before starting the gateway:
 
 ```bash
-# Fix volume permissions on the host before starting the container
+# For a bind mount, create and fix the host directory before starting the container
+sudo mkdir -p /path/to/volume
 sudo chown -R 65532:65532 /path/to/volume
 ```
 
