@@ -53,7 +53,9 @@ An operator making a validation claim must also show that the pinned crate and
 resulting module match the version, installation procedure, configuration, and
 operating environment in the applicable vendor security policy.
 
-Prerequisites (in addition to Ferrum's usual `protoc`):
+First complete Ferrum's [source-build prerequisites](../README.md#prerequisites) and
+[one-time bootstrap](../CONTRIBUTING.md#one-time-local-bootstrap).
+Additional FIPS build prerequisites:
 
 - a C/C++ toolchain
 - CMake and a generator (`ninja` or `make`)
