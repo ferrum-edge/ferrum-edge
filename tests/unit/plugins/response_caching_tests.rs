@@ -2169,6 +2169,176 @@ async fn test_if_none_match_returns_304_from_cache() {
 }
 
 #[tokio::test]
+async fn test_conditional_success_eligibility_and_wildcard_without_etag() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({"cacheable_status_codes": [200, 203]}));
+    let last_modified = "Wed, 01 Jan 2020 00:00:00 GMT";
+    let later = "Wed, 01 Jan 2025 00:00:00 GMT";
+    let cases = [
+        (Some("*"), None, true),
+        (Some(" \t*\t "), None, true),
+        (Some("*"), Some("Tue, 01 Jan 2019 00:00:00 GMT"), true),
+        (Some(r#"*, "v1""#), Some(later), false),
+        (Some(r#""v1", *"#), Some(later), false),
+        (Some("**"), Some(later), false),
+        (Some("* trailing"), Some(later), false),
+        (Some("\n*"), Some(later), false),
+        (Some(r#""other""#), Some(later), false),
+        (Some(""), Some(later), false),
+        (None, Some(later), true),
+        (None, Some(last_modified), true),
+        (None, Some("Tue, 01 Jan 2019 00:00:00 GMT"), false),
+        (None, Some("invalid-date"), false),
+        (None, None, false),
+    ];
+
+    for method in ["GET", "HEAD"] {
+        for stored_status in [200, 203] {
+            for etag in [None, Some(r#"W/"v1""#)] {
+                let path = format!("/conditional-{method}-{stored_status}-{}", etag.is_some());
+                let mut response_headers = HashMap::from([
+                    ("cache-control".to_string(), "max-age=60".to_string()),
+                    ("last-modified".to_string(), last_modified.to_string()),
+                ]);
+                if let Some(etag) = etag {
+                    response_headers.insert("etag".to_string(), etag.to_string());
+                }
+                let stored_body = if method == "HEAD" {
+                    &b""[..]
+                } else {
+                    b"cached-body"
+                };
+                cache_response(
+                    &plugin,
+                    method,
+                    &path,
+                    stored_status,
+                    &response_headers,
+                    stored_body,
+                )
+                .await;
+
+                for (if_none_match, if_modified_since, should_match) in cases {
+                    let mut ctx = make_ctx(method, &path);
+                    if let Some(value) = if_none_match {
+                        ctx.headers
+                            .insert("if-none-match".to_string(), value.to_string());
+                    }
+                    if let Some(value) = if_modified_since {
+                        ctx.headers
+                            .insert("if-modified-since".to_string(), value.to_string());
+                    }
+                    let mut headers = ctx.headers.clone();
+                    let (status, body, headers) =
+                        expect_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
+                    assert_eq!(
+                        status,
+                        if should_match { 304 } else { stored_status },
+                        "{path}: INM={if_none_match:?}, IMS={if_modified_since:?}"
+                    );
+                    let expected_body = if should_match { &b""[..] } else { stored_body };
+                    assert_eq!(body, expected_body);
+                    assert_eq!(headers.get("etag"), response_headers.get("etag"));
+                    let cache_status = if should_match { "REVALIDATED" } else { "HIT" };
+                    assert_eq!(
+                        headers.get("x-cache-status").map(String::as_str),
+                        Some(cache_status)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_conditional_non_success_preserves_cached_status_body_and_headers() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let statuses = [301, 302, 307, 308, 404, 410, 412, 500, 503];
+    let plugin = plugin_with_config(json!({"cacheable_status_codes": statuses}));
+    let conditions = [
+        None,
+        Some(("if-none-match", "*")),
+        Some(("if-none-match", r#"W/"v1""#)),
+        Some(("if-none-match", r#""other", "v1""#)),
+        Some(("if-none-match", r#""other""#)),
+        Some(("if-modified-since", "Wed, 01 Jan 2025 00:00:00 GMT")),
+        Some(("if-modified-since", "Tue, 01 Jan 2019 00:00:00 GMT")),
+    ];
+
+    for method in ["GET", "HEAD"] {
+        for stored_status in statuses {
+            let path = format!("/conditional-{method}-{stored_status}");
+            let mut response_headers = HashMap::from([
+                ("cache-control".to_string(), "max-age=60".to_string()),
+                ("etag".to_string(), r#""v1""#.to_string()),
+                (
+                    "last-modified".to_string(),
+                    "Wed, 01 Jan 2020 00:00:00 GMT".to_string(),
+                ),
+                ("content-type".to_string(), "text/plain".to_string()),
+            ]);
+            if stored_status < 400 {
+                response_headers.insert("location".to_string(), "/destination".to_string());
+            }
+            let stored_body = if method == "HEAD" {
+                &b""[..]
+            } else {
+                b"cached-body"
+            };
+            cache_response(
+                &plugin,
+                method,
+                &path,
+                stored_status,
+                &response_headers,
+                stored_body,
+            )
+            .await;
+
+            for condition in conditions {
+                let mut ctx = make_ctx(method, &path);
+                if let Some((name, value)) = condition {
+                    ctx.headers.insert(name.to_string(), value.to_string());
+                }
+                let mut headers = ctx.headers.clone();
+                let (status, body, headers) =
+                    expect_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
+                assert_eq!(status, stored_status, "{path}: {condition:?}");
+                assert_eq!(body, stored_body, "{path}: {condition:?}");
+                for (name, value) in &response_headers {
+                    assert_eq!(headers.get(name), Some(value), "{path}: {condition:?}");
+                }
+                assert_eq!(
+                    headers.get("x-cache-status").map(String::as_str),
+                    Some("HIT")
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_conditional_wildcard_cache_miss_reaches_origin() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+    for method in ["GET", "HEAD"] {
+        let mut ctx = make_ctx(method, "/not-cached");
+        ctx.headers
+            .insert("if-none-match".to_string(), "*".to_string());
+        let mut headers = ctx.headers.clone();
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert_status(&plugin, &ctx, "MISS");
+        assert_eq!(
+            headers.get("if-none-match").map(String::as_str),
+            Some("*")
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_if_none_match_parses_entity_tag_lists_without_partial_matches() {
     let plugin = default_plugin();
     let cases = [
