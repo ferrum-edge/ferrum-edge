@@ -14,6 +14,7 @@ use dashmap::DashMap;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use tokio::sync::watch;
 use tracing::{info, warn};
 use url::{Host, Url};
 
@@ -128,6 +129,26 @@ const SESSION_SET_COOKIE_METADATA_KEY: &str = "oidc_rp.session_set_cookie";
 /// token endpoint is not retried on every request until the session reaches its
 /// ttl/idle bound.
 const REFRESH_RETRY_BACKOFF_SECS: i64 = 30;
+/// How long a completed refresh transition stays addressable by the refresh
+/// token it spent. A request that decrypted the pre-rotation cookie before the
+/// winner finished (or a browser tab that still carries it) adopts the
+/// published outcome instead of re-submitting a token the provider has already
+/// consumed. An `invalid_grant` record doubles as this instance's cookie-less
+/// retry backoff. Kept shorter than `REFRESH_RETRY_BACKOFF_SECS` (the floor of
+/// every scheduled `refresh_after`) so a provider that does not rotate refresh
+/// tokens never has its next due refresh adopt its own previous record.
+const REFRESH_FLIGHT_RETENTION: Duration = Duration::from_secs(25);
+/// Upper bound on retained refresh transitions per plugin instance. Live
+/// flights are bounded by the concurrency of refresh-due requests; completed
+/// records beyond this cap evict oldest-first.
+const MAX_RETAINED_REFRESH_FLIGHTS: usize = 4096;
+/// Bound on a coalesced follower's wait for the leader's published outcome.
+/// The leader's token-endpoint call has its own 10s timeout; a follower that
+/// outlives this bound serves without a session update rather than issuing a
+/// duplicate grant.
+const REFRESH_FLIGHT_FOLLOWER_WAIT: Duration = Duration::from_secs(30);
+/// Re-election attempts when a leader is cancelled before publishing.
+const REFRESH_FLIGHT_MAX_ELECTIONS: usize = 4;
 
 pub struct OidcRelyingParty {
     provider: Arc<ProviderRuntime>,
@@ -227,6 +248,11 @@ struct SessionRuntime {
     ttl: Duration,
     idle_ttl: Duration,
     state_cache: Arc<StateCache>,
+    /// Single-flight refresh transitions keyed by spent refresh-token digest.
+    /// Instance-local, like `state_cache`: a plugin-cache rebuild starts a new
+    /// map, and other replicas cannot see it (see the multi-replica notes on
+    /// `maybe_refresh_session`).
+    refresh_flights: RefreshFlightMap,
 }
 
 struct BehaviorConfig {
@@ -465,6 +491,215 @@ impl RefreshOutcome {
         mutated: false,
         refreshed: false,
     };
+}
+
+/// Why a `grant_type=refresh_token` attempt did not rotate the session.
+enum RefreshFailure {
+    /// RFC 6749 §5.2 `invalid_grant`: the provider rejected the refresh token
+    /// itself (spent by an earlier rotation, revoked, or expired). Re-submitting
+    /// it can never succeed, and re-sealing it may overwrite a rotated cookie.
+    InvalidGrant,
+    /// Any other failure (transport, non-2xx without `invalid_grant`, malformed
+    /// response, ID token validation). The token is not known to be spent, so
+    /// the retry is deferred by `REFRESH_RETRY_BACKOFF_SECS`.
+    Other(String),
+}
+
+impl From<String> for RefreshFailure {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+
+/// RFC 6749 §5.2 token error envelope. Only `error` is read;
+/// `error_description` / `error_uri` are ignored and never logged.
+#[derive(Deserialize)]
+struct TokenErrorResponse {
+    #[serde(default)]
+    error: String,
+}
+
+/// Outcome of one refresh transition, published to every request that carries
+/// the refresh token the transition spent.
+enum RefreshFlightResult {
+    /// The grant rotated the session. `sealed` is the codec-sealed refreshed
+    /// payload (ciphertext, never the raw tokens) that followers open and adopt.
+    Rotated {
+        sealed: String,
+        claims_refreshed: bool,
+    },
+    /// The refresh token is spent or otherwise unusable. Nothing may be
+    /// re-sealed from it: the browser keeps whatever cookie it holds, which is
+    /// the rotated session whenever a winner exists anywhere in the fleet.
+    SpentCredential,
+    /// A transient failure. The token is still the live credential, so a
+    /// backoff re-seal of the unchanged payload is safe.
+    Deferred,
+}
+
+struct RefreshFlightRecord {
+    completed_at: Instant,
+    result: RefreshFlightResult,
+}
+
+type RefreshFlightValue = Option<Arc<RefreshFlightRecord>>;
+
+struct RefreshFlightSlot {
+    rx: watch::Receiver<RefreshFlightValue>,
+}
+
+enum RefreshFlightRole {
+    /// First request for this token generation: owns the sender and the slot.
+    Leader {
+        tx: watch::Sender<RefreshFlightValue>,
+        slot: Arc<RefreshFlightSlot>,
+    },
+    /// A later request that found the transition in flight: awaits the leader.
+    Follower(watch::Receiver<RefreshFlightValue>),
+    /// The transition already completed within `REFRESH_FLIGHT_RETENTION`.
+    Completed(Arc<RefreshFlightRecord>),
+}
+
+enum RefreshFlightWait {
+    Published(Arc<RefreshFlightRecord>),
+    /// The leader dropped its sender without publishing (cancelled request).
+    LeaderGone,
+    TimedOut,
+}
+
+/// Per-instance single-flight registry for refresh-token grants.
+///
+/// Reached only on the refresh-due branch, so its cost never lands on requests
+/// whose cookie is not due. Keys are SHA-256 digests of the refresh token, so
+/// the map holds no raw credential; values are `watch` channels so followers
+/// wait without any lock, and a completed record stays readable after the
+/// leader's sender is dropped.
+struct RefreshFlightMap {
+    flights: DashMap<[u8; 32], Arc<RefreshFlightSlot>>,
+}
+
+impl RefreshFlightMap {
+    fn new(shard_amount: usize) -> Self {
+        Self {
+            flights: DashMap::with_shard_amount(shard_amount),
+        }
+    }
+
+    fn join(&self, key: [u8; 32]) -> RefreshFlightRole {
+        if self.flights.len() >= MAX_RETAINED_REFRESH_FLIGHTS {
+            self.evict_completed();
+        }
+        match self.flights.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                // Clone out of the `watch` borrow before touching the entry so
+                // no guard is alive across the replacement below.
+                let latest = occupied.get().rx.borrow().clone();
+                match latest {
+                    None => RefreshFlightRole::Follower(occupied.get().rx.clone()),
+                    Some(record) if record.completed_at.elapsed() < REFRESH_FLIGHT_RETENTION => {
+                        RefreshFlightRole::Completed(record)
+                    }
+                    Some(_) => {
+                        let (tx, rx) = watch::channel::<RefreshFlightValue>(None);
+                        let slot = Arc::new(RefreshFlightSlot { rx });
+                        occupied.insert(Arc::clone(&slot));
+                        RefreshFlightRole::Leader { tx, slot }
+                    }
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                let (tx, rx) = watch::channel::<RefreshFlightValue>(None);
+                let slot = Arc::new(RefreshFlightSlot { rx });
+                vacant.insert(Arc::clone(&slot));
+                RefreshFlightRole::Leader { tx, slot }
+            }
+        }
+    }
+
+    /// Drop expired completed records, then the oldest completed record if the
+    /// cap is still reached. Live flights are never evicted: removing one would
+    /// let a second leader submit the same token.
+    fn evict_completed(&self) {
+        let now = Instant::now();
+        self.flights.retain(|_, slot| match slot.rx.borrow().as_ref() {
+            Some(record) => {
+                now.saturating_duration_since(record.completed_at) < REFRESH_FLIGHT_RETENTION
+            }
+            None => true,
+        });
+        if self.flights.len() < MAX_RETAINED_REFRESH_FLIGHTS {
+            return;
+        }
+        let mut oldest: Option<([u8; 32], Instant)> = None;
+        for entry in self.flights.iter() {
+            if let Some(record) = entry.value().rx.borrow().as_ref()
+                && oldest.is_none_or(|(_, at)| record.completed_at < at)
+            {
+                oldest = Some((*entry.key(), record.completed_at));
+            }
+        }
+        if let Some((key, _)) = oldest {
+            self.flights.remove(&key);
+        }
+    }
+}
+
+/// Cancellation-safe ownership of a leader's slot. Dropping without `retain`
+/// (the leader was cancelled before publishing) frees the entry so followers
+/// re-elect exactly one replacement; a published leader sets `retain` so the
+/// completed record stays addressable for `REFRESH_FLIGHT_RETENTION`.
+/// `ptr_eq` ensures only our own slot is removed, never a newer leader's.
+struct RefreshFlightCleanup<'a> {
+    map: &'a RefreshFlightMap,
+    key: [u8; 32],
+    slot: Arc<RefreshFlightSlot>,
+    retain: bool,
+}
+
+impl Drop for RefreshFlightCleanup<'_> {
+    fn drop(&mut self) {
+        if !self.retain {
+            self.map
+                .flights
+                .remove_if(&self.key, |_, existing| Arc::ptr_eq(existing, &self.slot));
+        }
+    }
+}
+
+/// Wait for the leader's published record. `TimedOut` leaves the live leader
+/// in place: the follower serves without a session update rather than stealing
+/// the flight and issuing a duplicate grant.
+async fn await_refresh_flight(rx: &mut watch::Receiver<RefreshFlightValue>) -> RefreshFlightWait {
+    let deadline = Instant::now() + REFRESH_FLIGHT_FOLLOWER_WAIT;
+    loop {
+        // Bind the clone so the borrow guard drops before `changed()` below.
+        let latest = rx.borrow_and_update().clone();
+        if let Some(record) = latest {
+            return RefreshFlightWait::Published(record);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return RefreshFlightWait::TimedOut;
+        }
+        match tokio::time::timeout(remaining, rx.changed()).await {
+            Ok(Ok(())) => continue,
+            Ok(Err(_)) => return RefreshFlightWait::LeaderGone,
+            Err(_) => return RefreshFlightWait::TimedOut,
+        }
+    }
+}
+
+/// Classify a non-2xx token endpoint response for a refresh grant. Only the
+/// bounded JSON `error` code is inspected; the body is never logged.
+async fn classify_refresh_failure(response: reqwest::Response) -> RefreshFailure {
+    if response.status().as_u16() == 400
+        && let Ok(envelope) =
+            read_bounded_json::<TokenErrorResponse>(response, MAX_TOKEN_RESPONSE_BYTES).await
+        && envelope.error == "invalid_grant"
+    {
+        return RefreshFailure::InvalidGrant;
+    }
+    RefreshFailure::Other(r#"{"error":"Token refresh failed"}"#.to_string())
 }
 
 impl OidcRelyingParty {
@@ -727,6 +962,7 @@ impl OidcRelyingParty {
                 state_ttl,
                 http_client.pool_shard_amount(),
             )),
+            refresh_flights: RefreshFlightMap::new(http_client.pool_shard_amount()),
         });
 
         let post_login_redirect_param =
@@ -1260,7 +1496,10 @@ impl OidcRelyingParty {
         // Keep the session live: refresh tokens when due (which also re-derives
         // claims from any new ID token), then slide the idle window. Any change
         // is re-sealed now, but only the accepted first principal commits the
-        // cookie for `after_proxy` to emit as `Set-Cookie`.
+        // cookie for `after_proxy` to emit as `Set-Cookie`. Concurrent requests
+        // carrying the same refresh token share one grant, and a spent token is
+        // never re-sealed (`mutated` stays false), so this request can never
+        // publish the pre-rotation credential over a rotated cookie.
         let refresh = self.maybe_refresh_session(&mut payload, now).await;
 
         // Token-freshness gate: the ID token was validly verified at login, but
@@ -1402,10 +1641,26 @@ impl OidcRelyingParty {
     /// produced freshly validated claims — the two differ on the deferred-failure
     /// branch and on refresh responses that rotate access tokens without returning
     /// a new ID token. The freshness gate in `run_session_auth` relies on that
-    /// distinction. Failures are non-fatal here:
-    /// the next attempt is deferred by `REFRESH_RETRY_BACKOFF_SECS` so a flaky token
-    /// endpoint is not retried on every request, and the freshness gate decides
-    /// whether the still-expired session may keep serving.
+    /// distinction.
+    ///
+    /// Refresh transitions are single-flight per refresh-token generation: the
+    /// refresh token is the identity the grant spends exactly once, so every
+    /// request carrying the same token (two tabs, a burst of asset fetches,
+    /// a request admitted just before or just after the winner completed) shares
+    /// one token-endpoint call and adopts the winner's session state. Failures
+    /// are non-fatal: a transient failure defers the next attempt by
+    /// `REFRESH_RETRY_BACKOFF_SECS` and re-seals the unchanged payload; an
+    /// `invalid_grant` marks the credential spent, re-seals nothing, and
+    /// suppresses re-submission on this instance for the same window. The
+    /// freshness gate decides whether a still-expired session may keep serving.
+    ///
+    /// Cross-replica topology: the cookie store has no shared server-side
+    /// session, so two replicas can still both receive the pre-rotation cookie
+    /// and only one can win at the provider. The loser sees `invalid_grant`
+    /// and emits no `Set-Cookie`, which is what keeps the browser on the
+    /// winner's rotated cookie; nothing here can hand the loser the winner's
+    /// tokens. Sticky routing on the session cookie removes the residual
+    /// duplicate submission entirely.
     async fn maybe_refresh_session(
         &self,
         payload: &mut SessionPayload,
@@ -1420,20 +1675,137 @@ impl OidcRelyingParty {
         let Some(discovery) = self.provider.discovery.load().as_ref().as_ref().cloned() else {
             return RefreshOutcome::UNCHANGED;
         };
-        match self
-            .refresh_tokens(&discovery, &refresh_token, payload, now)
-            .await
-        {
-            Ok(claims_refreshed) => RefreshOutcome {
-                mutated: true,
-                refreshed: claims_refreshed,
-            },
-            Err(error) => {
-                warn!(
-                    plugin = "oidc_relying_party",
-                    error = %error,
-                    "OIDC token refresh failed; the freshness gate decides whether the existing session may keep serving"
-                );
+        // Key the transition by the token's digest so the registry never holds
+        // a raw credential; every cookie sealed from the same generation hashes
+        // to the same flight.
+        let flight_key: [u8; 32] = Sha256::digest(refresh_token.as_bytes());
+        let flights = &self.session.refresh_flights;
+        for _ in 0..REFRESH_FLIGHT_MAX_ELECTIONS {
+            match flights.join(flight_key) {
+                RefreshFlightRole::Leader { tx, slot } => {
+                    let mut cleanup = RefreshFlightCleanup {
+                        map: flights,
+                        key: flight_key,
+                        slot,
+                        retain: false,
+                    };
+                    let (outcome, published) = match self
+                        .refresh_tokens(&discovery, &refresh_token, payload, now)
+                        .await
+                    {
+                        Ok(claims_refreshed) => {
+                            let outcome = RefreshOutcome {
+                                mutated: true,
+                                refreshed: claims_refreshed,
+                            };
+                            match self.seal_session_value(payload) {
+                                Ok(sealed) => (
+                                    outcome,
+                                    RefreshFlightResult::Rotated {
+                                        sealed,
+                                        claims_refreshed,
+                                    },
+                                ),
+                                // The rotation happened but nothing can carry
+                                // it; the old token is spent either way.
+                                Err(_) => (outcome, RefreshFlightResult::SpentCredential),
+                            }
+                        }
+                        Err(RefreshFailure::InvalidGrant) => {
+                            warn!(
+                                plugin = "oidc_relying_party",
+                                "OIDC token refresh rejected as invalid_grant; the spent refresh token is not re-sealed and the freshness gate decides whether the existing session may keep serving"
+                            );
+                            (RefreshOutcome::UNCHANGED, RefreshFlightResult::SpentCredential)
+                        }
+                        Err(RefreshFailure::Other(error)) => {
+                            warn!(
+                                plugin = "oidc_relying_party",
+                                error = %error,
+                                "OIDC token refresh failed; the freshness gate decides whether the existing session may keep serving"
+                            );
+                            payload.refresh_after_unix = now + REFRESH_RETRY_BACKOFF_SECS;
+                            (
+                                RefreshOutcome {
+                                    mutated: true,
+                                    refreshed: false,
+                                },
+                                RefreshFlightResult::Deferred,
+                            )
+                        }
+                    };
+                    // Publish before retaining so a follower observing the
+                    // record can never find the slot missing.
+                    let _ = tx.send(Some(Arc::new(RefreshFlightRecord {
+                        completed_at: Instant::now(),
+                        result: published,
+                    })));
+                    cleanup.retain = true;
+                    return outcome;
+                }
+                RefreshFlightRole::Follower(mut rx) => match await_refresh_flight(&mut rx).await {
+                    RefreshFlightWait::Published(record) => {
+                        return self.adopt_refresh_flight(payload, &record, now);
+                    }
+                    RefreshFlightWait::LeaderGone => continue,
+                    RefreshFlightWait::TimedOut => {
+                        warn!(
+                            plugin = "oidc_relying_party",
+                            "coalesced OIDC token refresh outlived the follower wait bound; serving without a session update"
+                        );
+                        return RefreshOutcome::UNCHANGED;
+                    }
+                },
+                RefreshFlightRole::Completed(record) => {
+                    return self.adopt_refresh_flight(payload, &record, now);
+                }
+            }
+        }
+        warn!(
+            plugin = "oidc_relying_party",
+            "OIDC token refresh leader re-election budget exhausted; serving without a session update"
+        );
+        RefreshOutcome::UNCHANGED
+    }
+
+    /// Apply a coalesced refresh transition to a request that did not run the
+    /// grant itself. A rotated winner is opened from its sealed form and its
+    /// credential-bearing fields adopted; the request keeps its own issue and
+    /// touch times so a newer sliding update in its cookie is not regressed.
+    fn adopt_refresh_flight(
+        &self,
+        payload: &mut SessionPayload,
+        record: &RefreshFlightRecord,
+        now: i64,
+    ) -> RefreshOutcome {
+        match &record.result {
+            RefreshFlightResult::Rotated {
+                sealed,
+                claims_refreshed,
+            } => {
+                let Some(winner) = self.open_session(sealed) else {
+                    warn!(
+                        plugin = "oidc_relying_party",
+                        "coalesced OIDC refresh result did not open; serving without a session update"
+                    );
+                    return RefreshOutcome::UNCHANGED;
+                };
+                payload.sub = winner.sub;
+                payload.id_token_b64 = winner.id_token_b64;
+                payload.access_token_b64 = winner.access_token_b64;
+                payload.refresh_token_b64 = winner.refresh_token_b64;
+                payload.expires_at_unix = winner.expires_at_unix;
+                payload.claims_expires_at_unix = winner.claims_expires_at_unix;
+                payload.refresh_after_unix = winner.refresh_after_unix;
+                payload.last_touch_unix = payload.last_touch_unix.max(winner.last_touch_unix);
+                payload.claims = winner.claims;
+                RefreshOutcome {
+                    mutated: true,
+                    refreshed: *claims_refreshed,
+                }
+            }
+            RefreshFlightResult::SpentCredential => RefreshOutcome::UNCHANGED,
+            RefreshFlightResult::Deferred => {
                 payload.refresh_after_unix = now + REFRESH_RETRY_BACKOFF_SECS;
                 RefreshOutcome {
                     mutated: true,
@@ -1449,7 +1821,7 @@ impl OidcRelyingParty {
         refresh_token: &str,
         payload: &mut SessionPayload,
         now: i64,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, RefreshFailure> {
         let params = vec![
             ("grant_type".to_string(), "refresh_token".to_string()),
             ("refresh_token".to_string(), refresh_token.to_string()),
@@ -1459,7 +1831,7 @@ impl OidcRelyingParty {
             .post_token_endpoint(&discovery.token_endpoint, params)
             .await?;
         if !response.status().is_success() {
-            return Err(r#"{"error":"Token refresh failed"}"#.to_string());
+            return Err(classify_refresh_failure(response).await);
         }
         let token: RefreshTokenResponse = read_bounded_json(response, MAX_TOKEN_RESPONSE_BYTES)
             .await
@@ -1700,6 +2072,17 @@ impl OidcRelyingParty {
     }
 
     fn seal_session_cookie(&self, payload: &SessionPayload) -> Result<String, String> {
+        let value = self.seal_session_value(payload)?;
+        Ok(format!(
+            "{}={}; {}",
+            self.session.cookie_name, value, self.session.cookie_attrs
+        ))
+    }
+
+    /// Seal a payload to its cookie value (without name and attributes). Also
+    /// the form a coalesced refresh publishes to its followers, so the shared
+    /// record carries ciphertext rather than raw tokens.
+    fn seal_session_value(&self, payload: &SessionPayload) -> Result<String, String> {
         let bytes = serde_json::to_vec(payload)
             .map_err(|_| r#"{"error":"Session creation failed"}"#.to_string())?;
         let estimated_cookie_value_len = encoded_session_cookie_len(bytes.len());
@@ -1720,10 +2103,7 @@ impl OidcRelyingParty {
             );
             r#"{"error":"Session creation failed"}"#.to_string()
         })?;
-        Ok(format!(
-            "{}={}; {}",
-            self.session.cookie_name, value, self.session.cookie_attrs
-        ))
+        Ok(value)
     }
 
     // Reached only through the lib target's `_test_support` shim by external
@@ -4498,10 +4878,14 @@ mod tests {
     #[tokio::test]
     async fn failed_refresh_keeps_session_and_backs_off() {
         let server = MockServer::start().await;
+        // A transient failure keeps the token live and persists the backoff in
+        // the cookie; `invalid_grant` is the spent-credential contract covered
+        // by the external unit tests and re-seals nothing.
         Mock::given(method("POST"))
             .and(path("/token"))
             .respond_with(
-                ResponseTemplate::new(400).set_body_json(json!({"error":"invalid_grant"})),
+                ResponseTemplate::new(503)
+                    .set_body_json(json!({"error":"temporarily_unavailable"})),
             )
             .mount(&server)
             .await;
