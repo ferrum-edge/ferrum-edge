@@ -604,7 +604,12 @@ impl RefreshFlightMap {
     }
 
     fn join(&self, key: [u8; 32]) -> RefreshFlightRole {
-        if self.flights.len() >= self.max_retained {
+        // Make room only when this key needs a slot of its own. A key that is
+        // already present adopts its live flight or its completed record, and
+        // evicting on its behalf could remove that very record — the oldest
+        // completed one — and turn the adopter into a second leader that
+        // re-submits the token inside the retention window.
+        if !self.flights.contains_key(&key) && self.flights.len() >= self.max_retained {
             self.evict_completed();
         }
         match self.flights.entry(key) {

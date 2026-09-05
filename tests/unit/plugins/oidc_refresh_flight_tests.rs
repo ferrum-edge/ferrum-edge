@@ -69,6 +69,29 @@ fn cap_reached_join_drops_expired_records_before_any_live_completed_record() {
 }
 
 #[test]
+fn cap_reached_join_of_a_retained_key_adopts_its_record_instead_of_evicting_it() {
+    let flights = OidcRefreshFlightsForTest::new(Duration::from_secs(60), 2);
+    complete(&flights, 1, Duration::from_secs(5));
+    complete(&flights, 2, Duration::from_secs(1));
+    assert_eq!(flights.flight_count(), 2);
+
+    // Key 1 holds the oldest completed record. At the cap its own joiner must
+    // adopt that record rather than run the eviction pass, which would remove
+    // it and hand the joiner a fresh leadership: a second submission of the
+    // token inside the retention window.
+    assert!(
+        matches!(
+            flights.join(key(1)),
+            OidcRefreshFlightJoinForTest::Completed
+        ),
+        "a within-retention record is adopted at the cap"
+    );
+    assert!(flights.contains(&key(1)));
+    assert!(flights.contains(&key(2)));
+    assert_eq!(flights.flight_count(), 2);
+}
+
+#[test]
 fn cap_reached_join_evicts_the_oldest_completed_record_and_never_a_live_flight() {
     let flights = OidcRefreshFlightsForTest::new(Duration::from_secs(60), 3);
     let live = lead(&flights, 1);
