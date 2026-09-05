@@ -3081,8 +3081,10 @@ impl Plugin for BodyValidator {
 
         // The ONLY no-body exemptions are the ones HTTP itself defines. An
         // ordinary body-bearing success (200, 201, …) that arrives empty is a
-        // validation failure, not an exemption (`GHSA-2vmr-ww8r-mww3`).
-        if synthetic_response_omits_body(&ctx.method, response_status) {
+        // validation failure, not an exemption (`GHSA-2vmr-ww8r-mww3`), and the
+        // exemption covers an ABSENT body only: a no-content status that somehow
+        // carries bytes is still validated.
+        if body.is_empty() && synthetic_response_omits_body(&ctx.method, response_status) {
             return PluginResult::Continue;
         }
 

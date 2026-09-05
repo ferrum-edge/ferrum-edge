@@ -3172,7 +3172,10 @@ impl Plugin for AiResponseGuard {
         response_headers: &mut HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if synthetic_response_omits_body(&ctx.method, response_status) {
+        // An absent body on a no-content response is HTTP's answer, not a
+        // representation to inspect; bytes that somehow arrive on one are still
+        // inspected.
+        if body.is_empty() && synthetic_response_omits_body(&ctx.method, response_status) {
             return PluginResult::Continue;
         }
 
