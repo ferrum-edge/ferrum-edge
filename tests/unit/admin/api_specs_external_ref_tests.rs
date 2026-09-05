@@ -43,9 +43,13 @@ fn process_enabled(file_root: Option<PathBuf>) -> ExternalRefProcessPolicy {
         max_uri_length: 2048,
         max_redirects: 2,
         max_nesting: 8,
-        connect_timeout: Duration::from_millis(100),
-        request_timeout: Duration::from_millis(200),
-        total_timeout: Duration::from_secs(2),
+        // Success-path budgets. Every fixture here answers within microseconds
+        // on an idle machine, but a loaded coverage runner has reported both
+        // request timeouts and truncated body reads under a 200 ms request
+        // budget. Tests that assert on a deadline set their own tight values.
+        connect_timeout: Duration::from_secs(2),
+        request_timeout: Duration::from_secs(5),
+        total_timeout: Duration::from_secs(10),
     }
 }
 
