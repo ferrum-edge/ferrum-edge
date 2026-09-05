@@ -101,6 +101,7 @@ pub mod _test_support {
     use crate::modes::mesh::startup_rollback_test_seams as mesh_startup_rollback_seams;
     use crate::modes::node_agent::startup_cleanup_test_seams as node_agent_cleanup_seams;
     use crate::plugins::Plugin;
+    use crate::plugins::oidc_relying_party::refresh_flight_test_seams as oidc_refresh_flight_seams;
 
     /// Parse-only URI authority and Host header a Unix WebSocket handshake uses.
     ///
@@ -2114,6 +2115,102 @@ pub mod _test_support {
             refresh_token,
             refresh_after_unix,
         })
+    }
+
+    // ── OIDC refresh single-flight seams (issue #4640) ──────────────────────
+
+    /// A refresh single-flight registry with caller-chosen retention and cap,
+    /// so eviction, expiry, and follower outcomes are reachable in unit tests.
+    pub struct OidcRefreshFlightsForTest {
+        harness: oidc_refresh_flight_seams::RefreshFlightHarness,
+    }
+
+    pub enum OidcRefreshFlightJoinForTest<'a> {
+        Leader(OidcRefreshFlightLeaderForTest<'a>),
+        Follower(OidcRefreshFlightFollowerForTest),
+        Completed,
+    }
+
+    /// Owns a leader's slot exactly as the request path does: dropping it
+    /// without publishing is a cancelled leader.
+    pub struct OidcRefreshFlightLeaderForTest<'a> {
+        leader: oidc_refresh_flight_seams::RefreshFlightLeader<'a>,
+    }
+
+    pub struct OidcRefreshFlightFollowerForTest {
+        follower: oidc_refresh_flight_seams::RefreshFlightFollower,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum OidcRefreshFlightWaitForTest {
+        Published,
+        LeaderGone,
+        TimedOut,
+    }
+
+    impl OidcRefreshFlightsForTest {
+        pub fn new(retention: Duration, max_retained: usize) -> Self {
+            Self {
+                harness: oidc_refresh_flight_seams::RefreshFlightHarness::new(
+                    retention,
+                    max_retained,
+                ),
+            }
+        }
+
+        pub fn join(&self, key: [u8; 32]) -> OidcRefreshFlightJoinForTest<'_> {
+            match self.harness.join(key) {
+                oidc_refresh_flight_seams::RefreshFlightJoin::Leader(leader) => {
+                    OidcRefreshFlightJoinForTest::Leader(OidcRefreshFlightLeaderForTest { leader })
+                }
+                oidc_refresh_flight_seams::RefreshFlightJoin::Follower(follower) => {
+                    OidcRefreshFlightJoinForTest::Follower(OidcRefreshFlightFollowerForTest {
+                        follower,
+                    })
+                }
+                oidc_refresh_flight_seams::RefreshFlightJoin::Completed => {
+                    OidcRefreshFlightJoinForTest::Completed
+                }
+            }
+        }
+
+        /// Run the cap-reached eviction pass directly.
+        pub fn evict_completed(&self) {
+            self.harness.evict_completed();
+        }
+
+        pub fn flight_count(&self) -> usize {
+            self.harness.flight_count()
+        }
+
+        pub fn contains(&self, key: &[u8; 32]) -> bool {
+            self.harness.contains(key)
+        }
+    }
+
+    impl OidcRefreshFlightLeaderForTest<'_> {
+        /// Publish a deferred outcome completed `age` ago and retain the slot.
+        pub fn publish_completed_ago(self, age: Duration) -> Result<(), String> {
+            self.leader.publish_completed_ago(age)
+        }
+    }
+
+    impl OidcRefreshFlightFollowerForTest {
+        /// Await the leader's outcome with the production follower wait bound.
+        pub async fn wait(&mut self) -> OidcRefreshFlightWaitForTest {
+            use oidc_refresh_flight_seams::RefreshFlightWaitOutcome as Outcome;
+            match self.follower.wait().await {
+                Outcome::Published => OidcRefreshFlightWaitForTest::Published,
+                Outcome::LeaderGone => OidcRefreshFlightWaitForTest::LeaderGone,
+                Outcome::TimedOut => OidcRefreshFlightWaitForTest::TimedOut,
+            }
+        }
+    }
+
+    /// `From<String>` classification of a refresh failure: `Some(error)` when
+    /// it is a deferrable `Other`, `None` when it is a spent credential.
+    pub fn oidc_refresh_failure_from_string_for_test(error: String) -> Option<String> {
+        oidc_refresh_flight_seams::refresh_failure_from_string(error)
     }
 
     pub fn prepare_basic_auth_credential_for_test(

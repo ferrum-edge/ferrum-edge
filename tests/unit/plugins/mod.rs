@@ -74,6 +74,7 @@ mod metadata_redaction_contract_tests;
 mod mtls_auth_certificate_lifetime_tests;
 mod mtls_auth_tests;
 mod oauth2_introspection_tests;
+mod oidc_refresh_flight_tests;
 mod oidc_relying_party_tests;
 mod opa_tests;
 mod openapi_validator_tests;

@@ -576,17 +576,31 @@ enum RefreshFlightWait {
 /// leader's sender is dropped.
 struct RefreshFlightMap {
     flights: DashMap<[u8; 32], Arc<RefreshFlightSlot>>,
+    /// How long a completed record stays adoptable (`REFRESH_FLIGHT_RETENTION`).
+    retention: Duration,
+    /// Retained-flight cap (`MAX_RETAINED_REFRESH_FLIGHTS`).
+    max_retained: usize,
 }
 
 impl RefreshFlightMap {
     fn new(shard_amount: usize) -> Self {
+        Self::with_limits(shard_amount, REFRESH_FLIGHT_RETENTION, MAX_RETAINED_REFRESH_FLIGHTS)
+    }
+
+    /// Construct with explicit limits. Production always goes through `new`;
+    /// the refresh-flight test seams shrink the limits so eviction and expiry
+    /// are reachable without thousands of flights or a 25-second wait.
+    #[doc(hidden)]
+    fn with_limits(shard_amount: usize, retention: Duration, max_retained: usize) -> Self {
         Self {
             flights: DashMap::with_shard_amount(shard_amount),
+            retention,
+            max_retained,
         }
     }
 
     fn join(&self, key: [u8; 32]) -> RefreshFlightRole {
-        if self.flights.len() >= MAX_RETAINED_REFRESH_FLIGHTS {
+        if self.flights.len() >= self.max_retained {
             self.evict_completed();
         }
         match self.flights.entry(key) {
@@ -596,7 +610,7 @@ impl RefreshFlightMap {
                 let latest = occupied.get().rx.borrow().clone();
                 match latest {
                     None => RefreshFlightRole::Follower(occupied.get().rx.clone()),
-                    Some(record) if record.completed_at.elapsed() < REFRESH_FLIGHT_RETENTION => {
+                    Some(record) if record.completed_at.elapsed() < self.retention => {
                         RefreshFlightRole::Completed(record)
                     }
                     Some(_) => {
@@ -621,14 +635,13 @@ impl RefreshFlightMap {
     /// let a second leader submit the same token.
     fn evict_completed(&self) {
         let now = Instant::now();
+        let retention = self.retention;
         self.flights
             .retain(|_, slot| match slot.rx.borrow().as_ref() {
-                Some(record) => {
-                    now.saturating_duration_since(record.completed_at) < REFRESH_FLIGHT_RETENTION
-                }
+                Some(record) => now.saturating_duration_since(record.completed_at) < retention,
                 None => true,
             });
-        if self.flights.len() < MAX_RETAINED_REFRESH_FLIGHTS {
+        if self.flights.len() < self.max_retained {
             return;
         }
         let mut oldest: Option<([u8; 32], Instant)> = None;
@@ -3824,6 +3837,135 @@ async fn fetch_discovery(
         jwks_uri,
         end_session_endpoint,
     })
+}
+
+/// External coverage seams for the issue #4640 refresh single-flight registry.
+///
+/// Reached only through the lib target's `_test_support` shims by external unit
+/// tests; `src/main.rs` re-declares modules without that bridge, so the module
+/// is unused in the binary target — hence the module-scoped `allow(dead_code)`.
+/// Nothing here is on a request path.
+#[allow(dead_code)]
+#[doc(hidden)]
+pub(crate) mod refresh_flight_test_seams {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use tokio::sync::watch;
+
+    use super::{
+        RefreshFailure, RefreshFlightCleanup, RefreshFlightMap, RefreshFlightRecord,
+        RefreshFlightResult, RefreshFlightRole, RefreshFlightValue, RefreshFlightWait,
+        await_refresh_flight,
+    };
+
+    /// Shard count for the harness map; `DashMap` requires a power of two.
+    const HARNESS_SHARD_AMOUNT: usize = 4;
+
+    /// A `RefreshFlightMap` with caller-chosen retention and cap.
+    pub(crate) struct RefreshFlightHarness {
+        map: RefreshFlightMap,
+    }
+
+    pub(crate) enum RefreshFlightJoin<'a> {
+        Leader(RefreshFlightLeader<'a>),
+        Follower(RefreshFlightFollower),
+        Completed,
+    }
+
+    /// Owns a leader's slot exactly as the request path does: dropping it
+    /// without publishing runs the cancelled-leader cleanup.
+    pub(crate) struct RefreshFlightLeader<'a> {
+        tx: watch::Sender<RefreshFlightValue>,
+        cleanup: RefreshFlightCleanup<'a>,
+    }
+
+    pub(crate) struct RefreshFlightFollower {
+        rx: watch::Receiver<RefreshFlightValue>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum RefreshFlightWaitOutcome {
+        Published,
+        LeaderGone,
+        TimedOut,
+    }
+
+    impl RefreshFlightHarness {
+        pub(crate) fn new(retention: Duration, max_retained: usize) -> Self {
+            Self {
+                map: RefreshFlightMap::with_limits(HARNESS_SHARD_AMOUNT, retention, max_retained),
+            }
+        }
+
+        pub(crate) fn join(&self, key: [u8; 32]) -> RefreshFlightJoin<'_> {
+            match self.map.join(key) {
+                RefreshFlightRole::Leader { tx, slot } => {
+                    RefreshFlightJoin::Leader(RefreshFlightLeader {
+                        tx,
+                        cleanup: RefreshFlightCleanup {
+                            map: &self.map,
+                            key,
+                            slot,
+                            retain: false,
+                        },
+                    })
+                }
+                RefreshFlightRole::Follower(rx) => {
+                    RefreshFlightJoin::Follower(RefreshFlightFollower { rx })
+                }
+                RefreshFlightRole::Completed(_) => RefreshFlightJoin::Completed,
+            }
+        }
+
+        pub(crate) fn evict_completed(&self) {
+            self.map.evict_completed();
+        }
+
+        pub(crate) fn flight_count(&self) -> usize {
+            self.map.flights.len()
+        }
+
+        pub(crate) fn contains(&self, key: &[u8; 32]) -> bool {
+            self.map.flights.contains_key(key)
+        }
+    }
+
+    impl RefreshFlightLeader<'_> {
+        /// Publish a deferred outcome whose `completed_at` lies `age` in the
+        /// past, then retain the slot as a published leader does. Fails only
+        /// when the monotonic clock cannot represent that instant.
+        pub(crate) fn publish_completed_ago(mut self, age: Duration) -> Result<(), String> {
+            let completed_at = Instant::now()
+                .checked_sub(age)
+                .ok_or_else(|| "monotonic clock cannot represent the requested age".to_string())?;
+            let _ = self.tx.send(Some(Arc::new(RefreshFlightRecord {
+                completed_at,
+                result: RefreshFlightResult::Deferred,
+            })));
+            self.cleanup.retain = true;
+            Ok(())
+        }
+    }
+
+    impl RefreshFlightFollower {
+        pub(crate) async fn wait(&mut self) -> RefreshFlightWaitOutcome {
+            match await_refresh_flight(&mut self.rx).await {
+                RefreshFlightWait::Published(_) => RefreshFlightWaitOutcome::Published,
+                RefreshFlightWait::LeaderGone => RefreshFlightWaitOutcome::LeaderGone,
+                RefreshFlightWait::TimedOut => RefreshFlightWaitOutcome::TimedOut,
+            }
+        }
+    }
+
+    /// `From<String>` classification: `Some(error)` when it lands in `Other`,
+    /// `None` when it is treated as a spent credential.
+    pub(crate) fn refresh_failure_from_string(error: String) -> Option<String> {
+        match RefreshFailure::from(error) {
+            RefreshFailure::Other(error) => Some(error),
+            RefreshFailure::InvalidGrant => None,
+        }
+    }
 }
 
 #[cfg(test)]
