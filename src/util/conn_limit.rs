@@ -154,7 +154,7 @@ impl ConnLimiter {
     fn with_per_ip_map(
         max_connections: usize,
         max_connections_per_ip: usize,
-        per_ip_active: DashMap<IpAddr, u64>,
+        per_ip_active: DashMap<IpAddr, u32>,
     ) -> Self {
         let semaphore = if max_connections > 0 {
             // Clamp to the tokio semaphore ceiling so an absurd operator value
