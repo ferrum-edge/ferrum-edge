@@ -209,10 +209,11 @@ mod admission {
 
     use ferrum_edge::config::EnvConfig;
     use ferrum_edge::modes::mesh::app_probe::{
-        AppProbeAdmission, AppProbeBudget, AppProbeServer, DEFAULT_APP_PROBE_MAX_ACTIVE_PROBES,
-        DEFAULT_APP_PROBE_MAX_CONNECTIONS, DEFAULT_APP_PROBE_MAX_CONNECTIONS_PER_IP,
-        parse_app_probes,
+        AppProbeAdmission, AppProbeAdmissionRejection, AppProbeBudget, AppProbeServer,
+        DEFAULT_APP_PROBE_MAX_ACTIVE_PROBES, DEFAULT_APP_PROBE_MAX_CONNECTIONS,
+        DEFAULT_APP_PROBE_MAX_CONNECTIONS_PER_IP, parse_app_probes,
     };
+    use ferrum_edge::overload::OverloadState;
     use ferrum_edge::util::conn_limit::ConnRejectReason;
     use hyper::{Method, StatusCode};
 
@@ -234,7 +235,7 @@ mod admission {
     /// permit is what bounds it, and it is taken before anything is allocated.
     #[test]
     fn the_connection_cap_admits_exactly_max_connections() {
-        let admission = AppProbeAdmission::new(4, 0, 0);
+        let admission = AppProbeAdmission::new(4, 0, 0, None);
         let permits: Vec<_> = (0..4)
             .map(|i| {
                 admission
@@ -247,7 +248,10 @@ mod admission {
         let rejected = admission
             .try_admit(ip(9))
             .expect_err("the fifth connection is over the ceiling");
-        assert_eq!(rejected, ConnRejectReason::MaxConnections);
+        assert_eq!(
+            rejected,
+            AppProbeAdmissionRejection::Limit(ConnRejectReason::MaxConnections)
+        );
         assert_eq!(rejected.as_label(), "max_connections");
 
         // RAII release on every exit shape — the permit is dropped when the
@@ -261,14 +265,17 @@ mod admission {
     /// take the share kubelet's own probes need.
     #[test]
     fn one_source_cannot_take_the_whole_connection_budget() {
-        let admission = AppProbeAdmission::new(8, 2, 0);
+        let admission = AppProbeAdmission::new(8, 2, 0, None);
         let noisy = ip(5);
         let _first = admission.try_admit(noisy).expect("first");
         let _second = admission.try_admit(noisy).expect("second");
         let rejected = admission
             .try_admit(noisy)
             .expect_err("the third from one source exceeds its share");
-        assert_eq!(rejected, ConnRejectReason::MaxConnectionsPerIp);
+        assert_eq!(
+            rejected,
+            AppProbeAdmissionRejection::Limit(ConnRejectReason::MaxConnectionsPerIp)
+        );
         assert_eq!(rejected.as_label(), "max_connections_per_ip");
         // Kubelet's own source is unaffected.
         assert!(admission.try_admit(ip(6)).is_ok());
@@ -277,6 +284,47 @@ mod admission {
         let _v6 = admission.try_admit(peer).expect("first v6");
         let _v6b = admission.try_admit(peer).expect("second v6");
         assert!(admission.try_admit(peer).is_err());
+    }
+
+    /// Critical overload admits no new probe connection, and the refusal costs
+    /// no slot — the flag is checked before the semaphore is touched.
+    #[test]
+    fn critical_overload_admits_no_probe_connection() {
+        let overload = Arc::new(OverloadState::new());
+        let admission = AppProbeAdmission::new(64, 8, 8, Some(Arc::clone(&overload)));
+        assert!(admission.try_admit(ip(1)).is_ok());
+
+        overload
+            .reject_new_connections
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let rejected = admission
+            .try_admit(ip(1))
+            .expect_err("critical overload admits nothing");
+        assert_eq!(rejected, AppProbeAdmissionRejection::Overload);
+        assert_eq!(rejected.as_label(), "overload");
+        assert_eq!(admission.rejected_overload(), 1);
+        let snapshot = admission.limiter_snapshot();
+        assert_eq!(snapshot.rejected_max_connections, 0);
+        assert_eq!(snapshot.rejected_max_connections_per_ip, 0);
+
+        overload
+            .reject_new_connections
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(admission.try_admit(ip(1)).is_ok());
+    }
+
+    /// With no overload state wired (standalone construction) the listener
+    /// never sheds on that dimension.
+    #[test]
+    fn without_overload_state_only_the_caps_apply() {
+        let admission = AppProbeAdmission::new(2, 0, 0, None);
+        let _a = admission.try_admit(ip(1)).expect("first");
+        let _b = admission.try_admit(ip(2)).expect("second");
+        assert_eq!(
+            admission.try_admit(ip(3)).unwrap_err(),
+            AppProbeAdmissionRejection::Limit(ConnRejectReason::MaxConnections)
+        );
+        assert_eq!(admission.rejected_overload(), 0);
     }
 
     /// The active-probe budget is a second, independent dimension: it bounds
@@ -317,7 +365,7 @@ mod admission {
     /// fixed body and `Connection: close`, and no probe runs.
     #[tokio::test]
     async fn an_over_budget_probe_request_is_shed_with_connection_close() {
-        let admission = Arc::new(AppProbeAdmission::new(0, 0, 1));
+        let admission = Arc::new(AppProbeAdmission::new(0, 0, 1, None));
         let server = one_target_server(Arc::clone(&admission));
 
         // Occupy the whole budget the way an in-flight probe would.
@@ -349,7 +397,7 @@ mod admission {
     /// costs nothing and still 404s.
     #[tokio::test]
     async fn an_unknown_target_never_consumes_the_probe_budget() {
-        let admission = Arc::new(AppProbeAdmission::new(0, 0, 1));
+        let admission = Arc::new(AppProbeAdmission::new(0, 0, 1, None));
         let server = one_target_server(Arc::clone(&admission));
         let response = server
             .handle_request_detailed(&Method::GET, "/app-probe/app/nope")
@@ -386,7 +434,7 @@ mod admission {
         );
         assert!(env_config.validate_mesh_app_probe_limits().is_ok());
 
-        let admission = AppProbeAdmission::from_env_config(&env_config);
+        let admission = AppProbeAdmission::from_env_config(&env_config, None);
         let snapshot = admission.limiter_snapshot();
         assert_eq!(snapshot.max_connections, DEFAULT_APP_PROBE_MAX_CONNECTIONS);
         assert_eq!(
