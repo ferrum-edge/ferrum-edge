@@ -303,7 +303,9 @@ async fn workload_metrics_preserves_service_accounts_in_namespace_sa() {
                 Some("sa")
             );
             assert_eq!(
-                metadata.get("mesh.source.service_account").map(String::as_str),
+                metadata
+                    .get("mesh.source.service_account")
+                    .map(String::as_str),
                 Some(account)
             );
         }
