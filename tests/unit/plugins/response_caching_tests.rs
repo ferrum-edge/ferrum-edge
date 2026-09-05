@@ -1026,8 +1026,14 @@ async fn test_expires_invalid_or_past_releases_invalidates_and_never_hits() {
         vec![("cache-control", "max-age=0, max-age=120")],
         vec![("cache-control", "max-age=120, max-age=invalid")],
         vec![("cache-control", "max-age=invalid, max-age=120")],
-        vec![("cache-control", "max-age=120"), ("Cache-Control", "max-age=0")],
-        vec![("Cache-Control", "max-age=120"), ("cache-control", "max-age=0")],
+        vec![
+            ("cache-control", "max-age=120"),
+            ("Cache-Control", "max-age=0"),
+        ],
+        vec![
+            ("Cache-Control", "max-age=120"),
+            ("cache-control", "max-age=0"),
+        ],
         vec![("cache-control", "max-age")],
         vec![("cache-control", "s-maxage=120, s-maxage=invalid")],
         vec![("cache-control", "max-age=120, s-maxage=0")],
@@ -1126,8 +1132,7 @@ async fn test_expires_freshness_precedence_age_and_fallback_with_clock() {
 
         let residency = std::time::Duration::from_secs(fresh_seconds);
         advance_response_caching_clock_for_test(&plugin, residency);
-        let (_, _, headers) =
-            expect_reject(advisory_lookup(&plugin, path, &HashMap::new()).await);
+        let (_, _, headers) = expect_reject(advisory_lookup(&plugin, path, &HashMap::new()).await);
         assert!(cached_age(&headers) >= initial_age + fresh_seconds);
         advance_response_caching_clock_for_test(&plugin, std::time::Duration::from_secs(30));
         assert!(
