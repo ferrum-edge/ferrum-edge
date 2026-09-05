@@ -2438,6 +2438,16 @@ pub mod _test_support {
             .map_err(|error| error.to_string())
     }
 
+    // ── plugins/utils/http_client ────────────────────────────────────────────
+    /// Process-wide number of plugin `reqwest::Client` constructions so far.
+    ///
+    /// Config-load validation sweeps must build a bounded number of clients
+    /// per sweep regardless of how many plugin configs they screen (issue
+    /// #4116); tests take a before/after delta around one full load.
+    pub fn plugin_http_client_builds_for_test() -> u64 {
+        crate::plugins::utils::http_client::plugin_http_client_builds()
+    }
+
     // ── plugins/request_mirror ───────────────────────────────────────────────
     pub fn request_mirror_should_mirror_for_test(
         plugin: &crate::plugins::request_mirror::RequestMirror,

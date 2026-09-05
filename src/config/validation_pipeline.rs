@@ -596,6 +596,17 @@ impl<'a> ValidationPipeline<'a> {
                             backend_allow_ips.clone(),
                         )
                         .with_process_compression_admission_policy();
+                    // Built ONCE for the whole sweep (issue #4116). Every
+                    // enabled plugin config in the namespace is screened here,
+                    // and constructing the two-client validation stack plus its
+                    // resolver per config cost ~20 ms per proxy on both SQLite
+                    // and PostgreSQL — a ten-minute full reload at 30k proxies,
+                    // longer than the poller needs to accumulate another
+                    // saturated change batch, so the fallback thrashed instead
+                    // of converging. Same shape as the single-config
+                    // `validate_plugin_config_with_policy` entry point.
+                    let plugin_http_client =
+                        crate::plugins::plugin_config_validation_http_client(backend_allow_ips);
                     if let Err(graph_errors) =
                         crate::plugins::transaction_log_schema::validate_config_graph(
                             config,
@@ -639,11 +650,14 @@ impl<'a> ValidationPipeline<'a> {
                             }
                             continue;
                         }
-                        if let Err(err) = crate::plugins::validate_plugin_config_with_policy(
-                            &plugin_config.plugin_name,
-                            &plugin_config.config,
-                            backend_allow_ips,
-                        ) {
+                        if let Err(err) =
+                            crate::plugins::validate_plugin_config_with_policy_and_client(
+                                &plugin_config.plugin_name,
+                                &plugin_config.config,
+                                backend_allow_ips,
+                                plugin_http_client.clone(),
+                            )
+                        {
                             let message = format!(
                                 "Plugin '{}' (id={}): {}",
                                 plugin_config.plugin_name, plugin_config.id, err

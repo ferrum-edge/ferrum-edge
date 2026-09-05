@@ -11589,9 +11589,40 @@ pub fn validate_plugin_config_with_policy(
     config: &Value,
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(), String> {
-    let http_client = PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone())
+    let http_client = plugin_config_validation_http_client(backend_allow_ips);
+    validate_plugin_config_with_policy_and_client(name, config, backend_allow_ips, http_client)
+}
+
+/// The validation client [`validate_plugin_config_with_policy`] builds: the
+/// egress-screened default pool client carrying the resolved real-IP header
+/// and the process compression admission policy.
+///
+/// Construction loads platform trust roots and wires a resolver for two
+/// `reqwest` clients, so it costs milliseconds. Sweeps that screen every
+/// enabled plugin config in a namespace (database full loads, file loads, CP
+/// admission) must build it ONCE per sweep and pass it to
+/// [`validate_plugin_config_with_policy_and_client`]: at 60k plugin configs the
+/// per-config shape made a full reload cost ~20 ms per proxy — ten minutes at
+/// 30k proxies — which is longer than the poll loop needs to accumulate another
+/// saturated change batch, so the fallback never converged (issue #4116).
+pub(crate) fn plugin_config_validation_http_client(
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+) -> PluginHttpClient {
+    PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone())
         .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
-        .with_process_compression_admission_policy();
+        .with_process_compression_admission_policy()
+}
+
+/// [`validate_plugin_config_with_policy`] over a caller-built validation
+/// client (see [`plugin_config_validation_http_client`]). Shape/construction
+/// validation and the policy-only egress screen are applied in the same order
+/// as the single-config entry point, so the two cannot drift.
+pub(crate) fn validate_plugin_config_with_policy_and_client(
+    name: &str,
+    config: &Value,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+    http_client: PluginHttpClient,
+) -> Result<(), String> {
     validate_plugin_config_with_http_client(name, config, http_client)?;
     validate_plugin_config_policy_only(name, config, backend_allow_ips)
 }
