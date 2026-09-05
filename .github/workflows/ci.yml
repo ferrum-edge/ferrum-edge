@@ -5819,7 +5819,7 @@ jobs:
           shared-key: "ci-ebpf-programs"
           workspaces: |
             ebpf -> target
-          cache-directories: ${{ github.workspace }}/.cache/sccache
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Install bpf-linker
         uses: ./.github/actions/setup-bpf-linker
@@ -6679,7 +6679,7 @@ jobs:
         continue-on-error: true
         with:
           shared-key: "build-${{ matrix.target }}-${{ github.event_name == 'push' && 'release' || 'prbuild' }}"
-          cache-directories: ${{ github.workspace }}/.cache/sccache
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
