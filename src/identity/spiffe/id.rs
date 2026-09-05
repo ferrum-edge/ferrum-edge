@@ -98,17 +98,44 @@ impl SpiffeId {
         self.path().split('/').filter(|s| !s.is_empty())
     }
 
-    /// Return the Kubernetes service-account name encoded into this SPIFFE ID
-    /// per the Istio convention `<...>/sa/<service-account>`.
+    /// Return `(namespace, service_account)` for the exact Istio workload path
+    /// `ns/<namespace>/sa/<service-account>`, with no prefix or trailing segments.
     ///
-    /// Returns the segment immediately following the first `sa` segment in the
-    /// path. Returns `None` when the path does not contain an `sa` segment or
+    /// Marker positions are structural: a namespace or account named `sa` or
+    /// `ns` is a value, not another marker. URI validation already rejects empty
+    /// segments; Kubernetes-specific name validation remains the caller's job.
+    pub fn kubernetes_identity(&self) -> Option<(&str, &str)> {
+        let mut segments = self.path_segments();
+        match (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ) {
+            (Some("ns"), Some(namespace), Some("sa"), Some(service_account), None) => {
+                Some((namespace, service_account))
+            }
+            _ => None,
+        }
+    }
+
+    /// Return the Kubernetes service-account name encoded into this SPIFFE ID.
+    ///
+    /// Exact Istio workload paths use [`SpiffeId::kubernetes_identity`], so
+    /// `ns/sa/sa/backend` resolves to `backend`, not the namespace's `sa` value.
+    ///
+    /// Other paths retain first-marker extraction: return the segment immediately
+    /// following the first `sa` segment. Returns `None` when there is no `sa` or
     /// when `sa` is the trailing segment. Only the first `sa` segment is
     /// considered — a path like `sa/foo/sa/bar` resolves to `Some("foo")`, not
     /// `Some("bar")`, because Istio places `sa/<name>` at a single canonical
     /// position and accepting later `sa/...` patterns would weaken identity
     /// checks built on top of this helper.
     pub fn service_account(&self) -> Option<&str> {
+        if let Some((_, service_account)) = self.kubernetes_identity() {
+            return Some(service_account);
+        }
         let mut segments = self.path_segments();
         while let Some(segment) = segments.next() {
             if segment == "sa" {
