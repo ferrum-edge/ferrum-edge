@@ -304,7 +304,13 @@ fn test_parse_quoted_values_preserve_literal_content() {
 
 #[test]
 fn test_parse_unclosed_quotes_name_key_and_line_without_value() {
-    for value in ["\"", "'", "\"secret # suffix", "'secret # suffix", "\"secret'"] {
+    for value in [
+        "\"",
+        "'",
+        "\"secret # suffix",
+        "'secret # suffix",
+        "\"secret'",
+    ] {
         let input = format!("# comment\n\nFERRUM_ADMIN_JWT_SECRET = {value}\nKEY = next");
         let err = ConfFile::parse(&input).unwrap_err();
         assert_eq!(
