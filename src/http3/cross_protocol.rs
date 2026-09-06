@@ -132,8 +132,8 @@ use crate::proxy::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER, GrpcResponseKind, proxy_grpc_request_from_bytes,
 };
 use crate::proxy::headers::{
-    ClientResponseFraming, PrePolicyResponseHeaders,
-    RejectBodyDisposition, ResponseTrailerGovernance, TrailerSectionKind, apply_response_headers,
+    ClientResponseFraming, PrePolicyResponseHeaders, RejectBodyDisposition,
+    ResponseTrailerGovernance, TrailerSectionKind, apply_response_headers,
     is_backend_response_strip_header, is_untrusted_real_ip_header, parse_connection_listed_headers,
     reconcile_streaming_backend_trailers, sanitize_backend_request_trailers,
     sanitize_client_response_headers_for_wire, strip_response_hop_by_hop_trailers,
@@ -4252,8 +4252,9 @@ where
         };
 
     let response_via = match &response {
-        PlainBridgeResponse::Reqwest(response) =>
-            crate::proxy::via_header_for_inbound_version(state, response.version()).as_deref(),
+        PlainBridgeResponse::Reqwest(response) => {
+            crate::proxy::via_header_for_inbound_version(state, response.version()).as_deref()
+        }
         // Preserve the shared H1/H2 buffered-response convention for mesh
         // dispatches whose retained response no longer carries a wire version.
         PlainBridgeResponse::MeshBuffered(_) => state.via_header_http11.as_deref(),
@@ -7573,9 +7574,8 @@ where
                 state.via_header_http2.as_deref(),
                 &mut response_headers,
             );
-            response_trailers.retain(|name, _| {
-                !gateway_owned_headers.owns(&name.to_ascii_lowercase())
-            });
+            response_trailers
+                .retain(|name, _| !gateway_owned_headers.owns(&name.to_ascii_lowercase()));
             let header_write = if terminal_gateway_deadline {
                 crate::http3::stream_util::await_terminal_response_write_before_deadline(
                     grpc_deadline_at,

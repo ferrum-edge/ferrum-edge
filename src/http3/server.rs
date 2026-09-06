@@ -7815,7 +7815,7 @@ async fn handle_h3_request(
                         &mut h3_resp.recv_stream,
                         backend_read_timeout_ms,
                         H3StreamingTrailerPolicy {
-                    gateway_owned: gateway_owned_headers,
+                            gateway_owned: gateway_owned_headers,
                             final_headers: &response_headers,
                             pre_policy: &pre_policy_response_headers,
                             governance: response_trailer_governance,
@@ -19964,7 +19964,12 @@ mod response_routing_header_tests {
     #[test]
     fn fallback_and_via_are_independent_and_preserve_existing_hops() {
         for is_fallback in [false, true] {
-            for via in [None, Some("1.1 gateway"), Some("2.0 gateway"), Some("3.0 gateway")] {
+            for via in [
+                None,
+                Some("1.1 gateway"),
+                Some("2.0 gateway"),
+                Some("3.0 gateway"),
+            ] {
                 let mut headers = HashMap::from([("via".into(), "1.1 upstream".into())]);
                 let owned = finalize_h3_response_routing_headers(is_fallback, via, &mut headers);
                 assert_eq!(

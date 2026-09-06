@@ -5231,8 +5231,8 @@ async fn h3_response_via_matches_backend_protocol_for_stream_and_buffer() {
                         .expect("h3 backend"),
                 );
             }
-            let mut config: Value = serde_yaml::from_str(&file_mode_yaml_for_h3(backend_port))
-                .expect("fixture config");
+            let mut config: Value =
+                serde_yaml::from_str(&file_mode_yaml_for_h3(backend_port)).expect("fixture config");
             config["proxies"][0]["response_body_mode"] = json!(body_mode);
             let (harness, _, _) = spawn_h3_harness_with_explicit_https_port_config_and_env(
                 serde_yaml::to_string(&config).unwrap(),
@@ -5251,7 +5251,9 @@ async fn h3_response_via_matches_backend_protocol_for_stream_and_buffer() {
                     .expect("capability probe")
                     .expect("native H3 must be selected");
             }
-            let response = h3_get(&harness, "/api/routing-headers").await.expect("response");
+            let response = h3_get(&harness, "/api/routing-headers")
+                .await
+                .expect("response");
             assert_eq!(response.status.as_u16(), 200, "{protocol}/{body_mode}");
             assert_eq!(response.body_bytes.as_ref(), b"ok");
             assert_eq!(
