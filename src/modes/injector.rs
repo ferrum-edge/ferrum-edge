@@ -636,13 +636,22 @@ fn classify_pod_kind(request: &AdmissionRequest) -> PodKindCheck {
     PodKindCheck::NotPod("no kind or resource metadata".to_string())
 }
 
+/// Parse runtime settings and load serving material without binding a listener.
+/// Shared by `run` and the CLI's pre-deploy validation gate.
+pub(crate) fn load_startup_config(
+    env_config: &EnvConfig,
+) -> Result<(InjectorConfig, Option<TlsAcceptor>), anyhow::Error> {
+    let config = InjectorConfig::from_env_config(env_config)
+        .map_err(|e| anyhow::anyhow!("invalid injector configuration: {e}"))?;
+    let tls_acceptor = build_tls_acceptor(env_config, &config)?;
+    Ok((config, tls_acceptor))
+}
+
 pub async fn run(
     env_config: EnvConfig,
     shutdown_tx: watch::Sender<bool>,
 ) -> Result<(), anyhow::Error> {
-    let config = InjectorConfig::from_env_config(&env_config)
-        .map_err(|e| anyhow::anyhow!("invalid injector configuration: {e}"))?;
-    let tls_acceptor = build_tls_acceptor(&env_config, &config)?;
+    let (config, tls_acceptor) = load_startup_config(&env_config)?;
     let max_connections = env_config.max_connections;
     let shutdown_drain_seconds = env_config.shutdown_drain_seconds;
     let config = Arc::new(config);

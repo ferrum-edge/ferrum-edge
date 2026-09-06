@@ -3188,3 +3188,168 @@ async fn functional_cli_validate_accepts_valid_trusted_proxies() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_rejects_missing_mode_runtime_inputs() {
+    let temp_dir = TempDir::new().unwrap();
+    for (mode, expected) in [
+        ("injector", "injector requires TLS"),
+        ("node_agent", "FERRUM_NODE_AGENT_NODE_NAME is required"),
+    ] {
+        let output = hermetic_validate_command(&temp_dir, &["--mode", mode])
+            .output()
+            .expect("run validate");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.status.success(), "{mode}: {combined}");
+        assert!(combined.contains(expected), "{mode}: {combined}");
+        assert!(!combined.contains("Validation passed."));
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_injector_loads_tls_without_binding() {
+    use rcgen::{CertificateParams, KeyPair};
+
+    let temp_dir = TempDir::new().unwrap();
+    let cert_path = temp_dir.path().join("injector.crt");
+    let key_path = temp_dir.path().join("injector.key");
+    let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let cert = CertificateParams::new(vec!["localhost".into()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    std::fs::write(&key_path, key.serialize_pem()).unwrap();
+    // An already-bound port proves validation does not start the webhook.
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listen_addr = occupied.local_addr().unwrap().to_string();
+    for (material, valid) in [
+        (None, false),
+        (Some("invalid certificate".to_string()), false),
+        (Some(cert.pem()), true),
+    ] {
+        if let Some(contents) = &material {
+            std::fs::write(&cert_path, contents).unwrap();
+        }
+        let output = hermetic_validate_command(&temp_dir, &["--mode", "injector"])
+            .env("FERRUM_INJECTOR_LISTEN_ADDR", &listen_addr)
+            .env("FERRUM_INJECTOR_TLS_CERT_PATH", &cert_path)
+            .env("FERRUM_INJECTOR_TLS_KEY_PATH", &key_path)
+            .output()
+            .expect("run injector validate");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.success(), valid, "{combined}");
+        if valid {
+            assert!(combined.contains("Injector runtime and serving TLS: OK"));
+        } else {
+            assert!(
+                combined.contains("Injector runtime validation failed"),
+                "{combined}"
+            );
+        }
+    }
+    let output = hermetic_validate_command(&temp_dir, &["--mode", "injector"])
+        .env("FERRUM_INJECTOR_LISTEN_ADDR", &listen_addr)
+        .env("FERRUM_INJECTOR_ALLOW_PLAINTEXT", "true")
+        .output()
+        .expect("run explicit development injector validate");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_node_agent_parses_runtime_contract() {
+    let temp_dir = TempDir::new().unwrap();
+    for (fallback, valid) in [("invalid-mode", false), ("fail", true)] {
+        let output = hermetic_validate_command(&temp_dir, &["--mode", "node_agent"])
+            .env("FERRUM_NODE_AGENT_NODE_NAME", "validation-node")
+            .env("FERRUM_NODE_AGENT_FALLBACK_MODE", fallback)
+            .env("FERRUM_ADMIN_HTTP_PORT", "0")
+            .env("FERRUM_ADMIN_HTTPS_PORT", "0")
+            .output()
+            .expect("run node-agent validate");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.success(), valid, "{combined}");
+        if valid {
+            assert!(combined.contains("Node-agent runtime: OK"));
+        } else {
+            assert!(
+                combined.contains("Node-agent runtime validation failed"),
+                "{combined}"
+            );
+        }
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_migration_reads_without_mutation() {
+    let temp_dir = TempDir::new().unwrap();
+    let spec = temp_dir.path().join("migration.yaml");
+    for (contents, expected) in [
+        (None, "Configuration file not found"),
+        (Some("version: ["), "Migration config validation failed"),
+        (Some("proxies: []"), "missing required 'version' field"),
+        (Some("version: \"1\"\nproxies: []\n"), "Validation passed."),
+    ] {
+        if let Some(contents) = contents {
+            std::fs::write(&spec, contents).unwrap();
+        }
+        let output = hermetic_validate_command(&temp_dir, &["--mode", "migrate"])
+            .env("FERRUM_MIGRATE_ACTION", "config")
+            .env("FERRUM_FILE_CONFIG_PATH", &spec)
+            .output()
+            .expect("run migration validate");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.status.success(),
+            expected == "Validation passed.",
+            "{combined}"
+        );
+        assert!(combined.contains(expected), "{combined}");
+        if let Some(contents) = contents {
+            assert_eq!(std::fs::read_to_string(&spec).unwrap(), contents);
+        } else {
+            assert!(!spec.exists());
+        }
+    }
+    let db = temp_dir.path().join("unopened.db");
+    for action in ["up", "status"] {
+        let output = hermetic_validate_command(&temp_dir, &["--mode", "migrate"])
+            .env("FERRUM_MIGRATE_ACTION", action)
+            .env("FERRUM_DB_TYPE", "sqlite")
+            .env("FERRUM_DB_URL", format!("sqlite://{}?mode=rwc", db.display()))
+            .output()
+            .expect("run database migration validate");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!db.exists(), "validate must not open the database");
+    }
+    assert!(std::fs::read_dir(temp_dir.path()).unwrap().all(|entry| {
+        !entry.unwrap().file_name().to_string_lossy().contains("backup")
+    }));
+}
