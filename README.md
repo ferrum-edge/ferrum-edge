@@ -53,15 +53,23 @@ On Kubernetes, map each mode to its chart or external contract in
 
 - **Rust** toolchain — latest stable (the repo pins `channel = "stable"` via `rust-toolchain.toml`; rustup will auto-install on first `cargo` invocation). CI runs clippy with `-D warnings` against the current stable, so local toolchains MUST be at parity.
 - **protoc** (Protocol Buffers compiler) for gRPC code generation — install `protobuf-compiler` or set `PROTOC` to the executable path
+- **sccache and platform linker tools** — required by `.cargo/config.toml`; complete the
+  [one-time bootstrap](CONTRIBUTING.md#one-time-local-bootstrap) before building.
 - **Database** (optional): PostgreSQL, MySQL, SQLite, or MongoDB (for database and CP modes)
 
 ## Installation
 
 ### From Source
 
+The bootstrap below requires Homebrew on macOS or apt-based Linux. The fast-linker
+configuration covers x86_64 and ARM64 GNU/Linux and macOS. For other platforms, manual
+installation, or building without sccache and fast linkers, follow the
+[platform limits and fallback instructions](CONTRIBUTING.md#one-time-local-bootstrap).
+
 ```bash
 git clone https://github.com/ferrum-edge/ferrum-edge.git
 cd ferrum-edge
+./scripts/install-build-deps.sh
 cargo build --release
 
 # Install to PATH
@@ -92,8 +100,13 @@ Published Linux GNU artifacts (`ferrum-edge-linux-x86_64`, `ferrum-cni-linux-x86
 
 ### Docker
 
+Images are published to Docker Hub (`docker.io/ferrumedge/ferrum-edge`, anonymously
+pullable) and to GitHub Container Registry (`ghcr.io/ferrum-edge/ferrum-edge`). Use the
+Docker Hub path unless you have confirmed the GHCR package is visible to you: a GHCR
+package that is not public returns `401 Unauthorized` to an anonymous `docker pull`.
+
 ```bash
-docker pull ghcr.io/ferrum-edge/ferrum-edge:latest
+docker pull docker.io/ferrumedge/ferrum-edge:latest
 
 docker run -d --name ferrum-edge \
   -p 8000:8000 \
@@ -103,7 +116,7 @@ docker run -d --name ferrum-edge \
   -e FERRUM_ADMIN_JWT_SECRET="please-change-me-to-a-32+character-secret" \
   -e FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1 \
   -v ferrum_data:/data \
-  ghcr.io/ferrum-edge/ferrum-edge:latest
+  docker.io/ferrumedge/ferrum-edge:latest
 ```
 
 > **Admin API exposure.** The admin API is a management plane. Both admin

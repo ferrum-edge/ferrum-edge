@@ -646,6 +646,23 @@ fn accept_plugin_http_client(
     }
 }
 
+/// Process-wide count of `reqwest::Client` constructions performed by
+/// [`build_configured_plugin_client`].
+///
+/// Each construction loads the platform trust roots and wires a resolver, so
+/// it costs milliseconds. A config-load validation sweep must therefore build
+/// a bounded number of clients per sweep, not one per plugin config: at 60k
+/// plugin configs the per-config shape made a full reload take minutes and
+/// let the change-log fallback thrash (issue #4116). External tests read this
+/// through `_test_support::plugin_http_client_builds_for_test`.
+static PLUGIN_HTTP_CLIENT_BUILDS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of plugin `reqwest::Client` constructions so far in this process.
+#[allow(dead_code)] // exercised via external integration tests through the lib target
+pub(crate) fn plugin_http_client_builds() -> u64 {
+    PLUGIN_HTTP_CLIENT_BUILDS.load(Ordering::Relaxed)
+}
+
 /// Build a fully-configured plugin `reqwest::Client`, optionally forcing
 /// HTTP/2 prior knowledge for native gRPC / h2c destinations.
 fn build_configured_plugin_client(
@@ -654,6 +671,7 @@ fn build_configured_plugin_client(
     tls_posture: &PluginTlsPosture,
     http2_prior_knowledge: bool,
 ) -> Result<reqwest::Client, PluginHttpClientBuildError> {
+    PLUGIN_HTTP_CLIENT_BUILDS.fetch_add(1, Ordering::Relaxed);
     let crypto_provider = crate::fips::ensure_internal_client_crypto_provider();
     let mut builder = reqwest::Client::builder()
         .no_proxy()

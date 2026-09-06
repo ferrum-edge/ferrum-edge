@@ -2083,11 +2083,18 @@ impl ResponseCaching {
         request_headers: &HashMap<String, String>,
         entry: &CacheEntry,
     ) -> bool {
+        // Lookup admits only GET/HEAD. RFC 9111 §4.3.2 permits a local 304
+        // only for a stored successful response; redirects and errors retain
+        // their ordinary replay status, body, and headers, even with validators.
+        if !(200..300).contains(&entry.status_code) {
+            return false;
+        }
+
         if let Some(if_none_match) = request_headers.get("if-none-match") {
-            return entry
-                .headers
-                .get("etag")
-                .is_some_and(|etag| if_none_match_matches(if_none_match, etag));
+            return if_none_match_matches(
+                if_none_match,
+                entry.headers.get("etag").map(String::as_str),
+            );
         }
 
         if let Some(if_modified_since) = request_headers.get("if-modified-since") {
@@ -2831,19 +2838,20 @@ fn parse_single_entity_tag(value: &str) -> Option<&str> {
     (position == value.len()).then_some(opaque)
 }
 
-fn if_none_match_matches(if_none_match: &str, etag: &str) -> bool {
+fn if_none_match_matches(if_none_match: &str, etag: Option<&str>) -> bool {
     let bytes = if_none_match.as_bytes();
     let mut position = 0;
     skip_etag_ows(bytes, &mut position);
 
-    // `*` is an alternative to the entity-tag list, not a list member.
+    // `*` tests representation existence independently of an ETag. It is an
+    // alternative to the entity-tag list, not a list member.
     if bytes.get(position) == Some(&b'*') {
         position += 1;
         skip_etag_ows(bytes, &mut position);
         return position == bytes.len();
     }
 
-    let Some(current_opaque) = parse_single_entity_tag(etag) else {
+    let Some(current_opaque) = etag.and_then(parse_single_entity_tag) else {
         return false;
     };
     let mut matched = false;
