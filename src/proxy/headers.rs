@@ -1522,7 +1522,7 @@ impl GatewayOwnedResponseHeaders {
         self.0 |= header as u8;
     }
 
-    fn owns(self, field: &str) -> bool {
+    pub(crate) fn owns(self, field: &str) -> bool {
         let bit = match field {
             "via" => GatewayOwnedResponseHeader::Via as u8,
             "alt-svc" => GatewayOwnedResponseHeader::AltSvc as u8,

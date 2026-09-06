@@ -6753,7 +6753,10 @@ pub struct ProxyState {
 }
 
 #[inline]
-fn via_header_for_inbound_version(state: &ProxyState, version: hyper::Version) -> &Option<String> {
+pub(crate) fn via_header_for_inbound_version(
+    state: &ProxyState,
+    version: hyper::Version,
+) -> &Option<String> {
     match version {
         hyper::Version::HTTP_2 => &state.via_header_http2,
         hyper::Version::HTTP_3 => &state.via_header_http3,
