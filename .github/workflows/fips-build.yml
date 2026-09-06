@@ -1412,6 +1412,18 @@ jobs:
     needs: fips-compile
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # The same runner-memory signature issue #4018 documents on
+    # `fips-test-build`, one job earlier in the graph: the dependency graph
+    # finishes (`Checking tikv-jemalloc-ctl` is the last line), the run goes
+    # silent while clippy type-checks the whole `ferrum-edge` crate with every
+    # test module (`--lib --tests`), and the runner dies with `exit code 143`
+    # and "The runner has received a shutdown signal" — or stalls until the
+    # 45-minute cap. Four of forty completed runs over 2026-09-04/05 ended that
+    # way; the rest finish in 11–15 minutes. `CARGO_BUILD_JOBS` bounds the
+    # crates checked side by side in the tail, and the additive swapfile below
+    # gives the single large check the headroom the 7 GiB image lacks.
+    env:
+      CARGO_BUILD_JOBS: "3"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
@@ -1906,6 +1918,26 @@ jobs:
           if [ "$leaked" -ne 0 ]; then
             exit 1
           fi
+
+      # Best-effort, additive, and cleaned up on failure, exactly like the
+      # `fips-test-build` step (issue #4018): insurance for the main-crate
+      # check that follows, not a correctness gate.
+      - name: Enlarge runner swap for the main-crate lint
+        run: |
+          set -uo pipefail
+          ferrum_swap="/mnt/ferrum-fips-swapfile"
+          if sudo fallocate -l 8G "$ferrum_swap" \
+            && sudo chmod 600 "$ferrum_swap" \
+            && sudo mkswap "$ferrum_swap" \
+            && sudo swapon "$ferrum_swap"; then
+            echo "Runner swap enlarged for the FIPS clippy lint (additive 8 GiB Ferrum swapfile)."
+          else
+            echo "::warning::could not enlarge runner swap; continuing on whatever the image provides" >&2
+            sudo swapoff "$ferrum_swap" 2>/dev/null || true
+            sudo rm -f "$ferrum_swap" || true
+          fi
+          awk '/^SwapTotal:/ {print "SwapTotal: " $2 " kB"}' /proc/meminfo
+          free -h
 
       - name: Lint the FIPS profile
         run: |
