@@ -976,7 +976,7 @@ fn image_surfaces_are_scheduled_by_the_trusted_relevance_classifier() {
 fn ambient_udp_production_entry_points_are_scheduled_by_the_trusted_classifier() {
     let filter = read(".github/scripts/live_suite_path_filter.py");
     assert!(
-        filter.contains(r#"r"^src/(cli|main)\.rs$""#),
+        filter.contains(r#"r"^src/(cli|main|gateway_entry)\.rs$""#),
         "a preflight subcommand or dispatch edit must schedule this gate"
     );
     assert!(
@@ -986,6 +986,7 @@ fn ambient_udp_production_entry_points_are_scheduled_by_the_trusted_classifier()
     for pin in [
         r#"("ambient-host-udp", ["src/cli.rs"], True)"#,
         r#"("ambient-host-udp", ["src/main.rs"], True)"#,
+        r#"("ambient-host-udp", ["src/gateway_entry.rs"], True)"#,
         r#"("ambient-host-udp", ["src/modes/node_agent.rs"], True)"#,
         r#"("ambient-host-udp", ["src/proxy/udp_placement_migration.rs"], True)"#,
         r#"("ambient-host-udp", ["src/proxy/udp_placement_cleanup.rs"], True)"#,
