@@ -1786,7 +1786,9 @@ mod tests {
             blocker.await.expect("worker blocker should not panic");
         }
         let latency = probe_thread.join().expect("latency probe should not panic");
-        release_thread.join().expect("worker release should not panic");
+        release_thread
+            .join()
+            .expect("worker release should not panic");
         assert!(
             latency >= Duration::from_millis(25),
             "expected probe to surface ≥25ms saturation, got {:?} \
