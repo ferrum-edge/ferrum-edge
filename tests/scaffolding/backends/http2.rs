@@ -1370,7 +1370,9 @@ mod tests {
             .read_exact(&mut received[..5])
             .await
             .expect("first read");
-        peer.write_all(&preface[5..]).await.expect("second fragment");
+        peer.write_all(&preface[5..])
+            .await
+            .expect("second fragment");
         observed
             .read_exact(&mut received[5..])
             .await
