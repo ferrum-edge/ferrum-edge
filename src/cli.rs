@@ -1589,6 +1589,11 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             std::fs::write(directory.path().join("ferrum.conf"), settings).unwrap();
             std::fs::write(directory.path().join("custom.conf"), settings).unwrap();
+            if index == 1 || index == 2 {
+                // Explicit CLI/env paths must win over a conflicting discovered file.
+                std::fs::write(directory.path().join("ferrum.conf"), "invalid fallback\n")
+                    .unwrap();
+            }
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             command
                 .arg("--exact")
