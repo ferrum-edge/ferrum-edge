@@ -3477,7 +3477,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: fuzz -> target
-          shared-key: fuzz-smoke
+          shared-key: fuzz-smoke-dev
           cache-directories: ${{ github.workspace }}/.cache/sccache
           # Only a push to `main` may write this lane's cache. GitHub already
           # scopes a pull request's cache writes to its own ref; writing
@@ -29197,6 +29197,9 @@ pre_build = []
     # What the adopted profile and lane split require, and what a later pull
     # request must not be able to take back out of it.
     fuzz_smoke_adopted_tampering: dict[str, tuple[str, str]] = {
+        "old optimized cache reused for dev smoke": (
+            "shared-key: fuzz-smoke-dev", "shared-key: fuzz-smoke",
+        ),
         "run profile differs from timed build": (
             "cargo fuzz run --dev", "cargo fuzz run",
         ),

@@ -100,7 +100,12 @@ The job retains the checksum-pinned `setup-sccache` action and
 `Swatinem/rust-cache` payload/ownership policy. `save-if` remains strictly
 `${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}`:
 pull requests (including forks), `merge_group`, and `workflow_dispatch` restore
-but never publish a `fuzz-smoke` cache. Cache splitting, quota survival across
+but never publish a `fuzz-smoke-dev` cache. The new stable cache key separates
+this profile generation from the previous optimized payload: the step-only
+profile overrides are applied after cache restoration, so the old key could
+otherwise hit an immutable entry that cannot be refreshed with dev outputs.
+It also avoids carrying unused optimized artifacts into the new payload.
+Cache splitting, quota survival across
 subsequent main runs, and elimination of redundant cache data are separate
 #4694/#4643 work and are **not established by this profile change**.
 The credential-bearing sccache GHA backend is never enabled. Every run logs

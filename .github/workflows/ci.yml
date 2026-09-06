@@ -5705,7 +5705,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: fuzz -> target
-          shared-key: fuzz-smoke
+          shared-key: fuzz-smoke-dev
           cache-directories: ${{ github.workspace }}/.cache/sccache
           # Only a push to `main` may write this lane's cache. GitHub already
           # scopes a pull request's cache writes to its own ref; writing

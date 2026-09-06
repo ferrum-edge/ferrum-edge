@@ -190,6 +190,7 @@ fn smoke_dev_profile_is_scoped_to_sanitizers_and_matches_build_and_run() {
     }
     assert!(before.contains("          cargo test --locked\n"));
     assert!(!before.contains("--dev"));
+    assert!(before.contains("shared-key: fuzz-smoke-dev\n"));
     assert!(sanitizer.contains(
         "        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'\n"
     ));
