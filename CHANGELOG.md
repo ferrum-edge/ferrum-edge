@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-09-06
+
+Patch release replacing `v0.9.2`, whose release workflow was retracted after
+its SBOM check rejected syft's SPDX 2.3 output (no `documentDescribes`); the
+check now accepts the `SPDXRef-DOCUMENT` `DESCRIBES` relationship. Also carries
+the 2026-09-05 backlog wave: OIDC refresh coalescing, response-caching
+conditional and `Expires` freshness fixes, bodyless-response handling under
+whole-body SSE policies, `Max-Forwards` on proxied `OPTIONS`, Kubernetes watch
+backoff with relist divergence detection, quote-aware `ferrum.conf` comments,
+positional SPIFFE service-account parsing, writable `/data` in the runtime
+images, and the CI reliability fixes (fuzz-smoke deadline, macOS deployment
+target, FIPS clippy headroom, cache-lane diet).
+
 ## [0.9.2] - 2026-09-04
 
 Patch release replacing `v0.9.1`, whose tag commit can never satisfy the
