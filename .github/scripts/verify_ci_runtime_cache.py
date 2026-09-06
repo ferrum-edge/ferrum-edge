@@ -4515,6 +4515,47 @@ def check_fips(workflow: str, failures: list[str]) -> None:
     )
 
 
+# The eBPF image has the same target/profile/features as Ambient's trusted
+# GHCR writer. NodeWaypoint imports that cache anonymously on every event.
+NODE_EBPF_REGISTRY_REF = "type=registry,ref=ghcr.io/ferrum-edge/ferrum-edge-buildcache:ambient-v1-linux-amd64-runtime-ebpf"
+NODE_EBPF_BUILD_WITH = """          context: .
+          file: Dockerfile
+          target: runtime-ebpf
+          build-args: |
+            CARGO_PROFILE=pr-build
+            FEATURES=cloud-secrets,ebpf
+          load: true
+          tags: ferrum-edge:production-ebpf-smoke
+          provenance: false
+"""
+
+
+def check_node_ebpf_registry_reader(job: str, failures: list[str]) -> None:
+    steps = job_steps(job)
+    actions = [step_uses(step) for step in steps if step_uses(step)]
+    require(actions == [CHECKOUT, BUILDX, BUILD_PUSH, BUILD_PUSH],
+            "Node eBPF reader must use only checkout, buildx and two pinned builds", failures)
+    require("persist-credentials: false" in job and "permissions:" not in job,
+            "Node eBPF reader must inherit read-only permissions and disable checkout credentials", failures)
+    require(not any(token in job for token in ("cache-to:", "actions/cache", "docker login", "secrets.")),
+            "Node eBPF reader must not authenticate or export/cache an archive", failures)
+    builds = [step for step in steps if step_uses(step) == BUILD_PUSH]
+    require(len(builds) == 2, "Node eBPF reader must retain warm and cold builds", failures)
+    for index, step in enumerate(builds):
+        cold = index == 1
+        condition = COLD_IS_TRUE if cold else COLD_NOT_TRUE
+        expected = NODE_EBPF_BUILD_WITH
+        if not cold:
+            expected += f"          cache-from: {NODE_EBPF_REGISTRY_REF}\n"
+        require(step_if(step) == condition and step_with(step).strip() == expected.strip(),
+                "Node eBPF build must preserve exact inputs and exclusive warm/cold import policy", failures)
+    require("--phase image-build" in job and "--phase ebpf-inventory" in job
+            and "policy=anonymous-restore-only" in job and "policy=force-cold" in job,
+            "Node eBPF reader must retain image/inventory timing and cache policy telemetry", failures)
+    require("--hit true" not in job and "classify-restore" not in job,
+            "Node eBPF registry telemetry must not invent an Actions cache hit", failures)
+
+
 def check_production_smoke(workflow: str, failures: list[str]) -> None:
     require(
         re.search(r"(?m)^    name: Production Dockerfile eBPF image smoke$", workflow)
@@ -4557,16 +4598,10 @@ def check_production_smoke(workflow: str, failures: list[str]) -> None:
         "production-dockerfile-smoke-default",
         failures,
     )
-    check_buildkit_cache_boundary(
-        ebpf_job,
-        "production-dockerfile-smoke-ebpf",
-        failures,
-    )
+    check_node_ebpf_registry_reader(ebpf_job, failures)
     require(
         "trusted-publish" in default_job
-        and "fork-restore-only" in default_job
-        and "trusted-publish" in ebpf_job
-        and "fork-restore-only" in ebpf_job,
+        and "fork-restore-only" in default_job,
         "production-image telemetry must name the trusted-publish and "
         "fork-restore-only cache-to policies",
         failures,
@@ -4578,24 +4613,11 @@ def check_production_smoke(workflow: str, failures: list[str]) -> None:
         "local BuildKit cache",
         failures,
     )
-    require(
-        "type=local" in ebpf_job
-        and buildkit_cache_key("production-dockerfile-smoke-ebpf") in ebpf_job,
-        "eBPF production-image job must restore a schema- and architecture-scoped "
-        "local BuildKit cache",
-        failures,
-    )
     check_local_cache_actions(
         default_job,
         "production-dockerfile-smoke-default",
         failures,
         scope="production-dockerfile-smoke-default",
-    )
-    check_local_cache_actions(
-        ebpf_job,
-        "production-dockerfile-smoke-ebpf",
-        failures,
-        scope="production-dockerfile-smoke-ebpf",
     )
     check_cache_save_preparation(
         default_job,
@@ -4603,20 +4625,9 @@ def check_production_smoke(workflow: str, failures: list[str]) -> None:
         failures,
         scope="production-dockerfile-smoke-default",
     )
-    check_cache_save_preparation(
-        ebpf_job,
-        "production-dockerfile-smoke-ebpf",
-        failures,
-        scope="production-dockerfile-smoke-ebpf",
-    )
     check_cache_telemetry_evidence(
         default_job,
         "production-dockerfile-smoke-default",
-        failures,
-    )
-    check_cache_telemetry_evidence(
-        ebpf_job,
-        "production-dockerfile-smoke-ebpf",
         failures,
     )
     plan_job = extract_job(workflow, "production-dockerfile-plan")
@@ -5099,6 +5110,27 @@ def check_dockerfile(failures: list[str]) -> None:
 
 def self_test() -> int:
     failures: list[str] = []
+    node_reader = NODE_WORKFLOW.read_text(encoding="utf-8")
+    node_reader = extract_job(node_reader, "production-dockerfile-smoke-ebpf")
+    reader_errors: list[str] = []
+    check_node_ebpf_registry_reader(node_reader, reader_errors)
+    require(not reader_errors, "self-test: Node registry reader must pass", failures)
+    for before, after in (
+        (NODE_EBPF_REGISTRY_REF, "type=registry,ref=ghcr.io/untrusted/cache:latest"),
+        ("target: runtime-ebpf", "target: runtime"),
+        ("FEATURES=cloud-secrets,ebpf", "FEATURES=cloud-secrets"),
+        ("CARGO_PROFILE=pr-build", "CARGO_PROFILE=release"),
+        ("load: true", "load: false"),
+        (COLD_IS_TRUE, COLD_NOT_TRUE),
+        ("persist-credentials: false", "persist-credentials: true"),
+        ("          cache-from:", "          cache-to:"),
+        ("--phase ebpf-inventory", "--phase removed-inventory"),
+    ):
+        mutated = node_reader.replace(before, after)
+        require(mutated != node_reader, "self-test: Node reader mutation must apply", failures)
+        reader_errors = []
+        check_node_ebpf_registry_reader(mutated, reader_errors)
+        require(bool(reader_errors), "self-test: Node reader regression must fail", failures)
     registry_fixture = (
         "jobs:\n" + AMBIENT_REGISTRY_IMAGE_READ_JOB + "\n"
         + AMBIENT_REGISTRY_IMAGE_WRITE_JOB + "\n"

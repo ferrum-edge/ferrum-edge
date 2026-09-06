@@ -262,17 +262,17 @@ cold-cache run still proves every live contract within the existing job
 timeouts.
 
 **Production images.** The ordinary `runtime` and distroless `runtime-ebpf`
-targets build in parallel with `docker/build-push-action`. Each job restores a
-schema- and architecture-scoped local BuildKit cache (`type=local`) through pinned
-`actions/cache/restore`. Cache keys are
-`production-dockerfile-smoke-{default,ebpf}-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}`
-with matching `v1-${{ runner.os }}-${{ runner.arch }}-` restore prefixes. The `v1`
-component is the BuildKit cache schema; bump it only when the exported layout
-changes. The Ambient production-image jobs use target-specific GHCR registry
-caches with separate main writers and read-only PR consumers, documented with
-that live suite.
+targets build in parallel with `docker/build-push-action`. The ordinary image
+restores a schema- and architecture-scoped local BuildKit cache (`type=local`)
+through pinned `actions/cache/restore`, using
+`production-dockerfile-smoke-default-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}`
+and its matching architecture prefix. The `v1` component is the local cache
+schema. The eBPF image instead reads Ambient's public, target-specific GHCR
+cache anonymously, with no export or Actions archive save. Ambient's trusted
+main writer maintains that shared cache. Both images preserve the explicit
+cold-cache dispatch path.
 
-`actions/cache/restore` v4 outputs are classified strictly: `cache-hit == 'true'`
+For the ordinary image's local cache, `actions/cache/restore` v4 outputs are classified strictly: `cache-hit == 'true'`
 is an exact primary-key hit; `cache-hit == 'false'` is a restore-key partial
 match (still a hit); empty `cache-hit` plus empty `cache-matched-key` is an
 ordinary miss. Exact and partial hits require a nonempty matched key and an
@@ -1204,10 +1204,11 @@ eBPF userspace binary with `FEATURES=cloud-secrets,ebpf`, builds the
 image from those cached host-built artifacts instead of recompiling inside
 Docker. A separate production-Dockerfile smoke builds the ordinary `runtime`
 target (which must omit `ip`) and the privileged `runtime-ebpf` target (which
-must contain `ip`) **in parallel** through BuildKit, restoring a scoped local
-BuildKit cache (`type=local`) via pinned `actions/cache/restore` and measuring
-restored bytes from the restored directory. Trusted runs save that cache with
-pinned `actions/cache/save`; fork pull requests restore-only and do not save.
+must contain `ip`) **in parallel** through BuildKit. The ordinary target
+uses its scoped local Actions archive; the eBPF target anonymously imports
+Ambient's matching GHCR cache without exporting or saving another archive.
+The ordinary cache records measured restored bytes and saves only on main
+pushes; pull requests restore without saving.
 Each job then checks a normalized
 filesystem inventory for shells and package managers. A trusted-base path
 planner reads a NUL-delimited `git diff --name-only --no-renames -z` listing and
@@ -1352,8 +1353,8 @@ package must be public before anonymous imports can reuse it. Existing GHA
 entries expire under LRU. See the registry migration section below.
 
 The Fuzz Smoke lane's separate main-only save remains owned by PR #3918. The
-NodeWaypoint/FIPS exact-generation local BuildKit design from PR #3889 is
-unchanged by the Ambient migration.
+ordinary NodeWaypoint image retains its local BuildKit contract from PR #3889;
+the eBPF image now shares Ambient's registry cache. FIPS handoff is unchanged.
 
 The shared `setup-rust-ci` action applies the same restore-only policy to the
 Swatinem rust-cache: `save-if` is true only when the event is neither
@@ -3149,3 +3150,21 @@ not become public merely because their source repository is public. A missing
 cache still builds cold, while a failed registry export fails the writer. See
 [the migration runbook](ghcr_cache_migration.md) for activation, measurement,
 retention and the separate NodeWaypoint/manual-benchmark follow-ups.
+
+### NodeWaypoint eBPF registry cache reuse
+
+The production eBPF image smoke imports the public Ambient
+`ambient-v1-linux-amd64-runtime-ebpf` cache from
+`ghcr.io/ferrum-edge/ferrum-edge-buildcache`. Its Dockerfile, `runtime-ebpf`
+target, `pr-build` profile and `cloud-secrets,ebpf` features match Ambient's
+trusted main writer. NodeWaypoint performs no registry login, export or
+Actions archive save for this image, including on main. This removes its
+duplicate multi-gigabyte BuildKit archive from the 10 GB Actions quota.
+
+The `force_cold_cache` dispatch option omits registry imports. Both paths keep
+the version, iproute2 and distroless inventory assertions, image timing and
+required aggregate. Registry import runs within image-build timing; BuildKit
+logs provide actual layer-reuse evidence. Telemetry records unknown hit/bytes
+for registry reads rather than claiming an Actions cache hit. A missing cache
+can still produce a correct cold build. The ordinary default image retains
+its separate local-cache contract. All package and billing settings stay as-is.
