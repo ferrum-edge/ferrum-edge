@@ -52,3 +52,24 @@ protocol category, byte count, loopback peer, backend port, and connection index
 on protocol-handshake errors. It never logs those bytes or relaxes the fixture's
 error assertion. This captures evidence for an unresolved intermittent fixture
 failure; it is not a claim that the sending path has been repaired.
+
+
+## Scheduling comparison
+
+Dispatch **Resources Scale Benchmark** with `benchmark=unit-compile` to compare
+one and three Cargo jobs on the same source revision. Each standard Ubuntu
+runner starts with empty Cargo target and local sccache directories after setup;
+downloaded dependency sources may be reused. The normal unit suite's default,
+hardening, kTLS and ACME selections and log verifiers run before readiness is
+recorded. Production profiles and ordinary CI scheduling remain unchanged.
+
+Each matrix lane then repeats default and ACME precompilation with its existing
+workspace artifacts. This measures same-workspace reuse after feature switching,
+not a restored Actions cache on another runner. Both cold and warm Cargo reports,
+procfs samples, GNU time logs, test proofs, source/toolchain provenance and readiness
+start/end timestamps are retained for seven days. Full job duration adds setup,
+artifact transfer and cleanup costs. The two runner instances can differ in noise;
+one observation is descriptive and does not establish a robust performance bound.
+The matrix remains fail-fast disabled so either result survives the other failure.
+Do not adopt a lower job count solely from maximum-child RSS: compare concurrent
+samples, paging, cold readiness, warm reuse and total standard-runner minutes.
