@@ -219,6 +219,88 @@ legacy functional filters, can still select tests that under-report
 child-process coverage until their local `kill()` cleanup paths are migrated to
 the shared coverage-aware shutdown helper.
 
+## Artifact fan-in transport and measurements (#4670)
+
+Shard uploads retain the same Actions ZIP containing one
+`coverage-<shard>.tar`, the same packaging `find` exclusions, raw profiles,
+object files, executable permissions, retention, and default ZIP compression.
+The merge job downloads the compressed ZIP through the Actions artifact API
+and streams its single tar member through `unzip -p` into `tar -xpf -`.
+This avoids writing and rereading the intermediate uncompressed tar. It stages
+only one compressed archive at a time and preserves the planner's sequential
+extraction/overwrite order, including all shared paths. No objects are stripped,
+deduplicated, renamed, or selected differently; no profiles are pre-merged.
+
+Artifact IDs come only from the current workflow run's paginated artifact list.
+Each planned name must resolve uniquely to a non-expired artifact, and its ZIP
+must contain exactly the expected tar member. Download failures retain the
+two-attempt retry; failed downloads, invalid ZIPs, CRC errors, tar failures, and
+missing profiles fail the step. The pipeline drains tar end padding so ZIP CRC
+verification finishes, and `pipefail` preserves both processes' failures.
+The required `Merge Coverage` check, shard-success checks, report commands,
+ignore regex, full/changed-line gates, and exact-SHA publication evidence remain
+unchanged. The operative workflow floors remain **77.50% overall**, **84.50%
+plugins**, and **84.98% changed plugin lines**; the earlier baseline table above
+records the historical introduction values.
+
+Before-change observations from the two successful main runs on 2026-09-06:
+
+| Measurement | [34008463617](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34008463617) | [34018271783](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34018271783) |
+| --- | ---: | ---: |
+| Source SHA | `5d586f5e013ec4ea7d0ed573c604bb2ddade4e2f` | `aa251c3326c8d237e46bf8b7346861cec6c7aaf4` |
+| Lib/unit job | 28m02s | 33m39s |
+| Integration job range | 13m07s–14m31s | 17m21s–18m10s |
+| Sum of six shard job durations | 96m12s | 121m55s |
+| Merge Coverage job | 9m58s | 12m10s |
+| Download/extract step | 5m58s | 7m11s |
+| Report generation | 2m22s | 2m53s |
+| Total uploaded shard ZIP bytes | 7,492,574,957 | 7,531,180,534 |
+
+The job-duration sum measures elapsed runner time, excluding queueing, rather
+than billing-rounded minutes. API artifact sizes are exact; the expanded tar
+sizes below are only the rounded `ls -lh` values in the packaging logs, not
+exact extracted-file byte counts.
+
+| Shard | Historical ZIP bytes | Historical tar | Latest ZIP bytes | Latest tar |
+| --- | ---: | ---: | ---: | ---: |
+| lib-unit | 872,186,168 | 4.0 GiB | 878,861,708 | 4.1 GiB |
+| admin-api | 1,205,668,583 | 4.8 GiB | 1,212,123,854 | 4.8 GiB |
+| admin-config | 1,340,759,632 | 5.2 GiB | 1,347,138,224 | 5.3 GiB |
+| mesh-routing | 1,307,752,897 | 5.1 GiB | 1,314,158,779 | 5.2 GiB |
+| mesh-platform | 1,338,184,871 | 5.2 GiB | 1,344,557,956 | 5.3 GiB |
+| protocols-data-plane | 1,428,022,806 | 5.5 GiB | 1,434,340,013 | 5.6 GiB |
+
+Log timestamps put download-to-extract intervals at approximately 3m15s and
+4m43s in total, with the remaining approximately 2m43s and 2m28s spent in
+extraction, cleanup, and other step overhead. The old download interval itself
+includes ZIP decompression and writing the expanded tar, so these are not pure
+network measurements. Streaming removes about 30 GiB of intermediate tar writes
+and rereads per full run; its net wall-time benefit remains unmeasured until
+hosted CI runs this change. ZIP size, upload cost, and report-generation cost
+are not expected to improve. These different-SHA runs are timing evidence, not
+a same-source coverage-equivalence comparison. Identical cross-run object
+content and the cost of duplicate workspace metadata have not been established.
+The latest lib/unit log reports 21m07s compilation and about 9m26s running its
+two suites; this change does not add shards or address compilation latency.
+
+Hosted workflow regression tests exercise the actual transport shell using
+small ZIP/tar fixtures: forced ZIP64 headers, pagination, unplanned artifacts,
+retried partial downloads, exhausted retries, missing/expired/duplicate planned
+artifacts, wrong/extra ZIP members, CRC errors, invalid tars, missing
+profiles, profile bytes, executable modes, and sequential shared-object
+overwrites. Actual coverage artifacts retain their format and objects; ZIP CRC
+checks validate the stream on every hosted merge. The step summary now records
+exact ZIP/tar bytes, download/extraction seconds per shard, and fan-in wall time
+for comparison with subsequent exact-head CI. No local test or benchmark result
+is claimed for this optimization.
+
+Cancellation remains a separate limitation: GitHub re-evaluates job and step
+conditions, and an `always()` job can continue after cancellation
+([workflow cancellation reference](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-cancellation)).
+Both sampled runs succeeded, so they do not measure a cancellation delay.
+The required aggregate's existing `always()` and failure semantics are retained;
+changing cancellation behavior needs a dedicated failing/cancelled-run check.
+
 ## Lowest-Covered Modules (historical snapshot)
 
 > **Historical.** The table and percentages below are a dated local baseline

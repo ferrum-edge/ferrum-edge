@@ -4,9 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
+import tarfile
+import tempfile
+import textwrap
+import zipfile
 from pathlib import Path
 
 from coverage_plan import (
@@ -420,10 +428,188 @@ def validate_docs(failures: list[str]) -> None:
     )
 
 
+def artifact_transport_script(workflow: str) -> str:
+    body = extract_job_body(workflow, "coverage-merge")
+    match = re.search(
+        r"(?ms)^      - name: Download and extract coverage data\n"
+        r".*?^        run: \|\n(?P<script>.*?)^        env:",
+        body,
+    )
+    if not match:
+        raise RuntimeError("missing coverage artifact transport step")
+    return textwrap.dedent(match.group("script"))
+
+
+def validate_artifact_transport(workflow: str, failures: list[str]) -> None:
+    shard = extract_job_body(workflow, "coverage-shard")
+    for token in (
+        "-type d \\( -name incremental -o -name .fingerprint \\) -prune -o",
+        "-type f ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' ! -name '*.o' -print",
+        'tar -cf "coverage-${{ matrix.shard }}.tar" -T coverage-files.txt',
+        'path: coverage-${{ matrix.shard }}.tar',
+        'name: coverage-data-${{ matrix.shard }}',
+    ):
+        require(token in shard, f"coverage payload must retain {token}", failures)
+    script = artifact_transport_script(workflow)
+    for token in (
+        "set -euo pipefail",
+        "gh api --paginate --slurp",
+        'repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts',
+        'select(.name == $name)',
+        'length == 1 and .[0].expired == false',
+        'repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip',
+        'for attempt in 1 2; do',
+        'if [ "$downloaded" != "true" ]; then',
+        'member="coverage-${artifact_name#coverage-data-}.tar"',
+        'if [ "$(unzip -Z1 "$archive")" != "$member" ]; then',
+        'unzip -p "$archive" "$member" | { tar -xpf - && cat > /dev/null; }',
+        'done <<< "$artifact_names"',
+    ):
+        require(token in script, f"coverage transport must retain {token}", failures)
+    require(
+        "gh run download" not in script,
+        "coverage transport must not materialize the intermediate tar",
+        failures,
+    )
+
+
+def self_test_artifact_transport(failures: list[str]) -> None:
+    """Exercise the hosted shell against tiny ZIP/tar fixtures, without network."""
+    workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
+    validate_artifact_transport(workflow, failures)
+    for old, new in (
+        ("set -euo pipefail", "set -eu"),
+        ("gh api --paginate --slurp", "gh api --slurp"),
+        ("length == 1 and .[0].expired == false", "length >= 1"),
+        ('if [ "$downloaded" != "true" ]; then', 'if false; then'),
+        ('tar -xpf - && cat > /dev/null', 'tar -xpf - || true'),
+    ):
+        # Mutate the transport step, not another job's shell prologue.
+        merge_start = workflow.index("  coverage-merge:")
+        transport_start = workflow.index("      - name: Download and extract coverage data", merge_start)
+        changed = workflow[:transport_start] + mutated(workflow[transport_start:], old, new)
+        rejected: list[str] = []
+        validate_artifact_transport(changed, rejected)
+        require(bool(rejected), f"transport mutation not caught: {old}", failures)
+
+    script = artifact_transport_script(workflow)
+    fixture_path = Path(".github/scripts/fixtures/coverage_transport.sh")
+    require(fixture_path.read_text() == script,
+            "coverage transport fixture must exactly match the hosted shell", failures)
+    cases = (
+        "valid", "zip64", "retry", "download-failure", "missing", "expired", "duplicate", "wrong-member",
+        "extra-member", "corrupt-zip", "invalid-tar", "no-profiles",
+    )
+    for case in cases:
+        with tempfile.TemporaryDirectory(prefix="coverage-transport-") as directory:
+            root = Path(directory)
+            scripts = root / ".github/scripts"
+            scripts.mkdir(parents=True)
+            shutil.copy2(PLANNER_PATH, scripts / PLANNER_PATH.name)
+            (scripts / "fixtures").mkdir()
+            shutil.copy2(fixture_path, scripts / "fixtures/coverage_transport.sh")
+            artifacts = []
+            for artifact_id, shard in ((11, LIB_UNIT_SHARD), (12, ADMIN_API_SHARD)):
+                artifact = {"id": artifact_id, "name": f"coverage-data-{shard}", "expired": False}
+                artifacts.append(artifact)
+                contents = io.BytesIO()
+                with tarfile.open(fileobj=contents, mode="w") as archive:
+                    entries = [("debug/deps/shared-object", f"object-{shard}".encode(), 0o755)]
+                    if case != "no-profiles":
+                        entries.append((f"{shard}.profraw", f"profile-{shard}".encode(), 0o644))
+                    for path, data, mode in entries:
+                        entry = tarfile.TarInfo(f"target/llvm-cov-target/{path}")
+                        entry.size, entry.mode = len(data), mode
+                        archive.addfile(entry, io.BytesIO(data))
+                payload = b"not a tar" if case == "invalid-tar" else contents.getvalue()
+                member = "unexpected.tar" if case == "wrong-member" else f"coverage-{shard}.tar"
+                zip_path = root / f"{artifact_id}.zip"
+                with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                    with archive.open(member, "w", force_zip64=(case == "zip64")) as zipped:
+                        zipped.write(payload)
+                    if case == "extra-member":
+                        archive.writestr("extra.tar", payload)
+                if case == "corrupt-zip":
+                    data = bytearray(zip_path.read_bytes())
+                    # Corrupt both declared CRCs, leaving a readable member
+                    # list and valid tar so the extracted bytes fail integrity.
+                    # Info-ZIP streams against the local-header CRC; changing
+                    # only the central directory does not corrupt its payload.
+                    data[data.index(b"PK\x03\x04") + 14] ^= 1
+                    data[data.index(b"PK\x01\x02") + 16] ^= 1
+                    zip_path.write_bytes(data)
+            if case == "missing":
+                artifacts.pop()
+            elif case == "expired":
+                artifacts[-1]["expired"] = True
+            elif case == "duplicate":
+                artifacts.append(dict(artifacts[-1]))
+            # Simulate pagination plus an unplanned artifact that must never be
+            # downloaded, even when it belongs to this same run.
+            (root / "metadata.json").write_text(json.dumps([
+                {"artifacts": artifacts[:1]},
+                {"artifacts": artifacts[1:] + [{"id": 99, "name": "coverage-data-mesh-routing", "expired": False}]},
+            ]), encoding="utf-8")
+            fake_gh = root / "gh"
+            fake_gh.write_text("""#!/usr/bin/env bash
+set -eu
+download() {
+  echo "$1" >> downloads
+  if [ "$TRANSPORT_TEST_CASE" = download-failure ] ||
+     { [ "$TRANSPORT_TEST_CASE" = retry ] && [ ! -f retried ]; }; then
+    touch retried
+    printf 'partial download'
+    exit 1
+  fi
+  cat "$1.zip"
+}
+case "$*" in
+  'api --paginate --slurp repos/example/coverage/actions/runs/42/artifacts') cat metadata.json ;;
+  'api repos/example/coverage/actions/artifacts/11/zip') download 11 ;;
+  'api repos/example/coverage/actions/artifacts/12/zip') download 12 ;;
+  *) echo "unexpected artifact request: $*" >&2; exit 1 ;;
+esac
+""", encoding="utf-8")
+            fake_gh.chmod(0o755)
+            # Avoid a real retry delay while keeping the executed script and
+            # argv literal and inspectable by the trusted automation scanner.
+            fake_sleep = root / "sleep"
+            fake_sleep.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> retry-delays\n')
+            fake_sleep.chmod(0o755)
+            result = subprocess.run(
+                ["bash", ".github/scripts/fixtures/coverage_transport.sh"], cwd=root,
+                env={**os.environ, "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
+                     "TRANSPORT_TEST_CASE": case,
+                     "GITHUB_REPOSITORY": "example/coverage", "GITHUB_RUN_ID": "42",
+                     "GITHUB_STEP_SUMMARY": str(root / "summary.md"),
+                     "PLANNED_SHARDS": json.dumps([LIB_UNIT_SHARD, ADMIN_API_SHARD])},
+                capture_output=True, text=True, timeout=30,
+            )
+            should_succeed = case in {"valid", "zip64", "retry"}
+            require(
+                (result.returncode == 0) == should_succeed,
+                f"transport {case}: exit {result.returncode}; {result.stderr}", failures,
+            )
+            if case in {"retry", "download-failure"}:
+                require((root / "retry-delays").read_text().splitlines() == ["5"], "transport retry delay changed", failures)
+            if case == "download-failure":
+                require((root / "downloads").read_text().splitlines() == ["11", "11"], "transport must stop after two failed downloads", failures)
+            if should_succeed and result.returncode == 0:
+                target = root / "target/llvm-cov-target"
+                for shard in (LIB_UNIT_SHARD, ADMIN_API_SHARD):
+                    require((target / f"{shard}.profraw").read_bytes() == f"profile-{shard}".encode(), "profile bytes changed", failures)
+                obj = target / "debug/deps/shared-object"
+                require(obj.read_bytes() == b"object-admin-api" and (obj.stat().st_mode & 0o777) == 0o755, "shared object overwrite order or executable mode changed", failures)
+                expected_downloads = ["11", "11", "12"] if case == "retry" else ["11", "12"]
+                require((root / "downloads").read_text().splitlines() == expected_downloads, "transport downloaded unplanned or reordered artifacts", failures)
+                require(not (root / "coverage-data").exists() and not list(root.rglob("*.tar")), "transport left an intermediate archive", failures)
+
+
 def validate_repository_contract(failures: list[str]) -> None:
     validate_planner_contract(failures)
     text = WORKFLOW_PATH.read_text(encoding="utf-8")
     validate_workflow_text(text, failures)
+    validate_artifact_transport(text, failures)
     validate_docs(failures)
     if planner_self_test() != 0:
         failures.append("coverage planner self-test failed")
@@ -437,6 +623,7 @@ def mutated(text: str, old: str, new: str) -> str:
 
 def self_test() -> int:
     failures: list[str] = []
+    self_test_artifact_transport(failures)
     if planner_self_test() != 0:
         failures.append("planner self-test failed during verifier self-test")
 
