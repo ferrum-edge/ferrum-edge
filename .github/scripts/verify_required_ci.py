@@ -11,6 +11,10 @@ import textwrap
 from pathlib import Path
 
 from test_release_dispatch import run_self_test as release_dispatch_self_test
+from test_unit_ci import (
+    check_repository as unit_ci_contract_errors,
+    self_test as unit_ci_self_test,
+)
 
 from check_markdown_links import check_repository, run_self_test
 from check_node_agent_chart_runtime import (
@@ -1583,24 +1587,11 @@ def main() -> int:
             "together before running inline or plugin-hardening tests"
         )
 
-    acme_precompile = "Precompile ACME library and DNS hook test binaries"
-    acme_outbound = "Run ACME outbound-boundary regressions"
-    acme_dns_hook = "Run ACME DNS-01 hook cancellation regressions"
-    acme_resume = "Run ACME renewal crash-recovery regressions"
-    if not (
-        unit_body.count(
-            "cargo test --features acme --lib --test unit_tests --no-run"
-        )
-        == 1
-        and 0 <= unit_body.find(acme_precompile)
-        < unit_body.find(acme_outbound)
-        < unit_body.find(acme_dns_hook)
-        < unit_body.find(acme_resume)
-    ):
-        planner_errors.append(
-            "jobs.test-unit must precompile the acme lib and unit_tests binaries "
-            "together before running any ACME filter"
-        )
+    # Optional ACME coverage must use the small DNS target and prove every
+    # required selection. The self-tests exercise missing/ignored tests and
+    # disabled, masked, or retargeted workflow commands (issue #4669).
+    planner_errors.extend(unit_ci_contract_errors())
+    planner_errors.extend(unit_ci_self_test())
 
     pkcs11_body = extract_job_body(ci_yml, "test-pkcs11-softhsm")
     pkcs11_precompile = "Precompile PKCS#11 signer and pairing test binaries"

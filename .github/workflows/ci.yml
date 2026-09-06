@@ -425,14 +425,14 @@ jobs:
         # Compile both targets in one Cargo invocation before running either.
         # Otherwise a hosted runner can pass all inline tests, then lose the
         # entire job while compiling the separate four-test hardening binary.
-        run: cargo test --lib --test unit_tests --no-run
+        run: python3 .github/scripts/run_unit_ci.py default-build -- cargo test --lib --test unit_tests --no-run
         env:
           RUST_BACKTRACE: 1
 
       - name: Run inline lib tests
         # Covers `#[cfg(test)] mod tests` blocks inline in `src/` (used for
         # private fns/structs that the separate tests/ binaries can't see).
-        run: cargo test --lib
+        run: python3 .github/scripts/run_unit_ci.py default-lib -- cargo test --lib
         env:
           RUST_BACKTRACE: 1
 
@@ -522,20 +522,20 @@ jobs:
           RUST_BACKTRACE: 1
 
       - name: Run unit tests
-        run: cargo test --test unit_tests
+        run: python3 .github/scripts/run_unit_ci.py default-unit -- cargo test --test unit_tests
         env:
           RUST_BACKTRACE: 1
 
       - name: Precompile ACME library and DNS hook test binaries
-        # All three ACME filters below run in one of these two libtest binaries.
-        # Compile the pair together so a hosted runner cannot pass one filter,
-        # then spend another full compile window linking the other target.
-        run: cargo test --features acme --lib --test unit_tests --no-run
+        # Keep inline ACME coverage, but compile only the two-test DNS target
+        # alongside it: enabling ACME must not rebuild monolithic unit_tests.
+        # Default suites above retain their full target graph and test counts.
+        run: python3 .github/scripts/run_unit_ci.py acme-build -- cargo test --features acme --lib --test acme_dns01_tests --no-run
         env:
           RUST_BACKTRACE: 1
 
       - name: Run ACME outbound-boundary regressions
-        run: cargo test --features acme --lib tls::acme::client::tests
+        run: python3 .github/scripts/run_unit_ci.py acme-outbound -- cargo test --features acme --lib tls::acme::client::tests
         env:
           RUST_BACKTRACE: 1
 
@@ -544,7 +544,7 @@ jobs:
       # child must not outlive the renewal claim) only has a gate if it is run
       # explicitly with the feature on.
       - name: Run ACME DNS-01 hook cancellation regressions
-        run: cargo test --features acme --test unit_tests tls::acme_dns01_hook_tests
+        run: python3 .github/scripts/run_unit_ci.py acme-dns -- cargo test --features acme --test acme_dns01_tests
         env:
           RUST_BACKTRACE: 1
 
@@ -552,7 +552,7 @@ jobs:
       # recovery) only exists behind `acme`, so the takeover/skip decisions it
       # makes before any ACME networking need the feature on to be gated at all.
       - name: Run ACME renewal crash-recovery regressions
-        run: cargo test --features acme --lib tls::acme_renewal_resume_tests
+        run: python3 .github/scripts/run_unit_ci.py acme-renewal -- cargo test --features acme --lib tls::acme_renewal_resume_tests
         env:
           RUST_BACKTRACE: 1
 

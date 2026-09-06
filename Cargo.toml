@@ -72,6 +72,14 @@ path = "tests/secrets_functional/mod.rs"
 name = "service_integration"
 path = "tests/service_integration/mod.rs"
 
+# The two Unix DNS hook cancellation tests need ACME but no unit-suite
+# scaffolding. Keep this target out of default builds and avoid recompiling
+# the monolithic unit_tests binary for optional-feature CI (issue #4669).
+[[test]]
+name = "acme_dns01_tests"
+path = "tests/acme_dns01/mod.rs"
+required-features = ["acme"]
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
