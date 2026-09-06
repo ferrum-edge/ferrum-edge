@@ -102,8 +102,9 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 - The `fuzz-smoke` job carries TWO exact generations for #4694
   (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first): the current-main seven-target
   #4442 job is `CI_FUZZ_SMOKE_RETIRED_JOB`; `CI_FUZZ_SMOKE_JOB` uses cargo-fuzz
-  0.13.1's `--dev`, explicit ASan, step-local line-table debug info and disabled
-  incremental output, with per-target build/completion/iteration telemetry.
+  0.13.1's `--dev` at optimization level 1, explicit ASan, step-local line-table
+  debug info and disabled incremental output, with per-target
+  build/completion/iteration telemetry.
   Both retain the property gate, every runtime/input/RSS/timeout bound, all pins,
   event scopes and main-push-only cache writes. The spent six-target generation
   is retired. Complete command blocks are frozen separately for each generation;

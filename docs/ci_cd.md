@@ -1764,8 +1764,9 @@ admitted texts, oldest first, with a one-way transition for issue #4694:
 
 - `CI_FUZZ_SMOKE_RETIRED_JOB`: the current-main seven-target #4442 job, including
   #4650's 120-minute outer deadline, using cargo-fuzz's optimized default.
-- `CI_FUZZ_SMOKE_JOB`: the smoke-only `--dev` profile, explicit AddressSanitizer,
-  step-local line-table debug information and disabled incremental output.
+- `CI_FUZZ_SMOKE_JOB`: the smoke-only `--dev` profile with optimization level 1,
+  explicit AddressSanitizer, step-local line-table debug information and
+  disabled incremental output.
   Separate per-target build timing, successful completion markers, libFuzzer
   final execution statistics and lane timing expose the profile tradeoff.
 

@@ -67,7 +67,8 @@ rejects crash artifacts larger than 64 KiB before upload.
   took it off `pull_request` for cost, #4238 off `merge_group` for blast
   radius). Every merged change still reaches the budget seconds later through
   the push to `main`, which is also the only event permitted to populate this
-  lane's cache. The smoke uses `--dev -s address` with 16 codegen units;
+  lane's cache. The smoke uses `--dev -s address` with optimization level 1
+  and 16 codegen units;
   this changes compilation and achieved throughput, not the execution bounds.
 - **Scheduled sanitizer lane** (`.github/workflows/fuzz.yml`): AddressSanitizer
   builds of all seven targets, 300 s per target at `-max_len=65536`, bounded
@@ -82,12 +83,12 @@ The smoke-specific profile experiment uses the documented `--dev` interface in
 shared by `build` and `run`. In that exact version,
 [the Cargo command builder](https://github.com/rust-fuzz/cargo-fuzz/blob/1b34938413a104856042376b285c8d1c1e11b098/src/project.rs#L135-L152)
 omits `--release` when `dev` is set; sanitizer instrumentation is independent
-and remains explicitly selected with `-s address`. The isolated workspace's dev
-profile uses Cargo's default optimization level 0. Debug assertions remain
+and remains explicitly selected with `-s address`. The sanitizer step sets
+optimization level 1. Debug assertions remain
 active (cargo-fuzz also enables them in the predecessor unless `-O` is passed).
 
 Only the bounded sanitizer **step** sets
-`CARGO_PROFILE_DEV_DEBUG=line-tables-only` and
+`CARGO_PROFILE_DEV_OPT_LEVEL=1`, `CARGO_PROFILE_DEV_DEBUG=line-tables-only` and
 `CARGO_PROFILE_DEV_INCREMENTAL=false`. Line tables retain file/line backtrace
 information and match cargo-fuzz 0.13.1's release-mode debug override; incremental
 output is disabled to avoid adding that payload to the shared cache. See
@@ -96,11 +97,20 @@ No manifest, production profile, deterministic property command, scheduled
 workflow, compiler/tool pin, or dependency changes accompany this experiment.
 The scheduled discovery lane keeps cargo-fuzz's optimized default.
 
+The first level-0 experiment in manual run
+[34026677585](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34026677585)
+reduced cold sanitizer time to 19m46s and first compilation to 12m46s. Six
+targets completed 512 iterations, but `config_decode` completed only 45 within
+the unchanged time cap, versus 512 in the optimized baseline. That revision
+was not adopted. Level 1 is being measured to recover throughput while keeping
+compilation cheaper than the production profile; equal time limits alone do
+not establish equivalent smoke coverage.
+
 The job retains the checksum-pinned `setup-sccache` action and
 `Swatinem/rust-cache` payload/ownership policy. `save-if` remains strictly
 `${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}`:
 pull requests (including forks), `merge_group`, and `workflow_dispatch` restore
-but never publish a `fuzz-smoke-dev` cache. The new stable cache key separates
+but never publish a `fuzz-smoke-dev-opt1` cache. The new stable cache key separates
 this profile generation from the previous optimized payload: the step-only
 profile overrides are applied after cache restoration, so the old key could
 otherwise hit an immutable entry that cannot be refreshed with dev outputs.

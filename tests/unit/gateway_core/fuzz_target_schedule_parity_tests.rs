@@ -180,6 +180,7 @@ fn smoke_dev_profile_is_scoped_to_sanitizers_and_matches_build_and_run() {
         .split_once("      - name: Report fuzz lane compiler-cache telemetry\n")
         .expect("the closing telemetry step exists");
     for profile_setting in [
+        "CARGO_PROFILE_DEV_OPT_LEVEL: \"1\"",
         "CARGO_PROFILE_DEV_DEBUG: line-tables-only",
         "CARGO_PROFILE_DEV_INCREMENTAL: \"false\"",
     ] {
@@ -190,7 +191,8 @@ fn smoke_dev_profile_is_scoped_to_sanitizers_and_matches_build_and_run() {
     }
     assert!(before.contains("          cargo test --locked\n"));
     assert!(!before.contains("--dev"));
-    assert!(before.contains("shared-key: fuzz-smoke-dev\n"));
+    assert!(before.contains("shared-key: fuzz-smoke-dev-opt1\n"));
+    assert!(sanitizer.contains("Fuzz sanitizer profile: dev opt-level=1,"));
     assert!(sanitizer.contains(
         "        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'\n"
     ));

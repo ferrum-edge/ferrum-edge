@@ -5705,7 +5705,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: fuzz -> target
-          shared-key: fuzz-smoke-dev
+          shared-key: fuzz-smoke-dev-opt1
           cache-directories: ${{ github.workspace }}/.cache/sccache
           # Only a push to `main` may write this lane's cache. GitHub already
           # scopes a pull request's cache writes to its own ref; writing
@@ -5738,6 +5738,7 @@ jobs:
         # cargo-fuzz 0.13.1 supports --dev; profile overrides apply only here.
         # Keep source locations for ASan and avoid incremental cache payloads.
         env:
+          CARGO_PROFILE_DEV_OPT_LEVEL: "1"
           CARGO_PROFILE_DEV_DEBUG: line-tables-only
           CARGO_PROFILE_DEV_INCREMENTAL: "false"
         run: |
@@ -5745,7 +5746,7 @@ jobs:
 
           sanitizer_started=$SECONDS
           trap 'lane_status=$?; echo "Fuzz sanitizer lane seconds: $((SECONDS - sanitizer_started)); exit status: ${lane_status}"' EXIT
-          echo "Fuzz sanitizer profile: dev, line-tables-only, incremental=false, AddressSanitizer"
+          echo "Fuzz sanitizer profile: dev opt-level=1, line-tables-only, incremental=false, AddressSanitizer"
           sccache_bin="${RUSTC_WRAPPER:-}"
           echo "Fuzz sanitizer lane sccache statistics before the sanitizer build:"
           if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then

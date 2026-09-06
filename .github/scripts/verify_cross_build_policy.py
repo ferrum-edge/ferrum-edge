@@ -3477,7 +3477,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: fuzz -> target
-          shared-key: fuzz-smoke-dev
+          shared-key: fuzz-smoke-dev-opt1
           cache-directories: ${{ github.workspace }}/.cache/sccache
           # Only a push to `main` may write this lane's cache. GitHub already
           # scopes a pull request's cache writes to its own ref; writing
@@ -3510,6 +3510,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
         # cargo-fuzz 0.13.1 supports --dev; profile overrides apply only here.
         # Keep source locations for ASan and avoid incremental cache payloads.
         env:
+          CARGO_PROFILE_DEV_OPT_LEVEL: "1"
           CARGO_PROFILE_DEV_DEBUG: line-tables-only
           CARGO_PROFILE_DEV_INCREMENTAL: "false"
         run: |
@@ -3517,7 +3518,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
 
           sanitizer_started=$SECONDS
           trap 'lane_status=$?; echo "Fuzz sanitizer lane seconds: $((SECONDS - sanitizer_started)); exit status: ${lane_status}"' EXIT
-          echo "Fuzz sanitizer profile: dev, line-tables-only, incremental=false, AddressSanitizer"
+          echo "Fuzz sanitizer profile: dev opt-level=1, line-tables-only, incremental=false, AddressSanitizer"
           sccache_bin="${RUSTC_WRAPPER:-}"
           echo "Fuzz sanitizer lane sccache statistics before the sanitizer build:"
           if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
@@ -29198,7 +29199,19 @@ pre_build = []
     # request must not be able to take back out of it.
     fuzz_smoke_adopted_tampering: dict[str, tuple[str, str]] = {
         "old optimized cache reused for dev smoke": (
-            "shared-key: fuzz-smoke-dev", "shared-key: fuzz-smoke",
+            "shared-key: fuzz-smoke-dev-opt1", "shared-key: fuzz-smoke",
+        ),
+        "unoptimized dev cache reused for opt-level 1 smoke": (
+            "shared-key: fuzz-smoke-dev-opt1", "shared-key: fuzz-smoke-dev",
+        ),
+        "smoke optimization level reduced": (
+            'CARGO_PROFILE_DEV_OPT_LEVEL: "1"', 'CARGO_PROFILE_DEV_OPT_LEVEL: "0"',
+        ),
+        "smoke optimization level raised to production level": (
+            'CARGO_PROFILE_DEV_OPT_LEVEL: "1"', 'CARGO_PROFILE_DEV_OPT_LEVEL: "3"',
+        ),
+        "smoke optimization override removed": (
+            '          CARGO_PROFILE_DEV_OPT_LEVEL: "1"\n', "",
         ),
         "run profile differs from timed build": (
             "cargo fuzz run --dev", "cargo fuzz run",
