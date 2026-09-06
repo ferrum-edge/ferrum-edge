@@ -1,33 +1,41 @@
 # Release profile study
 
-Issue #4674 remains open. No shipping profile or publication path changes in
-this experiment. Dispatch **Release Profile Study** with all protocols and three iterations to compare
-fat LTO / one codegen unit with thin LTO / sixteen codegen units on the same
-source revision. Each uses a standard Linux runner, an empty Cargo target,
-disabled compiler caching, the release profile's other settings and the
-`cloud-secrets` feature. Downloaded dependency sources may be reused.
+Issue #4674 remains open. Dispatch **Release Profile Study** to build fat LTO /
+one codegen unit and thin LTO / sixteen codegen units on one standard Linux
+runner. Both use the same revision, toolchain, native dependencies, other
+release settings and `cloud-secrets` feature. Each compilation starts with an
+empty Cargo target and disabled compiler caching. Downloaded crate sources and
+OS file caches can benefit the second build: the fixed fat-then-thin compile
+order is recorded, and compile-time differences remain descriptive.
 
-Both builds finish before their protocol measurements. Benchmark tools use the
-same unmodified release profile in both lanes. Results retain gateway Cargo
-timings, wall time, maximum-child RSS, page faults, runner-wide vmstat samples,
-source/toolchain/CPU provenance, executable size/hash/version and raw protocol
-results for seven days. The first vmstat row covers time since boot; subsequent
-rows cover five-second intervals. Cargo timings attribute compilation units,
-not every rustc frontend, LLVM and linker subphase. Separate runner instances
-can differ in noise; comparisons are descriptive and need confirmation before
-adopting a tradeoff.
+Both binaries finish before benchmarking. Common benchmark tools use the
+unmodified release profile. The existing full ten-protocol harness runs three
+pairs in fat/thin, thin/fat, fat/thin order, at five seconds, 100 connections and
+10,240 payload bytes (the harness uses 2,048 for UDP). Binaries stay on that
+runner and are selected by copying to the harness's expected path. Each run's
+binary hash must match its compiled profile. No binaries are uploaded or
+published as release assets or images.
 
-This native Linux study is not the pinned GNU sysroot release producer and
-cannot establish the shipping ABI floor. Its binaries are used only inside the
-benchmark job, are not uploaded as release binaries, and are not published as
-images or release assets. Artifact names distinguish both lanes. A successful
-workflow is evidence collection, not approval to change optimization settings.
+The data-only verifier requires all 120 ordered gateway/direct samples, exact
+protocol/control identities, positive finite throughput and p99, the fixed
+workload and zero errors. Missing, duplicate, malformed or error-bearing
+samples fail the study. Raw logs remain available on failure. Hosted self-tests
+exercise rejection cases on changes to the workflow or verifier. Summaries
+report median paired percentage changes, not confidence bounds or equivalence.
 
-Before adoption, agree an explicit tolerated p99/throughput regression budget,
-confirm useful protocol results with no missing/error-only samples, and extend
-measurements to the affected macOS, Windows and protected ARM64/sysroot
-producers. Existing exact-SHA publication gates, Cross isolation, FIPS boundaries
-and install/image/ABI checks remain prerequisites for any shipping change.
+Seven-day artifacts retain both Cargo timing reports, compile logs/wall time,
+maximum-child RSS, page faults, runner-wide vmstat, source/toolchain/CPU
+provenance, executable sizes/hashes/versions and raw/validated protocol results.
+Cargo timings do not isolate every frontend, LLVM and linker subphase. The
+first vmstat row covers time since boot; subsequent rows cover its interval.
+
+A successful study does not authorize shipping changes. Agree a tolerated
+p99/throughput regression budget and extend measurements to affected macOS,
+Windows and protected ARM64/sysroot producers before adoption. This native
+Linux experiment does not establish the shipping GNU ABI floor. Exact-SHA
+publication gates, Cross isolation, FIPS boundaries and install/image/ABI
+checks remain prerequisites. Production profiles and publication paths are
+unchanged.
 
 ## Initial hosted measurements
 
@@ -54,6 +62,6 @@ alone therefore does not establish an error-free benchmark.
 The CPU-model mismatch confounds both compilation and protocol comparisons;
 raw throughput differences cannot be attributed to LTO/codegen settings. The
 observed thin executable is 21.6% larger. These are preliminary measurements,
-not evidence for shipping adoption. A follow-up must compare both produced
-binaries on the same host with interleaved repetitions, require complete valid
-samples, and retain the previously listed platform/ABI and agreed-budget gates.
+not evidence for shipping adoption. The paired workflow above addresses the host mismatch and validates complete
+samples. Its measurements are pending; the platform/ABI and agreed-budget
+gates still apply.
