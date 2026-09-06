@@ -13174,13 +13174,6 @@ LOCAL_ACTION_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
         "b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924",
         "219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925",
     ),
-    # #4643: completed-job cache publication only. Exact reviewed action bytes;
-    # remove this transition after the destination is adopted on main.
-    (
-        "setup-rust-ci/action.yml",
-        "219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925",
-        "1b52b769047dc1ed0ef2b26f9b77603b2c97f9b9f5a87c2da1298e409bf60806",
-    ),
 )
 
 
@@ -20674,15 +20667,10 @@ pre_build = []
             "b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924",
             "219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925",
         ),
-        (
-            "setup-rust-ci/action.yml",
-            "219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925",
-            "1b52b769047dc1ed0ef2b26f9b77603b2c97f9b9f5a87c2da1298e409bf60806",
-        ),
     ):
         failures.append(
             "the setup-rust-ci generation table does not pin the cache-budget "
-            "generation chain, combined #3911 destination, and completed-job cache destination"
+            "generation chain and the rebased combined #3911 destination"
         )
 
     remote_action_composite = (
