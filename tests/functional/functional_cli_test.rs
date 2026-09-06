@@ -3339,7 +3339,10 @@ async fn functional_cli_validate_migration_reads_without_mutation() {
         let output = hermetic_validate_command(&temp_dir, &["--mode", "migrate"])
             .env("FERRUM_MIGRATE_ACTION", action)
             .env("FERRUM_DB_TYPE", "sqlite")
-            .env("FERRUM_DB_URL", format!("sqlite://{}?mode=rwc", db.display()))
+            .env(
+                "FERRUM_DB_URL",
+                format!("sqlite://{}?mode=rwc", db.display()),
+            )
             .output()
             .expect("run database migration validate");
         assert!(
@@ -3350,6 +3353,10 @@ async fn functional_cli_validate_migration_reads_without_mutation() {
         assert!(!db.exists(), "validate must not open the database");
     }
     assert!(std::fs::read_dir(temp_dir.path()).unwrap().all(|entry| {
-        !entry.unwrap().file_name().to_string_lossy().contains("backup")
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("backup")
     }));
 }
