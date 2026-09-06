@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Regression checks for manual version selection and the CI/release boundary."""
 
+import ast
 from pathlib import Path
+import re
+import shlex
+import subprocess
 import unittest
 
 from validate_release_request import validate
@@ -9,6 +13,45 @@ from verify_publication_gate import job_body, _parse_job, _scalar, _sequence, _m
 
 
 class ReleaseRequestTests(unittest.TestCase):
+    def test_trusted_extraction_includes_every_protected_publication_input(self):
+        # Read the canonical inventory as data: importing/executing the large
+        # policy scanner here would repeat its expensive self-test work.
+        source = ast.parse(Path(".github/scripts/verify_cross_build_policy.py").read_text())
+        inventories = [
+            ast.literal_eval(node.value)
+            for node in source.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "PROTECTED_PUBLICATION_GATE_FILES"
+                    for target in node.targets)
+        ]
+        self.assertEqual(len(inventories), 1)
+        protected = set(inventories[0])
+        workflow = Path(".github/workflows/cross-build-policy.yml").read_text()
+        extraction = workflow.split("          extract_automation() {\n", 1)[1].split(
+            "\n          }\n", 1
+        )[0]
+        selection = re.search(
+            r'git ls-tree -rz --name-only "\$commit" -- (.*?) > "\$listing"; then',
+            extraction, re.DOTALL,
+        )
+        self.assertIsNotNone(selection)
+        pathspecs = shlex.split(selection[1].replace("\\\n", ""))
+
+        def selected_files(specs):
+            result = subprocess.run(
+                ["git", "ls-tree", "-rz", "--name-only", "HEAD", "--", *specs],
+                check=True, capture_output=True, timeout=10,
+            )
+            return set(result.stdout.decode().rstrip("\0").split("\0"))
+
+        self.assertFalse(protected - selected_files(pathspecs),
+                         "trusted automation checkout omits protected publication inputs")
+        # Reproduce the old extraction omission without altering the checkout.
+        omitted = [path for path in pathspecs if path != ".github/workflows/release-dispatch.yml"]
+        self.assertIn(".github/workflows/release-dispatch.yml",
+                      protected - selected_files(omitted))
+
     def test_stable_version_matches_exact_checkout(self):
         validate("v1.2.3", "1.2.3", "refs/heads/main", "a" * 40, "a" * 40)
 
