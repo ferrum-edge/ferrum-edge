@@ -2427,11 +2427,12 @@ async fn handle_h3_request(
         return Ok(());
     }
 
-    // Global request admission control (HTTP/3). Single atomic load (~1ns).
+    // Match H1/H2 admission: acquire pairs with begin_drain's release store
+    // when rejecting new streams on already-established connections.
     if state
         .overload
         .reject_new_requests
-        .load(std::sync::atomic::Ordering::Relaxed)
+        .load(std::sync::atomic::Ordering::Acquire)
     {
         record_h3_flavor_aware_reject(&state, http_flavor, 503);
         if grpc_web_response_content_type.is_some() {
