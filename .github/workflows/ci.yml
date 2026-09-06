@@ -6747,7 +6747,9 @@ jobs:
       - name: Save image for inspection
         env:
           IMAGE: ferrum-edge:ci-${{ github.sha }}
-        run: docker save "$IMAGE" | gzip > ferrum-edge-linux-amd64.tar.gz
+        run: |
+          set -euo pipefail
+          docker save "$IMAGE" | gzip > ferrum-edge-linux-amd64.tar.gz
 
       - name: Upload Linux CI image
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

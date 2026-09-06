@@ -50,6 +50,7 @@ class ReleaseRequestTests(unittest.TestCase):
         self.assertNotIn("--release", job_body(ci, "build-binaries"))
         image_body = job_body(ci, "main-linux-image")
         self.assertIn("    needs: [test, build-test-artifacts]\n", image_body)
+        self.assertIn('set -euo pipefail\n          docker save "$IMAGE" | gzip', image_body)
         image = _parse_job(image_body.replace("    needs: [test, build-test-artifacts]\n", ""))
         self.assertEqual(_scalar(image, "if"), "github.event_name == 'push' && github.ref == 'refs/heads/main'")
         for filename in ("ambient-host-udp-live.yml", "node-waypoint-ebpf-live.yml"):

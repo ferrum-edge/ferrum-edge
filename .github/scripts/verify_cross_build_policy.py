@@ -86,7 +86,7 @@ WORKFLOW_CONTRACTS = (
     (
         "CI workflow",
         "main-linux-image",
-        "6fb7634330503ea981d8bc85f972759e0a655194b0eede8e331c4ee06aa3f26f",
+        "ad65ce950b2aa86b2a8c36ac6875ef3bccaaa73e38032f340746b98ec05813aa",
         "143872ebf5dd925529b785273f180671bcc3bbd612d74ef0b88e1b8dce86c774",
         # Pins the top-level `on:` mapping that schedules CI, including
         # unconditional `merge_group: checks_requested` alongside push,
