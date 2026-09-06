@@ -3374,11 +3374,6 @@ def check_rust_cache_trusted_main_save_if(
             "refs/heads/main so pull requests and merge groups restore only",
             failures,
         )
-        require(
-            "cache-on-failure:" in block and "true" in block,
-            f"{source} rust-cache site {index} must keep cache-on-failure true",
-            failures,
-        )
 
 
 def check_direct_rust_cache_diet(
@@ -4697,14 +4692,22 @@ def check_production_smoke(workflow: str, failures: list[str]) -> None:
     )
 
 
+def check_completed_rust_cache_save(action: str, failures: list[str]) -> None:
+    blocks = rust_cache_with_blocks(action)
+    require(len(blocks) == 1, "setup-rust-ci must have one Rust cache step", failures)
+    for block in blocks:
+        values = re.findall(r"(?m)^[ \t]+cache-on-failure:[ \t]*(.*)$", block)
+        require(
+            values == ['"false"'],
+            "setup-rust-ci must publish Rust caches only after successful jobs",
+            failures,
+        )
+
+
 def check_shared_actions(failures: list[str]) -> None:
     rust_ci = SETUP_RUST.read_text(encoding="utf-8")
     sccache = SETUP_SCCACHE.read_text(encoding="utf-8")
-    require(
-        "cache-on-failure:" in rust_ci and "true" in rust_ci,
-        "setup-rust-ci must save rust-cache after ordinary failures when post-job cleanup still runs",
-        failures,
-    )
+    check_completed_rust_cache_save(rust_ci, failures)
     require(
         "cache-hit:" in rust_ci,
         "setup-rust-ci must expose rust-cache hit/miss as an action output",
@@ -5110,6 +5113,21 @@ def check_dockerfile(failures: list[str]) -> None:
 
 def self_test() -> int:
     failures: list[str] = []
+    completed_cache = SETUP_RUST.read_text(encoding="utf-8")
+    cache_errors: list[str] = []
+    check_completed_rust_cache_save(completed_cache, cache_errors)
+    require(not cache_errors, "self-test: completed-cache action must pass", failures)
+    for replacement in (
+        'cache-on-failure: "true"',
+        '# cache-on-failure: "false"',
+        "cache-on-failure: ${{ always() }}",
+        'cache-on-failure: "false"\n        cache-on-failure: "true"',
+    ):
+        mutated = completed_cache.replace('cache-on-failure: "false"', replacement)
+        cache_errors = []
+        require(mutated != completed_cache, "self-test: cache mutation must apply", failures)
+        check_completed_rust_cache_save(mutated, cache_errors)
+        require(bool(cache_errors), "self-test: incomplete cache save must fail", failures)
     node_reader = NODE_WORKFLOW.read_text(encoding="utf-8")
     node_reader = extract_job(node_reader, "production-dockerfile-smoke-ebpf")
     reader_errors: list[str] = []

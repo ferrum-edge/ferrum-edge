@@ -3192,3 +3192,33 @@ Hosted validation must confirm the Two-Cluster reader restores the Netns key
 and passes its complete live suite. The broader quota issue still requires
 Unit/Lint/Artifacts retention across subsequent main runs; this change alone
 is not evidence that every required cache survives.
+
+### Completed-job Rust cache saves (#4643)
+
+Main run 34064592905 was cancelled during dependency fetching before its Istio
+job compiled anything. Its failure-save post-action published a 168,625,963-byte
+archive under the normal immutable cache key. Later exact-hit consumers cannot
+enrich that entry because the pinned cache action treats an exact hit as up to
+date. This compounds cancellation amplification and quota eviction.
+
+
+`setup-rust-ci` now sets `cache-on-failure: "false"`. The pinned cache action's
+post-step runs on job success, so cancellation during fetch or compilation
+cannot reserve a normal immutable key with an incomplete archive. Cache writes
+remain restricted to trusted main events; PRs and merge groups only restore.
+This changes the shared action only: direct cache sites, including the separate
+FIPS producer contract, retain their existing policies.
+
+A failed job no longer publishes new dependency/compiler state even if its
+compilation completed before a later test failed. It can still read a previously
+completed archive. This tradeoff prevents the observed fetch-only archive from
+remaining the exact-key baseline indefinitely. The runtime-cache verifier covers
+enabled, commented-out, expression-based and duplicate failure-save regressions.
+Hosted adoption and subsequent main reuse must be verified before treating
+#4643 as resolved; this policy does not by itself bring all archives under quota.
+
+The action's frozen trusted-base comparison requires the explicitly authorized
+reviewed policy adoption. No generation admission or ruleset change is retained.
+Known incomplete archives need separate evidence-based retirement so a subsequent
+successful main producer can populate their keys. Do not purge unrelated caches.
+Capacity stays at 10 GB and spending budgets stay at $0.
