@@ -5632,7 +5632,8 @@ jobs:
     # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
     # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
     # issue #3902 decides where each half of it runs, and issue #4442 decides
-    # which targets it covers. This is its entire
+    # which targets it covers. Issue #4694 selects the smoke-only dev profile.
+    # This is its entire
     # permitted shape. Every command, action pin, toolchain pin, tool version,
     # target name, and libFuzzer bound below is part of the contract, so a pull
     # request cannot widen the budget, change the target list, add a step, or
@@ -5640,15 +5641,15 @@ jobs:
     #
     # Lane split (#3902, narrowed by #4238): the deterministic property smoke
     # stays the required gate and runs on pull_request AND merge_group. The
-    # sanitizer-instrumented libFuzzer build spends roughly 39 minutes
-    # compiling to buy under a minute of fuzzing, so it runs only on the push
+    # sanitizer-instrumented libFuzzer build historically spent roughly 39
+    # minutes compiling for under a minute of fuzzing, so it runs only on the push
     # to `main` and on manual dispatch.
     #
     # #3902 took it off the pull-request path for cost. #4238 takes it off the
     # merge_group path for blast radius: a hosted-runner reclamation (exit 143)
     # anywhere in that ~38-minute window ejected the queue entry and cascaded a
     # rebuild of every entry behind it, and it did so without a defect in the
-    # ejected change. Discovery coverage is unchanged -- every merged change is
+    # ejected change. Every merged change is
     # still fuzzed at byte-identical bounds by the push to `main` that follows
     # it, which is also the only event permitted to populate this lane's cache.
     #
@@ -5728,17 +5729,23 @@ jobs:
       - name: Run bounded libFuzzer smoke budget
         # Issue #4238: the push to `main` and manual dispatch only. This step
         # is a probabilistic DISCOVERY run, not a verdict on one diff, so it
-        # must not be able to eject a merge-queue entry: its bounds buy about
-        # 48 seconds of fuzzing behind roughly 39 minutes of sanitizer compile,
-        # and a runner reclamation in that window costs the whole queue.
+        # must not be able to eject a merge-queue entry. A runner reclamation
+        # during sanitizer compilation costs the whole queue.
         # Every merged change still reaches this budget through the push to
         # `main`, at byte-identical bounds, seconds later.
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         working-directory: fuzz
+        # cargo-fuzz 0.13.1 supports --dev; profile overrides apply only here.
+        # Keep source locations for ASan and avoid incremental cache payloads.
+        env:
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+          CARGO_PROFILE_DEV_INCREMENTAL: "false"
         run: |
           set -euo pipefail
 
           sanitizer_started=$SECONDS
+          trap 'lane_status=$?; echo "Fuzz sanitizer lane seconds: $((SECONDS - sanitizer_started)); exit status: ${lane_status}"' EXIT
+          echo "Fuzz sanitizer profile: dev, line-tables-only, incremental=false, AddressSanitizer"
           sccache_bin="${RUSTC_WRAPPER:-}"
           echo "Fuzz sanitizer lane sccache statistics before the sanitizer build:"
           if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
@@ -5749,22 +5756,33 @@ jobs:
 
           for fuzz_target in traceparent config_decode proxy_protocol mesh_udp_frame k8s_crd plugin_config; do
             echo "Fuzz smoke target: ${fuzz_target}"
-            cargo fuzz run --codegen-units 16 "$fuzz_target" -- \
+            compile_started=$SECONDS
+            cargo fuzz build --dev --codegen-units 16 -s address "$fuzz_target"
+            echo "Fuzz smoke compile seconds: ${fuzz_target}: $((SECONDS - compile_started))"
+            run_started=$SECONDS
+            cargo fuzz run --dev --codegen-units 16 -s address "$fuzz_target" -- \
               -runs=512 \
               -max_total_time=8 \
               -max_len=4096 \
               -timeout=2 \
-              -rss_limit_mb=1024
+              -rss_limit_mb=1024 \
+              -print_final_stats=1
+            echo "Fuzz smoke completed: ${fuzz_target}; run seconds (including Cargo freshness check): $((SECONDS - run_started))"
           done
 
           echo "Fuzz smoke target: datagram_client_address"
-          cargo fuzz run --codegen-units 16 datagram_client_address -- \
+          compile_started=$SECONDS
+          cargo fuzz build --dev --codegen-units 16 -s address datagram_client_address
+          echo "Fuzz smoke compile seconds: datagram_client_address: $((SECONDS - compile_started))"
+          run_started=$SECONDS
+          cargo fuzz run --dev --codegen-units 16 -s address datagram_client_address -- \
             -runs=512 \
             -max_total_time=8 \
             -max_len=65536 \
             -timeout=2 \
-            -rss_limit_mb=1024
-          echo "Fuzz sanitizer lane seconds: $((SECONDS - sanitizer_started))"
+            -rss_limit_mb=1024 \
+            -print_final_stats=1
+          echo "Fuzz smoke completed: datagram_client_address; run seconds (including Cargo freshness check): $((SECONDS - run_started))"
 
       - name: Report fuzz lane compiler-cache telemetry
         if: always()

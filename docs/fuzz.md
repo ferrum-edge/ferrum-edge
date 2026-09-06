@@ -39,9 +39,9 @@ duplicate authentication and duplicate freshness TLVs, a wrong-length freshness
 value, and an authenticated-shape envelope (freshness + tag TLVs).
 
 Because the whole `fuzz-smoke` job is byte-frozen, scheduling the target
-required a new admitted generation of that job rather than an edit, and the
-`fuzz.yml` whole-file freeze had to move with it. That is a direct-to-`main`
-trusted-policy change; no pull request can carry it.
+required a coordinated trusted-policy migration of that job and the
+`fuzz.yml` whole-file freeze. Ordinary PR admission cannot authorize its own
+policy changes; the controller owns any override for an authorized migration.
 
 Shared budgets and helpers live in `src/fuzz_support.rs`.
 
@@ -57,7 +57,8 @@ rejects crash artifacts larger than 64 KiB before upload.
   (`cargo test --locked` in `fuzz/`). This is the required full-mode
   pull-request gate and runs on every full-mode pull request.
 - **Bounded libFuzzer budget** (same `Fuzz Smoke` job, `if: github.event_name ==
-  'push' || github.event_name == 'workflow_dispatch'`): six targets at ~8 s each
+  'push' || github.event_name == 'workflow_dispatch'`): six targets at up to
+  512 executions or roughly 8 s each
   (`-runs=512`, `-max_total_time=8`, `-max_len=4096`, `-timeout=2`,
   `-rss_limit_mb=1024`), then `datagram_client_address` at the same bounds with
   `-max_len=65536` (issue #4442). It runs on the push to `main` and on manual
@@ -66,31 +67,66 @@ rejects crash artifacts larger than 64 KiB before upload.
   took it off `pull_request` for cost, #4238 off `merge_group` for blast
   radius). Every merged change still reaches the budget seconds later through
   the push to `main`, which is also the only event permitted to populate this
-  lane's cache.
+  lane's cache. The smoke uses `--dev -s address` with 16 codegen units;
+  this changes compilation and achieved throughput, not the execution bounds.
 - **Scheduled sanitizer lane** (`.github/workflows/fuzz.yml`): AddressSanitizer
   builds of all seven targets, 300 s per target at `-max_len=65536`, bounded
   crash artifacts uploaded after size/count checks, a 2048 MiB RSS cap, 7-day
   retention, and concurrency capped at two targets. Unchanged by #3902/#4238.
 
-`cargo fuzz run` defaults to AddressSanitizer, so the bounded budget is a
-sanitizer build in both lanes. That build, not the fuzzing, was the cost: the
-`Fuzz Smoke` job averaged ~47 minutes on pull requests, of which ~39 minutes was
-compiling the instrumented targets for ~48 seconds of fuzzing. The `Fuzz Smoke`
-job now uses the repository's checksum-pinned `setup-sccache` action and
-persists its bounded local cache directory through `Swatinem/rust-cache`.
-`save-if` is strictly `${{ github.event_name == 'push' && github.ref ==
-'refs/heads/main' }}`: pull requests (including same-repository PR refs and
-forks), `merge_group`, and `workflow_dispatch` never publish a `fuzz-smoke`
-cache. The generation that predates #3902 had no `save-if` at all, which is how
-a full-mode predecessor PR could still mint a PR-ref Fuzz cache; neither
-admitted generation can create another.
+Issue #4694 records a successful main baseline of **53m02s** for Fuzz Smoke,
+including **37m22s** compiling the first sanitizer target and **41m35s** in the
+sanitizer step ([run 34018271780](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34018271780/job/101447338009)).
+The smoke-specific profile experiment uses the documented `--dev` interface in
+[cargo-fuzz 0.13.1's BuildOptions](https://github.com/rust-fuzz/cargo-fuzz/blob/1b34938413a104856042376b285c8d1c1e11b098/src/options.rs),
+shared by `build` and `run`. In that exact version,
+[the Cargo command builder](https://github.com/rust-fuzz/cargo-fuzz/blob/1b34938413a104856042376b285c8d1c1e11b098/src/project.rs#L135-L152)
+omits `--release` when `dev` is set; sanitizer instrumentation is independent
+and remains explicitly selected with `-s address`. The isolated workspace's dev
+profile uses Cargo's default optimization level 0. Debug assertions remain
+active (cargo-fuzz also enables them in the predecessor unless `-O` is passed).
+
+Only the bounded sanitizer **step** sets
+`CARGO_PROFILE_DEV_DEBUG=line-tables-only` and
+`CARGO_PROFILE_DEV_INCREMENTAL=false`. Line tables retain file/line backtrace
+information and match cargo-fuzz 0.13.1's release-mode debug override; incremental
+output is disabled to avoid adding that payload to the shared cache. See
+[Cargo profile settings](https://doc.rust-lang.org/cargo/reference/profiles.html).
+No manifest, production profile, deterministic property command, scheduled
+workflow, compiler/tool pin, or dependency changes accompany this experiment.
+The scheduled discovery lane keeps cargo-fuzz's optimized default.
+
+The job retains the checksum-pinned `setup-sccache` action and
+`Swatinem/rust-cache` payload/ownership policy. `save-if` remains strictly
+`${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}`:
+pull requests (including forks), `merge_group`, and `workflow_dispatch` restore
+but never publish a `fuzz-smoke` cache. Cache splitting, quota survival across
+subsequent main runs, and elimination of redundant cache data are separate
+#4694/#4643 work and are **not established by this profile change**.
 The credential-bearing sccache GHA backend is never enabled. Every run logs
-`Fuzz property smoke seconds`, the lane shape it took, a closing
-`sccache --show-stats`, and the on-disk cache size; runs that execute the
-sanitizer budget add a second `--show-stats` just before it plus `Fuzz
-sanitizer lane seconds`, so the log shows directly whether the sanitizer build
-reused compilation. When sccache is unavailable the job emits a warning
-annotation rather than letting caching fail silently.
+`Fuzz property smoke seconds`, lane shape, closing `sccache --show-stats`, and
+on-disk compiler-cache size. Sanitizer runs also log pre-build sccache statistics,
+the selected profile, a separate `cargo fuzz build` duration for each target,
+and a completion marker after each successful bounded `cargo fuzz run`.
+The run timer includes Cargo's freshness check, so it is not pure libFuzzer
+time. Unfiltered libFuzzer output includes `Done ... runs` and, with
+`-print_final_stats=1`, `stat::number_of_executed_units`, execution rate and peak
+RSS. Read those actual per-target counts; 512 is a ceiling, not a claimed
+completion count. An EXIT trap records sanitizer lane time and exit status even
+on ordinary command failure; runner termination may prevent the trap. Build or
+fuzz failures still fail the step, and no completion marker precedes success.
+
+Hosted validation is pending until the controller runs **manual `ci.yml` on the
+exact pushed branch SHA**; PR CI exercises only the deterministic property gate
+when admitted. The existing trusted-base policy may reject this migration until
+the controller arranges its authorized admission; candidate self-tests never
+override that decision.
+Compare first-target compilation, subsequent target links, total lane/job time,
+actual executions, peak RSS, cache bytes and diagnostic source locations with
+the optimized baseline, controlling source/toolchain and cache state for a fair
+comparison. Dev code may complete fewer iterations or hit existing timeout/RSS
+limits; equal seconds do not demonstrate equal fuzzing throughput or coverage.
+No sanitizer crash is deliberately introduced to validate diagnostics.
 
 Both hosted shapes are byte-frozen by the trusted Cross build policy. The
 `fuzz-smoke` job is admitted as two generations with a one-way transition

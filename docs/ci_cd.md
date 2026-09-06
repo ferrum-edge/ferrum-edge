@@ -1697,8 +1697,8 @@ shapes and nothing else:
   of the fully linked, sanitizer-instrumented fuzz binaries.
 
   Because a whole-job freeze cannot express an edit, a change to *where* each
-  half of the lane runs (#3902, #4238) or to *which targets* the budget covers
-  (#4442) is admitted as two byte-frozen **generations** with a one-way
+  half of the lane runs (#3902, #4238), *which targets* the budget covers
+  (#4442), or its smoke build profile (#4694) is admitted as two byte-frozen **generations** with a one-way
   transition between them (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first) — the
   same shape as the admitted `release.yml` image-family adoption. See
   [Admitted `fuzz-smoke` lane-split generation](#admitted-fuzz-smoke-lane-split-generation).
@@ -1759,113 +1759,67 @@ unreviewed place to set a target linker, runner, or rustflags.
 
 ###### Admitted `fuzz-smoke` lane-split generation
 
-The whole job is frozen, so neither moving the lane nor extending its target
-list can be an edit. `CI_FUZZ_SMOKE_JOB_GENERATIONS` therefore lists the job's
-admitted texts oldest first, and a generation retires once its successor is on
-`main`. The pair currently carries issue #4442.
+The whole job is frozen. `CI_FUZZ_SMOKE_JOB_GENERATIONS` lists exactly two
+admitted texts, oldest first, with a one-way transition for issue #4694:
 
-- `CI_FUZZ_SMOKE_RETIRED_JOB` — the shape issue #4238 landed. `Fuzz Smoke` had
-  been the longest job in required pull-request CI (roughly 47 minutes, of which
-  roughly 46 were compilation) because the six sanitizer-instrumented libFuzzer
-  targets were rebuilt from scratch on every pull request to buy about 48
-  seconds of actual fuzzing. #3902 moved that budget off the pull-request path
-  and added the checksum-pinned `setup-sccache` compiler cache; #4238 moved it
-  off `merge_group` as well, because a hosted-runner reclamation (`exit 143`)
-  inside the ~38-minute window ejected the queue entry and cascaded a rebuild of
-  everything behind it with no defect in the ejected change. In this shape the
-  deterministic property smoke is the required `pull_request` and `merge_group`
-  gate, and the six-target bounded budget runs on the push to `main` and on
-  `workflow_dispatch` only.
-- `CI_FUZZ_SMOKE_JOB` — the adopted shape (#4442): identical, plus a seventh
-  bounded libFuzzer invocation for `datagram_client_address`.
+- `CI_FUZZ_SMOKE_RETIRED_JOB`: the current-main seven-target #4442 job, including
+  #4650's 120-minute outer deadline, using cargo-fuzz's optimized default.
+- `CI_FUZZ_SMOKE_JOB`: the smoke-only `--dev` profile, explicit AddressSanitizer,
+  step-local line-table debug information and disabled incremental output.
+  Separate per-target build timing, successful completion markers, libFuzzer
+  final execution statistics and lane timing expose the profile tradeoff.
 
-  That target parses the Datagram PROXY v2 envelope — address block, the `0xE0`
-  authentication-tag and `0xE1` freshness TLVs, and the freshness value — on
-  attacker-controlled UDP input, entirely **before** the MAC decision. It had
-  been registered, corpus-seeded, and property-tested since #3289/#3862, but
-  neither libFuzzer lane executed it, so no lane was actually fuzzing that
-  parser.
+The spent six-target #4238 generation is no longer admitted. Both remaining
+shapes retain all seven targets: the six-target loop at `-max_len=4096`, plus
+`datagram_client_address` at its documented `-max_len=65536`. Every invocation
+keeps `-runs=512`, `-max_total_time=8`, `-timeout=2`, and `-rss_limit_mb=1024`.
+The generation-specific `CI_FUZZ_SMOKE_[RETIRED_]BOUNDED_BUDGET` and
+`CI_FUZZ_SMOKE_[RETIRED_]DATAGRAM_BUDGET` constants freeze the complete command
+blocks. Self-tests check each block occurs exactly once in its generation and
+compare the five literal runtime bounds with fixed expected values.
 
-  It is invoked on its own rather than appended to the six-target loop because
-  its documented input budget is 64 KiB (`fuzz_support::MAX_FUZZ_INPUT_BYTES`),
-  not the loop's 4 KiB. The scheduled `fuzz.yml` lane runs every target at
-  `-max_len=65536`; running this one at 4 KiB here would leave the same parser's
-  length boundaries reachable in one required lane and unreachable in the other.
-  Every other bound — `-runs=512`, `-max_total_time=8`, `-timeout=2`,
-  `-rss_limit_mb=1024` — is byte-identical to the loop's, so the budget is
-  widened by one target rather than relaxed.
+The remaining invariants are unchanged:
 
-What is invariant across both generations:
+- `cargo test --locked` remains the deterministic full-mode `pull_request` and
+  `merge_group` property gate, with no profile override on that step.
+- The sanitizer step runs only under the literal allowlist
+  `if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'`;
+  the job itself restricts pushes to `main` and retains its 120-minute deadline.
+- The sole local action remains the checksum-pinned `setup-sccache` installer.
+  It never enables the credential-bearing GHA backend, and its fail-closed
+  `GITHUB_ENV` wrapper decision is not overridden by job-level environment.
+  Local-action surfaces remain subject to their own policy comparison.
+- Inherited linker flags are cleared with `RUSTFLAGS: ""`. All compiler, tool,
+  dependency and action pins remain unchanged.
+- Cache payload configuration is unchanged. `Swatinem/rust-cache` saves only
+  under `${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}`;
+  PRs, forks, merge groups and manual runs restore but never write this cache.
+- The optimized scheduled `fuzz.yml` and its whole-file contract are unchanged,
+  as are production profiles and the required aggregate wiring
+  (`CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS`).
 
-- the property smoke runs the same `cargo test --locked` and is the required
-  full-mode `pull_request` and `merge_group` gate;
-- the six-target loop is byte-identical. The self-test asserts
-  `CI_FUZZ_SMOKE_BOUNDED_BUDGET` — the six `Fuzz smoke target:` markers, the
-  `cargo fuzz run --codegen-units 16` invocation, and `-runs=512`,
-  `-max_total_time=8`, `-max_len=4096`, `-timeout=2`, `-rss_limit_mb=1024` —
-  appears exactly once in every generation, so a generation can never move or
-  extend the lane and relax its bounds in the same change;
-- the seventh invocation is frozen the same way in the adopted generation only.
-  `CI_FUZZ_SMOKE_DATAGRAM_BUDGET` must appear exactly once in
-  `CI_FUZZ_SMOKE_JOB` and never in `CI_FUZZ_SMOKE_RETIRED_JOB`, and the
-  self-test separately asserts its 64 KiB `-max_len` and each shared bound;
-- the bounded budget is gated by an **allow-list** —
-  `if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'`
-  — not by excluding events. The self-test rejects a `!=` form outright;
-- compiler caching is admitted only through the repository's own
-  `./.github/actions/setup-sccache`, the single local action the contract
-  permits. That action installs a checksum-pinned sccache release, never enables
-  the credential-bearing sccache GHA backend, never persists
-  `ACTIONS_RUNTIME_TOKEN` / `ACTIONS_RESULTS_URL` into later
-  pull-request-controlled steps, asserts those variables are absent before any
-  build runs, and clears the wrapper entirely if the install fails. Local
-  actions are not exempt from the policy: `validate_action_collection` and
-  `compare_pr_action_collection` reject a Cross executable or configuration
-  input in any of them, and the action's own surfaces are attributed to
-  `actions/<name>`, never withheld with the job's;
-- the job does not pin `RUSTC_WRAPPER` at job level — a job-level `env` entry
-  would override the installer's fail-closed `GITHUB_ENV` decision — while
-  `RUSTFLAGS: ""` stays, because the root Cargo configuration still selects a
-  mold linker this lane does not install;
-- the sccache directory is persisted by the pinned `Swatinem/rust-cache` step
-  under `save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}`
-  and nothing else. That predicate is the cache-quota control: `pull_request`
-  (same-repository PR refs and forks), `merge_group`, and `workflow_dispatch`
-  may restore a `fuzz-smoke` cache but cannot publish one;
-- telemetry: the job prints `Fuzz property smoke seconds`, `Fuzz sanitizer lane
-  seconds`, sccache statistics before and after the sanitizer build, the lane
-  shape it took, and the on-disk cache size — so a hosted log shows whether the
-  sanitizer build actually reused work, and warns explicitly when sccache was
-  unavailable.
+`admitted_fuzz_smoke_errors` accepts only the two exact texts (or absence before
+initial adoption). `admitted_fuzz_smoke_removal_errors` rejects removal or a move
+to an older generation after adoption. Both generations are withheld symmetrically
+from surface comparison, so the explicit direction check remains load-bearing.
+No admission function or scanner is relaxed for this migration. The trusted
+base still controls admission; a candidate policy cannot authorize itself.
+The controller owns any override needed to land this authorized policy migration.
 
-The transition is exact on both ends and one-way. `admitted_fuzz_smoke_errors`
-accepts a `fuzz-smoke` job only at one of these two texts (or absent);
-`admitted_fuzz_smoke_removal_errors` refuses both removal and a move to a lower
-generation. That direction check is load-bearing rather than decorative: every
-admitted generation is withheld from *both* sides of the surface comparison, so
-the digest comparison alone would accept a revert. The self-test drives the full
-transition through `compare_pr_workflow_job` in both directions, re-runs every
-shared tamper mutation against each generation, and adds adopted-generation
-mutations covering what #3902, #4238, and #4442 introduced — restoring the
-sanitizer budget to pull requests, dropping it from the push to `main`,
-re-adding it to the merge queue, skipping the property gate on pull requests,
-allowing untrusted cache writes, substituting an unpinned third-party sccache
-installer, enabling the credential-bearing GHA backend, widening the cached
-directory, deleting the `datagram_client_address` invocation, re-bounding it to
-the generic 4 KiB ceiling, and pointing it at a target the loop already covers.
+Self-tests exercise admission and the full aggregate transition in both
+directions, target deletion, changed bounds/pins/events/cache ownership, failure
+suppression, profile mismatch between build and run, disabled ASan, removed
+source locations, incremental output, and missing timing/completion/statistics.
+The external fuzz scheduling tests also bind the smoke profile to the sanitizer
+step while retaining the property and optimized scheduled commands.
 
-The scheduled lane's own contract carries the same target inventory: the
-`fuzz.yml` freeze includes `datagram_client_address` in both the matrix and the
-shell allowlist, and the self-test rejects a revision that drops it from either.
+See [fuzz.md](fuzz.md#hosted-ci) for exact cargo-fuzz 0.13.1 source provenance,
+logging semantics and the pending hosted experiment. Equal runtime limits do
+not imply equivalent achieved iterations or discovery coverage. Cache survival
+on later main runs remains separate acceptance work for #4694.
 
-The aggregate wiring is unaffected: this is still one job named `fuzz-smoke`,
-so `CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS` and the `require_success "Fuzz Smoke"`
-assertion are byte-identical across the transition.
-
-Delete `CI_FUZZ_SMOKE_RETIRED_JOB` from `CI_FUZZ_SMOKE_JOB_GENERATIONS` — and the
-`("retired fuzz-smoke generation", CI_FUZZ_SMOKE_RETIRED_JOB)` self-test row with
-it — once the adopted generation is on `main` and no supported base still carries
-the retired one.
+Retire the predecessor job and budget constants once this generation is on
+`main` and no supported base needs the predecessor.
 
 ##### Admitted release image-family adoption (`-ebpf-tools`)
 

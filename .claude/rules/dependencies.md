@@ -99,27 +99,21 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   still compared byte for byte, and the wiring cannot be removed once adopted. A
   committed `.cargo/config[.toml]` below the repository root is rejected
   outright.
-- The `fuzz-smoke` job carries TWO admitted generations, now for issue #4442
-  (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first): `CI_FUZZ_SMOKE_RETIRED_JOB`
-  is #4238's shape — the deterministic property smoke as the required
-  `pull_request`/`merge_group` gate, the six-target libFuzzer budget on push to
-  `main` / `workflow_dispatch` only, and `./.github/actions/setup-sccache` plus
-  a `main`-push-only `save-if` cache (`pull_request`, fork, `merge_group`, and
-  `workflow_dispatch` restore but never publish a `fuzz-smoke` cache);
-  `CI_FUZZ_SMOKE_JOB` adds a seventh bounded invocation for
-  `datagram_client_address` at `-max_len=65536`, that target's documented 64 KiB
-  budget, so one hostile-UDP parser's length boundaries are reachable in BOTH
-  required lanes rather than only the scheduled one. The
-  transition is exact on both ends and
-  one-way — withholding is symmetric, so `admitted_fuzz_smoke_removal_errors` is
-  what refuses a revert. `CI_FUZZ_SMOKE_BOUNDED_BUDGET` must appear exactly once
-  in every generation and `CI_FUZZ_SMOKE_DATAGRAM_BUDGET` exactly once in the
-  adopted one, so a generation can never move or extend the lane and relax its
-  bounds at the same time. `FUZZ_WORKFLOW` carries the same target in the
-  scheduled matrix and the literal shell allowlist. Delete the retired
-  generation once the adopted one is
-  on `main`. See `docs/ci_cd.md` → "Admitted `fuzz-smoke` lane-split
-  generation".
+- The `fuzz-smoke` job carries TWO exact generations for #4694
+  (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first): the current-main seven-target
+  #4442 job is `CI_FUZZ_SMOKE_RETIRED_JOB`; `CI_FUZZ_SMOKE_JOB` uses cargo-fuzz
+  0.13.1's `--dev`, explicit ASan, step-local line-table debug info and disabled
+  incremental output, with per-target build/completion/iteration telemetry.
+  Both retain the property gate, every runtime/input/RSS/timeout bound, all pins,
+  event scopes and main-push-only cache writes. The spent six-target generation
+  is retired. Complete command blocks are frozen separately for each generation;
+  self-tests also compare literal runtime bounds. Admission/scanner logic and
+  the optimized `FUZZ_WORKFLOW` remain unchanged. The transition is exact and
+  one-way; the trusted base controls admission and the controller owns any
+  override for an authorized policy migration. Retire the predecessor once its
+  successor is on `main`. See `docs/ci_cd.md` → "Admitted `fuzz-smoke` lane-split
+  generation" and `docs/fuzz.md` for pending hosted measurement and separate
+  cache-survival acceptance.
 - `release.yml` is admitted in exactly two shapes
   (`RELEASE_IMAGE_FAMILY_GENERATIONS`): the current two image families, or those
   plus the complete frozen `-ebpf-tools` contract (`docker-ebpf-tools-manifest`

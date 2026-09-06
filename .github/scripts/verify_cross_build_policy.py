@@ -3216,36 +3216,16 @@ NODE_WAYPOINT_RELEVANCE_CONTRACT = {
 # a new image family: as two byte-frozen GENERATIONS with a one-way transition
 # between them (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first).
 #
-# The pair now carries issue #4442. Issue #4238's own transition is spent: its
-# adopted generation reached `main`, and the rule is to retire a generation once
-# that is true, so the #3902 shape it retired is gone from this file.
-#
-#   * `CI_FUZZ_SMOKE_RETIRED_JOB` is #4238's adopted shape: the deterministic
-#     property smoke as the required pull-request and merge_group gate, and the
-#     six-target bounded budget on push to `main` / manual dispatch only.
-#   * `CI_FUZZ_SMOKE_JOB` is the adopted shape: identical except that the
-#     bounded budget additionally fuzzes `datagram_client_address`.
-#
-#     That target parses the Datagram PROXY v2 envelope -- address block, the
-#     `0xE0` authentication tag and `0xE1` freshness TLVs, and the freshness
-#     value -- on attacker-controlled UDP input, entirely BEFORE the MAC
-#     decision. It has been registered, corpus-seeded, and property-tested
-#     since #3289/#3862, but neither libFuzzer lane executed it, so no lane
-#     was actually fuzzing that parser.
-#
-#     It is invoked on its own rather than appended to the six-target loop
-#     because its documented input budget is 64 KiB, not the loop's 4 KiB. The
-#     scheduled sanitizer lane in `fuzz.yml` runs every target at `-max_len=
-#     65536`; running this one at 4 KiB here would leave the same parser's
-#     length boundaries reachable in one required lane and unreachable in the
-#     other. Every other bound -- `-runs`, `-max_total_time`, `-timeout`,
-#     `-rss_limit_mb` -- is byte-identical to the loop's, so the budget is
-#     widened by one target, not relaxed.
-#
-#     `CI_FUZZ_SMOKE_DATAGRAM_BUDGET` freezes that invocation the way
-#     `CI_FUZZ_SMOKE_BOUNDED_BUDGET` freezes the loop: the adopted generation
-#     must carry it verbatim exactly once, so a later revision cannot quietly
-#     drop the seventh target or re-bound it to the generic 4 KiB ceiling.
+# The pair now carries issue #4694. The spent six-target #4238 generation is
+# retired. CI_FUZZ_SMOKE_RETIRED_JOB is the current-main seven-target #4442
+# shape, including #4650's 120-minute outer deadline. CI_FUZZ_SMOKE_JOB uses
+# cargo-fuzz 0.13.1's documented --dev with explicit AddressSanitizer, step-local
+# line-table debug info and no incremental output. Per-target build/run timing,
+# completion markers and libFuzzer final statistics make the tradeoff observable.
+# Equal time bounds do not imply equal iterations or discovery coverage.
+# Both generations retain every target, runtime/input/RSS/timeout bound, property
+# command, event scope, cache ownership rule and tool/dependency pin. Production
+# profiles and the optimized scheduled FUZZ_WORKFLOW are unchanged.
 #
 # Both generations are admitted so the trusted base stays valid while the
 # transition lands, and so the destination revision validates against a policy
@@ -3255,153 +3235,11 @@ NODE_WAYPOINT_RELEVANCE_CONTRACT = {
 # symmetric across generations, so that explicit check — not the digest
 # comparison — is what makes the direction stick.
 #
-# `CI_FUZZ_SMOKE_BOUNDED_BUDGET` is the bounded loop itself, asserted verbatim in
-# every generation by the self-test: the six target markers, the `cargo fuzz
-# run` invocation, and the `-runs` / `-max_total_time` / `-max_len` / `-timeout`
-# / `-rss_limit_mb` bounds cannot drift while a generation is added.
+# The generation-specific BOUNDED_BUDGET and DATAGRAM_BUDGET constants freeze
+# the complete command blocks; self-tests additionally compare the literal
+# runtime bounds across generations. No admission or scanner logic changes.
 CI_FUZZ_SMOKE_JOB_NAME = "fuzz-smoke"
 CI_FUZZ_SMOKE_RETIRED_JOB = r"""  fuzz-smoke:
-    # Byte-frozen by the trusted Cross build policy
-    # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
-    # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
-    # issue #3902 decides where each half of it runs. This is its entire
-    # permitted shape. Every command, action pin, toolchain pin, tool version,
-    # target name, and libFuzzer bound below is part of the contract, so a pull
-    # request cannot widen the budget, change the target list, add a step, or
-    # redirect this job at a repository-supplied script.
-    #
-    # Lane split (#3902, narrowed by #4238): the deterministic property smoke
-    # stays the required gate and runs on pull_request AND merge_group. The
-    # six-target, sanitizer-instrumented libFuzzer build spends roughly 39
-    # minutes compiling to buy roughly 48 seconds of fuzzing, so it runs only
-    # on the push to `main` and on manual dispatch.
-    #
-    # #3902 took it off the pull-request path for cost. #4238 takes it off the
-    # merge_group path for blast radius: a hosted-runner reclamation (exit 143)
-    # anywhere in that ~38-minute window ejected the queue entry and cascaded a
-    # rebuild of every entry behind it, and it did so without a defect in the
-    # ejected change. Discovery coverage is unchanged -- every merged change is
-    # still fuzzed at byte-identical bounds by the push to `main` that follows
-    # it, which is also the only event permitted to populate this lane's cache.
-    name: Fuzz Smoke
-    needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    # The repository-root Cargo config also selects the mold linker through
-    # per-target rustflags, and this isolated lane installs no fast linker, so
-    # the inherited rustflags are cleared explicitly. The rustc wrapper is
-    # deliberately NOT pinned here: `setup-sccache` below publishes either the
-    # checksum-verified sccache path or an empty value through `GITHUB_ENV`,
-    # and a job-level `env` entry of the same name would override that
-    # fail-closed decision.
-    env:
-      RUSTFLAGS: ""
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
-        with:
-          persist-credentials: false
-
-      - name: Install required build dependency
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends protobuf-compiler
-
-      - name: Install pinned nightly toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
-        with:
-          toolchain: nightly-2025-07-01
-
-      # The repository's own checksum-pinned sccache installer, and the only
-      # local action this contract admits. It never enables the
-      # credential-bearing sccache GHA backend, never persists
-      # ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL into later steps, asserts
-      # those credentials are absent before any build runs, and fails closed to
-      # no wrapper at all. It must run BEFORE the cache restore below so the
-      # lazily started sccache server indexes the restored entries.
-      - uses: ./.github/actions/setup-sccache
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          workspaces: fuzz -> target
-          shared-key: fuzz-smoke
-          cache-directories: ${{ github.workspace }}/.cache/sccache
-          # Only a push to `main` may write this lane's cache. GitHub already
-          # scopes a pull request's cache writes to its own ref; writing
-          # nothing at all from an untrusted ref is the stronger statement,
-          # and it keeps every compiler artifact the sanitizer build reuses
-          # attributable to code that has already merged.
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-
-      - name: Install pinned cargo-fuzz
-        run: cargo install cargo-fuzz --locked --version 0.13.1
-
-      - name: Run deterministic property smoke tests
-        working-directory: fuzz
-        run: |
-          set -euo pipefail
-
-          property_started=$SECONDS
-          cargo test --locked
-          echo "Fuzz property smoke seconds: $((SECONDS - property_started))"
-
-      - name: Run bounded libFuzzer smoke budget
-        # Issue #4238: the push to `main` and manual dispatch only. This step
-        # is a probabilistic DISCOVERY run, not a verdict on one diff, so it
-        # must not be able to eject a merge-queue entry: its bounds buy about
-        # 48 seconds of fuzzing behind roughly 39 minutes of sanitizer compile,
-        # and a runner reclamation in that window costs the whole queue.
-        # Every merged change still reaches this budget through the push to
-        # `main`, at byte-identical bounds, seconds later.
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        working-directory: fuzz
-        run: |
-          set -euo pipefail
-
-          sanitizer_started=$SECONDS
-          sccache_bin="${RUSTC_WRAPPER:-}"
-          echo "Fuzz sanitizer lane sccache statistics before the sanitizer build:"
-          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
-            "$sccache_bin" --show-stats
-          else
-            echo "sccache is unavailable; this sanitizer build cannot reuse compiler output"
-          fi
-
-          for fuzz_target in traceparent config_decode proxy_protocol mesh_udp_frame k8s_crd plugin_config; do
-            echo "Fuzz smoke target: ${fuzz_target}"
-            cargo fuzz run --codegen-units 16 "$fuzz_target" -- \
-              -runs=512 \
-              -max_total_time=8 \
-              -max_len=4096 \
-              -timeout=2 \
-              -rss_limit_mb=1024
-          done
-          echo "Fuzz sanitizer lane seconds: $((SECONDS - sanitizer_started))"
-
-      - name: Report fuzz lane compiler-cache telemetry
-        if: always()
-        run: |
-          set -euo pipefail
-
-          if [ "$GITHUB_EVENT_NAME" = "push" ] || [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "Fuzz lane shape: property gate plus the six-target sanitizer budget"
-          else
-            echo "Fuzz lane shape: deterministic property gate only"
-          fi
-
-          sccache_bin="${RUSTC_WRAPPER:-}"
-          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
-            echo "Fuzz lane sccache statistics after this run:"
-            "$sccache_bin" --show-stats
-            du -sh "${GITHUB_WORKSPACE}/.cache/sccache" || true
-          else
-            echo "::warning::sccache was unavailable; this fuzz run compiled without a compiler cache"
-          fi
-"""
-CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
     # Byte-frozen by the trusted Cross build policy
     # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
     # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
@@ -3561,38 +3399,241 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
           fi
 """
 
+CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
+    # Byte-frozen by the trusted Cross build policy
+    # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
+    # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
+    # issue #3902 decides where each half of it runs, and issue #4442 decides
+    # which targets it covers. Issue #4694 selects the smoke-only dev profile.
+    # This is its entire
+    # permitted shape. Every command, action pin, toolchain pin, tool version,
+    # target name, and libFuzzer bound below is part of the contract, so a pull
+    # request cannot widen the budget, change the target list, add a step, or
+    # redirect this job at a repository-supplied script.
+    #
+    # Lane split (#3902, narrowed by #4238): the deterministic property smoke
+    # stays the required gate and runs on pull_request AND merge_group. The
+    # sanitizer-instrumented libFuzzer build historically spent roughly 39
+    # minutes compiling for under a minute of fuzzing, so it runs only on the push
+    # to `main` and on manual dispatch.
+    #
+    # #3902 took it off the pull-request path for cost. #4238 takes it off the
+    # merge_group path for blast radius: a hosted-runner reclamation (exit 143)
+    # anywhere in that ~38-minute window ejected the queue entry and cascaded a
+    # rebuild of every entry behind it, and it did so without a defect in the
+    # ejected change. Every merged change is
+    # still fuzzed at byte-identical bounds by the push to `main` that follows
+    # it, which is also the only event permitted to populate this lane's cache.
+    #
+    # Target inventory (#4442): `datagram_client_address` is the seventh smoke
+    # target. It is invoked on its own rather than from the six-target loop
+    # because its documented input budget is 64 KiB
+    # (`fuzz_support::MAX_FUZZ_INPUT_BYTES`) rather than the loop's 4 KiB, and
+    # the scheduled sanitizer lane already fuzzes it at that ceiling. A parser
+    # whose length boundaries are reachable in one required lane and not the
+    # other is not actually scheduled. Every other bound is byte-identical to
+    # the loop's.
+    name: Fuzz Smoke
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    # The repository-root Cargo config also selects the mold linker through
+    # per-target rustflags, and this isolated lane installs no fast linker, so
+    # the inherited rustflags are cleared explicitly. The rustc wrapper is
+    # deliberately NOT pinned here: `setup-sccache` below publishes either the
+    # checksum-verified sccache path or an empty value through `GITHUB_ENV`,
+    # and a job-level `env` entry of the same name would override that
+    # fail-closed decision.
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install required build dependency
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly-2025-07-01
+
+      # The repository's own checksum-pinned sccache installer, and the only
+      # local action this contract admits. It never enables the
+      # credential-bearing sccache GHA backend, never persists
+      # ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL into later steps, asserts
+      # those credentials are absent before any build runs, and fails closed to
+      # no wrapper at all. It must run BEFORE the cache restore below so the
+      # lazily started sccache server indexes the restored entries.
+      - uses: ./.github/actions/setup-sccache
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: fuzz -> target
+          shared-key: fuzz-smoke
+          cache-directories: ${{ github.workspace }}/.cache/sccache
+          # Only a push to `main` may write this lane's cache. GitHub already
+          # scopes a pull request's cache writes to its own ref; writing
+          # nothing at all from an untrusted ref is the stronger statement,
+          # and it keeps every compiler artifact the sanitizer build reuses
+          # attributable to code that has already merged.
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.1
+
+      - name: Run deterministic property smoke tests
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+
+          property_started=$SECONDS
+          cargo test --locked
+          echo "Fuzz property smoke seconds: $((SECONDS - property_started))"
+
+      - name: Run bounded libFuzzer smoke budget
+        # Issue #4238: the push to `main` and manual dispatch only. This step
+        # is a probabilistic DISCOVERY run, not a verdict on one diff, so it
+        # must not be able to eject a merge-queue entry. A runner reclamation
+        # during sanitizer compilation costs the whole queue.
+        # Every merged change still reaches this budget through the push to
+        # `main`, at byte-identical bounds, seconds later.
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        working-directory: fuzz
+        # cargo-fuzz 0.13.1 supports --dev; profile overrides apply only here.
+        # Keep source locations for ASan and avoid incremental cache payloads.
+        env:
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+          CARGO_PROFILE_DEV_INCREMENTAL: "false"
+        run: |
+          set -euo pipefail
+
+          sanitizer_started=$SECONDS
+          trap 'lane_status=$?; echo "Fuzz sanitizer lane seconds: $((SECONDS - sanitizer_started)); exit status: ${lane_status}"' EXIT
+          echo "Fuzz sanitizer profile: dev, line-tables-only, incremental=false, AddressSanitizer"
+          sccache_bin="${RUSTC_WRAPPER:-}"
+          echo "Fuzz sanitizer lane sccache statistics before the sanitizer build:"
+          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
+            "$sccache_bin" --show-stats
+          else
+            echo "sccache is unavailable; this sanitizer build cannot reuse compiler output"
+          fi
+
+          for fuzz_target in traceparent config_decode proxy_protocol mesh_udp_frame k8s_crd plugin_config; do
+            echo "Fuzz smoke target: ${fuzz_target}"
+            compile_started=$SECONDS
+            cargo fuzz build --dev --codegen-units 16 -s address "$fuzz_target"
+            echo "Fuzz smoke compile seconds: ${fuzz_target}: $((SECONDS - compile_started))"
+            run_started=$SECONDS
+            cargo fuzz run --dev --codegen-units 16 -s address "$fuzz_target" -- \
+              -runs=512 \
+              -max_total_time=8 \
+              -max_len=4096 \
+              -timeout=2 \
+              -rss_limit_mb=1024 \
+              -print_final_stats=1
+            echo "Fuzz smoke completed: ${fuzz_target}; run seconds (including Cargo freshness check): $((SECONDS - run_started))"
+          done
+
+          echo "Fuzz smoke target: datagram_client_address"
+          compile_started=$SECONDS
+          cargo fuzz build --dev --codegen-units 16 -s address datagram_client_address
+          echo "Fuzz smoke compile seconds: datagram_client_address: $((SECONDS - compile_started))"
+          run_started=$SECONDS
+          cargo fuzz run --dev --codegen-units 16 -s address datagram_client_address -- \
+            -runs=512 \
+            -max_total_time=8 \
+            -max_len=65536 \
+            -timeout=2 \
+            -rss_limit_mb=1024 \
+            -print_final_stats=1
+          echo "Fuzz smoke completed: datagram_client_address; run seconds (including Cargo freshness check): $((SECONDS - run_started))"
+
+      - name: Report fuzz lane compiler-cache telemetry
+        if: always()
+        run: |
+          set -euo pipefail
+
+          if [ "$GITHUB_EVENT_NAME" = "push" ] || [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "Fuzz lane shape: property gate plus the seven-target sanitizer budget"
+          else
+            echo "Fuzz lane shape: deterministic property gate only"
+          fi
+
+          sccache_bin="${RUSTC_WRAPPER:-}"
+          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
+            echo "Fuzz lane sccache statistics after this run:"
+            "$sccache_bin" --show-stats
+            du -sh "${GITHUB_WORKSPACE}/.cache/sccache" || true
+          else
+            echo "::warning::sccache was unavailable; this fuzz run compiled without a compiler cache"
+          fi
+"""
+
 # Oldest first. The index of a revision's job text in this tuple is its
 # generation; a higher index may replace a lower one, never the reverse.
 CI_FUZZ_SMOKE_JOB_GENERATIONS = (CI_FUZZ_SMOKE_RETIRED_JOB, CI_FUZZ_SMOKE_JOB)
 
-# The bounded libFuzzer budget, verbatim. Every admitted generation must carry
-# it exactly once, wherever in the job it runs.
-CI_FUZZ_SMOKE_BOUNDED_BUDGET = (
-    "          for fuzz_target in traceparent config_decode proxy_protocol "
-    "mesh_udp_frame k8s_crd plugin_config; do\n"
-    '            echo "Fuzz smoke target: ${fuzz_target}"\n'
-    '            cargo fuzz run --codegen-units 16 "$fuzz_target" -- \\\n'
-    "              -runs=512 \\\n"
-    "              -max_total_time=8 \\\n"
-    "              -max_len=4096 \\\n"
-    "              -timeout=2 \\\n"
-    "              -rss_limit_mb=1024\n"
-    "          done\n"
-)
+# Exact build/run blocks for both generations. Runtime bounds and target
+# inventory stay fixed; only the adopted smoke profile and telemetry differ.
+CI_FUZZ_SMOKE_RETIRED_BOUNDED_BUDGET = r"""          for fuzz_target in traceparent config_decode proxy_protocol mesh_udp_frame k8s_crd plugin_config; do
+            echo "Fuzz smoke target: ${fuzz_target}"
+            cargo fuzz run --codegen-units 16 "$fuzz_target" -- \
+              -runs=512 \
+              -max_total_time=8 \
+              -max_len=4096 \
+              -timeout=2 \
+              -rss_limit_mb=1024
+          done
+"""
 
-# The seventh target's own bounded invocation, verbatim. It is separate from the
-# loop only because its `-max_len` is the target's documented 64 KiB budget
-# rather than the generic 4 KiB smoke ceiling; every other bound matches. The
-# adopted generation must carry it exactly once (issue #4442).
-CI_FUZZ_SMOKE_DATAGRAM_BUDGET = (
-    '          echo "Fuzz smoke target: datagram_client_address"\n'
-    "          cargo fuzz run --codegen-units 16 datagram_client_address -- \\\n"
-    "            -runs=512 \\\n"
-    "            -max_total_time=8 \\\n"
-    "            -max_len=65536 \\\n"
-    "            -timeout=2 \\\n"
-    "            -rss_limit_mb=1024\n"
-)
+CI_FUZZ_SMOKE_RETIRED_DATAGRAM_BUDGET = r"""          echo "Fuzz smoke target: datagram_client_address"
+          cargo fuzz run --codegen-units 16 datagram_client_address -- \
+            -runs=512 \
+            -max_total_time=8 \
+            -max_len=65536 \
+            -timeout=2 \
+            -rss_limit_mb=1024
+"""
+
+CI_FUZZ_SMOKE_BOUNDED_BUDGET = r"""          for fuzz_target in traceparent config_decode proxy_protocol mesh_udp_frame k8s_crd plugin_config; do
+            echo "Fuzz smoke target: ${fuzz_target}"
+            compile_started=$SECONDS
+            cargo fuzz build --dev --codegen-units 16 -s address "$fuzz_target"
+            echo "Fuzz smoke compile seconds: ${fuzz_target}: $((SECONDS - compile_started))"
+            run_started=$SECONDS
+            cargo fuzz run --dev --codegen-units 16 -s address "$fuzz_target" -- \
+              -runs=512 \
+              -max_total_time=8 \
+              -max_len=4096 \
+              -timeout=2 \
+              -rss_limit_mb=1024 \
+              -print_final_stats=1
+            echo "Fuzz smoke completed: ${fuzz_target}; run seconds (including Cargo freshness check): $((SECONDS - run_started))"
+          done
+"""
+
+CI_FUZZ_SMOKE_DATAGRAM_BUDGET = r"""          echo "Fuzz smoke target: datagram_client_address"
+          compile_started=$SECONDS
+          cargo fuzz build --dev --codegen-units 16 -s address datagram_client_address
+          echo "Fuzz smoke compile seconds: datagram_client_address: $((SECONDS - compile_started))"
+          run_started=$SECONDS
+          cargo fuzz run --dev --codegen-units 16 -s address datagram_client_address -- \
+            -runs=512 \
+            -max_total_time=8 \
+            -max_len=65536 \
+            -timeout=2 \
+            -rss_limit_mb=1024 \
+            -print_final_stats=1
+          echo "Fuzz smoke completed: datagram_client_address; run seconds (including Cargo freshness check): $((SECONDS - run_started))"
+"""
 
 # Adopting the byte-frozen job above is only half of the gate: a lane nothing
 # observes is not a gate at all, so the first adoption must also make
@@ -28847,49 +28888,68 @@ pre_build = []
             failures.append(
                 f"the admitted {admitted_label} requests write permission"
             )
-    # Wherever the six-target budget runs, it runs at exactly these bounds. A
-    # generation that moved the lane must not also have relaxed it.
-    for generation, admitted in enumerate(CI_FUZZ_SMOKE_JOB_GENERATIONS):
-        if admitted.count(CI_FUZZ_SMOKE_BOUNDED_BUDGET) != 1:
-            failures.append(
-                f"admitted fuzz-smoke generation {generation} does not carry the "
-                "bounded six-target libFuzzer budget exactly once"
-            )
-    # The seventh target runs at its own documented 64 KiB ceiling, and only in
-    # the adopted generation. Freezing the invocation is what stops a later
-    # revision from dropping `datagram_client_address` back out of the required
-    # smoke, or re-bounding it to the loop's generic 4 KiB ceiling and leaving
-    # the scheduled lane reaching parser lengths this lane never can (#4442).
-    if CI_FUZZ_SMOKE_JOB.count(CI_FUZZ_SMOKE_DATAGRAM_BUDGET) != 1:
-        failures.append(
-            "the adopted fuzz-smoke generation does not carry the bounded "
-            "datagram_client_address invocation exactly once"
+    # The profile migration must keep BOTH command blocks and all five runtime
+    # bounds in both generations. These checks exercise the constants as well
+    # as the whole-job admission; telemetry flags cannot stand in for a bound.
+    for generation, (admitted, loop_budget, datagram_budget) in enumerate(
+        (
+            (
+                CI_FUZZ_SMOKE_RETIRED_JOB,
+                CI_FUZZ_SMOKE_RETIRED_BOUNDED_BUDGET,
+                CI_FUZZ_SMOKE_RETIRED_DATAGRAM_BUDGET,
+            ),
+            (
+                CI_FUZZ_SMOKE_JOB,
+                CI_FUZZ_SMOKE_BOUNDED_BUDGET,
+                CI_FUZZ_SMOKE_DATAGRAM_BUDGET,
+            ),
         )
-    if CI_FUZZ_SMOKE_RETIRED_JOB.count(CI_FUZZ_SMOKE_DATAGRAM_BUDGET):
-        failures.append(
-            "the retired fuzz-smoke generation must predate the "
-            "datagram_client_address invocation"
-        )
-    if "-max_len=65536" not in CI_FUZZ_SMOKE_DATAGRAM_BUDGET:
-        failures.append(
-            "the datagram_client_address smoke invocation no longer reaches the "
-            "target's documented 64 KiB input budget"
-        )
-    for shared_bound in (
-        "-runs=512",
-        "-max_total_time=8",
-        "-timeout=2",
-        "-rss_limit_mb=1024",
     ):
-        if shared_bound not in CI_FUZZ_SMOKE_DATAGRAM_BUDGET:
-            failures.append(
-                "the datagram_client_address smoke invocation relaxes "
-                f"{shared_bound}, which the six-target loop still enforces"
+        for label, budget, max_len in (
+            ("six-target loop", loop_budget, 4096),
+            ("datagram_client_address", datagram_budget, 65536),
+        ):
+            if admitted.count(budget) != 1:
+                failures.append(
+                    f"fuzz-smoke generation {generation} must carry {label} "
+                    "exactly once"
+                )
+            actual_bounds = re.findall(
+                r"(?<!\S)-(?:runs|max_total_time|max_len|timeout|rss_limit_mb)=\S+",
+                budget,
             )
+            if actual_bounds != [
+                "-runs=512",
+                "-max_total_time=8",
+                f"-max_len={max_len}",
+                "-timeout=2",
+                "-rss_limit_mb=1024",
+            ]:
+                failures.append(
+                    f"fuzz-smoke generation {generation} changed {label} bounds"
+                )
+    property_step = "      - name: Run deterministic property smoke tests\n"
+    sanitizer_step = "      - name: Run bounded libFuzzer smoke budget\n"
+    if (
+        CI_FUZZ_SMOKE_RETIRED_JOB.split(property_step)[1].split(sanitizer_step)[0]
+        != CI_FUZZ_SMOKE_JOB.split(property_step)[1].split(sanitizer_step)[0]
+    ):
+        failures.append("the smoke profile migration changed the property gate")
+    for target in ('"$fuzz_target"', "datagram_client_address"):
+        for command in ("build", "run"):
+            invocation = (
+                f"cargo fuzz {command} --dev --codegen-units 16 -s address {target}"
+            )
+            if CI_FUZZ_SMOKE_JOB.count(invocation) != 1:
+                failures.append(
+                    f"the adopted smoke must use the same dev/ASan profile for {invocation}"
+                )
+    if "--dev" in FUZZ_WORKFLOW or "CARGO_PROFILE_" in FUZZ_WORKFLOW:
+        failures.append("the optimized scheduled fuzz profile changed")
     # The scheduled lane installs no compiler cache at all, so it clears every
     # wrapper input the root Cargo config sets. This assertion used to cover the
     # retired generation too, because the #2461 shape it held also disabled
-    # caching. That generation is gone: the retired slot now holds #4238's
+    # caching. That generation is gone: the retired slot now holds #4442's
     # shape, which deliberately DOES use the checksum-pinned sccache installer,
     # so asserting the opposite of it here would be false.
     cargo_override_block = (
@@ -29047,16 +29107,23 @@ pre_build = []
                 )
 
     # An entry's original may be a tuple of alternatives when the admitted
-    # generations legitimately differ at that point (the outer deadline moved
-    # from 60 to 120 minutes for #4650); the first alternative present in a
-    # generation is the one mutated.
+    # generations legitimately differ at that point (the #4694 build profile
+    # and telemetry); the first alternative present in a generation is mutated.
     fuzz_smoke_tampering: dict[str, tuple[str | tuple[str, ...], str]] = {
         "altered outer deadline": (
-            ("timeout-minutes: 120", "timeout-minutes: 60"),
+            "timeout-minutes: 120",
             "timeout-minutes: 30",
         ),
         "reduced compilation parallelism": ("--codegen-units 16", "--codegen-units 1"),
         "widened libFuzzer budget": ("-max_total_time=8", "-max_total_time=800"),
+        "changed iteration bound": ("-runs=512", "-runs=1"),
+        "changed per-input timeout": ("-timeout=2", "-timeout=20"),
+        "changed RSS bound": ("-rss_limit_mb=1024", "-rss_limit_mb=2048"),
+        "ignored build or run failure": ("set -euo pipefail", "set +e"),
+        "datagram target dropped from either generation": (
+            (CI_FUZZ_SMOKE_RETIRED_DATAGRAM_BUDGET, CI_FUZZ_SMOKE_DATAGRAM_BUDGET),
+            "",
+        ),
         "unbounded input length": ("-max_len=4096", "-max_len=1048576"),
         "unpinned cargo-fuzz": (
             "cargo install cargo-fuzz --locked --version 0.13.1",
@@ -29073,8 +29140,11 @@ pre_build = []
         ),
         "mutable toolchain pin": ("nightly-2025-07-01", "nightly"),
         "repository-supplied script": (
-            'cargo fuzz run --codegen-units 16 "$fuzz_target" -- \\',
-            'bash scripts/fuzz_smoke.sh --codegen-units 16 "$fuzz_target" -- \\',
+            (
+                'cargo fuzz run --codegen-units 16 "$fuzz_target" -- \\',
+                'cargo fuzz run --dev --codegen-units 16 -s address "$fuzz_target" -- \\',
+            ),
+            'bash scripts/fuzz_smoke.sh "$fuzz_target" -- \\',
         ),
         "mutable action ref": (
             "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6",
@@ -29124,9 +29194,35 @@ pre_build = []
                     "still admitted"
                 )
 
-    # What issue #3902 added to the contract, and therefore what a later pull
+    # What the adopted profile and lane split require, and what a later pull
     # request must not be able to take back out of it.
     fuzz_smoke_adopted_tampering: dict[str, tuple[str, str]] = {
+        "run profile differs from timed build": (
+            "cargo fuzz run --dev", "cargo fuzz run",
+        ),
+        "timed build profile differs from run": (
+            "cargo fuzz build --dev", "cargo fuzz build",
+        ),
+        "AddressSanitizer disabled": ("-s address", "-s none"),
+        "source locations removed": (
+            "CARGO_PROFILE_DEV_DEBUG: line-tables-only", "CARGO_PROFILE_DEV_DEBUG: '0'",
+        ),
+        "incremental cache payload re-enabled": (
+            'CARGO_PROFILE_DEV_INCREMENTAL: "false"',
+            'CARGO_PROFILE_DEV_INCREMENTAL: "true"',
+        ),
+        "actual execution statistics suppressed": (
+            "-print_final_stats=1", "-print_final_stats=0",
+        ),
+        "compile telemetry removed": (
+            '            echo "Fuzz smoke compile seconds: ${fuzz_target}: $((SECONDS - compile_started))"\n',
+            "",
+        ),
+        "completion telemetry removed": (
+            '            echo "Fuzz smoke completed: ${fuzz_target}; run seconds (including Cargo freshness check): $((SECONDS - run_started))"\n',
+            "",
+        ),
+        "lane timing disabled": ("' EXIT\n", "'\n"),
         # Removing the guard entirely restores the six-target sanitizer build
         # to every full-mode pull request -- the ~39-minute compile #3902 took
         # off that path. Still forbidden.
@@ -29190,8 +29286,8 @@ pre_build = []
             "            -max_len=4096 \\\n",
         ),
         "datagram target substituted for one already covered": (
-            "cargo fuzz run --codegen-units 16 datagram_client_address -- \\",
-            "cargo fuzz run --codegen-units 16 proxy_protocol -- \\",
+            "cargo fuzz run --dev --codegen-units 16 -s address datagram_client_address -- \\",
+            "cargo fuzz run --dev --codegen-units 16 -s address proxy_protocol -- \\",
         ),
     }
     for tamper_name, (original, replacement) in fuzz_smoke_adopted_tampering.items():
@@ -29361,7 +29457,7 @@ pre_build = []
             "initial adoption of the byte-frozen fuzz job plus its required "
             "aggregate wiring was rejected"
         )
-    # Issue #3902's transition, end to end: one revision moves the whole job
+    # Issue #4694's transition, end to end: one revision moves the whole job
     # from the retired generation to the adopted one with the aggregate wiring
     # untouched. Both generations are withheld, so the digest comparison alone
     # would accept the move in either direction; the reverse must be refused by

@@ -6,8 +6,8 @@
 //! are separate facts, and nothing compared them. These tests compare them.
 //!
 //! Both hosted lanes are byte-frozen by the trusted Cross build policy, so a
-//! pull request cannot repair a divergence found here; it is a direct-to-`main`
-//! trusted-policy change. That is exactly why the divergence has to be visible
+//! repair requires a coordinated trusted-policy migration. That is why any
+//! divergence has to be visible
 //! in the ordinary test suite rather than only inside the policy self-test.
 
 use std::path::{Path, PathBuf};
@@ -143,7 +143,7 @@ fn datagram_client_address_is_fuzzed_at_its_documented_64_kib_budget() {
     // actually scheduled.
     let job = fuzz_smoke_job();
     let invocation = job
-        .find("cargo fuzz run --codegen-units 16 datagram_client_address --")
+        .find("cargo fuzz run --dev --codegen-units 16 -s address datagram_client_address --")
         .expect("the fuzz-smoke job invokes datagram_client_address on its own");
     let bounds = &job[invocation..];
     let terminator = bounds
@@ -168,6 +168,83 @@ fn datagram_client_address_is_fuzzed_at_its_documented_64_kib_budget() {
         FUZZ_DOCS.contains("scheduled in **both** required"),
         "docs/fuzz.md must document both lanes rather than the retired deferral"
     );
+}
+
+#[test]
+fn smoke_dev_profile_is_scoped_to_sanitizers_and_matches_build_and_run() {
+    let job = fuzz_smoke_job();
+    let (before, sanitizer) = job
+        .split_once("      - name: Run bounded libFuzzer smoke budget\n")
+        .expect("the bounded sanitizer step exists");
+    let (sanitizer, after) = sanitizer
+        .split_once("      - name: Report fuzz lane compiler-cache telemetry\n")
+        .expect("the closing telemetry step exists");
+    for profile_setting in [
+        "CARGO_PROFILE_DEV_DEBUG: line-tables-only",
+        "CARGO_PROFILE_DEV_INCREMENTAL: \"false\"",
+    ] {
+        assert!(sanitizer.contains(profile_setting));
+        assert!(!before.contains(profile_setting));
+        assert!(!after.contains(profile_setting));
+        assert!(!FUZZ_WORKFLOW.contains(profile_setting));
+    }
+    assert!(before.contains("          cargo test --locked\n"));
+    assert!(!before.contains("--dev"));
+    assert!(sanitizer.contains(
+        "        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'\n"
+    ));
+    for target in ["\"$fuzz_target\"", "datagram_client_address"] {
+        let build = format!("cargo fuzz build --dev --codegen-units 16 -s address {target}");
+        let run = format!("cargo fuzz run --dev --codegen-units 16 -s address {target} --");
+        assert_eq!(sanitizer.matches(&build).count(), 1);
+        assert_eq!(sanitizer.matches(&run).count(), 1);
+        assert!(sanitizer.find(&build).unwrap() < sanitizer.find(&run).unwrap());
+    }
+    assert!(!FUZZ_WORKFLOW.contains("--dev"));
+    assert!(
+        FUZZ_WORKFLOW.contains("cargo fuzz run --codegen-units 16 -s address \"$FUZZ_TARGET\" --")
+    );
+}
+
+#[test]
+fn smoke_records_actual_iterations_and_completion_after_each_bounded_run() {
+    let job = fuzz_smoke_job();
+    let loop_start = job
+        .find("          for fuzz_target in ")
+        .expect("the six-target loop exists");
+    let (loop_body, datagram_body) = job[loop_start..]
+        .split_once("          done\n")
+        .expect("the six-target loop ends before the datagram run");
+    assert!(loop_body.starts_with(
+        "          for fuzz_target in traceparent config_decode proxy_protocol mesh_udp_frame k8s_crd plugin_config; do\n"
+    ));
+    for (body, max_len) in [(loop_body, 4096), (datagram_body, 65536)] {
+        let build = body.find("cargo fuzz build ").unwrap();
+        let compile_time = body.find("echo \"Fuzz smoke compile seconds:").unwrap();
+        let run = body.find("cargo fuzz run ").unwrap();
+        let stats = body.find("-print_final_stats=1").unwrap();
+        let completion = body.find("echo \"Fuzz smoke completed:").unwrap();
+        assert!(build < compile_time && compile_time < run && run < stats && stats < completion);
+        let bounds: Vec<_> = body[run..completion]
+            .trim_end()
+            .lines()
+            .skip(1)
+            .map(|line| line.trim().trim_end_matches('\\').trim_end())
+            .collect();
+        assert_eq!(
+            bounds,
+            [
+                "-runs=512",
+                "-max_total_time=8",
+                &format!("-max_len={max_len}"),
+                "-timeout=2",
+                "-rss_limit_mb=1024",
+                "-print_final_stats=1",
+            ]
+        );
+    }
+    assert!(job.contains("trap 'lane_status=$?; echo \"Fuzz sanitizer lane seconds:"));
+    assert!(job.contains("exit status: ${lane_status}\"' EXIT"));
 }
 
 #[test]
