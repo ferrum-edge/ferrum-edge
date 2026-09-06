@@ -6468,7 +6468,7 @@ jobs:
             run_wrr_benchmark=true
           fi
 
-          if [ "${EVENT_NAME}" != "pull_request" ] && [ "${EVENT_NAME}" != "merge_group" ] || [ "${ci_yml_schedules_microbenchmarks}" = "true" ] || grep -Eq '^(src/load_balancer\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/rr_selection\.rs)|\.github/scripts/(verify_rr_selection_benchmark|run_rr_selection_comparison)\.py)$' <<<"${changed_files}"; then
+          if [ "${EVENT_NAME}" != "pull_request" ] && [ "${EVENT_NAME}" != "merge_group" ] || [ "${ci_yml_schedules_microbenchmarks}" = "true" ] || grep -Eq '^(src/load_balancer\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/rr_selection\.rs)|\.github/scripts/(verify_rr_selection_benchmark\.py|run_rr_selection_comparison\.(py|sh)))$' <<<"${changed_files}"; then
             run_rr_benchmark=true
           fi
 
@@ -6551,9 +6551,7 @@ jobs:
           RR_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event_name == 'push' && github.event.before || '' }}
         run: |
           python3 .github/scripts/verify_rr_selection_benchmark.py --self-test
-          python3 .github/scripts/run_rr_selection_comparison.py \
-            --baseline-sha "$RR_BASE_SHA" \
-            --output tests/performance/ci_results/rr-comparison
+          bash .github/scripts/run_rr_selection_comparison.sh
 
       - name: Run AI semantic-cache cleanup p99 microbenchmark
         if: steps.perf_changes.outputs.run_ai_semantic_cache_benchmark == 'true'

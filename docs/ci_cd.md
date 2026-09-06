@@ -1558,7 +1558,7 @@ not a representative scaling control for snapshot loads, reference counts and
 selection together; their costs need not inflate proportionally on a busy
 runner. The old 0.50 multiplier could reject unchanged selection code.
 
-`run_rr_selection_comparison.py` builds candidate and baseline binaries using
+`run_rr_selection_comparison.sh` builds candidate and baseline binaries using
 the same candidate benchmark harness and locked dependency graphs. Only that
 harness is overlaid on the baseline checkout. The PR base SHA, merge-group base
 SHA, or main push's before SHA selects the baseline; manual dispatch defaults

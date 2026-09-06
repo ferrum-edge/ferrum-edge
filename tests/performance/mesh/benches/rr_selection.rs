@@ -13,7 +13,7 @@
 //! one runner. The full selection path is compared at each thread count. The
 //! bare shared-counter fixture remains available for exploration, but no
 //! proportional relationship between its cost and selection cost is assumed.
-//! See `.github/scripts/run_rr_selection_comparison.py`.
+//! See `.github/scripts/run_rr_selection_comparison.sh`.
 
 use std::collections::HashMap;
 use std::hint::black_box;
