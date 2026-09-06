@@ -10,6 +10,7 @@ import sys
 import textwrap
 from pathlib import Path
 
+from test_ci_policy_parallel import run_self_test as ci_policy_parallel_self_test
 from test_release_dispatch import run_self_test as release_dispatch_self_test
 
 from check_markdown_links import check_repository, run_self_test
@@ -81,6 +82,7 @@ from verify_ci_runtime_cache import (
 
 REQUIRED_JOBS = {
     "ci-plan",
+    "ci-policy",
     "test-unit",
     "test-secrets",
     "test-service-integration",
@@ -1801,6 +1803,7 @@ def main() -> int:
                 "must fail the publication contract"
             )
 
+    planner_errors.extend(ci_policy_parallel_self_test())
     planner_errors.extend(release_dispatch_self_test())
     planner_errors.extend(merge_group_self_test())
     planner_errors.extend(optional_live_suite_self_test())
