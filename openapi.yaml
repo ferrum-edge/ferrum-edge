@@ -4,9 +4,13 @@ info:
   description: |
     RESTful API for managing the Ferrum Edge configuration at runtime.
 
-    All endpoints except `/live`, `/health`, `/status`, exact `/metrics`, and
-    `/overload` require JWT bearer token authentication via the
-    `Authorization: Bearer <token>` header.
+    `/live`, `/health`, `/status`, and `/overload` expose minimal unauthenticated
+    observations. Exact `/metrics` requires a valid admin JWT, a matching
+    `FERRUM_METRICS_BEARER_TOKEN`, or a source IP within
+    `FERRUM_METRICS_ALLOWED_CIDRS`; otherwise it returns `401 Unauthorized`.
+    All other endpoints require JWT bearer token authentication via the
+    `Authorization: Bearer <token>` header. Detailed health, status, and overload
+    observations use the same access gate as exact `/metrics`.
 
     Admin JWTs must include `iss`, `sub`, `exp`, `iat`, `nbf`, `jti`, and a
     string `role` claim. `viewer` can call read-only endpoints, `operator` can
@@ -25,7 +29,8 @@ info:
 
     Resource endpoints that include the `X-Ferrum-Namespace` parameter are
     scoped by that request header. Resources (proxies, consumers, plugin configs,
-    upstreams, API specs, audit log entries, and backup/restore payloads) are
+    upstreams, API specs, gateway trust bundles, audit log entries, and
+    backup/restore payloads) are
     isolated per namespace — uniqueness constraints (listen_path, proxy/upstream
     name, consumer username, listen_port) apply per namespace, and a request only
     sees resources whose `namespace` field matches the header. The header
@@ -38,7 +43,9 @@ info:
     observability, cluster state, backend capabilities, TLS management, and mesh
     topology reflect the current node or control-plane state and are not
     namespace-filtered unless their operation explicitly declares the namespace
-    header. Audit events for those fleet-global mutations (TLS/ACME management
+    header. Both `/gateway-trust-bundles` and `/gateway-trust` (including
+    `GET /gateway-trust/status`) are namespace-scoped. Audit events for those
+    fleet-global mutations (TLS/ACME management
     and `POST /mesh/config-revision/reset`) are stored under the canonical
     default namespace (`ferrum`), not `X-Ferrum-Namespace`. Invalid namespace
     headers and `ns`-claim denials use the same canonical audit bucket.
@@ -55,8 +62,10 @@ info:
     carry an `ns` claim (a single string or an array of strings, the same claim
     shapes as the CP/DP gRPC plane) that includes the requested
     `X-Ferrum-Namespace` value; requests outside the claimed namespaces are
-    rejected with `403 Forbidden`. With the flag unset (default), any valid
-    admin JWT may address any namespace. The `/namespaces` registry is not
+    rejected with `403 Forbidden`. A control plane serving multiple namespaces
+    (`FERRUM_CP_NAMESPACES` names more than one namespace or `*`) engages this
+    enforcement automatically. With the flag unset and no multi-namespace CP
+    scope, any valid admin JWT may address any namespace. The `/namespaces` registry is not
     selected by `X-Ferrum-Namespace`: list results are filtered to claimed
     names (a token with no `ns` claim sees an empty list), and
     create/get/rename/delete of a specific name return `403` when the token
@@ -101,10 +110,12 @@ info:
 
     ## Caching and read-only mode
 
-    When the primary database is unavailable, read endpoints transparently fall
+    When the primary database is unavailable, eligible configuration reads fall
     back to the most recent cached configuration and include an
-    `X-Data-Source: cached` response header. Write operations require a live
-    database and return `503 Service Unavailable` when one is not present.
+    `X-Data-Source: cached` response header. Gateway trust bundle list/get reads
+    fail closed with `503 Service Unavailable` on a store failure; they do not
+    serve stale cached trust records. Write operations require a live database
+    and return `503 Service Unavailable` when one is not present.
 
     The Admin API can be placed in **read-only mode**, in which case persisted
     configuration and database mutations return `403 Forbidden`. Authenticated
@@ -3453,7 +3464,7 @@ paths:
                       xDS resource-warming convergence state. Present only in
                       xDS mode after the first ADS response; omitted in native
                       mode. Surfaced here (JWT-authenticated) rather than on the
-                      unauthenticated `/metrics` surface because the per-type
+                      separately gated `/metrics` surface because the per-type
                       version strings embed config-change timestamps and content
                       digests.
                     required:
@@ -6151,6 +6162,11 @@ paths:
       description: |
         Namespace trust summary plus process-wide load/convergence counters.
         Requires the `operator` role.
+
+        The namespace is selected by `X-Ferrum-Namespace`. When
+        `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true` or a multi-namespace control
+        plane automatically engages enforcement, the token's `ns` claim must
+        authorize that namespace; missing or out-of-scope claims return `403`.
 
         Redaction contract: the payload carries the trust domain, authority
         counts, this namespace's revision, a digest `generation` identity,
