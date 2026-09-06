@@ -14,6 +14,7 @@ import shlex
 import sys
 import tomllib
 from collections.abc import Callable, Iterable
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Any, NamedTuple
 
@@ -7763,7 +7764,7 @@ def replace_command_substitutions(line: str, *, literal: bool) -> str:
     return "".join(parts)
 
 
-def shell_tokens(value: str) -> tuple[str, ...] | None:
+def _uncached_shell_tokens(value: str) -> tuple[str, ...] | None:
     """Tokenize one shell program without turning quoted prose into commands."""
 
     try:
@@ -7775,10 +7776,33 @@ def shell_tokens(value: str) -> tuple[str, ...] | None:
         return None
 
 
+# Only lexical results are reusable across scans: policy decisions also depend
+# on dynamic dispatch/opaque-stdin scopes. Bound both entry count and input
+# length so untrusted workflow text cannot retain arbitrarily large programs.
+SHELL_LEX_CACHE_SIZE = 2048
+SHELL_LEX_CACHE_MAX_CHARS = 4096
+_cached_shell_tokens = lru_cache(maxsize=SHELL_LEX_CACHE_SIZE)(_uncached_shell_tokens)
+
+
+def shell_tokens(value: str) -> tuple[str, ...] | None:
+    """Reuse immutable tokens for small, identical shell programs in this process."""
+
+    if len(value) > SHELL_LEX_CACHE_MAX_CHARS:
+        return _uncached_shell_tokens(value)
+    return _cached_shell_tokens(value)
+
+
+@lru_cache(maxsize=SHELL_LEX_CACHE_SIZE)
+def _cached_tool_name(value: str) -> str:
+    return PurePosixPath(value).name
+
+
 def tool_name(value: str) -> str:
     """Return the executable basename for a literal shell word."""
 
-    return PurePosixPath(value).name
+    if len(value) > SHELL_LEX_CACHE_MAX_CHARS:
+        return PurePosixPath(value).name
+    return _cached_tool_name(value)
 
 
 def dynamic_shell_word(value: str) -> bool:
@@ -18157,6 +18181,56 @@ def compare_pr_workflow_job(
 
 def self_test() -> list[str]:
     failures: list[str] = []
+
+    # Repeated scans must retain quoting, malformed-input and content-change
+    # behavior. Cache only lexical data, never a decision from a scanner scope.
+    _cached_shell_tokens.cache_clear()
+    for program in (
+        "echo 'cross build' # inert prose",
+        "cross build --target aarch64-unknown-linux-gnu",
+        'run() { "$@"; }; run cross build',
+        "echo 'unterminated",
+        "",
+    ):
+        expected_tokens = _uncached_shell_tokens(program)
+        if (
+            shell_tokens(program) != expected_tokens
+            or shell_tokens(program) != expected_tokens
+        ):
+            failures.append("shell token cache changed lexical results")
+    if _cached_shell_tokens.cache_info().hits != 5:
+        failures.append("identical small shell programs did not reuse tokens")
+    before_large = _cached_shell_tokens.cache_info()
+    large_program = "echo " + "x" * SHELL_LEX_CACHE_MAX_CHARS
+    if shell_tokens(large_program) != _uncached_shell_tokens(large_program):
+        failures.append("uncached large shell program changed lexical results")
+    if _cached_shell_tokens.cache_info() != before_large:
+        failures.append("oversized shell program entered the token cache")
+    for index in range(SHELL_LEX_CACHE_SIZE + 1):
+        shell_tokens(f"echo cache-bound-{index}")
+    if _cached_shell_tokens.cache_info().currsize != SHELL_LEX_CACHE_SIZE:
+        failures.append("shell token cache exceeded its entry bound")
+    _cached_shell_tokens.cache_clear()
+
+    _cached_tool_name.cache_clear()
+    for word in ("", "/", "./cargo", "/usr/bin/cross", "a//b/../cross/", "a/."):
+        if (
+            tool_name(word) != PurePosixPath(word).name
+            or tool_name(word) != PurePosixPath(word).name
+        ):
+            failures.append("tool-name cache changed path semantics")
+    if _cached_tool_name.cache_info().hits != 6:
+        failures.append("identical tool names did not reuse lexical results")
+    before_large = _cached_tool_name.cache_info()
+    if tool_name(large_program) != PurePosixPath(large_program).name:
+        failures.append("uncached large tool name changed path semantics")
+    if _cached_tool_name.cache_info() != before_large:
+        failures.append("oversized tool name entered the lexical cache")
+    for index in range(SHELL_LEX_CACHE_SIZE + 1):
+        tool_name(f"cache-bound-{index}")
+    if _cached_tool_name.cache_info().currsize != SHELL_LEX_CACHE_SIZE:
+        failures.append("tool-name cache exceeded its entry bound")
+    _cached_tool_name.cache_clear()
 
     expected = list(EXPECTED_PRE_BUILD_COMMANDS)
     if validate_pre_build(expected):
