@@ -1564,7 +1564,9 @@ harness is overlaid on the baseline checkout. The PR base SHA, merge-group base
 SHA, or main push's before SHA selects the baseline; manual dispatch defaults
 to the preceding commit. Both binaries are preserved before measurements start,
 so rebuilding the shared target directory cannot replace one with the other.
-Compiler work finishes before timing starts.
+Compiler work finishes before timing starts. Both commands use the runner-root
+Cargo configuration and toolchain; the baseline manifest resolves its own source
+and locked dependencies from the separate checkout.
 
 The harness performs 50,000 operations per thread at one and eight threads.
 Its timer starts before the worker-release barrier. Three baseline and three
