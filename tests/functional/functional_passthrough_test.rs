@@ -1123,3 +1123,125 @@ upstreams: []
     gateway.kill().ok();
     gateway.wait().ok();
 }
+
+/// A bound, non-listening socket reserves the failed endpoint without a port
+/// reuse race. Least-connections deterministically picks that first target at
+/// zero active connections; only connect-phase rotation can reach the TLS echo.
+#[tokio::test]
+#[ignore]
+async fn test_tcp_passthrough_rotates_before_forwarding_client_hello() {
+    use std::sync::Arc;
+
+    let (cert_pem, key_pem) = generate_self_signed_cert();
+    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_pem.as_bytes()))
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_pem.as_bytes()))
+        .unwrap()
+        .unwrap();
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add_parsable_certificates(certs.clone());
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    ));
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap(),
+    ));
+
+    for (retry_enabled, max_retries, succeeds) in [(true, 1, true), (false, 1, false), (true, 0, false)] {
+        let refused = tokio::net::TcpSocket::new_v4().unwrap();
+        refused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let refused_port = refused.local_addr().unwrap().port();
+        let healthy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let healthy_port = healthy.local_addr().unwrap().port();
+        let (gateway, proxy_port, _, _, dir) = start_gateway_with_retry(|stream_port, _| {
+            format!(
+                r#"
+version: "1"
+proxies:
+  - id: "passthrough-retry"
+    backend_scheme: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {refused_port}
+    listen_port: {stream_port}
+    passthrough: true
+    upstream_id: "passthrough-retry-targets"
+    retry:
+      retry_on_connect_failure: {retry_enabled}
+      max_retries: {max_retries}
+      backoff: !fixed
+        delay_ms: 1
+upstreams:
+  - id: "passthrough-retry-targets"
+    algorithm: least_connections
+    targets:
+      - host: "127.0.0.1"
+        port: {refused_port}
+      - host: "127.0.0.1"
+        port: {healthy_port}
+consumers: []
+plugin_configs: []
+"#
+            )
+        })
+        .await;
+        let _gateway = GatewayProcess(gateway);
+        if succeeds {
+            // Two successive streams also prove the failed target's connection
+            // guard is released, so the second selection still reaches it first.
+            for _ in 0..2 {
+                let server = async {
+                    let (socket, _) = healthy.accept().await.unwrap();
+                    let mut stream = acceptor.accept(socket).await.unwrap();
+                    let mut data = [0; 15];
+                    stream.read_exact(&mut data).await.unwrap();
+                    assert_eq!(&data, b"retry tls bytes");
+                    stream.write_all(&data).await.unwrap();
+                    stream.shutdown().await.unwrap();
+                };
+                let client = async {
+                    let socket = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+                        .await
+                        .unwrap();
+                    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+                    let mut stream = connector.connect(name, socket).await.unwrap();
+                    stream.write_all(b"retry tls bytes").await.unwrap();
+                    let mut response = [0; 15];
+                    stream.read_exact(&mut response).await.unwrap();
+                    assert_eq!(&response, b"retry tls bytes");
+                    stream.shutdown().await.unwrap();
+                };
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    tokio::join!(server, client);
+                })
+                .await
+                .expect("TLS retry and echo finish within the bound");
+            }
+            assert_eq!(
+                gateway_logs(dir.path()).matches("TCP passthrough setup failed").count(),
+                2,
+                "each stream should retry the first target exactly once"
+            );
+        } else {
+            let socket = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+                .await
+                .unwrap();
+            let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(5), connector.connect(name, socket))
+                .await
+                .expect("disabled or exhausted retries fail promptly");
+            assert!(result.is_err(), "retry controls must prevent target rotation");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), healthy.accept()).await.is_err(),
+                "the alternate target must not be dialed"
+            );
+            assert!(!gateway_logs(dir.path()).contains("TCP passthrough setup failed"));
+        }
+    }
+}

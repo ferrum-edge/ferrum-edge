@@ -3975,40 +3975,6 @@ async fn handle_tcp_connection_inner(
             client_local_addr,
         )?;
 
-        // Circuit breaker check — reject before DNS resolution or backend
-        // connect if the passthrough target is open. This mirrors the
-        // terminating TCP path; passthrough still records backend outcomes
-        // below, so it must also honor breaker admission and preserve the
-        // half-open probe flag for the matching record_success/failure call.
-        // Keep the admitted Arc so post-admission PROXY write failures settle
-        // the exact selected breaker rather than a get_or_create miss/transient.
-        let mut admitted_cb: Option<Arc<crate::circuit_breaker::CircuitBreaker>> = None;
-        if let Some(ref cb_config) = cb_info.cb_config {
-            match circuit_breaker_cache.can_execute(
-                &cb_info.namespace,
-                proxy_id,
-                cb_info.cb_target_key.as_deref(),
-                cb_config,
-            ) {
-                Ok((cb, is_half_open_probe)) => {
-                    cb_info.is_half_open_probe = is_half_open_probe;
-                    admitted_cb = Some(cb);
-                }
-                Err(_) => {
-                    warn!(
-                        proxy_id = %proxy_id,
-                        client = %remote_addr,
-                        "TCP passthrough connection rejected: circuit breaker open"
-                    );
-                    return Err(StreamSetupError::new(
-                        StreamSetupKind::CircuitBreakerOpen,
-                        format!("for {}:{}", params.backend_host, params.backend_port),
-                    )
-                    .into());
-                }
-            }
-        }
-
         let connect_timeout = Duration::from_millis(params.backend_connect_timeout_ms);
         let idle_timeout = if params.tcp_idle_timeout_seconds > 0 {
             Some(Duration::from_secs(params.tcp_idle_timeout_seconds))
@@ -4038,177 +4004,307 @@ async fn handle_tcp_connection_inner(
         #[cfg(not(target_os = "linux"))]
         let splice_used = false;
 
-        // Resolve backend IP via DNS. A resolution failure is a backend
-        // reachability failure: record it against the breaker (mirrors the
-        // non-passthrough path) so the failure counts toward opening AND any
-        // half-open probe slot claimed by can_execute above is released —
-        // otherwise an unresolvable passthrough hostname wedges HALF_OPEN
-        // until reload.
-        let resolved_candidates = within_stream_auth_deadline(
-            stream_auth_deadline,
-            dns_cache.resolve_candidates(
-                &params.backend_host,
-                params.dns_override.as_deref(),
-                params.dns_cache_ttl_seconds,
-            ),
-        )
-        .await;
-        let candidates = match resolved_candidates {
-            Err(termination) => {
-                if let Some(ref cb_config) = cb_info.cb_config {
-                    let cb = circuit_breaker_cache.get_or_create(
-                        &cb_info.namespace,
-                        proxy_id,
-                        cb_info.cb_target_key.as_deref(),
-                        cb_config,
-                    );
-                    cb.record_neutral(cb_info.is_half_open_probe);
-                }
+        // ClientHello peeking and plugin admission ran once, without consuming
+        // client bytes. Only DNS/admission/plain TCP dial belongs in this loop;
+        // outbound PROXY framing and the relay start after it succeeds.
+        let can_retry = params
+            .retry
+            .as_ref()
+            .is_some_and(|retry| retry.retry_on_connect_failure);
+        let max_retries = params
+            .retry
+            .as_ref()
+            .map(|retry| retry.max_retries)
+            .unwrap_or(0);
+        let mut params = params;
+        let mut attempt = 0u32;
+        let mut admitted_cb: Option<Arc<crate::circuit_breaker::CircuitBreaker>> = None;
+        let (mut backend_stream, addr, _backend_inflight_guard) = loop {
+            if let Some(termination) =
+                crate::proxy::auth_lifetime::expired_authorization(stream_auth_deadline)
+            {
                 return Err(settle_stream_auth_setup_expiry(
                     termination,
                     stream_ctx,
                     &stream_auth_expired,
                 ));
             }
-            Ok(Ok(addresses)) => addresses,
-            Ok(Err(e)) => {
+            let _ = admitted_cb.take();
+            let mut retryable = true;
+            let result: anyhow::Result<_> = async {
+                // Circuit breaker check — reject before DNS resolution or backend
+                // connect if the passthrough target is open. This mirrors the
+                // terminating TCP path; passthrough still records backend outcomes
+                // below, so it must also honor breaker admission and preserve the
+                // half-open probe flag for the matching record_success/failure call.
+                // Keep the admitted Arc so post-admission PROXY write failures settle
+                // the exact selected breaker rather than a get_or_create miss/transient.
                 if let Some(ref cb_config) = cb_info.cb_config {
-                    let cb = circuit_breaker_cache.get_or_create(
+                    match circuit_breaker_cache.can_execute(
                         &cb_info.namespace,
                         proxy_id,
                         cb_info.cb_target_key.as_deref(),
                         cb_config,
-                    );
-                    // A gateway-side egress-policy denial (literal / dns_override /
-                    // rebound passthrough host blocked) dialed no backend, so it
-                    // must NOT trip the breaker as a connect failure — release any
-                    // HALF_OPEN probe slot NEUTRALLY (mirrors the non-passthrough
-                    // TCP/UDP paths). Genuine DNS/transport failures still count.
-                    if crate::dns::is_egress_policy_denial(&e) {
-                        cb.record_neutral(cb_info.is_half_open_probe);
-                    } else {
-                        cb.record_failure(502, true, cb_info.is_half_open_probe);
+                    ) {
+                        Ok((cb, is_half_open_probe)) => {
+                            cb_info.is_half_open_probe = is_half_open_probe;
+                            admitted_cb = Some(cb);
+                        }
+                        Err(_) => {
+                            warn!(
+                                proxy_id = %proxy_id,
+                                client = %remote_addr,
+                                "TCP passthrough connection rejected: circuit breaker open"
+                            );
+                            return Err(StreamSetupError::new(
+                                StreamSetupKind::CircuitBreakerOpen,
+                                format!("for {}:{}", params.backend_host, params.backend_port),
+                            )
+                            .into());
+                        }
                     }
                 }
-                return Err(stream_dns_setup_error(&params.backend_host, e));
-            }
-        };
-        // DestinationRule `connectionPool.tcp.maxConnections` enforcement on
-        // the passthrough path. The cap is checked before connect so we don't
-        // count failed handshakes against the cap. The guard's RAII drop
-        // covers every relay exit (graceful EOF, idle timeout, error).
-        let passthrough_port_override = resolve_port_override(&params, params.backend_policy_port);
-        let _backend_inflight_guard = match acquire_backend_inflight_slot(
-            passthrough_port_override,
-            metrics,
-            &params.backend_host,
-            params.backend_policy_port,
-        ) {
-            Ok(guard) => guard,
-            Err(reason) => {
-                warn!(
-                    proxy_id = %proxy_id,
-                    backend = %format_backend_target(&params.backend_host, params.backend_port),
-                    reason = %reason,
-                    "TCP passthrough rejected: backend maxConnections reached"
-                );
-                // This is a gateway-local policy rejection, not a backend
-                // outcome. If the breaker admission above claimed a
-                // half-open probe slot, release it neutrally so passthrough
-                // traffic cannot wedge HALF_OPEN.
-                if let Some(ref cb_config) = cb_info.cb_config {
-                    let cb = circuit_breaker_cache.get_or_create(
-                        &cb_info.namespace,
-                        proxy_id,
-                        cb_info.cb_target_key.as_deref(),
-                        cb_config,
-                    );
-                    cb.record_neutral(cb_info.is_half_open_probe);
-                }
-                return Err(StreamSetupError::with_source(
-                    StreamSetupKind::BackendMaxConnectionsExceeded,
-                    format!(
-                        "for {}",
-                        format_backend_target(&params.backend_host, params.backend_port)
-                    ),
-                    reason,
-                )
-                .into());
-            }
-        };
 
-        // Connect plain TCP to backend (no TLS origination — the client's encrypted
-        // stream passes through directly to the backend which terminates TLS).
-        let connect_attempt = crate::dns::connect_candidates(
-            &candidates,
-            params.backend_port,
-            connect_timeout,
-            |addr| {
-                connect_backend_plain(addr, connect_timeout, params.tcp_fastopen_enabled, overload)
-            },
-        );
-        // Same stream latency sampling as the terminating path (issue #4514).
-        // Passthrough never rotates targets, so the initial guard's target is
-        // still the dialled one here.
-        let dial_started = Instant::now();
-        let bounded_connect =
-            within_stream_auth_deadline(stream_auth_deadline, connect_attempt).await;
-        let (mut backend_stream, addr) = match bounded_connect {
-            Err(termination) => {
-                if let Some(ref cb_config) = cb_info.cb_config {
-                    let cb = circuit_breaker_cache.get_or_create(
-                        &cb_info.namespace,
-                        proxy_id,
-                        cb_info.cb_target_key.as_deref(),
-                        cb_config,
-                    );
-                    cb.record_neutral(cb_info.is_half_open_probe);
-                }
-                return Err(settle_stream_auth_setup_expiry(
-                    termination,
-                    stream_ctx,
-                    &stream_auth_expired,
-                ));
-            }
-            Ok(result) => result
-                .map_err(|error| match error {
-                    crate::dns::CandidateConnectError::TimedOut { last_addr } => anyhow::anyhow!(
-                        "Backend TCP connect budget exhausted after {}ms (last={})",
-                        params.backend_connect_timeout_ms,
-                        last_addr
+                // Resolve backend IP via DNS. A resolution failure is a backend
+                // reachability failure: record it against the breaker (mirrors the
+                // non-passthrough path) so the failure counts toward opening AND any
+                // half-open probe slot claimed by can_execute above is released —
+                // otherwise an unresolvable passthrough hostname wedges HALF_OPEN
+                // until reload.
+                let resolved_candidates = within_stream_auth_deadline(
+                    stream_auth_deadline,
+                    dns_cache.resolve_candidates(
+                        &params.backend_host,
+                        params.dns_override.as_deref(),
+                        params.dns_cache_ttl_seconds,
                     ),
-                    crate::dns::CandidateConnectError::Failed { source, .. } => source,
-                })
-                .inspect_err(|_| {
-                    if lb_passive_latency && let Some(balancer) = lb_balancer.as_ref() {
-                        balancer.record_failed_attempt(&stream_lb_accounting_target(
+                )
+                .await;
+                let candidates = match resolved_candidates {
+                    Err(termination) => {
+                        if let Some(ref cb_config) = cb_info.cb_config {
+                            let cb = circuit_breaker_cache.get_or_create(
+                                &cb_info.namespace,
+                                proxy_id,
+                                cb_info.cb_target_key.as_deref(),
+                                cb_config,
+                            );
+                            cb.record_neutral(cb_info.is_half_open_probe);
+                        }
+                        retryable = false;
+                        return Err(settle_stream_auth_setup_expiry(
+                            termination,
+                            stream_ctx,
+                            &stream_auth_expired,
+                        ));
+                    }
+                    Ok(Ok(addresses)) => addresses,
+                    Ok(Err(e)) => {
+                        if let Some(ref cb_config) = cb_info.cb_config {
+                            let cb = circuit_breaker_cache.get_or_create(
+                                &cb_info.namespace,
+                                proxy_id,
+                                cb_info.cb_target_key.as_deref(),
+                                cb_config,
+                            );
+                            // A gateway-side egress-policy denial (literal / dns_override /
+                            // rebound passthrough host blocked) dialed no backend, so it
+                            // must NOT trip the breaker as a connect failure — release any
+                            // HALF_OPEN probe slot NEUTRALLY (mirrors the non-passthrough
+                            // TCP/UDP paths). Genuine DNS/transport failures still count.
+                            if crate::dns::is_egress_policy_denial(&e) {
+                                cb.record_neutral(cb_info.is_half_open_probe);
+                            } else {
+                                cb.record_failure(502, true, cb_info.is_half_open_probe);
+                            }
+                        }
+                        return Err(stream_dns_setup_error(&params.backend_host, e));
+                    }
+                };
+                // DestinationRule `connectionPool.tcp.maxConnections` enforcement on
+                // the passthrough path. The cap is checked before connect so we don't
+                // count failed handshakes against the cap. The guard's RAII drop
+                // covers every relay exit (graceful EOF, idle timeout, error).
+                let passthrough_port_override =
+                    resolve_port_override(&params, params.backend_policy_port);
+                let _backend_inflight_guard = match acquire_backend_inflight_slot(
+                    passthrough_port_override,
+                    metrics,
+                    &params.backend_host,
+                    params.backend_policy_port,
+                ) {
+                    Ok(guard) => guard,
+                    Err(reason) => {
+                        warn!(
+                            proxy_id = %proxy_id,
+                            backend = %format_backend_target(&params.backend_host, params.backend_port),
+                            reason = %reason,
+                            "TCP passthrough rejected: backend maxConnections reached"
+                        );
+                        // This is a gateway-local policy rejection, not a backend
+                        // outcome. If the breaker admission above claimed a
+                        // half-open probe slot, release it neutrally so passthrough
+                        // traffic cannot wedge HALF_OPEN.
+                        if let Some(ref cb_config) = cb_info.cb_config {
+                            let cb = circuit_breaker_cache.get_or_create(
+                                &cb_info.namespace,
+                                proxy_id,
+                                cb_info.cb_target_key.as_deref(),
+                                cb_config,
+                            );
+                            cb.record_neutral(cb_info.is_half_open_probe);
+                        }
+                        return Err(StreamSetupError::with_source(
+                            StreamSetupKind::BackendMaxConnectionsExceeded,
+                            format!(
+                                "for {}",
+                                format_backend_target(&params.backend_host, params.backend_port)
+                            ),
+                            reason,
+                        )
+                        .into());
+                    }
+                };
+
+                // Connect plain TCP to backend (no TLS origination — the client's encrypted
+                // stream passes through directly to the backend which terminates TLS).
+                let connect_attempt = crate::dns::connect_candidates(
+                    &candidates,
+                    params.backend_port,
+                    connect_timeout,
+                    |addr| {
+                        connect_backend_plain(
+                            addr,
+                            connect_timeout,
+                            params.tcp_fastopen_enabled,
+                            overload,
+                        )
+                    },
+                );
+                // Same stream latency sampling as the terminating path (issue #4514).
+                // Sample the current attempt, including a rotated target.
+                let dial_started = Instant::now();
+                let bounded_connect =
+                    within_stream_auth_deadline(stream_auth_deadline, connect_attempt).await;
+                let (backend_stream, addr) = match bounded_connect {
+                    Err(termination) => {
+                        if let Some(ref cb_config) = cb_info.cb_config {
+                            let cb = circuit_breaker_cache.get_or_create(
+                                &cb_info.namespace,
+                                proxy_id,
+                                cb_info.cb_target_key.as_deref(),
+                                cb_config,
+                            );
+                            cb.record_neutral(cb_info.is_half_open_probe);
+                        }
+                        retryable = false;
+                        return Err(settle_stream_auth_setup_expiry(
+                            termination,
+                            stream_ctx,
+                            &stream_auth_expired,
+                        ));
+                    }
+                    Ok(result) => result
+                        .map_err(|error| match error {
+                            crate::dns::CandidateConnectError::TimedOut { last_addr } => anyhow::anyhow!(
+                                "Backend TCP connect budget exhausted after {}ms (last={})",
+                                params.backend_connect_timeout_ms,
+                                last_addr
+                            ),
+                            crate::dns::CandidateConnectError::Failed { source, .. } => source,
+                        })
+                        .inspect_err(|_| {
+                            if lb_passive_latency && let Some(balancer) = lb_balancer.as_ref() {
+                                balancer.record_failed_attempt(&stream_lb_accounting_target(
+                                    &params.backend_host,
+                                    params.backend_port,
+                                    params.backend_policy_port,
+                                ));
+                            }
+                            if let Some(ref cb_config) = cb_info.cb_config {
+                                let cb = circuit_breaker_cache.get_or_create(
+                                    &cb_info.namespace,
+                                    proxy_id,
+                                    cb_info.cb_target_key.as_deref(),
+                                    cb_config,
+                                );
+                                cb.record_failure(502, true, cb_info.is_half_open_probe);
+                            }
+                        })?,
+                };
+                if lb_passive_latency && let Some(balancer) = lb_balancer.as_ref() {
+                    balancer.record_latency(
+                        &stream_lb_accounting_target(
                             &params.backend_host,
                             params.backend_port,
                             params.backend_policy_port,
-                        ));
+                        ),
+                        dial_started.elapsed().as_micros() as u64,
+                    );
+                }
+                Ok((backend_stream, addr, _backend_inflight_guard))
+            }
+            .await;
+            match result {
+                Ok(connected) => break connected,
+                Err(error) => {
+                    if !retryable || !can_retry || attempt >= max_retries {
+                        return Err(error);
                     }
-                    if let Some(ref cb_config) = cb_info.cb_config {
-                        let cb = circuit_breaker_cache.get_or_create(
-                            &cb_info.namespace,
-                            proxy_id,
-                            cb_info.cb_target_key.as_deref(),
-                            cb_config,
-                        );
-                        cb.record_failure(502, true, cb_info.is_half_open_probe);
+                    let Some((host, port, policy_port)) = try_next_enforced_target(
+                        &params,
+                        proxy,
+                        health_checker,
+                        &params.backend_host,
+                        params.backend_port,
+                        params.backend_policy_port,
+                        &epoch.load_balancer,
+                        mesh_outbound_enforcement,
+                        stream_ctx.listen_port,
+                        proxy_id,
+                        remote_addr.ip(),
+                    )? else {
+                        return Err(error);
+                    };
+                    warn!(
+                        proxy_id = %proxy_id,
+                        attempt,
+                        error = %error,
+                        "TCP passthrough setup failed for {}:{}, retrying with {}:{}",
+                        params.backend_host, params.backend_port, host, port
+                    );
+                    _lb_guard = arm_lb_guard(&host, port, policy_port);
+                    params.backend_host = host;
+                    params.backend_port = port;
+                    params.backend_policy_port = policy_port;
+                    cb_info.cb_target_key = params.upstream_id.as_ref().map(|_| {
+                        crate::circuit_breaker::target_key(&params.backend_host, params.backend_port)
+                    });
+                    cb_info.is_half_open_probe = false;
+                    backend_info.backend_target =
+                        format_backend_target(&params.backend_host, params.backend_port);
+                    backend_info.backend_resolved_ip = None;
+                    attempt += 1;
+                    if let Some(ref retry_config) = params.retry {
+                        let backoff = crate::retry::retry_delay(retry_config, attempt);
+                        if let Err(termination) = retry_backoff_within_stream_auth_deadline(
+                            stream_auth_deadline,
+                            backoff,
+                        )
+                        .await
+                        {
+                            return Err(settle_stream_auth_setup_expiry(
+                                termination,
+                                stream_ctx,
+                                &stream_auth_expired,
+                            ));
+                        }
                     }
-                })?,
+                }
+            }
         };
-        if lb_passive_latency && let Some(balancer) = lb_balancer.as_ref() {
-            balancer.record_latency(
-                &stream_lb_accounting_target(
-                    &params.backend_host,
-                    params.backend_port,
-                    params.backend_policy_port,
-                ),
-                dial_started.elapsed().as_micros() as u64,
-            );
-        }
         backend_info.backend_resolved_ip = Some(addr.ip().to_string());
+        let passthrough_port_override = resolve_port_override(&params, params.backend_policy_port);
 
         // Apply DR `connectionPool.tcp.tcpKeepalive` on the freshly connected
         // backend socket. Best-effort: a `setsockopt` failure logs and
