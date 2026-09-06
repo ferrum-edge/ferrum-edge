@@ -45,7 +45,7 @@ are announced.
 
 | Channel | What it is | Schema / config / API stability |
 |---|---|---|
-| `main` / build-out branches | Every push to `main` overwrites the `latest` prerelease image (see [ci_cd.md](ci_cd.md)). | **No cross-commit stability.** Core schema changes are folded into the `V001` baseline (see [Build-Out Schema Policy](#build-out-schema-policy)); breaking changes to schema, env vars, config shapes, and DB values are acceptable and are **not** shimmed. Treat any schema change as requiring a fresh database or an operator-managed rebuild. Do not run `latest` in production with data you cannot recreate. |
+| `main` / build-out branches | Main CI validates each push and publishes no production artifacts (see [ci_cd.md](ci_cd.md)); historical `latest` images are not refreshed. | **No cross-commit stability.** Core schema changes are folded into the `V001` baseline (see [Build-Out Schema Policy](#build-out-schema-policy)); breaking changes to schema, env vars, config shapes, and DB values are acceptable and are **not** shimmed. Treat any schema change as requiring a fresh database or an operator-managed rebuild. Do not run `latest` in production with data you cannot recreate. |
 | Tagged release `vX.Y.Z` | A `v*` tag cuts a versioned GitHub Release + Docker tags from a green CI/coverage SHA. | Semantic versioning per [ci_cd.md → Version Numbering](ci_cd.md#version-numbering). The promises in [Version Compatibility](upgrade_guide.md#version-compatibility) apply **between tagged releases**, not between arbitrary `main` commits. |
 
 The CP↔DP gRPC protocol is the one compatibility contract enforced in code

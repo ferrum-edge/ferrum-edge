@@ -857,10 +857,11 @@ kernel / netns-capture / two-cluster live gates, performance, and the
 cross-platform build matrix. When the planner marks `run_secrets_backends` or
 `run_pkcs11` false, the aggregate accepts a skipped Secret Backends or PKCS#11
 job; when the planner marks either true, that job must succeed. In light mode
-it requires the planner to succeed
-and accepts the planned heavy jobs as skipped. Pushes to `main` publish the
-`latest` prerelease and Docker images only after the full aggregate and build
-matrix pass.
+it requires successful planning and CI Policy with `verified=true`, and accepts
+the planned heavy jobs as skipped. Pushes to `main` validate the
+commit and may produce a CI image artifact; they do not publish production
+binaries, GitHub Releases, or registry tags. Production publication belongs to
+`release-dispatch.yml` and the version-tag `release.yml` workflow.
 
 Branch protection must require nine independent PR **and** merge-queue checks:
 the unchanged `Tests` aggregate from `ci.yml`, `Merge Coverage` from
@@ -891,10 +892,11 @@ CI uses
 `concurrency.group: ci-publish-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}`
 with `cancel-in-progress: true`, so a newer push to the same PR or the same
 merge-group head cancels the older run without cancelling unrelated lanes. On
-`main`, that can interrupt an in-flight publish job such as Docker manifest
-creation. If the cancellation left publishing incomplete, re-run the newest
-workflow attempt (the one for the latest `main` SHA) — re-running the older,
-canceled run would re-publish stale binaries and images as `latest`.
+`main`, that can interrupt validation or CI artifact creation, but cannot
+publish or retract production registry tags. Investigate a failed or cancelled
+validation at its exact SHA before any justified retry. Production release
+recovery is separate: inspect the version-tag release workflow and its artifacts;
+a main-CI rerun cannot finish a version release.
 
 ### Jobs
 
@@ -2200,8 +2202,9 @@ that *some* `@sha256:` digest was present, and the only constraint on
 same pull request supplied. A merged change to
 `image = "ghcr.io/<attacker>/almalinux@sha256:…"` would have produced the
 released `ferrum-edge-linux-x86_64` / `ferrum-cni-linux-x86_64` bytes, their
-`.sha256` sidecars, the moving `latest` prerelease, and the default container
-images, with every gate green.
+`.sha256` sidecars and the default container images, with every gate green.
+At that historical point main also published a moving `latest` prerelease;
+that publishing path was removed by the version-tag release split.
 
 The identity now lives in the trusted base, in two places that must agree:
 
@@ -2386,7 +2389,7 @@ downstream job fails closed with it.
 - Downloads the trusted `release-binaries-aarch64-unknown-linux-gnu` artifact on `ubuntu-24.04-arm`, re-checks its SHA-256 sidecars, and scans the published bytes — it never rebuilds them
 - Rejects GLIBC symbols above 2.34, unexpected `DT_NEEDED` entries, a `DT_RPATH`/`DT_RUNPATH`, and an ELF `e_machine` that does not match the advertised `*-x86_64` / `*-aarch64` asset
 - Smokes both binaries and their operator commands (`ferrum-edge version --json` / `validate` / `run` + `health`; `ferrum-cni VERSION` / `install` / `uninstall` / ADD / CHECK / DEL) on digest-pinned AlmaLinux 9.4 (the GLIBC_2.34 floor) and Ubuntu 22.04 via `bash .github/scripts/smoke_linux_gnu_baseline.sh`
-- `linux-gnu-abi-release-gate` joins `create-release` with this job (`if: always()`). The ARM64 producer and `create-release.needs` are both frozen by trusted Cross policy, so the ARM64 scan can only join after publication; the gate fails the workflow and deletes the GitHub Release if that job did not succeed. Checksums, Cosign signatures, and container publish jobs are unchanged: the retraction does not delete `:latest` / `:vX.Y.Z` image tags.
+- `linux-gnu-abi-release-gate` joins `create-release` with this job (`if: always()`). The ARM64 producer and `create-release.needs` are both frozen by trusted Cross policy, so the ARM64 scan can only join after publication; the gate fails the workflow and deletes the GitHub Release if that job did not succeed. Checksums, Cosign signatures, and container publish jobs are unchanged: the retraction does not delete published `:vX.Y.Z` image tags.
 
 
 ### Create Release Job
@@ -2407,9 +2410,9 @@ uploaded, so an unverified x86_64 artifact never reaches publication at all.
 Only ARM64, whose producer and consumer `needs` are both frozen, is joined
 after the fact: `linux-gnu-abi-release-gate` requires
 `verify-linux-gnu-abi-aarch64` and deletes the GitHub Release if it did not
-succeed, and `linux-gnu-abi-latest-gate` does the same for the moving
-`latest` prerelease, deleting it only when it is proven to target the
-current `GITHUB_SHA`.
+succeed. The former main-path `linux-gnu-abi-latest-gate` and moving prerelease
+publication are no longer part of CI; retained historical `latest` artifacts do
+not reflect subsequent main validation.
 
 **Release Content**:
 1. Release title: Version tag (e.g., `v0.2.0`)

@@ -51,8 +51,8 @@ migrations; use the explicit Job for `status`, dry-run, and operator-controlled
   `Chart.appVersion`. That tag must exist in the container registry before
   install. Override with a published tag from `docker.io/ferrumedge/ferrum-edge`
   or `ghcr.io/ferrum-edge/ferrum-edge` (for example
-  `--set image.tag=<tag>`). The mutable `latest` tag exists for evaluation but
-  must not be used in production.
+  `--set image.tag=<tag>`). Historical `latest` images are no longer refreshed
+  by main CI and must not be used as a production or security-update channel.
 - **Private registries.** `image.pullSecrets` is a list of Secret **names** in
   the release namespace — each must already exist as a
   `kubernetes.io/dockerconfigjson` Secret, the chart never creates one. The
