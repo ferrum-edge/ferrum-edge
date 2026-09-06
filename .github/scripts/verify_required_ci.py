@@ -1589,7 +1589,8 @@ def main() -> int:
 
     # Optional ACME coverage must use the small DNS target and prove every
     # required selection. The self-tests exercise missing/ignored tests and
-    # disabled, masked, or retargeted workflow commands (issue #4669).
+    # disabled, masked, or retargeted literal workflow commands, plus Cargo/tee
+    # pipeline failure propagation and read-only report validation (issue #4669).
     planner_errors.extend(unit_ci_contract_errors())
     planner_errors.extend(unit_ci_self_test())
 

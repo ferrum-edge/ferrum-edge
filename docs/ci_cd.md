@@ -940,24 +940,31 @@ builds the inline library and the two-test DNS executable without rebuilding
 existing default targets, and inline ACME/renewal coverage remains in the lib
 binary. The Unix-only hook fixture and its real-process delays are unchanged.
 
-In CI, the default and ACME commands above run through
-`.github/scripts/run_unit_ci.py`. It requires the complete unfiltered default
-suites (baseline floors: 5,880 inline passes and 18,239 external passes) and
+In CI, each default and ACME command above appears literally in its workflow
+step, wrapped by `/usr/bin/time` with explicit format/output options and piped
+through `tee` under `set -euo pipefail`. Cargo and log-write failures stop the
+step before reporting, even when the other pipeline command succeeds. Python
+never launches Cargo: `.github/scripts/run_unit_ci.py` reads the phase log and
+GNU time output after the pipeline succeeds. It requires the complete unfiltered
+default suites (baseline floors: 5,880 inline passes and 18,239 external passes) and
 all 20 outbound, 2 DNS hook, and 16 renewal regression names from main run
 `34018271780`. Additional tests are allowed; missing/renamed required ACME
 tests, zero matches, ignored ACME tests, unexpected filtering of a whole target,
 and failed commands fail closed. Default inline opt-in/ignored tests remain
 allowed; the separate kTLS proof retains its own three-test gate.
 `verify_required_ci.py` runs the selection and workflow/manifest mutation tests
-in `test_unit_ci.py`; neither the new runner nor its tests changes scheduling,
-required aggregate dependencies, memory limits, or release-SHA proof.
+in `test_unit_ci.py`, including missing/failed telemetry and literal shell
+fixtures proving command and `tee` failure propagation. Neither the reporter
+nor its tests changes scheduling, required aggregate dependencies, memory limits,
+or release-SHA proof.
 
-Each wrapped phase streams its Cargo output and writes a step summary with wall
-time, libtest counts/execution time, GNU time maximum child RSS, and sampled
-whole-runner peak RAM/swap usage (1-second samples, not an exact instantaneous
-peak). Detailed phase logs remain under `$RUNNER_TEMP/unit-ci/`. Sampling errors
-are reported as unavailable, never as evidence of zero memory usage. Compare
-precompile/execution measurements only on the exact pushed-head CI run and
+Each phase streams its Cargo output; successful phases write a step summary
+with wall time (including Cargo), libtest counts/execution time, and GNU time
+maximum child RSS. This measures child RSS, not aggregate process-tree or
+whole-runner RAM/swap usage; there is no runner sampler. Detailed phase logs and
+GNU time reports remain under `$RUNNER_TEMP/unit-ci/`. Missing/malformed timing
+or nonzero child status fails validation. Compare precompile/execution
+measurements only on the exact pushed-head CI run and
 include cache restoration evidence. Measure `Tests` aggregate latency from the
 Actions run's `created_at` to the `Tests` job's `completed_at`, so queueing and
 other required lanes remain visible without changing the aggregate job.

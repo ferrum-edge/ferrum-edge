@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Run the existing unit CI commands with selection proof and phase measurements.
+"""Validate unit CI logs and report selection proof and phase measurements.
 
 Counts are floors from main run 34018271780, not caps on new coverage. ACME
 also requires every named regression so replacement tests cannot mask deletion.
-Only CI executes Cargo; importing this module never runs a command.
+Cargo commands are literal workflow steps. This helper never executes a process.
 """
 
 from __future__ import annotations
@@ -11,22 +11,14 @@ from __future__ import annotations
 import argparse
 import os
 import re
-import subprocess
 import sys
-import threading
-import time
 from pathlib import Path
 
 
-COMMANDS = {
-    "default-build": "cargo test --lib --test unit_tests --no-run",
-    "default-lib": "cargo test --lib",
-    "default-unit": "cargo test --test unit_tests",
-    "acme-build": "cargo test --features acme --lib --test acme_dns01_tests --no-run",
-    "acme-outbound": "cargo test --features acme --lib tls::acme::client::tests",
-    "acme-dns": "cargo test --features acme --test acme_dns01_tests",
-    "acme-renewal": "cargo test --features acme --lib tls::acme_renewal_resume_tests",
-}
+PHASES = (
+    "default-build", "default-lib", "default-unit",
+    "acme-build", "acme-outbound", "acme-dns", "acme-renewal",
+)
 MINIMUM_PASSED = {
     "default-lib": 5880,
     "default-unit": 18239,
@@ -115,91 +107,38 @@ def validate_output(phase: str, output: str) -> str:
     )
 
 
-def sample_memory(stop: threading.Event, peaks: dict[str, int], errors: list[str]) -> None:
-    """Sample whole-runner usage, including concurrent Cargo children, in KiB."""
-    while True:
-        try:
-            fields = dict(re.findall(r"^(\w+):\s+(\d+) kB$", Path("/proc/meminfo").read_text(), re.M))
-            ram = int(fields["MemTotal"]) - int(fields["MemAvailable"])
-            swap = int(fields["SwapTotal"]) - int(fields["SwapFree"])
-            peaks["ram"] = max(peaks["ram"], ram)
-            peaks["swap"] = max(peaks["swap"], swap)
-        except (OSError, KeyError, ValueError) as error:
-            errors.append(f"memory sampling unavailable: {error}")
-            return
-        if stop.wait(1):
-            return
+def validate_usage(phase: str, usage: str) -> str:
+    """Require complete GNU time telemetry and a successful child exit."""
+    match = re.fullmatch(
+        r"wall_seconds=([0-9]+(?:\.[0-9]+)?) max_child_rss_kib=([0-9]+) exit_status=0\n?",
+        usage,
+    )
+    if match is None:
+        raise ValueError(f"{phase}: missing/invalid timing or unsuccessful command")
+    return f"Wall time (including Cargo): {match[1]}s; maximum child RSS: {match[2]} KiB"
 
 
-def run(phase: str, command: list[str]) -> int:
-    if command != COMMANDS[phase].split():
-        raise ValueError(f"{phase}: command must be exactly {COMMANDS[phase]}")
+def report(phase: str) -> None:
     root = Path(os.environ["RUNNER_TEMP"]) / "unit-ci"
-    root.mkdir(parents=True, exist_ok=True)
-    usage_path = root / f"{phase}.time"
-    output_path = root / f"{phase}.log"
-    stop = threading.Event()
-    peaks = {"ram": 0, "swap": 0}
-    errors: list[str] = []
-    sampler = threading.Thread(target=sample_memory, args=(stop, peaks, errors), daemon=True)
-    started = time.monotonic()
-    sampler.start()
-    status = 1
-    proof = "FAILED before test proof"
-    try:
-        # GNU time reports the maximum child RSS, not aggregate process-tree
-        # memory; the independent runner sample supplies RAM and swap peaks.
-        with output_path.open("w", encoding="utf-8") as log:
-            with subprocess.Popen(
-                ["/usr/bin/time", "-f", "max_child_rss_kib=%M swap_outs=%W", "-o", str(usage_path), *command],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            ) as process:
-                assert process.stdout is not None
-                for line in process.stdout:
-                    print(line, end="", flush=True)
-                    log.write(line)
-                status = process.wait()
-        if status == 0:
-            proof = validate_output(phase, output_path.read_text(encoding="utf-8"))
-        else:
-            proof = f"FAILED: Cargo exit {status}"
-    except (OSError, ValueError) as error:
-        proof = f"FAILED: {error}"
-        status = 1
-    finally:
-        stop.set()
-        sampler.join()
-        elapsed = time.monotonic() - started
-        usage = usage_path.read_text().strip() if usage_path.exists() else "child RSS unavailable"
-        memory = (
-            f"sampled runner peak RAM: {peaks['ram']} KiB; "
-            f"swap: {peaks['swap']} KiB (1s samples)"
-            if not errors else "; ".join(errors)
-        )
-        report = (
-            f"### Unit CI: {phase}\n\n"
-            f"- {proof}\n"
-            f"- Wall time (including Cargo): {elapsed:.2f}s; {usage}\n"
-            f"- {memory}\n"
-        )
-        print(report, flush=True)
-        if summary := os.environ.get("GITHUB_STEP_SUMMARY"):
-            with Path(summary).open("a", encoding="utf-8") as stream:
-                stream.write(report + "\n")
-    # Keep the actual Cargo failure code; telemetry never turns failure green.
-    return status if status >= 0 else 128 - status
+    # Read both files even for precompile phases; missing logs/telemetry are
+    # errors. The workflow's pipefail also rejects Cargo AND tee failures
+    # before this helper runs, independently of any apparent passing output.
+    usage = validate_usage(phase, (root / f"{phase}.time").read_text(encoding="utf-8"))
+    proof = validate_output(phase, (root / f"{phase}.log").read_text(encoding="utf-8"))
+    result = f"### Unit CI: {phase}\n\n- {proof}\n- {usage}\n"
+    print(result, flush=True)
+    if summary := os.environ.get("GITHUB_STEP_SUMMARY"):
+        with Path(summary).open("a", encoding="utf-8") as stream:
+            stream.write(result + "\n")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=COMMANDS)
-    parser.add_argument("command", nargs=argparse.REMAINDER)
+    parser.add_argument("phase", choices=PHASES)
     args = parser.parse_args()
-    command = args.command[1:] if args.command[:1] == ["--"] else args.command
     try:
-        return run(args.phase, command)
+        report(args.phase)
+        return 0
     except (OSError, ValueError, KeyError) as error:
         print(f"::error::{error}", file=sys.stderr)
         return 1

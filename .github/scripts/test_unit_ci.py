@@ -5,14 +5,25 @@ from __future__ import annotations
 
 import io
 import re
+import subprocess
 import tempfile
 import tomllib
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-from run_unit_ci import COMMANDS, MINIMUM_PASSED, REQUIRED_TESTS, run, validate_output
+from run_unit_ci import MINIMUM_PASSED, REQUIRED_TESTS, main, validate_output, validate_usage
 
+
+COMMANDS = {
+    "default-build": "cargo test --lib --test unit_tests --no-run",
+    "default-lib": "cargo test --lib",
+    "default-unit": "cargo test --test unit_tests",
+    "acme-build": "cargo test --features acme --lib --test acme_dns01_tests --no-run",
+    "acme-outbound": "cargo test --features acme --lib tls::acme::client::tests",
+    "acme-dns": "cargo test --features acme --test acme_dns01_tests",
+    "acme-renewal": "cargo test --features acme --lib tls::acme_renewal_resume_tests",
+}
 
 STEPS = {
     "default-build": "Precompile inline and hardening test binaries",
@@ -38,7 +49,13 @@ def contract_errors(workflow: str, manifest: str, tls_modules: str) -> list[str]
         candidates = [step for step in steps if step.startswith(f"      - name: {name}\n")]
         expected = [
             f"- name: {name}",
-            f"run: python3 .github/scripts/run_unit_ci.py {phase} -- {COMMANDS[phase]}",
+            "run: |",
+            "set -euo pipefail",
+            'mkdir -p "$RUNNER_TEMP/unit-ci"',
+            f"/usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M exit_status=%x' "
+            f'--output="$RUNNER_TEMP/unit-ci/{phase}.time" {COMMANDS[phase]} '
+            f'2>&1 | tee "$RUNNER_TEMP/unit-ci/{phase}.log"',
+            f"python3 .github/scripts/run_unit_ci.py {phase}",
             "env:",
             "RUST_BACKTRACE: 1",
         ]
@@ -142,12 +159,32 @@ class ContractTests(unittest.TestCase):
 
     def test_missing_disabled_or_masked_commands_are_rejected(self):
         for phase, name in STEPS.items():
-            command = f"run: python3 .github/scripts/run_unit_ci.py {phase} -- {COMMANDS[phase]}"
-            for replacement in ("# " + command, command + " || true", command + "\n        if: false",
-                                command + "\n        continue-on-error: true", command.replace("cargo test", "echo cargo test")):
-                with self.subTest(phase=phase, replacement=replacement):
-                    self.assertTrue(self.check(workflow=self.workflow.replace(command, replacement, 1)))
+            reporter = f"python3 .github/scripts/run_unit_ci.py {phase}"
+            for before, after in (
+                (reporter, "# " + reporter),
+                (reporter, reporter + " || true"),
+                (reporter, reporter + "\n        if: false"),
+                (reporter, reporter + "\n        continue-on-error: true"),
+                (COMMANDS[phase], "echo " + COMMANDS[phase]),
+                (f'{phase}.time"', 'wrong-phase.time"'),
+                (f'{phase}.log"', f'{phase}.log" || true'),
+                (f'{phase}.log"', 'wrong-phase.log"'),
+            ):
+                with self.subTest(phase=phase, replacement=after):
+                    self.assertTrue(self.check(workflow=self.workflow.replace(before, after)))
             self.assertTrue(self.check(workflow=self.workflow.replace(f"- name: {name}", "- name: Removed", 1)))
+
+    def test_pipeline_failure_guards_and_timing_cannot_be_removed(self):
+        for before, after in (
+            ("set -euo pipefail", "set -eu"),
+            ("set -euo pipefail", "set -uo pipefail"),
+            ("set -euo pipefail", "set -euo pipefail; set +e"),
+            ("2>&1 | tee", "2>&1 || tee"),
+            ("/usr/bin/time --format=", "echo --format="),
+            ("exit_status=%x", "exit_status=0"),
+        ):
+            with self.subTest(replacement=after):
+                self.assertTrue(self.check(workflow=self.workflow.replace(before, after)))
 
     def test_monolith_rebuild_missing_target_or_feature_gate_are_rejected(self):
         self.assertTrue(self.check(workflow=self.workflow.replace("--test acme_dns01_tests", "--test unit_tests")))
@@ -163,41 +200,81 @@ class ContractTests(unittest.TestCase):
         self.assertTrue(self.check(modules=self.modules + "mod acme_dns01_hook_tests;\n"))
 
 
-class RunnerTests(unittest.TestCase):
-    def test_cargo_failure_and_missing_proof_cannot_turn_green(self):
-        # Fake only the process boundary: no Cargo, compilation, or Rust tests
-        # are executed by this Python regression suite.
-        for cargo_status, output, expected in (
-            (42, output_for("acme-dns"), 42),
-            (-15, "", 143),
-            (0, "", 1),
-            (0, output_for("acme-dns"), 0),
-        ):
-            with self.subTest(status=cargo_status, output=output), tempfile.TemporaryDirectory() as root:
-                process = MagicMock()
-                process.__enter__.return_value = process
-                process.stdout = io.StringIO(output)
-                process.wait.return_value = cargo_status
-                with (
-                    patch.dict("os.environ", {"RUNNER_TEMP": root, "GITHUB_STEP_SUMMARY": ""}),
-                    patch("run_unit_ci.subprocess.Popen", return_value=process) as popen,
-                    patch("run_unit_ci.sample_memory"),
-                    patch("sys.stdout", new_callable=io.StringIO),
-                ):
-                    self.assertEqual(run("acme-dns", COMMANDS["acme-dns"].split()), expected)
-                    self.assertEqual(popen.call_args.args[0][-6:], COMMANDS["acme-dns"].split())
+class ReportTests(unittest.TestCase):
+    def test_missing_proof_and_failed_commands_cannot_turn_green(self):
+        success = "wall_seconds=1.25 max_child_rss_kib=2048 exit_status=0\n"
+        for phase in ("acme-dns", "acme-build"):
+            for usage, output, expected in (
+                (success, output_for("acme-dns"), 0),
+                (success.replace("exit_status=0", "exit_status=42"), output_for("acme-dns"), 1),
+                ("Command terminated by signal 15\n" + success, output_for("acme-dns"), 1),
+                ("", output_for("acme-dns"), 1),
+                (None, output_for("acme-dns"), 1),
+                (success, None, 1),
+                (success, "", 0 if phase.endswith("-build") else 1),
+            ):
+                with self.subTest(phase=phase, usage=usage, output=output), tempfile.TemporaryDirectory() as root:
+                    logs = Path(root) / "unit-ci"
+                    logs.mkdir()
+                    if usage is not None:
+                        (logs / f"{phase}.time").write_text(usage)
+                    if output is not None:
+                        (logs / f"{phase}.log").write_text(output)
+                    summary = Path(root) / "summary.md"
+                    with (
+                        patch.dict("os.environ", {"RUNNER_TEMP": root, "GITHUB_STEP_SUMMARY": str(summary)}),
+                        patch("sys.argv", ["run_unit_ci.py", phase]),
+                        patch("sys.stdout", new_callable=io.StringIO),
+                        patch("sys.stderr", new_callable=io.StringIO),
+                    ):
+                        self.assertEqual(main(), expected)
+                    self.assertEqual(summary.exists(), expected == 0)
+                    if expected == 0:
+                        self.assertIn("1.25s; maximum child RSS: 2048 KiB", summary.read_text())
+                        self.assertIn("precompile" if phase.endswith("-build") else "2 passed", summary.read_text())
 
-    def test_wrong_command_is_rejected_before_spawning(self):
-        with patch("run_unit_ci.subprocess.Popen") as popen:
-            with self.assertRaises(ValueError):
-                run("acme-dns", ["cargo", "test", "--test", "unit_tests"])
-            popen.assert_not_called()
+    def test_malformed_or_duplicate_telemetry_is_rejected(self):
+        success = "wall_seconds=1.25 max_child_rss_kib=2048 exit_status=0\n"
+        for usage in (success * 2, success.replace("1.25", "nan"), success.replace("2048", "-1"),
+                      success.replace(" exit_status=0", "")):
+            with self.subTest(usage=usage), self.assertRaises(ValueError):
+                validate_usage("acme-dns", usage)
+
+
+class PipelineTests(unittest.TestCase):
+    # These literal shell fixtures execute only in remote CI, never Cargo.
+    # ContractTests separately pin every workflow to this pipeline shape.
+    def test_command_failure_is_fatal_even_when_tee_succeeds(self):
+        with tempfile.TemporaryDirectory() as root:
+            result = subprocess.run(
+                ["bash", "-c", """set -euo pipefail
+/usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M exit_status=%x' --output=phase.time bash -c 'echo command-output; exit 42' 2>&1 | tee phase.log
+echo reporter-ran > reporter.marker
+"""],
+                cwd=root, capture_output=True, text=True, check=False, timeout=10,
+            )
+            self.assertEqual(result.returncode, 42)
+            self.assertIn("command-output", (Path(root) / "phase.log").read_text())
+            self.assertFalse((Path(root) / "reporter.marker").exists())
+
+    def test_tee_failure_is_fatal_even_when_command_succeeds(self):
+        with tempfile.TemporaryDirectory() as root:
+            result = subprocess.run(
+                ["bash", "-c", """set -euo pipefail
+/usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M exit_status=%x' --output=phase.time echo command-output 2>&1 | tee missing-directory/phase.log
+echo reporter-ran > reporter.marker
+"""],
+                cwd=root, capture_output=True, text=True, check=False, timeout=10,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("exit_status=0", (Path(root) / "phase.time").read_text())
+            self.assertFalse((Path(root) / "reporter.marker").exists())
 
 
 def self_test() -> list[str]:
     suite = unittest.TestSuite(
         unittest.defaultTestLoader.loadTestsFromTestCase(case)
-        for case in (SelectionTests, ContractTests, RunnerTests)
+        for case in (SelectionTests, ContractTests, ReportTests, PipelineTests)
     )
     result = unittest.TextTestRunner(verbosity=1).run(suite)
     return [] if result.wasSuccessful() else ["unit CI selection/target self-tests failed"]
