@@ -264,6 +264,7 @@ ferrum-edge health [OPTIONS]
 
 | Flag | Short | Description |
 |------|-------|-------------|
+| `--settings <PATH>` | `-s` | Operational settings file for inferred ports (same path discovery as `run`) |
 | `--port <PORT>` | `-p` | Admin API port (defaults to `FERRUM_ADMIN_HTTP_PORT` / 9000, or `FERRUM_ADMIN_HTTPS_PORT` / 9443 when TLS is used) |
 | `--host <HOST>` | | Admin API host (default: `127.0.0.1`) |
 | `--tls` | | Connect via HTTPS instead of HTTP |
@@ -272,7 +273,15 @@ ferrum-edge health [OPTIONS]
 
 ### Auto-Detection
 
-When `FERRUM_ADMIN_HTTP_PORT=0` (plaintext admin disabled), the health command automatically switches to TLS mode and uses port 9443 (or the value of `FERRUM_ADMIN_HTTPS_PORT`). No `--tls` flag is needed in this case.
+Health resolves admin ports from environment variables, then the selected
+`ferrum.conf`, then 9000/9443 defaults. Use `--settings` for the same custom
+settings path passed to `run`, or `FERRUM_CONF_PATH`; otherwise normal settings
+path discovery applies. An invalid settings file or port fails the probe.
+An explicit `--port` bypasses settings inference and uses plaintext unless
+`--tls` is also given. The one-shot probe does not run startup secret-source
+materialization; pass resolved paths/ports when startup uses external sources.
+
+When `FERRUM_ADMIN_HTTP_PORT=0` in either environment or settings (plaintext admin disabled), the health command automatically switches to TLS mode and uses port 9443 (or the value of `FERRUM_ADMIN_HTTPS_PORT`). No `--tls` flag is needed in this case.
 
 ### Examples
 

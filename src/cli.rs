@@ -138,6 +138,10 @@ pub struct VersionArgs {
 
 #[derive(clap::Args)]
 pub struct HealthArgs {
+    /// Path to ferrum.conf for inferred admin ports (env values take precedence).
+    #[arg(short = 's', long = "settings")]
+    pub settings: Option<PathBuf>,
+
     /// Admin API port to check (defaults to FERRUM_ADMIN_HTTP_PORT, or
     /// FERRUM_ADMIN_HTTPS_PORT when --tls is set, or 9000/9443 respectively).
     #[arg(short = 'p', long = "port")]
@@ -148,7 +152,7 @@ pub struct HealthArgs {
     pub host: String,
 
     /// Use TLS (HTTPS) to connect to the admin API.
-    /// Required when the plaintext admin HTTP listener is disabled (FERRUM_ADMIN_HTTP_PORT=0).
+    /// Selected automatically when HTTP is disabled and --port is not supplied.
     #[arg(long)]
     pub tls: bool,
 
@@ -1069,6 +1073,37 @@ impl std::io::Write for DeadlineTcpStream {
     }
 }
 
+/// Resolve only the settings needed by the one-shot health probe. Explicit
+/// ports keep their existing independent behavior; inferred ports use the same
+/// stable settings reader and env-over-conf resolver as gateway startup.
+fn resolve_health_target(args: &HealthArgs) -> Result<(u16, bool), String> {
+    use crate::config::conf_file::ConfFile;
+    use crate::config::env_config::resolve_var;
+
+    if let Some(port) = args.port {
+        return Ok((port, args.tls));
+    }
+    let conf = match resolve_settings_path(args.settings.as_deref()) {
+        Some(path) => ConfFile::load_from_path(&path, false)?,
+        None => ConfFile::load()?,
+    };
+    let configured_port = |key: &str, default: u16| -> Result<u16, String> {
+        match resolve_var(&conf, key) {
+            Some(value) => value
+                .parse::<u16>()
+                .map_err(|_| format!("{key} must be an integer from 0 to 65535")),
+            None => Ok(default),
+        }
+    };
+    let use_tls = args.tls || configured_port("FERRUM_ADMIN_HTTP_PORT", 9000)? == 0;
+    let port = if use_tls {
+        configured_port("FERRUM_ADMIN_HTTPS_PORT", 9443)?
+    } else {
+        configured_port("FERRUM_ADMIN_HTTP_PORT", 9000)?
+    };
+    Ok((port, use_tls))
+}
+
 /// Check gateway health by connecting to the admin API.
 ///
 /// By default this probes readiness via `GET /health` (503 until the gateway is
@@ -1085,29 +1120,7 @@ pub fn execute_health(args: &HealthArgs) -> Result<(), String> {
     use std::net::{TcpStream, ToSocketAddrs};
     use std::time::Instant;
 
-    // Auto-detect TLS when admin HTTP port is explicitly disabled (port=0) and
-    // the user didn't pass --port to override.
-    let auto_tls = args.port.is_none()
-        && !args.tls
-        && std::env::var("FERRUM_ADMIN_HTTP_PORT")
-            .ok()
-            .and_then(|v| v.parse::<u16>().ok())
-            == Some(0);
-    let use_tls = args.tls || auto_tls;
-
-    let port = args.port.unwrap_or_else(|| {
-        if use_tls {
-            std::env::var("FERRUM_ADMIN_HTTPS_PORT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(9443)
-        } else {
-            std::env::var("FERRUM_ADMIN_HTTP_PORT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(9000)
-        }
-    });
+    let (port, use_tls) = resolve_health_target(args)?;
 
     let addr_str = format_host_port(&args.host, port);
     let sock_addr = addr_str
@@ -1490,6 +1503,132 @@ mod tests {
     use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener};
 
     #[test]
+    fn health_target_respects_settings_and_overrides() {
+        const CHILD_CASE: &str = "FERRUM_TEST_HEALTH_SETTINGS_CASE";
+        let cases = [
+            (
+                "FERRUM_ADMIN_HTTP_PORT = 9001\n",
+                vec!["health"],
+                None,
+                None,
+                Ok((9001, false)),
+            ),
+            (
+                "FERRUM_ADMIN_HTTP_PORT = 0\nFERRUM_ADMIN_HTTPS_PORT = 9555\n",
+                vec!["health", "-s", "custom.conf"],
+                None,
+                None,
+                Ok((9555, true)),
+            ),
+            (
+                "FERRUM_ADMIN_HTTP_PORT = 0\n",
+                vec!["health"],
+                Some("9222"),
+                None,
+                Ok((9222, false)),
+            ),
+            (
+                "FERRUM_ADMIN_HTTP_PORT = 9001\n",
+                vec!["health", "--tls"],
+                None,
+                Some("9666"),
+                Ok((9666, true)),
+            ),
+            (
+                "FERRUM_ADMIN_HTTP_PORT = 0\n",
+                vec!["health", "-p", "9777"],
+                None,
+                None,
+                Ok((9777, false)),
+            ),
+            ("", vec!["health"], None, None, Ok((9000, false))),
+            (
+                "FERRUM_ADMIN_HTTP_PORT = 0\n",
+                vec!["health"],
+                None,
+                None,
+                Ok((9443, true)),
+            ),
+            (
+                "invalid settings\n",
+                vec!["health"],
+                None,
+                None,
+                Err("Invalid conf file syntax"),
+            ),
+            (
+                "FERRUM_ADMIN_HTTP_PORT = invalid\n",
+                vec!["health"],
+                None,
+                None,
+                Err("FERRUM_ADMIN_HTTP_PORT must be an integer"),
+            ),
+            (
+                "FERRUM_ADMIN_HTTP_PORT = 9001\n",
+                vec!["health", "-s", "missing.conf"],
+                None,
+                None,
+                Err("ferrum.conf"),
+            ),
+        ];
+        if let Ok(index) = std::env::var(CHILD_CASE) {
+            let (_, arguments, _, _, expected) = &cases[index.parse::<usize>().unwrap()];
+            let cli =
+                Cli::parse_from(std::iter::once("ferrum-edge").chain(arguments.iter().copied()));
+            let Some(Command::Health(args)) = cli.command else {
+                panic!("expected health command");
+            };
+            let actual = resolve_health_target(&args);
+            match expected {
+                Ok(target) => assert_eq!(actual.unwrap(), *target),
+                Err(message) => assert!(actual.unwrap_err().contains(*message)),
+            }
+            return;
+        }
+        for (index, (settings, _, http, https, _)) in cases.iter().enumerate() {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("ferrum.conf"), settings).unwrap();
+            std::fs::write(directory.path().join("custom.conf"), settings).unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("--exact")
+                .arg("cli::tests::health_target_respects_settings_and_overrides")
+                .current_dir(directory.path())
+                .env(CHILD_CASE, index.to_string());
+            for key in [
+                "FERRUM_CONF_PATH",
+                "FERRUM_CONF_PATH_FILE",
+                "FERRUM_CONF_PATH_VAULT",
+                "FERRUM_CONF_PATH_AWS",
+                "FERRUM_CONF_PATH_AZURE",
+                "FERRUM_CONF_PATH_GCP",
+                "FERRUM_ADMIN_HTTP_PORT",
+                "FERRUM_ADMIN_HTTPS_PORT",
+            ] {
+                command.env_remove(key);
+            }
+            if let Some(value) = http {
+                command.env("FERRUM_ADMIN_HTTP_PORT", value);
+            }
+            if let Some(value) = https {
+                command.env("FERRUM_ADMIN_HTTPS_PORT", value);
+            }
+            // A direct environment path must work as well as smart discovery.
+            if index == 2 {
+                command.env("FERRUM_CONF_PATH", directory.path().join("custom.conf"));
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "case {index}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+    }
+
+    #[test]
     fn format_host_port_brackets_ipv6_literals() {
         assert_eq!(format_host_port("::1", 9443), "[::1]:9443");
         assert_eq!(format_host_port("[::1]", 9443), "[::1]:9443");
@@ -1518,6 +1657,7 @@ mod tests {
         });
 
         let args = HealthArgs {
+            settings: None,
             port: Some(port),
             host: "::1".to_string(),
             tls: false,
