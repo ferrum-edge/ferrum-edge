@@ -6,7 +6,7 @@ on:
       - 'v*'
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: production-release
   cancel-in-progress: false
 
 env:
@@ -1541,3 +1541,28 @@ jobs:
           fi
 
           echo "GitHub Release ${TAG_NAME} remains published after successful Linux GNU ABI verification"
+
+  anonymous-pull-smoke:
+    name: Anonymous image pull smoke
+    needs: docker-manifest
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      # The publishers above logged in before pushing, so their success does not
+      # show that a first-time user can consume the images (issue #4637). Prove
+      # it with no credentials at all: the documented Docker Hub path must be
+      # anonymously pullable; GHCR is reported until the package is public.
+      - name: Verify the documented registry path is anonymously pullable
+        env:
+          VERSION_TAG: ${{ github.ref_name }}
+          GHCR_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          bash scripts/smoke_anonymous_pull.sh "docker.io/ferrumedge/ferrum-edge:${VERSION_TAG}"
+          bash scripts/smoke_anonymous_pull.sh --warn-only "ghcr.io/${GHCR_REPOSITORY}:${VERSION_TAG}"

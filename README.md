@@ -9,7 +9,7 @@
 <p align="center">
   <a href="https://github.com/ferrum-edge/ferrum-edge/actions/workflows/ci.yml"><img src="https://github.com/ferrum-edge/ferrum-edge/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="https://github.com/ferrum-edge/ferrum-edge/actions/workflows/coverage.yml"><img src="https://github.com/ferrum-edge/ferrum-edge/actions/workflows/coverage.yml/badge.svg?branch=main" alt="Coverage"></a>
-  <a href="https://github.com/ferrum-edge/ferrum-edge/releases/tag/latest"><img src="https://img.shields.io/github/v/release/ferrum-edge/ferrum-edge?include_prereleases" alt="Release"></a>
+  <a href="https://github.com/ferrum-edge/ferrum-edge/releases"><img src="https://img.shields.io/github/v/release/ferrum-edge/ferrum-edge?include_prereleases" alt="Release"></a>
   <a href="https://github.com/ferrum-edge/ferrum-edge/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-PolyForm%20Noncommercial-blue" alt="License"></a>
   <a href="https://hub.docker.com/r/ferrumedge/ferrum-edge"><img src="https://img.shields.io/docker/pulls/ferrumedge/ferrum-edge" alt="Docker Pulls"></a>
 </p>
@@ -81,7 +81,7 @@ ferrum-edge version
 
 Download from [GitHub Releases](https://github.com/ferrum-edge/ferrum-edge/releases) for Linux x86_64/ARM64 and macOS x86_64/ARM64. Releases ship raw platform binaries plus adjacent `.sha256` checksum files (for example `ferrum-edge-linux-x86_64` and `ferrum-edge-linux-x86_64.sha256`).
 
-Pin an explicit release tag in download URLs. Ferrum's moving `latest` tag is published as a prerelease, while GitHub's `/releases/latest` redirect and the `releases/latest` API endpoint skip prereleases. Use `/releases/download/<tag>/…` or `gh release download <tag>` instead. Pick the current immutable `vX.Y.Z` semver tag from the [Releases](https://github.com/ferrum-edge/ferrum-edge/releases) page, and do not pin production to the mutable `latest` prerelease.
+Pin an explicit release tag in download URLs. Production artifacts are published only for version tags; merging main no longer refreshes a moving `latest` build. GitHub's `/releases/latest` endpoint skips prereleases. Use `/releases/download/<tag>/…` or `gh release download <tag>` instead. Pick the current immutable `vX.Y.Z` semver tag from the [Releases](https://github.com/ferrum-edge/ferrum-edge/releases) page, and pin deployments to that version.
 
 ```bash
 # Example: Linux x86_64

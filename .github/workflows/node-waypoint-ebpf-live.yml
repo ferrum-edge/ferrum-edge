@@ -282,6 +282,8 @@ jobs:
           context: .
           file: Dockerfile
           target: runtime
+          build-args: |
+            CARGO_PROFILE=pr-build
           load: true
           tags: ferrum-edge:production-default-smoke
           cache-from: type=local,src=${{ runner.temp }}/production-dockerfile-smoke-default
@@ -294,6 +296,8 @@ jobs:
           context: .
           file: Dockerfile
           target: runtime
+          build-args: |
+            CARGO_PROFILE=pr-build
           load: true
           tags: ferrum-edge:production-default-smoke
           cache-from: ${{ steps.buildkit-cache.outputs.cache-matched-key != '' && format('type=local,src={0}/production-dockerfile-smoke-default', runner.temp) || '' }}
@@ -307,6 +311,8 @@ jobs:
           context: .
           file: Dockerfile
           target: runtime
+          build-args: |
+            CARGO_PROFILE=pr-build
           load: true
           tags: ferrum-edge:production-default-smoke
           cache-from: ${{ steps.buildkit-cache.outputs.cache-matched-key != '' && format('type=local,src={0}/production-dockerfile-smoke-default', runner.temp) || '' }}
@@ -319,6 +325,8 @@ jobs:
           context: .
           file: Dockerfile
           target: runtime
+          build-args: |
+            CARGO_PROFILE=pr-build
           load: true
           tags: ferrum-edge:production-default-smoke
           provenance: false
@@ -484,6 +492,7 @@ jobs:
           file: Dockerfile
           target: runtime-ebpf
           build-args: |
+            CARGO_PROFILE=pr-build
             FEATURES=cloud-secrets,ebpf
           load: true
           tags: ferrum-edge:production-ebpf-smoke
@@ -498,6 +507,7 @@ jobs:
           file: Dockerfile
           target: runtime-ebpf
           build-args: |
+            CARGO_PROFILE=pr-build
             FEATURES=cloud-secrets,ebpf
           load: true
           tags: ferrum-edge:production-ebpf-smoke
@@ -513,6 +523,7 @@ jobs:
           file: Dockerfile
           target: runtime-ebpf
           build-args: |
+            CARGO_PROFILE=pr-build
             FEATURES=cloud-secrets,ebpf
           load: true
           tags: ferrum-edge:production-ebpf-smoke
@@ -527,6 +538,7 @@ jobs:
           file: Dockerfile
           target: runtime-ebpf
           build-args: |
+            CARGO_PROFILE=pr-build
             FEATURES=cloud-secrets,ebpf
           load: true
           tags: ferrum-edge:production-ebpf-smoke
