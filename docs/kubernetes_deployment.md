@@ -259,6 +259,45 @@ uses a writable PVC rather than a ConfigMap or `emptyDir`: ConfigMaps are
 read-only, while an ephemeral volume would lose the only migrated copy when the
 Pod is removed.
 
+### SQLite storage
+
+The gateway chart runs as UID/GID `65532:65532` with `fsGroup: 65532` and
+`fsGroupChangePolicy: OnRootMismatch`. Its container root filesystem is
+read-only, so SQLite requires an explicitly mounted writable PVC. Kubernetes
+does not use Docker's image-directory ownership copy-up for mounted storage.
+The storage driver must honor `fsGroup`, or the operator must provision the
+volume with permissions allowing UID/GID 65532 to write the database and its
+journal files. Keep the default non-root security contexts.
+
+For a single gateway replica, add these values alongside the normal database
+mode admin JWT Secret configuration, using a pre-created PVC `ferrum-data`:
+
+```yaml
+mode: database
+replicaCount: 1
+updateStrategy:
+  type: Recreate
+  rollingUpdate: null
+database:
+  type: sqlite
+  sqlite:
+    path: ////data/ferrum.db
+    mode: rwc
+extraVolumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: ferrum-data
+extraVolumeMounts:
+  - name: data
+    mountPath: /data
+```
+
+Use this as the sole database URL source; do not also set `database.url` or a
+database URL Secret. `Recreate` avoids overlapping replicas using the same
+SQLite file during upgrades. Use an external database for multi-replica
+deployments. Any SQLite migration Job must mount the same PVC and use the same
+UID/GID and `fsGroup`; an `emptyDir` loses the database when its Pod is deleted.
+
 ## Ferrum Mesh Helm Chart Contract
 
 The `charts/ferrum-mesh` chart defaults to scaffolding only. It creates the
@@ -780,7 +819,7 @@ spec:
       terminationGracePeriodSeconds: 110
       containers:
         - name: ferrum-edge
-          image: ghcr.io/ferrum-edge/ferrum-edge:latest
+          image: docker.io/ferrumedge/ferrum-edge:latest
           imagePullPolicy: IfNotPresent
           args: ["run"]
           env:

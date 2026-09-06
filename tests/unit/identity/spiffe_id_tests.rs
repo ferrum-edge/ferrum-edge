@@ -144,6 +144,55 @@ fn spiffe_id_root_no_path_ok() {
 }
 
 #[test]
+fn kubernetes_identity_parses_marker_named_values_positionally() {
+    for (namespace, account) in [
+        ("sa", "backend"),
+        ("sa", "frontend"),
+        ("sa", "sa"),
+        ("default", "backend"),
+        ("ns", "ns"),
+    ] {
+        let uri = format!("spiffe://cluster.local/ns/{namespace}/sa/{account}");
+        let id = SpiffeId::new(uri).unwrap();
+        assert_eq!(id.kubernetes_identity(), Some((namespace, account)));
+        assert_eq!(id.namespace(), Some(namespace));
+        assert_eq!(id.service_account(), Some(account));
+    }
+}
+
+#[test]
+fn kubernetes_identity_preserves_noncanonical_accessor_behavior() {
+    for (path, namespace, account) in [
+        ("", None, None),
+        ("ns/prod", Some("prod"), None),
+        ("ns/prod/sa", Some("prod"), None),
+        ("sa/foo/sa/bar", None, Some("foo")),
+        ("ns/prod/ns/staging/sa/foo", Some("prod"), Some("foo")),
+        ("ns/prod/sa/foo/sa/bar", Some("prod"), Some("foo")),
+        ("prefix/ns/prod/sa/foo", Some("prod"), Some("foo")),
+        ("ns/prod/sa/foo/extra", Some("prod"), Some("foo")),
+        ("ns/prod/workload/foo", Some("prod"), None),
+    ] {
+        let id = SpiffeId::from_parts(&TrustDomain::new("cluster.local").unwrap(), path).unwrap();
+        assert_eq!(id.kubernetes_identity(), None, "{path}");
+        assert_eq!(id.namespace(), namespace, "{path}");
+        assert_eq!(id.service_account(), account, "{path}");
+    }
+}
+
+#[test]
+fn kubernetes_identity_rejects_empty_segments() {
+    for path in [
+        "ns//sa/backend",
+        "ns/sa//backend",
+        "ns/sa/sa/",
+        "ns/sa/sa//backend",
+    ] {
+        assert!(SpiffeId::new(format!("spiffe://cluster.local/{path}")).is_err());
+    }
+}
+
+#[test]
 fn service_account_returns_segment_after_first_sa() {
     let id = SpiffeId::new("spiffe://cluster.local/ns/default/sa/ztunnel").unwrap();
     assert_eq!(id.service_account(), Some("ztunnel"));

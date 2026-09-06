@@ -1415,6 +1415,7 @@ jobs:
               functional_h3_mtls_early_data_test
               functional_request_termination_h3_test
               functional_policy_path_canonicalization_test
+              functional_response_caching_conditional_test
               functional_response_mock_grpc_exclusion_test
               functional_response_mock_semantics_test
               functional_response_protocol_managed_headers_test
@@ -7480,3 +7481,29 @@ jobs:
             -t ghcr.io/${{ github.repository }}:latest \
             -t ghcr.io/${{ github.repository }}:main-${{ github.sha }} \
             $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
+
+  anonymous-pull-smoke:
+    name: Anonymous image pull smoke
+    needs: docker-manifest
+    if: always() && needs.docker-manifest.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      # The publishers above logged in before pushing, so their success does not
+      # show that a first-time user can consume the images (issue #4637). Prove
+      # it with no credentials at all: the documented Docker Hub path must be
+      # anonymously pullable; GHCR is reported until the package is public.
+      - name: Verify the documented registry path is anonymously pullable
+        env:
+          MAIN_SHA: ${{ github.sha }}
+          GHCR_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          bash scripts/smoke_anonymous_pull.sh "docker.io/ferrumedge/ferrum-edge:main-${MAIN_SHA}"
+          bash scripts/smoke_anonymous_pull.sh --warn-only "ghcr.io/${GHCR_REPOSITORY}:main-${MAIN_SHA}"

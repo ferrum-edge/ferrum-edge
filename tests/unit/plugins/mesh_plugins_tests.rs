@@ -232,6 +232,86 @@ fn mesh_config_normalize_lowercases_policy_hosts() {
     );
 }
 
+#[tokio::test]
+async fn mesh_authz_service_account_conditions_distinguish_accounts_in_namespace_sa() {
+    let identities = [
+        ("sa", "backend"),
+        ("sa", "frontend"),
+        ("sa", "sa"),
+        ("default", "backend"),
+    ];
+    for (policy_namespace, policy_account) in identities {
+        let mut policy = allow_client_policy(PolicyAction::Allow);
+        policy.rules[0].from.clear();
+        policy.rules[0].when = vec![ConditionMatch {
+            key: "source.serviceAccount".to_string(),
+            values: vec![format!("{policy_namespace}/{policy_account}")],
+            not_values: Vec::new(),
+        }];
+        let plugin = MeshAuthz::new(&json!({ "mesh_policies": [policy] })).unwrap();
+
+        for (namespace, account) in identities {
+            let principal = format!("spiffe://cluster.local/ns/{namespace}/sa/{account}");
+            let allowed = (namespace, account) == (policy_namespace, policy_account);
+            let mut http = request_context(Some(&principal));
+            let mut stream = stream_context();
+            stream.authenticated_identity = Some(principal.clone());
+            stream.tls_client_cert_der = Some(Arc::new(vec![1, 2, 3]));
+
+            for result in [
+                plugin.authorize(&mut http).await,
+                plugin.on_stream_connect(&mut stream).await,
+            ] {
+                if allowed {
+                    assert!(
+                        matches!(result, PluginResult::Continue),
+                        "{principal}: {result:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(
+                            result,
+                            PluginResult::Reject {
+                                status_code: 403,
+                                ..
+                            }
+                        ),
+                        "{principal} must not match {policy_namespace}/{policy_account}: {result:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn workload_metrics_preserves_service_accounts_in_namespace_sa() {
+    let plugin = WorkloadMetrics::new(&json!({})).unwrap();
+    for account in ["backend", "frontend", "sa"] {
+        let principal = format!("spiffe://cluster.local/ns/sa/sa/{account}");
+        let mut http = request_context(Some(&principal));
+        let mut headers = HashMap::new();
+        plugin.before_proxy(&mut http, &mut headers).await;
+        let mut stream = stream_context();
+        stream.authenticated_identity = Some(principal);
+        stream.tls_client_cert_der = Some(Arc::new(vec![1, 2, 3]));
+        plugin.on_stream_connect(&mut stream).await;
+
+        for metadata in [&http.metadata, stream.metadata.as_ref().unwrap()] {
+            assert_eq!(
+                metadata.get("mesh.source.namespace").map(String::as_str),
+                Some("sa")
+            );
+            assert_eq!(
+                metadata
+                    .get("mesh.source.service_account")
+                    .map(String::as_str),
+                Some(account)
+            );
+        }
+    }
+}
+
 #[test]
 fn mesh_plugins_are_registered() {
     let available = available_plugins();

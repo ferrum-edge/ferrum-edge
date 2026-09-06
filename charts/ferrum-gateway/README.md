@@ -155,6 +155,11 @@ migrations; use the explicit Job for `status`, dry-run, and operator-controlled
   `0440` with pod `fsGroup: 65532`, matching the distroless nonroot image. Both
   `secretVolumeDefaultMode` and `podSecurityContext` are overridable for images
   with a different runtime identity.
+- **SQLite needs writable persistent storage.** Mount a PVC at `/data` through
+  `extraVolumes` / `extraVolumeMounts`; the default root filesystem is read-only.
+  UID/GID and `fsGroup` already default to `65532`. The storage driver must honor
+  `fsGroup`, or the operator must provision matching write permissions. See the
+  [single-replica SQLite example](../../docs/kubernetes_deployment.md#sqlite-storage).
 - **Graceful shutdown** wires `terminationGracePeriodSeconds` to the WHOLE
   termination sequence (enforced at render): `preStop + preDrain + shutdown
   budget`, where the shutdown budget sums in-flight drain, transport pool tail

@@ -2020,6 +2020,11 @@ Istio does **not** compile every condition key to the same matcher, and Ferrum f
 | `source.trustDomain` | exact, presence `*`, one **leading** `*`, or one **trailing** `*`. A mid-string or repeated `*`, and any `/`, are **rejected** at admission | `CheckTrustDomainValues` |
 | everything else (`source.principal`, `connection.sni`, `request.auth.*`, `request.headers[...]`, `experimental.envoy.filters.*`) | `StringMatcherWithPrefix`: `*` presence, `<prefix>*`, `*<suffix>`, otherwise exact — a mid-string `*` is **literal text** | `matcher.StringMatcherWithPrefix` |
 
+Canonical SPIFFE workload paths `ns/<namespace>/sa/<service-account>` are read
+positionally: `spiffe://cluster.local/ns/sa/sa/backend` identifies account `backend`
+in namespace `sa`, producing `source.serviceAccount = sa/backend` for both HTTP
+and stream authorization.
+
 A bare `source.serviceAccount` is namespace-relative, so the same policy text means different things in different namespaces:
 
 ```yaml
