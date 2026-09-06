@@ -526,8 +526,11 @@ def self_test_artifact_transport(failures: list[str]) -> None:
                         archive.writestr("extra.tar", payload)
                 if case == "corrupt-zip":
                     data = bytearray(zip_path.read_bytes())
-                    # Corrupt the central-directory CRC, leaving a readable
-                    # member list and valid tar so only ZIP integrity fails.
+                    # Corrupt both declared CRCs, leaving a readable member
+                    # list and valid tar so the extracted bytes fail integrity.
+                    # Info-ZIP streams against the local-header CRC; changing
+                    # only the central directory does not corrupt its payload.
+                    data[data.index(b"PK\x03\x04") + 14] ^= 1
                     data[data.index(b"PK\x01\x02") + 16] ^= 1
                     zip_path.write_bytes(data)
             if case == "missing":
