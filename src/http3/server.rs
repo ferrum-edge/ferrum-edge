@@ -12906,13 +12906,21 @@ async fn dispatch_grpc_native_h3(
                     method,
                     backend_url,
                     &h3_headers,
+                    grpc_deadline_at,
                     tls_config_fn,
                 )
                 .await
         } else {
             state
                 .h3_pool
-                .open_bidi_backend_stream(proxy, method, backend_url, &h3_headers, tls_config_fn)
+                .open_bidi_backend_stream(
+                    proxy,
+                    method,
+                    backend_url,
+                    &h3_headers,
+                    grpc_deadline_at,
+                    tls_config_fn,
+                )
                 .await
         }
     };

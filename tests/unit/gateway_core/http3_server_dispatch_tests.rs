@@ -4039,6 +4039,23 @@ fn h3_native_grpc_bidi_open_is_pre_wire_and_splits() {
         "the duplex opener must share the `te: trailers` header rule with the \
          drain-then-read streaming path"
     );
+    assert!(
+        opener.contains("grpc_deadline_at: Option<tokio::time::Instant>")
+            && opener.contains("headers,\n            grpc_deadline_at,"),
+        "the request head must receive the receipt-anchored deadline after connection acquisition"
+    );
+    let pooled_openers = client
+        .split("pub async fn open_bidi_backend_stream(")
+        .nth(1)
+        .unwrap()
+        .split("/// Execute an HTTP/3 request, streaming the request body from a hyper")
+        .next()
+        .unwrap();
+    assert_eq!(
+        pooled_openers.matches("grpc_deadline_at,").count(),
+        4,
+        "direct and target pools must pass the same deadline on cached and cold opens"
+    );
 }
 
 #[test]

@@ -1249,11 +1249,13 @@ pub struct H3BackendResponseHead {
 /// author that header themselves AFTER `build_h3_backend_headers` has removed
 /// any client-supplied `te`, so the value forwarded here is always the
 /// gateway's own. Shared by the drain-then-read streaming path and the
-/// full-duplex opener so the two cannot drift.
+/// full-duplex opener so the two cannot drift. A typed gRPC deadline replaces
+/// any relative timeout only at this final request-head construction step.
 fn build_h3_backend_request_preserving_te(
     method: http::Method,
     path_and_query: &str,
     headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+    grpc_deadline_at: Option<tokio::time::Instant>,
 ) -> H3PoolResult<Request<()>> {
     let mut req_builder = Request::builder().method(method).uri(path_and_query);
     for (name, value) in headers {
@@ -1268,7 +1270,16 @@ fn build_h3_backend_request_preserving_te(
             }
         }
     }
-    req_builder.body(()).map_err(H3PoolError::pre_wire)
+    let mut request = req_builder.body(()).map_err(H3PoolError::pre_wire)?;
+    if let Some(deadline) = grpc_deadline_at {
+        // This builder runs after pooled/cold connection acquisition and again
+        // on a cached-connection replacement. Keep the original absolute budget.
+        crate::proxy::grpc_proxy::apply_remaining_grpc_timeout_header(
+            request.headers_mut(),
+            deadline,
+        );
+    }
+    Ok(request)
 }
 
 /// Await the backend response HEADERS on the receive half of a split
@@ -2727,7 +2738,8 @@ impl Http3ConnectionPool {
             H3PoolError::pre_wire(anyhow::anyhow!("Invalid HTTP method: {}", method))
         })?;
 
-        let req = build_h3_backend_request_preserving_te(req_method, path_and_query, headers)?;
+        let req =
+            build_h3_backend_request_preserving_te(req_method, path_and_query, headers, None)?;
         let mut backend_stream = send_request
             .send_request(req)
             .await
@@ -2863,6 +2875,7 @@ impl Http3ConnectionPool {
         method: &str,
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        grpc_deadline_at: Option<tokio::time::Instant>,
     ) -> H3PoolResult<H3BidiBackendStream> {
         let uri: http::Uri = backend_url
             .parse()
@@ -2875,7 +2888,12 @@ impl Http3ConnectionPool {
             H3PoolError::pre_wire(anyhow::anyhow!("Invalid HTTP method: {}", method))
         })?;
 
-        let req = build_h3_backend_request_preserving_te(req_method, path_and_query, headers)?;
+        let req = build_h3_backend_request_preserving_te(
+            req_method,
+            path_and_query,
+            headers,
+            grpc_deadline_at,
+        )?;
         let stream = send_request
             .send_request(req)
             .await
@@ -2891,6 +2909,7 @@ impl Http3ConnectionPool {
         method: &str,
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        grpc_deadline_at: Option<tokio::time::Instant>,
         tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
     ) -> H3PoolResult<H3BidiBackendStream> {
         let conns_per_backend = proxy
@@ -2902,8 +2921,15 @@ impl Http3ConnectionPool {
 
         if let Some(pooled) = self.pool.cached(&key) {
             let mut sr = pooled.send_request;
-            match Self::do_open_bidi_backend_stream(&mut sr, proxy, method, backend_url, headers)
-                .await
+            match Self::do_open_bidi_backend_stream(
+                &mut sr,
+                proxy,
+                method,
+                backend_url,
+                headers,
+                grpc_deadline_at,
+            )
+            .await
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
@@ -2946,8 +2972,15 @@ impl Http3ConnectionPool {
             },
         };
         let mut sr_for_request = pooled.send_request;
-        Self::do_open_bidi_backend_stream(&mut sr_for_request, proxy, method, backend_url, headers)
-            .await
+        Self::do_open_bidi_backend_stream(
+            &mut sr_for_request,
+            proxy,
+            method,
+            backend_url,
+            headers,
+            grpc_deadline_at,
+        )
+        .await
     }
 
     /// [`Self::open_bidi_backend_stream`] against an explicit LB-selected target.
@@ -2966,6 +2999,7 @@ impl Http3ConnectionPool {
         method: &str,
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        grpc_deadline_at: Option<tokio::time::Instant>,
         tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
     ) -> H3PoolResult<H3BidiBackendStream> {
         let conns_per_backend = proxy
@@ -2982,8 +3016,15 @@ impl Http3ConnectionPool {
 
         if let Some(pooled) = self.pool.cached(&key) {
             let mut sr = pooled.send_request;
-            match Self::do_open_bidi_backend_stream(&mut sr, proxy, method, backend_url, headers)
-                .await
+            match Self::do_open_bidi_backend_stream(
+                &mut sr,
+                proxy,
+                method,
+                backend_url,
+                headers,
+                grpc_deadline_at,
+            )
+            .await
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
@@ -3036,8 +3077,15 @@ impl Http3ConnectionPool {
             },
         };
         let mut sr_for_request = pooled.send_request;
-        Self::do_open_bidi_backend_stream(&mut sr_for_request, proxy, method, backend_url, headers)
-            .await
+        Self::do_open_bidi_backend_stream(
+            &mut sr_for_request,
+            proxy,
+            method,
+            backend_url,
+            headers,
+            grpc_deadline_at,
+        )
+        .await
     }
 
     /// Execute an HTTP/3 request, streaming the request body from a hyper
@@ -4269,6 +4317,74 @@ mod h3_pool_error_tests {
     //! functional test in `tests/functional/`.
 
     use super::*;
+
+    #[test]
+    fn native_h3_request_head_uses_remaining_absolute_grpc_budget() {
+        let headers = vec![
+            (
+                http::header::HeaderName::from_static("grpc-timeout"),
+                http::HeaderValue::from_static("60S"),
+            ),
+            (
+                http::header::HeaderName::from_static("grpc-timeout"),
+                http::HeaderValue::from_static("70S"),
+            ),
+            (http::header::TE, http::HeaderValue::from_static("trailers")),
+        ];
+        // Model an original 60-second RPC after 20 seconds of gateway work.
+        // No real sleep or tight scheduling tolerance is needed.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+        let request = build_h3_backend_request_preserving_te(
+            http::Method::POST,
+            "/service/Call",
+            &headers,
+            Some(deadline),
+        )
+        .unwrap();
+        let timeout = request
+            .headers()
+            .get("grpc-timeout")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let remaining = crate::proxy::grpc_proxy::parse_grpc_timeout_value(timeout).unwrap();
+        assert!((1..=40_000).contains(&remaining), "{timeout}");
+        assert_eq!(request.headers().get_all("grpc-timeout").iter().count(), 1);
+        assert_eq!(request.headers().get("te").unwrap(), "trailers");
+
+        let expired = build_h3_backend_request_preserving_te(
+            http::Method::POST,
+            "/service/Call",
+            &headers,
+            Some(tokio::time::Instant::now() - Duration::from_secs(1)),
+        )
+        .unwrap();
+        assert_eq!(expired.headers().get("grpc-timeout").unwrap(), "1m");
+    }
+
+    #[test]
+    fn h3_request_head_without_typed_deadline_preserves_existing_headers() {
+        let headers = vec![(
+            http::header::HeaderName::from_static("grpc-timeout"),
+            http::HeaderValue::from_static("60S"),
+        )];
+        let request = build_h3_backend_request_preserving_te(
+            http::Method::POST,
+            "/service/Call",
+            &headers,
+            None,
+        )
+        .unwrap();
+        assert_eq!(request.headers().get("grpc-timeout").unwrap(), "60S");
+        let request = build_h3_backend_request_preserving_te(
+            http::Method::GET,
+            "/ordinary",
+            &[],
+            None,
+        )
+        .unwrap();
+        assert!(!request.headers().contains_key("grpc-timeout"));
+    }
 
     #[test]
     fn collect_h3_response_headers_matches_h1_h2_folding() {
