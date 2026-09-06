@@ -28,3 +28,32 @@ confirm useful protocol results with no missing/error-only samples, and extend
 measurements to the affected macOS, Windows and protected ARM64/sysroot
 producers. Existing exact-SHA publication gates, Cross isolation, FIPS boundaries
 and install/image/ABI checks remain prerequisites for any shipping change.
+
+## Initial hosted measurements
+
+Run [34055184720](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34055184720)
+used `d5a92bb1df1dc292b82fed46f414959486d9a716` and Rust 1.98.1. Both workflow
+lanes completed. These measurements predate the separate workflow layout but
+use the same compilation settings and protocol harness.
+
+| Measurement | Fat LTO / 1 codegen unit | Thin LTO / 16 codegen units |
+| --- | ---: | ---: |
+| CPU | Xeon Platinum 8370C | Xeon Platinum 8573C |
+| Exposed vCPUs | 4 | 4 |
+| Empty-target gateway compilation | 2,600.20s | 1,265.21s |
+| Maximum-child RSS | 13,768,744 KiB | 12,932,248 KiB |
+| Major faults | 8,374 | 7,965 |
+| Executable size | 92,918,592 bytes | 112,983,168 bytes |
+
+All three iterations in each lane produced 20 positive-throughput records,
+covering gateway and direct controls for ten protocols. Thin had no reported
+errors. Fat's second direct-backend TCP+TLS sample reported 14 errors; its
+remaining samples, including the gateway samples, reported none. A green job
+alone therefore does not establish an error-free benchmark.
+
+The CPU-model mismatch confounds both compilation and protocol comparisons;
+raw throughput differences cannot be attributed to LTO/codegen settings. The
+observed thin executable is 21.6% larger. These are preliminary measurements,
+not evidence for shipping adoption. A follow-up must compare both produced
+binaries on the same host with interleaved repetitions, require complete valid
+samples, and retain the previously listed platform/ABI and agreed-budget gates.
