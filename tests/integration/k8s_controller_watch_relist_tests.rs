@@ -21,13 +21,15 @@
 //! only once every task is idle, so the idle relist fires deterministically
 //! instead of racing a wall clock.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ferrum_edge::_test_support::{
     K8sWatchScopeForTest, k8s_watch_idle_relist_jitter_millis as jitter_millis,
     k8s_watch_scope_for_test,
 };
-use kube::runtime::watcher::Event;
+use ferrum_edge::k8s_controller::watcher::{FORBIDDEN_WATCH_HOLD, LIST_FAILURE_HOLD_FLOOR};
+use kube::runtime::watcher::{self, Event};
 use tokio::sync::watch;
 
 const GROUP: &str = "gateway.networking.k8s.io";
@@ -88,6 +90,78 @@ fn list(harness: &K8sWatchScopeForTest, generation: usize, names: &[&str]) {
 fn apply(harness: &K8sWatchScopeForTest, generation: usize, name: &str) {
     let object = harness.object(NAMESPACE, name);
     harness.emit(generation, Event::Apply(object));
+}
+
+/// One failed list attempt exactly as kube-rs 3.x shapes it: the watcher
+/// yields `Init` from its empty state BEFORE it issues the list request, then
+/// the error, then returns to the empty state — so the next attempt begins with
+/// another `Init`.
+fn failed_list_attempt(harness: &K8sWatchScopeForTest, generation: usize, error: watcher::Error) {
+    harness.emit(generation, Event::Init);
+    harness.emit_error(generation, error);
+}
+
+/// Everything the watcher logs at debug level and above, captured for the
+/// lifetime of the guard. `#[tokio::test]` runs on the current thread and the
+/// subscriber is thread-local, so the spawned watcher task logs through it.
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+impl CapturedLogs {
+    fn lines(&self) -> Vec<String> {
+        let bytes = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Lines at `level` (as the formatter spells it) mentioning `needle`.
+    fn matching(&self, level: &str, needle: &str) -> Vec<String> {
+        self.lines()
+            .into_iter()
+            .filter(|line| line.contains(level) && line.contains(needle))
+            .collect()
+    }
+}
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    type Writer = CapturedLogs;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(logs.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    (logs, guard)
 }
 
 /// The conformance failure, reproduced and then repaired: generation 0 lists an
@@ -365,4 +439,370 @@ async fn watcher_task_still_returns_on_shutdown_mid_relist() {
         .await
         .expect("watcher must observe shutdown while relisting")
         .expect("watcher task");
+}
+
+/// Issue #4491: the proof a black-box "deleted route kept serving" failure
+/// cannot produce on its own. Generation 0 lists two routes and then goes
+/// silent while one is deleted and another created in Kubernetes; the relist
+/// repairs the store and must SAY so — as missed events, distinguishable from
+/// the ordinary quiet relist a healthy scope also performs.
+#[tokio::test(start_paused = true)]
+async fn relist_reports_objects_that_changed_without_a_watch_event() {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (harness, task) = scope(2, IDLE_RELIST_SECS, shutdown_rx);
+    let watcher = tokio::spawn(task);
+
+    list(&harness, 0, &["blackbox-tcp-delete", "blackbox-tcp-main"]);
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(harness.watch_relist_missed_deletes(), 0);
+    assert_eq!(harness.watch_relist_missed_adds(), 0);
+
+    // The watch is stale: `blackbox-tcp-delete` is deleted and
+    // `blackbox-tcp-late` created, and neither event arrives.
+    tokio::time::sleep(PAST_IDLE_WINDOW).await;
+    list(&harness, 1, &["blackbox-tcp-main", "blackbox-tcp-late"]);
+    tokio::time::sleep(SETTLE).await;
+
+    assert_eq!(
+        harness.visible_names().await,
+        vec!["blackbox-tcp-late", "blackbox-tcp-main"],
+        "the relist repairs the store"
+    );
+    assert_eq!(
+        harness.watch_relist_missed_deletes(),
+        1,
+        "the withdrawal no Delete event announced is counted"
+    );
+    assert_eq!(
+        harness.watch_relist_missed_adds(),
+        1,
+        "the creation no Apply event announced is counted"
+    );
+    assert_eq!(harness.watch_idle_relists(), 1);
+
+    let _ = shutdown_tx.send(true);
+    watcher.await.expect("watcher task");
+}
+
+/// A delete the watch DID deliver is not a divergence: the retiring store had
+/// already dropped the object, so the authoritative list agrees with it and
+/// the relist stays an ordinary quiet one.
+#[tokio::test(start_paused = true)]
+async fn a_delivered_delete_is_not_reported_as_missed_on_relist() {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (harness, task) = scope(2, IDLE_RELIST_SECS, shutdown_rx);
+    let watcher = tokio::spawn(task);
+
+    list(&harness, 0, &["blackbox-tcp-delete", "blackbox-tcp-main"]);
+    tokio::time::sleep(SETTLE).await;
+    harness.emit(
+        0,
+        Event::Delete(harness.object(NAMESPACE, "blackbox-tcp-delete")),
+    );
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(harness.visible_names().await, vec!["blackbox-tcp-main"]);
+
+    tokio::time::sleep(PAST_IDLE_WINDOW).await;
+    list(&harness, 1, &["blackbox-tcp-main"]);
+    tokio::time::sleep(SETTLE).await;
+
+    assert_eq!(harness.visible_names().await, vec!["blackbox-tcp-main"]);
+    assert_eq!(
+        harness.watch_idle_relists(),
+        1,
+        "the quiet scope still relisted"
+    );
+    assert_eq!(
+        harness.watch_relist_missed_deletes(),
+        0,
+        "an observed delete must not be reported as missed"
+    );
+    assert_eq!(harness.watch_relist_missed_adds(), 0);
+
+    let _ = shutdown_tx.send(true);
+    watcher.await.expect("watcher task");
+}
+
+fn forbidden_error() -> watcher::Error {
+    let refusal = kube::core::Status::failure(
+        "tcproutes.gateway.networking.k8s.io is forbidden: the control plane cannot list them",
+        "Forbidden",
+    );
+    watcher::Error::InitialListFailed(kube::Error::Api(Box::new(refusal.with_code(403))))
+}
+
+/// An authorization refusal holds the scope (issue #4491). kube-rs's backoff
+/// cannot see the error class, so the watcher itself parks the stream for
+/// `FORBIDDEN_WATCH_HOLD` before polling it again. Relisting is disabled here
+/// so the hold is the only timer in play, and the list the API server would
+/// deliver once RBAC is fixed is queued right behind the refusal: it must not
+/// land until the hold expires.
+#[tokio::test(start_paused = true)]
+async fn a_forbidden_scope_is_held_before_its_stream_is_polled_again() {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (harness, task) = scope(1, 0, shutdown_rx);
+    let watcher = tokio::spawn(task);
+
+    harness.emit_error(0, forbidden_error());
+    list(&harness, 0, &["blackbox-tcp-main"]);
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(harness.watch_errors(), 1, "the refusal is counted");
+    assert!(
+        harness.visible_names().await.is_empty(),
+        "the stream must not be polled while the scope is held"
+    );
+
+    tokio::time::sleep(FORBIDDEN_WATCH_HOLD / 2).await;
+    assert!(
+        harness.visible_names().await.is_empty(),
+        "half the hold is still the hold"
+    );
+
+    tokio::time::sleep(FORBIDDEN_WATCH_HOLD / 2 + SETTLE).await;
+    assert_eq!(
+        harness.visible_names().await,
+        vec!["blackbox-tcp-main"],
+        "once the hold expires the queued list lands and the scope recovers"
+    );
+    assert_eq!(harness.watch_errors(), 1);
+
+    let _ = shutdown_tx.send(true);
+    watcher.await.expect("watcher task");
+}
+
+fn list_error(code: u16, reason: &str) -> watcher::Error {
+    let status = kube::core::Status::failure("the API server could not list tcproutes", reason);
+    watcher::Error::InitialListFailed(kube::Error::Api(Box::new(status.with_code(code))))
+}
+
+/// A refused scope produces `Init, Err, Init, Err, …` (issue #4491): kube-rs
+/// yields `Init` before every list request and returns to its empty state after
+/// a failed one. The `Init` must not read as a delivered event, or every
+/// attempt would log a bogus recovery and a fresh error. The fault is announced
+/// once at error level, repeats stay at debug, the reconciler is not woken, and
+/// recovery is logged exactly once — when a real list finally lands.
+#[tokio::test(start_paused = true)]
+async fn a_refused_scope_announces_its_fault_once_and_recovers_once() {
+    let (logs, _guard) = capture_logs();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (harness, task) = scope(1, 0, shutdown_rx);
+    let watcher = tokio::spawn(task);
+    let wakeups = harness.change_notifications().await;
+
+    // Three attempts; the second and third queue behind the first refusal's
+    // hold and land one hold apart.
+    for _ in 0..3 {
+        failed_list_attempt(&harness, 0, forbidden_error());
+    }
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(harness.watch_errors(), 1, "one attempt per hold");
+    assert_eq!(logs.matching("ERROR", "class=\"forbidden\"").len(), 1);
+
+    tokio::time::sleep(FORBIDDEN_WATCH_HOLD + SETTLE).await;
+    tokio::time::sleep(FORBIDDEN_WATCH_HOLD + SETTLE).await;
+    assert_eq!(
+        harness.watch_errors(),
+        3,
+        "each hold expiry polls the stream once"
+    );
+    assert_eq!(
+        logs.matching("ERROR", "class=\"forbidden\"").len(),
+        1,
+        "the fault is announced once, not once per attempt: {:?}",
+        logs.lines()
+    );
+    assert_eq!(logs.matching("DEBUG", "watch error repeated").len(), 2);
+    assert!(
+        logs.matching("INFO", "recovered").is_empty(),
+        "an `Init` is not a recovery: {:?}",
+        logs.lines()
+    );
+    assert_eq!(
+        harness.change_notifications().await,
+        wakeups,
+        "an `Init` changes no store and must not wake the reconciler"
+    );
+
+    // RBAC fixed: the next attempt lists for real.
+    list(&harness, 0, &["blackbox-tcp-main"]);
+    tokio::time::sleep(FORBIDDEN_WATCH_HOLD + SETTLE).await;
+    assert_eq!(harness.visible_names().await, vec!["blackbox-tcp-main"]);
+    let recovered = logs.matching("INFO", "recovered");
+    assert_eq!(recovered.len(), 1, "{:?}", logs.lines());
+    assert!(
+        recovered[0].contains("failed_attempts=3"),
+        "recovery reports the whole streak: {recovered:?}"
+    );
+    assert_eq!(harness.watch_errors(), 3);
+    assert_eq!(logs.matching("ERROR", "class=\"forbidden\"").len(), 1);
+
+    let _ = shutdown_tx.send(true);
+    watcher.await.expect("watcher task");
+}
+
+/// An `Init` is not activity either. A live scope that only ever restarts its
+/// list still reaches the idle relist on schedule, whereas real events keep a
+/// scope out of it (`a_scope_that_keeps_delivering_events_is_never_relisted`).
+#[tokio::test(start_paused = true)]
+async fn init_alone_does_not_keep_a_scope_out_of_the_idle_relist() {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (harness, task) = scope(2, IDLE_RELIST_SECS, shutdown_rx);
+    let watcher = tokio::spawn(task);
+
+    list(&harness, 0, &["blackbox-tcp-main"]);
+    // Both `Init`s land strictly before the earliest possible idle deadline
+    // (one window with zero jitter), so generation 0's stream is still open;
+    // the final sleep then ends before the earliest possible readiness timeout
+    // of the replacement they failed to postpone.
+    tokio::time::sleep(BUSY_EVENT_CADENCE).await;
+    harness.emit(0, Event::Init);
+    tokio::time::sleep(BUSY_EVENT_CADENCE - Duration::from_secs(10)).await;
+    harness.emit(0, Event::Init);
+
+    tokio::time::sleep(PAST_IDLE_WINDOW).await;
+    assert_eq!(
+        harness.watch_idle_relists(),
+        1,
+        "two `Init`s inside the window are not events; the scope relisted anyway"
+    );
+    assert_eq!(
+        harness.visible_names().await,
+        vec!["blackbox-tcp-main"],
+        "the pending replacement has not listed, so the last good store still serves"
+    );
+
+    let _ = shutdown_tx.send(true);
+    watcher.await.expect("watcher task");
+}
+
+/// A replacement generation the API server refuses is held, and the hold IS its
+/// retry schedule (issue #4491): the readiness timeout must not warn and count
+/// an idle relist against it on every `readiness_timeout` while it is held. The
+/// last good store keeps serving, and the replacement takes over on the first
+/// attempt the API server accepts.
+#[tokio::test(start_paused = true)]
+async fn a_held_replacement_is_not_reported_as_a_slow_initial_list() {
+    let (logs, _guard) = capture_logs();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (harness, task) = scope(2, IDLE_RELIST_SECS, shutdown_rx);
+    let watcher = tokio::spawn(task);
+
+    list(&harness, 0, &["blackbox-tcp-main"]);
+    tokio::time::sleep(PAST_IDLE_WINDOW).await;
+    assert_eq!(
+        harness.watch_idle_relists(),
+        1,
+        "the idle relist started generation 1"
+    );
+
+    // Three refusals, one hold apart: together they outlast the readiness
+    // timeout (two idle windows) more than twice over.
+    for _ in 0..3 {
+        failed_list_attempt(&harness, 1, forbidden_error());
+    }
+    tokio::time::sleep(FORBIDDEN_WATCH_HOLD * 2 + SETTLE).await;
+    assert_eq!(harness.watch_errors(), 3);
+    assert_eq!(
+        harness.watch_idle_relists(),
+        1,
+        "a held replacement is not a timed-out one"
+    );
+    assert!(
+        logs.matching("WARN", "did not finish its initial list")
+            .is_empty(),
+        "{:?}",
+        logs.lines()
+    );
+    assert_eq!(
+        harness.visible_names().await,
+        vec!["blackbox-tcp-main"],
+        "the last good store serves throughout"
+    );
+
+    // RBAC fixed: the held replacement lists on its next attempt and takes over.
+    list(&harness, 1, &["blackbox-tcp-cross", "blackbox-tcp-main"]);
+    tokio::time::sleep(FORBIDDEN_WATCH_HOLD + SETTLE).await;
+    assert_eq!(
+        harness.visible_names().await,
+        vec!["blackbox-tcp-cross", "blackbox-tcp-main"]
+    );
+    assert_eq!(harness.watch_idle_relists(), 1);
+    assert_eq!(logs.matching("INFO", "recovered").len(), 1);
+
+    let _ = shutdown_tx.send(true);
+    watcher.await.expect("watcher task");
+}
+
+/// A failed initial list that is not a refusal is held too, for a doubling
+/// interval (issue #4491): kube-rs cannot space it because the `Init` each
+/// attempt yields resets its backoff. The queued list lands only once the
+/// third hold expires.
+#[tokio::test(start_paused = true)]
+async fn a_failed_initial_list_is_held_for_a_doubling_interval() {
+    let (logs, _guard) = capture_logs();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (harness, task) = scope(1, 0, shutdown_rx);
+    let watcher = tokio::spawn(task);
+
+    for _ in 0..3 {
+        failed_list_attempt(&harness, 0, list_error(500, "InternalError"));
+    }
+    list(&harness, 0, &["blackbox-tcp-main"]);
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(harness.watch_errors(), 1);
+    assert_eq!(logs.matching("ERROR", "class=\"list_failed\"").len(), 1);
+
+    // Holds of one, two, and four floors.
+    tokio::time::sleep(LIST_FAILURE_HOLD_FLOOR).await;
+    assert_eq!(
+        harness.watch_errors(),
+        2,
+        "the second attempt lands after one floor"
+    );
+    tokio::time::sleep(LIST_FAILURE_HOLD_FLOOR).await;
+    assert_eq!(
+        harness.watch_errors(),
+        2,
+        "the third attempt is held for two floors"
+    );
+    tokio::time::sleep(LIST_FAILURE_HOLD_FLOOR).await;
+    assert_eq!(harness.watch_errors(), 3);
+    tokio::time::sleep(LIST_FAILURE_HOLD_FLOOR * 3).await;
+    assert!(
+        harness.visible_names().await.is_empty(),
+        "the list is held for four floors after the third failure"
+    );
+    tokio::time::sleep(LIST_FAILURE_HOLD_FLOOR + SETTLE).await;
+    assert_eq!(harness.visible_names().await, vec!["blackbox-tcp-main"]);
+    assert_eq!(logs.matching("ERROR", "class=\"list_failed\"").len(), 1);
+    assert_eq!(logs.matching("INFO", "recovered").len(), 1);
+
+    let _ = shutdown_tx.send(true);
+    watcher.await.expect("watcher task");
+}
+
+/// Every other failure is left to kube-rs's backoff inside the stream: the
+/// watcher counts it and keeps polling, so the very next item lands.
+#[tokio::test(start_paused = true)]
+async fn an_ordinary_watch_error_is_counted_but_not_held() {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (harness, task) = scope(1, 0, shutdown_rx);
+    let watcher = tokio::spawn(task);
+
+    harness.emit_error(
+        0,
+        watcher::Error::WatchFailed(kube::Error::LinesCodecMaxLineLengthExceeded),
+    );
+    list(&harness, 0, &["blackbox-tcp-main"]);
+    tokio::time::sleep(SETTLE).await;
+
+    assert_eq!(harness.watch_errors(), 1);
+    assert_eq!(
+        harness.visible_names().await,
+        vec!["blackbox-tcp-main"],
+        "no hold applies to a transport failure"
+    );
+
+    let _ = shutdown_tx.send(true);
+    watcher.await.expect("watcher task");
 }

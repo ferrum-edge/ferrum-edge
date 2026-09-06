@@ -12985,7 +12985,10 @@ pub mod _test_support {
         >,
         senders: Vec<
             tokio::sync::mpsc::UnboundedSender<
-                kube::runtime::watcher::Event<kube::api::DynamicObject>,
+                Result<
+                    kube::runtime::watcher::Event<kube::api::DynamicObject>,
+                    kube::runtime::watcher::Error,
+                >,
             >,
         >,
         resource: kube::api::ApiResource,
@@ -13027,6 +13030,31 @@ pub mod _test_support {
             self.metrics.snapshot().watch_idle_relists
         }
 
+        /// Watch stream errors the production watcher counted (issue #4491),
+        /// one per attempt whatever the logging decision was.
+        pub fn watch_errors(&self) -> u64 {
+            self.metrics.snapshot().watch_errors
+        }
+
+        /// Objects a relist found missing from the store it replaced without a
+        /// `Delete` event having delivered the withdrawal (issue #4491).
+        pub fn watch_relist_missed_deletes(&self) -> u64 {
+            self.metrics.snapshot().watch_relist_missed_deletes
+        }
+
+        /// Objects a relist found that the store it replaced never held
+        /// (issue #4491).
+        pub fn watch_relist_missed_adds(&self) -> u64 {
+            self.metrics.snapshot().watch_relist_missed_adds
+        }
+
+        /// Reconciler wake-ups the scope set has issued so far: the change
+        /// notifier's monotonic revision. A watch item that changes nothing
+        /// (kube-rs's `Init`) must not advance it (issue #4491).
+        pub async fn change_notifications(&self) -> u64 {
+            *self.store_set.lock().await.subscribe().borrow()
+        }
+
         /// Raise the demand-driven evidence refresh the reconciler publication
         /// boundary raises when it has to withhold mesh content under a
         /// sequence it cannot advance (issue #3611). Every subscribed watch
@@ -13063,7 +13091,16 @@ pub mod _test_support {
             event: kube::runtime::watcher::Event<kube::api::DynamicObject>,
         ) {
             self.senders[generation]
-                .send(event)
+                .send(Ok(event))
+                .expect("scripted watch generation stream was dropped");
+        }
+
+        /// Deliver one watch stream error on `generation`'s stream, exactly as
+        /// kube-rs's `watcher` yields a failed list or watch (issue #4491).
+        /// Panics if that generation was never scripted.
+        pub fn emit_error(&self, generation: usize, error: kube::runtime::watcher::Error) {
+            self.senders[generation]
+                .send(Err(error))
                 .expect("scripted watch generation stream was dropped");
         }
 
@@ -13160,7 +13197,7 @@ pub mod _test_support {
         use crate::k8s_controller::watcher::{
             RelistPolicy, WatchBoundaryReader, WatchTarget, run_watcher_generations,
         };
-        use futures_util::{Stream, StreamExt};
+        use futures_util::Stream;
         use kube::api::{ApiResource, DynamicObject};
         use kube::runtime::{reflector, watcher};
 
@@ -13215,8 +13252,7 @@ pub mod _test_support {
             match receivers.pop_front() {
                 Some(rx) => Box::pin(reflector::reflector(
                     writer,
-                    tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
-                        .map(Ok::<_, watcher::Error>),
+                    tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
                 )),
                 // Unscripted generations stay silent forever rather than ending,
                 // so they never look like a watch that closed.

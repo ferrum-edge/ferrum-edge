@@ -2284,9 +2284,39 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_k8s_controller_watch_errors_total",
+    "type": "counter",
+    "help": "Kubernetes watch stream errors observed across every watched scope, including refused initial lists and failed watch starts.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_k8s_controller_watch_idle_relists_total",
     "type": "counter",
     "help": "Watch-scope reflector rebuilds triggered because a scope delivered no event for the configured idle window, or because a replacement generation never finished its initial list.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_k8s_controller_watch_relist_missed_adds_total",
+    "type": "counter",
+    "help": "Objects an authoritative Kubernetes relist found that the watch scope's previous store never held: creations no Apply event delivered.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_k8s_controller_watch_relist_missed_deletes_total",
+    "type": "counter",
+    "help": "Objects an authoritative Kubernetes relist found missing from the watch scope's previous store: withdrawals no Delete event delivered.",
     "labels": [],
     "subsystem": "k8s_controller",
     "export_surface": "/metrics",

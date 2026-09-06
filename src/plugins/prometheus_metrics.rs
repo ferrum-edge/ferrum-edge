@@ -3049,6 +3049,36 @@ impl MetricsRegistry {
             "",
         );
         output.push_str(
+            "# HELP ferrum_k8s_controller_watch_errors_total Kubernetes watch stream errors observed across every watched scope, including refused initial lists and failed watch starts.\n",
+        );
+        output.push_str("# TYPE ferrum_k8s_controller_watch_errors_total counter\n");
+        render_process_counter(
+            output,
+            "ferrum_k8s_controller_watch_errors_total",
+            snapshot.watch_errors,
+            "",
+        );
+        output.push_str(
+            "# HELP ferrum_k8s_controller_watch_relist_missed_deletes_total Objects an authoritative Kubernetes relist found missing from the watch scope's previous store: withdrawals no Delete event delivered.\n",
+        );
+        output.push_str("# TYPE ferrum_k8s_controller_watch_relist_missed_deletes_total counter\n");
+        render_process_counter(
+            output,
+            "ferrum_k8s_controller_watch_relist_missed_deletes_total",
+            snapshot.watch_relist_missed_deletes,
+            "",
+        );
+        output.push_str(
+            "# HELP ferrum_k8s_controller_watch_relist_missed_adds_total Objects an authoritative Kubernetes relist found that the watch scope's previous store never held: creations no Apply event delivered.\n",
+        );
+        output.push_str("# TYPE ferrum_k8s_controller_watch_relist_missed_adds_total counter\n");
+        render_process_counter(
+            output,
+            "ferrum_k8s_controller_watch_relist_missed_adds_total",
+            snapshot.watch_relist_missed_adds,
+            "",
+        );
+        output.push_str(
             "# HELP ferrum_k8s_controller_istio_status_conflicts_total Istio status JSON Merge Patch 409 conflicts observed while applying Ferrum-owned conditions.\n",
         );
         output.push_str("# TYPE ferrum_k8s_controller_istio_status_conflicts_total counter\n");
