@@ -574,7 +574,41 @@ the live datapath compiled without re-running it.
 
 The CI workflow is triggered by every pull request, every merge-queue
 `merge_group` check request, and every push to `main`.
-The `CI Plan` job first selects `full` or `light` mode. Pull requests and
+The independent, read-only `CI Policy` job runs the complete trusted Cross
+verifier self-tests and workflow scan on every CI event, including light-mode
+PRs. It starts alongside `CI Plan`, so policy validation overlaps application
+compilation instead of adding its full runtime before compilation can begin.
+`Tests` directly needs both jobs and unconditionally rejects failed, cancelled,
+skipped, or missing policy results and missing/invalid completion output. The
+`verified=true` output is written only after the complete verifier succeeds;
+it is never cached. Light mode does not exempt either planning or policy.
+Main's Linux image packaging still needs `Tests`, so policy failure blocks it.
+The directly required `Trusted Cross Build Policy` workflow and all nine
+required product checks keep their existing identities and release contracts.
+
+Both `CI Plan` and `CI Policy` independently pin trusted source before any
+trusted Python executes: on PRs they fetch the base branch from the repository,
+require that its live tip descends from the event base, and resolve it to an
+immutable SHA; merge groups use the payload base SHA and verify the checkout
+matches the group head; main/manual runs use the triggering checkout SHA.
+All checkouts are read-only and keep credentials unpersisted, including forks.
+Each job uses its own pinned snapshot if main advances between their fetches.
+Planner outputs never choose the trust source, and missing trusted planner or
+verifier modules are fatal rather than falling back to candidate code.
+
+CI Plan also performs a cheap diff against the pinned base to reject changes
+to the two already-frozen policy files (`verify_cross_build_policy.py` and
+`cross-build-policy.yml`) before allocating application builders. This is only
+an early rejection: it does not replace the full policy scan or admit policy
+migrations. Other invalid changes can still spend compilation minutes before
+the parallel policy verdict arrives. The existing immutable-base guard may
+reject this legitimate workflow migration's changed CI surfaces; that verdict
+must be reported and resolved through reviewed policy governance, never hidden
+by suppressing checks or synthesizing successful release proof. See
+[policy performance measurement](ci_policy_performance.md) for the rollout
+measurements, whose hosted results remain pending until collected.
+
+The `CI Plan` job selects `full` or `light` mode. Pull requests and
 merge-group runs whose entire diff is limited to ordinary documentation,
 `.agents/**`, `.claude/**`, Markdown outside `vendor/`, or license files use
 light mode and preserve a fast `Tests` aggregate without starting the Rust/build
@@ -875,6 +909,13 @@ requests and pushes to `main`:
 cargo fmt --all -- --check
 # Also diffs tests/integration/*.rs against integration::<module> filters in ci.yml.
 ```
+
+The expensive policy self-tests and repository scan run in independent
+`CI Policy`, not in these serial planning steps. Its complete job, trust
+extraction, aggregate wiring, and failure paths are covered by
+`.github/scripts/test_ci_policy_parallel.py`, invoked by `verify_required_ci.py`
+in `Tests`. The contract tests share that checker's PR-mutable trust tier;
+the base-owned `Trusted Cross Build Policy` remains the admission authority.
 
 **Failures**:
 - Indicate formatting drift

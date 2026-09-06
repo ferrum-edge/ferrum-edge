@@ -1,6 +1,6 @@
 name: Trusted Policy Candidate
 
-# A pull request cannot replace the trusted policy used by CI Plan or the
+# A pull request cannot replace the trusted policy used by CI Policy or the
 # protected-policy check. This isolated, read-only lane provides the missing
 # complementary evidence: candidate policy source is compiled and its own
 # static self-tests execute without producing any output consumed by another
