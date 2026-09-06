@@ -3,11 +3,15 @@
 What a Ferrum Edge version number promises, how long a release is supported, how
 deprecations are announced, and how security fixes reach released versions.
 
-> **Current state (verified).** `Cargo.toml` declares `version = "0.9.0"`. **No
-> `v*` release tag exists.** The only published artifact is a rolling `latest`
-> prerelease built from `main`. Everything in the "After 1.0" section below is a
-> **proposed** commitment that takes effect when the first `v*` tag is cut; it is
-> not in force today.
+> **Release-preparation snapshot (2026-09-06).** `Cargo.toml` declares
+> `version = "0.9.3"`; source tags `v0.9.0`, `v0.9.1`, and `v0.9.2` already
+> exist. Main CI validates and does not publish production artifacts. The
+> version-tag release workflow publishes after exact-commit validation.
+> Tag existence does not establish successful artifact publication; verify the
+> version's workflow and [Releases page](https://github.com/ferrum-edge/ferrum-edge/releases).
+> Historical `latest` artifacts may remain but are not refreshed by main.
+> The "After 1.0" commitments below remain **proposed**; pre-1.0 tags do not
+> activate them.
 
 ## Today: build-out (pre-1.0)
 
@@ -34,8 +38,11 @@ dependency explicitly:
 > forward migrations; until then, follow the rebuild procedure below."
 > — [upgrade_guide.md](upgrade_guide.md)
 
-**The schema freeze has not been declared.** Declaring it is a prerequisite for
-the first `v*` tag, and this document will name the freeze point when it happens.
+**The schema freeze has not been declared.** It begins with the first tagged
+release designated stable: `v1.0.0`, or an earlier release whose notes explicitly
+declare the stable baseline, as defined in
+[migrations.md](migrations.md#when-v002-migrations-start-the-schema-freeze).
+A pre-1.0 source tag by itself does not freeze the schema.
 
 Breaking changes that have already landed are listed per release in
 [Breaking changes in 0.9.0](upgrade_guide.md#breaking-changes-in-090).
@@ -55,18 +62,20 @@ metric contract against
 
 | Artifact | What it is | Use in production? |
 |---|---|---|
-| `latest` GitHub prerelease | rolling build of `main` | No — evaluation only |
-| `latest` container tag | mutable | No — pin an immutable digest or published tag |
-| Source at a commit | reproducible | Yes, if you pin the commit |
+| Published `vX.Y.Z` release and container image | version-tag workflow output after validation | Pin the published version or digest and review its build-out limitations |
+| Historical `latest` release/container tag | retained old artifact; main no longer refreshes it | No — not a current release or update channel |
+| Source at a commit | source identity, not proof of a published artifact | Pin the commit and validate your own build |
 
-The Helm chart makes the same point: the mutable `latest` tag "exists for
-evaluation but must not be used in production" —
+The Helm chart defaults to `Chart.appVersion`, which may name a version still in
+release preparation. Confirm that the image exists before installation or set
+an explicit published tag; see the
 [ferrum-gateway chart](../charts/ferrum-gateway/README.md#security-defaults-you-should-know).
 
 ## After 1.0 (proposed)
 
-Every commitment in this section is **proposed** and takes effect at the first
-`v*` tag. Until then it describes intent, not an obligation.
+Every commitment in this section is **proposed** for the declared 1.0 support
+policy. Until it is adopted, it describes intent, not an obligation; existing
+pre-1.0 tags do not activate it.
 
 ### Semantic versioning
 
@@ -117,7 +126,7 @@ current minor only.
 
 The six-month figure is a **proposed conservative value**. It is not derived from
 anything in the code, and it will be reconfirmed — and may be shortened or
-lengthened — when the first `v*` tag is cut.
+lengthened — when the 1.0 support policy is adopted.
 
 ### Deprecation notice period (proposed)
 
@@ -132,7 +141,7 @@ A documented surface is removed only after it has been announced as deprecated:
 4. It is removed in a major release.
 
 The "one minor and 90 days" figure is likewise a **proposed** value pending the
-first `v*` tag.
+declared 1.0 support policy.
 
 ### Security-fix backport policy (proposed)
 
@@ -162,7 +171,7 @@ crates. See [dependency-policy.md](dependency-policy.md).
 
 ## Changes to this policy
 
-Until the first `v*` tag, this document may change without notice — that is what
+While the 1.0 commitments remain proposed, they may change without notice — that is what
 "proposed" means. After 1.0, a change that reduces a commitment (a shorter
 support window, a shorter deprecation period, a narrower SemVer surface) is
 itself announced one minor release ahead.

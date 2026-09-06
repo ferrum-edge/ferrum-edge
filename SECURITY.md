@@ -2,22 +2,26 @@
 
 ## Supported Versions
 
-Ferrum Edge is pre-release. `Cargo.toml` declares version `0.9.0` and **no `v*`
-release tag has been cut yet**, so there is no released line to support and no
-previous minor to fall back to.
+Ferrum Edge is in pre-1.0 build-out. The release-preparation snapshot on
+2026-09-06 declares `0.9.3` in `Cargo.toml`; source tags `v0.9.0`, `v0.9.1`, and
+`v0.9.2` already exist. A source tag alone does not prove that its release assets
+or container images finished publishing. Check the
+[Releases page](https://github.com/ferrum-edge/ferrum-edge/releases) and the
+version's release workflow before choosing an artifact.
 
 | Version | Status | Security updates |
 | ------- | ------ | ---------------- |
-| `main` / `0.9.0` (pre-release) | active build-out; breaking changes expected | :white_check_mark: fixed on `main` |
-| `latest` rolling prerelease (built from `main`) | evaluation only, not for production | :white_check_mark: via the next rolling build |
-| Any tagged `v*` release | none exists yet | — |
+| `main` (currently preparing `0.9.3`) | active build-out; breaking changes expected | fixes land on `main`; CI validates but does not publish production artifacts |
+| Published `v0.9.x` artifacts | pre-1.0 versioned releases, where publication completed | take a subsequently published version containing the fix; no minor-line backport window is committed yet |
+| Historical `latest` artifacts | no longer refreshed by main CI | do not use as a security-update channel |
 
-Until the first `v*` tag, run a pinned build from `main` and update it to take a
-security fix; there is no backport target. The support window per minor, the
-deprecation notice period, and the security-fix backport policy that will apply
-from 1.0 are in
-[docs/support_policy.md](docs/support_policy.md) — the values there are
-**proposed** until that first tag.
+Production artifacts are published by the version-tag release workflow after
+exact-commit validation. Pin a published version or immutable image digest and
+verify that its release contains the required fix; merging a fix to `main` does
+not update an installed artifact. The proposed support windows, deprecation
+periods, and backport policy for 1.0 are documented in
+[docs/support_policy.md](docs/support_policy.md). Existing pre-1.0 tags do not
+activate those proposed 1.0 commitments or declare a stable database schema.
 
 ## Reporting a Vulnerability
 

@@ -86,7 +86,7 @@ Pin an explicit release tag in download URLs. Production artifacts are published
 ```bash
 # Example: Linux x86_64
 set -euo pipefail
-TAG=<published-tag>  # from GitHub Releases / container registry (not a chart default)
+TAG='<published-tag>'  # from GitHub Releases / container registry (not a chart default)
 BASE="https://github.com/ferrum-edge/ferrum-edge/releases/download/${TAG}"
 curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64"
 curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64.sha256"
@@ -100,13 +100,18 @@ Published Linux GNU artifacts (`ferrum-edge-linux-x86_64`, `ferrum-cni-linux-x86
 
 ### Docker
 
+Choose a published version, not a source tag or chart `appVersion` that is still
+in release preparation. Historical `latest` images are not refreshed by main CI.
+
 Images are published to Docker Hub (`docker.io/ferrumedge/ferrum-edge`, anonymously
 pullable) and to GitHub Container Registry (`ghcr.io/ferrum-edge/ferrum-edge`). Use the
 Docker Hub path unless you have confirmed the GHCR package is visible to you: a GHCR
 package that is not public returns `401 Unauthorized` to an anonymous `docker pull`.
 
 ```bash
-docker pull docker.io/ferrumedge/ferrum-edge:latest
+# Replace with a version whose image has completed publication.
+TAG='<published-tag>'
+docker pull "docker.io/ferrumedge/ferrum-edge:${TAG}"
 
 docker run -d --name ferrum-edge \
   -p 8000:8000 \
@@ -116,7 +121,7 @@ docker run -d --name ferrum-edge \
   -e FERRUM_ADMIN_JWT_SECRET="please-change-me-to-a-32+character-secret" \
   -e FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1 \
   -v ferrum_data:/data \
-  docker.io/ferrumedge/ferrum-edge:latest
+  "docker.io/ferrumedge/ferrum-edge:${TAG}"
 ```
 
 > **Admin API exposure.** The admin API is a management plane. Both admin
