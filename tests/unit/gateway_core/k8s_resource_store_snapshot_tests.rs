@@ -5,9 +5,10 @@
 //! of the store list, so without an explicit rule the same cluster state could
 //! translate differently from one reconcile to the next — including which
 //! served API version of one object the translator sees. These tests pin the
-//! rule: one object per `(group, kind, namespace, name)`, the lexicographically
-//! smallest `apiVersion` among served-version aliases, ordered by group, kind,
-//! namespace, name, whatever order the stores were registered in.
+//! rule: one object per `(group, kind, namespace, name)`, the preferred served
+//! version among aliases by Kubernetes version priority (GA, then beta, then
+//! alpha), ordered by group, kind, namespace, name, whatever order the stores
+//! were registered in.
 
 use std::sync::Arc;
 
@@ -173,7 +174,7 @@ fn snapshot_all_order_is_independent_of_store_registration_order() {
 }
 
 #[test]
-fn served_version_aliases_collapse_onto_the_smallest_api_version_in_any_order() {
+fn served_version_aliases_collapse_onto_the_preferred_version_in_any_order() {
     let gateway_v1 = resource("gateway.networking.k8s.io", "v1", "Gateway");
     let gateway_v1beta1 = resource("gateway.networking.k8s.io", "v1beta1", "Gateway");
     let tlsroute_v1 = resource("gateway.networking.k8s.io", "v1", "TLSRoute");
@@ -202,6 +203,55 @@ fn served_version_aliases_collapse_onto_the_smallest_api_version_in_any_order() 
     );
     assert_eq!(objects[0].kind, "Gateway");
     assert_eq!(objects[1].kind, "TLSRoute");
+}
+
+/// The preference is Kubernetes version priority, not string order, so the
+/// invariant survives the first alias pair that is not GA `v1` against a
+/// `v1{alpha,beta}N` sibling: `v2` beats `v1beta1` (string order would pick
+/// `v1beta1`), a GA `v1` beats a newer `v2alpha1`, and `v1beta2` beats
+/// `v1beta1`.
+#[test]
+fn served_version_preference_is_kubernetes_version_priority_not_string_order() {
+    let widget_v2 = resource("example.com", "v2", "Widget");
+    let widget_v1beta1 = resource("example.com", "v1beta1", "Widget");
+    let gadget_v1 = resource("example.com", "v1", "Gadget");
+    let gadget_v2alpha1 = resource("example.com", "v2alpha1", "Gadget");
+    let gizmo_v1beta1 = resource("example.com", "v1beta1", "Gizmo");
+    let gizmo_v1beta2 = resource("example.com", "v1beta2", "Gizmo");
+    let one = &[(Some("default"), "one")];
+
+    for reversed in [false, true] {
+        let mut aliases = vec![
+            &widget_v1beta1,
+            &widget_v2,
+            &gadget_v2alpha1,
+            &gadget_v1,
+            &gizmo_v1beta1,
+            &gizmo_v1beta2,
+        ];
+        if reversed {
+            aliases.reverse();
+        }
+        let mut set = ResourceStoreSet::new();
+        for alias in aliases {
+            register(&mut set, alias, "all", one);
+        }
+
+        let chosen: Vec<(String, String)> = set
+            .snapshot_all()
+            .into_iter()
+            .map(|object| (object.kind, object.api_version))
+            .collect();
+        assert_eq!(
+            chosen,
+            vec![
+                ("Gadget".to_string(), "example.com/v1".to_string()),
+                ("Gizmo".to_string(), "example.com/v1beta2".to_string()),
+                ("Widget".to_string(), "example.com/v2".to_string()),
+            ],
+            "reversed registration: {reversed}"
+        );
+    }
 }
 
 #[test]

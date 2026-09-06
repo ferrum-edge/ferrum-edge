@@ -1,4 +1,5 @@
 use std::cmp::Ordering as CmpOrdering;
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
@@ -255,12 +256,15 @@ impl ResourceStoreSet {
     /// incidental: a reflector store iterates a hash map, and a scope whose
     /// stream ended re-registers at the end of the store list. One Kubernetes
     /// object watched under several served API versions (`Gateway` v1 and
-    /// v1beta1, `TLSRoute` v1 and v1alpha2) is kept once, under the
-    /// lexicographically smallest `apiVersion` — the GA version on every alias
-    /// pair Ferrum watches — and the result is ordered by group, kind,
+    /// v1beta1, `TLSRoute` v1 and v1alpha2) is kept once, under the preferred
+    /// served version by Kubernetes version priority
+    /// ([`served_version_rank`]: GA, then beta, then alpha, higher numbers
+    /// first within a stability) — and the result is ordered by group, kind,
     /// namespace, and name. The same cluster state, including a stale store
     /// that still holds a deleted object, therefore always yields the same
-    /// snapshot and the same translation.
+    /// snapshot and the same translation. A deleted object survives here until
+    /// EVERY alias scope that held it has relisted, since each scope's store
+    /// is retired independently.
     pub fn snapshot_all(&self) -> Vec<K8sObject> {
         let mut chosen: HashMap<ResourceIdentity, K8sObject> = HashMap::new();
         for store in &self.stores {
@@ -270,7 +274,9 @@ impl ResourceStoreSet {
                         slot.insert(object);
                     }
                     Entry::Occupied(mut slot) => {
-                        if object.api_version < slot.get().api_version {
+                        if served_version_rank(&object.api_version)
+                            < served_version_rank(&slot.get().api_version)
+                        {
                             slot.insert(object);
                         }
                     }
@@ -316,6 +322,44 @@ fn api_group(api_version: &str) -> &str {
     api_version
         .split_once('/')
         .map_or("", |(group, _version)| group)
+}
+
+/// Kubernetes version priority of one `apiVersion`, most preferred first,
+/// mirroring `k8s.io/apimachinery`'s `CompareKubeAwareVersionStrings`: GA
+/// before beta before alpha before anything not shaped `vN[(alpha|beta)M]`;
+/// within one stability the higher `N`, then the higher `M`, comes first; the
+/// unrecognized shapes sort last, lexicographically. So `v1` beats `v1beta1`,
+/// `v2` beats `v1beta1` (where string order would not), `v1` beats `v2alpha1`,
+/// and `v1beta2` beats `v1beta1`. Only the version segment is compared; the
+/// caller has already matched group, kind, namespace, and name.
+fn served_version_rank(api_version: &str) -> (u8, Reverse<u64>, Reverse<u64>, &str) {
+    let version = api_version.rsplit('/').next().unwrap_or(api_version);
+    match parse_kube_version(version) {
+        Some((stability, major, minor)) => (stability, Reverse(major), Reverse(minor), ""),
+        None => (3, Reverse(0), Reverse(0), version),
+    }
+}
+
+/// `(stability, major, minor)` of a `vN`, `vNbetaM`, or `vNalphaM` version,
+/// with stability `0`, `1`, `2` respectively; `None` for anything else,
+/// including a missing `M` or a number that does not fit.
+fn parse_kube_version(version: &str) -> Option<(u8, u64, u64)> {
+    let rest = version.strip_prefix('v')?;
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let (major, rest) = rest.split_at(digits);
+    let major: u64 = major.parse().ok()?;
+    if rest.is_empty() {
+        return Some((0, major, 0));
+    }
+    let (stability, minor) = if let Some(minor) = rest.strip_prefix("beta") {
+        (1, minor)
+    } else if let Some(minor) = rest.strip_prefix("alpha") {
+        (2, minor)
+    } else {
+        return None;
+    };
+    let minor: u64 = minor.parse().ok()?;
+    Some((stability, major, minor))
 }
 
 /// Deterministic reconcile order: group, kind, namespace, name. Identities are
