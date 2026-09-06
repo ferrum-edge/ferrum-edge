@@ -262,17 +262,17 @@ cold-cache run still proves every live contract within the existing job
 timeouts.
 
 **Production images.** The ordinary `runtime` and distroless `runtime-ebpf`
-targets build in parallel with `docker/build-push-action`. Each job restores a
-schema- and architecture-scoped local BuildKit cache (`type=local`) through pinned
-`actions/cache/restore`. Cache keys are
-`production-dockerfile-smoke-{default,ebpf}-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}`
-with matching `v1-${{ runner.os }}-${{ runner.arch }}-` restore prefixes. The `v1`
-component is the BuildKit cache schema; bump it only when the exported layout
-changes. The Ambient production-image jobs use target-specific GHCR registry
-caches with separate main writers and read-only PR consumers, documented with
-that live suite.
+targets build in parallel with `docker/build-push-action`. The ordinary image
+restores a schema- and architecture-scoped local BuildKit cache (`type=local`)
+through pinned `actions/cache/restore`, using
+`production-dockerfile-smoke-default-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}`
+and its matching architecture prefix. The `v1` component is the local cache
+schema. The eBPF image instead reads Ambient's public, target-specific GHCR
+cache anonymously, with no export or Actions archive save. Ambient's trusted
+main writer maintains that shared cache. Both images preserve the explicit
+cold-cache dispatch path.
 
-`actions/cache/restore` v4 outputs are classified strictly: `cache-hit == 'true'`
+For the ordinary image's local cache, `actions/cache/restore` v4 outputs are classified strictly: `cache-hit == 'true'`
 is an exact primary-key hit; `cache-hit == 'false'` is a restore-key partial
 match (still a hit); empty `cache-hit` plus empty `cache-matched-key` is an
 ordinary miss. Exact and partial hits require a nonempty matched key and an
@@ -1204,10 +1204,11 @@ eBPF userspace binary with `FEATURES=cloud-secrets,ebpf`, builds the
 image from those cached host-built artifacts instead of recompiling inside
 Docker. A separate production-Dockerfile smoke builds the ordinary `runtime`
 target (which must omit `ip`) and the privileged `runtime-ebpf` target (which
-must contain `ip`) **in parallel** through BuildKit, restoring a scoped local
-BuildKit cache (`type=local`) via pinned `actions/cache/restore` and measuring
-restored bytes from the restored directory. Trusted runs save that cache with
-pinned `actions/cache/save`; fork pull requests restore-only and do not save.
+must contain `ip`) **in parallel** through BuildKit. The ordinary target
+uses its scoped local Actions archive; the eBPF target anonymously imports
+Ambient's matching GHCR cache without exporting or saving another archive.
+The ordinary cache records measured restored bytes and saves only on main
+pushes; pull requests restore without saving.
 Each job then checks a normalized
 filesystem inventory for shells and package managers. A trusted-base path
 planner reads a NUL-delimited `git diff --name-only --no-renames -z` listing and
@@ -1352,8 +1353,8 @@ package must be public before anonymous imports can reuse it. Existing GHA
 entries expire under LRU. See the registry migration section below.
 
 The Fuzz Smoke lane's separate main-only save remains owned by PR #3918. The
-NodeWaypoint/FIPS exact-generation local BuildKit design from PR #3889 is
-unchanged by the Ambient migration.
+ordinary NodeWaypoint image retains its local BuildKit contract from PR #3889;
+the eBPF image now shares Ambient's registry cache. FIPS handoff is unchanged.
 
 The shared `setup-rust-ci` action applies the same restore-only policy to the
 Swatinem rust-cache: `save-if` is true only when the event is neither
@@ -1554,53 +1555,43 @@ clears 1.10x, a selection miss is still a hard failure. Its 4-target
 small-cardinality fixture is measured but informational, because an Arc
 strong-count hotspot dominates it.
 
-The **RoundRobin** guard does not assert a parallel speedup at all
-(issue #4484). Its only fixture is a 2-target upstream, whose measurement
-is dominated by a shared-line hotspot: hosted runs of an unmodified tree
-land near 0.6x-0.7x, so a 1.10x floor sat above the workload's own typical
-value and ejected green pull requests from the merge queue. That fixture is
-the RoundRobin analogue of the WRR 4-target one, and is now treated the
-same way: `verify_rr_selection_benchmark.py` still prints its wall times and
-its throughput speedup against `--min-parallel-speedup`, but reports a miss
-as a `::notice::` instead of failing on it.
+The **RoundRobin** guard compares the complete 2-target selection workload
+against an immutable baseline revision (issue #4708). A bare shared atomic is
+not a representative scaling control for snapshot loads, reference counts and
+selection together; their costs need not inflate proportionally on a busy
+runner. The old 0.50 multiplier could reject unchanged selection code.
 
-What it enforces instead is a **per-selection contention bound** built from
-the same two measurements the fixture already records:
+`run_rr_selection_comparison.sh` builds candidate and baseline binaries using
+the same candidate benchmark harness and locked dependency graphs. Only that
+harness is overlaid on the baseline checkout. The PR base SHA, merge-group base
+SHA, or main push's before SHA selects the baseline; manual dispatch defaults
+to the preceding commit. Both binaries are preserved before measurements start,
+so rebuilding the shared target directory cannot replace one with the other.
+Compiler work finishes before timing starts. Both commands use the runner-root
+Cargo configuration and toolchain; the baseline manifest resolves its own source
+and locked dependencies from the separate checkout.
 
-```
-contention_ratio = parallel_ns / (8 * serial_ns)
-                 = parallel ns/selection / serial ns/selection
-```
+The harness performs 50,000 operations per thread at one and eight threads.
+Its timer starts before the worker-release barrier. Three baseline and three
+candidate runs alternate order on the same hosted runner. At each thread count,
+the gate fails if the lowest candidate 95% interval bound exceeds the highest
+baseline bound by more than Criterion's default 1% noise threshold. This detects
+a consistent regression in the same workload without assuming a relationship
+to a different operation. The envelope is conservative, not a joint confidence
+interval or proof of equivalence; noise can hide small regressions. Missing,
+incomplete, non-finite, or invalid interval evidence fails.
 
-`contention_ratio` is 1.00x for a workload that scales perfectly and rises
-toward 8.00x as the batch serializes on one cache line. The reference for
-"serialized on one cache line" is not a constant: the Criterion bench adds
-`shared_counter_control_{1,8}_threads`, which drives the same
-barrier-synchronized worker pool at the same thread counts over one
-genuinely shared `AtomicU64` — the exact cost the sharded `CachePadded`
-selection counters exist to avoid, measured on the same runner in the same
-run. The gate passes when
+The artifact includes exact source revisions, the shared harness hash, binary
+hashes, compilation durations, run order, raw Criterion samples and intervals,
+and `rr-comparison/comparison.json`. The temporary baseline checkout and large
+executables stay outside the artifact. The additional baseline compilation
+cost is reported separately and must be assessed with hosted readiness time.
 
-```
-selection contention_ratio <= 0.50 * shared_counter_control contention_ratio
-```
-
-An oversubscribed or coherence-degraded runner inflates both readings
-together, so the verdict does not flip; a regression that puts every worker
-back on one shared counter drives the selection reading up to the control's
-own, whatever absolute value that runner produces that day. This is what
-makes the control representative — unlike the independent-process CPU
-control, which measures whether cores are free rather than what a contended
-cache line costs, and therefore cleared on all three of the readings that
-ejected #4466.
-
-Two fallbacks apply the wide absolute backstop `contention_ratio <= 4.00x`
-(healthy hosted readings are ~1.3x-1.7x; full serialization is >= 8.00x)
-and say so with a `::warning::`: a control below 2.00x, meaning the runner
-resolves no shared-line penalty at all so the comparison has no signal; and
-an unreadable control fixture, which is fail-closed. Serial-ratio and
-missing-artifact contracts stay hard either way. The WRR floor value is not
-lowered.
+Throughput speedup remains descriptive. Its reciprocal,
+`parallel_ns / (8 * serial_ns)`, is 1/8 for ideal eight-way scaling and 1 for
+flat throughput. The bare shared-counter fixture remains available for manual
+exploration but no longer determines the gate. WRR's separate contract is
+unchanged.
 
 **Failures**:
 - Indicate performance regression issues
@@ -3159,3 +3150,21 @@ not become public merely because their source repository is public. A missing
 cache still builds cold, while a failed registry export fails the writer. See
 [the migration runbook](ghcr_cache_migration.md) for activation, measurement,
 retention and the separate NodeWaypoint/manual-benchmark follow-ups.
+
+### NodeWaypoint eBPF registry cache reuse
+
+The production eBPF image smoke imports the public Ambient
+`ambient-v1-linux-amd64-runtime-ebpf` cache from
+`ghcr.io/ferrum-edge/ferrum-edge-buildcache`. Its Dockerfile, `runtime-ebpf`
+target, `pr-build` profile and `cloud-secrets,ebpf` features match Ambient's
+trusted main writer. NodeWaypoint performs no registry login, export or
+Actions archive save for this image, including on main. This removes its
+duplicate multi-gigabyte BuildKit archive from the 10 GB Actions quota.
+
+The `force_cold_cache` dispatch option omits registry imports. Both paths keep
+the version, iproute2 and distroless inventory assertions, image timing and
+required aggregate. Registry import runs within image-build timing; BuildKit
+logs provide actual layer-reuse evidence. Telemetry records unknown hit/bytes
+for registry reads rather than claiming an Actions cache hit. A missing cache
+can still produce a correct cold build. The ordinary default image retains
+its separate local-cache contract. All package and billing settings stay as-is.

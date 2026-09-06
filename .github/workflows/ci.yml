@@ -6491,7 +6491,7 @@ jobs:
             run_wrr_benchmark=true
           fi
 
-          if [ "${EVENT_NAME}" != "pull_request" ] && [ "${EVENT_NAME}" != "merge_group" ] || [ "${ci_yml_schedules_microbenchmarks}" = "true" ] || grep -Eq '^(src/load_balancer\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/rr_selection\.rs)|\.github/scripts/verify_rr_selection_benchmark\.py)$' <<<"${changed_files}"; then
+          if [ "${EVENT_NAME}" != "pull_request" ] && [ "${EVENT_NAME}" != "merge_group" ] || [ "${ci_yml_schedules_microbenchmarks}" = "true" ] || grep -Eq '^(src/load_balancer\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/rr_selection\.rs)|\.github/scripts/(verify_rr_selection_benchmark\.py|run_rr_selection_comparison\.(py|sh)))$' <<<"${changed_files}"; then
             run_rr_benchmark=true
           fi
 
@@ -6570,12 +6570,11 @@ jobs:
 
       - name: Run RoundRobin selection contention microbenchmark
         if: steps.perf_changes.outputs.run_rr_benchmark == 'true'
+        env:
+          RR_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event_name == 'push' && github.event.before || '' }}
         run: |
-          cargo bench --manifest-path tests/performance/mesh/Cargo.toml --bench rr_selection
           python3 .github/scripts/verify_rr_selection_benchmark.py --self-test
-          python3 .github/scripts/verify_rr_selection_benchmark.py \
-            --criterion-root tests/performance/mesh/target/criterion \
-            --min-parallel-speedup 1.10
+          bash .github/scripts/run_rr_selection_comparison.sh
 
       - name: Run AI semantic-cache cleanup p99 microbenchmark
         if: steps.perf_changes.outputs.run_ai_semantic_cache_benchmark == 'true'
@@ -6700,7 +6699,7 @@ jobs:
           fi
           if [ "${RUN_RR}" = "true" ]; then
             {
-              echo "RoundRobin selection contention guard executed: 8-thread/1-thread throughput speedup >= 1.10x for the 2-target fixture. A miss is a hard failure only when an independent-process CPU control at the same thread count still clears 1.10x (median of 5); if the control also misses, the floor is advisory because the runner is oversubscribed."
+              echo "RoundRobin selection guard compared the same 2-target workload at 1 and 8 threads against an immutable baseline, with three interleaved runs per revision on one runner. Missing evidence fails; a consistent regression beyond all measured 95% intervals plus Criterion's 1% noise threshold fails. See rr-comparison/comparison.json and provenance.json."
               echo ""
             } >> "${GITHUB_STEP_SUMMARY}"
           fi
