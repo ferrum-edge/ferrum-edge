@@ -1339,6 +1339,61 @@ async fn committed_response_consumes_the_staging_permit_exactly_once() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn audit_namespace_follows_settings_and_proxy_identity() {
+    const CHILD_EXPECTED: &str = "FERRUM_TEST_AUDIT_NAMESPACE_EXPECTED";
+    if let Ok(expected) = std::env::var(CHILD_EXPECTED) {
+        // Each child owns a fresh immutable ConfFile cache and process environment.
+        for proxy_namespace in [None, Some(""), Some("proxy-tenant")] {
+            let mut ctx = make_ctx();
+            if let Some(namespace) = proxy_namespace {
+                let mut proxy = create_test_proxy();
+                proxy.namespace = namespace.to_string();
+                ctx.matched_proxy = Some(Arc::new(proxy));
+            }
+            let records = capture_roundtrip_over_ctx(json!({ "mode": "metadata_only" }), ctx).await;
+            assert_eq!(records.len(), 1);
+            let wanted = proxy_namespace
+                .filter(|value| !value.is_empty())
+                .unwrap_or(&expected);
+            assert_eq!(records[0]["namespace"], wanted);
+        }
+        return;
+    }
+
+    for (settings, environment, expected) in [
+        ("FERRUM_NAMESPACE = conf-tenant\n", None, "conf-tenant"),
+        (
+            "FERRUM_NAMESPACE = conf-tenant\n",
+            Some("env-tenant"),
+            "env-tenant",
+        ),
+        ("", None, DEFAULT_NAMESPACE),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let settings_path = directory.path().join("ferrum.conf");
+        std::fs::write(&settings_path, settings).unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("unit::plugins::ai_transcript_audit_tests::audit_namespace_follows_settings_and_proxy_identity")
+            .env("FERRUM_CONF_PATH", &settings_path)
+            .env(CHILD_EXPECTED, expected)
+            .env_remove("FERRUM_NAMESPACE");
+        if let Some(value) = environment {
+            command.env("FERRUM_NAMESPACE", value);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+}
+
+#[tokio::test]
 async fn request_capture_redacts_pii() {
     let records = capture_roundtrip(
         json!({ "mode": "redacted_body" }),

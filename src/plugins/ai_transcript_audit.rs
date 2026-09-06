@@ -2166,10 +2166,9 @@ impl AiTranscriptAudit {
             .min(limits.max_stream_reservation.as_secs() / 2)
             .max(1);
         let active = capture.request || capture.response || streaming != StreamingCapture::Off;
-        let namespace = std::env::var("FERRUM_NAMESPACE")
-            .ok()
+        let namespace = crate::config::conf_file::resolve_ferrum_var("FERRUM_NAMESPACE")
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "default".to_string());
+            .unwrap_or_else(|| crate::config::types::DEFAULT_NAMESPACE.to_string());
 
         // ---- gRPC enrollment (optional) ----
         let grpc = load_grpc_capture(config, descriptor_mode)?;
