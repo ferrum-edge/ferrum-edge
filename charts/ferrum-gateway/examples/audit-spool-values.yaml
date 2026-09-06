@@ -1,0 +1,22 @@
+# Overlay database-values.yaml or cp-values.yaml after provisioning this claim.
+# Single serving owner: preserve the PVC across pod replacement for replay.
+# This is deliberately not HA; Recreate incurs upgrade downtime.
+replicaCount: 1
+autoscaling:
+  enabled: false
+updateStrategy:
+  type: Recreate
+  rollingUpdate: null
+
+env:
+  FERRUM_ADMIN_AUDIT_ENABLED: "true"
+  FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY: fail_closed
+  FERRUM_ADMIN_AUDIT_SPOOL_DIR: /var/lib/ferrum/audit-spool
+extraVolumes:
+  - name: admin-audit-spool
+    persistentVolumeClaim:
+      claimName: ferrum-admin-audit-spool
+extraVolumeMounts:
+  - name: admin-audit-spool
+    mountPath: /var/lib/ferrum/audit-spool
+    readOnly: false

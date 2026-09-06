@@ -46,6 +46,10 @@ spec:
               drop:
                 - ALL
           env:
+            # No Admin API is served by this one-shot migration Job. Override
+            # inherited serving-mode audit settings before common startup init.
+            - name: FERRUM_ADMIN_AUDIT_ENABLED
+              value: "false"
             - name: FERRUM_MODE
               value: migrate
             - name: FERRUM_MIGRATE_ACTION

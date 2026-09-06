@@ -34,6 +34,7 @@ tokens are issued by your own identity tooling.
 | Enforce tenancy on namespace-scoped routes instead of trusting the header | `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` | `true` in multi-tenant deployments | [Per-namespace tenancy](admin_api.md#per-namespace-tenancy-ferrum_admin_require_namespace_claim) |
 | Bound admin connection concurrency | `FERRUM_ADMIN_MAX_CONNECTIONS` | leave at `1024`; do not set `0` | [Admin API](configuration.md#admin-api) |
 | Make gateways that never need writes read-only | `FERRUM_ADMIN_READ_ONLY` | `true` where writes are not required | [Admin read-only mode](admin_read_only_mode.md) |
+| Mount writable, persistent audit storage before enabling fail-closed audit | `FERRUM_ADMIN_AUDIT_SPOOL_DIR` plus a volume mount | writable by UID/GID `65532`; default path `/var/lib/ferrum/audit-spool` | [Audit spool deployment](../charts/ferrum-gateway/README.md#audit-spool-with-a-read-only-root) |
 | Record configuration mutations | `FERRUM_ADMIN_AUDIT_ENABLED` | `true` | [Admin API](configuration.md#admin-api) |
 | Decide what happens when the audit handoff fails | `FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY` | `fail_closed` where an unaudited mutation is unacceptable | [Admin API](configuration.md#admin-api) |
 

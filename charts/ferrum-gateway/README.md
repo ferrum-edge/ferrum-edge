@@ -525,3 +525,43 @@ plugin_configs:
 See [`docs/admin_metrics.md`](../../docs/admin_metrics.md) and
 [`docs/prometheus_metrics.md`](../../docs/prometheus_metrics.md) for the metric
 families and bundled alert expressions.
+
+
+### Audit spool with a read-only root
+
+Enabling `FERRUM_ADMIN_AUDIT_ENABLED=true` with
+`FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_closed` requires a writable spool
+before startup, at `/var/lib/ferrum/audit-spool` by default. The read-only root
+and `/tmp` mount alone do not provide it. Mount persistent storage using the
+existing `extraVolumes` and `extraVolumeMounts` values; keep the security defaults.
+
+The [audit spool overlay](examples/audit-spool-values.yaml) can be combined with
+`database-values.yaml` or `cp-values.yaml`. First create a PVC named
+`ferrum-admin-audit-spool` in the release namespace, backed by storage that honors
+`fsGroup: 65532` or is pre-provisioned writable by UID/GID 65532. Use the same
+published image tag as your deployment. The chart does not create the claim.
+
+```sh
+helm upgrade --install ferrum ./charts/ferrum-gateway -n ferrum \
+  -f charts/ferrum-gateway/examples/database-values.yaml \
+  -f charts/ferrum-gateway/examples/audit-spool-values.yaml \
+  --set image.tag=<published-tag>
+```
+
+This overlay deliberately uses one replica, disables autoscaling, and selects
+`Recreate` so a single claim has one serving owner through upgrades. It incurs
+upgrade downtime. Do not share the claim with another release or migration Job.
+For HA, provision independently owned persistent spools and an explicit recovery
+procedure for each replica; changing this example to multiple replicas is not
+that procedure. Keep the claim when replacing a pod so its pending records can
+be replayed. An `emptyDir` is writable but loses pending audit records when the
+pod is deleted and does not satisfy durable handoff requirements.
+
+The external `migrate-job-*.yaml` examples explicitly disable **admin request**
+audit: migrate mode has no Admin API listener or admin mutations, but currently
+passes through audit initialization before mode dispatch. Keep that explicit
+job-local override when sharing a gateway ConfigMap, and retain migration logs
+and database change records through your migration process. Serving Deployments
+continue to use the enabled, fail-closed configuration above. Mesh control-plane
+Deployments have the same storage requirement; use their `controlPlane.env`,
+`controlPlane.extraVolumes`, and `controlPlane.extraVolumeMounts` equivalents.
