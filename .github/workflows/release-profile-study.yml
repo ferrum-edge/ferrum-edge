@@ -204,6 +204,7 @@ jobs:
           BENCH_CONCURRENCY: ${{ inputs.concurrency }}
           BENCH_PAYLOAD_SIZE: ${{ inputs.payload_size }}
         run: |
+          set -euo pipefail
           ITERATIONS="$BENCH_ITERATIONS"
           for run in $(seq 1 "$ITERATIONS"); do
             echo ""
