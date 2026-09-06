@@ -59,6 +59,16 @@ pub fn build_cp_grpc_server_tls_config(
     )
 }
 
+fn cp_grpc_active_crls(
+    env_config: &EnvConfig,
+    startup_crls: &CrlList,
+) -> Result<CrlList, anyhow::Error> {
+    match env_config.tls_crl_file_path.as_deref() {
+        Some(source) => tls::load_crls(Some(source), env_config.tls_crl_expiry_warning_days),
+        None => Ok(startup_crls.clone()),
+    }
+}
+
 pub fn prepare_cp_grpc_server_tls_reload(
     tls_config: Arc<ServerConfig>,
     env_config: Arc<EnvConfig>,
@@ -110,11 +120,15 @@ pub fn prepare_cp_grpc_server_tls_reload(
                 // frontend reload watcher can swap the slot, but leave the
                 // candidate unarmed so a CRL/client-CA rotation here cannot
                 // retire frontend transports.
+                // Resolve the watched CRL source for this candidate. A failed
+                // load refuses the candidate before the shared watcher swaps
+                // the slot, preserving the last accepted revocation set.
+                let active_crls = cp_grpc_active_crls(&env_for_rebuild, &crls_for_rebuild)?;
                 Ok(FrontendTlsRebuilt {
                     config: build_cp_grpc_server_tls_config(
                         &env_for_rebuild,
                         &policy_for_rebuild,
-                        &crls_for_rebuild,
+                        &active_crls,
                     )?,
                     client_trust: None,
                 })
@@ -262,6 +276,67 @@ pub(crate) fn dp_grpc_watched_sources(env_config: &EnvConfig) -> Vec<WatchedMate
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn crl_pem(number: u64, expired: bool) -> String {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .expect("generate test issuer key");
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages.push(rcgen::KeyUsagePurpose::CrlSign);
+        let issuer = rcgen::Issuer::new(params, key);
+        let now = time::OffsetDateTime::now_utc();
+        rcgen::CertificateRevocationListParams {
+            this_update: now - time::Duration::days(2),
+            next_update: if expired {
+                now - time::Duration::days(1)
+            } else {
+                now + time::Duration::days(30)
+            },
+            crl_number: rcgen::SerialNumber::from(number),
+            issuing_distribution_point: None,
+            revoked_certs: vec![rcgen::RevokedCertParams {
+                serial_number: rcgen::SerialNumber::from(number),
+                revocation_time: now - time::Duration::days(2),
+                reason_code: None,
+                invalidity_date: None,
+            }],
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        }
+        .signed_by(&issuer)
+        .expect("sign test CRL")
+        .pem()
+        .unwrap()
+    }
+
+    #[test]
+    fn cp_grpc_crl_reload_reads_current_source_and_refuses_invalid_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revocations.pem");
+        let env = EnvConfig {
+            tls_crl_file_path: Some(path.to_string_lossy().into_owned()),
+            ..EnvConfig::default()
+        };
+        let empty = Arc::new(Vec::new());
+        std::fs::write(&path, crl_pem(1, false)).unwrap();
+        let startup = cp_grpc_active_crls(&env, &empty).unwrap();
+        assert_eq!(startup.len(), 1);
+
+        std::fs::write(&path, crl_pem(2, false)).unwrap();
+        let rotated = cp_grpc_active_crls(&env, &startup).unwrap();
+        assert_eq!(rotated.len(), 1);
+        assert_ne!(rotated.as_ref(), startup.as_ref());
+
+        for invalid in ["torn CRL".to_string(), crl_pem(3, true)] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(cp_grpc_active_crls(&env, &rotated).is_err());
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert!(cp_grpc_active_crls(&env, &rotated).is_err());
+
+        let unconfigured = EnvConfig::default();
+        let preserved = cp_grpc_active_crls(&unconfigured, &startup).unwrap();
+        assert!(Arc::ptr_eq(&preserved, &startup));
+    }
 
     #[test]
     fn dp_grpc_watched_sources_collects_configured_sources() {
