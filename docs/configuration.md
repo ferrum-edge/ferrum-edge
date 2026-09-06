@@ -1211,8 +1211,10 @@ FERRUM_FRONTEND_TLS_CERT_PATH = "/path/with spaces/cert.pem"
 ```
 
 - Lines starting with `#` are comments
-- Inline comments are supported: `KEY = value # comment`
-- Values can be quoted with double or single quotes (quotes are stripped)
+- Unquoted values support inline comments starting with a space followed by `#`: `KEY = value # comment`
+- Values can be quoted with double or single quotes. The first matching quote closes the value; surrounding quotes are stripped, and everything inside (including whitespace, `#`, the other quote character, and backslashes) is literal. There is no escape processing.
+- After a closing quote, only whitespace and an optional `#` comment are allowed: `FERRUM_MODE = "file" # file mode`. A comment can also immediately follow the closing quote.
+- Unclosed quotes or other text after a closing quote are parse errors identifying the key and line number.
 - Empty lines are ignored
 
 A reference `ferrum.conf` with all available fields and descriptions is included in the repository root.
