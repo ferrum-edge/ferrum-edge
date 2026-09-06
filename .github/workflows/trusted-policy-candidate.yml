@@ -8,16 +8,14 @@ name: Trusted Policy Candidate
 on:
   pull_request:
     paths:
-      - .github/scripts/verify_cross_build_policy.py
-      - .github/workflows/ci.yml
-      - .github/workflows/trusted-policy-candidate.yml
+      - .github/scripts/**
+      - .github/workflows/**
   push:
     branches:
       - main
     paths:
-      - .github/scripts/verify_cross_build_policy.py
-      - .github/workflows/ci.yml
-      - .github/workflows/trusted-policy-candidate.yml
+      - .github/scripts/**
+      - .github/workflows/**
 
 permissions:
   contents: read
@@ -33,6 +31,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           persist-credentials: false
+
+      # Catch contract/extraction drift before waiting for the application
+      # matrix. Tests still repeats these checks as its required final gate.
+      - name: Validate candidate CI contracts
+        run: python3 .github/scripts/verify_required_ci.py
 
       - name: Exercise the candidate policy
         run: |

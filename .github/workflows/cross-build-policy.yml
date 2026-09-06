@@ -279,6 +279,7 @@ jobs:
             workspace_listing="${destination}.workspace-ls-tree"
             if ! git ls-tree -rz --name-only "$commit" -- \
               .github/scripts .github/required-publication-checks.json \
+              .github/workflows/release-dispatch.yml \
               comparison scripts tests/k8s tests/performance \
               Makefile makefile GNUmakefile package.json \
               justfile Justfile .justfile Taskfile.yml Taskfile.yaml > "$listing"; then
