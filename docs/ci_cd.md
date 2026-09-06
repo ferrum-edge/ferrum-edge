@@ -3168,3 +3168,27 @@ logs provide actual layer-reuse evidence. Telemetry records unknown hit/bytes
 for registry reads rather than claiming an Actions cache hit. A missing cache
 can still produce a correct cold build. The ordinary default image retains
 its separate local-cache contract. All package and billing settings stay as-is.
+
+### Shared default-profile live dependency cache (#4643)
+
+Netns Source Capture and Two-Cluster Mesh Live use the existing
+`ci-netns-capture-live` key. Both run on the same Linux runner/toolchain setup,
+with the same default features, Cargo profile, native dependencies, workspace
+and compiler flags. Both build the gateway and `functional_tests`; Netns also
+builds the inline library tests. The pinned Rust cache removes workspace
+binaries and keeps external dependencies plus the compiler store, so either
+completed producer supplies the shared dependency archive. Cargo still checks
+source fingerprints and each job independently executes its own required tests.
+
+The 2026-09-06 main inventory held separate Netns/Two-Cluster archives of
+2,638,376,752 / 2,638,386,367 bytes. Sharing their existing namespace removes a
+duplicate roughly 2.64 GB producer without invalidating the Netns cache. The
+trusted-main-only save rule and all job triggers, budgets, commands, dependency
+edges and test assertions are unchanged. Unit, lint, feature-specific and
+archive-builder profiles keep their separate keys. Reassess this pairing if
+either job changes its build profile, features, toolchain or target layout.
+
+Hosted validation must confirm the Two-Cluster reader restores the Netns key
+and passes its complete live suite. The broader quota issue still requires
+Unit/Lint/Artifacts retention across subsequent main runs; this change alone
+is not evidence that every required cache survives.
