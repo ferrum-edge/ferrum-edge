@@ -282,74 +282,103 @@ fn fair_budget_boundary_matches_default_cap() {
 
 #[test]
 fn large_route_snapshots_scale_indexing_while_budget_bounds_planning() {
-    // Table-driven scale regression (#2397): snapshot size grows with route
-    // count, but each reconcile pass plans at most the fixed fair-work budget.
-    let cases = [(1_000usize, 1_002usize), (10_000usize, 10_002usize)];
-    let budget = StatusPlanBudget::new(DEFAULT_STATUS_PLAN_WORK_BUDGET, 0);
-    let mut prior_eligible = 0usize;
+    use std::io::Write;
+    use std::time::Instant;
 
-    for (route_count, expected_eligible) in cases {
-        let objects = base_objects_with_routes(route_count);
-        assert_eq!(objects.len(), route_count + 2, "fixture size tracks routes");
-        assert!(
-            expected_eligible > prior_eligible,
-            "eligible set must grow with snapshot size"
-        );
-        prior_eligible = expected_eligible;
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter("ferrum_edge::k8s_controller::status=debug")
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    tracing::dispatcher::with_default(&dispatch, || {
+        // Table-driven scale regression (#2397): snapshot size grows with route
+        // count, but each reconcile pass plans at most the fixed fair-work budget.
+        let cases = [(1_000usize, 1_002usize), (10_000usize, 10_002usize)];
+        let budget = StatusPlanBudget::new(DEFAULT_STATUS_PLAN_WORK_BUDGET, 0);
+        let mut prior_eligible = 0usize;
 
-        let conflicts = gateway_api_route_conflicts(&objects, &options());
-        let outcome = plan_gateway_api_status_updates_budgeted(
-            &objects,
-            options(),
-            &conflicts,
-            Default::default(),
-            None,
-            budget,
-        );
+        for (route_count, expected_eligible) in cases {
+            let fixture_started = Instant::now();
+            let objects = base_objects_with_routes(route_count);
+            let fixture_elapsed = fixture_started.elapsed();
+            assert_eq!(objects.len(), route_count + 2, "fixture size tracks routes");
+            assert!(
+                expected_eligible > prior_eligible,
+                "eligible set must grow with snapshot size"
+            );
+            prior_eligible = expected_eligible;
 
-        assert_eq!(
-            outcome.eligible_candidates, expected_eligible,
-            "{route_count} routes: class + gateway + routes"
-        );
-        assert_eq!(
-            outcome.planned_candidates, DEFAULT_STATUS_PLAN_WORK_BUDGET,
-            "{route_count} routes: expensive planning must stay within the cap"
-        );
-        assert!(
-            outcome.updates.len() <= DEFAULT_STATUS_PLAN_WORK_BUDGET,
-            "{route_count} routes: writes must not exceed the work budget"
-        );
-        assert_eq!(
-            outcome.next_cursor, DEFAULT_STATUS_PLAN_WORK_BUDGET,
-            "cursor advances by the bounded window, not the full eligible set"
-        );
+            let conflicts_started = Instant::now();
+            let conflicts = gateway_api_route_conflicts(&objects, &options());
+            let conflicts_elapsed = conflicts_started.elapsed();
+            let first_started = Instant::now();
+            let outcome = plan_gateway_api_status_updates_budgeted(
+                &objects,
+                options(),
+                &conflicts,
+                Default::default(),
+                None,
+                budget,
+            );
+            let first_elapsed = first_started.elapsed();
 
-        let repeat = plan_gateway_api_status_updates_budgeted(
-            &objects,
-            options(),
-            &conflicts,
-            Default::default(),
-            None,
-            budget,
-        );
-        assert_eq!(repeat.eligible_candidates, outcome.eligible_candidates);
-        assert_eq!(repeat.planned_candidates, outcome.planned_candidates);
-        assert_eq!(repeat.next_cursor, outcome.next_cursor);
-        let first_keys: Vec<(&str, &str)> = outcome
-            .updates
-            .iter()
-            .map(|update| (update.kind.as_str(), update.name.as_str()))
-            .collect();
-        let repeat_keys: Vec<(&str, &str)> = repeat
-            .updates
-            .iter()
-            .map(|update| (update.kind.as_str(), update.name.as_str()))
-            .collect();
-        assert_eq!(
-            repeat_keys, first_keys,
-            "{route_count} routes: identical inputs must yield deterministic plans"
-        );
-    }
+            assert_eq!(
+                outcome.eligible_candidates, expected_eligible,
+                "{route_count} routes: class + gateway + routes"
+            );
+            assert_eq!(
+                outcome.planned_candidates, DEFAULT_STATUS_PLAN_WORK_BUDGET,
+                "{route_count} routes: expensive planning must stay within the cap"
+            );
+            assert!(
+                outcome.updates.len() <= DEFAULT_STATUS_PLAN_WORK_BUDGET,
+                "{route_count} routes: writes must not exceed the work budget"
+            );
+            assert_eq!(
+                outcome.next_cursor, DEFAULT_STATUS_PLAN_WORK_BUDGET,
+                "cursor advances by the bounded window, not the full eligible set"
+            );
+
+            let repeat_started = Instant::now();
+            let repeat = plan_gateway_api_status_updates_budgeted(
+                &objects,
+                options(),
+                &conflicts,
+                Default::default(),
+                None,
+                budget,
+            );
+            let repeat_elapsed = repeat_started.elapsed();
+            writeln!(
+                std::io::stderr(),
+                "status-plan-scale routes={route_count} fixture_us={} conflicts_us={} first_us={} repeat_us={}",
+                fixture_elapsed.as_micros(),
+                conflicts_elapsed.as_micros(),
+                first_elapsed.as_micros(),
+                repeat_elapsed.as_micros(),
+            )
+            .expect("write hosted scale telemetry");
+            assert_eq!(repeat.eligible_candidates, outcome.eligible_candidates);
+            assert_eq!(repeat.planned_candidates, outcome.planned_candidates);
+            assert_eq!(repeat.next_cursor, outcome.next_cursor);
+            let first_keys: Vec<(&str, &str)> = outcome
+                .updates
+                .iter()
+                .map(|update| (update.kind.as_str(), update.name.as_str()))
+                .collect();
+            let repeat_keys: Vec<(&str, &str)> = repeat
+                .updates
+                .iter()
+                .map(|update| (update.kind.as_str(), update.name.as_str()))
+                .collect();
+            assert_eq!(
+                repeat_keys, first_keys,
+                "{route_count} routes: identical inputs must yield deterministic plans"
+            );
+        }
+    });
 }
 
 #[test]
