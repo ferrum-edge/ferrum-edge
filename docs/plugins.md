@@ -2359,7 +2359,7 @@ config:
 
 ### `oidc_relying_party`
 
-Runs a browser-oriented OpenID Connect relying party flow with authorization code + PKCE, encrypted gateway sessions with a sliding idle window and proactive refresh-token rotation, ID token validation through provider JWKS, optional UserInfo merge, scope/role checks, claim header fan-out, and RP-initiated logout.
+Runs a browser-oriented OpenID Connect relying party flow with authorization code + PKCE, encrypted gateway sessions with a sliding idle window and proactive refresh-token rotation, ID token validation through provider JWKS, optional UserInfo merge, scope/role checks, claim header fan-out, and RP-initiated logout. Concurrent refresh-due requests carrying the same refresh token share one token-endpoint call per instance, and a refresh token the provider reports as `invalid_grant` is never re-sealed into a `Set-Cookie`; see [OIDC Relying Party](oidc_relying_party.md#concurrent-refreshes-and-spent-refresh-tokens) for the multi-replica caveat.
 
 **Priority:** 1075
 

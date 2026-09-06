@@ -45,6 +45,8 @@ Exactly one provider is supported. Use `discovery_url` for normal OIDC providers
 
 Fresh logins work behind non-sticky load balancers when every Ferrum replica shares the same `oidc_relying_party` configuration and `session.encryption_secret` (plus `encryption_secret_previous` during rotation). The durable session cookie was already replica-safe; pending authorization-code state is now likewise carried in the sealed correlation cookie, so an `/oidc`/`/oauth` callback may land on a different replica than the one that issued the challenge. Sticky sessions are not required for login completion. Keep encryption secrets identical across the fleet; a replica with the wrong secret or a different provider/session context rejects sealed pending-flow cookies and fails closed.
 
+Token refresh is the one place the cookie store's replica independence still shows. Refresh coalescing (see [Concurrent refreshes and spent refresh tokens](#concurrent-refreshes-and-spent-refresh-tokens)) is per instance: two replicas that both receive the same refresh-due cookie both submit the refresh token, and with a rotating provider only one can win. No replica can hand another the winner's tokens without a shared server-side session store, so the loser's contract is what protects the browser: it sees `invalid_grant`, emits no `Set-Cookie`, and does not re-submit that generation for `25` seconds. The browser keeps the winner's rotated cookie, and the only cost is one rejected grant per additional replica per generation. Providers that revoke the whole token family on detected reuse ([RFC 9700 §4.14.2](https://www.rfc-editor.org/rfc/rfc9700.html#section-4.14.2)) can still invalidate the winner in that case; routing requests for one session cookie to one replica (cookie-based affinity on the session cookie name) removes the duplicate submission entirely and is recommended with such providers.
+
 ## Session Lifetime and Token Refresh
 
 The gateway session has two bounds, both enforced on every request:
@@ -59,6 +61,15 @@ When the provider issues a refresh token (typically by adding the `offline_acces
 - Refresh is best-effort while the stored claims are still fresh. If the token endpoint remains unavailable or the provider omits fresh claims until the stored claims pass expiry plus clock skew, the plugin fails closed and re-challenges instead of serving stale authorization claims.
 
 Both a sliding update and a refresh re-issue the session cookie on the proxied response via `Set-Cookie`, preserving any cookie the backend also set.
+
+### Concurrent refreshes and spent refresh tokens
+
+A browser routinely sends several requests carrying the same refresh-due cookie at once (parallel tabs, a page plus its asset fetches). Providers that rotate refresh tokens accept the token exactly once, so each such burst must submit it exactly once:
+
+- **Single-flight per token generation.** Within one Ferrum instance, every request whose cookie carries the same refresh token joins one refresh transition, keyed by a SHA-256 digest of that token (the registry never holds the raw credential). The first request runs the grant; the others wait for its outcome without any lock and receive the winner's session state, so each of them re-issues the rotated cookie. A completed transition stays addressable for `25` seconds, so a request that decrypted the old cookie just before the winner finished, or a tab that still carries it, adopts the rotation instead of re-submitting the spent token. The retained registry is bounded (4096 completed records per instance, oldest evicted first); live transitions are never evicted. Requests whose cookie is not due never touch the registry.
+- **`invalid_grant` re-seals nothing.** When the token endpoint answers `invalid_grant` (RFC 6749 §5.2: the token is spent, revoked, or expired), the request is still served while its stored claims are fresh, but it emits **no** `Set-Cookie`. The browser therefore keeps whatever cookie it holds — the rotated session whenever a winner exists anywhere in the fleet — rather than being handed the spent credential again. The instance records the spent identity for `25` seconds, so repeat requests with the same stale cookie are not re-submitted either. Once the stored claims expire, the freshness gate re-challenges as usual.
+- **Transient failures keep the token.** A transport error, non-2xx without `invalid_grant`, or malformed response leaves the token live; the unchanged payload is re-sealed with the next attempt deferred by `30` seconds, and every request sharing the transition carries that same backoff.
+- A follower whose leader is cancelled (client disconnect) re-elects exactly one replacement; one that outlives the leader's wait bound serves without a session update and never issues a duplicate grant.
 
 ## Client Authentication
 

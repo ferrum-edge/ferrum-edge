@@ -15,6 +15,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use url::Url;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -467,6 +468,208 @@ async fn accepted_refresh_failure_commits_backoff_and_avoids_retry_storm() {
 }
 
 #[tokio::test]
+async fn concurrent_refresh_due_requests_share_one_rotation_and_never_reseal_the_spent_token() {
+    let server = MockServer::start().await;
+    // Single-use rotating token endpoint with reversed timing: the first grant
+    // rotates after a short delay; any duplicate submission of the same token
+    // fails with `invalid_grant` even later, so a racing loser (should one ever
+    // run) would be the response the browser applies last.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(move |_: &Request| {
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(150))
+                    .set_body_json(json!({
+                        "access_token": "new-access-token",
+                        "refresh_token": "rotated-refresh-token",
+                        "token_type": "Bearer",
+                        "expires_in": 3600
+                    }))
+            } else {
+                ResponseTemplate::new(400)
+                    .set_delay(Duration::from_millis(600))
+                    .set_body_json(json!({"error": "invalid_grant"}))
+            }
+        })
+        .mount(&server)
+        .await;
+    let plugin = OidcRelyingParty::new(
+        &refresh_config(&format!("{}/token", server.uri())),
+        PluginHttpClient::default(),
+    )
+    .expect("valid refresh config");
+    let now = chrono::Utc::now().timestamp();
+    let cookie = oidc_sealed_refresh_session_cookie_for_test(
+        &plugin,
+        json!({
+            "sub": "oidc-subject",
+            "email": "accepted@example.test",
+            "exp": now + 3600
+        }),
+        Some("original-refresh-token".to_string()),
+        true,
+        false,
+    )
+    .expect("session seals");
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut first = session_ctx(&cookie);
+    let mut second = session_ctx(&cookie);
+
+    // Both requests decrypt the same pre-rotation cookie and are polled in one
+    // task: the first inserts its flight before its token POST suspends, so the
+    // second is deterministically a follower of that flight.
+    let (first_result, second_result) = tokio::join!(
+        plugin.authenticate(&mut first, &consumer_index),
+        plugin.authenticate(&mut second, &consumer_index),
+    );
+    assert_continue(first_result);
+    assert_continue(second_result);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "one token generation must reach the token endpoint exactly once"
+    );
+    for ctx in [&mut first, &mut second] {
+        let rolled = rolling_cookie(&plugin, ctx)
+            .await
+            .expect("every coalesced request emits the rotated session");
+        let payload =
+            oidc_open_session_cookie_for_test(&plugin, &rolled).expect("rolling cookie opens");
+        assert_eq!(payload["refresh_token_b64"], json!("rotated-refresh-token"));
+        assert_eq!(payload["access_token_b64"], json!("new-access-token"));
+    }
+
+    // Completion racing admission: a request that decrypted the spent cookie
+    // after the winner published adopts the rotation instead of re-submitting.
+    let mut late = session_ctx(&cookie);
+    assert_continue(plugin.authenticate(&mut late, &consumer_index).await);
+    let late_cookie = rolling_cookie(&plugin, &mut late)
+        .await
+        .expect("a late request with the spent cookie re-issues the rotated session");
+    let payload =
+        oidc_open_session_cookie_for_test(&plugin, &late_cookie).expect("late cookie opens");
+    assert_eq!(payload["refresh_token_b64"], json!("rotated-refresh-token"));
+    assert_eq!(payload["access_token_b64"], json!("new-access-token"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(server.received_requests().await.expect("requests").len(), 1);
+
+    // The rotated cookie is not due, so it does not join the retained flight.
+    let mut rotated = session_ctx(&late_cookie);
+    assert_continue(plugin.authenticate(&mut rotated, &consumer_index).await);
+    assert!(rolling_cookie(&plugin, &mut rotated).await.is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn spent_refresh_token_rejection_emits_no_cookie_and_is_not_resubmitted() {
+    // Cross-replica shape: another replica already rotated this generation, so
+    // the provider answers `invalid_grant`. The browser holds the winner's
+    // cookie; this instance must not overwrite it with the spent credential.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": "invalid_grant"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let plugin = OidcRelyingParty::new(
+        &refresh_config(&format!("{}/token", server.uri())),
+        PluginHttpClient::default(),
+    )
+    .expect("valid refresh config");
+    let now = chrono::Utc::now().timestamp();
+    let cookie = oidc_sealed_refresh_session_cookie_for_test(
+        &plugin,
+        json!({
+            "sub": "oidc-subject",
+            "email": "accepted@example.test",
+            "exp": now + 3600
+        }),
+        Some("spent-refresh-token".to_string()),
+        true,
+        false,
+    )
+    .expect("session seals");
+    let consumer_index = ConsumerIndex::new(&[]);
+
+    let mut first = session_ctx(&cookie);
+    assert_continue(plugin.authenticate(&mut first, &consumer_index).await);
+    assert!(
+        rolling_cookie(&plugin, &mut first).await.is_none(),
+        "a spent refresh token must never be re-sealed into a Set-Cookie"
+    );
+
+    // The same stale cookie again: the spent-credential record suppresses a
+    // second submission for the backoff window without any cookie update.
+    let mut repeated = session_ctx(&cookie);
+    assert_continue(plugin.authenticate(&mut repeated, &consumer_index).await);
+    assert!(rolling_cookie(&plugin, &mut repeated).await.is_none());
+    assert_eq!(server.received_requests().await.expect("requests").len(), 1);
+}
+
+#[tokio::test]
+async fn concurrent_requests_share_one_transient_refresh_failure_and_backoff() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_delay(Duration::from_millis(150))
+                .set_body_json(json!({"error": "temporarily_unavailable"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let plugin = OidcRelyingParty::new(
+        &refresh_config(&format!("{}/token", server.uri())),
+        PluginHttpClient::default(),
+    )
+    .expect("valid refresh config");
+    let now = chrono::Utc::now().timestamp();
+    let cookie = oidc_sealed_refresh_session_cookie_for_test(
+        &plugin,
+        json!({
+            "sub": "oidc-subject",
+            "email": "accepted@example.test",
+            "exp": now + 3600
+        }),
+        Some("live-refresh-token".to_string()),
+        true,
+        false,
+    )
+    .expect("session seals");
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut first = session_ctx(&cookie);
+    let mut second = session_ctx(&cookie);
+
+    let (first_result, second_result) = tokio::join!(
+        plugin.authenticate(&mut first, &consumer_index),
+        plugin.authenticate(&mut second, &consumer_index),
+    );
+    assert_continue(first_result);
+    assert_continue(second_result);
+    // The token is not known to be spent, so both carry the unchanged
+    // credential forward with a persisted backoff instead of retrying.
+    for ctx in [&mut first, &mut second] {
+        let backed_off = rolling_cookie(&plugin, ctx)
+            .await
+            .expect("a shared transient failure still persists its backoff");
+        let payload =
+            oidc_open_session_cookie_for_test(&plugin, &backed_off).expect("backoff cookie opens");
+        assert_eq!(payload["refresh_token_b64"], json!("live-refresh-token"));
+        assert!(
+            payload["refresh_after_unix"]
+                .as_i64()
+                .is_some_and(|next| next > now)
+        );
+    }
+    assert_eq!(server.received_requests().await.expect("requests").len(), 1);
+}
+
+#[tokio::test]
 async fn oidc_success_commits_claim_headers_and_rolling_cookie_together() {
     let mut config = base_config();
     config["providers"][0]["consumer_identity_claim"] = json!("email");
@@ -585,7 +788,9 @@ async fn oidc_scope_rejection_persists_refresh_failure_backoff() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/token"))
-        .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": "invalid_grant"})))
+        .respond_with(
+            ResponseTemplate::new(503).set_body_json(json!({"error": "temporarily_unavailable"})),
+        )
         .expect(1)
         .mount(&server)
         .await;
@@ -1164,7 +1369,9 @@ async fn oidc_multi_auth_preserves_refresh_backoff_when_later_credential_rejects
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/token"))
-        .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": "invalid_grant"})))
+        .respond_with(
+            ResponseTemplate::new(503).set_body_json(json!({"error": "temporarily_unavailable"})),
+        )
         .expect(1)
         .mount(&server)
         .await;
