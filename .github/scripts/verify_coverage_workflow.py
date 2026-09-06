@@ -493,6 +493,9 @@ def self_test_artifact_transport(failures: list[str]) -> None:
         require(bool(rejected), f"transport mutation not caught: {old}", failures)
 
     script = artifact_transport_script(workflow)
+    fixture_path = Path(".github/scripts/fixtures/coverage_transport.sh")
+    require(fixture_path.read_text() == script,
+            "coverage transport fixture must exactly match the hosted shell", failures)
     cases = (
         "valid", "zip64", "retry", "download-failure", "missing", "expired", "duplicate", "wrong-member",
         "extra-member", "corrupt-zip", "invalid-tar", "no-profiles",
@@ -503,6 +506,8 @@ def self_test_artifact_transport(failures: list[str]) -> None:
             scripts = root / ".github/scripts"
             scripts.mkdir(parents=True)
             shutil.copy2(PLANNER_PATH, scripts / PLANNER_PATH.name)
+            (scripts / "fixtures").mkdir()
+            shutil.copy2(fixture_path, scripts / "fixtures/coverage_transport.sh")
             artifacts = []
             for artifact_id, shard in ((11, LIB_UNIT_SHARD), (12, ADMIN_API_SHARD)):
                 artifact = {"id": artifact_id, "name": f"coverage-data-{shard}", "expired": False}
@@ -566,9 +571,13 @@ case "$*" in
 esac
 """, encoding="utf-8")
             fake_gh.chmod(0o755)
+            # Avoid a real retry delay while keeping the executed script and
+            # argv literal and inspectable by the trusted automation scanner.
+            fake_sleep = root / "sleep"
+            fake_sleep.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> retry-delays\n')
+            fake_sleep.chmod(0o755)
             result = subprocess.run(
-                # Record the retry delay without spending wall time asleep.
-                ["bash", "-c", "sleep() { echo \"$*\" >> retry-delays; }\n" + script], cwd=root,
+                ["bash", ".github/scripts/fixtures/coverage_transport.sh"], cwd=root,
                 env={**os.environ, "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
                      "TRANSPORT_TEST_CASE": case,
                      "GITHUB_REPOSITORY": "example/coverage", "GITHUB_RUN_ID": "42",
