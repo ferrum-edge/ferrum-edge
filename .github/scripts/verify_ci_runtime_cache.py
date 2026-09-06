@@ -177,8 +177,8 @@ NODE_WAYPOINT_PLANNER_OUTPUT = (
     "needs.production-dockerfile-plan.outputs.node_waypoint_relevant"
 )
 NODE_WAYPOINT_LIVE_IF = (
-    "always() && "
-    "needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false'"
+    "${{ !cancelled() && "
+    "needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false' }}"
 )
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 USES = re.compile(
@@ -633,12 +633,12 @@ def check_node_waypoint_live_job(
     require(
         live_condition == NODE_WAYPOINT_LIVE_IF,
         f"{source} live job must skip only on exact {NODE_WAYPOINT_PLANNER_OUTPUT} "
-        f"!= 'false' under always(); found: {live_condition}",
+        f"!= 'false' under !cancelled(); found: {live_condition}",
         failures,
     )
     require(
-        "always()" in live_condition,
-        f"{source} live job must use always() so a planner failure cannot skip",
+        "!cancelled()" in live_condition and "always()" not in live_condition,
+        f"{source} live job must use !cancelled() to stop superseded runs and fail closed on planner failure",
         failures,
     )
     require(
@@ -4914,8 +4914,8 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         failures,
     )
     require(
-        "node_waypoint_relevant" in ci_cd and "always()" in ci_cd,
-        "docs/ci_cd.md must document the NodeWaypoint job-level always() exact-false skip",
+        "node_waypoint_relevant" in ci_cd and "!cancelled()" in ci_cd,
+        "docs/ci_cd.md must document the NodeWaypoint cancellable job-level exact-false skip",
         failures,
     )
     require(
@@ -8231,17 +8231,31 @@ def self_test() -> int:
         failures,
     )
 
-    no_always_failures: list[str] = []
+    no_cancelled_failures: list[str] = []
     check_node_waypoint_live_job(
         _live_workflow(
             "needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false'"
         ),
-        "self-test-live-no-always",
-        no_always_failures,
+        "self-test-live-no-cancelled",
+        no_cancelled_failures,
     )
     require(
-        any("always()" in item for item in no_always_failures),
-        "self-test: NodeWaypoint live job without always() must fail",
+        any("!cancelled()" in item for item in no_cancelled_failures),
+        "self-test: NodeWaypoint live job without !cancelled() must fail",
+        failures,
+    )
+
+    uncancellable_failures: list[str] = []
+    check_node_waypoint_live_job(
+        _live_workflow(
+            "always() && needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false'"
+        ),
+        "self-test-live-uncancellable",
+        uncancellable_failures,
+    )
+    require(
+        any("!cancelled()" in item for item in uncancellable_failures),
+        "self-test: NodeWaypoint live job with always() must fail cancellation policy",
         failures,
     )
 

@@ -672,7 +672,7 @@ jobs:
   node-waypoint-ebpf-live:
     name: NodeWaypoint eBPF live datapath
     needs: production-dockerfile-plan
-    if: always() && needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false'
+    if: ${{ !cancelled() && needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
 

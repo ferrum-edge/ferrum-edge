@@ -543,10 +543,11 @@ skipping it. A new NodeWaypoint proxy module is now sensitive by
 construction. Ordinary `src/**`, `vendor/**`, `.cargo/**`,
 `rust-toolchain.toml`, and `custom_plugins/**` changes still start the
 workflow for production-image smoke, but skip the 120-minute Kind/eBPF live
-job unless they also match that scope. The live job uses `if: always() &&
-needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false'`:
-GitHub skip-propagation is defeated with `always()`, and a trustworthy exact
-`false` is the only skip. A missing trusted planner (adoption PR), planner
+job unless they also match that scope. The live job uses `if: ${{ !cancelled() &&
+needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false' }}`:
+`!cancelled()` defeats implicit success-based skip propagation while allowing
+superseded runs to stop. On an active run, a trustworthy exact `false` is the
+only planner verdict that skips the live job. A missing trusted planner (adoption PR), planner
 failure, unknown path, or blank/malformed NodeWaypoint verdict fails closed
 toward running.
 
@@ -1101,11 +1102,12 @@ NodeWaypoint datapath modules added since (the `src/proxy/node_waypoint_`
 prefix, `src/proxy/stream_listener.rs`, `src/proxy/udp_proxy.rs`,
 `src/proxy/mesh_tcp_inbound.rs`, PR #3953). The expensive Kind/eBPF job is
 gated by `node_waypoint_relevant` from that planner:
-`if: always() &&
-needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false'`.
+`if: ${{ !cancelled() &&
+needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false' }}`.
 Unrelated production-image-only paths skip the live cluster; planner failure,
 a missing trusted copy, an unknown path, or a blank/malformed verdict cannot
-skip it. The `NodeWaypoint eBPF Live` aggregate (`if: always()`) reports green
+skip it. Cancellation stops the expensive job so the latest PR run can start.
+The `NodeWaypoint eBPF Live` aggregate (`if: always()`) reports green
 for proven irrelevance and fails closed otherwise, and is **not**
 branch-protection-required.
 It builds the normal runtime Docker image from the host-built binary, builds the

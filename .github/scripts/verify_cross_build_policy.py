@@ -3204,13 +3204,13 @@ NODE_WAYPOINT_RELEVANCE_CONTRACT = {
     "node-waypoint-ebpf-live": {
         "needs": "    needs: production-dockerfile-plan\n",
         # Fail-closed on purpose: only an exact `false` from the trusted-base
-        # planner skips the live datapath. `always() &&` keeps the live job
+        # planner skips the live datapath. `!cancelled() &&` keeps the live job
         # reachable when the planner itself failed, so the aggregate reports a
-        # failure rather than an absence.
+        # failure rather than an absence, while superseded runs can stop.
         "if": (
-            "    if: always() && "
+            "    if: ${{ !cancelled() && "
             "needs.production-dockerfile-plan.outputs.node_waypoint_relevant"
-            " != 'false'\n"
+            " != 'false' }}\n"
         ),
     },
     "production-dockerfile-smoke-default": {
@@ -28270,13 +28270,11 @@ pre_build = []
         # Item A of issue #3908: the binding a pull request could previously
         # rewrite at will, because nothing in trusted policy pinned it.
         "severed live binding": (
-            "    if: always() && needs.production-dockerfile-plan.outputs."
-            "node_waypoint_relevant != 'false'\n",
+            NODE_WAYPOINT_RELEVANCE_CONTRACT["node-waypoint-ebpf-live"]["if"],
             "    if: false\n",
         ),
         "inverted live binding": (
-            "    if: always() && needs.production-dockerfile-plan.outputs."
-            "node_waypoint_relevant != 'false'\n",
+            NODE_WAYPOINT_RELEVANCE_CONTRACT["node-waypoint-ebpf-live"]["if"],
             "    if: needs.production-dockerfile-plan.outputs."
             "node_waypoint_relevant == 'true'\n",
         ),
