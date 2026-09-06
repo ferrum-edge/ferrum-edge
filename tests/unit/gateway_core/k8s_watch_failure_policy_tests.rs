@@ -1,9 +1,10 @@
 //! Kubernetes watch failure policy and relist divergence (issue #4491).
 //!
-//! A kube-rs `watcher` yields its errors without pausing, so the controller
-//! wraps every scope in kube-rs's own backoff and, on top of that, holds a
-//! scope the API server refused with HTTP 403 for a longer fixed interval and
-//! logs the fault once per state change rather than once per attempt. An idle
+//! kube-rs's own backoff cannot space a failed initial list (every attempt
+//! yields an `Init` first, which resets it), so the controller holds a scope
+//! the API server refused with HTTP 403 for a long fixed interval, holds any
+//! other failed list for a doubling interval, and logs the fault once per
+//! state change rather than once per attempt. An idle
 //! relist compares the retiring store with the authoritative list so a missed
 //! `Delete`/`Apply` becomes visible instead of being silently repaired. These
 //! tests pin the pure decisions; the watcher task itself is driven over
@@ -17,9 +18,10 @@ use ferrum_edge::k8s_controller::metrics::{
     IDLE_RECONCILE_LOG_INTERVAL, should_log_idle_reconcile,
 };
 use ferrum_edge::k8s_controller::watcher::{
-    FORBIDDEN_WATCH_HOLD, K8S_WATCH_IDLE_RELIST_SECS_DEFAULT, RELIST_DIVERGENCE_LOG_LIMIT,
-    RelistDivergence, WatchErrorClass, WatchFailureStreak, WatchFailureTransition,
-    classify_watch_error, relist_divergence, render_object_list,
+    FORBIDDEN_WATCH_HOLD, K8S_WATCH_IDLE_RELIST_SECS_DEFAULT, LIST_FAILURE_HOLD_CAP,
+    LIST_FAILURE_HOLD_FLOOR, RELIST_DIVERGENCE_LOG_LIMIT, RelistDivergence, WatchErrorClass,
+    WatchFailureStreak, WatchFailureTransition, classify_watch_error, list_failure_hold,
+    relist_divergence, render_object_list,
 };
 use kube::core::Status;
 use kube::runtime::watcher;
@@ -60,27 +62,74 @@ fn forbidden_status_is_classified_on_every_watch_error_shape() {
     );
 }
 
+/// kube-rs stays in its listed or watching state after these, so its own
+/// backoff grows between attempts and the watcher adds nothing.
 #[test]
 fn other_failures_are_left_to_the_stream_backoff() {
     for error in [
-        watcher::Error::InitialListFailed(api_error(404, "NotFound")),
         watcher::Error::WatchFailed(api_error(410, "Expired")),
         watcher::Error::WatchStartFailed(api_error(500, "InternalError")),
         watcher::Error::WatchFailed(kube::Error::LinesCodecMaxLineLengthExceeded),
-        watcher::Error::NoResourceVersion,
+        watcher::Error::WatchError(Box::new(Status::failure("expired", "Expired"))),
     ] {
         let class = classify_watch_error(&error);
         assert_eq!(class, WatchErrorClass::Other, "{error}");
-        assert_eq!(class.hold(), None, "{error}");
+        for attempts in [1, 2, 50] {
+            assert_eq!(class.hold(attempts), None, "{error}");
+        }
     }
+    assert_eq!(WatchErrorClass::Other.as_str(), "other");
+}
+
+/// kube-rs returns to its empty state after a failed initial list (and after a
+/// list carrying no `resourceVersion`) and yields `Init` before the next
+/// attempt, which resets `StreamBackoff`; these are the failures it cannot
+/// space on its own, so the watcher restores the intended doubling itself.
+#[test]
+fn failed_initial_lists_are_held_with_a_doubling_interval() {
+    for error in [
+        watcher::Error::InitialListFailed(api_error(404, "NotFound")),
+        watcher::Error::InitialListFailed(api_error(500, "InternalError")),
+        watcher::Error::InitialListFailed(kube::Error::LinesCodecMaxLineLengthExceeded),
+        watcher::Error::NoResourceVersion,
+    ] {
+        let class = classify_watch_error(&error);
+        assert_eq!(class, WatchErrorClass::ListFailed, "{error}");
+        assert_eq!(class.hold(1), Some(LIST_FAILURE_HOLD_FLOOR), "{error}");
+    }
+    assert_eq!(WatchErrorClass::ListFailed.as_str(), "list_failed");
+
+    assert_eq!(list_failure_hold(0), LIST_FAILURE_HOLD_FLOOR);
+    assert_eq!(list_failure_hold(1), LIST_FAILURE_HOLD_FLOOR);
+    assert_eq!(list_failure_hold(2), LIST_FAILURE_HOLD_FLOOR * 2);
+    assert_eq!(list_failure_hold(3), LIST_FAILURE_HOLD_FLOOR * 4);
+    assert_eq!(list_failure_hold(6), LIST_FAILURE_HOLD_FLOOR * 32);
+    assert_eq!(list_failure_hold(7), LIST_FAILURE_HOLD_CAP);
+    assert_eq!(list_failure_hold(u64::MAX), LIST_FAILURE_HOLD_CAP);
+    assert_eq!(
+        WatchErrorClass::ListFailed.hold(u64::MAX),
+        Some(LIST_FAILURE_HOLD_CAP)
+    );
+    assert_eq!(
+        LIST_FAILURE_HOLD_FLOOR,
+        Duration::from_millis(800),
+        "the floor is kube-rs's own, so a single blip recovers as fast as before"
+    );
+    assert!(
+        LIST_FAILURE_HOLD_CAP < FORBIDDEN_WATCH_HOLD,
+        "an RBAC gap is held longer than any transient list failure"
+    );
 }
 
 #[test]
 fn forbidden_hold_is_long_but_inside_the_default_relist_window() {
-    assert_eq!(
-        WatchErrorClass::Forbidden.hold(),
-        Some(FORBIDDEN_WATCH_HOLD)
-    );
+    for attempts in [1, 2, 50] {
+        assert_eq!(
+            WatchErrorClass::Forbidden.hold(attempts),
+            Some(FORBIDDEN_WATCH_HOLD),
+            "the refusal hold does not grow: it is already the long one"
+        );
+    }
     assert!(
         FORBIDDEN_WATCH_HOLD >= Duration::from_secs(60),
         "an RBAC gap must not be retried at kube-rs's 30s ceiling"
@@ -90,7 +139,6 @@ fn forbidden_hold_is_long_but_inside_the_default_relist_window() {
         "the hold must not outlive the idle relist that would restart the scope anyway"
     );
     assert_eq!(WatchErrorClass::Forbidden.as_str(), "forbidden");
-    assert_eq!(WatchErrorClass::Other.as_str(), "other");
 }
 
 #[test]

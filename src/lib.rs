@@ -13048,6 +13048,13 @@ pub mod _test_support {
             self.metrics.snapshot().watch_relist_missed_adds
         }
 
+        /// Reconciler wake-ups the scope set has issued so far: the change
+        /// notifier's monotonic revision. A watch item that changes nothing
+        /// (kube-rs's `Init`) must not advance it (issue #4491).
+        pub async fn change_notifications(&self) -> u64 {
+            *self.store_set.lock().await.subscribe().borrow()
+        }
+
         /// Raise the demand-driven evidence refresh the reconciler publication
         /// boundary raises when it has to withhold mesh content under a
         /// sequence it cannot advance (issue #3611). Every subscribed watch

@@ -616,35 +616,61 @@ const MIN_RELIST_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a watch scope the API server refused with HTTP 403 is held before
 /// its stream is polled again (issue #4491).
 ///
-/// kube-rs's `DefaultBackoff` already spaces retries of *any* failure
-/// exponentially (0.8 s doubling to a 30 s cap, jittered, reset after two
-/// quiet minutes), so a scope that can never succeed is not a hot loop. An
-/// authorization refusal is different in kind, though: it is an operator's
-/// RBAC gap on a served kind, it does not heal on its own, and every retry is
-/// a full list attempt the API server audits and refuses. Two minutes keeps
-/// that at one attempt per hold — a RoleBinding fix is picked up within the
-/// window — while the idle relist (`FERRUM_K8S_WATCH_IDLE_RELIST_SECS`) stays
-/// the only other thing that touches the scope.
+/// kube-rs's `DefaultBackoff` (0.8 s doubling to a 30 s cap, jittered) cannot
+/// space a refused list: `StreamBackoff` resets on every `Ok` item, and each
+/// list attempt yields `Ok(Init)` *before* the list request is issued
+/// (kube-runtime 3.1.0 `step_trampolined`, `State::Empty`), so a list that
+/// keeps failing is retried at the 0.8 s floor forever. An authorization
+/// refusal is also different in kind: it is an operator's RBAC gap on a served
+/// kind, it does not heal on its own, and every retry is a full list attempt
+/// the API server audits and refuses. Two minutes keeps that at one attempt
+/// per hold — a RoleBinding fix is picked up within the window. While a hold
+/// is active the scope's idle-relist and replacement-readiness clocks are
+/// paused: the hold *is* the retry, and the failure that armed it has already
+/// been logged, so neither a relist nor a "did not finish its initial list"
+/// warning is started against it.
 pub const FORBIDDEN_WATCH_HOLD: Duration = Duration::from_secs(120);
+
+/// First hold after an initial list fails for any reason other than an
+/// authorization refusal (issue #4491): kube-rs's own floor.
+pub const LIST_FAILURE_HOLD_FLOOR: Duration = Duration::from_millis(800);
+
+/// Longest hold a failing initial list is retried under: kube-rs's own cap.
+///
+/// Together with [`LIST_FAILURE_HOLD_FLOOR`] this restores the exponential
+/// spacing `DefaultBackoff` intends but cannot deliver for list-phase failures
+/// (see [`FORBIDDEN_WATCH_HOLD`]): the hold doubles from the floor on every
+/// consecutive failure and stops here, so an API server that is refusing or
+/// timing out lists is asked again at most every 30 s per scope instead of
+/// every 0.8 s, while a single blip still recovers on the very next attempt.
+pub const LIST_FAILURE_HOLD_CAP: Duration = Duration::from_secs(30);
 
 /// Coarse class of one watch stream error, chosen for retry and logging policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatchErrorClass {
     /// The API server refused the list or watch with HTTP 403 (`Forbidden`):
-    /// an RBAC gap on a served kind. Held for [`FORBIDDEN_WATCH_HOLD`] on top
-    /// of kube-rs's backoff between attempts.
+    /// an RBAC gap on a served kind. Held for [`FORBIDDEN_WATCH_HOLD`].
     Forbidden,
-    /// Every other failure — transport, timeout, `410 Gone`, malformed event.
-    /// kube-rs's own backoff paces these.
+    /// The initial list failed for any other reason (a 5xx, a timeout, a
+    /// malformed list carrying no `resourceVersion`). kube-rs restarts these
+    /// from its empty state, and the `Init` each fresh attempt yields resets
+    /// its backoff, so the watcher holds them itself: doubling from
+    /// [`LIST_FAILURE_HOLD_FLOOR`] to [`LIST_FAILURE_HOLD_CAP`].
+    ListFailed,
+    /// Every other failure — a failed watch start after a successful list, a
+    /// transport error mid-stream, a `410 Gone` or other `Status` event. The
+    /// stream stays in a listed or watching state for these, so kube-rs's own
+    /// backoff grows between attempts and no hold is added.
     Other,
 }
 
 impl WatchErrorClass {
-    /// Extra hold this watcher imposes before the stream is polled again, on
-    /// top of the backoff kube-rs applies inside the stream.
-    pub fn hold(self) -> Option<Duration> {
+    /// Hold this watcher imposes before the stream is polled again, given how
+    /// many consecutive failures (this one included) the scope has recorded.
+    pub fn hold(self, attempts: u64) -> Option<Duration> {
         match self {
             Self::Forbidden => Some(FORBIDDEN_WATCH_HOLD),
+            Self::ListFailed => Some(list_failure_hold(attempts)),
             Self::Other => None,
         }
     }
@@ -653,17 +679,43 @@ impl WatchErrorClass {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Forbidden => "forbidden",
+            Self::ListFailed => "list_failed",
             Self::Other => "other",
         }
     }
+
+    /// What the watcher does about this class, for the once-per-transition
+    /// error line.
+    pub fn retry_policy(self) -> &'static str {
+        match self {
+            Self::Forbidden => "refused by the API server with HTTP 403 (RBAC gap on a served \
+                 kind); holding this scope between attempts",
+            Self::ListFailed => "the initial list failed; holding this scope for a doubling \
+                 interval between attempts",
+            Self::Other => "the stream backs off before retrying",
+        }
+    }
+}
+
+/// Hold before the `attempts`-th consecutive failed initial list is retried:
+/// [`LIST_FAILURE_HOLD_FLOOR`] doubled per prior failure, capped at
+/// [`LIST_FAILURE_HOLD_CAP`].
+pub fn list_failure_hold(attempts: u64) -> Duration {
+    // 0.8 s << 6 already exceeds the cap, so the shift is bounded before the
+    // multiplication can overflow.
+    let doublings = attempts.saturating_sub(1).min(6) as u32;
+    (LIST_FAILURE_HOLD_FLOOR * (1u32 << doublings)).min(LIST_FAILURE_HOLD_CAP)
 }
 
 /// Classify one `watcher` stream error.
 ///
 /// Only the API server's own `Status` can say `Forbidden`; it arrives either
 /// wrapped in a `kube::Error::Api` from the list/watch request or as an inline
-/// watch `Status` event. Everything else — including errors whose source is
-/// not a `Status` at all — is [`WatchErrorClass::Other`].
+/// watch `Status` event. A failed initial list that is not a refusal, and a
+/// list answered without any `resourceVersion`, are [`WatchErrorClass::ListFailed`]:
+/// kube-rs returns to its empty state after both, so the next attempt starts
+/// over with an `Init` that resets its backoff. Everything else — including
+/// errors whose source is not a `Status` at all — is [`WatchErrorClass::Other`].
 pub fn classify_watch_error(error: &watcher::Error) -> WatchErrorClass {
     let forbidden = match error {
         watcher::Error::InitialListFailed(source)
@@ -676,6 +728,11 @@ pub fn classify_watch_error(error: &watcher::Error) -> WatchErrorClass {
     };
     if forbidden {
         WatchErrorClass::Forbidden
+    } else if matches!(
+        error,
+        watcher::Error::InitialListFailed(_) | watcher::Error::NoResourceVersion
+    ) {
+        WatchErrorClass::ListFailed
     } else {
         WatchErrorClass::Other
     }
@@ -714,6 +771,12 @@ pub enum WatchFailureTransition {
 /// its fault once, at error level, and then only when the fault changes or
 /// the watch recovers — not once per backoff step and not again on every
 /// idle relist. Repeats stay visible at debug level with the attempt count.
+///
+/// Only a *delivered* item ends a streak: a listed or watched object, or the
+/// `InitDone` that completes a list. kube-rs's `Init` is excluded — it is
+/// yielded before the list request is issued and again after every failed
+/// one, so counting it would report a recovery on each attempt against a
+/// scope the API server keeps refusing.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct WatchFailureStreak {
     failures: u64,
@@ -739,9 +802,9 @@ impl WatchFailureStreak {
         transition
     }
 
-    /// A delivered event ends the streak. Returns how many attempts had
-    /// failed first, so recovery is logged exactly once, or `None` when the
-    /// scope was already healthy.
+    /// A delivered item (anything but `Init`) ends the streak. Returns how
+    /// many attempts had failed first, so recovery is logged exactly once, or
+    /// `None` when the scope was already healthy.
     pub fn record_success(&mut self) -> Option<u64> {
         if self.failures == 0 {
             return None;
@@ -1087,18 +1150,30 @@ pub(crate) async fn run_watcher_generations<S, F>(
         tokio::pin!(stream);
 
         let generation_start = tokio::time::Instant::now();
+        // When the current attempt began: the generation start, or the end of
+        // the most recent hold (issue #4491). The replacement-readiness clock
+        // runs from here, and the idle clock never reads earlier than it.
+        let mut attempt_start = generation_start;
         let mut last_event = generation_start;
         let mut refresh_requested = false;
-        // `Some` while an authorization refusal holds this stream unpolled
-        // (issue #4491). Per generation: a relist is a fresh attempt.
+        // `Some` while a failed list or an authorization refusal holds this
+        // stream unpolled (issue #4491). Per generation: a relist is a fresh
+        // attempt.
         let mut stream_hold: Option<tokio::time::Instant> = None;
 
         loop {
-            let idle_deadline = match pending.as_ref() {
-                Some(_) => Some(generation_start + policy.readiness_timeout),
-                None => policy
+            // A held stream is neither idle nor listing slowly: the hold IS
+            // its retry schedule, and the failure that armed it has already
+            // been logged. Neither clock runs until the hold clears, so a
+            // refused replacement does not warn and count a relist on every
+            // `readiness_timeout`, and a refused live scope does not relist
+            // into the same refusal.
+            let idle_deadline = match (pending.as_ref(), stream_hold) {
+                (_, Some(_)) => None,
+                (Some(_), None) => Some(attempt_start + policy.readiness_timeout),
+                (None, None) => policy
                     .idle_window
-                    .map(|window| last_event + window + jitter),
+                    .map(|window| last_event.max(attempt_start) + window + jitter),
             };
             // A refresh request is satisfied by any COMPLETED generation, so a
             // replacement already listing needs no second trigger — it will
@@ -1177,12 +1252,28 @@ pub(crate) async fn run_watcher_generations<S, F>(
                     refresh_requested = true;
                 }
                 // The hold expired; the next iteration polls the stream again
-                // (kube-rs's own backoff may still be running inside it).
+                // (kube-rs's own backoff may still be running inside it) and
+                // the clocks resume from now.
                 _ = sleep_until_or_pending(stream_hold), if stream_hold.is_some() => {
                     stream_hold = None;
+                    attempt_start = tokio::time::Instant::now();
                 }
                 item = stream.try_next(), if stream_hold.is_none() => {
                     match item {
+                        Ok(Some(watcher::Event::Init)) => {
+                            // kube-rs yields `Init` from its empty state BEFORE
+                            // it issues the list request, and returns to that
+                            // state after a failed list, a `410 Gone`, or a
+                            // list without a `resourceVersion` (kube-runtime
+                            // 3.1.0 `step_trampolined`). Every attempt against
+                            // a scope the API server keeps refusing therefore
+                            // begins with one, so it proves nothing: it is not
+                            // a delivered item for the failure streak, not
+                            // activity for the idle clock, and not a store
+                            // change worth waking the reconciler for. The
+                            // reflector has already reset its list buffer; a
+                            // pending replacement stays pending.
+                        }
                         Ok(Some(event)) => {
                             last_event = tokio::time::Instant::now();
                             if let Some(failed_attempts) = failure_streak.record_success() {
@@ -1347,49 +1438,40 @@ pub(crate) async fn run_watcher_generations<S, F>(
                             return;
                         }
                         Err(e) => {
-                            // The stream applies `DefaultBackoff` before it is
-                            // polled again, so a watch that can never succeed
-                            // retries at most once per backoff step rather than
-                            // as fast as this task is scheduled. Issue #4491
-                            // adds two things on top: an authorization refusal
-                            // holds the stream for `FORBIDDEN_WATCH_HOLD`, and
-                            // the fault is logged at error level once per state
+                            // Issue #4491. kube-rs's `DefaultBackoff` spaces a
+                            // failed watch start or a mid-stream failure, but
+                            // not a failed initial list: `StreamBackoff` resets
+                            // on every `Ok` item and each list attempt yields
+                            // `Ok(Init)` first, so those would retry at the
+                            // 0.8 s floor forever. The watcher therefore holds
+                            // a refused scope for `FORBIDDEN_WATCH_HOLD` and any
+                            // other failed list for a doubling interval, and
+                            // logs the fault at error level once per state
                             // change instead of once per attempt.
                             metrics
                                 .watch_errors
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let class = classify_watch_error(&e);
-                            if let Some(hold) = class.hold() {
+                            let transition = failure_streak.record_failure(class);
+                            let hold = class.hold(failure_streak.failures());
+                            if let Some(hold) = hold {
                                 stream_hold = Some(tokio::time::Instant::now() + hold);
                             }
-                            match failure_streak.record_failure(class) {
+                            let hold_secs = hold.map_or(0.0, |duration| duration.as_secs_f64());
+                            match transition {
                                 WatchFailureTransition::Entered(_)
-                                | WatchFailureTransition::Changed { .. } => match class {
-                                    WatchErrorClass::Forbidden => error!(
-                                        kind = %target.kind,
-                                        api_version = %target.api_version,
-                                        scope = %target.scope,
-                                        error = %e,
-                                        class = class.as_str(),
-                                        hold_secs = FORBIDDEN_WATCH_HOLD.as_secs(),
-                                        "{} refused by the API server with HTTP 403 (RBAC gap \
-                                         on a served kind); holding this scope between attempts \
-                                         and logging again only when the failure changes or the \
-                                         watch recovers",
-                                        target.watcher_label
-                                    ),
-                                    WatchErrorClass::Other => error!(
-                                        kind = %target.kind,
-                                        api_version = %target.api_version,
-                                        scope = %target.scope,
-                                        error = %e,
-                                        class = class.as_str(),
-                                        "{} watch error; the stream backs off before retrying, \
-                                         and this is logged again only when the failure changes \
-                                         or the watch recovers",
-                                        target.watcher_label
-                                    ),
-                                },
+                                | WatchFailureTransition::Changed { .. } => error!(
+                                    kind = %target.kind,
+                                    api_version = %target.api_version,
+                                    scope = %target.scope,
+                                    error = %e,
+                                    class = class.as_str(),
+                                    hold_secs,
+                                    "{} watch error: {}; logged again only when the failure \
+                                     changes or the watch recovers",
+                                    target.watcher_label,
+                                    class.retry_policy()
+                                ),
                                 WatchFailureTransition::Repeated { attempts, .. } => debug!(
                                     kind = %target.kind,
                                     api_version = %target.api_version,
