@@ -2,7 +2,8 @@
 
 Issue [#4668](https://github.com/ferrum-edge/ferrum-edge/issues/4668) tracks
 reducing CPU work in the trusted Cross verifier without changing its decisions.
-The CI Plan job runs before most CI jobs: its Cross validation step took 5m09s
+Before the parallel-policy split in #4680, CI Plan ran the Cross verifier
+before most CI jobs: its validation step took 5m09s
 in [PR run 34005446618](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34005446618)
 and 6m56s in [merge-group run 33973581181](https://github.com/ferrum-edge/ferrum-edge/actions/runs/33973581181).
 
@@ -39,12 +40,71 @@ git diff --check
 
 Record peak memory as well as elapsed time; on macOS `/usr/bin/time -l` supplies
 both. Compare the hosted **Candidate policy self-test** job against its baseline.
-The experiment PR's **CI Plan** and **Trusted Cross Build Policy** jobs still run
-the reviewed base verifier, so a passing candidate test does not yet demonstrate
-lower planning latency. That end-to-end measurement requires reviewed landing
+The lexical-reuse experiment's original **CI Plan** and **Trusted Cross Build
+Policy** jobs ran the reviewed base verifier, so its passing candidate test
+alone did not demonstrate lower planning latency. That end-to-end measurement requires reviewed landing
 and subsequent PR/merge-group runs. Keep their required checks intact.
 
 Local timing and hosted results are recorded on the experiment PR linked from
 [#4668](https://github.com/ferrum-edge/ferrum-edge/issues/4668). A faster parser
 alone does not establish a shorter whole-PR critical path; compare artifact
 compilation, Unit Tests, and other required workflows separately.
+
+
+## Parallel trusted validation (#4680)
+
+After lexical reuse landed, [main run 34016773796](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34016773796)
+still spent **6m21s** in CI Plan; its policy step consumed **316s**, from
+06:33:52 to 06:39:08 UTC. These are the issue's baseline measurements, not
+results from the parallel-policy implementation.
+
+`CI Policy` now performs the same complete trusted self-tests and workflow
+validation as an independent read-only job. CI Plan retains authenticated,
+immutable-base planning, diff hygiene, formatting, and shard coverage. Both
+jobs pin their own trust source without consuming candidate planner output.
+Every `Tests` aggregate, including light mode, requires successful policy and
+its post-validation completion output. Failure, cancellation, skipping, and
+missing/invalid output all reject the aggregate and block main image packaging.
+No policy decisions are cached, and the separate protected-policy workflow,
+required check inventory, default test coverage, thresholds, and exact-SHA
+production release proof remain unchanged.
+
+The cheap planner diff rejects modifications to the already-frozen verifier
+and its protected workflow. Other invalid changes may compile speculatively
+while policy runs. Expect roughly five minutes of overlap on a similarly
+provisioned full-mode run; this is a hypothesis, not measured improvement.
+A second checkout/fetch and runner allocation add overhead, and runner queueing
+can reduce overlap. Light-mode completion still waits for full verification.
+
+### Hosted comparison to collect
+
+Use matched source/toolchain, runner class, dependency cache state and event
+kind for base/candidate runs. Record the exact head SHA, run ID and attempt,
+cache-hit evidence, and GitHub step/job timestamps. Compare PR, merge-group,
+and post-adoption main separately; light-mode/fork smoke cases verify that
+trust and failure semantics survive the new scheduling.
+
+| Metric | Definition | Parallel result |
+| --- | --- | --- |
+| Plan completion | CI Plan `completed_at` minus workflow `run_started_at` | Pending |
+| First compiler | Earliest application compilation step start minus workflow start | Pending |
+| Policy overlap | Intersection of CI Policy runtime with application compilation | Pending |
+| Required Tests completion | Tests `completed_at` minus workflow start | Pending |
+| Runner-minutes | Sum of all job runtime seconds / 60, including failed/cancelled speculative work | Pending |
+
+Also compare an invalid frozen-policy edit (early rejection) and an invalid
+semantic-policy edit (speculative compilation) to quantify the added cost.
+Candidate regressions run remotely through `verify_required_ci.py`: actual
+aggregate-shell cases cover full/light success, failure, cancellation, skipped,
+missing result, and missing/invalid completion output; extraction cases cover
+PR live-base ancestry, merge-group identity, main/manual checkout identity,
+transport failure, and failed/interrupted verifier execution.
+
+No local builds, tests, or timing runs were performed for this implementation;
+exact pushed-head remote CI is the validation authority. The immutable-base
+policy may reject the workflow migration itself because it changes previously
+frozen CI executable surfaces. Keep that result visible and report it to the
+controller. Do not weaken the guard, change branch protection, or treat a
+policy bypass as successful exact-SHA release evidence. End-to-end timing
+requires a reviewed adoption and subsequent runs; until then all candidate
+performance and CI results above remain pending.

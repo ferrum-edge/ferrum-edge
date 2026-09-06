@@ -52,64 +52,80 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Validate ARM64 Cross policy without executing a PR verifier
-        run: |
-          set -euo pipefail
-          policy=.github/scripts/verify_cross_build_policy.py
-
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            base_ref="origin/${BASE_REF}"
-            git fetch --no-tags origin \
-              "refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
-            # Never execute the pull request's verifier in this security-
-            # sensitive planning job. The separate read-only candidate-policy
-            # workflow parses and exercises the proposed source without
-            # producing any output consumed by CI planning.
-            if git cat-file -e "${base_ref}:${policy}" 2>/dev/null; then
-              trusted_policy="$RUNNER_TEMP/verify-cross-build-policy.py"
-              git show "${base_ref}:${policy}" > "$trusted_policy"
-              policy="$trusted_policy"
-            fi
-            # Otherwise this is the one-time bootstrap where the base has no
-            # verifier to execute yet: `policy` stays the reviewed proposal and
-            # runs in isolated mode. All later PRs take the trusted-base branch.
-          elif [ "$EVENT_NAME" = "merge_group" ]; then
-            if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
-              echo "::error::merge_group base_sha missing or malformed" >&2
-              exit 1
-            fi
-            if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
-              git fetch --no-tags origin "${MERGE_BASE_SHA}"
-            fi
-            if git cat-file -e "${MERGE_BASE_SHA}:${policy}" 2>/dev/null; then
-              trusted_policy="$RUNNER_TEMP/verify-cross-build-policy.py"
-              git show "${MERGE_BASE_SHA}:${policy}" > "$trusted_policy"
-              policy="$trusted_policy"
-            fi
-          fi
-
-          python3 -I "$policy" \
-            --self-test \
-            --config Cross.toml \
-            --cargo-config Cargo.toml \
-            --ci-workflow .github/workflows/ci.yml \
-            --release-workflow .github/workflows/release.yml \
-            --workflows-dir .github/workflows
+      - id: trusted-base
+        name: Pin trusted CI base
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
-          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          MERGE_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          checked_out="$(git rev-parse HEAD)"
+          if [ "$checked_out" != "$GITHUB_SHA" ]; then
+            echo "::error::checkout does not match the triggering SHA" >&2
+            exit 1
+          fi
+          trusted_base="$checked_out"
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
+            if [[ ! "$EVENT_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::event base SHA missing or malformed" >&2
+              exit 1
+            fi
+            if ! git cat-file -e "${EVENT_BASE_SHA}^{commit}" 2>/dev/null; then
+              git fetch --no-tags origin "$EVENT_BASE_SHA"
+            fi
+            if [ "$EVENT_NAME" = "pull_request" ]; then
+              if [[ ! "$BASE_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$BASE_REF" == *".."* ]] \
+                || [[ "$BASE_REF" == -* ]] || [[ "$BASE_REF" == */ ]]; then
+                echo "::error::invalid triggering base ref" >&2
+                exit 1
+              fi
+              git fetch --no-tags origin \
+                "+refs/heads/${BASE_REF}:refs/remotes/trusted-ci-base"
+              trusted_base="$(git rev-parse "refs/remotes/trusted-ci-base^{commit}")"
+              if ! git merge-base --is-ancestor "$EVENT_BASE_SHA" "$trusted_base"; then
+                echo "::error::live base does not descend from the event base" >&2
+                exit 1
+              fi
+            else
+              if [ "$checked_out" != "$MERGE_HEAD_SHA" ]; then
+                echo "::error::checkout is not the merge-group head" >&2
+                exit 1
+              fi
+              trusted_base="$EVENT_BASE_SHA"
+            fi
+          fi
+          if [[ ! "$trusted_base" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::trusted base did not resolve to a commit" >&2
+            exit 1
+          fi
+          echo "sha=$trusted_base" >> "$GITHUB_OUTPUT"
+
+      - name: Reject edits to frozen policy files early
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        env:
+          TRUSTED_BASE_SHA: ${{ steps.trusted-base.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # This cheap rejection mirrors the protected-policy workflow. The
+          # complete semantic scan runs independently in CI Policy.
+          if ! git diff --no-ext-diff --quiet "${TRUSTED_BASE_SHA}...HEAD" -- \
+            .github/scripts/verify_cross_build_policy.py \
+            .github/workflows/cross-build-policy.yml; then
+            echo "::error::frozen policy files changed; a reviewed policy migration is required" >&2
+            exit 1
+          fi
 
       - name: Validate trusted PR CI planner examples
         run: |
           set -euo pipefail
-          # The preceding Cross-policy step fetches the exact base ref into
-          # origin/${BASE_REF}; keep these adjacent because this consumer uses
-          # that immutable fetched ref rather than PR-controlled planner code.
+          # The dedicated pin step supplies an immutable authenticated base;
+          # planner code and output never select their own trust source.
           planner=.github/scripts/pr_ci_plan.py
           planner_dir=.github/scripts
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            base_ref="origin/${BASE_REF}"
+            base_ref="$TRUSTED_BASE_SHA"
             if ! git cat-file -e "${base_ref}:${planner}" 2>/dev/null; then
               echo "::error::trusted base branch has no PR CI planner" >&2
               exit 1
@@ -150,12 +166,14 @@ jobs:
           python3 -I -c 'import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); sys.argv[0] = sys.argv.pop(1); runpy.run_path(sys.argv[0], run_name="__main__")' "$planner_dir" "$planner" --self-test
         env:
           EVENT_NAME: ${{ github.event_name }}
-          BASE_REF: ${{ github.base_ref }}
+          TRUSTED_BASE_SHA: ${{ steps.trusted-base.outputs.sha }}
           MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
 
       - name: Check PR diff hygiene
         if: github.event_name == 'pull_request'
-        run: git diff --check "origin/${{ github.base_ref }}...HEAD"
+        env:
+          TRUSTED_BASE_SHA: ${{ steps.trusted-base.outputs.sha }}
+        run: git diff --check "${TRUSTED_BASE_SHA}...HEAD"
 
       - name: Check merge-group diff hygiene
         if: github.event_name == 'merge_group'
@@ -183,7 +201,7 @@ jobs:
           : > "$changed_files"
 
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            base_ref="origin/${BASE_REF}"
+            base_ref="$TRUSTED_BASE_SHA"
             # Disable rename detection so moving a full-CI input to an allowed
             # lightweight path reports both the deleted source and destination.
             # NUL-delimit the stream so a hostile filename cannot split or
@@ -191,21 +209,16 @@ jobs:
             git diff --name-only --no-renames -z "${base_ref}...HEAD" > "$changed_files"
 
             # A PR that edits only the planner must not be able to classify
-            # itself as light. Use the base branch's trusted planner when it
-            # exists; the current checkout is the bootstrap fallback for the
-            # PR that first introduces this file.
+            # itself as light. Missing trusted modules are fatal; never fall
+            # back to executing the proposal's planner.
             trusted_dir="$RUNNER_TEMP/pr-ci-plan"
             trusted_planner="$trusted_dir/pr_ci_plan.py"
             trusted_live_filter="$trusted_dir/live_suite_path_filter.py"
-            if git cat-file -e "${base_ref}:${planner}" 2>/dev/null; then
-              mkdir -p "$trusted_dir"
-              git show "${base_ref}:${planner}" > "$trusted_planner"
-              if git cat-file -e "${base_ref}:.github/scripts/live_suite_path_filter.py" 2>/dev/null; then
-                git show "${base_ref}:.github/scripts/live_suite_path_filter.py" > "$trusted_live_filter"
-              fi
-              planner="$trusted_planner"
-              planner_dir="$trusted_dir"
-            fi
+            mkdir -p "$trusted_dir"
+            git show "${base_ref}:${planner}" > "$trusted_planner"
+            git show "${base_ref}:.github/scripts/live_suite_path_filter.py" > "$trusted_live_filter"
+            planner="$trusted_planner"
+            planner_dir="$trusted_dir"
           elif [ "$EVENT_NAME" = "merge_group" ]; then
             if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
               echo "::error::merge_group base_sha missing or malformed" >&2
@@ -222,15 +235,11 @@ jobs:
             trusted_dir="$RUNNER_TEMP/pr-ci-plan"
             trusted_planner="$trusted_dir/pr_ci_plan.py"
             trusted_live_filter="$trusted_dir/live_suite_path_filter.py"
-            if git cat-file -e "${MERGE_BASE_SHA}:${planner}" 2>/dev/null; then
-              mkdir -p "$trusted_dir"
-              git show "${MERGE_BASE_SHA}:${planner}" > "$trusted_planner"
-              if git cat-file -e "${MERGE_BASE_SHA}:.github/scripts/live_suite_path_filter.py" 2>/dev/null; then
-                git show "${MERGE_BASE_SHA}:.github/scripts/live_suite_path_filter.py" > "$trusted_live_filter"
-              fi
-              planner="$trusted_planner"
-              planner_dir="$trusted_dir"
-            fi
+            mkdir -p "$trusted_dir"
+            git show "${MERGE_BASE_SHA}:${planner}" > "$trusted_planner"
+            git show "${MERGE_BASE_SHA}:.github/scripts/live_suite_path_filter.py" > "$trusted_live_filter"
+            planner="$trusted_planner"
+            planner_dir="$trusted_dir"
           fi
 
           plan="$(python3 -I -c 'import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); sys.argv[0] = sys.argv.pop(1); runpy.run_path(sys.argv[0], run_name="__main__")' "$planner_dir" "$planner" \
@@ -307,7 +316,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
         env:
           EVENT_NAME: ${{ github.event_name }}
-          BASE_REF: ${{ github.base_ref }}
+          TRUSTED_BASE_SHA: ${{ steps.trusted-base.outputs.sha }}
           MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
 
       - id: binary-matrix
@@ -385,6 +394,93 @@ jobs:
           echo "All $(echo "$actual" | wc -l | tr -d ' ') integration test files are sharded."
 
 
+  ci-policy:
+    name: CI Policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      verified: ${{ steps.verify.outputs.verified }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: trusted-base
+        name: Pin trusted CI base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          MERGE_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          checked_out="$(git rev-parse HEAD)"
+          if [ "$checked_out" != "$GITHUB_SHA" ]; then
+            echo "::error::checkout does not match the triggering SHA" >&2
+            exit 1
+          fi
+          trusted_base="$checked_out"
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
+            if [[ ! "$EVENT_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::event base SHA missing or malformed" >&2
+              exit 1
+            fi
+            if ! git cat-file -e "${EVENT_BASE_SHA}^{commit}" 2>/dev/null; then
+              git fetch --no-tags origin "$EVENT_BASE_SHA"
+            fi
+            if [ "$EVENT_NAME" = "pull_request" ]; then
+              if [[ ! "$BASE_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$BASE_REF" == *".."* ]] \
+                || [[ "$BASE_REF" == -* ]] || [[ "$BASE_REF" == */ ]]; then
+                echo "::error::invalid triggering base ref" >&2
+                exit 1
+              fi
+              git fetch --no-tags origin \
+                "+refs/heads/${BASE_REF}:refs/remotes/trusted-ci-base"
+              trusted_base="$(git rev-parse "refs/remotes/trusted-ci-base^{commit}")"
+              if ! git merge-base --is-ancestor "$EVENT_BASE_SHA" "$trusted_base"; then
+                echo "::error::live base does not descend from the event base" >&2
+                exit 1
+              fi
+            else
+              if [ "$checked_out" != "$MERGE_HEAD_SHA" ]; then
+                echo "::error::checkout is not the merge-group head" >&2
+                exit 1
+              fi
+              trusted_base="$EVENT_BASE_SHA"
+            fi
+          fi
+          if [[ ! "$trusted_base" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::trusted base did not resolve to a commit" >&2
+            exit 1
+          fi
+          echo "sha=$trusted_base" >> "$GITHUB_OUTPUT"
+
+      - id: verify
+        name: Validate trusted Cross policy
+        env:
+          TRUSTED_BASE_SHA: ${{ steps.trusted-base.outputs.sha }}
+        run: |
+          set -euo pipefail
+          policy=.github/scripts/verify_cross_build_policy.py
+          entry="$(git ls-tree "$TRUSTED_BASE_SHA" -- "$policy")"
+          if [[ "$entry" != "100644 blob "* && "$entry" != "100755 blob "* ]]; then
+            echo "::error::trusted policy must be a regular blob" >&2
+            exit 1
+          fi
+          trusted_policy="$RUNNER_TEMP/verify-cross-build-policy.py"
+          git show "${TRUSTED_BASE_SHA}:${policy}" > "$trusted_policy"
+          python3 -I "$trusted_policy" \
+            --self-test \
+            --config Cross.toml \
+            --cargo-config Cargo.toml \
+            --ci-workflow .github/workflows/ci.yml \
+            --release-workflow .github/workflows/release.yml \
+            --workflows-dir .github/workflows
+          echo "verified=true" >> "$GITHUB_OUTPUT"
+
   test-unit:
     name: Unit Tests
     needs: ci-plan
@@ -425,14 +521,22 @@ jobs:
         # Compile both targets in one Cargo invocation before running either.
         # Otherwise a hosted runner can pass all inline tests, then lose the
         # entire job while compiling the separate four-test hardening binary.
-        run: cargo test --lib --test unit_tests --no-run
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/unit-ci"
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M exit_status=%x' --output="$RUNNER_TEMP/unit-ci/default-build.time" cargo test --lib --test unit_tests --no-run 2>&1 | tee "$RUNNER_TEMP/unit-ci/default-build.log"
+          python3 .github/scripts/run_unit_ci.py default-build
         env:
           RUST_BACKTRACE: 1
 
       - name: Run inline lib tests
         # Covers `#[cfg(test)] mod tests` blocks inline in `src/` (used for
         # private fns/structs that the separate tests/ binaries can't see).
-        run: cargo test --lib
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/unit-ci"
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M exit_status=%x' --output="$RUNNER_TEMP/unit-ci/default-lib.time" cargo test --lib 2>&1 | tee "$RUNNER_TEMP/unit-ci/default-lib.log"
+          python3 .github/scripts/run_unit_ci.py default-lib
         env:
           RUST_BACKTRACE: 1
 
@@ -522,20 +626,32 @@ jobs:
           RUST_BACKTRACE: 1
 
       - name: Run unit tests
-        run: cargo test --test unit_tests
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/unit-ci"
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M exit_status=%x' --output="$RUNNER_TEMP/unit-ci/default-unit.time" cargo test --test unit_tests 2>&1 | tee "$RUNNER_TEMP/unit-ci/default-unit.log"
+          python3 .github/scripts/run_unit_ci.py default-unit
         env:
           RUST_BACKTRACE: 1
 
       - name: Precompile ACME library and DNS hook test binaries
-        # All three ACME filters below run in one of these two libtest binaries.
-        # Compile the pair together so a hosted runner cannot pass one filter,
-        # then spend another full compile window linking the other target.
-        run: cargo test --features acme --lib --test unit_tests --no-run
+        # Keep inline ACME coverage, but compile only the two-test DNS target
+        # alongside it: enabling ACME must not rebuild monolithic unit_tests.
+        # Default suites above retain their full target graph and test counts.
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/unit-ci"
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M exit_status=%x' --output="$RUNNER_TEMP/unit-ci/acme-build.time" cargo test --features acme --lib --test acme_dns01_tests --no-run 2>&1 | tee "$RUNNER_TEMP/unit-ci/acme-build.log"
+          python3 .github/scripts/run_unit_ci.py acme-build
         env:
           RUST_BACKTRACE: 1
 
       - name: Run ACME outbound-boundary regressions
-        run: cargo test --features acme --lib tls::acme::client::tests
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/unit-ci"
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M exit_status=%x' --output="$RUNNER_TEMP/unit-ci/acme-outbound.time" cargo test --features acme --lib tls::acme::client::tests 2>&1 | tee "$RUNNER_TEMP/unit-ci/acme-outbound.log"
+          python3 .github/scripts/run_unit_ci.py acme-outbound
         env:
           RUST_BACKTRACE: 1
 
@@ -544,7 +660,11 @@ jobs:
       # child must not outlive the renewal claim) only has a gate if it is run
       # explicitly with the feature on.
       - name: Run ACME DNS-01 hook cancellation regressions
-        run: cargo test --features acme --test unit_tests tls::acme_dns01_hook_tests
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/unit-ci"
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M exit_status=%x' --output="$RUNNER_TEMP/unit-ci/acme-dns.time" cargo test --features acme --test acme_dns01_tests 2>&1 | tee "$RUNNER_TEMP/unit-ci/acme-dns.log"
+          python3 .github/scripts/run_unit_ci.py acme-dns
         env:
           RUST_BACKTRACE: 1
 
@@ -552,7 +672,11 @@ jobs:
       # recovery) only exists behind `acme`, so the takeover/skip decisions it
       # makes before any ACME networking need the feature on to be gated at all.
       - name: Run ACME renewal crash-recovery regressions
-        run: cargo test --features acme --lib tls::acme_renewal_resume_tests
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/unit-ci"
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M exit_status=%x' --output="$RUNNER_TEMP/unit-ci/acme-renewal.time" cargo test --features acme --lib tls::acme_renewal_resume_tests 2>&1 | tee "$RUNNER_TEMP/unit-ci/acme-renewal.log"
+          python3 .github/scripts/run_unit_ci.py acme-renewal
         env:
           RUST_BACKTRACE: 1
 
@@ -5476,6 +5600,7 @@ jobs:
     if: always() && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     needs:
       - ci-plan
+      - ci-policy
       - test-unit
       - test-secrets
       - test-service-integration
@@ -5547,6 +5672,7 @@ jobs:
           echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
 
           add_row "CI plan, format, and shard coverage (${CI_MODE})" "${{ needs.ci-plan.result }}"
+          add_row "Trusted policy validation" "${{ needs.ci-policy.result }}"
           add_row "Unit and inline lib" "${{ needs.test-unit.result }}"
           add_row "Secret backends" "${{ needs.test-secrets.result }}"
           add_row "Service integration" "${{ needs.test-service-integration.result }}"
@@ -5569,6 +5695,12 @@ jobs:
           add_row "Performance regression" "${{ needs.performance-regression.result }}"
           add_row "Native platform binaries" "${{ needs.build-binaries.result }}"
 
+          # These gates are mandatory even in light mode. The output is only
+          # emitted after the complete verifier command succeeds.
+          if [ "$PLAN_RESULT" != "success" ] || [ "$POLICY_RESULT" != "success" ] || [ "$POLICY_VERIFIED" != "true" ]; then
+            echo "::error::CI planning and complete trusted policy verification must succeed"
+            failures=1
+          fi
           require_success "CI plan" "${{ needs.ci-plan.result }}"
           require_success "Unit and inline lib" "${{ needs.test-unit.result }}"
           require_planned_gate "Secret backends" "${{ needs.test-secrets.result }}" "${{ needs.ci-plan.outputs.run_secrets_backends }}"
@@ -5598,6 +5730,9 @@ jobs:
         env:
           CI_MODE: ${{ needs.ci-plan.outputs.mode }}
           EVENT_NAME: ${{ github.event_name }}
+          PLAN_RESULT: ${{ needs.ci-plan.result }}
+          POLICY_RESULT: ${{ needs.ci-policy.result }}
+          POLICY_VERIFIED: ${{ needs.ci-policy.outputs.verified }}
 
   lint:
     name: Lint

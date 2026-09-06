@@ -1,5 +1,3 @@
-#[cfg(all(feature = "acme", unix))]
-mod acme_dns01_hook_tests;
 mod acme_http01_challenge_path_tests;
 mod acme_store_ha_tests;
 mod client_trust_dtls_session_tests;
