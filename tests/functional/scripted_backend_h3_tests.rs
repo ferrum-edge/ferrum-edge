@@ -5168,3 +5168,99 @@ async fn h3_progressing_sse_survives_idle_read_timeout() {
         "progressing SSE body truncated: {text:?}"
     );
 }
+
+/// Ordinary responses report the backend hop, including a retained earlier
+/// Via value, on both buffered and streaming H3 frontend paths.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_response_via_matches_backend_protocol_for_stream_and_buffer() {
+    for protocol in ["1.1", "2.0", "3.0"] {
+        for body_mode in ["stream", "buffer"] {
+            let ca = TestCa::new("h3-response-via").expect("ca");
+            let (cert, key) = ca.valid().expect("leaf");
+            let (tcp, udp) = reserve_colocated_tcp_udp().await.expect("backend ports");
+            let backend_port = tcp.port;
+            let mut h1 = None;
+            let mut h2 = None;
+            let mut h3 = None;
+            if protocol == "1.1" {
+                h1 = Some(
+                    ScriptedTlsBackend::builder(
+                        tcp.into_listener(),
+                        TlsConfig::new(cert.clone(), key.clone())
+                            .with_alpn(vec![b"http/1.1".to_vec()]),
+                    )
+                    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+                    .step(TcpStep::Write(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nVia: 1.1 upstream\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+                    ))
+                    .step(TcpStep::Drop)
+                    .spawn()
+                    .expect("h1 backend"),
+                );
+            } else {
+                h2 = Some(
+                    ScriptedH2Backend::builder_tls(tcp.into_listener(), &cert, &key)
+                        .expect("h2 builder")
+                        .repeat_script(true)
+                        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+                        .step(H2Step::RespondHeaders(vec![
+                            (":status", "200".into()),
+                            ("content-type", "text/plain".into()),
+                            ("via", "1.1 upstream".into()),
+                        ]))
+                        .step(H2Step::RespondData {
+                            data: Bytes::from_static(b"ok"),
+                            end_stream: true,
+                        })
+                        .spawn()
+                        .expect("h2 backend"),
+                );
+            }
+            if protocol == "3.0" {
+                h3 = Some(
+                    ScriptedH3Backend::builder(udp.into_socket(), H3TlsConfig::new(cert, key))
+                        .step(H3Step::AcceptStream)
+                        .step(H3Step::RespondHeaders(vec![
+                            (":status", "200".into()),
+                            ("content-type", "text/plain".into()),
+                            ("via", "1.1 upstream".into()),
+                        ]))
+                        .step(H3Step::RespondData(Bytes::from_static(b"ok")))
+                        .spawn()
+                        .expect("h3 backend"),
+                );
+            }
+            let mut config: Value = serde_yaml::from_str(&file_mode_yaml_for_h3(backend_port))
+                .expect("fixture config");
+            config["proxies"][0]["response_body_mode"] = json!(body_mode);
+            let (harness, _, _) = spawn_h3_harness_with_explicit_https_port_config_and_env(
+                serde_yaml::to_string(&config).unwrap(),
+                true,
+                None,
+                &[
+                    ("FERRUM_ADD_VIA_HEADER", "true"),
+                    ("FERRUM_VIA_PSEUDONYM", "routing-test"),
+                    ("FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES", "0"),
+                ],
+            )
+            .await;
+            if protocol == "3.0" {
+                wait_for_h3_class(&harness, "supported", Duration::from_secs(15))
+                    .await
+                    .expect("capability probe")
+                    .expect("native H3 must be selected");
+            }
+            let response = h3_get(&harness, "/api/routing-headers").await.expect("response");
+            assert_eq!(response.status.as_u16(), 200, "{protocol}/{body_mode}");
+            assert_eq!(response.body_bytes.as_ref(), b"ok");
+            assert_eq!(
+                response.headers.get("via").unwrap().to_str().unwrap(),
+                format!("1.1 upstream, {protocol} routing-test"),
+                "{protocol}/{body_mode}"
+            );
+            assert!(!response.headers.contains_key("x-gateway-upstream-status"));
+            drop((harness, h1, h2, h3));
+        }
+    }
+}

@@ -2498,6 +2498,8 @@ pub struct RequestContext {
     /// request headers. Fault rejection shaping consults this fixed value so a
     /// transformer cannot add or remove native-gRPC semantics mid-pipeline.
     request_http_flavor: HttpFlavor,
+    /// H3 routing outcome retained outside plugin/log metadata until response commitment.
+    pub(crate) h3_response_upstream_is_fallback: bool,
     /// The client's original `Accept-Encoding` field value, captured with the
     /// raw wire headers before any `before_proxy` hook runs.
     ///
@@ -3406,6 +3408,7 @@ impl RequestContext {
             buffered_initial_response_header_policy_state: None,
             buffered_deadline_response_header_provenance: None,
             request_http_flavor: HttpFlavor::Plain,
+            h3_response_upstream_is_fallback: false,
             original_accept_encoding: None,
             websocket_response_boundary: false,
             ai_semantic_cache_embeddings: HashMap::new(),
@@ -4624,6 +4627,7 @@ impl RequestContext {
             buffered_initial_response_header_policy_state: None,
             buffered_deadline_response_header_provenance: None,
             request_http_flavor: self.request_http_flavor,
+            h3_response_upstream_is_fallback: self.h3_response_upstream_is_fallback,
             original_accept_encoding: self.original_accept_encoding.clone(),
             websocket_response_boundary: self.websocket_response_boundary,
             ai_semantic_cache_embeddings: self.ai_semantic_cache_embeddings.clone(),
