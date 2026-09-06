@@ -351,12 +351,9 @@ fn parse_kube_version(version: &str) -> Option<(u8, u64, u64)> {
     if rest.is_empty() {
         return Some((0, major, 0));
     }
-    let (stability, minor) = if let Some(minor) = rest.strip_prefix("beta") {
-        (1, minor)
-    } else if let Some(minor) = rest.strip_prefix("alpha") {
-        (2, minor)
-    } else {
-        return None;
+    let (stability, minor) = match rest.strip_prefix("beta") {
+        Some(minor) => (1, minor),
+        None => (2, rest.strip_prefix("alpha")?),
     };
     let minor: u64 = minor.parse().ok()?;
     Some((stability, major, minor))
