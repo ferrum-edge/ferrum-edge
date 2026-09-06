@@ -213,8 +213,7 @@ async fn bodyless_sse_http1_wire() {
                     );
                 }
                 assert_bodyless_headers(&headers, &method, expected);
-                let chunked_empty =
-                    expected == 205 && headers.contains_key("transfer-encoding");
+                let chunked_empty = expected == 205 && headers.contains_key("transfer-encoding");
                 let trailing = &wire[end + 4..];
                 assert!(
                     trailing.is_empty() || (chunked_empty && trailing == b"0\r\n\r\n"),
