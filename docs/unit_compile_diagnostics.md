@@ -52,3 +52,24 @@ protocol category, byte count, loopback peer, backend port, and connection index
 on protocol-handshake errors. It never logs those bytes or relaxes the fixture's
 error assertion. This captures evidence for an unresolved intermittent fixture
 failure; it is not a claim that the sending path has been repaired.
+
+## Reuse the library in the gateway executable
+
+Cargo builds the gateway binary when compiling integration targets. The initial
+three-job measurement spent 533.04s in that binary target after separately
+compiling the normal library and library test harness; the binary finished
+last. Its module declarations duplicated the library's gateway source tree.
+
+The executable now retains the same non-Windows jemalloc declaration and calls
+`ferrum_edge::run_gateway_cli()`. Startup bodies live in `src/gateway_entry.rs`,
+included at the library root to preserve existing crate-relative paths and
+implicit tracing targets. The version constant remains the library's existing
+Cargo-derived constant. No startup ordering, error handling, secret resolution,
+crypto initialization, runtime sizing, shutdown logic or test selections change.
+CI relevance rules and source-contract assertions follow the startup file.
+
+Hosted cold/warm default and ACME timings, memory/paging and complete test
+readiness must be measured before claiming a reduction. Production optimization
+profiles are unchanged; binary layout and link work can change when the same
+implementation is linked through its library, so image/runtime checks remain
+required.

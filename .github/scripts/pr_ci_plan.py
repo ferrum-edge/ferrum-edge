@@ -607,7 +607,7 @@ HELM_PATTERNS = [
         r"^src/lib\.rs$",
         r"^src/overload\.rs$",
         r"^src/runtime_metrics\.rs$",
-        r"^src/(?:main|startup|cli)\.rs$",
+        r"^src/(?:main|gateway_entry|startup|cli)\.rs$",
         r"^src/config/",
         r"^src/config_sources/k8s/",
         r"^src/logging/",
@@ -790,7 +790,7 @@ SECRETS_BACKENDS_PATTERNS = [
         r"^src/secrets/",
         r"^src/tls/source/mod\.rs$",
         r"^tests/secrets_functional/",
-        r"^src/main\.rs$",
+        r"^src/(?:main|gateway_entry)\.rs$",
         r"^src/config/env_config\.rs$",
         r"^\.config/nextest\.toml$",
     )
@@ -1625,6 +1625,11 @@ def self_test() -> int:
         (
             "pull_request",
             ["src/main.rs"],
+            {"run_secrets_backends": True, "run_pkcs11": False},
+        ),
+        (
+            "pull_request",
+            ["src/gateway_entry.rs"],
             {"run_secrets_backends": True, "run_pkcs11": False},
         ),
         (

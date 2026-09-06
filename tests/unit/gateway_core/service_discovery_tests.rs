@@ -5398,7 +5398,12 @@ async fn discovery_body_test_override_does_not_leak_to_parallel_threads() {
 
 #[test]
 fn discovery_body_limits_production_publish_seam_lives_in_main() {
-    let main_src = include_str!("../../../src/main.rs");
+    let binary_src = include_str!("../../../src/main.rs");
+    let library_src = include_str!("../../../src/lib.rs");
+    assert!(binary_src.contains("ferrum_edge::run_gateway_cli();"));
+    assert!(binary_src.contains("#[global_allocator]"));
+    assert!(library_src.contains("include!(\"gateway_entry.rs\");"));
+    let main_src = include_str!("../../../src/gateway_entry.rs");
     let env_src = include_str!("../../../src/config/env_config.rs");
     assert!(
         main_src.contains("install_discovery_body_limits"),

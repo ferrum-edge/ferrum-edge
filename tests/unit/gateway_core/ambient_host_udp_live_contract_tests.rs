@@ -1004,13 +1004,13 @@ fn ambient_udp_production_entry_points_are_scheduled_by_the_trusted_classifier()
             && cli.contains("AmbientUdpPreflight("),
         "src/cli.rs must still define and dispatch the preflight subcommand"
     );
-    let main = read("src/main.rs");
+    let main = read("src/gateway_entry.rs");
     assert!(
         main.contains("cli::Command::AmbientUdpPreflight(args)")
             && main.contains("cli::execute_ambient_udp_preflight(args)")
             && main.contains("cli::apply_ambient_udp_preflight_overrides(args)")
             && main.contains("fn run_ambient_udp_preflight"),
-        "src/main.rs must still route the preflight subcommand"
+        "src/gateway_entry.rs must still route the preflight subcommand"
     );
     let crypto_at = main
         .find("fips::install_crypto_provider()")
