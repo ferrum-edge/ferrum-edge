@@ -1423,6 +1423,11 @@ async fn response_content_type_allowlist_rejects_invalid_and_unsupported_headers
         response.extend_from_slice(b"\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
         let (port, server) = spawn_raw_http_response(response);
         let mut process = process_enabled(None);
+        // The assertion is on the Content-Type refusal, not on timing: keep a
+        // loaded runner from reporting a timeout in its place.
+        process.connect_timeout = Duration::from_secs(2);
+        process.request_timeout = Duration::from_secs(5);
+        process.total_timeout = Duration::from_secs(10);
         process.allow_http_origins = vec![format!("http://127.0.0.1:{port}")];
         let error = load_production_http(format!("http://127.0.0.1:{port}/content-type"), process)
             .await
@@ -1445,6 +1450,11 @@ async fn absent_response_content_type_uses_bounded_format_detection() {
             .to_vec();
     let (port, server) = spawn_raw_http_response(response);
     let mut process = process_enabled(None);
+    // A success-path fixture, not a timeout test: the tight defaults report a
+    // spurious request timeout on a loaded coverage runner.
+    process.connect_timeout = Duration::from_secs(2);
+    process.request_timeout = Duration::from_secs(5);
+    process.total_timeout = Duration::from_secs(10);
     process.allow_http_origins = vec![format!("http://127.0.0.1:{port}")];
     let loaded = load_production_http(format!("http://127.0.0.1:{port}/no-content-type"), process)
         .await

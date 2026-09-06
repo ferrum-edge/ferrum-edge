@@ -551,6 +551,9 @@ impl CacheEntry {
     }
 
     fn is_fresh_at(&self, now: Duration) -> bool {
+        // Reuse the shared header calculation captured at storage, including
+        // Expires' receipt-time baseline when Date was absent. Recomputing it
+        // on a HIT would move that baseline and change the freshness budget.
         self.current_age(now) < self.freshness_lifetime
     }
 
@@ -691,6 +694,11 @@ fn parse_quoted_string<'a>(value: &'a str, position: &mut usize) -> Option<Cow<'
 /// stays inside its member.
 fn parse_cache_control(header_value: &str) -> CacheControlDirectives {
     let mut directives = CacheControlDirectives::default();
+    parse_cache_control_into(header_value, &mut directives);
+    directives
+}
+
+fn parse_cache_control_into(header_value: &str, directives: &mut CacheControlDirectives) {
     let bytes = header_value.as_bytes();
     let mut index = 0usize;
 
@@ -750,15 +758,13 @@ fn parse_cache_control(header_value: &str) -> CacheControlDirectives {
             }
         }
 
-        apply_cache_control_directive(&mut directives, name, argument.as_ref());
+        apply_cache_control_directive(directives, name, argument.as_ref());
 
         // Discard any trailing junk between this member and the next comma.
         while !matches!(bytes.get(index), None | Some(b',')) {
             index += 1;
         }
     }
-
-    directives
 }
 
 fn value_slice_trimmed(value: &str, start: usize, end: usize) -> Option<&str> {
@@ -835,15 +841,14 @@ fn parse_field_name_list(list: &str) -> Option<Vec<String>> {
 }
 
 fn merge_delta_seconds(slot: &mut Option<u64>, argument: Option<&CacheControlArgument<'_>>) {
-    let raw = match argument {
-        Some(CacheControlArgument::Token(token)) => *token,
-        Some(CacheControlArgument::Quoted(value)) => &**value,
-        Some(CacheControlArgument::Malformed) | None => return,
-    };
-    let Some(seconds) = parse_delta_seconds(raw) else {
-        return;
-    };
-    // Conflicting duplicates are ambiguous; keep the most restrictive lifetime.
+    let seconds = match argument {
+        Some(CacheControlArgument::Token(token)) => parse_delta_seconds(token),
+        Some(CacheControlArgument::Quoted(value)) => parse_delta_seconds(value),
+        Some(CacheControlArgument::Malformed) | None => None,
+    }
+    .unwrap_or(0);
+    // Keep the shortest duplicate; an invalid explicit lifetime means expired,
+    // never absent metadata that could fall back to a longer heuristic TTL.
     *slot = Some(slot.map_or(seconds, |existing| existing.min(seconds)));
 }
 
@@ -1484,14 +1489,7 @@ impl ResponseCaching {
             return FinalHeaderDecision::Inert;
         }
 
-        let directives = if self.config.respect_cache_control {
-            response_headers
-                .get("cache-control")
-                .map(|cc| parse_cache_control(cc))
-                .unwrap_or_default()
-        } else {
-            CacheControlDirectives::default()
-        };
+        let directives = self.response_cache_control(response_headers);
 
         // 3. Response directives that forbid storing also supersede whatever this
         //    base key holds.
@@ -1499,7 +1497,10 @@ impl ResponseCaching {
             return FinalHeaderDecision::InvalidateBaseKey;
         }
 
-        let freshness_lifetime = self.freshness_lifetime(&directives);
+        let response_time_monotonic = self.now_monotonic();
+        let response_time_wall = self.now_wall();
+        let freshness_lifetime =
+            self.freshness_lifetime(response_headers, response_time_wall, &directives);
 
         // 4. Zero freshness — including a configured `ttl_seconds: 0`, where
         //    EVERY response lands here.
@@ -1523,8 +1524,6 @@ impl ResponseCaching {
         // 7. A representation that is already stale on arrival. Corrected age only
         //    grows, so evaluating this earlier than the store path can only fail
         //    to refuse — never refuse something the store path would have kept.
-        let response_time_monotonic = self.now_monotonic();
-        let response_time_wall = self.now_wall();
         let corrected_initial_age = self.corrected_initial_age(
             ctx,
             response_headers,
@@ -2544,14 +2543,69 @@ impl ResponseCaching {
             .unwrap_or_default()
     }
 
-    fn freshness_lifetime(&self, directives: &CacheControlDirectives) -> Duration {
-        if let Some(s_maxage) = directives.s_maxage {
-            Duration::from_secs(s_maxage)
-        } else if let Some(max_age) = directives.max_age {
-            Duration::from_secs(max_age)
-        } else {
-            Duration::from_secs(self.config.ttl_seconds)
+    fn response_cache_control(
+        &self,
+        response_headers: &HashMap<String, String>,
+    ) -> CacheControlDirectives {
+        let mut directives = CacheControlDirectives::default();
+        if self.config.respect_cache_control {
+            // Wire repeats are comma-folded; also reduce case-variant keys
+            // from plugin header maps without depending on iteration order.
+            for (name, value) in response_headers {
+                if name.eq_ignore_ascii_case("cache-control") {
+                    parse_cache_control_into(value, &mut directives);
+                }
+            }
         }
+        directives
+    }
+
+    /// RFC 9111 §4.2.1: explicit freshness precedes the configured heuristic.
+    /// Disabling respect_cache_control explicitly overrides origin freshness,
+    /// including Expires. Age and response delay still consume that budget.
+    fn freshness_lifetime(
+        &self,
+        response_headers: &HashMap<String, String>,
+        response_time_wall: DateTime<Utc>,
+        directives: &CacheControlDirectives,
+    ) -> Duration {
+        if !self.config.respect_cache_control {
+            return Duration::from_secs(self.config.ttl_seconds);
+        }
+        if let Some(s_maxage) = directives.s_maxage {
+            return Duration::from_secs(s_maxage);
+        }
+        if let Some(max_age) = directives.max_age {
+            return Duration::from_secs(max_age);
+        }
+
+        let mut expires_values = response_headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("expires"));
+        let Some((_, expires)) = expires_values.next() else {
+            return Duration::from_secs(self.config.ttl_seconds);
+        };
+        // Expires is a singleton HTTP-date, not a list. Folded repeated fields
+        // fail whole-value parsing; case-variant duplicates also fail closed,
+        // independently of HashMap iteration order (even if values agree).
+        if expires_values.next().is_some() {
+            return Duration::ZERO;
+        }
+        let Some(expires) = parse_http_date(expires) else {
+            return Duration::ZERO;
+        };
+        let mut dates = response_headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("date"));
+        let date = match dates.next() {
+            None => response_time_wall,
+            Some((_, value)) => match parse_http_date(value) {
+                Some(date) if dates.next().is_none() => date,
+                // An invalid/ambiguous Date cannot establish an expiry budget.
+                _ => return Duration::ZERO,
+            },
+        };
+        duration_since_http_date(expires, date)
     }
 
     fn corrected_initial_age(
@@ -3421,14 +3475,7 @@ impl Plugin for ResponseCaching {
         // predictor mark this hook used to take now belongs to the header phase,
         // which is the only place that can take it for a streamed response too.
 
-        let directives = if self.config.respect_cache_control {
-            response_headers
-                .get("cache-control")
-                .map(|cc| parse_cache_control(cc))
-                .unwrap_or_default()
-        } else {
-            CacheControlDirectives::default()
-        };
+        let directives = self.response_cache_control(response_headers);
 
         // The header-only refusals below were all settled — and their evictions
         // and predictor marks taken — by the classification above. They remain as
@@ -3444,7 +3491,10 @@ impl Plugin for ResponseCaching {
         // both see the transformed values, not the untransformed
         // `ctx.headers`. See `restore_request_headers_view` for why.
         let lookup_headers = self.restore_request_headers_view(ctx);
-        let freshness_lifetime = self.freshness_lifetime(&directives);
+        let response_time_monotonic = self.now_monotonic();
+        let response_time_wall = self.now_wall();
+        let freshness_lifetime =
+            self.freshness_lifetime(response_headers, response_time_wall, &directives);
 
         if freshness_lifetime.is_zero() {
             return PluginResult::Continue;
@@ -3467,8 +3517,6 @@ impl Plugin for ResponseCaching {
             return PluginResult::Continue;
         }
 
-        let response_time_monotonic = self.now_monotonic();
-        let response_time_wall = self.now_wall();
         let corrected_initial_age = self.corrected_initial_age(
             ctx,
             response_headers,

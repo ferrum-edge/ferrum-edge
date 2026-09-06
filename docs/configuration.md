@@ -1032,6 +1032,14 @@ See [client_ip_resolution.md](client_ip_resolution.md) for the security model an
 
 ### Runtime Tuning
 
+The `response_caching` plugin's freshness settings live in its plugin configuration,
+not environment variables. With the default `respect_cache_control: true`, origin
+`s-maxage`, `max-age`, and then `Expires - Date` precede the `ttl_seconds` fallback.
+Missing `Date` uses response receipt time; invalid or repeated expiry metadata is
+conservatively expired. Setting `respect_cache_control: false` explicitly overrides
+origin freshness with `ttl_seconds`, while Age and response-delay accounting remain
+active. See [response_caching](plugins.md#response_caching) for the complete rules.
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_WORKER_THREADS` | No | CPU cores | Tokio async worker threads |

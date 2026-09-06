@@ -26201,7 +26201,7 @@ components:
           type: [integer, "null"]
           format: uint64
           default: 300
-          description: "Default freshness lifetime in seconds when the backend response has no max-age/s-maxage. Backend cache-control directives take precedence when respect_cache_control is true. Upstream Age and Date still reduce remaining freshness."
+          description: "Fallback freshness lifetime in seconds when the backend response has no s-maxage, max-age, or Expires, or when respect_cache_control is explicitly false. With the default true policy, precedence is s-maxage > max-age > Expires minus Date > ttl_seconds; missing Date uses response receipt time. Invalid or repeated Expires, or invalid/repeated Date for Expires-based freshness, means already expired. Upstream Age, Date, response delay, and cache residency still reduce remaining freshness."
         max_entries:
           type: [integer, "null"]
           format: uint64
@@ -26243,7 +26243,7 @@ components:
         respect_cache_control:
           type: [boolean, "null"]
           default: true
-          description: "Honor backend Cache-Control directives (no-store, private, no-cache, max-age, s-maxage, must-revalidate, public). Parsing is grammar-aware: the qualified field-name forms private=\"x-account\" and no-cache=\"x-secret\" are understood, and the named fields are removed from the retained entry so they are never replayed from the shared cache. A qualified argument that is not a well-formed quoted field-name list (unquoted, unterminated, empty, or not a valid field name) fails closed to the bare directive and the whole response is refused. Duplicate max-age/s-maxage keep the most restrictive value."
+          description: "Honor backend Cache-Control directives (no-store, private, no-cache, max-age, s-maxage, must-revalidate, public) and explicit Expires freshness. Setting false explicitly overrides origin Cache-Control and Expires with ttl_seconds; age accounting still applies. Parsing is grammar-aware: the qualified field-name forms private=\"x-account\" and no-cache=\"x-secret\" are understood, and the named fields are removed from the retained entry so they are never replayed from the shared cache. A qualified argument that is not a well-formed quoted field-name list (unquoted, unterminated, empty, or not a valid field name) fails closed to the bare directive and the whole response is refused. Duplicate max-age/s-maxage keep the most restrictive value; malformed lifetime directives contribute zero."
         respect_no_cache:
           type: [boolean, "null"]
           default: true
