@@ -208,11 +208,12 @@ canonical CI check suite; trusted policy evidence is bound to the associated
 merged PR head. A policy override does not fabricate successful evidence: a
 commit landed with a failed trusted check is not a releasable commit.
 
-The `main-publication-required-checks` job in the Gateway API workflow remains
-a read-only evidence collector. The inventory's `validation_stage` values
-identify the Tests aggregate, checks collected directly by the release gate,
-and the main evidence collector's subset. All stages are checked on release.
-There is no `main-publish-gate` polling job or automatic main publisher.
+Ordinary main validation has no publication-evidence polling job. The Gateway
+API workflow reports its own conformance result; it does not wait for unrelated
+suites or re-evaluate a merged PR's admission verdict. The manual release
+request and tag-triggered release each verify the complete, unpartitioned
+inventory. Neither can omit a required check. There is no automatic main
+publisher.
 
 The trusted base freezes the production publisher, release dispatcher, input
 validator, evidence verifier, and inventory. Changes to these controls require
