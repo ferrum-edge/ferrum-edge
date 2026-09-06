@@ -2,6 +2,9 @@ name: Cache Payload Study
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ci/4643-fuzz-cache-payload-study]
+    paths: [.github/workflows/cache-payload-study.yml]
 
 permissions:
   contents: read
