@@ -32,25 +32,6 @@ jobs:
         with:
           persist-credentials: false
 
-      # Explain comparison-only matches for the scheduling experiment. This
-      # read-only diagnostic does not replace or affect either policy gate.
-      - name: Explain unit scheduling policy surfaces
-        run: |
-          python3 - <<'PYCODE'
-          import json
-          import sys
-          from pathlib import Path
-          sys.path.insert(0, ".github/scripts")
-          from verify_cross_build_policy import generic_workflow_cross_surfaces
-          source = ".github/workflows/scale-benchmark.yml"
-          reasons = {}
-          surfaces, errors = generic_workflow_cross_surfaces(
-              Path(source).read_text(), source,
-              include_opaque_shell_executable=True, reasons=reasons,
-          )
-          print(json.dumps({"surfaces": surfaces, "reasons": reasons, "errors": errors}, indent=2))
-          PYCODE
-
       # Catch contract/extraction drift before waiting for the application
       # matrix. Tests still repeats these checks as its required final gate.
       - name: Validate candidate CI contracts

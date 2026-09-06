@@ -606,7 +606,7 @@ jobs:
           target_dir="$(mktemp -d "$RUNNER_TEMP/unit-target.XXXXXX")"
           compiler_cache="$(mktemp -d "$RUNNER_TEMP/unit-sccache.XXXXXX")"
           if [ -n "${FERRUM_SCCACHE_BIN:-}" ]; then
-            "$FERRUM_SCCACHE_BIN" --stop-server || true
+            sccache --stop-server || true
           fi
           echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
           echo "SCCACHE_DIR=$compiler_cache" >> "$GITHUB_ENV"
