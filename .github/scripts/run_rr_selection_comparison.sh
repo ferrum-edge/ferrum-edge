@@ -33,14 +33,14 @@ export CARGO_TARGET_DIR="$PWD/tests/performance/mesh/target"
 for role in candidate baseline; do
   export RR_COMPARISON_ROLE="$role"
   if [ "$role" = candidate ]; then
-    cd "$RR_COMPARISON_ROOT"
+    cd "$GITHUB_WORKSPACE"
   else
     cd "$RR_COMPARISON_WORK/baseline-source"
   fi
   /usr/bin/time --format='%e' --output="$RR_COMPARISON_OUTPUT/$role-compile.time" \
     cargo bench --manifest-path tests/performance/mesh/Cargo.toml --bench rr_selection --no-run --locked --message-format=json \
     > "$RR_COMPARISON_OUTPUT/$role-compile.jsonl"
-  cd "$RR_COMPARISON_ROOT"
+  cd "$GITHUB_WORKSPACE"
   python3 .github/scripts/run_rr_selection_comparison.py record-build
 done
 
