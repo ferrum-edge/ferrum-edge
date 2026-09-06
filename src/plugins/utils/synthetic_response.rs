@@ -29,8 +29,9 @@ pub fn request_method_omits_response_body(method: &str) -> bool {
 
 /// Whether the wire response must omit content bytes for this method/status.
 ///
-/// Shared across H1/H2/H3 so response-size and synthetic-response paths cannot
-/// drift on body presence.
+/// Shared across H1/H2/H3, synthetic responses, and response-body policies so
+/// they cannot drift on body presence. Representation metadata such as
+/// `Content-Type: text/event-stream` does not imply a stream on these responses.
 #[inline]
 pub fn synthetic_response_omits_body(method: &str, status: u16) -> bool {
     request_method_omits_response_body(method) || status_forbids_response_body(status)

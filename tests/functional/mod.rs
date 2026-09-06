@@ -17,6 +17,7 @@ mod functional_backend_lb_session_persistence_test;
 mod functional_body_size_limits_test;
 mod functional_body_validator_request_representation_test;
 mod functional_body_validator_response_stream_test;
+mod functional_bodyless_sse_refusal_test;
 mod functional_capability_registry_test;
 mod functional_chunked_request_size_limits_test;
 mod functional_chunked_response_size_limits_test;
