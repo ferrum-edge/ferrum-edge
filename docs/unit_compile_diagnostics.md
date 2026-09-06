@@ -44,3 +44,11 @@ feature/live proofs when evaluating a scheduling or harness-layout experiment.
 The instrumentation itself leaves compiler concurrency, debug/codegen profiles,
 production profiles, and test selections unchanged. Issue #4704 remains open
 until measured changes reduce the footprint and complete hosted validation.
+
+The application shard can also report bounded diagnostics for an unexpected
+HTTP/2 preface in a scripted backend (issue #4720). The observer forwards the
+existing I/O operations, stores at most 24 prefix bytes, and reports only a
+protocol category, byte count, loopback peer, backend port, and connection index
+on protocol-handshake errors. It never logs those bytes or relaxes the fixture's
+error assertion. This captures evidence for an unresolved intermittent fixture
+failure; it is not a claim that the sending path has been repaired.

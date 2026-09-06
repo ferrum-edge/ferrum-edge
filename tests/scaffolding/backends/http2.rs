@@ -50,11 +50,13 @@ use http::{HeaderMap, Request, Response, StatusCode};
 use rustls::ServerConfig;
 use rustls_pemfile::{certs, private_key};
 use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
@@ -405,7 +407,7 @@ impl ScriptedH2BackendBuilder {
                     biased;
                     _ = &mut shutdown_rx => return,
                     accept_result = listener.accept() => {
-                        let Ok((tcp, _addr)) = accept_result else { continue; };
+                        let Ok((tcp, peer_addr)) = accept_result else { continue; };
                         let connection_index =
                             state_task.accepted.fetch_add(1, Ordering::SeqCst) as usize;
                         let script = connection_scripts
@@ -438,7 +440,12 @@ impl ScriptedH2BackendBuilder {
                                 run_h2_connection(tcp, settings, script, repeat_script, conn_state)
                                     .await
                             };
-                            if let Err(msg) = result {
+                            if let Err(mut msg) = result {
+                                if msg.contains("preface_kind=") {
+                                    msg.push_str(&format!(
+                                        "; backend_port={port} peer={peer_addr} connection_index={connection_index}"
+                                    ));
+                                }
                                 err_sink.step_errors.lock().await.push(msg);
                             }
                         });
@@ -640,6 +647,107 @@ enum DriverCtrl {
     Stop,
 }
 
+/// Observe only the connection preface, without an extra read or changing
+/// handshake ordering. Diagnostics classify it; they never print payload bytes.
+#[derive(Default)]
+struct PrefaceObservation {
+    bytes: [u8; 24],
+    len: usize,
+}
+
+impl PrefaceObservation {
+    fn record(&mut self, bytes: &[u8]) {
+        let count = bytes.len().min(self.bytes.len() - self.len);
+        self.bytes[self.len..self.len + count].copy_from_slice(&bytes[..count]);
+        self.len += count;
+    }
+
+    fn kind(&self) -> &'static str {
+        let bytes = &self.bytes[..self.len];
+        if bytes.is_empty() {
+            "empty"
+        } else if b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".starts_with(bytes) {
+            "h2-preface-prefix"
+        } else if [
+            b"GET ".as_slice(),
+            b"HEAD ",
+            b"POST ",
+            b"OPTIONS ",
+            b"PUT ",
+            b"DELETE ",
+            b"CONNECT ",
+            b"PATCH ",
+        ]
+        .iter()
+        .any(|method| bytes.starts_with(method))
+        {
+            "http1-method-prefix"
+        } else if bytes.starts_with(&[0x16, 0x03]) {
+            "tls-handshake-record-prefix"
+        } else {
+            "other"
+        }
+    }
+}
+
+struct PrefaceObservedIo<T> {
+    inner: T,
+    observation: Arc<StdMutex<PrefaceObservation>>,
+    recorded: usize,
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for PrefaceObservedIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let result = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if this.recorded < 24 && buf.filled().len() > before {
+            let bytes = &buf.filled()[before..];
+            let count = bytes.len().min(24 - this.recorded);
+            this.observation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .record(&bytes[..count]);
+            this.recorded += count;
+        }
+        result
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for PrefaceObservedIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, bytes)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 /// Drive a single accepted connection end-to-end: H2 handshake, spawn a
 /// connection-driver task that continuously polls the connection and
 /// feeds accepted streams to the script task. The script task then
@@ -659,10 +767,30 @@ where
 {
     let mut builder = H2Builder::new();
     settings.apply(&mut builder);
+    let observation = Arc::new(StdMutex::new(PrefaceObservation::default()));
+    let observed_io = PrefaceObservedIo {
+        inner: io,
+        observation: Arc::clone(&observation),
+        recorded: 0,
+    };
     let conn = builder
-        .handshake::<_, Bytes>(io)
+        .handshake::<_, Bytes>(observed_io)
         .await
-        .map_err(|e| format!("h2 handshake failed: {e}"))?;
+        .map_err(|e| {
+            if e.reason() == Some(Reason::PROTOCOL_ERROR) {
+                let prefix = observation
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                format!(
+                    "h2 handshake failed: {e}; preface_kind={} observed_bytes={}",
+                    prefix.kind(),
+                    prefix.len
+                )
+            } else {
+                // Keep existing exact disconnect classifications unchanged.
+                format!("h2 handshake failed: {e}")
+            }
+        })?;
     state.handshakes.fetch_add(1, Ordering::SeqCst);
 
     // Channel: driver → script with newly accepted (request, response) pairs.
@@ -1223,6 +1351,51 @@ mod tests {
     use h2::client as h2_client;
     use http::Request as HttpRequest;
     use tokio::net::TcpStream;
+
+    #[tokio::test]
+    async fn preface_observer_preserves_duplex_io() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (inner, mut peer) = tokio::io::duplex(64);
+        let observation = Arc::new(StdMutex::new(PrefaceObservation::default()));
+        let mut observed = PrefaceObservedIo {
+            inner,
+            observation: Arc::clone(&observation),
+            recorded: 0,
+        };
+        let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        peer.write_all(&preface[..5]).await.expect("first fragment");
+        let mut received = [0; 24];
+        observed
+            .read_exact(&mut received[..5])
+            .await
+            .expect("first read");
+        peer.write_all(&preface[5..]).await.expect("second fragment");
+        observed
+            .read_exact(&mut received[5..])
+            .await
+            .expect("second read");
+        assert_eq!(&received, preface);
+        observed.write_all(b"ok").await.expect("write response");
+        let mut response = [0; 2];
+        peer.read_exact(&mut response).await.expect("read response");
+        assert_eq!(&response, b"ok");
+        let prefix = observation.lock().expect("observation");
+        assert_eq!(prefix.kind(), "h2-preface-prefix");
+        assert_eq!(prefix.len, 24);
+    }
+
+    #[test]
+    fn preface_observation_is_bounded_and_reports_categories_only() {
+        let mut observation = PrefaceObservation::default();
+        assert_eq!(observation.kind(), "empty");
+        observation.record(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert_eq!(observation.len, 24);
+        assert_eq!(observation.kind(), "http1-method-prefix");
+        observation.record(b"additional body");
+        assert_eq!(observation.len, 24);
+        assert_eq!(observation.kind(), "http1-method-prefix");
+    }
 
     #[test]
     fn benign_script_step_error_ignores_pre_script_h2_handshake_broken_pipe() {
