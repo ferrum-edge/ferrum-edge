@@ -708,7 +708,8 @@ async fn a_held_replacement_is_not_reported_as_a_slow_initial_list() {
         "a held replacement is not a timed-out one"
     );
     assert!(
-        logs.matching("WARN", "did not finish its initial list").is_empty(),
+        logs.matching("WARN", "did not finish its initial list")
+            .is_empty(),
         "{:?}",
         logs.lines()
     );

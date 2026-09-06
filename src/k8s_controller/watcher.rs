@@ -688,10 +688,14 @@ impl WatchErrorClass {
     /// error line.
     pub fn retry_policy(self) -> &'static str {
         match self {
-            Self::Forbidden => "refused by the API server with HTTP 403 (RBAC gap on a served \
-                 kind); holding this scope between attempts",
-            Self::ListFailed => "the initial list failed; holding this scope for a doubling \
-                 interval between attempts",
+            Self::Forbidden => {
+                "refused by the API server with HTTP 403 (RBAC gap on a served \
+                 kind); holding this scope between attempts"
+            }
+            Self::ListFailed => {
+                "the initial list failed; holding this scope for a doubling \
+                 interval between attempts"
+            }
             Self::Other => "the stream backs off before retrying",
         }
     }
