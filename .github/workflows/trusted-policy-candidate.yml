@@ -33,6 +33,9 @@ jobs:
           persist-credentials: false
 
       - name: Diagnose checked-in mesh benchmark lockfile
+        env:
+          RUSTC_WRAPPER: ""
+          CARGO_BUILD_RUSTC_WRAPPER: ""
         run: |
           cargo metadata --manifest-path tests/performance/mesh/Cargo.toml --format-version 1 > /dev/null
           git diff -- tests/performance/mesh/Cargo.lock
