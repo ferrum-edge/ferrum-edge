@@ -242,6 +242,9 @@ impl ScalePerfHarness {
             // interval: the blocking `GET /config/apply-status` cursor gate
             // raises an immediate poll wake on demand.
             .env("FERRUM_DB_POLL_INTERVAL", "30")
+            // Attribute convergence delays to SQL snapshot loading versus
+            // runtime application without enabling per-request info logs.
+            .env("FERRUM_DB_SLOW_QUERY_THRESHOLD_MS", "1000")
             .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
             .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
             .env("FERRUM_LOG_LEVEL", "warn");

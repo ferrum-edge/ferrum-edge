@@ -3340,9 +3340,7 @@ fn upsert_http_route_resources(
             acc.record_gateway_api_refused_route_attachments(attachments);
             continue;
         }
-        if let Some(merged_into) =
-            merge_http_route_proxy(acc, proxy.clone(), &route_plugins, route_kind)
-        {
+        if let Some(merged_into) = merge_http_route_proxy(acc, &proxy, &route_plugins, route_kind) {
             // The claim materializes through the proxy it collapsed into, so
             // credit that proxy: withdrawing the survivor must take the merged
             // claim's status down with it.
@@ -3397,7 +3395,7 @@ fn upsert_http_route_resources(
 /// merge happened and the caller must materialize the proxy itself.
 fn merge_http_route_proxy(
     acc: &mut K8sAccumulator,
-    proxy: Proxy,
+    proxy: &Proxy,
     route_plugins: &[PluginConfig],
     route_kind: &str,
 ) -> Option<NamespacedResourceId> {
@@ -3405,7 +3403,7 @@ fn merge_http_route_proxy(
         .config
         .proxies
         .iter()
-        .position(|existing| can_merge_http_route_proxy(acc, existing, &proxy, route_kind))?;
+        .position(|existing| can_merge_http_route_proxy(acc, existing, proxy, route_kind))?;
 
     let new_dispatch = route_plugins
         .iter()
@@ -3433,7 +3431,7 @@ fn merge_http_route_proxy(
         != Some(true);
 
     if new_has_default {
-        replace_proxy_default_route(&mut acc.config.proxies[existing_index], &proxy);
+        replace_proxy_default_route(&mut acc.config.proxies[existing_index], proxy);
     }
 
     if let Some(plugin) = new_dispatch {
@@ -3504,8 +3502,10 @@ fn can_merge_http_route_proxy(
     proxy: &Proxy,
     route_kind: &str,
 ) -> bool {
-    acc.proxy_source(&existing.namespace, &existing.id) == Some(SourceKind::GatewayApi)
-        && occupies_same_route_slot(existing, proxy)
+    // Reject different slots before proxy_source allocates an ownership key.
+    // Unique host/path snapshots otherwise allocate on every quadratic miss.
+    occupies_same_route_slot(existing, proxy)
+        && acc.proxy_source(&existing.namespace, &existing.id) == Some(SourceKind::GatewayApi)
         && route_proxy_listener(acc, existing) == route_proxy_listener(acc, proxy)
         && namespaced_resource_key(&existing.namespace, &existing.id)
             .and_then(|key| acc.gateway_api_route_proxy_kinds.get(&key))
@@ -3531,8 +3531,9 @@ fn conflicting_slot_claim(acc: &K8sAccumulator, proxy: &Proxy) -> Option<(String
         .proxies
         .iter()
         .find(|existing| {
-            acc.proxy_source(&existing.namespace, &existing.id) == Some(SourceKind::GatewayApi)
-                && occupies_same_route_slot(existing, proxy)
+            occupies_same_route_slot(existing, proxy)
+                && acc.proxy_source(&existing.namespace, &existing.id)
+                    == Some(SourceKind::GatewayApi)
                 && route_proxy_listener(acc, existing) != route_proxy_listener(acc, proxy)
         })
         .map(|existing| (existing.namespace.clone(), existing.id.clone()))
