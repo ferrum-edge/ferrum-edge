@@ -1,8 +1,7 @@
 # Release profile study
 
 Issue #4674 remains open. No shipping profile or publication path changes in
-this experiment. Dispatch **Multi Protocol Performance Benchmark** with
-`build_profile=release-study`, all protocols, and three iterations to compare
+this experiment. Dispatch **Release Profile Study** with all protocols and three iterations to compare
 fat LTO / one codegen unit with thin LTO / sixteen codegen units on the same
 source revision. Each uses a standard Linux runner, an empty Cargo target,
 disabled compiler caching, the release profile's other settings and the
