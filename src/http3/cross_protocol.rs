@@ -132,8 +132,8 @@ use crate::proxy::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER, GrpcResponseKind, proxy_grpc_request_from_bytes,
 };
 use crate::proxy::headers::{
-    ClientResponseFraming, GatewayOwnedResponseHeaders, PrePolicyResponseHeaders,
-    RejectBodyDisposition, ResponseTrailerGovernance, TrailerSectionKind, apply_response_headers,
+    ClientResponseFraming, PrePolicyResponseHeaders, RejectBodyDisposition,
+    ResponseTrailerGovernance, TrailerSectionKind, apply_response_headers,
     is_backend_response_strip_header, is_untrusted_real_ip_header, parse_connection_listed_headers,
     reconcile_streaming_backend_trailers, sanitize_backend_request_trailers,
     sanitize_client_response_headers_for_wire, strip_response_hop_by_hop_trailers,
@@ -4251,6 +4251,15 @@ where
             }
         };
 
+    let response_via = match &response {
+        PlainBridgeResponse::Reqwest(response) => {
+            crate::proxy::via_header_for_inbound_version(state, response.version()).as_deref()
+        }
+        // Preserve the shared H1/H2 buffered-response convention for mesh
+        // dispatches whose retained response no longer carries a wire version.
+        PlainBridgeResponse::MeshBuffered(_) => state.via_header_http11.as_deref(),
+    };
+
     // Both dispatch arms converge on one client-facing pipeline. `terminal_*`
     // carries the mesh dispatch's backend classification so passive health,
     // admission, and the transaction record still see what the mesh transport
@@ -4783,6 +4792,12 @@ where
             response_status,
             response_body.len(),
         );
+        sanitize_client_response_headers_for_wire(&mut response_headers, buffered_framing);
+        super::server::finalize_h3_response_routing_headers(
+            ctx.h3_response_upstream_is_fallback,
+            response_via,
+            &mut response_headers,
+        );
         if let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
             plain_write_bound.deadline(),
             send_response_headers_with_framing(
@@ -5113,6 +5128,16 @@ where
     if response_inspector.is_some() {
         crate::proxy::headers::remove_content_length_header(&mut response_headers);
     }
+
+    sanitize_client_response_headers_for_wire(
+        &mut response_headers,
+        ClientResponseFraming::for_streaming_response(&ctx.method, status),
+    );
+    super::server::finalize_h3_response_routing_headers(
+        ctx.h3_response_upstream_is_fallback,
+        response_via,
+        &mut response_headers,
+    );
 
     // Send response headers, then stream the body.
     if let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
@@ -5633,6 +5658,8 @@ where
         response_trailer_governance,
         !plugins.is_empty()
             || sticky_cookie_needed
+            || ctx.h3_response_upstream_is_fallback
+            || state.via_header_http2.is_some()
             || streaming.headers.contains_key("content-length"),
     );
 
@@ -5779,6 +5806,16 @@ where
     crate::proxy::strip_content_length_for_streaming_grpc_deadline(
         &mut streaming.headers,
         streaming.grpc_deadline_at,
+    );
+
+    sanitize_client_response_headers_for_wire(
+        &mut streaming.headers,
+        ClientResponseFraming::Streaming,
+    );
+    let gateway_owned_headers = super::server::finalize_h3_response_routing_headers(
+        ctx.h3_response_upstream_is_fallback,
+        state.via_header_http2.as_deref(),
+        &mut streaming.headers,
     );
 
     if let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
@@ -5969,7 +6006,7 @@ where
                 &streaming.headers,
                 &grpc_pre_policy_response_headers,
                 response_trailer_governance,
-                GatewayOwnedResponseHeaders::default(),
+                gateway_owned_headers,
                 TrailerSectionKind::NativeGrpcTerminal,
             );
             if removed > 0 {
@@ -6076,7 +6113,7 @@ where
             &streaming.headers,
             &grpc_pre_policy_response_headers,
             response_trailer_governance,
-            GatewayOwnedResponseHeaders::default(),
+            gateway_owned_headers,
             TrailerSectionKind::NativeGrpcTerminal,
         );
         if removed > 0 {
@@ -7531,6 +7568,14 @@ where
             // §4.1.2 makes malformed. Mirrors the main buffered gRPC path.
             let grpc_framing =
                 ClientResponseFraming::for_buffered_grpc(response_status, response_body.len());
+            sanitize_client_response_headers_for_wire(&mut response_headers, grpc_framing);
+            let gateway_owned_headers = super::server::finalize_h3_response_routing_headers(
+                ctx.h3_response_upstream_is_fallback,
+                state.via_header_http2.as_deref(),
+                &mut response_headers,
+            );
+            response_trailers
+                .retain(|name, _| !gateway_owned_headers.owns(&name.to_ascii_lowercase()));
             let header_write = if terminal_gateway_deadline {
                 crate::http3::stream_util::await_terminal_response_write_before_deadline(
                     grpc_deadline_at,

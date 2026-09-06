@@ -1125,3 +1125,11 @@ upstreams:
         port: 8080
         weight: 1
 ```
+
+HTTP/3 client responses also expose `X-Gateway-Upstream-Status: degraded` when
+selection uses the all-unhealthy fallback. With `FERRUM_ADD_VIA_HEADER=true`,
+HTTP/3 responses append the configured Via pseudonym using the backend hop's
+protocol (`1.1`, `2.0`, or `3.0`), including cross-protocol bridges and buffered
+responses. Existing Via hops are retained. Buffered mesh responses retain the
+shared H1/H2 convention of reporting `1.1` when their retained body has no wire
+version metadata.

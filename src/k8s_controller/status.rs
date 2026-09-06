@@ -925,9 +925,12 @@ pub fn plan_gateway_api_status_updates_budgeted(
     translation_reuse: Option<&StatusTranslationReuse>,
     budget: StatusPlanBudget,
 ) -> GatewayApiStatusPlanOutcome {
+    let plan_started = std::time::Instant::now();
     let conflict_context = gateway_api_status_conflict_context(objects, options.clone());
     let backend_lb_conflict_losers = backend_lb_policy_conflict_losers(objects, &options);
 
+    let conflict_elapsed = plan_started.elapsed();
+    let translation_started = std::time::Instant::now();
     let owned_reuse;
     let reuse = match translation_reuse {
         Some(reuse) => reuse,
@@ -946,6 +949,9 @@ pub fn plan_gateway_api_status_updates_budgeted(
             &owned_reuse
         }
     };
+
+    let translation_elapsed = translation_started.elapsed();
+    let indexing_started = std::time::Instant::now();
 
     // Built after translation: policy-status scoping needs the materialized
     // route→parentRef records, which only exist once translation has run.
@@ -973,6 +979,8 @@ pub fn plan_gateway_api_status_updates_budgeted(
             ))
     });
 
+    let indexing_elapsed = indexing_started.elapsed();
+    let window_started = std::time::Instant::now();
     let window = select_fair_work_window(eligible.len(), budget);
     let mut updates = Vec::new();
     for (_, object) in fair_work_window_iter(&eligible, window) {
@@ -1034,6 +1042,16 @@ pub fn plan_gateway_api_status_updates_budgeted(
         });
     }
 
+    tracing::debug!(
+        objects = objects.len(),
+        reused_translation = translation_reuse.is_some(),
+        conflict_us = conflict_elapsed.as_micros() as u64,
+        translation_us = translation_elapsed.as_micros() as u64,
+        indexing_us = indexing_elapsed.as_micros() as u64,
+        window_us = window_started.elapsed().as_micros() as u64,
+        total_us = plan_started.elapsed().as_micros() as u64,
+        "Gateway API status planning phase timings"
+    );
     GatewayApiStatusPlanOutcome {
         updates,
         next_cursor: window.next_cursor,

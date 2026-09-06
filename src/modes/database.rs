@@ -3307,7 +3307,11 @@ async fn try_publish_full_reload_after_gate(
     // clearing it — otherwise an accepted quarantined reload would report the
     // store as healthy while a plugin the operator configured is not running.
     let quarantined_plugin_configs = new_config.quarantined_plugin_configs.len();
+    let proxy_count = new_config.proxies.len();
+    let upstream_count = new_config.upstreams.len();
+    let apply_started = std::time::Instant::now();
     let outcome = proxy_state.update_config(new_config);
+    let apply_elapsed = apply_started.elapsed();
     let committed = commit_full_reload_poll_state(
         commit_context,
         outcome,
@@ -3318,6 +3322,20 @@ async fn try_publish_full_reload_after_gate(
         quarantined_plugin_configs,
     );
     drop(topology_permit);
+    if let Some(threshold_ms) = proxy_state.env_config.db_slow_query_threshold_ms
+        && apply_elapsed.as_millis() > u128::from(threshold_ms)
+    {
+        warn!(
+            proxy_count,
+            upstream_count,
+            apply_ms = apply_elapsed.as_millis() as u64,
+            threshold_ms,
+            topology_epoch = cursor.topology_epoch,
+            sequence = cursor.sequence,
+            committed,
+            "Slow database full-reload runtime application (database snapshot loading excluded)"
+        );
+    }
     // This is the ONE chokepoint through which an authoritative database FULL
     // snapshot reaches the live runtime, so it is the only place that may
     // settle a trust authority the backup bootstrap left unknown (issue #3727).
