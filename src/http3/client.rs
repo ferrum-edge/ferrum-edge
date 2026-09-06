@@ -4376,13 +4376,9 @@ mod h3_pool_error_tests {
         )
         .unwrap();
         assert_eq!(request.headers().get("grpc-timeout").unwrap(), "60S");
-        let request = build_h3_backend_request_preserving_te(
-            http::Method::GET,
-            "/ordinary",
-            &[],
-            None,
-        )
-        .unwrap();
+        let request =
+            build_h3_backend_request_preserving_te(http::Method::GET, "/ordinary", &[], None)
+                .unwrap();
         assert!(!request.headers().contains_key("grpc-timeout"));
     }
 
