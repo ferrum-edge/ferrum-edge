@@ -197,7 +197,6 @@ jobs:
 
       - name: Run benchmark suite (${{ inputs.iterations }} iteration(s))
         timeout-minutes: 45
-        working-directory: tests/performance/multi_protocol
         env:
           BENCH_ITERATIONS: ${{ inputs.iterations }}
           BENCH_PROTOCOLS: ${{ inputs.protocols }}
@@ -220,7 +219,7 @@ jobs:
               echo "::warning::Run ${run}: CPU steal is ${AVG_STEAL}% before starting — noisy neighbor detected"
             fi
 
-            bash run_protocol_test.sh \
+            bash tests/performance/multi_protocol/run_protocol_test.sh \
               "$BENCH_PROTOCOLS" \
               --skip-build \
               --duration "$BENCH_DURATION" \
