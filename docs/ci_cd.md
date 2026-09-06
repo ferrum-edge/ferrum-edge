@@ -3168,3 +3168,27 @@ logs provide actual layer-reuse evidence. Telemetry records unknown hit/bytes
 for registry reads rather than claiming an Actions cache hit. A missing cache
 can still produce a correct cold build. The ordinary default image retains
 its separate local-cache contract. All package and billing settings stay as-is.
+
+### Completed-job Rust cache publication transition (#4643)
+
+Main run 34064592905 was cancelled during dependency fetching before its Istio
+job compiled anything. Its failure-save post-action published a 168,625,963-byte
+archive under the normal immutable cache key. Later exact-hit consumers cannot
+enrich that entry because the pinned cache action treats an exact hit as up to
+date. This compounds cancellation amplification and quota eviction.
+
+The policy prepares one exact, path-bound, one-way change to
+`setup-rust-ci/action.yml`: `cache-on-failure` becomes `false`, with its action
+description updated to match. The source/destination SHA-256 pair is:
+
+- Source: `219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925`
+- Destination: `1b52b769047dc1ed0ef2b26f9b77603b2c97f9b9f5a87c2da1298e409bf60806`
+
+This policy-only step does not activate the action change. Adoption must also
+update the runtime-cache contract, preserve trusted-main-only saves, and verify
+completed publication and reuse in hosted CI. Failed jobs will lose their newly
+compiled cache state; existing completed caches remain available for restore.
+Known incomplete archives need separate evidence-based retirement so the next
+successful main producer can populate their keys. Do not purge unrelated caches.
+Remove the admission tuple after adoption. Capacity stays at 10 GB and spending
+budgets stay at $0. This does not resolve all Rust archive quota pressure.
