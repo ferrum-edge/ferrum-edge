@@ -38,6 +38,12 @@ from ci_runtime_plan import (
     self_test as plan_self_test,
 )
 from ci_runtime_telemetry import self_test as telemetry_self_test
+from verify_cross_build_policy import (
+    AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB,
+    AMBIENT_REGISTRY_IMAGE_READ_JOB,
+    AMBIENT_REGISTRY_IMAGE_WRITE_JOB,
+    extract_job_contract_block,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -3573,6 +3579,34 @@ def with_scalar(with_block: str, key: str) -> str:
     return value
 
 
+def check_ambient_workflow_cache_budget(workflow: str, failures: list[str]) -> None:
+    """Keep the complete reader/writer generation tied to the trusted contract."""
+    image, extraction_errors = extract_job_contract_block(
+        workflow, "Ambient registry cache", "ambient-host-udp-image", required=True
+    )
+    failures.extend(extraction_errors)
+    if image == AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB:
+        for name, expected in (
+            ("ambient-host-udp-image-read", AMBIENT_REGISTRY_IMAGE_READ_JOB),
+            ("ambient-host-udp-image-write", AMBIENT_REGISTRY_IMAGE_WRITE_JOB),
+        ):
+            actual, extraction_errors = extract_job_contract_block(
+                workflow, "Ambient registry cache", name, required=True
+            )
+            failures.extend(extraction_errors)
+            require(
+                actual == expected,
+                f"{name} must preserve the complete registry cache contract",
+                failures,
+            )
+    else:
+        check_ambient_image_cache_budget(
+            extract_job(workflow, "ambient-host-udp-image"),
+            "ambient-host-udp-image",
+            failures,
+        )
+
+
 def check_ambient_image_cache_budget(
     job_body: str,
     source: str,
@@ -5065,6 +5099,26 @@ def check_dockerfile(failures: list[str]) -> None:
 
 def self_test() -> int:
     failures: list[str] = []
+    registry_fixture = (
+        "jobs:\n" + AMBIENT_REGISTRY_IMAGE_READ_JOB + "\n"
+        + AMBIENT_REGISTRY_IMAGE_WRITE_JOB + "\n"
+        + AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB
+    )
+    registry_errors: list[str] = []
+    check_ambient_workflow_cache_budget(registry_fixture, registry_errors)
+    if registry_errors:
+        failures.append("complete Ambient registry-cache fixture was rejected")
+    for label, removed in (
+        ("reader", AMBIENT_REGISTRY_IMAGE_READ_JOB),
+        ("writer", AMBIENT_REGISTRY_IMAGE_WRITE_JOB),
+        ("aggregate", AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB),
+    ):
+        registry_errors = []
+        check_ambient_workflow_cache_budget(
+            registry_fixture.replace(removed, "", 1), registry_errors
+        )
+        if not registry_errors:
+            failures.append(f"registry-cache fixture without {label} was accepted")
     direct_cache = (
         f"      - uses: {RUST_CACHE}\n"
         "        with:\n"
@@ -8619,11 +8673,7 @@ def main(argv: list[str] | None = None) -> int:
     check_common_trust(ambient, "ambient-host-udp-live.yml", failures)
     check_fips(fips, failures)
     check_production_smoke(node, failures)
-    check_ambient_image_cache_budget(
-        extract_job(ambient, "ambient-host-udp-image"),
-        "ambient-host-udp-image",
-        failures,
-    )
+    check_ambient_workflow_cache_budget(ambient, failures)
     check_shared_actions(failures)
     check_performance_cache_wrapper_key(ci, "ci.yml", failures)
     for filename, job_name, compiler_only in DIRECT_CACHE_DIET_JOBS:
