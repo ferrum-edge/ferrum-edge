@@ -6,25 +6,18 @@
 //! barrier-synchronized workers; Criterion custom-iteration wall time covers
 //! `threads * ITERATIONS_PER_THREAD` operations).
 //!
-//! # Shared-counter control (issue #4484)
+//! # Same-workload reference (issue #4708)
 //!
-//! The 2-target selection fixture does not speed up with thread count even when
-//! the counters are correctly sharded: `LoadBalancer::select` also touches
-//! per-call shared state (snapshot load, refcounts) whose cache lines bounce
-//! across cores. Hosted runs measure roughly 0.6x-0.7x parallel throughput on a
-//! healthy tree, so a *speedup floor* on this fixture asserts a property the
-//! workload does not have.
-//!
-//! `shared_counter_control_{1,8}_threads` runs the same barrier-synchronized
-//! worker pool at the same thread counts over one genuinely shared
-//! `AtomicU64`. That is the cost the sharded counters exist to avoid, measured
-//! on the same runner in the same run, so the verifier can compare the
-//! selection path's per-operation contention cost against a contemporaneous
-//! shared-line reference instead of against a fixed speedup constant. See
-//! `.github/scripts/verify_rr_selection_benchmark.py`.
+//! Hosted CI compiles the same harness against the candidate and an immutable
+//! baseline revision, then interleaves three measurements of each binary on
+//! one runner. The full selection path is compared at each thread count. The
+//! bare shared-counter fixture remains available for exploration, but no
+//! proportional relationship between its cost and selection cost is assumed.
+//! See `.github/scripts/run_rr_selection_comparison.py`.
 
 use std::collections::HashMap;
 use std::hint::black_box;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -113,8 +106,9 @@ fn measure_parallel_batches(work: &Workload, threads: usize, batches: u64) -> Du
 
     let mut total = Duration::ZERO;
     for _ in 0..batches {
-        start_line.wait();
+        // Start before release so no worker can execute outside the timer.
         let started = Instant::now();
+        start_line.wait();
         end_line.wait();
         total += started.elapsed();
     }
@@ -175,5 +169,17 @@ fn bench_rr_selection(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_rr_selection);
+fn criterion_config() -> Criterion {
+    let criterion = Criterion::default();
+    match std::env::var_os("FERRUM_RR_CRITERION_ROOT") {
+        Some(path) => criterion.output_directory(Path::new(&path)),
+        None => criterion,
+    }
+}
+
+criterion_group! {
+    name = benches;
+    config = criterion_config();
+    targets = bench_rr_selection
+}
 criterion_main!(benches);
