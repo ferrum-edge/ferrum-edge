@@ -9,9 +9,12 @@ Cargo commands are literal workflow steps. This helper never executes a process.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
+import signal
 import sys
+import time
 from pathlib import Path
 
 
@@ -19,6 +22,96 @@ PHASES = (
     "default-build", "default-lib", "default-unit",
     "acme-build", "acme-outbound", "acme-dns", "acme-renewal",
 )
+COMPILERS = {"cargo", "rustc", "sccache", "cc", "gcc", "clang", "clang++", "ld", "ld.lld", "rust-lld", "collect2"}
+
+
+def proc_metrics(stat: str, status: str) -> dict[str, int]:
+    """Parse procfs without assuming the parenthesized comm has no spaces."""
+    fields = stat[stat.rindex(")") + 2:].split()
+    sizes = {name: int(value) for name, value in re.findall(
+        r"^(VmRSS|VmSwap):\s+(\d+) kB$", status, re.MULTILINE,
+    )}
+    return {
+        "start_ticks": int(fields[19]),
+        "minor_faults": int(fields[7]), "major_faults": int(fields[9]),
+        "cpu_ticks": int(fields[11]) + int(fields[12]),
+        "rss_kib": sizes.get("VmRSS", 0), "swap_kib": sizes.get("VmSwap", 0),
+    }
+
+
+def compiler_identity(comm: str, command: bytes) -> dict[str, object]:
+    # Never emit argv, environment, paths, or arbitrary option values. Only a
+    # syntactically valid Rust crate identifier is admitted as a target label.
+    result: dict[str, object] = {"comm": comm}
+    if comm == "rustc":
+        args = command.split(b"\0")
+        result["test_harness"] = b"--test" in args
+        for index, arg in enumerate(args[:-1]):
+            if arg == b"--crate-name" and re.fullmatch(rb"[A-Za-z_][A-Za-z0-9_]*", args[index + 1]):
+                result["crate"] = args[index + 1].decode("ascii")
+                break
+    return result
+
+
+def sample_compile(phase: str, parent: int) -> None:
+    """Sample the hosted runner only; never launch or wrap a compiler."""
+    stopped = False
+
+    def stop(_signum, _frame):
+        nonlocal stopped
+        stopped = True
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    root = Path(os.environ["RUNNER_TEMP"]) / "unit-ci"
+    started = time.monotonic()
+    peak_rss = peak_swap = 0
+    samples = 0
+    with (root / f"{phase}.samples.jsonl").open("w", encoding="utf-8") as output:
+        # The parent check prevents an orphan sampler after a failed step. The
+        # deadline also bounds telemetry if a runner does not deliver signals.
+        while not stopped and os.getppid() == parent and time.monotonic() - started < 7200:
+            processes = []
+            vanished = 0
+            for proc in Path("/proc").glob("[0-9]*"):
+                try:
+                    comm = (proc / "comm").read_text().strip()
+                    if comm not in COMPILERS:
+                        continue
+                    before = (proc / "stat").read_text()
+                    metrics = proc_metrics(before, (proc / "status").read_text())
+                    identity = compiler_identity(comm, (proc / "cmdline").read_bytes())
+                    after = proc_metrics((proc / "stat").read_text(), "")
+                    if after["start_ticks"] != metrics["start_ticks"]:
+                        vanished += 1
+                        continue
+                    processes.append({"pid": int(proc.name), **identity, **metrics})
+                except (OSError, ValueError, IndexError):
+                    vanished += 1
+            vm = dict(line.split() for line in Path("/proc/vmstat").read_text().splitlines())
+            memory = dict(re.findall(r"^(MemAvailable|SwapFree):\s+(\d+) kB$",
+                                     Path("/proc/meminfo").read_text(), re.MULTILINE))
+            rss = sum(p["rss_kib"] for p in processes)
+            swap = sum(p["swap_kib"] for p in processes)
+            peak_rss, peak_swap = max(peak_rss, rss), max(peak_swap, swap)
+            output.write(json.dumps({
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "clock_ticks_per_second": os.sysconf("SC_CLK_TCK"),
+                "page_size_bytes": os.sysconf("SC_PAGE_SIZE"),
+                "processes": processes, "concurrent_rss_kib": rss,
+                "concurrent_swap_kib": swap, "vanished_or_unreadable": vanished,
+                "runner_pswpin_pages": int(vm["pswpin"]),
+                "runner_pswpout_pages": int(vm["pswpout"]),
+                "runner_mem_available_kib": int(memory["MemAvailable"]),
+                "runner_swap_free_kib": int(memory["SwapFree"]),
+            }, sort_keys=True) + "\n")
+            output.flush()
+            samples += 1
+            time.sleep(5)
+    print(f"Unit compile samples: {phase}; samples={samples}; "
+          f"peak concurrent RSS={peak_rss} KiB; peak concurrent swap={peak_swap} KiB", flush=True)
+
+
 MINIMUM_PASSED = {
     "default-lib": 5880,
     "default-unit": 18239,
@@ -110,12 +203,14 @@ def validate_output(phase: str, output: str) -> str:
 def validate_usage(phase: str, usage: str) -> str:
     """Require complete GNU time telemetry and a successful child exit."""
     match = re.fullmatch(
-        r"wall_seconds=([0-9]+(?:\.[0-9]+)?) max_child_rss_kib=([0-9]+) exit_status=0\n?",
+        r"wall_seconds=([0-9]+(?:\.[0-9]+)?) max_child_rss_kib=([0-9]+) "
+        r"major_faults=([0-9]+) minor_faults=([0-9]+) exit_status=0\n?",
         usage,
     )
     if match is None:
         raise ValueError(f"{phase}: missing/invalid timing or unsuccessful command")
-    return f"Wall time (including Cargo): {match[1]}s; maximum child RSS: {match[2]} KiB"
+    return (f"Wall time (including Cargo): {match[1]}s; maximum child RSS: {match[2]} KiB; "
+            f"major faults: {match[3]}; minor faults: {match[4]}")
 
 
 def report(phase: str) -> None:
@@ -135,8 +230,14 @@ def report(phase: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("phase", choices=PHASES)
+    parser.add_argument("--sample-parent", type=int)
     args = parser.parse_args()
     try:
+        if args.sample_parent is not None:
+            if not args.phase.endswith("-build") or args.sample_parent <= 1:
+                raise ValueError("sampling requires a compile phase and its live shell parent")
+            sample_compile(args.phase, args.sample_parent)
+            return 0
         report(args.phase)
         return 0
     except (OSError, ValueError, KeyError) as error:

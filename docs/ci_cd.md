@@ -268,9 +268,9 @@ schema- and architecture-scoped local BuildKit cache (`type=local`) through pinn
 `production-dockerfile-smoke-{default,ebpf}-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}`
 with matching `v1-${{ runner.os }}-${{ runner.arch }}-` restore prefixes. The `v1`
 component is the BuildKit cache schema; bump it only when the exported layout
-changes. The Ambient production-image job uses a separate GHA-backend
-restore-only policy documented with that live suite, not this exact-generation
-local cache.
+changes. The Ambient production-image jobs use target-specific GHCR registry
+caches with separate main writers and read-only PR consumers, documented with
+that live suite.
 
 `actions/cache/restore` v4 outputs are classified strictly: `cache-hit == 'true'`
 is an exact primary-key hit; `cache-hit == 'false'` is a restore-key partial
@@ -1340,18 +1340,20 @@ budget is exhausted. The Ambient production-image job previously published
 `scope=ambient-host-udp-images`. Those PR-scoped `buildkit-blob-*` entries
 cannot be restored by other PRs or by `ci-test`, but they still consume the
 shared quota, so ordinary Swatinem rust-cache entries disappear and Unit /
-PKCS#11 jobs compile cold. The image job still restores
-`cache-from: type=gha,scope=ambient-host-udp-images` on every event, including
-fork PRs, so a trusted default-branch cache remains useful. It publishes
-`cache-to` only when `github.ref == 'refs/heads/main'`, the event is neither
-`pull_request` nor `merge_group`, and the head is not a fork — today that is
-`workflow_dispatch` on `main`. The three required image targets
-(`capture-tools-base`, `runtime-ebpf-tools`, `runtime-ebpf`) and their
-executable/distroless contract checks always run; an empty `cache-to` does not
-skip a build. Existing cache entries are left for GitHub's LRU rather than
-deleted by this change. The Fuzz Smoke lane's separate main-only save is owned
-by PR #3918 and is not changed here. The NodeWaypoint/FIPS exact-generation
-local BuildKit design from PR #3889 is also unchanged.
+PKCS#11 jobs compile cold. The Ambient recipes now use target-specific GHCR
+registry caches. Relevant main pushes and main `workflow_dispatch` runs select
+a writer job with `packages: write`; PRs, `merge_group`, and other dispatches
+select a read-only reader with no registry login. Each selected recipe runs the
+three required image targets (`capture-tools-base`, `runtime-ebpf-tools`,
+`runtime-ebpf`) and their executable/distroless checks. The image aggregate
+requires the selected recipe to succeed and the unused recipe to be skipped.
+A cache miss builds cold; an export failure fails the writer. The dedicated
+package must be public before anonymous imports can reuse it. Existing GHA
+entries expire under LRU. See the registry migration section below.
+
+The Fuzz Smoke lane's separate main-only save remains owned by PR #3918. The
+NodeWaypoint/FIPS exact-generation local BuildKit design from PR #3889 is
+unchanged by the Ambient migration.
 
 The shared `setup-rust-ci` action applies the same restore-only policy to the
 Swatinem rust-cache: `save-if` is true only when the event is neither
@@ -3122,3 +3124,28 @@ The expected saving is dependency reuse in the second binary build, not removal
 of tests. Dev-dependency feature unification can still require recompilation
 when the archive build starts. Repository-wide cache capacity is tracked in
 [#4643](https://github.com/ferrum-edge/ferrum-edge/issues/4643).
+
+
+### Ambient registry cache migration (#4643)
+
+The Ambient image recipes now import target-specific BuildKit registry caches
+from `ghcr.io/ferrum-edge/ferrum-edge-buildcache`. Relevant main pushes and main
+workflow dispatches use a dedicated writer job with `packages: write`. PRs,
+merge groups and other dispatches use a reader job with only `contents: read`
+and no registry login. Both jobs retain every production-image contract check;
+`ambient-host-udp-image` requires the selected job to pass and the other to skip.
+The existing outer required check remains `Ambient Host UDP Live`.
+
+This replaces the former `ambient-host-udp-images` GHA scope. Its existing
+entries expire under the usual 10 GB/LRU policy; the workflows no longer export
+new Ambient layers there. The Actions limit and $0 budgets remain unchanged.
+Each of the three targets has its own `ambient-v1-linux-amd64-` cache tag so a
+later target does not overwrite another target's cache graph. GHCR container
+storage and bandwidth are currently free under GitHub's published policy.
+
+The dedicated cache package must be public for anonymous fork imports. Verify
+actual anonymous import after the first trusted-main export; new packages do
+not become public merely because their source repository is public. A missing
+cache still builds cold, while a failed registry export fails the writer. See
+[the migration runbook](ghcr_cache_migration.md) for activation, measurement,
+retention and the separate NodeWaypoint/manual-benchmark follow-ups.

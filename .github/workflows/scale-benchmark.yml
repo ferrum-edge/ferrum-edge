@@ -27,6 +27,7 @@ on:
         options:
           - resources
           - route-status
+          - unit-compile
       baseline_ref:
         description: "Baseline revision for isolated route-status comparison"
         required: false
@@ -45,7 +46,7 @@ on:
 jobs:
   scale-benchmark:
     name: Scale Benchmark (${{ inputs.db_type }})
-    if: inputs.benchmark != 'route-status'
+    if: inputs.benchmark == 'resources'
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -559,3 +560,280 @@ jobs:
           path: ${{ runner.temp }}/route-status-profile/
           retention-days: 14
           if-no-files-found: warn
+
+  unit-scheduling:
+    name: Unit scheduling (${{ matrix.cargo_jobs }} Cargo jobs)
+    if: inputs.benchmark == 'unit-compile'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        cargo_jobs: [1, 3]
+    env:
+      CARGO_BUILD_JOBS: ${{ matrix.cargo_jobs }}
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Extend runner swap for the aggregated unit_tests compile
+        run: |
+          set -euo pipefail
+          # The single-crate rustc frontend for the aggregated tests/unit_tests
+          # binary exceeds hosted-runner RAM on cold compiles: the VM dies with
+          # "The runner has received a shutdown signal" / exit 143 before any
+          # compiler diagnostic can print. Give the VM swap headroom so memory
+          # pressure degrades to paging instead of killing the runner agent.
+          sudo fallocate -l 12G /mnt/ferrum-swapfile
+          sudo chmod 600 /mnt/ferrum-swapfile
+          sudo mkswap /mnt/ferrum-swapfile
+          sudo swapon /mnt/ferrum-swapfile
+          free -h
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-unit-scheduling-downloads"
+
+      - name: Isolate cold compiler state and record provenance
+        run: |
+          set -euo pipefail
+          # Use fresh directories after setup's dependency download/cache step.
+          # Retain downloaded crate sources, but import no compiled artifacts.
+          target_dir="$(mktemp -d "$RUNNER_TEMP/unit-target.XXXXXX")"
+          compiler_cache="$(mktemp -d "$RUNNER_TEMP/unit-sccache.XXXXXX")"
+          if [ -n "${FERRUM_SCCACHE_BIN:-}" ]; then
+            sccache --stop-server || true
+          fi
+          echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
+          echo "SCCACHE_DIR=$compiler_cache" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/unit-experiment" "$RUNNER_TEMP/unit-ci"
+          {
+            git rev-parse HEAD
+            rustc -Vv
+            cargo -V
+            uname -a
+            nproc
+            free -k
+            printf 'cargo_jobs=%s\nprofile_dev_debug=%s\n' "$CARGO_BUILD_JOBS" "$CARGO_PROFILE_DEV_DEBUG"
+            printf 'cold state: empty Cargo target and empty local sccache; downloaded sources may be reused\n'
+          } > "$RUNNER_TEMP/unit-experiment/provenance.txt"
+          date +%s > "$RUNNER_TEMP/unit-experiment/readiness-start.txt"
+
+      - name: Precompile inline and hardening test binaries
+        # Compile both targets in one Cargo invocation before running either.
+        # Otherwise a hosted runner can pass all inline tests, then lose the
+        # entire job while compiling the separate four-test hardening binary.
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/unit-ci"
+          python3 .github/scripts/run_unit_ci.py default-build --sample-parent "$$" &
+          unit_sampler_pid=$!
+          trap 'kill "$unit_sampler_pid" 2>/dev/null || true; wait "$unit_sampler_pid" || true' EXIT
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/default-build.time" cargo test --lib --test unit_tests --no-run --timings 2>&1 | tee "$RUNNER_TEMP/unit-ci/default-build.log"
+          kill "$unit_sampler_pid"
+          wait "$unit_sampler_pid"
+          trap - EXIT
+          cp "$CARGO_TARGET_DIR/cargo-timings/cargo-timing.html" "$RUNNER_TEMP/unit-ci/default-build.cargo-timing.html"
+          python3 .github/scripts/run_unit_ci.py default-build
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Run inline lib tests
+        # Covers `#[cfg(test)] mod tests` blocks inline in `src/` (used for
+        # private fns/structs that the separate tests/ binaries can't see).
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/unit-ci"
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/default-lib.time" cargo test --lib 2>&1 | tee "$RUNNER_TEMP/unit-ci/default-lib.log"
+          python3 .github/scripts/run_unit_ci.py default-lib
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Run cache accounting and reload safety regressions
+        # These tests are also part of the complete unit suite below. Run the
+        # explicit contract first so test deletion/renaming cannot silently
+        # weaken the hardening gate, while reusing the same compiled test
+        # binary instead of paying for a second cold Rust job.
+        run: |
+          set -euo pipefail
+          hardening_tests=(
+            unit::plugins::response_caching_tests::test_concurrent_stores_keep_size_bounded_and_non_wrapping
+            unit::plugins::plugin_cache_tests::test_rebuild_rejects_malformed_body_validator_and_keeps_prior_cache
+            unit::plugins::plugin_cache_tests::test_apply_delta_rejects_malformed_request_size_limiting_and_keeps_prior_cache
+            unit::plugins::plugin_cache_tests::test_apply_delta_rejects_unknown_enabled_plugin_and_keeps_prior_cache
+          )
+
+          set +e
+          test_output="$(cargo test --test unit_tests -- --exact "${hardening_tests[@]}" 2>&1)"
+          test_status=$?
+          set -e
+
+          printf '%s\n' "$test_output"
+          if [ "$test_status" -ne 0 ]; then
+            exit "$test_status"
+          fi
+
+          if ! printf '%s\n' "$test_output" | grep -qE '^test result: ok\. 4 passed; 0 failed; 0 ignored;'; then
+            echo "::error::expected exactly 4 plugin hardening unit regressions to run and pass"
+            exit 1
+          fi
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Summarize plugin hardening unit regressions
+        if: always()
+        run: |
+          echo "## Plugin Hardening Unit Regressions" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- test_concurrent_stores_keep_size_bounded_and_non_wrapping" >> $GITHUB_STEP_SUMMARY
+          echo "- test_rebuild_rejects_malformed_body_validator_and_keeps_prior_cache" >> $GITHUB_STEP_SUMMARY
+          echo "- test_apply_delta_rejects_malformed_request_size_limiting_and_keeps_prior_cache" >> $GITHUB_STEP_SUMMARY
+          echo "- test_apply_delta_rejects_unknown_enabled_plugin_and_keeps_prior_cache" >> $GITHUB_STEP_SUMMARY
+
+      - name: Run kTLS live-kernel handoff proof
+        # Issue #3619 re-enabled a handoff that had been INERT, so classifier
+        # unit tests are not sufficient evidence. These tests drive a real
+        # rustls TLS 1.2 client against the real `try_ktls_accept`, install
+        # kernel TLS keys on this runner's kernel, relay application bytes
+        # through splice(2), and assert the close handshake: an authenticated
+        # close_notify is clean EOF, a bare FIN is a truncation, a backend EOF
+        # produces the reciprocal alert, and an unauthenticated record never
+        # becomes EOF.
+        #
+        # `FERRUM_KTLS_LIVE_REQUIRED=1` makes an unavailable kernel capability
+        # a failure rather than a skip, and the SKIP/`test result` assertions
+        # below make "the live path did not run" indistinguishable from a red
+        # gate. This job is `require_success "Unit and inline lib"` in the
+        # required `Tests` aggregate, so the live path is genuinely blocking.
+        run: |
+          set -euo pipefail
+          # The TLS ULP normally autoloads from setsockopt(TCP_ULP); load it
+          # explicitly too so a failure below is about the handoff, not the
+          # module.
+          sudo modprobe tls || true
+
+          set +e
+          output="$(cargo test --lib -- --ignored --nocapture --test-threads=1 \
+            proxy::ktls_live_kernel_tests 2>&1)"
+          status=$?
+          set -e
+
+          printf '%s\n' "$output"
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          if grep -q '^SKIP:' <<<"$output"; then
+            echo "::error::kTLS live-kernel tests skipped under required CI mode"
+            exit 1
+          fi
+          if ! grep -Eq '^test result: ok\. 3 passed; 0 failed;' <<<"$output"; then
+            echo "::error::expected exactly 3 kTLS live-kernel tests to pass"
+            exit 1
+          fi
+        env:
+          FERRUM_KTLS_LIVE_REQUIRED: "1"
+          RUST_BACKTRACE: 1
+
+      - name: Run unit tests
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/unit-ci"
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/default-unit.time" cargo test --test unit_tests 2>&1 | tee "$RUNNER_TEMP/unit-ci/default-unit.log"
+          python3 .github/scripts/run_unit_ci.py default-unit
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Precompile ACME library and DNS hook test binaries
+        # Keep inline ACME coverage, but compile only the two-test DNS target
+        # alongside it: enabling ACME must not rebuild monolithic unit_tests.
+        # Default suites above retain their full target graph and test counts.
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/unit-ci"
+          python3 .github/scripts/run_unit_ci.py acme-build --sample-parent "$$" &
+          unit_sampler_pid=$!
+          trap 'kill "$unit_sampler_pid" 2>/dev/null || true; wait "$unit_sampler_pid" || true' EXIT
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/acme-build.time" cargo test --features acme --lib --test acme_dns01_tests --no-run --timings 2>&1 | tee "$RUNNER_TEMP/unit-ci/acme-build.log"
+          kill "$unit_sampler_pid"
+          wait "$unit_sampler_pid"
+          trap - EXIT
+          cp "$CARGO_TARGET_DIR/cargo-timings/cargo-timing.html" "$RUNNER_TEMP/unit-ci/acme-build.cargo-timing.html"
+          python3 .github/scripts/run_unit_ci.py acme-build
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Run ACME outbound-boundary regressions
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/unit-ci"
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/acme-outbound.time" cargo test --features acme --lib tls::acme::client::tests 2>&1 | tee "$RUNNER_TEMP/unit-ci/acme-outbound.log"
+          python3 .github/scripts/run_unit_ci.py acme-outbound
+        env:
+          RUST_BACKTRACE: 1
+
+      # The `acme` feature is not default, so the unit suite above compiles the
+      # DNS-01 hook out entirely. Issue #2409's cancellation contract (a hook
+      # child must not outlive the renewal claim) only has a gate if it is run
+      # explicitly with the feature on.
+      - name: Run ACME DNS-01 hook cancellation regressions
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/unit-ci"
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/acme-dns.time" cargo test --features acme --test acme_dns01_tests 2>&1 | tee "$RUNNER_TEMP/unit-ci/acme-dns.log"
+          python3 .github/scripts/run_unit_ci.py acme-dns
+        env:
+          RUST_BACKTRACE: 1
+
+      # Same reason: the renewal-resumption entry point (issue #2409's crash
+      # recovery) only exists behind `acme`, so the takeover/skip decisions it
+      # makes before any ACME networking need the feature on to be gated at all.
+      - name: Run ACME renewal crash-recovery regressions
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/unit-ci"
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/acme-renewal.time" cargo test --features acme --lib tls::acme_renewal_resume_tests 2>&1 | tee "$RUNNER_TEMP/unit-ci/acme-renewal.log"
+          python3 .github/scripts/run_unit_ci.py acme-renewal
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Preserve cold readiness evidence
+        run: |
+          set -euo pipefail
+          date +%s > "$RUNNER_TEMP/unit-experiment/readiness-end.txt"
+          cp -a "$RUNNER_TEMP/unit-ci" "$RUNNER_TEMP/unit-experiment/cold"
+
+      - name: Measure same-workspace reuse after both feature builds
+        run: |
+          set -euo pipefail
+          for phase in default-build acme-build; do
+            python3 .github/scripts/run_unit_ci.py "$phase" --sample-parent "$$" &
+            unit_sampler_pid=$!
+            trap 'kill "$unit_sampler_pid" 2>/dev/null || true; wait "$unit_sampler_pid" || true' EXIT
+            if [ "$phase" = default-build ]; then
+              /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/default-build.time" cargo test --lib --test unit_tests --no-run --timings 2>&1 | tee "$RUNNER_TEMP/unit-ci/default-build.log"
+            else
+              /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/acme-build.time" cargo test --features acme --lib --test acme_dns01_tests --no-run --timings 2>&1 | tee "$RUNNER_TEMP/unit-ci/acme-build.log"
+            fi
+            kill "$unit_sampler_pid"
+            wait "$unit_sampler_pid"
+            trap - EXIT
+            cp "$CARGO_TARGET_DIR/cargo-timings/cargo-timing.html" "$RUNNER_TEMP/unit-ci/$phase.cargo-timing.html"
+            python3 .github/scripts/run_unit_ci.py "$phase"
+            mkdir -p "$RUNNER_TEMP/unit-experiment/warm"
+            cp "$RUNNER_TEMP/unit-ci/$phase".* "$RUNNER_TEMP/unit-experiment/warm/"
+          done
+
+      - name: Preserve scheduling experiment evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: unit-scheduling-${{ matrix.cargo_jobs }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/unit-ci/
+            ${{ runner.temp }}/unit-experiment/
+          retention-days: 7
+          if-no-files-found: error

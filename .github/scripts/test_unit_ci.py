@@ -12,7 +12,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from run_unit_ci import MINIMUM_PASSED, REQUIRED_TESTS, main, validate_output, validate_usage
+from run_unit_ci import (
+    MINIMUM_PASSED, REQUIRED_TESTS, compiler_identity, main, proc_metrics,
+    validate_output, validate_usage,
+)
 
 
 COMMANDS = {
@@ -52,13 +55,26 @@ def contract_errors(workflow: str, manifest: str, tls_modules: str) -> list[str]
             "run: |",
             "set -euo pipefail",
             'mkdir -p "$RUNNER_TEMP/unit-ci"',
-            f"/usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M exit_status=%x' "
+            f"/usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' "
             f'--output="$RUNNER_TEMP/unit-ci/{phase}.time" {COMMANDS[phase]} '
             f'2>&1 | tee "$RUNNER_TEMP/unit-ci/{phase}.log"',
             f"python3 .github/scripts/run_unit_ci.py {phase}",
             "env:",
             "RUST_BACKTRACE: 1",
         ]
+        if phase.endswith("-build"):
+            expected[4] = expected[4].replace("--no-run 2>&1", "--no-run --timings 2>&1")
+            expected[4:4] = [
+                f'python3 .github/scripts/run_unit_ci.py {phase} --sample-parent "$$" &',
+                "unit_sampler_pid=$!",
+                "trap 'kill \"$unit_sampler_pid\" 2>/dev/null || true; wait \"$unit_sampler_pid\" || true' EXIT",
+            ]
+            expected[8:8] = [
+                'kill "$unit_sampler_pid"',
+                'wait "$unit_sampler_pid"',
+                "trap - EXIT",
+                f'cp target/cargo-timings/cargo-timing.html "$RUNNER_TEMP/unit-ci/{phase}.cargo-timing.html"',
+            ]
         if len(candidates) != 1 or [
             line.strip() for line in candidates[0].splitlines()
             if line.strip() and not line.lstrip().startswith("#")
@@ -106,6 +122,29 @@ def output_for(phase: str, *, passed: int | None = None, ignored: int = 0, filte
         f"\ntest result: ok. {count} passed; 0 failed; {ignored} ignored; "
         f"0 measured; {filtered} filtered out; finished in 0.10s\n"
     )
+
+
+class CompileTelemetryTests(unittest.TestCase):
+    def test_proc_fields_keep_faults_cpu_start_identity_and_memory_separate(self):
+        # Fields 3..22 of proc(5) stat; comm may contain spaces and parentheses.
+        fields = ["S", "42", "0", "0", "0", "0", "0", "101", "999", "7", "888", "23", "31", "0", "0", "0", "0", "0", "0", "456"]
+        metrics = proc_metrics("123 (rustc (worker)) " + " ".join(fields),
+                               "Name:\trustc\nVmRSS:\t1024 kB\nVmSwap:\t512 kB\n")
+        self.assertEqual(metrics, {
+            "start_ticks": 456, "minor_faults": 101, "major_faults": 7,
+            "cpu_ticks": 54, "rss_kib": 1024, "swap_kib": 512,
+        })
+        self.assertEqual(proc_metrics("123 (rustc) " + " ".join(fields), "")["rss_kib"], 0)
+        with self.assertRaises(ValueError):
+            proc_metrics("invalid", "")
+
+    def test_identity_never_reports_arbitrary_arguments_or_paths(self):
+        self.assertEqual(compiler_identity("rustc", b"/private/path/rustc\0--crate-name\0unit_tests\0--test\0secret=value\0"),
+                         {"comm": "rustc", "test_harness": True, "crate": "unit_tests"})
+        for value in (b"/private/path", b"token=value", b"not a crate", b"\xff"):
+            self.assertEqual(compiler_identity("rustc", b"rustc\0--crate-name\0" + value + b"\0"),
+                             {"comm": "rustc", "test_harness": False})
+        self.assertEqual(compiler_identity("sccache", b"sccache\0--secret\0value\0"), {"comm": "sccache"})
 
 
 class SelectionTests(unittest.TestCase):
@@ -202,7 +241,7 @@ class ContractTests(unittest.TestCase):
 
 class ReportTests(unittest.TestCase):
     def test_missing_proof_and_failed_commands_cannot_turn_green(self):
-        success = "wall_seconds=1.25 max_child_rss_kib=2048 exit_status=0\n"
+        success = "wall_seconds=1.25 max_child_rss_kib=2048 major_faults=3 minor_faults=40 exit_status=0\n"
         for phase in ("acme-dns", "acme-build"):
             for usage, output, expected in (
                 (success, output_for("acme-dns"), 0),
@@ -234,7 +273,7 @@ class ReportTests(unittest.TestCase):
                         self.assertIn("precompile" if phase.endswith("-build") else "2 passed", summary.read_text())
 
     def test_malformed_or_duplicate_telemetry_is_rejected(self):
-        success = "wall_seconds=1.25 max_child_rss_kib=2048 exit_status=0\n"
+        success = "wall_seconds=1.25 max_child_rss_kib=2048 major_faults=3 minor_faults=40 exit_status=0\n"
         for usage in (success * 2, success.replace("1.25", "nan"), success.replace("2048", "-1"),
                       success.replace(" exit_status=0", "")):
             with self.subTest(usage=usage), self.assertRaises(ValueError):
@@ -248,7 +287,7 @@ class PipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             result = subprocess.run(
                 ["bash", "-c", """set -euo pipefail
-/usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M exit_status=%x' --output=phase.time bash -c 'echo command-output; exit 42' 2>&1 | tee phase.log
+/usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output=phase.time bash -c 'echo command-output; exit 42' 2>&1 | tee phase.log
 echo reporter-ran > reporter.marker
 """],
                 cwd=root, capture_output=True, text=True, check=False, timeout=10,
@@ -261,7 +300,7 @@ echo reporter-ran > reporter.marker
         with tempfile.TemporaryDirectory() as root:
             result = subprocess.run(
                 ["bash", "-c", """set -euo pipefail
-/usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M exit_status=%x' --output=phase.time echo command-output 2>&1 | tee missing-directory/phase.log
+/usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output=phase.time echo command-output 2>&1 | tee missing-directory/phase.log
 echo reporter-ran > reporter.marker
 """],
                 cwd=root, capture_output=True, text=True, check=False, timeout=10,
@@ -274,7 +313,7 @@ echo reporter-ran > reporter.marker
 def self_test() -> list[str]:
     suite = unittest.TestSuite(
         unittest.defaultTestLoader.loadTestsFromTestCase(case)
-        for case in (SelectionTests, ContractTests, ReportTests, PipelineTests)
+        for case in (CompileTelemetryTests, SelectionTests, ContractTests, ReportTests, PipelineTests)
     )
     result = unittest.TextTestRunner(verbosity=1).run(suite)
     return [] if result.wasSuccessful() else ["unit CI selection/target self-tests failed"]
