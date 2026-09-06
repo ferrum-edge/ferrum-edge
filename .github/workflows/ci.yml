@@ -1352,6 +1352,7 @@ jobs:
               functional_h3_soap_utf16_test
               functional_http3_connect_udp_test
               functional_key_auth_query_test
+              functional_max_forwards_test
               functional_request_mirror_admission_test
               functional_request_mirror_query_parity_test
               functional_request_transformer_query_test

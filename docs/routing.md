@@ -308,6 +308,24 @@ Two protocol-level filters run **before** route match and also return 405:
 
 Those 405s carry a static `Allow: GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS`. TRACE and CONNECT are omitted because the same filter rejected them. There is no matched proxy yet, so `allowed_methods` cannot supply the list.
 
+### Max-Forwards on OPTIONS
+
+RFC 9110 §7.6.2 requires an intermediary that forwards `OPTIONS` to process the client's `Max-Forwards` hop budget. The gateway takes one checked decision per inbound request, shared by the HTTP/1.1, HTTP/2, native HTTP/3, and HTTP/3-to-HTTP/1.1/2 bridge frontends. It runs after authentication, authorization, the `cors` plugin's local preflight answer, and every `before_proxy` transform, and before any backend transport is dialed:
+
+| `OPTIONS` request field | Gateway behaviour |
+|---|---|
+| absent | Forwarded unchanged (existing behaviour). |
+| `Max-Forwards: 0` | The gateway is the final recipient: it responds **204 No Content** with an `Allow` field and never contacts the origin. |
+| `Max-Forwards: N`, N ≥ 1 | Forwarded with `Max-Forwards: N-1`. |
+| malformed (`abc`, `-1`, `1.0`, empty) or repeated field lines (`1, 1`) | **400 Bad Request** with `{"error":"Invalid Max-Forwards header"}`; the origin is never contacted. |
+
+- The value is parsed as `1*DIGIT` into an unsigned 32-bit integer with saturation, so no digit count can overflow or panic. A value above 4294967295 is treated as that maximum (RFC 9110 §7.6.2 lets an intermediary forward the greatest value it can process) and goes out as 4294967294.
+- `Max-Forwards` is not a list-based field (RFC 9110 §5.3). Repeated field lines are refused rather than combined or picked from, even when their values agree: a request whose hop budget cannot be read unambiguously is not forwarded with a reset or guessed budget.
+- The decrement happens exactly once per inbound request, not once per retry attempt. Retries reuse the same outbound header map, and every transport (reqwest, direct HTTP/2, the HTTP/3 client, HBONE, and mesh-mTLS replay) layers that map over any raw header snapshot, so the client's original value cannot reappear on the wire.
+- `Allow` on the 204 lists the proxy's `allowed_methods` (uppercased, config order) when configured, otherwise the static protocol-level list above.
+- A protected route still returns its normal 401/403 before the hop budget is consulted, a CORS preflight carrying `Max-Forwards: 0` is still answered by the `cors` plugin, and response-phase plugins decorate the 204/400 exactly as they decorate any other gateway-local rejection. Transaction logs record `metadata.rejection_phase = "max_forwards"`.
+- Only `OPTIONS` is processed. Every other method keeps its existing behaviour and forwards the field unchanged; `TRACE` stays rejected with 405 before routing.
+
 ## WebSocket Origin admission
 
 Browsers do not apply the CORS protocol to WebSocket upgrade handshakes. The `cors`
