@@ -596,7 +596,7 @@ async fn a_refused_scope_announces_its_fault_once_and_recovers_once() {
     }
     tokio::time::sleep(SETTLE).await;
     assert_eq!(harness.watch_errors(), 1, "one attempt per hold");
-    assert_eq!(logs.matching("ERROR", "class=forbidden").len(), 1);
+    assert_eq!(logs.matching("ERROR", "class=\"forbidden\"").len(), 1);
 
     tokio::time::sleep(FORBIDDEN_WATCH_HOLD + SETTLE).await;
     tokio::time::sleep(FORBIDDEN_WATCH_HOLD + SETTLE).await;
@@ -606,7 +606,7 @@ async fn a_refused_scope_announces_its_fault_once_and_recovers_once() {
         "each hold expiry polls the stream once"
     );
     assert_eq!(
-        logs.matching("ERROR", "class=forbidden").len(),
+        logs.matching("ERROR", "class=\"forbidden\"").len(),
         1,
         "the fault is announced once, not once per attempt: {:?}",
         logs.lines()
@@ -634,7 +634,7 @@ async fn a_refused_scope_announces_its_fault_once_and_recovers_once() {
         "recovery reports the whole streak: {recovered:?}"
     );
     assert_eq!(harness.watch_errors(), 3);
-    assert_eq!(logs.matching("ERROR", "class=forbidden").len(), 1);
+    assert_eq!(logs.matching("ERROR", "class=\"forbidden\"").len(), 1);
 
     let _ = shutdown_tx.send(true);
     watcher.await.expect("watcher task");
@@ -750,7 +750,7 @@ async fn a_failed_initial_list_is_held_for_a_doubling_interval() {
     list(&harness, 0, &["blackbox-tcp-main"]);
     tokio::time::sleep(SETTLE).await;
     assert_eq!(harness.watch_errors(), 1);
-    assert_eq!(logs.matching("ERROR", "class=list_failed").len(), 1);
+    assert_eq!(logs.matching("ERROR", "class=\"list_failed\"").len(), 1);
 
     // Holds of one, two, and four floors.
     tokio::time::sleep(LIST_FAILURE_HOLD_FLOOR).await;
@@ -774,7 +774,7 @@ async fn a_failed_initial_list_is_held_for_a_doubling_interval() {
     );
     tokio::time::sleep(LIST_FAILURE_HOLD_FLOOR + SETTLE).await;
     assert_eq!(harness.visible_names().await, vec!["blackbox-tcp-main"]);
-    assert_eq!(logs.matching("ERROR", "class=list_failed").len(), 1);
+    assert_eq!(logs.matching("ERROR", "class=\"list_failed\"").len(), 1);
     assert_eq!(logs.matching("INFO", "recovered").len(), 1);
 
     let _ = shutdown_tx.send(true);
