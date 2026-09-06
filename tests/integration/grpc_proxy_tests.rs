@@ -2577,6 +2577,14 @@ async fn request_mirror_prebuffer_handles_client_stream_and_cancellation_without
     tokio::time::sleep(Duration::from_millis(25)).await;
     response_task.abort();
     connection_task.abort();
+    // abort() schedules cancellation; it does not wait for the body consumer
+    // to stop. Closing the producer first can send a clean END_STREAM and
+    // correctly dispatch the complete one-frame request instead of cancelling.
+    let _ = response_task.await;
+    let _ = connection_task.await;
+    tokio::time::timeout(Duration::from_secs(5), body_tx.closed())
+        .await
+        .expect("cancelled HTTP/2 request must release its body receiver");
     drop(body_tx);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
