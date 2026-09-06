@@ -40,7 +40,8 @@ remain the way to require `ns` claims on a **single-namespace** CP.
 > **Breaking on adoption.** Pointing an existing admin token at a CP whose
 > `FERRUM_CP_NAMESPACES` names multiple namespaces now returns `403` on
 > namespace-scoped admin routes (`/proxies`, `/consumers`, `/upstreams`,
-> `/plugins/config`, `/api-specs`, `/batch`, `/backup`, `/restore`, `/audit`)
+> `/plugins/config`, `/api-specs`, `/batch`, `/backup`, `/restore`, `/audit`,
+> `/gateway-trust-bundles`, `/gateway-trust` including `/gateway-trust/status`)
 > unless the token carries an `ns` claim. Re-mint operator tokens with `ns`
 > before widening the CP scope.
 
