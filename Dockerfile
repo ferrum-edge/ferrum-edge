@@ -129,6 +129,7 @@ COPY ebpf ./ebpf
 # `cloud-secrets` image and the `cloud-secrets,ebpf` image reuse that work.
 ARG FEATURES
 ARG TARGETARCH
+ARG CARGO_PROFILE=release
 
 # Issue #4602: the release profile is fat LTO with a single codegen unit, and
 # the final `ferrum-edge` bin-crate compile under that profile exhausts the
@@ -143,14 +144,15 @@ ENV FERRUM_ARM64_RELEASE_PROFILE_ENV="CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFI
 RUN mkdir src && \
     echo 'fn main() { println!("dummy"); }' > src/main.rs && \
     if [ "${TARGETARCH}" = "arm64" ]; then export ${FERRUM_ARM64_RELEASE_PROFILE_ENV}; fi && \
-    cargo build --features "${FEATURES}" --release 2>/dev/null || true && \
+    cargo build --features "${FEATURES}" --profile "${CARGO_PROFILE}" 2>/dev/null || true && \
     rm -rf src
 
 # ── Build the real binary ───────────────────────────────────────────────
 COPY src ./src
 # Touch main.rs so cargo knows it changed (not the dummy)
 RUN if [ "${TARGETARCH}" = "arm64" ]; then export ${FERRUM_ARM64_RELEASE_PROFILE_ENV}; fi && \
-    touch src/main.rs && cargo build --features "${FEATURES}" --release
+    touch src/main.rs && cargo build --features "${FEATURES}" --profile "${CARGO_PROFILE}" && \
+    install -m 0755 "target/${CARGO_PROFILE}/ferrum-edge" "target/${CARGO_PROFILE}/ferrum-cni" /build/
 
 # Distroless has no shell; stage the empty SQLite volume directory here.
 RUN mkdir -m 0755 /data
@@ -162,8 +164,8 @@ FROM runtime-base AS runtime-common
 WORKDIR /app
 
 # Copy binary from builder
-COPY --from=builder --chown=65532:65532 /build/target/release/ferrum-edge /app/ferrum-edge
-COPY --from=builder --chown=65532:65532 /build/target/release/ferrum-cni /app/ferrum-cni
+COPY --from=builder --chown=65532:65532 /build/ferrum-edge /app/ferrum-edge
+COPY --from=builder --chown=65532:65532 /build/ferrum-cni /app/ferrum-cni
 COPY --from=builder --chown=65532:65532 /data/ /data/
 
 # Set environment variables. `FERRUM_LOG_LEVEL` defaults to `warn` so the startup
@@ -263,8 +265,8 @@ FROM capture-tools-base AS runtime-ebpf-tools
 
 WORKDIR /app
 
-COPY --from=builder /build/target/release/ferrum-edge /app/ferrum-edge
-COPY --from=builder /build/target/release/ferrum-cni /app/ferrum-cni
+COPY --from=builder /build/ferrum-edge /app/ferrum-edge
+COPY --from=builder /build/ferrum-cni /app/ferrum-cni
 COPY --from=ebpf-builder \
     /build/ebpf/target/bpfel-unknown-none/release/ferrum-ebpf /app/bpf/ferrum-ebpf
 

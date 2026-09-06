@@ -1,47 +1,12 @@
 #!/usr/bin/env python3
-"""Publish-blocking required-check contract (issue #4302).
+"""Require exact-commit evidence before creating or publishing a production tag.
 
-`.github/required-publication-checks.json` is the ONE canonical, machine-consumed
-inventory of the repository-required product checks that must be successful, for
-the exact product SHA, under trusted workflow identity, before anything is
-published: the mutable `latest` GitHub prerelease, the mutable `latest` /
-`main-<sha>` Docker tags, and the immutable version-tag release artifacts.
-
-This module is the only consumer of that inventory. It provides two things:
-
-* a STATIC contract (`contract_errors`) that checks parity between the
-  branch-protection required set, ci.yml's frozen `main-publish-gate` polling
-  array, the `main-publication-required-checks` job, release.yml's
-  `validate-release-sha` step, and the inventory. Adding a required context
-  without publication coverage makes that contract fail, which is what
-  `.github/scripts/verify_required_ci.py` runs on every pull request. The
-  inventory, this verifier, and the hosted gate are PR-mutable and therefore
-  provide drift detection at the same trust tier as `verify_required_ci.py`;
-  this static contract does not freeze or protect its own enforcement code.
-* a RUNTIME gate (`enforce`) that both publication paths execute. It resolves
-  each required workflow by its canonical file, workflow id, path, and name,
-  then requires every matching run or bound check run to have completed
-  successfully under the evidence kind's exact SHA, event, and branch. Each
-  polling sweep re-evaluates the complete selected set; a success observed
-  while another context is still pending is never cached, and the permitting
-  sweep revalidates workflow identity and PR binding before returning. Missing,
-  queued, in-progress, waiting, failed, cancelled, skipped, timed-out, stale,
-  neutral, and unknown results are all blocking, as are wrong-SHA, wrong-event,
-  wrong-branch, wrong-path, wrong-workflow-id, and fork/untrusted runs. A
-  display name alone is never an identity.
-
-Why publication cannot simply be one gate: ci.yml's `main-publish-gate` job and
-the `needs`/`if` of `latest-release`, `docker`, and `docker-manifest` are frozen
-byte-for-byte by `.github/scripts/verify_cross_build_policy.py`, a protected
-trusted-policy file no pull request may modify. The frozen array therefore keeps
-carrying three of the nine contexts, while `Tests` is carried by the publishing
-jobs' in-run dependency. The remaining five are carried by the
-`main-publication-required-checks` job hosted in
-`gateway-api-conformance.yml` -- a workflow whose RUN CONCLUSION the frozen
-array already requires to be successful for the exact SHA. The single-valued
-`main_publication` field and the consumer-specific parity checks keep the two
-publisher sides an exhaustive, non-overlapping partition without an independent
-hard-coded subset.
+The canonical inventory covers every branch-required product check. Both the
+manual release request and the tag-triggered production workflow verify the
+complete inventory, trusted workflow identity, main ancestry, and PR binding.
+The existing main evidence job collects its designated subset; it publishes
+nothing. Missing, cancelled, stale, skipped, or failed evidence blocks release.
+The trusted-base policy freezes this verifier and inventory against PR edits.
 """
 
 from __future__ import annotations
@@ -166,18 +131,9 @@ RELEASE_GATE_ACTIVE_COMMANDS = (
     "--deadline-seconds 9600",
 )
 
-# `main_publication` says which publication control carries a context on the
-# `main` publishing path. The three values partition the inventory.
-MAIN_PUBLICATION_MODES = (
-    # Proven in-run: the publishing jobs declare `needs: <job>` on it and
-    # require `success`, so no Actions API evidence is involved.
-    "ci_job_dependency",
-    # Carried by the frozen `main-publish-gate` same-SHA polling array.
-    "ci_main_publish_gate",
-    # Carried by the `main-publication-required-checks` job, whose run
-    # conclusion the frozen array requires for the same SHA.
-    "publication_gate_job",
-)
+# The main evidence job collects its subset before a release is requested.
+# Both release gates independently require ALL stages, including Tests.
+VALIDATION_STAGES = ("tests_aggregate", "release_gate", "main_evidence_gate")
 
 # `evidence` says how a run is bound to the exact product SHA.
 EVIDENCE_MODES = ("push_main", "pr_head", "check_run")
@@ -188,7 +144,7 @@ REQUIRED_ENTRY_FIELDS = (
     "workflow_path",
     "workflow_name",
     "job",
-    "main_publication",
+    "validation_stage",
     "evidence",
     "rationale",
 )
@@ -318,10 +274,10 @@ def inventory_errors(inventory: dict) -> list[str]:
                 f"{located} workflow_path {workflow_path!r} must be "
                 f".github/workflows/{entry['workflow_file']}"
             )
-        if entry["main_publication"] not in MAIN_PUBLICATION_MODES:
+        if entry["validation_stage"] not in VALIDATION_STAGES:
             errors.append(
-                f"{located} main_publication must be one of "
-                f"{list(MAIN_PUBLICATION_MODES)}"
+                f"{located} validation_stage must be one of "
+                f"{list(VALIDATION_STAGES)}"
             )
         if entry["evidence"] not in EVIDENCE_MODES:
             errors.append(f"{located} evidence must be one of {list(EVIDENCE_MODES)}")
@@ -331,7 +287,7 @@ def inventory_errors(inventory: dict) -> list[str]:
 
 
 def by_mode(inventory: dict, mode: str) -> list[dict]:
-    return [entry for entry in entries(inventory) if entry["main_publication"] == mode]
+    return [entry for entry in entries(inventory) if entry["validation_stage"] == mode]
 
 
 # ---------------------------------------------------------------------------
@@ -806,41 +762,6 @@ def _proof_step_errors(
     return errors
 
 
-def parse_main_publish_gate_specs(ci_yml: str) -> tuple[tuple[str, str, str], ...]:
-    """Return the frozen `main-publish-gate` polling array as parsed records."""
-
-    body = job_body(ci_yml, "main-publish-gate")
-    if body is None:
-        raise ContractError(f"{CI_WORKFLOW_PATH} has no `main-publish-gate` job")
-    match = re.search(
-        r"(?ms)^\s*required_workflow_specs=\(\n(?P<rows>.*?)^\s*\)\n",
-        body,
-    )
-    if match is None:
-        raise ContractError(
-            f"{CI_WORKFLOW_PATH} `main-publish-gate` has no "
-            "`required_workflow_specs` array to compare with the inventory"
-        )
-    specs: list[tuple[str, str, str]] = []
-    for line in match.group("rows").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if not (stripped.startswith('"') and stripped.endswith('"')):
-            raise ContractError(
-                f"{CI_WORKFLOW_PATH} `main-publish-gate` array row {stripped!r} "
-                "is not a plain double-quoted record"
-            )
-        fields = stripped[1:-1].split("|")
-        if len(fields) != 3:
-            raise ContractError(
-                f"{CI_WORKFLOW_PATH} `main-publish-gate` array row {stripped!r} "
-                "must be `file|path|display name`"
-            )
-        specs.append((fields[0], fields[1], fields[2]))
-    return tuple(specs)
-
-
 def required_context_parity_errors(
     required_contexts: dict[str, str],
     inventory: dict,
@@ -878,81 +799,7 @@ def required_context_parity_errors(
     return errors
 
 
-def main_publish_gate_parity_errors(ci_yml: str, inventory: dict) -> list[str]:
-    """Prove the frozen ci.yml array equals the `ci_main_publish_gate` subset."""
-
-    try:
-        specs = parse_main_publish_gate_specs(ci_yml)
-    except ContractError as error:
-        return [str(error)]
-    actual = set(specs)
-    if len(actual) != len(specs):
-        return [
-            f"{CI_WORKFLOW_PATH} `main-publish-gate` array has duplicate records"
-        ]
-    expected = {
-        (entry["workflow_file"], entry["workflow_path"], entry["workflow_name"])
-        for entry in by_mode(inventory, "ci_main_publish_gate")
-    }
-    if actual == expected:
-        return []
-    errors = []
-    for spec in sorted(expected - actual):
-        errors.append(
-            f"{CI_WORKFLOW_PATH} `main-publish-gate` does not wait for "
-            f"{spec[1]} (`{spec[2]}`), which {INVENTORY_PATH} marks "
-            "`ci_main_publish_gate`"
-        )
-    for spec in sorted(actual - expected):
-        errors.append(
-            f"{CI_WORKFLOW_PATH} `main-publish-gate` waits for {spec[1]} "
-            f"(`{spec[2]}`), which is not a `ci_main_publish_gate` entry of "
-            f"{INVENTORY_PATH}"
-        )
-    return errors
-
-
-def ci_job_dependency_errors(ci_yml: str, inventory: dict) -> list[str]:
-    """Prove every in-run entry is a hard `needs` of each publishing job."""
-
-    errors: list[str] = []
-    publishers = ("main-publish-gate", "latest-release", "docker")
-    for entry in by_mode(inventory, "ci_job_dependency"):
-        if entry["workflow_path"] != CI_WORKFLOW_PATH:
-            errors.append(
-                f"{INVENTORY_PATH} entry {entry['context']!r} is "
-                "`ci_job_dependency` but is not owned by ci.yml, so no in-run "
-                "dependency can carry it"
-            )
-            continue
-        job = entry["job"]
-        for publisher in publishers:
-            body = job_body(ci_yml, publisher)
-            if body is None:
-                errors.append(f"{CI_WORKFLOW_PATH} has no `{publisher}` job")
-                continue
-            inline_need = re.search(
-                rf"(?m)^    needs:(?:.*[\[, ])?{re.escape(job)}\b",
-                body,
-            )
-            block_need = re.search(rf"(?m)^      - {re.escape(job)}$", body)
-            if inline_need is None and block_need is None:
-                errors.append(
-                    f"{CI_WORKFLOW_PATH} jobs.{publisher} must declare "
-                    f"`needs: {job}` for in-run required check "
-                    f"{entry['context']!r}"
-                )
-            condition = _direct_job_scalar(body, "if")
-            success_predicate = f"needs.{job}.result == 'success'"
-            if condition is None or success_predicate not in condition:
-                errors.append(
-                    f"{CI_WORKFLOW_PATH} jobs.{publisher} must require "
-                    f"`needs.{job}.result == 'success'` in its active direct `if:`"
-                )
-    return errors
-
-
-def publication_gate_job_errors(gateway_yml: str, inventory: dict) -> list[str]:
+def main_evidence_gate_errors(gateway_yml: str, inventory: dict) -> list[str]:
     """Prove the hosted publication gate by exact active structure."""
 
     errors: list[str] = []
@@ -1014,22 +861,22 @@ def publication_gate_job_errors(gateway_yml: str, inventory: dict) -> list[str]:
                 PUBLICATION_GATE_ACTIVE_COMMANDS,
             )
         )
-    if not by_mode(inventory, "publication_gate_job"):
+    if not by_mode(inventory, "main_evidence_gate"):
         errors.append(
-            f"{INVENTORY_PATH} marks no context `publication_gate_job`, so the "
+            f"{INVENTORY_PATH} marks no context `main_evidence_gate`, so the "
             "hosted gate would prove nothing"
         )
-    # The frozen `main-publish-gate` array must itself wait for the workflow
-    # that hosts the gate; otherwise the hosted verdict never blocks anything.
+    # Release verification waits for the workflow that hosts main evidence,
+    # so its run conclusion must remain a release-stage inventory entry.
     hosting = [
         entry
-        for entry in by_mode(inventory, "ci_main_publish_gate")
+        for entry in by_mode(inventory, "release_gate")
         if entry["workflow_path"] == PUBLICATION_GATE_WORKFLOW_PATH
     ]
     if not hosting:
         errors.append(
             f"{PUBLICATION_GATE_WORKFLOW_PATH} hosts the publication gate, so it "
-            f"must itself be a `ci_main_publish_gate` entry of {INVENTORY_PATH}"
+            f"must itself be a `release_gate` entry of {INVENTORY_PATH}"
         )
     return errors
 
@@ -1177,14 +1024,12 @@ def contract_errors(
         return errors
     errors.extend(required_context_parity_errors(required_contexts, inventory))
     errors.extend(workflow_identity_errors(inventory, read))
-    errors.extend(main_publish_gate_parity_errors(read(CI_WORKFLOW_PATH), inventory))
-    errors.extend(ci_job_dependency_errors(read(CI_WORKFLOW_PATH), inventory))
     errors.extend(
-        publication_gate_job_errors(read(PUBLICATION_GATE_WORKFLOW_PATH), inventory)
+        main_evidence_gate_errors(read(PUBLICATION_GATE_WORKFLOW_PATH), inventory)
     )
     errors.extend(release_gate_errors(read(RELEASE_WORKFLOW_PATH), inventory))
     # `inventory_errors` proves every unique context has exactly one value from
-    # the closed MAIN_PUBLICATION_MODES enum. The consumer-specific checks above
+    # the closed VALIDATION_STAGES enum. The consumer-specific checks above
     # bind all three values, which is the exhaustive, non-overlapping partition;
     # recomputing their union from the same single field would prove nothing.
     return list(dict.fromkeys(errors))
@@ -1942,7 +1787,7 @@ def enforce(
 def select_entries(inventory: dict, mode: str) -> list[dict]:
     """Return the contexts a given publication path must prove through the API.
 
-    `main` proves exactly the contexts the frozen ci.yml controls cannot carry.
+    `main` collects the designated main-evidence subset without publishing.
     `release` proves the COMPLETE inventory, because the version-release
     verifier has no in-run relationship with any of them.
     """
@@ -1950,7 +1795,7 @@ def select_entries(inventory: dict, mode: str) -> list[dict]:
     if mode == "release":
         return list(entries(inventory))
     if mode == "main":
-        return by_mode(inventory, "publication_gate_job")
+        return by_mode(inventory, "main_evidence_gate")
     raise ContractError(f"unknown enforcement mode {mode!r}")
 
 
@@ -1971,7 +1816,7 @@ def _fixture_inventory() -> dict:
                 "workflow_path": ".github/workflows/alpha.yml",
                 "workflow_name": "Alpha Workflow",
                 "job": "gate",
-                "main_publication": "publication_gate_job",
+                "validation_stage": "main_evidence_gate",
                 "evidence": "push_main",
                 "rationale": "self-test",
             },
@@ -1981,7 +1826,7 @@ def _fixture_inventory() -> dict:
                 "workflow_path": ".github/workflows/beta.yml",
                 "workflow_name": "Beta Workflow",
                 "job": "verify",
-                "main_publication": "publication_gate_job",
+                "validation_stage": "main_evidence_gate",
                 "evidence": "pr_head",
                 "rationale": "self-test",
             },
@@ -2226,7 +2071,7 @@ def _tests_entry() -> dict:
         "workflow_path": CI_WORKFLOW_PATH,
         "workflow_name": "CI",
         "job": "test",
-        "main_publication": "ci_job_dependency",
+        "validation_stage": "tests_aggregate",
         "evidence": "check_run",
         "rationale": "self-test",
     }
@@ -2339,7 +2184,7 @@ def _gate_inventory() -> dict:
             "workflow_path": PUBLICATION_GATE_WORKFLOW_PATH,
             "workflow_name": "Gateway API Conformance",
             "job": "gate",
-            "main_publication": "ci_main_publish_gate",
+            "validation_stage": "release_gate",
             "evidence": "push_main",
             "rationale": "self-test hosting workflow",
         },
@@ -2456,7 +2301,7 @@ _CONFORMING_RELEASE_JOB = """    name: Validate release SHA
 
 
 def _publication_errors(body: str) -> list[str]:
-    return publication_gate_job_errors(
+    return main_evidence_gate_errors(
         _wrap_publication_job(body), _gate_inventory()
     )
 
@@ -3052,7 +2897,7 @@ def self_test() -> list[str]:
         == {
             entry["context"]
             for entry in entries(inventory)
-            if entry["main_publication"] == "publication_gate_job"
+            if entry["validation_stage"] == "main_evidence_gate"
         },
         "main enforcement must select exactly the hosted-gate contexts",
     )
@@ -3095,68 +2940,9 @@ def self_test() -> list[str]:
         "a renamed required context must fail parity",
     )
 
-    # Static contract: the frozen ci.yml array must equal the inventory subset.
-    gate_inventory = {
-        **real,
-        "required_checks": [
-            {
-                "context": "Alpha",
-                "workflow_file": "alpha.yml",
-                "workflow_path": ".github/workflows/alpha.yml",
-                "workflow_name": "Alpha Workflow",
-                "job": "gate",
-                "main_publication": "ci_main_publish_gate",
-                "evidence": "push_main",
-                "rationale": "self-test",
-            }
-        ],
-    }
-    conforming_ci = (
-        "jobs:\n"
-        "  main-publish-gate:\n"
-        "    steps:\n"
-        "      - run: |\n"
-        "          required_workflow_specs=(\n"
-        '            "alpha.yml|.github/workflows/alpha.yml|Alpha Workflow"\n'
-        "          )\n"
-        "  next-job:\n"
-        "    steps: []\n"
-    )
-    expect(
-        main_publish_gate_parity_errors(conforming_ci, gate_inventory) == [],
-        "a matching main-publish-gate array must produce no error",
-    )
-    expect(
-        main_publish_gate_parity_errors(
-            conforming_ci.replace("Alpha Workflow\"", "Decoy Workflow\""),
-            gate_inventory,
-        )
-        != [],
-        "a display-name drift in the frozen array must fail",
-    )
-    expect(
-        main_publish_gate_parity_errors(
-            conforming_ci.replace(
-                '            "alpha.yml|.github/workflows/alpha.yml|Alpha Workflow"\n',
-                "",
-            ),
-            gate_inventory,
-        )
-        != [],
-        "an emptied main-publish-gate array must fail",
-    )
-    expect(
-        main_publish_gate_parity_errors(
-            "jobs:\n  other:\n    steps: []\n",
-            gate_inventory,
-        )
-        != [],
-        "a missing main-publish-gate job must fail",
-    )
-
     # Static contract: inventory schema defects are rejected.
     for label, mutation in (
-        ("unknown mode", {"main_publication": "somewhere_else"}),
+        ("unknown mode", {"validation_stage": "somewhere_else"}),
         ("unknown evidence", {"evidence": "trust_me"}),
         ("empty rationale", {"rationale": "  "}),
         ("path mismatch", {"workflow_path": ".github/workflows/other.yml"}),
@@ -3196,35 +2982,6 @@ def self_test() -> list[str]:
         )
         != [],
         "a blank line before push paths must not evade the filter guard",
-    )
-
-    # In-run dependency proof reads the active direct `if:` scalar; a comment
-    # containing the success predicate cannot satisfy it.
-    dependency_inventory = {
-        "version": 1,
-        "documentation": "self-test",
-        "main_branch": "main",
-        "required_checks": [_tests_entry()],
-    }
-    dependency_ci = "jobs:\n" + "".join(
-        f"  {publisher}:\n"
-        "    needs: [test]\n"
-        "    if: always() && needs.test.result == 'success'\n"
-        "    runs-on: ubuntu-latest\n"
-        for publisher in ("main-publish-gate", "latest-release", "docker")
-    )
-    expect(
-        ci_job_dependency_errors(dependency_ci, dependency_inventory) == [],
-        "active in-run success predicates must satisfy the dependency proof",
-    )
-    commented_dependency = dependency_ci.replace(
-        "    if: always() && needs.test.result == 'success'\n",
-        "    if: always()\n"
-        "    # needs.test.result == 'success'\n",
-    )
-    expect(
-        ci_job_dependency_errors(commented_dependency, dependency_inventory) != [],
-        "a comment-only in-run success predicate must fail",
     )
 
     # Static contract: hosted publication-gate and release-gate jobs are
@@ -3578,7 +3335,7 @@ def self_test() -> list[str]:
         f"  {PUBLICATION_GATE_JOB}:\n{_CONFORMING_PUBLICATION_JOB}"
     )
     expect(
-        publication_gate_job_errors(publication_quoted_before, _gate_inventory())
+        main_evidence_gate_errors(publication_quoted_before, _gate_inventory())
         != [],
         "a quoted publication-gate duplicate before the canonical job must fail",
     )
@@ -3586,7 +3343,7 @@ def self_test() -> list[str]:
         f'jobs:\n  "{PUBLICATION_GATE_JOB}":\n{_CONFORMING_PUBLICATION_JOB}'
     )
     expect(
-        publication_gate_job_errors(publication_quoted_only, _gate_inventory()) != [],
+        main_evidence_gate_errors(publication_quoted_only, _gate_inventory()) != [],
         "a quoted-only replacement of the publication-gate job must fail",
     )
     publication_opaque_key = _CONFORMING_PUBLICATION_JOB + (

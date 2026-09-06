@@ -39,11 +39,11 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 - The trusted publication boundary freezes
   `.github/scripts/verify_publication_gate.py` and
   `.github/required-publication-checks.json` by whole-file digest, plus the
-  complete `main-publication-required-checks` job body in
+  manual release dispatcher and input validator, plus the complete `main-publication-required-checks` job body in
   `gateway-api-conformance.yml`. The trusted verifier compares those proposal
   surfaces before inspecting candidate automation, and never executes the
-  candidate publication verifier. Changing any of the three protected
-  surfaces is a direct-to-`main` operation; `verify_required_ci.py` remains a
+  candidate publication verifier. Changing these protected
+  surfaces requires a reviewed policy update; `verify_required_ci.py` remains a
   PR-mutable parity check, not the admission authority. See `docs/ci_cd.md` →
   "Publish-blocking required checks".
 - A required live gate must decide its own relevance from a pinned trusted-base

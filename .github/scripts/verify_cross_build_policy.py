@@ -85,8 +85,8 @@ EXPECTED_CARGO_TARGETS = {
 WORKFLOW_CONTRACTS = (
     (
         "CI workflow",
-        "build-arm64-cross",
-        "b0ffbe05ef3d7682291e1118ca8d024112fdb46297ad0932ff4b1b2cb5c520a5",
+        "main-linux-image",
+        "ad65ce950b2aa86b2a8c36ac6875ef3bccaaa73e38032f340746b98ec05813aa",
         "143872ebf5dd925529b785273f180671bcc3bbd612d74ef0b88e1b8dce86c774",
         # Pins the top-level `on:` mapping that schedules CI, including
         # unconditional `merge_group: checks_requested` alongside push,
@@ -2657,6 +2657,7 @@ AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
           file: Dockerfile
           target: runtime-ebpf-tools
           build-args: |
+            CARGO_PROFILE=pr-build
             FEATURES=cloud-secrets,ebpf
           load: true
           tags: ferrum-edge-ebpf-tools:ci
@@ -2703,6 +2704,7 @@ AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
           file: Dockerfile
           target: runtime-ebpf
           build-args: |
+            CARGO_PROFILE=pr-build
             FEATURES=cloud-secrets,ebpf
           load: true
           tags: ferrum-edge-ebpf:ci
@@ -3202,13 +3204,13 @@ NODE_WAYPOINT_RELEVANCE_CONTRACT = {
     "node-waypoint-ebpf-live": {
         "needs": "    needs: production-dockerfile-plan\n",
         # Fail-closed on purpose: only an exact `false` from the trusted-base
-        # planner skips the live datapath. `always() &&` keeps the live job
+        # planner skips the live datapath. `!cancelled() &&` keeps the live job
         # reachable when the planner itself failed, so the aggregate reports a
-        # failure rather than an absence.
+        # failure rather than an absence, while superseded runs can stop.
         "if": (
-            "    if: always() && "
+            "    if: ${{ !cancelled() && "
             "needs.production-dockerfile-plan.outputs.node_waypoint_relevant"
-            " != 'false'\n"
+            " != 'false' }}\n"
         ),
     },
     "production-dockerfile-smoke-default": {
@@ -4113,6 +4115,8 @@ APPROVED_AUTOMATION_ROOTS = (
 PROTECTED_PUBLICATION_GATE_FILES = (
     ".github/required-publication-checks.json",
     ".github/scripts/verify_publication_gate.py",
+    ".github/workflows/release-dispatch.yml",
+    ".github/scripts/validate_release_request.py",
 )
 # A repository program whose stdout becomes shell source is still executed in
 # its own language, but every edit can change the generated program. Carry this
@@ -6528,7 +6532,34 @@ def closed_job_field_errors(
     return errors
 
 
+def nonpublishing_ci_errors(contents: str, source: str) -> list[str]:
+    """CI can build and upload test artifacts, but cannot publish releases."""
+    errors: list[str] = []
+    permission, failures = extract_top_level_block(contents, source, "permissions")
+    errors.extend(failures)
+    if permission != "permissions:\n  contents: read\n":
+        errors.append(f"{source} must default to contents: read only")
+    active = "\n".join(line for line in contents.splitlines() if not line.lstrip().startswith("#"))
+    if re.search(r"\b(?:actions|contents|packages|id-token):\s*write\b|\bwrite-all\b", active):
+        errors.append(f"{source} must not grant publication write permissions")
+    for job in ("latest-release", "docker", "docker-manifest", "build-arm64-cross",
+                "main-publish-gate", "verify-pr-linux-gnu-abi",
+                "verify-latest-linux-gnu-abi-aarch64", "linux-gnu-abi-latest-gate"):
+        block, failures = extract_job_block(contents, source, job, required=False)
+        errors.extend(failures)
+        if block is not None:
+            errors.append(f"{source} production job {job!r} belongs in release.yml")
+    if re.search(r"docker\s+(?:push\b|buildx\s+imagetools\s+create\b)|"
+                 r"gh\s+release\s+(?:create|upload|edit|delete)\b|"
+                 r"softprops/action-gh-release@|push-by-digest=true|"
+                 r"^\s+push:\s*true\s*$", active, re.MULTILINE):
+        errors.append(f"{source} must not contain registry or release publishing steps")
+    return list(dict.fromkeys(errors))
+
+
 def validate_publish_control_contract(contents: str, source: str) -> list[str]:
+    if source == "CI workflow":
+        return nonpublishing_ci_errors(contents, source)
     contracts = PUBLISH_CONTROL_CONTRACTS.get(source, {})
     exact_jobs = PUBLISH_EXACT_JOB_CONTRACTS.get(source, {})
     step_contracts = PUBLISH_ARTIFACT_STEP_CONTRACTS.get(source, {})
@@ -17477,7 +17508,6 @@ LINUX_GNU_PUBLISHED_CNI = "release-assets/ferrum-cni-linux-x86_64"
 # may name it on an upload step, so the scanned bytes and the published bytes
 # cannot be made to differ by a second uploader.
 LINUX_GNU_X86_PRODUCERS = {
-    "CI workflow": ("build-binaries", "binary-x86_64-unknown-linux-gnu"),
     "release workflow": (
         "build-release-binaries",
         "release-binaries-x86_64-unknown-linux-gnu",
@@ -17941,6 +17971,10 @@ def compare_pr_workflow_job(
     errors: list[str] = []
     if source == "CI workflow":
         errors.extend(validate_ci_planner_isolation(proposed_contents, source))
+        if job_name == "main-linux-image":
+            # Enforce the nonpublishing contract on the proposal as well as
+            # the trusted checkout, before any new CI job can be admitted.
+            errors.extend(nonpublishing_ci_errors(proposed_contents, source))
     if baseline != proposed:
         errors.append(
             f"{source} protected job {job_name!r} cannot be changed by a pull request"
@@ -21067,7 +21101,7 @@ pre_build = []
         "on:\n"
         "  pull_request:\n"
         "jobs:\n"
-        "  build-arm64-cross:\n"
+        "  main-linux-image:\n"
         "    runs-on: ubuntu-latest\n"
         "    steps:\n"
         "      - run: sh scripts/build_arm64.sh\n"
@@ -26303,338 +26337,19 @@ pre_build = []
                 f"{protected_name}"
             )
 
-    ci_exact_publish_jobs = PUBLISH_EXACT_JOB_CONTRACTS["CI workflow"]
-    ci_publish_contract = PUBLISH_CONTROL_CONTRACTS["CI workflow"]
-    ci_publish_steps = PUBLISH_ARTIFACT_STEP_CONTRACTS["CI workflow"]["docker"]
-    ci_manifest_steps = PUBLISH_ARTIFACT_STEP_CONTRACTS["CI workflow"][
-        "docker-manifest"
-    ]
-    publish_workflow = (
-        "name: Publish fixture\n"
-        "on: [push]\n"
-        "jobs:\n"
-        + ci_exact_publish_jobs["main-publish-gate"]
-        + "\n"
-        + "  latest-release:\n"
-        + ci_publish_contract["latest-release"]["needs"]
-        + ci_publish_contract["latest-release"]["if"]
-        + "    runs-on: ubuntu-latest\n"
-        + ci_publish_contract["latest-release"]["steps"]
-        + "\n"
-        + "  docker:\n"
-        + ci_publish_contract["docker"]["needs"]
-        + ci_publish_contract["docker"]["if"]
-        + "    runs-on: ubuntu-latest\n"
-        + ci_publish_contract["docker"]["strategy"]
-        + ci_publish_contract["docker"]["steps"]
-        + "\n"
-        + "  docker-manifest:\n"
-        + ci_publish_contract["docker-manifest"]["needs"]
-        + ci_publish_contract["docker-manifest"]["if"]
-        + "    runs-on: ubuntu-latest\n"
-        + ci_publish_contract["docker-manifest"]["steps"]
-        + "\n"
-        # A job with no publication contract at all, so the fixture can still
-        # show that unrelated implementation edits stay editable now that every
-        # wildcard-publishing job freezes its whole step list.
-        + "  unrelated:\n"
-        + "    runs-on: ubuntu-latest\n"
-        + "    steps:\n"
-        + "      - run: echo latest\n"
-    )
-    for manifest_step_name, manifest_step_body in ci_manifest_steps.items():
-        if manifest_step_body not in ci_publish_contract["docker-manifest"]["steps"]:
-            failures.append(
-                f"CI docker-manifest step {manifest_step_name!r} is not covered "
-                "by the frozen manifest step list"
-            )
-    if validate_publish_control_contract(publish_workflow, "CI workflow"):
-        failures.append("valid publication controls were rejected")
-
-    # The gate must be protected as one job, not as a selection of fields. A
-    # job-level escape hatch, widened permission, or weakened retry would alter
-    # publication semantics without necessarily touching `needs`, `if`, or the
-    # named step boundary.
-    exact_gate_edits = {
-        "publish gate permission widened": (
-            "      actions: read\n",
-            "      actions: write\n",
-        ),
-        "publish gate made non-blocking": (
-            "    runs-on: ubuntu-latest\n",
-            "    runs-on: ubuntu-latest\n    continue-on-error: true\n",
-        ),
-        "publish gate shell changed": (
-            "        shell: bash\n",
-            "        shell: python\n",
-        ),
-        "publish gate retry weakened": (
-            "              for attempt in 1 2 3; do\n",
-            "              for attempt in 1; do\n",
-        ),
-    }
-    for label, (original, replacement) in exact_gate_edits.items():
-        tampered = publish_workflow.replace(original, replacement, 1)
-        if tampered == publish_workflow:
-            failures.append(f"{label} fixture did not change the workflow")
-            continue
-        if not validate_publish_control_contract(tampered, "CI workflow"):
-            failures.append(f"{label} was not rejected")
-        if not compare_pr_publish_control_contract(
-            publish_workflow,
-            tampered,
-            "CI workflow",
-        ):
-            failures.append(f"{label} was allowed by the merge-base comparison")
-
-    inherited_run_defaults = publish_workflow.replace(
-        "jobs:\n",
-        "defaults:\n  run:\n    shell: python\njobs:\n",
-        1,
-    )
-    if not validate_publish_control_contract(
-        inherited_run_defaults,
-        "CI workflow",
+    no_publish = "name: CI\npermissions:\n  contents: read\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps: []\n"
+    if validate_publish_control_contract(no_publish, "CI workflow"):
+        failures.append("read-only nonpublishing CI was rejected")
+    for mutation in (
+        no_publish.replace("contents: read", "contents: write"),
+        no_publish.replace("    steps: []", "    permissions:\n      actions: write\n    steps: []"),
+        no_publish + "  docker:\n    steps: []\n",
+        no_publish.replace("steps: []", "steps:\n      - run: docker push evil/image:latest"),
+        no_publish.replace("steps: []", "steps:\n      - uses: softprops/action-gh-release@deadbeef"),
+        no_publish.replace("steps: []", "steps:\n      - run: docker buildx imagetools create evil/image:latest"),
     ):
-        failures.append("inherited publication run defaults were not rejected")
-    if not compare_pr_publish_control_contract(
-        publish_workflow,
-        inherited_run_defaults,
-        "CI workflow",
-    ):
-        failures.append(
-            "inherited publication run defaults were allowed by the comparison"
-        )
-
-    # The Docker jobs never name the ARM64 artifact literally, so repointing the
-    # `linux/arm64` matrix row or rewriting either consuming step would publish
-    # an ARM64 image built from the x86_64 binary.
-    artifact_selection_edits = {
-        "arm64 matrix row repointed at the x86_64 artifact": (
-            "            binary_target: aarch64-unknown-linux-gnu\n"
-            "            binary_asset: ferrum-edge-linux-aarch64\n",
-            "            binary_target: x86_64-unknown-linux-gnu\n"
-            "            binary_asset: ferrum-edge-linux-x86_64\n",
-        ),
-        "arm64 platform row bound to the x86_64 target": (
-            "          - platform: linux/arm64\n"
-            "            binary_target: aarch64-unknown-linux-gnu\n",
-            "          - platform: linux/arm64\n"
-            "            binary_target: x86_64-unknown-linux-gnu\n",
-        ),
-        "download step renamed to a fixed artifact": (
-            "          name: binary-${{ matrix.binary_target }}\n",
-            "          name: binary-x86_64-unknown-linux-gnu\n",
-        ),
-        "context step copies a fixed asset": (
-            "cp downloaded-artifacts/${{ matrix.binary_asset }} ",
-            "cp downloaded-artifacts/ferrum-edge-linux-x86_64 ",
-        ),
-    }
-    for label, (original, replacement) in artifact_selection_edits.items():
-        tampered = publish_workflow.replace(original, replacement, 1)
-        if tampered == publish_workflow:
-            failures.append(f"{label} fixture did not change the workflow")
-            continue
-        if not validate_publish_control_contract(tampered, "CI workflow"):
-            failures.append(f"{label} was not rejected")
-        if not compare_pr_publish_control_contract(
-            publish_workflow,
-            tampered,
-            "CI workflow",
-        ):
-            failures.append(f"{label} was allowed by the merge-base comparison")
-
-    # The manifest job assembles the published `latest` tag from a wildcard, so
-    # its dependency edges, its download pattern, and the commands that consume
-    # `/tmp/digests` are part of the publication contract too.
-    manifest_edits = {
-        "manifest needs widened to an added job": (
-            ci_publish_contract["docker-manifest"]["needs"],
-            "    needs: [docker, extra-digests]\n",
-        ),
-        "manifest download pattern widened": (
-            "          pattern: docker-digest-*\n",
-            "          pattern: docker-*\n",
-        ),
-        "manifest gate opened to pull requests": (
-            ci_publish_contract["docker-manifest"]["if"],
-            "    if: always()\n",
-        ),
-        "manifest tag repointed": (
-            "            -t ferrumedge/ferrum-edge:latest \\\n",
-            "            -t ferrumedge/ferrum-edge:latest -t evil/image:latest \\\n",
-        ),
-    }
-    for label, (original, replacement) in manifest_edits.items():
-        tampered = publish_workflow.replace(original, replacement, 1)
-        if tampered == publish_workflow:
-            failures.append(f"{label} fixture did not change the workflow")
-            continue
-        if not validate_publish_control_contract(tampered, "CI workflow"):
-            failures.append(f"{label} was not rejected")
-        if not compare_pr_publish_control_contract(
-            publish_workflow,
-            tampered,
-            "CI workflow",
-        ):
-            failures.append(f"{label} was allowed by the merge-base comparison")
-
-    # Artifacts are scoped to the workflow run rather than to `needs`, so an
-    # added job can put one more digest in front of the manifest wildcard
-    # without touching any frozen field. The name space is owned for that
-    # reason, not just the job graph frozen.
-    digest_namespace_workflow = publish_workflow + (
-        "\n"
-        "  extra-digests:\n"
-        "    runs-on: ubuntu-latest\n"
-        "    steps:\n"
-        "      - uses: actions/upload-artifact@" + ("0" * 40) + "\n"
-        "        with:\n"
-        "          name: docker-digest-evil\n"
-        "          path: /tmp/digests/*\n"
-    )
-    if not validate_publish_control_contract(
-        digest_namespace_workflow,
-        "CI workflow",
-    ):
-        failures.append("an added digest artifact producer was not rejected")
-    if not compare_pr_publish_control_contract(
-        publish_workflow,
-        digest_namespace_workflow,
-        "CI workflow",
-    ):
-        failures.append(
-            "an added digest artifact producer was allowed by the comparison"
-        )
-
-    # A name assembled by an expression is ruled out only when its literal
-    # prefix already disagrees with the wildcard.
-    dynamic_digest_workflow = digest_namespace_workflow.replace(
-        "          name: docker-digest-evil\n",
-        "          name: docker-digest-${{ github.actor }}\n",
-        1,
-    )
-    if not validate_publish_control_contract(dynamic_digest_workflow, "CI workflow"):
-        failures.append("a dynamically named digest artifact was not rejected")
-
-    # An unrelated artifact from an unrelated job stays editable.
-    for label, artifact_name in (
-        ("unrelated artifact upload", "coverage-report"),
-        ("unrelated dynamic artifact upload", "binary-${{ matrix.target }}"),
-    ):
-        unrelated_workflow = digest_namespace_workflow.replace(
-            "          name: docker-digest-evil\n",
-            f"          name: {artifact_name}\n",
-            1,
-        )
-        if validate_publish_control_contract(unrelated_workflow, "CI workflow"):
-            failures.append(f"{label} was rejected")
-
-    # Freezing the artifact-selection steps alone leaves the rest of the job
-    # able to rewrite the context they prepared. Every one of these keeps the
-    # matrix and both frozen steps byte-for-byte identical and still publishes
-    # an ARM64 image built from something other than the ARM64 artifact.
-    buildx_step = "      - name: Set up Docker Buildx\n"
-    context_mutations = {
-        "second download of the x86_64 artifact": (
-            buildx_step,
-            "      - name: Download other binary\n"
-            "        uses: actions/download-artifact"
-            "@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8\n"
-            "        with:\n"
-            "          name: binary-x86_64-unknown-linux-gnu\n"
-            "          path: other-artifacts\n"
-            "\n" + buildx_step,
-        ),
-        "later step overwrites the prepared arm64 binary": (
-            buildx_step,
-            "      - name: Patch context\n"
-            "        run: cp other/ferrum-edge "
-            "docker-context/bin/arm64/ferrum-edge\n"
-            "\n" + buildx_step,
-        ),
-        "context rewritten through a shell-assembled path": (
-            buildx_step,
-            "      - name: Patch context\n"
-            "        run: |\n"
-            "          prefix=docker-\n"
-            '          cp other/ferrum-edge "${prefix}context/bin/arm64/ferrum-edge"\n'
-            "\n" + buildx_step,
-        ),
-        "build repointed away from the prepared context": (
-            "          context: docker-context\n",
-            "          context: attacker-context\n",
-        ),
-    }
-    for label, (original, replacement) in context_mutations.items():
-        tampered = publish_workflow.replace(original, replacement, 1)
-        if tampered == publish_workflow:
-            failures.append(f"{label} fixture did not change the workflow")
-            continue
-        if not validate_publish_control_contract(tampered, "CI workflow"):
-            failures.append(f"{label} was not rejected")
-        if not compare_pr_publish_control_contract(
-            publish_workflow,
-            tampered,
-            "CI workflow",
-        ):
-            failures.append(f"{label} was allowed by the merge-base comparison")
-
-    duplicate_publish_step = publish_workflow.replace(
-        ci_publish_steps["Prepare Docker context"],
-        ci_publish_steps["Prepare Docker context"]
-        + "\n"
-        + ci_publish_steps["Prepare Docker context"],
-        1,
-    )
-    if not validate_publish_control_contract(duplicate_publish_step, "CI workflow"):
-        failures.append("duplicate artifact-selection step was not rejected")
-
-    release_publish_steps = PUBLISH_ARTIFACT_STEP_CONTRACTS["release workflow"][
-        "docker"
-    ]
-    if (
-        release_publish_steps["Download Linux binary"]
-        == ci_publish_steps["Download Linux binary"]
-    ):
-        failures.append(
-            "release and CI artifact-selection contracts must name distinct "
-            "artifacts"
-        )
-
-    benign_publish_edit = publish_workflow.replace("echo latest", "echo updated")
-    if compare_pr_publish_control_contract(
-        publish_workflow,
-        benign_publish_edit,
-        "CI workflow",
-    ):
-        failures.append("benign publishing job implementation edit was rejected")
-
-    changed_publish_needs = publish_workflow.replace(
-        ci_publish_contract["latest-release"]["needs"],
-        "    needs: [test, build-binaries]\n",
-        1,
-    )
-    if not validate_publish_control_contract(changed_publish_needs, "CI workflow"):
-        failures.append("removed ARM64 publication dependency was not rejected")
-    if not compare_pr_publish_control_contract(
-        publish_workflow,
-        changed_publish_needs,
-        "CI workflow",
-    ):
-        failures.append(
-            "merge-base comparison allowed an ARM64 publication dependency edit"
-        )
-
-    duplicate_publish_needs = publish_workflow.replace(
-        ci_publish_contract["latest-release"]["needs"],
-        ci_publish_contract["latest-release"]["needs"]
-        + "    needs: [test, build-binaries]\n",
-        1,
-    )
-    if not validate_publish_control_contract(duplicate_publish_needs, "CI workflow"):
-        failures.append("duplicate publication needs field was not rejected")
+        if not validate_publish_control_contract(mutation, "CI workflow"):
+            failures.append("publishing CI regression was not rejected")
 
     # An exact generated-output path is exempt from the scanned automation
     # roots only because a build produces it and no commit supplies it. The
@@ -28555,13 +28270,11 @@ pre_build = []
         # Item A of issue #3908: the binding a pull request could previously
         # rewrite at will, because nothing in trusted policy pinned it.
         "severed live binding": (
-            "    if: always() && needs.production-dockerfile-plan.outputs."
-            "node_waypoint_relevant != 'false'\n",
+            NODE_WAYPOINT_RELEVANCE_CONTRACT["node-waypoint-ebpf-live"]["if"],
             "    if: false\n",
         ),
         "inverted live binding": (
-            "    if: always() && needs.production-dockerfile-plan.outputs."
-            "node_waypoint_relevant != 'false'\n",
+            NODE_WAYPOINT_RELEVANCE_CONTRACT["node-waypoint-ebpf-live"]["if"],
             "    if: needs.production-dockerfile-plan.outputs."
             "node_waypoint_relevant == 'true'\n",
         ),

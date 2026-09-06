@@ -1,0 +1,95 @@
+name: Start Production Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'New version tag matching Cargo.toml (for example v1.2.3)'
+        required: true
+        type: string
+
+# Serialize tag-creation requests. The production workflow separately
+# serializes publishing because versions share major/minor image aliases.
+concurrency:
+  group: release-dispatch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate production release request
+    runs-on: ubuntu-latest
+    timeout-minutes: 170
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+    steps:
+      - name: Check release credential is configured
+        env:
+          RELEASE_TAG_TOKEN_CONFIGURED: ${{ secrets.RELEASE_TAG_TOKEN != '' }}
+        run: |
+          if [ "$RELEASE_TAG_TOKEN_CONFIGURED" != 'true' ]; then
+            echo '::error::Configure RELEASE_TAG_TOKEN for the permitted release-tag principal.'
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Validate version and selected commit
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: python3 .github/scripts/validate_release_request.py
+
+      - name: Require successful validation for the exact selected main commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLICATION_GATE_REPOSITORY: ${{ github.repository }}
+          PUBLICATION_GATE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_publication_gate.py --self-test
+          python3 .github/scripts/verify_publication_gate.py --enforce release --deadline-seconds 9600
+
+  create-tag:
+    name: Create version tag and start production builds
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # A dedicated user/App token is necessary: tags created by GITHUB_TOKEN
+      # do not trigger another workflow. Its principal must be permitted by the
+      # repository's Release tag creation principal ruleset.
+      - name: Create immutable tag
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TAG_TOKEN }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo '::error::Configure RELEASE_TAG_TOKEN for the permitted release-tag principal.'
+            exit 1
+          fi
+          jq -n --arg ref "refs/tags/$RELEASE_VERSION" --arg sha "$RELEASE_SHA" \
+            '{ref: $ref, sha: $sha}' > "$RUNNER_TEMP/release-tag.json"
+          # The create-ref endpoint fails if the tag already exists. Never
+          # update or delete a release tag, even when retrying this action.
+          gh api --method POST "repos/$REPOSITORY/git/refs" \
+            --input "$RUNNER_TEMP/release-tag.json" > "$RUNNER_TEMP/created-tag.json"
+          jq -e --arg ref "refs/tags/$RELEASE_VERSION" --arg sha "$RELEASE_SHA" \
+            '.ref == $ref and .object.type == "commit" and .object.sha == $sha' \
+            "$RUNNER_TEMP/created-tag.json" >/dev/null
+          {
+            echo '## Production release requested'
+            printf '\nTag: `%s`\n\nCommit: `%s`\n' "$RELEASE_VERSION" "$RELEASE_SHA"
+            echo
+            echo "Follow production builds and publishing in [Release](https://github.com/$REPOSITORY/actions/workflows/release.yml)."
+            echo 'This action completes when the tag is created; Release reports build and publication completion separately.'
+          } >> "$GITHUB_STEP_SUMMARY"
