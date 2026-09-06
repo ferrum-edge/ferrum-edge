@@ -7377,7 +7377,7 @@ fn unix_ingress_max_connections_rejects_an_unreachable_ceiling() {
 #[test]
 fn test_stream_lifetime_is_published_only_from_the_accepted_startup_config() {
     const ENV_CONFIG_SOURCE: &str = include_str!("../../../src/config/env_config.rs");
-    const MAIN_SOURCE: &str = include_str!("../../../src/main.rs");
+    const MAIN_SOURCE: &str = include_str!("../../../src/gateway_entry.rs");
     const PUBLISH_CALL: &str = "publish_authenticated_stream_max_lifetime_seconds(";
 
     let validate = ENV_CONFIG_SOURCE
@@ -7515,7 +7515,7 @@ fn shutdown_predrain_default_is_zero_in_every_mode() {
 /// `ready:false` while the accept loops stay open.
 #[test]
 fn main_resolves_predrain_through_the_shared_mode_gate() {
-    const MAIN_SOURCE: &str = include_str!("../../../src/main.rs");
+    const MAIN_SOURCE: &str = include_str!("../../../src/gateway_entry.rs");
 
     assert!(
         MAIN_SOURCE.contains("env_config.effective_shutdown_predrain_seconds()"),

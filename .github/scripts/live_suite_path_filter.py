@@ -282,7 +282,7 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         # node-agent that publishes the node identity every placement proof is
         # bound to. A defect in any of them bypasses the proof this gate
         # exercises live.
-        r"^src/(cli|main)\.rs$",
+        r"^src/(cli|main|gateway_entry)\.rs$",
         r"^src/modes/node_agent\.rs$",
         r"^src/socket_opts\.rs$",
         r"^src/ebpf/veth\.rs$",
@@ -1546,6 +1546,7 @@ def self_test() -> int:
         ("ambient-host-udp", ["src/proxy/udp_placement_cleanup.rs"], True),
         ("ambient-host-udp", ["src/cli.rs"], True),
         ("ambient-host-udp", ["src/main.rs"], True),
+        ("ambient-host-udp", ["src/gateway_entry.rs"], True),
         ("ambient-host-udp", ["src/modes/node_agent.rs"], True),
         ("ambient-host-udp", ["src/modes/data_plane.rs"], False),
         ("ambient-host-udp", ["tests/k8s/mesh_e2e_sidecar/run.sh"], False),
