@@ -1,64 +1,74 @@
 //! Origin-count regression for explicit Expires freshness (#4645).
 
 use crate::common::TestGateway;
-use crate::scaffolding::backends::http1::{HttpStep, RequestMatcher, ScriptedHttp1Backend};
 use crate::scaffolding::clients::{Http1Client, Http2Client, Http3Client};
 use crate::scaffolding::ports::reserve_port;
 
+use bytes::Bytes;
 use chrono::Utc;
+use http::{Request, Response};
+use http_body_util::Full;
+use hyper::body::Incoming;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
 use serde_json::json;
+use std::convert::Infallible;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::net::TcpListener;
+use tokio::task::JoinSet;
 
-fn origin_response(path: &'static str, count: usize, expires: Option<&str>) -> Vec<HttpStep> {
-    let body = json!({"path": path, "origin_count": count}).to_string();
-    let mut steps = vec![
-        HttpStep::ExpectRequest(RequestMatcher::method_path("GET", path)),
-        HttpStep::RespondStatus {
-            status: 200,
-            reason: "OK".to_string(),
-        },
-        HttpStep::RespondHeader {
-            name: "Content-Type".to_string(),
-            value: "application/json".to_string(),
-        },
-        HttpStep::RespondHeader {
-            name: "Date".to_string(),
-            value: Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
-        },
-        HttpStep::RespondHeader {
-            name: "Content-Length".to_string(),
-            value: body.len().to_string(),
-        },
-        HttpStep::RespondHeader {
-            name: "Connection".to_string(),
-            value: "close".to_string(),
-        },
-    ];
-    if let Some(expires) = expires {
-        steps.push(HttpStep::RespondHeader {
-            name: "Expires".to_string(),
-            value: expires.to_string(),
+fn http_date(offset_seconds: i64) -> String {
+    (Utc::now() + chrono::Duration::seconds(offset_seconds))
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string()
+}
+
+/// Request-driven origin: every request the gateway forwards is counted and
+/// the count travels in the body, so a cache HIT shows as a repeated number.
+/// Connection order is irrelevant, which keeps the gateway's startup h2c
+/// capability probe — an HTTP/2 preface hyper rejects before the service
+/// runs — from consuming a scripted answer meant for the first request.
+async fn serve_origin(listener: TcpListener, hits: Arc<AtomicUsize>) {
+    let mut connections = JoinSet::new();
+    while let Ok((stream, _)) = listener.accept().await {
+        let hits = Arc::clone(&hits);
+        connections.spawn(async move {
+            let service = service_fn(move |request: Request<Incoming>| {
+                let count = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                async move {
+                    let path = request.uri().path().to_string();
+                    let body = json!({"path": path, "origin_count": count}).to_string();
+                    let mut response = Response::builder()
+                        .status(200)
+                        .header("content-type", "application/json")
+                        .header("date", http_date(0))
+                        .header("content-length", body.len());
+                    match path.as_str() {
+                        "/expires" => response = response.header("expires", http_date(-60)),
+                        "/invalid" => response = response.header("expires", "0"),
+                        _ => {}
+                    }
+                    Ok::<_, Infallible>(
+                        response
+                            .body(Full::new(Bytes::from(body)))
+                            .expect("origin response"),
+                    )
+                }
+            });
+            // The probe connection fails to parse as HTTP/1.1; that is not a hit.
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
         });
     }
-    steps.push(HttpStep::RespondBodyChunk(body.into_bytes()));
-    steps.push(HttpStep::RespondBodyEnd);
-    steps
 }
 
 async fn assert_expires_origin_counts(protocol: u8) {
     let reservation = reserve_port().await.expect("reserve origin listener");
-    let past = (Utc::now() - chrono::Duration::seconds(60))
-        .format("%a, %d %b %Y %H:%M:%S GMT")
-        .to_string();
-    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
-        .connection_scripts([
-            origin_response("/expires", 1, Some(&past)),
-            origin_response("/expires", 2, Some(&past)),
-            origin_response("/invalid", 3, Some("0")),
-            origin_response("/invalid", 4, Some("0")),
-            origin_response("/control", 5, None),
-        ])
-        .spawn()
-        .expect("start scripted origin");
+    let backend_port = reservation.port;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let origin = tokio::spawn(serve_origin(reservation.into_listener(), Arc::clone(&hits)));
     let config = json!({
         "version": "1",
         "proxies": [{
@@ -66,7 +76,7 @@ async fn assert_expires_origin_counts(protocol: u8) {
             "listen_path": "/",
             "backend_scheme": "http",
             "backend_host": "127.0.0.1",
-            "backend_port": backend.port,
+            "backend_port": backend_port,
             "strip_listen_path": false,
             "pool_enable_http2": false,
             "plugins": [{"plugin_config_id": "expires-cache"}]
@@ -144,9 +154,9 @@ async fn assert_expires_origin_counts(protocol: u8) {
         let payload: serde_json::Value = serde_json::from_slice(&body).expect("origin JSON");
         assert_eq!(payload["path"], path);
         assert_eq!(payload["origin_count"], expected_count);
-        assert_eq!(backend.received_requests().await.len(), expected_count);
+        assert_eq!(hits.load(Ordering::SeqCst), expected_count);
     }
-    backend.assert_no_matcher_mismatches().await;
+    origin.abort();
 }
 
 #[tokio::test]
