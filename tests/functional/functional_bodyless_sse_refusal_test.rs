@@ -102,6 +102,12 @@ async fn backend() -> (u16, JoinHandle<()>) {
                 let mut parts = request.split_whitespace();
                 let method = parts.next().expect("method");
                 let path = parts.next().expect("path");
+                // The backend capability refresh probes h2c with the HTTP/2
+                // prior-knowledge preface (`PRI * HTTP/2.0`); this backend
+                // speaks HTTP/1.1 only, so the probe is dropped, not answered.
+                if method == "PRI" {
+                    return;
+                }
                 let status = match path {
                     "/204" => "204 No Content",
                     "/205" => "205 Reset Content",
@@ -139,7 +145,19 @@ async fn backend() -> (u16, JoinHandle<()>) {
 
 fn assert_bodyless_headers(headers: &HeaderMap, method: &Method, status: u16) {
     assert_eq!(headers["x-bodyless-checked"], "yes");
-    assert!(!headers.contains_key("transfer-encoding"));
+    if status == 205 && *method != Method::HEAD {
+        // `ProxyBody::empty_for_response_status` frames a 205 with an
+        // unknown-length, immediately-EOF body so no `Content-Length` is
+        // synthesized: on H1 hyper writes `Transfer-Encoding: chunked` with an
+        // empty chunked body, on H2/H3 END_STREAM with neither header.
+        assert!(
+            headers
+                .get("transfer-encoding")
+                .is_none_or(|value| value == "chunked")
+        );
+    } else {
+        assert!(!headers.contains_key("transfer-encoding"));
+    }
     if *method == Method::HEAD && status == 200 {
         assert_eq!(headers["content-length"], "128");
     } else if status == 204 || status == 304 {
@@ -195,8 +213,11 @@ async fn bodyless_sse_http1_wire() {
                     );
                 }
                 assert_bodyless_headers(&headers, &method, expected);
+                let chunked_empty =
+                    expected == 205 && headers.contains_key("transfer-encoding");
+                let trailing = &wire[end + 4..];
                 assert!(
-                    wire[end + 4..].is_empty(),
+                    trailing.is_empty() || (chunked_empty && trailing == b"0\r\n\r\n"),
                     "{route}/{method}/{path} sent bytes"
                 );
             }
