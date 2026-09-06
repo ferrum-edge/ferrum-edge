@@ -4263,7 +4263,8 @@ async fn handle_tcp_connection_inner(
                         stream_ctx.listen_port,
                         proxy_id,
                         remote_addr.ip(),
-                    )? else {
+                    )?
+                    else {
                         return Err(error);
                     };
                     warn!(
@@ -4278,7 +4279,10 @@ async fn handle_tcp_connection_inner(
                     params.backend_port = port;
                     params.backend_policy_port = policy_port;
                     cb_info.cb_target_key = params.upstream_id.as_ref().map(|_| {
-                        crate::circuit_breaker::target_key(&params.backend_host, params.backend_port)
+                        crate::circuit_breaker::target_key(
+                            &params.backend_host,
+                            params.backend_port,
+                        )
                     });
                     cb_info.is_half_open_probe = false;
                     backend_info.backend_target =
@@ -4287,11 +4291,9 @@ async fn handle_tcp_connection_inner(
                     attempt += 1;
                     if let Some(ref retry_config) = params.retry {
                         let backoff = crate::retry::retry_delay(retry_config, attempt);
-                        if let Err(termination) = retry_backoff_within_stream_auth_deadline(
-                            stream_auth_deadline,
-                            backoff,
-                        )
-                        .await
+                        if let Err(termination) =
+                            retry_backoff_within_stream_auth_deadline(stream_auth_deadline, backoff)
+                                .await
                         {
                             return Err(settle_stream_auth_setup_expiry(
                                 termination,

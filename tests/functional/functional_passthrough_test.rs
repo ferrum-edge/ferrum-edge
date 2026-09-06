@@ -1154,7 +1154,9 @@ async fn test_tcp_passthrough_rotates_before_forwarding_client_hello() {
             .unwrap(),
     ));
 
-    for (retry_enabled, max_retries, succeeds) in [(true, 1, true), (false, 1, false), (true, 0, false)] {
+    for (retry_enabled, max_retries, succeeds) in
+        [(true, 1, true), (false, 1, false), (true, 0, false)]
+    {
         let refused = tokio::net::TcpSocket::new_v4().unwrap();
         refused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let refused_port = refused.local_addr().unwrap().port();
@@ -1224,7 +1226,9 @@ plugin_configs: []
                 .expect("TLS retry and echo finish within the bound");
             }
             assert_eq!(
-                gateway_logs(dir.path()).matches("TCP passthrough setup failed").count(),
+                gateway_logs(dir.path())
+                    .matches("TCP passthrough setup failed")
+                    .count(),
                 2,
                 "each stream should retry the first target exactly once"
             );
@@ -1233,12 +1237,18 @@ plugin_configs: []
                 .await
                 .unwrap();
             let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-            let result = tokio::time::timeout(Duration::from_secs(5), connector.connect(name, socket))
-                .await
-                .expect("disabled or exhausted retries fail promptly");
-            assert!(result.is_err(), "retry controls must prevent target rotation");
+            let result =
+                tokio::time::timeout(Duration::from_secs(5), connector.connect(name, socket))
+                    .await
+                    .expect("disabled or exhausted retries fail promptly");
             assert!(
-                tokio::time::timeout(Duration::from_millis(100), healthy.accept()).await.is_err(),
+                result.is_err(),
+                "retry controls must prevent target rotation"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), healthy.accept())
+                    .await
+                    .is_err(),
                 "the alternate target must not be dialed"
             );
             assert!(!gateway_logs(dir.path()).contains("TCP passthrough setup failed"));
