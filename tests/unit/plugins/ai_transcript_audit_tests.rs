@@ -1350,10 +1350,11 @@ async fn audit_namespace_follows_settings_and_proxy_identity() {
                 proxy.namespace = namespace.to_string();
                 ctx.matched_proxy = Some(Arc::new(proxy));
             }
-            let records =
-                capture_roundtrip_over_ctx(json!({ "mode": "metadata_only" }), ctx).await;
+            let records = capture_roundtrip_over_ctx(json!({ "mode": "metadata_only" }), ctx).await;
             assert_eq!(records.len(), 1);
-            let wanted = proxy_namespace.filter(|value| !value.is_empty()).unwrap_or(&expected);
+            let wanted = proxy_namespace
+                .filter(|value| !value.is_empty())
+                .unwrap_or(&expected);
             assert_eq!(records[0]["namespace"], wanted);
         }
         return;
@@ -1361,7 +1362,11 @@ async fn audit_namespace_follows_settings_and_proxy_identity() {
 
     for (settings, environment, expected) in [
         ("FERRUM_NAMESPACE = conf-tenant\n", None, "conf-tenant"),
-        ("FERRUM_NAMESPACE = conf-tenant\n", Some("env-tenant"), "env-tenant"),
+        (
+            "FERRUM_NAMESPACE = conf-tenant\n",
+            Some("env-tenant"),
+            "env-tenant",
+        ),
         ("", None, DEFAULT_NAMESPACE),
     ] {
         let directory = tempfile::tempdir().unwrap();
@@ -1378,7 +1383,12 @@ async fn audit_namespace_follows_settings_and_proxy_identity() {
             command.env("FERRUM_NAMESPACE", value);
         }
         let output = command.output().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
 }
