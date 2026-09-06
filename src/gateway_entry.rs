@@ -105,8 +105,14 @@ fn emit_bootstrap_error(message: &str, fields: &[(&str, String)]) {
 ///    — each mode then loads TLS certs (frontend, admin, DTLS, gRPC) and validates
 ///    per-proxy backend TLS paths before starting listeners
 /// 8. Wait for SIGINT/SIGTERM for graceful shutdown
+///
+/// # Safety
+/// Call exactly once from the process entry point, before other application
+/// threads or runtimes exist. The startup pipeline resolves secrets and mutates
+/// the process environment before starting its logging workers and main runtime;
+/// callers must not access the environment concurrently with this initialization.
 #[doc(hidden)]
-pub fn run_gateway_cli() {
+pub unsafe fn run_gateway_cli() {
     // ── CLI parsing ─────────────────────────────────────────────────────
     // Parse before anything else so `--settings`/`--spec`/`--mode` env var
     // overrides are in place before `CONF_FILE_CACHE` OnceLock is triggered
@@ -404,8 +410,8 @@ fn init_logging() -> Result<LoggingGuards, String> {
 
 /// Adapter that turns a `tracing_subscriber::reload::Handle` into the
 /// process-global `crate::logging::LogLevelReloader` consumed by the mesh
-/// RTDS overlay path. Kept in `main.rs` so the binary owns the concrete
-/// subscriber type and the library stays subscriber-generic.
+/// RTDS overlay path. The process entry point owns this concrete subscriber
+/// type; the reusable logging interface remains subscriber-generic.
 struct EnvFilterReloader<S>
 where
     S: tracing::Subscriber + Send + Sync + 'static,

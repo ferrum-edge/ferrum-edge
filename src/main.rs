@@ -7,5 +7,9 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() {
-    ferrum_edge::run_gateway_cli();
+    // SAFETY: this is the process entry point. No application worker or runtime
+    // has started; the shared pipeline owns initialization and thread startup.
+    unsafe {
+        ferrum_edge::run_gateway_cli();
+    }
 }

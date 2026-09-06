@@ -61,7 +61,9 @@ compiling the normal library and library test harness; the binary finished
 last. Its module declarations duplicated the library's gateway source tree.
 
 The executable now retains the same non-Windows jemalloc declaration and calls
-`ferrum_edge::run_gateway_cli()`. Startup bodies live in `src/gateway_entry.rs`,
+`ferrum_edge::run_gateway_cli()` under its explicit unsafe process-start contract.
+The caller must enter once before concurrent environment access or application
+thread startup, preserving the original environment-mutation precondition. Startup bodies live in `src/gateway_entry.rs`,
 included at the library root to preserve existing crate-relative paths and
 implicit tracing targets. The version constant remains the library's existing
 Cargo-derived constant. No startup ordering, error handling, secret resolution,
