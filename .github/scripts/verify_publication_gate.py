@@ -4,8 +4,8 @@
 The canonical inventory covers every branch-required product check. Both the
 manual release request and the tag-triggered production workflow verify the
 complete inventory, trusted workflow identity, main ancestry, and PR binding.
-The existing main evidence job collects its designated subset; it publishes
-nothing. Missing, cancelled, stale, skipped, or failed evidence blocks release.
+Publication checks run only when production is requested. Missing, cancelled,
+stale, skipped, or failed evidence blocks release.
 The trusted-base policy freezes this verifier and inventory against PR edits.
 """
 
@@ -24,54 +24,17 @@ from pathlib import Path
 
 INVENTORY_PATH = ".github/required-publication-checks.json"
 CI_WORKFLOW_PATH = ".github/workflows/ci.yml"
-PUBLICATION_GATE_WORKFLOW_PATH = ".github/workflows/gateway-api-conformance.yml"
-PUBLICATION_GATE_JOB = "main-publication-required-checks"
+GATEWAY_WORKFLOW_PATH = ".github/workflows/gateway-api-conformance.yml"
 RELEASE_WORKFLOW_PATH = ".github/workflows/release.yml"
 RELEASE_GATE_JOB = "validate-release-sha"
 CHECKOUT_USES = (
     "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 )
 
-# Direct fields of the hosted publication gate. Comments are ignored; extra,
-# missing, duplicate, reordered, flow-spelled, or opaque fields fail closed.
-# The unique job itself is proven over the whole `jobs:` mapping: quoted,
-# escaped, or opaque YAML-equivalent duplicates of the protected key fail.
-PUBLICATION_GATE_FIELDS = (
-    "name",
-    "if",
-    "runs-on",
-    "timeout-minutes",
-    "permissions",
-    "steps",
-)
-PUBLICATION_GATE_NAME = "Main Publication Required Checks"
-PUBLICATION_GATE_IF = (
-    "github.event_name == 'push' && github.ref == 'refs/heads/main'"
-)
-PUBLICATION_GATE_RUNS_ON = "ubuntu-latest"
-PUBLICATION_GATE_TIMEOUT = "110"
-PUBLICATION_GATE_PERMISSIONS = (("contents", "read"), ("actions", "read"))
-PUBLICATION_GATE_STEP_NAME = (
-    "Prove every publish-blocking required check passed for this SHA"
-)
-PUBLICATION_GATE_CHECKOUT_FIELDS = ("uses",)
-PUBLICATION_GATE_PROOF_FIELDS = ("name", "env", "run")
-PUBLICATION_GATE_ENV = (
-    ("GH_TOKEN", "${{ secrets.GITHUB_TOKEN }}"),
-    ("PUBLICATION_GATE_REPOSITORY", "${{ github.repository }}"),
-    ("PUBLICATION_GATE_SHA", "${{ github.sha }}"),
-)
-PUBLICATION_GATE_ACTIVE_COMMANDS = (
-    "set -euo pipefail",
-    "python3 .github/scripts/verify_publication_gate.py --self-test",
-    "python3 .github/scripts/verify_publication_gate.py --enforce main "
-    "--deadline-seconds 6000",
-)
-
 # Direct fields of the version-release SHA gate. Same closed-set rule: a
 # write permission, `continue-on-error`, or other control beside this list
 # cannot hide behind a substring match. The unique job is proven over the
-# whole `jobs:` mapping, matching the hosted publication gate.
+# whole `jobs:` mapping.
 RELEASE_GATE_FIELDS = (
     "name",
     "needs",
@@ -131,10 +94,6 @@ RELEASE_GATE_ACTIVE_COMMANDS = (
     "--deadline-seconds 9600",
 )
 
-# The main evidence job collects its subset before a release is requested.
-# Both release gates independently require ALL stages, including Tests.
-VALIDATION_STAGES = ("tests_aggregate", "release_gate", "main_evidence_gate")
-
 # `evidence` says how a run is bound to the exact product SHA.
 EVIDENCE_MODES = ("push_main", "pr_head", "check_run")
 
@@ -144,7 +103,6 @@ REQUIRED_ENTRY_FIELDS = (
     "workflow_path",
     "workflow_name",
     "job",
-    "validation_stage",
     "evidence",
     "rationale",
 )
@@ -155,24 +113,12 @@ PAGE_SIZE = 100
 MAX_PAGES = 20
 TRANSIENT_ATTEMPTS = 3
 GITHUB_ACTIONS_APP_ID = 15368
-# The Actions token is rate limited per repository, and these gates can poll for
-# well over an hour. The hosted main gate polls four run listings once a minute
-# (240 requests/hour). The release gate polls once every three minutes and uses
-# nine listings per sweep because `Tests` needs both a workflow-run and a
-# check-run listing (180/hour). ci.yml's frozen gate uses three list calls every
-# 30 seconds (360/hour), for a 780/hour steady-state total. Workflow identity and
-# PR binding lookups are reused while pending and add only bounded startup/final
-# bursts. A completed success is never cached across sweeps: GitHub permits
-# rerunning a completed workflow, so the run record can return to queued /
-# in_progress and later fail while this wait is still in progress. The sweep
-# that would permit re-resolves canonical workflow identity and PR binding and
-# re-observes the complete set before returning.
-MAIN_POLL_SECONDS = 60
+# Release enforcement polls once every three minutes. Pending workflow identity
+# and PR-binding lookups are reused, but success is never cached across sweeps:
+# GitHub permits rerunning a completed workflow. The permitting sweep rechecks
+# canonical identity, PR binding and the complete evidence set.
+POLL_SECONDS = 60
 RELEASE_POLL_SECONDS = 180
-POLL_SECONDS_BY_MODE = {
-    "main": MAIN_POLL_SECONDS,
-    "release": RELEASE_POLL_SECONDS,
-}
 
 # Anything that is not a completed success blocks. Statuses are listed only so
 # a diagnostic can say "still running" rather than "unknown"; an unrecognized
@@ -274,20 +220,11 @@ def inventory_errors(inventory: dict) -> list[str]:
                 f"{located} workflow_path {workflow_path!r} must be "
                 f".github/workflows/{entry['workflow_file']}"
             )
-        if entry["validation_stage"] not in VALIDATION_STAGES:
-            errors.append(
-                f"{located} validation_stage must be one of "
-                f"{list(VALIDATION_STAGES)}"
-            )
         if entry["evidence"] not in EVIDENCE_MODES:
             errors.append(f"{located} evidence must be one of {list(EVIDENCE_MODES)}")
         if not entry["rationale"].strip():
             errors.append(f"{located} must carry a non-empty rationale")
     return errors
-
-
-def by_mode(inventory: dict, mode: str) -> list[dict]:
-    return [entry for entry in entries(inventory) if entry["validation_stage"] == mode]
 
 
 # ---------------------------------------------------------------------------
@@ -799,88 +736,6 @@ def required_context_parity_errors(
     return errors
 
 
-def main_evidence_gate_errors(gateway_yml: str, inventory: dict) -> list[str]:
-    """Prove the hosted publication gate by exact active structure."""
-
-    errors: list[str] = []
-    located = f"{PUBLICATION_GATE_WORKFLOW_PATH} jobs.{PUBLICATION_GATE_JOB}"
-    try:
-        body = _protected_job_body(gateway_yml, PUBLICATION_GATE_JOB)
-        job = _parse_job(body)
-    except StructuralError as error:
-        errors.append(f"{located} {error}")
-        return errors
-    if tuple(job) != PUBLICATION_GATE_FIELDS:
-        errors.append(
-            f"{located} direct fields must be exactly "
-            f"{PUBLICATION_GATE_FIELDS!r} in order, found {tuple(job)!r}"
-        )
-    if _scalar(job, "name") != PUBLICATION_GATE_NAME:
-        errors.append(f"{located} must keep name {PUBLICATION_GATE_NAME!r}")
-    if _scalar(job, "if") != PUBLICATION_GATE_IF:
-        errors.append(f"{located} must stay scoped by `{PUBLICATION_GATE_IF}`")
-    if _scalar(job, "runs-on") != PUBLICATION_GATE_RUNS_ON:
-        errors.append(f"{located} must run on `{PUBLICATION_GATE_RUNS_ON}`")
-    if _scalar(job, "timeout-minutes") != PUBLICATION_GATE_TIMEOUT:
-        errors.append(
-            f"{located} must keep the bounded timeout-minutes "
-            f"{PUBLICATION_GATE_TIMEOUT}"
-        )
-    permissions = _mapping(job, "permissions")
-    if (
-        permissions is None
-        or _mapping_pairs(permissions) != PUBLICATION_GATE_PERMISSIONS
-    ):
-        errors.append(
-            f"{located} permissions must be the exact least-privilege mapping "
-            f"{PUBLICATION_GATE_PERMISSIONS!r}; write scopes, extra keys, "
-            "duplicates, and flow spellings do not count"
-        )
-    steps = _sequence(job, "steps")
-    if steps is None or len(steps) != 2:
-        errors.append(
-            f"{located} must have exactly two active steps: the pinned "
-            "checkout, then the named publication proof"
-        )
-    else:
-        errors.extend(
-            _checkout_step_errors(
-                steps[0],
-                located,
-                PUBLICATION_GATE_CHECKOUT_FIELDS,
-                None,
-            )
-        )
-        errors.extend(
-            _proof_step_errors(
-                steps[1],
-                located,
-                PUBLICATION_GATE_STEP_NAME,
-                PUBLICATION_GATE_PROOF_FIELDS,
-                PUBLICATION_GATE_ENV,
-                PUBLICATION_GATE_ACTIVE_COMMANDS,
-            )
-        )
-    if not by_mode(inventory, "main_evidence_gate"):
-        errors.append(
-            f"{INVENTORY_PATH} marks no context `main_evidence_gate`, so the "
-            "hosted gate would prove nothing"
-        )
-    # Release verification waits for the workflow that hosts main evidence,
-    # so its run conclusion must remain a release-stage inventory entry.
-    hosting = [
-        entry
-        for entry in by_mode(inventory, "release_gate")
-        if entry["workflow_path"] == PUBLICATION_GATE_WORKFLOW_PATH
-    ]
-    if not hosting:
-        errors.append(
-            f"{PUBLICATION_GATE_WORKFLOW_PATH} hosts the publication gate, so it "
-            f"must itself be a `release_gate` entry of {INVENTORY_PATH}"
-        )
-    return errors
-
-
 def release_gate_errors(release_yml: str, inventory: dict) -> list[str]:
     """Prove the version-release verifier by exact active structure."""
 
@@ -1024,14 +879,7 @@ def contract_errors(
         return errors
     errors.extend(required_context_parity_errors(required_contexts, inventory))
     errors.extend(workflow_identity_errors(inventory, read))
-    errors.extend(
-        main_evidence_gate_errors(read(PUBLICATION_GATE_WORKFLOW_PATH), inventory)
-    )
     errors.extend(release_gate_errors(read(RELEASE_WORKFLOW_PATH), inventory))
-    # `inventory_errors` proves every unique context has exactly one value from
-    # the closed VALIDATION_STAGES enum. The consumer-specific checks above
-    # bind all three values, which is the exhaustive, non-overlapping partition;
-    # recomputing their union from the same single field would prove nothing.
     return list(dict.fromkeys(errors))
 
 
@@ -1083,7 +931,7 @@ def _transient_http_delay(
             return max(1.0, float(retry_after))
         except ValueError:
             pass
-    return float(MAIN_POLL_SECONDS)
+    return float(POLL_SECONDS)
 
 
 def http_get(token: str):
@@ -1126,7 +974,7 @@ def http_get(token: str):
         raise ApiPending(
             f"GET {path} remained unreadable after "
             f"{TRANSIENT_ATTEMPTS} attempts: {last}",
-            float(MAIN_POLL_SECONDS),
+            float(POLL_SECONDS),
         )
 
     return get
@@ -1655,7 +1503,7 @@ def enforce(
     selected: list[dict],
     deadline_seconds: int,
     *,
-    poll_seconds: float = MAIN_POLL_SECONDS,
+    poll_seconds: float = POLL_SECONDS,
     sleep=time.sleep,
     monotonic=time.monotonic,
     log=print,
@@ -1785,18 +1633,11 @@ def enforce(
 
 
 def select_entries(inventory: dict, mode: str) -> list[dict]:
-    """Return the contexts a given publication path must prove through the API.
+    """Both production gates must prove the complete inventory."""
 
-    `main` collects the designated main-evidence subset without publishing.
-    `release` proves the COMPLETE inventory, because the version-release
-    verifier has no in-run relationship with any of them.
-    """
-
-    if mode == "release":
-        return list(entries(inventory))
-    if mode == "main":
-        return by_mode(inventory, "main_evidence_gate")
-    raise ContractError(f"unknown enforcement mode {mode!r}")
+    if mode != "release":
+        raise ContractError(f"unknown enforcement mode {mode!r}")
+    return list(entries(inventory))
 
 
 # ---------------------------------------------------------------------------
@@ -1816,7 +1657,6 @@ def _fixture_inventory() -> dict:
                 "workflow_path": ".github/workflows/alpha.yml",
                 "workflow_name": "Alpha Workflow",
                 "job": "gate",
-                "validation_stage": "main_evidence_gate",
                 "evidence": "push_main",
                 "rationale": "self-test",
             },
@@ -1826,7 +1666,6 @@ def _fixture_inventory() -> dict:
                 "workflow_path": ".github/workflows/beta.yml",
                 "workflow_name": "Beta Workflow",
                 "job": "verify",
-                "validation_stage": "main_evidence_gate",
                 "evidence": "pr_head",
                 "rationale": "self-test",
             },
@@ -1953,7 +1792,7 @@ def _enforce(runs_by_file, **kwargs) -> int:
             "ferrum-edge/ferrum-edge",
             _SHA,
             inventory,
-            select_entries(inventory, "main"),
+            select_entries(inventory, "release"),
             deadline_seconds=0,
             sleep=lambda _seconds: None,
             monotonic=lambda: 1.0,
@@ -2036,7 +1875,7 @@ def _enforce_across_sweeps(
             "ferrum-edge/ferrum-edge",
             _SHA,
             inventory,
-            select_entries(inventory, "main"),
+            select_entries(inventory, "release"),
             deadline_seconds,
             sleep=sleep,
             monotonic=lambda: state["t"],
@@ -2071,7 +1910,6 @@ def _tests_entry() -> dict:
         "workflow_path": CI_WORKFLOW_PATH,
         "workflow_name": "CI",
         "job": "test",
-        "validation_stage": "tests_aggregate",
         "evidence": "check_run",
         "rationale": "self-test",
     }
@@ -2181,10 +2019,9 @@ def _gate_inventory() -> dict:
         {
             "context": "Gateway API Conformance",
             "workflow_file": "gateway-api-conformance.yml",
-            "workflow_path": PUBLICATION_GATE_WORKFLOW_PATH,
+            "workflow_path": GATEWAY_WORKFLOW_PATH,
             "workflow_name": "Gateway API Conformance",
             "job": "gate",
-            "validation_stage": "release_gate",
             "evidence": "push_main",
             "rationale": "self-test hosting workflow",
         },
@@ -2192,44 +2029,11 @@ def _gate_inventory() -> dict:
     return inventory
 
 
-def _wrap_publication_job(body: str) -> str:
-    if not body.endswith("\n"):
-        body += "\n"
-    return f"jobs:\n  {PUBLICATION_GATE_JOB}:\n{body}"
-
-
 def _wrap_release_job(body: str) -> str:
     if not body.endswith("\n"):
         body += "\n"
     return f"jobs:\n  {RELEASE_GATE_JOB}:\n{body}  next-job:\n    runs-on: ubuntu-latest\n"
 
-
-_CONFORMING_PUBLICATION_JOB = """    name: Main Publication Required Checks
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    # The gate stops at its own deadline below, so this ceiling is only a
-    # backstop against a wedged runner.
-    timeout-minutes: 110
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
-
-      - name: Prove every publish-blocking required check passed for this SHA
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PUBLICATION_GATE_REPOSITORY: ${{ github.repository }}
-          PUBLICATION_GATE_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-
-          # The commit and repository travel in the environment so this argv
-          # stays fully literal: a trusted-policy scan can read exactly what
-          # this step executes without resolving a shell expansion.
-          python3 .github/scripts/verify_publication_gate.py --self-test
-          python3 .github/scripts/verify_publication_gate.py --enforce main --deadline-seconds 6000
-"""
 
 _CONFORMING_RELEASE_JOB = """    name: Validate release SHA
     needs: validate-release-version
@@ -2246,7 +2050,7 @@ _CONFORMING_RELEASE_JOB = """    name: Validate release SHA
 
       # Issue #4302. The complete, repository-required product check set --
       # `.github/required-publication-checks.json`, the one canonical inventory
-      # consumed by the `main` publisher as well -- must be successful
+      # consumed by the manual release request as well -- must be successful
       # for the EXACT tag target under trusted workflow identity before any
       # immutable version-tag artifact is built. The previous implementation
       # kept an independent hard-coded subset here that omitted Gateway API
@@ -2298,12 +2102,6 @@ _CONFORMING_RELEASE_JOB = """    name: Validate release SHA
           python3 .github/scripts/verify_publication_gate.py --self-test
           python3 .github/scripts/verify_publication_gate.py --enforce release --deadline-seconds 9600
 """
-
-
-def _publication_errors(body: str) -> list[str]:
-    return main_evidence_gate_errors(
-        _wrap_publication_job(body), _gate_inventory()
-    )
 
 
 def _release_errors(body: str) -> list[str]:
@@ -2442,7 +2240,7 @@ def self_test() -> list[str]:
         "a later complete exact-SHA sweep must publish after a pending wait",
     )
     expect(
-        slept == [MAIN_POLL_SECONDS],
+        slept == [POLL_SECONDS],
         "a pending wait must keep the one-minute poll cadence",
     )
 
@@ -2458,8 +2256,8 @@ def self_test() -> list[str]:
     )
     expect(
         slept
-        and slept[0] == MAIN_POLL_SECONDS
-        and all(interval <= MAIN_POLL_SECONDS for interval in slept),
+        and slept[0] == POLL_SECONDS
+        and all(interval <= POLL_SECONDS for interval in slept),
         "a queued regression must keep a bounded one-minute cadence",
     )
 
@@ -2474,7 +2272,7 @@ def self_test() -> list[str]:
         "must block publication",
     )
     expect(
-        slept == [MAIN_POLL_SECONDS],
+        slept == [POLL_SECONDS],
         "a failure regression must fail closed after one pending wait",
     )
 
@@ -2505,7 +2303,7 @@ def self_test() -> list[str]:
     )
     expect(
         _transient_http_delay(503, {}, "", now=1000)
-        == MAIN_POLL_SECONDS,
+        == POLL_SECONDS,
         "a 5xx without reset headers must remain pending for one poll interval",
     )
     expect(
@@ -2538,7 +2336,7 @@ def self_test() -> list[str]:
             "ferrum-edge/ferrum-edge",
             _SHA,
             transient_inventory,
-            select_entries(transient_inventory, "main"),
+            select_entries(transient_inventory, "release"),
             deadline_seconds=90,
             sleep=transient_sleep,
             monotonic=lambda: transient_state["t"],
@@ -2568,7 +2366,7 @@ def self_test() -> list[str]:
             "ferrum-edge/ferrum-edge",
             _SHA,
             transient_inventory,
-            select_entries(transient_inventory, "main"),
+            select_entries(transient_inventory, "release"),
             deadline_seconds=20,
             sleep=bounded_sleep,
             monotonic=lambda: bounded_state["t"],
@@ -2858,7 +2656,7 @@ def self_test() -> list[str]:
                 "ferrum-edge/ferrum-edge",
                 _SHA,
                 inventory,
-                select_entries(inventory, "main"),
+                select_entries(inventory, "release"),
                 deadline_seconds=0,
                 sleep=lambda _seconds: None,
                 monotonic=lambda: 1.0,
@@ -2876,7 +2674,7 @@ def self_test() -> list[str]:
             "ferrum-edge/ferrum-edge",
             "not-a-sha",
             inventory,
-            select_entries(inventory, "main"),
+            select_entries(inventory, "release"),
             deadline_seconds=0,
             sleep=lambda _seconds: None,
             monotonic=lambda: 1.0,
@@ -2892,15 +2690,12 @@ def self_test() -> list[str]:
         == {entry["context"] for entry in entries(inventory)},
         "release enforcement must cover every inventory entry",
     )
-    expect(
-        {entry["context"] for entry in select_entries(inventory, "main")}
-        == {
-            entry["context"]
-            for entry in entries(inventory)
-            if entry["validation_stage"] == "main_evidence_gate"
-        },
-        "main enforcement must select exactly the hosted-gate contexts",
-    )
+    try:
+        select_entries(inventory, "main")
+        retired_main_rejected = False
+    except ContractError:
+        retired_main_rejected = True
+    expect(retired_main_rejected, "retired main publication mode must be rejected")
 
     # Static contract: a newly required context with no inventory entry fails.
     real = _fixture_inventory()
@@ -2942,7 +2737,7 @@ def self_test() -> list[str]:
 
     # Static contract: inventory schema defects are rejected.
     for label, mutation in (
-        ("unknown mode", {"validation_stage": "somewhere_else"}),
+        ("retired partition", {"validation_stage": "main_evidence_gate"}),
         ("unknown evidence", {"evidence": "trust_me"}),
         ("empty rationale", {"rationale": "  "}),
         ("path mismatch", {"workflow_path": ".github/workflows/other.yml"}),
@@ -2984,185 +2779,10 @@ def self_test() -> list[str]:
         "a blank line before push paths must not evade the filter guard",
     )
 
-    # Static contract: hosted publication-gate and release-gate jobs are
-    # proven by exact active structure, not raw substring search.
-    expect(
-        _publication_errors(_CONFORMING_PUBLICATION_JOB) == [],
-        "the exact hosted publication-gate job must pass",
-    )
+    # The production gate remains an exact active structural contract.
     expect(
         _release_errors(_CONFORMING_RELEASE_JOB) == [],
         "the exact validate-release-sha job must pass",
-    )
-
-    commented_enforce = _CONFORMING_PUBLICATION_JOB.replace(
-        "          python3 .github/scripts/verify_publication_gate.py --enforce main --deadline-seconds 6000\n",
-        "          # python3 .github/scripts/verify_publication_gate.py --enforce main --deadline-seconds 6000\n",
-    )
-    expect(
-        _publication_errors(commented_enforce) != [],
-        "a comment-only enforce command must fail the publication-gate job",
-    )
-    commented_scope = _CONFORMING_PUBLICATION_JOB.replace(
-        "    if: github.event_name == 'push' && github.ref == 'refs/heads/main'\n",
-        "    # if: github.event_name == 'push' && github.ref == 'refs/heads/main'\n"
-        "    if: always()\n",
-    )
-    expect(
-        _publication_errors(commented_scope) != [],
-        "a comment-only main-push scope must fail the publication-gate job",
-    )
-    commented_permissions = _CONFORMING_PUBLICATION_JOB.replace(
-        "    permissions:\n      contents: read\n      actions: read\n",
-        "    permissions:\n      contents: write\n      actions: write\n"
-        "      # contents: read\n      # actions: read\n",
-    )
-    expect(
-        _publication_errors(commented_permissions) != [],
-        "comment-only read permissions must fail the publication-gate job",
-    )
-    unrelated_step = _CONFORMING_PUBLICATION_JOB.replace(
-        "      - name: Prove every publish-blocking required check passed for this SHA\n"
-        "        env:\n"
-        "          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n"
-        "          PUBLICATION_GATE_REPOSITORY: ${{ github.repository }}\n"
-        "          PUBLICATION_GATE_SHA: ${{ github.sha }}\n"
-        "        run: |\n"
-        "          set -euo pipefail\n"
-        "\n"
-        "          # The commit and repository travel in the environment so this argv\n"
-        "          # stays fully literal: a trusted-policy scan can read exactly what\n"
-        "          # this step executes without resolving a shell expansion.\n"
-        "          python3 .github/scripts/verify_publication_gate.py --self-test\n"
-        "          python3 .github/scripts/verify_publication_gate.py --enforce main --deadline-seconds 6000\n",
-        "      - name: Unrelated decoy\n"
-        "        run: |\n"
-        "          python3 .github/scripts/verify_publication_gate.py --self-test\n"
-        "          python3 .github/scripts/verify_publication_gate.py --enforce main --deadline-seconds 6000\n"
-        "      - name: Prove every publish-blocking required check passed for this SHA\n"
-        "        env:\n"
-        "          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n"
-        "          PUBLICATION_GATE_REPOSITORY: ${{ github.repository }}\n"
-        "          PUBLICATION_GATE_SHA: ${{ github.sha }}\n"
-        "        run: |\n"
-        "          set -euo pipefail\n"
-        "          echo skipped\n",
-    )
-    expect(
-        _publication_errors(unrelated_step) != [],
-        "a required command in an unrelated step must fail the publication-gate job",
-    )
-    missing_enforce = _CONFORMING_PUBLICATION_JOB.replace(
-        "          python3 .github/scripts/verify_publication_gate.py --enforce main --deadline-seconds 6000\n",
-        "",
-    )
-    expect(
-        _publication_errors(missing_enforce) != [],
-        "a missing active enforce command must fail the publication-gate job",
-    )
-    altered_deadline = _CONFORMING_PUBLICATION_JOB.replace(
-        "--deadline-seconds 6000",
-        "--deadline-seconds 1",
-    )
-    expect(
-        _publication_errors(altered_deadline) != [],
-        "an altered enforce deadline must fail the publication-gate job",
-    )
-    extra_write = _CONFORMING_PUBLICATION_JOB.replace(
-        "      contents: read\n      actions: read\n",
-        "      contents: read\n      actions: read\n      packages: write\n",
-    )
-    expect(
-        _publication_errors(extra_write) != [],
-        "an extra write permission must fail the publication-gate job",
-    )
-    continue_on_error = _CONFORMING_PUBLICATION_JOB.replace(
-        "    timeout-minutes: 110\n",
-        "    timeout-minutes: 110\n    continue-on-error: true\n",
-    )
-    expect(
-        _publication_errors(continue_on_error) != [],
-        "continue-on-error on the publication-gate job must fail",
-    )
-    duplicate_permissions = _CONFORMING_PUBLICATION_JOB.replace(
-        "    permissions:\n      contents: read\n      actions: read\n",
-        "    permissions:\n      contents: read\n      actions: read\n"
-        "    permissions:\n      contents: write\n      actions: write\n",
-    )
-    expect(
-        _publication_errors(duplicate_permissions) != [],
-        "duplicate permissions mappings must fail the publication-gate job",
-    )
-    flow_permissions = _CONFORMING_PUBLICATION_JOB.replace(
-        "    permissions:\n      contents: read\n      actions: read\n",
-        "    permissions: { contents: read, actions: read }\n",
-    )
-    expect(
-        _publication_errors(flow_permissions) != [],
-        "flow-spelled permissions must fail the publication-gate job",
-    )
-    opaque_permissions = _CONFORMING_PUBLICATION_JOB.replace(
-        "    permissions:\n      contents: read\n      actions: read\n",
-        "    permissions: read-all\n",
-    )
-    expect(
-        _publication_errors(opaque_permissions) != [],
-        "opaque permissions: read-all must fail the publication-gate job",
-    )
-    reordered_permissions = _CONFORMING_PUBLICATION_JOB.replace(
-        "      contents: read\n      actions: read\n",
-        "      actions: read\n      contents: read\n",
-    )
-    expect(
-        _publication_errors(reordered_permissions) != [],
-        "reordered permission keys must fail the publication-gate job",
-    )
-    job_level_env = _CONFORMING_PUBLICATION_JOB.replace(
-        "    timeout-minutes: 110\n",
-        "    timeout-minutes: 110\n"
-        "    env:\n"
-        "      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n"
-        "      PUBLICATION_GATE_REPOSITORY: ${{ github.repository }}\n"
-        "      PUBLICATION_GATE_SHA: ${{ github.sha }}\n",
-    ).replace(
-        "        env:\n"
-        "          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n"
-        "          PUBLICATION_GATE_REPOSITORY: ${{ github.repository }}\n"
-        "          PUBLICATION_GATE_SHA: ${{ github.sha }}\n",
-        "",
-    )
-    expect(
-        _publication_errors(job_level_env) != [],
-        "env owned by the job instead of the named proof step must fail",
-    )
-    wrong_sha_env = _CONFORMING_PUBLICATION_JOB.replace(
-        "PUBLICATION_GATE_SHA: ${{ github.sha }}",
-        "PUBLICATION_GATE_SHA: ${{ github.event.pull_request.head.sha }}",
-    )
-    expect(
-        _publication_errors(wrong_sha_env) != [],
-        "a wrong proof-step env value must fail the publication-gate job",
-    )
-    missing_checkout = _CONFORMING_PUBLICATION_JOB.replace(
-        "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6\n\n",
-        "",
-    )
-    expect(
-        _publication_errors(missing_checkout) != [],
-        "a missing checkout step must fail the publication-gate job",
-    )
-    wrong_pin = _CONFORMING_PUBLICATION_JOB.replace(
-        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-        "actions/checkout@v6",
-    )
-    expect(
-        _publication_errors(wrong_pin) != [],
-        "a wrong checkout pin must fail the publication-gate job",
-    )
-    folded_run = _CONFORMING_PUBLICATION_JOB.replace("        run: |\n", "        run: >\n")
-    expect(
-        _publication_errors(folded_run) != [],
-        "a folded run block must fail the publication-gate job",
     )
 
     release_commented_enforce = _CONFORMING_RELEASE_JOB.replace(
@@ -3297,73 +2917,13 @@ def self_test() -> list[str]:
         "a missing active ancestry proof must fail the release gate",
     )
 
-    # Whole-jobs mapping: YAML-equivalent or opaque protected job keys fail
-    # closed even when a canonical decoy is the only header the old regex
-    # would inspect. `_publication_errors` / `_release_errors` wrap the
-    # canonical job; extra sibling keys are appended at the `jobs:` indent.
-    quoted_publication_after = _CONFORMING_PUBLICATION_JOB + (
-        f'  "{PUBLICATION_GATE_JOB}":\n    name: Attack\n    if: always()\n'
-    )
-    expect(
-        _publication_errors(quoted_publication_after) != [],
-        "a quoted duplicate immediately after the publication-gate job must fail",
-    )
-    single_quoted_publication_after = _CONFORMING_PUBLICATION_JOB + (
-        f"  '{PUBLICATION_GATE_JOB}':\n    name: Attack\n    if: always()\n"
-    )
-    expect(
-        _publication_errors(single_quoted_publication_after) != [],
-        "a single-quoted duplicate immediately after the publication-gate job must fail",
-    )
-    escaped_publication_after = _CONFORMING_PUBLICATION_JOB + (
-        '  "main-publication-required-check\\u0073":\n    name: Attack\n'
-    )
-    expect(
-        _publication_errors(escaped_publication_after) != [],
-        "an escaped quoted duplicate of the publication-gate job must fail",
-    )
-    publication_after_intervening = _CONFORMING_PUBLICATION_JOB + (
-        "  ordinary-job:\n    runs-on: ubuntu-latest\n"
-        f'  "{PUBLICATION_GATE_JOB}":\n    name: Attack\n    if: always()\n'
-    )
-    expect(
-        _publication_errors(publication_after_intervening) != [],
-        "a quoted publication-gate duplicate after an intervening job must fail",
-    )
-    publication_quoted_before = (
-        f'jobs:\n  "{PUBLICATION_GATE_JOB}":\n    name: Attack\n    if: always()\n'
-        f"  {PUBLICATION_GATE_JOB}:\n{_CONFORMING_PUBLICATION_JOB}"
-    )
-    expect(
-        main_evidence_gate_errors(publication_quoted_before, _gate_inventory())
-        != [],
-        "a quoted publication-gate duplicate before the canonical job must fail",
-    )
-    publication_quoted_only = (
-        f'jobs:\n  "{PUBLICATION_GATE_JOB}":\n{_CONFORMING_PUBLICATION_JOB}'
-    )
-    expect(
-        main_evidence_gate_errors(publication_quoted_only, _gate_inventory()) != [],
-        "a quoted-only replacement of the publication-gate job must fail",
-    )
-    publication_opaque_key = _CONFORMING_PUBLICATION_JOB + (
-        f"  ? {PUBLICATION_GATE_JOB}\n  :\n    name: Attack\n"
-    )
-    expect(
-        _publication_errors(publication_opaque_key) != [],
-        "an opaque explicit-key duplicate of the publication-gate job must fail",
-    )
+    # YAML-equivalent or opaque duplicate release job keys fail closed.
     try:
-        _parse_job(
-            _CONFORMING_PUBLICATION_JOB + '  "smuggled":\n    name: Attack\n'
-        )
-        publication_unconsumed = False
+        _parse_job(_CONFORMING_RELEASE_JOB + '  "smuggled":\n    name: Attack\n')
+        unconsumed = False
     except StructuralError:
-        publication_unconsumed = True
-    expect(
-        publication_unconsumed,
-        "unconsumed lower-indentation content in a publication job region must fail",
-    )
+        unconsumed = True
+    expect(unconsumed, "unconsumed lower-indentation content in a release job must fail")
 
     quoted_release_after = _CONFORMING_RELEASE_JOB + (
         f'  "{RELEASE_GATE_JOB}":\n    name: Attack\n'
@@ -3435,7 +2995,7 @@ def repository_contract_errors(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true")
-    parser.add_argument("--enforce", choices=("main", "release"))
+    parser.add_argument("--enforce", choices=("release",))
     # Both operands are read from the environment so every invocation in a
     # workflow keeps a fully literal argv. The flags exist for ad-hoc use.
     parser.add_argument(
@@ -3494,7 +3054,7 @@ def main(argv: list[str] | None = None) -> int:
             inventory,
             selected,
             arguments.deadline_seconds,
-            poll_seconds=POLL_SECONDS_BY_MODE[arguments.enforce],
+            poll_seconds=RELEASE_POLL_SECONDS,
         )
     except (ApiFailure, ApiPending, ContractError) as error:
         print(f"::error::{error}", file=sys.stderr)

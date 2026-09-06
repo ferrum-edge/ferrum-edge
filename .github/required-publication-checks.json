@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "documentation": "docs/ci_cd.md -> Publish-blocking required checks. Canonical inventory verified in full by the manual release request and release.yml for the exact main commit. The main evidence job collects its designated subset but publishes nothing.",
+  "documentation": "docs/ci_cd.md -> Publish-blocking required checks. Both production gates verify the complete inventory for the exact main commit; ordinary validation does not poll publication prerequisites.",
   "main_branch": "main",
   "required_checks": [
     {
@@ -10,8 +10,7 @@
       "workflow_name": "CI",
       "job": "test",
       "evidence": "check_run",
-      "rationale": "Both release gates bind the Tests check to canonical CI push runs for the exact main commit; no CI job publishes production artifacts.",
-      "validation_stage": "tests_aggregate"
+      "rationale": "Both release gates bind the Tests check to canonical CI push runs for the exact main commit; no CI job publishes production artifacts."
     },
     {
       "context": "Merge Coverage",
@@ -20,8 +19,7 @@
       "workflow_name": "Coverage",
       "job": "coverage-merge",
       "evidence": "push_main",
-      "rationale": "Both release gates require this canonical push-to-main workflow to succeed for the exact release commit.",
-      "validation_stage": "release_gate"
+      "rationale": "Both release gates require this canonical push-to-main workflow to succeed for the exact release commit."
     },
     {
       "context": "Gateway API Conformance",
@@ -30,8 +28,7 @@
       "workflow_name": "Gateway API Conformance",
       "job": "gate",
       "evidence": "push_main",
-      "rationale": "Both release gates require this canonical push-to-main workflow to succeed for the exact release commit.",
-      "validation_stage": "release_gate"
+      "rationale": "Both release gates require this canonical push-to-main workflow to succeed for the exact release commit."
     },
     {
       "context": "Mesh E2E Sidecar Live",
@@ -40,8 +37,7 @@
       "workflow_name": "Mesh E2E Sidecar Live Datapath",
       "job": "gate",
       "evidence": "push_main",
-      "rationale": "Both release gates require this canonical push-to-main workflow to succeed for the exact release commit.",
-      "validation_stage": "release_gate"
+      "rationale": "Both release gates require this canonical push-to-main workflow to succeed for the exact release commit."
     },
     {
       "context": "Trusted Cross Build Policy",
@@ -50,8 +46,7 @@
       "workflow_name": "Cross Build Policy",
       "job": "verify",
       "evidence": "pr_head",
-      "rationale": "This protected workflow is a PR-admission gate and cannot be given a push trigger by an ordinary change. The publication gate resolves the unique merged pull request associated with the product commit, requires that pull request to target main, binds its head SHA to the product commit's second parent, and then requires every canonical pull_request_target run of this workflow at that PR head to succeed. A direct push has no associated pull request and therefore does not publish.",
-      "validation_stage": "main_evidence_gate"
+      "rationale": "This protected workflow is a PR-admission gate and cannot be given a push trigger by an ordinary change. The publication gate resolves the unique merged pull request associated with the product commit, requires that pull request to target main, binds its head SHA to the product commit's second parent, and then requires every canonical pull_request_target run of this workflow at that PR head to succeed. A direct push has no associated pull request and therefore does not publish."
     },
     {
       "context": "Multicluster Federation Live",
@@ -60,8 +55,7 @@
       "workflow_name": "Multicluster Federation Live Datapath",
       "job": "gate",
       "evidence": "push_main",
-      "rationale": "Runs on every main push. The main evidence collector and both release gates require exact-commit success under trusted workflow identity.",
-      "validation_stage": "main_evidence_gate"
+      "rationale": "Runs on every main push. Both release gates require exact-commit success under trusted workflow identity."
     },
     {
       "context": "Multicluster Poller Partition Live",
@@ -70,8 +64,7 @@
       "workflow_name": "Multicluster Poller Partition Live",
       "job": "gate",
       "evidence": "push_main",
-      "rationale": "Runs on every main push. The main evidence collector and both release gates require exact-commit success under trusted workflow identity.",
-      "validation_stage": "main_evidence_gate"
+      "rationale": "Runs on every main push. Both release gates require exact-commit success under trusted workflow identity."
     },
     {
       "context": "FIPS Build & Test",
@@ -80,8 +73,7 @@
       "workflow_name": "FIPS Build Policy",
       "job": "fips-build",
       "evidence": "push_main",
-      "rationale": "Runs on every main push. The main evidence collector and both release gates require exact-commit success under trusted workflow identity.",
-      "validation_stage": "main_evidence_gate"
+      "rationale": "Runs on every main push. Both release gates require exact-commit success under trusted workflow identity."
     },
     {
       "context": "Ambient Host UDP Live",
@@ -90,8 +82,7 @@
       "workflow_name": "Ambient Host UDP Live Kernel",
       "job": "gate",
       "evidence": "push_main",
-      "rationale": "Runs on every main push. The main evidence collector and both release gates require exact-commit success under trusted workflow identity.",
-      "validation_stage": "main_evidence_gate"
+      "rationale": "Runs on every main push. Both release gates require exact-commit success under trusted workflow identity."
     }
   ]
 }

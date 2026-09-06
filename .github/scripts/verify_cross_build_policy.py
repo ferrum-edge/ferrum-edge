@@ -1727,41 +1727,7 @@ RELEASE_TOOLS_MANIFEST_CLOSED_FIELDS = (
     "steps",
 )
 
-# The hosted half of the main-branch publication gate is a release-integrity
-# boundary too. Freeze its complete job rather than selected fields so an
-# ordinary pull request cannot weaken or replace the proof while preserving a
-# partial structural contract.
-GATEWAY_PUBLICATION_WORKFLOW_FILENAME = "gateway-api-conformance.yml"
-GATEWAY_PUBLICATION_WORKFLOW_SOURCE = (
-    ".github/workflows/gateway-api-conformance.yml"
-)
-GATEWAY_MAIN_PUBLICATION_REQUIRED_CHECKS_JOB = r"""  main-publication-required-checks:
-    name: Main Publication Required Checks
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    # The gate stops at its own deadline below, so this ceiling is only a
-    # backstop against a wedged runner.
-    timeout-minutes: 110
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
-
-      - name: Prove every publish-blocking required check passed for this SHA
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PUBLICATION_GATE_REPOSITORY: ${{ github.repository }}
-          PUBLICATION_GATE_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-
-          # The commit and repository travel in the environment so this argv
-          # stays fully literal: a trusted-policy scan can read exactly what
-          # this step executes without resolving a shell expansion.
-          python3 .github/scripts/verify_publication_gate.py --self-test
-          python3 .github/scripts/verify_publication_gate.py --enforce main --deadline-seconds 6000
-"""
+GATEWAY_WORKFLOW_FILENAME = "gateway-api-conformance.yml"
 
 # The main-branch publication gate inside `ci.yml` is itself a
 # release-integrity boundary. Its complete job is frozen for the same reason.
@@ -1907,11 +1873,6 @@ CI_MAIN_PUBLISH_GATE_JOB = r"""  main-publish-gate:
 PUBLISH_EXACT_JOB_CONTRACTS = {
     "CI workflow": {
         "main-publish-gate": CI_MAIN_PUBLISH_GATE_JOB,
-    },
-    GATEWAY_PUBLICATION_WORKFLOW_SOURCE: {
-        "main-publication-required-checks": (
-            GATEWAY_MAIN_PUBLICATION_REQUIRED_CHECKS_JOB
-        ),
     },
     "release workflow": {
         "attest-release-images": RELEASE_ATTEST_RELEASE_IMAGES_JOB,
@@ -12563,22 +12524,30 @@ def scan_workflow_collection_cross_surfaces(
     return errors
 
 
-def publication_gate_workflow_contract_errors(
+def retired_main_publication_gate_errors(
     workflows: dict[str, str],
     source: str,
 ) -> list[str]:
-    """Hold the hosted publication gate to its complete trusted job body."""
+    """Conformance validation must not host the retired publication poller."""
 
-    contents = workflows.get(GATEWAY_PUBLICATION_WORKFLOW_FILENAME)
+    contents = workflows.get(GATEWAY_WORKFLOW_FILENAME)
     if contents is None:
-        return [
-            f"{source}/{GATEWAY_PUBLICATION_WORKFLOW_FILENAME} must contain "
-            "the protected main-publication-required-checks job"
-        ]
-    return validate_publish_control_contract(
-        contents,
-        GATEWAY_PUBLICATION_WORKFLOW_SOURCE,
+        return []
+    located = f"{source}/{GATEWAY_WORKFLOW_FILENAME}"
+    normalized, _, errors = flow_normalized_workflow(contents, located)
+    # None means no flow syntax needed normalization. Scan the original
+    # canonical block form in that case.
+    block, failures = extract_job_block(
+        normalized if normalized is not None else contents,
+        located, "main-publication-required-checks", required=False,
     )
+    errors.extend(failures)
+    if block is not None:
+        errors.append(
+            f"{located} must not restore main-publication-required-checks; "
+            "publication proof belongs in the production release gates"
+        )
+    return errors
 
 
 def validate_workflow_collection(
@@ -12594,7 +12563,7 @@ def validate_workflow_collection(
     """
 
     return [
-        *publication_gate_workflow_contract_errors(workflows, source),
+        *retired_main_publication_gate_errors(workflows, source),
         *live_suite_relevance_errors(workflows, source),
         *node_waypoint_relevance_errors(workflows, source),
         *required_check_name_ownership_errors(workflows, source),
@@ -13169,23 +13138,10 @@ def compare_pr_workflow_collection(
     request, regardless of what the base happened to carry.
     """
 
-    baseline_publication_workflow = merge_base_workflows.get(
-        GATEWAY_PUBLICATION_WORKFLOW_FILENAME,
-        "",
-    )
-    proposed_publication_workflow = proposed_workflows.get(
-        GATEWAY_PUBLICATION_WORKFLOW_FILENAME,
-        "",
-    )
     return [
-        *publication_gate_workflow_contract_errors(
+        *retired_main_publication_gate_errors(
             proposed_workflows,
             f"proposed {source}",
-        ),
-        *compare_pr_publish_control_contract(
-            baseline_publication_workflow,
-            proposed_publication_workflow,
-            GATEWAY_PUBLICATION_WORKFLOW_SOURCE,
         ),
         *live_suite_relevance_errors(proposed_workflows, f"proposed {source}"),
         *node_waypoint_relevance_errors(proposed_workflows, f"proposed {source}"),
@@ -26337,42 +26293,28 @@ pre_build = []
     ):
         failures.append("opaque shell stdin program edit was not rejected")
 
-    gateway_publication_workflow = (
+    gateway_validation_workflow = (
         "name: Gateway API Conformance fixture\n"
         "on: [push]\n"
         "jobs:\n"
-        + GATEWAY_MAIN_PUBLICATION_REQUIRED_CHECKS_JOB
+        "  ordinary:\n"
+        "    runs-on: ubuntu-latest\n"
     )
-    if publication_gate_workflow_contract_errors(
-        {
-            GATEWAY_PUBLICATION_WORKFLOW_FILENAME: (
-                gateway_publication_workflow
-            )
-        },
+    if retired_main_publication_gate_errors(
+        {GATEWAY_WORKFLOW_FILENAME: gateway_validation_workflow},
         "self-test workflow directory",
     ):
-        failures.append("the hosted publication-gate job contract was rejected")
-
-    weakened_publication_job = gateway_publication_workflow.replace(
-        "    if: github.event_name == 'push' && "
-        "github.ref == 'refs/heads/main'\n",
-        "    if: always()\n",
-        1,
-    )
-    weakened_publication_errors = compare_pr_publish_control_contract(
-        gateway_publication_workflow,
-        weakened_publication_job,
-        GATEWAY_PUBLICATION_WORKFLOW_SOURCE,
-    )
-    if not weakened_publication_errors:
-        failures.append("a weakened hosted publication-gate job was not rejected")
-    elif not any(
-        "main-publication-required-checks" in error
-        for error in weakened_publication_errors
+        failures.append("ordinary Gateway validation without publication was rejected")
+    for retired_key in (
+        "main-publication-required-checks",
+        '\"main-publication-required-checks\"',
+        '\"main-publication-required-check\\u0073\"',
     ):
-        failures.append(
-            "the weakened hosted publication-gate refusal did not name the job"
-        )
+        resurrected = gateway_validation_workflow + f"  {retired_key}:\n    runs-on: ubuntu-latest\n"
+        if not retired_main_publication_gate_errors(
+            {GATEWAY_WORKFLOW_FILENAME: resurrected}, "self-test workflow directory",
+        ):
+            failures.append("the retired main publication poller was admitted")
 
     protected_publication_files = {
         ".github/scripts/verify_publication_gate.py": (
@@ -28452,7 +28394,7 @@ pre_build = []
         **relevance_workflows,
         **node_waypoint_fixture,
         **isolated_fixture,
-        GATEWAY_PUBLICATION_WORKFLOW_FILENAME: gateway_publication_workflow,
+        GATEWAY_WORKFLOW_FILENAME: gateway_validation_workflow,
     }
     ownership_prose_collection = {
         **complete_collection,

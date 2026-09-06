@@ -54,7 +54,6 @@ from verify_linux_gnu_abi import (
 )
 from verify_publication_gate import (
     ContractError as PublicationContractError,
-    by_mode as publication_entries_by_mode,
     load_inventory as load_publication_inventory,
     repository_contract_errors as publication_gate_contract_errors,
     required_context_parity_errors as publication_context_parity_errors,
@@ -322,16 +321,12 @@ ARTIFACT_GATE_REQUIRED_IDS = {
     "multicluster.eastwest.endpoint_recovers_when_dest_returns",
 }
 
-RELEASE_GATE_WORKFLOWS = {
+DEDICATED_WORKFLOW_NAMES = {
     ".github/workflows/coverage.yml": "Coverage",
     ".github/workflows/gateway-api-conformance.yml": "Gateway API Conformance",
     ".github/workflows/mesh-e2e-sidecar-live.yml": (
         "Mesh E2E Sidecar Live Datapath"
     ),
-}
-
-DEDICATED_WORKFLOW_NAMES = {
-    **RELEASE_GATE_WORKFLOWS,
     ".github/workflows/multicluster-federation-live.yml": (
         "Multicluster Federation Live Datapath"
     ),
@@ -1779,15 +1774,9 @@ def main() -> int:
                     "ci.yml planner must handle merge_group base/head selection"
                 )
 
-    # Issue #4302: publication of the mutable `latest` release, the Docker
-    # tags, and every immutable version-tag artifact must fail closed unless the
-    # COMPLETE repository-required product check set succeeded for the exact
-    # product SHA. `.github/required-publication-checks.json` is the one
-    # canonical, machine-consumed inventory. These PR-mutable checks compare the
-    # required product set, the hosted
-    # `main-publication-required-checks` job, and release.yml's
-    # `validate-release-sha` with that inventory so independent subsets cannot
-    # drift. They do not protect their own hosted-gate enforcement surface.
+    # Both production gates require every repository-required product check
+    # for the exact release commit. Ordinary main validation publishes nothing
+    # and must not poll release prerequisites in a conformance workflow.
     planner_errors.extend(
         f"publication gate self-test: {failure}"
         for failure in publication_gate_self_test()
@@ -1800,19 +1789,6 @@ def main() -> int:
         planner_errors.extend(
             publication_gate_contract_errors(dict(REQUIRED_MERGE_GROUP_WORKFLOWS))
         )
-        inventory_main_gate = {
-            entry["workflow_path"]: entry["workflow_name"]
-            for entry in publication_entries_by_mode(
-                publication_inventory,
-                "release_gate",
-            )
-        }
-        if inventory_main_gate != RELEASE_GATE_WORKFLOWS:
-            planner_errors.append(
-                "RELEASE_GATE_WORKFLOWS must equal the `release_gate` "
-                "entries of .github/required-publication-checks.json; the "
-                "release evidence inventory has exactly one source of truth"
-            )
         # Adversarial fixture: a context that branch protection newly requires
         # but that nothing publishes against must fail this policy run.
         fabricated = dict(REQUIRED_MERGE_GROUP_WORKFLOWS)

@@ -47,6 +47,9 @@ class ReleaseRequestTests(unittest.TestCase):
 
     def test_ci_and_production_build_profiles(self):
         ci = Path(".github/workflows/ci.yml").read_text()
+        gateway = Path(".github/workflows/gateway-api-conformance.yml").read_text()
+        self.assertNotIn("main-publication-required-checks", gateway)
+        self.assertNotIn("--enforce main", gateway)
         self.assertNotIn("--release", job_body(ci, "build-binaries"))
         image_body = job_body(ci, "main-linux-image")
         self.assertIn("    needs: [test, build-test-artifacts]\n", image_body)
