@@ -3856,6 +3856,17 @@ jobs:
           for example in file-values.yaml database-values.yaml cp-values.yaml dp-values.yaml; do
             helm lint ./charts/ferrum-gateway -f "./charts/ferrum-gateway/examples/${example}"
           done
+          # Durable audit must render with the read-only-root defaults in both
+          # serving modes, including removal of RollingUpdate under Recreate.
+          for audit_mode in database cp; do
+            helm lint ./charts/ferrum-gateway \
+              -f "./charts/ferrum-gateway/examples/${audit_mode}-values.yaml" \
+              -f ./charts/ferrum-gateway/examples/audit-spool-values.yaml
+            helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+              -f "./charts/ferrum-gateway/examples/${audit_mode}-values.yaml" \
+              -f ./charts/ferrum-gateway/examples/audit-spool-values.yaml \
+              > "$RUNNER_TEMP/ferrum-gateway-helm-results/${audit_mode}-audit-spool.yaml"
+          done
           # Default (file mode) renders a runnable, Secret-free gateway.
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"
