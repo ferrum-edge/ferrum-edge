@@ -5227,6 +5227,11 @@ async fn h3_response_via_matches_backend_protocol_for_stream_and_buffer() {
                             ("via", "1.1 upstream".into()),
                         ]))
                         .step(H3Step::RespondData(Bytes::from_static(b"ok")))
+                        // FIN the response, then keep its QUIC connection alive
+                        // until the client has consumed it and drops the fixture.
+                        // Script-end close can race HEADERS parsing on the peer.
+                        .step(H3Step::RespondTrailers(vec![]))
+                        .step(H3Step::StallFor(Duration::from_secs(30)))
                         .spawn()
                         .expect("h3 backend"),
                 );
@@ -5254,7 +5259,13 @@ async fn h3_response_via_matches_backend_protocol_for_stream_and_buffer() {
             let response = h3_get(&harness, "/api/routing-headers")
                 .await
                 .expect("response");
-            assert_eq!(response.status.as_u16(), 200, "{protocol}/{body_mode}");
+            assert_eq!(
+                response.status.as_u16(),
+                200,
+                "{protocol}/{body_mode}; body={:?}; gateway logs:\n{}",
+                response.body_text(),
+                harness.captured_combined().unwrap_or_default()
+            );
             assert_eq!(response.body_bytes.as_ref(), b"ok");
             assert_eq!(
                 response.headers.get("via").unwrap().to_str().unwrap(),
