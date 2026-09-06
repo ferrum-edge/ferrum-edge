@@ -521,14 +521,22 @@ jobs:
         # Compile both targets in one Cargo invocation before running either.
         # Otherwise a hosted runner can pass all inline tests, then lose the
         # entire job while compiling the separate four-test hardening binary.
-        run: cargo test --lib --test unit_tests --no-run
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/unit-ci"
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M exit_status=%x' --output="$RUNNER_TEMP/unit-ci/default-build.time" cargo test --lib --test unit_tests --no-run 2>&1 | tee "$RUNNER_TEMP/unit-ci/default-build.log"
+          python3 .github/scripts/run_unit_ci.py default-build
         env:
           RUST_BACKTRACE: 1
 
       - name: Run inline lib tests
         # Covers `#[cfg(test)] mod tests` blocks inline in `src/` (used for
         # private fns/structs that the separate tests/ binaries can't see).
-        run: cargo test --lib
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/unit-ci"
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M exit_status=%x' --output="$RUNNER_TEMP/unit-ci/default-lib.time" cargo test --lib 2>&1 | tee "$RUNNER_TEMP/unit-ci/default-lib.log"
+          python3 .github/scripts/run_unit_ci.py default-lib
         env:
           RUST_BACKTRACE: 1
 
@@ -618,20 +626,32 @@ jobs:
           RUST_BACKTRACE: 1
 
       - name: Run unit tests
-        run: cargo test --test unit_tests
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/unit-ci"
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M exit_status=%x' --output="$RUNNER_TEMP/unit-ci/default-unit.time" cargo test --test unit_tests 2>&1 | tee "$RUNNER_TEMP/unit-ci/default-unit.log"
+          python3 .github/scripts/run_unit_ci.py default-unit
         env:
           RUST_BACKTRACE: 1
 
       - name: Precompile ACME library and DNS hook test binaries
-        # All three ACME filters below run in one of these two libtest binaries.
-        # Compile the pair together so a hosted runner cannot pass one filter,
-        # then spend another full compile window linking the other target.
-        run: cargo test --features acme --lib --test unit_tests --no-run
+        # Keep inline ACME coverage, but compile only the two-test DNS target
+        # alongside it: enabling ACME must not rebuild monolithic unit_tests.
+        # Default suites above retain their full target graph and test counts.
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/unit-ci"
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M exit_status=%x' --output="$RUNNER_TEMP/unit-ci/acme-build.time" cargo test --features acme --lib --test acme_dns01_tests --no-run 2>&1 | tee "$RUNNER_TEMP/unit-ci/acme-build.log"
+          python3 .github/scripts/run_unit_ci.py acme-build
         env:
           RUST_BACKTRACE: 1
 
       - name: Run ACME outbound-boundary regressions
-        run: cargo test --features acme --lib tls::acme::client::tests
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/unit-ci"
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M exit_status=%x' --output="$RUNNER_TEMP/unit-ci/acme-outbound.time" cargo test --features acme --lib tls::acme::client::tests 2>&1 | tee "$RUNNER_TEMP/unit-ci/acme-outbound.log"
+          python3 .github/scripts/run_unit_ci.py acme-outbound
         env:
           RUST_BACKTRACE: 1
 
@@ -640,7 +660,11 @@ jobs:
       # child must not outlive the renewal claim) only has a gate if it is run
       # explicitly with the feature on.
       - name: Run ACME DNS-01 hook cancellation regressions
-        run: cargo test --features acme --test unit_tests tls::acme_dns01_hook_tests
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/unit-ci"
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M exit_status=%x' --output="$RUNNER_TEMP/unit-ci/acme-dns.time" cargo test --features acme --test acme_dns01_tests 2>&1 | tee "$RUNNER_TEMP/unit-ci/acme-dns.log"
+          python3 .github/scripts/run_unit_ci.py acme-dns
         env:
           RUST_BACKTRACE: 1
 
@@ -648,7 +672,11 @@ jobs:
       # recovery) only exists behind `acme`, so the takeover/skip decisions it
       # makes before any ACME networking need the feature on to be gated at all.
       - name: Run ACME renewal crash-recovery regressions
-        run: cargo test --features acme --lib tls::acme_renewal_resume_tests
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/unit-ci"
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M exit_status=%x' --output="$RUNNER_TEMP/unit-ci/acme-renewal.time" cargo test --features acme --lib tls::acme_renewal_resume_tests 2>&1 | tee "$RUNNER_TEMP/unit-ci/acme-renewal.log"
+          python3 .github/scripts/run_unit_ci.py acme-renewal
         env:
           RUST_BACKTRACE: 1
 

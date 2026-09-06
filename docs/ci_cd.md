@@ -940,9 +940,9 @@ cargo test --lib
 FERRUM_KTLS_LIVE_REQUIRED=1 cargo test --lib -- --ignored --test-threads=1 \
   proxy::ktls_live_kernel_tests
 cargo test --test unit_tests
-cargo test --features acme --lib --test unit_tests --no-run
+cargo test --features acme --lib --test acme_dns01_tests --no-run
 cargo test --features acme --lib tls::acme::client::tests
-cargo test --features acme --test unit_tests tls::acme_dns01_hook_tests
+cargo test --features acme --test acme_dns01_tests
 cargo test --features acme --lib tls::acme_renewal_resume_tests
 
 # test-pkcs11-softhsm: compile both libtest binaries before either filtered
@@ -972,6 +972,50 @@ cargo nextest run --archive-file functional-tests-*.tar.zst \
   --no-fail-fast \
   -E 'not test(/test_scale_perf_30k_proxies/) and not test(/test_load_stress_10k_proxies/)'
 ```
+
+The ACME DNS hook tests live unchanged in `tests/acme_dns01/mod.rs`, explicitly
+registered as `acme_dns01_tests` with `required-features = ["acme"]`. The default
+suite still discovers every default-feature external test; the optional pass
+builds the inline library and the two-test DNS executable without rebuilding
+`unit_tests` with ACME. Other ACME store/challenge/lease tests stay in their
+existing default targets, and inline ACME/renewal coverage remains in the lib
+binary. The Unix-only hook fixture and its real-process delays are unchanged.
+
+In CI, each default and ACME command above appears literally in its workflow
+step, wrapped by `/usr/bin/time` with explicit format/output options and piped
+through `tee` under `set -euo pipefail`. Cargo and log-write failures stop the
+step before reporting, even when the other pipeline command succeeds. Python
+never launches Cargo: `.github/scripts/run_unit_ci.py` reads the phase log and
+GNU time output after the pipeline succeeds. It requires the complete unfiltered
+default suites (baseline floors: 5,880 inline passes and 18,239 external passes) and
+all 20 outbound, 2 DNS hook, and 16 renewal regression names from main run
+`34018271780`. Additional tests are allowed; missing/renamed required ACME
+tests, zero matches, ignored ACME tests, unexpected filtering of a whole target,
+and failed commands fail closed. Default inline opt-in/ignored tests remain
+allowed; the separate kTLS proof retains its own three-test gate.
+`verify_required_ci.py` runs the selection and workflow/manifest mutation tests
+in `test_unit_ci.py`, including missing/failed telemetry and literal shell
+fixtures proving command and `tee` failure propagation. Neither the reporter
+nor its tests changes scheduling, required aggregate dependencies, memory limits,
+or release-SHA proof.
+
+Each phase streams its Cargo output; successful phases write a step summary
+with wall time (including Cargo), libtest counts/execution time, and GNU time
+maximum child RSS. This measures child RSS, not aggregate process-tree or
+whole-runner RAM/swap usage; there is no runner sampler. Detailed phase logs and
+GNU time reports remain under `$RUNNER_TEMP/unit-ci/`. Missing/malformed timing
+or nonzero child status fails validation. Compare precompile/execution
+measurements only on the exact pushed-head CI run and
+include cache restoration evidence. Measure `Tests` aggregate latency from the
+Actions run's `created_at` to the `Tests` job's `completed_at`, so queueing and
+other required lanes remain visible without changing the aggregate job.
+
+Baseline main run `34018271780` at `aa251c3326c8d237e46bf8b7346861cec6c7aaf4`:
+Unit Tests **41m49s**, default precompile **13m33s**, external execution **542.60s**
+(**9m04s** step), ACME precompile **17m11s**, and `Tests` aggregate latency
+**64m14s**. These are the before measurements, not a claim of post-change speedup;
+remote CI must supply the after measurements. No local fixture/time conversion
+or broader unit sharding is part of this experiment (issue #4669).
 
 The kTLS step is a **live-kernel** gate, not a unit test: it drives a real
 rustls TLS 1.2 ChaCha20-Poly1305 client through `try_ktls_accept`, installs
