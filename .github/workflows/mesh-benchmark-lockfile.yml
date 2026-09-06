@@ -1,0 +1,44 @@
+name: Mesh Benchmark Lockfile
+
+on:
+  pull_request:
+    paths:
+      - Cargo.toml
+      - .cargo/config.toml
+      - tests/performance/mesh/Cargo.toml
+      - tests/performance/mesh/Cargo.lock
+      - vendor/**/Cargo.toml
+      - ebpf/ferrum-ebpf-common/Cargo.toml
+      - .github/workflows/mesh-benchmark-lockfile.yml
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - .cargo/config.toml
+      - tests/performance/mesh/Cargo.toml
+      - tests/performance/mesh/Cargo.lock
+      - vendor/**/Cargo.toml
+      - ebpf/ferrum-ebpf-common/Cargo.toml
+      - .github/workflows/mesh-benchmark-lockfile.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  metadata:
+    name: Mesh benchmark locked dependency graph
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - name: Require the committed lockfile to match the benchmark manifests
+        env:
+          RUSTC_WRAPPER: ""
+          CARGO_BUILD_RUSTC_WRAPPER: ""
+        run: cargo metadata --manifest-path tests/performance/mesh/Cargo.toml --locked --format-version 1 > /dev/null
