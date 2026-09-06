@@ -1747,9 +1747,7 @@ async fn run_saturate(args: &SaturateArgs) -> anyhow::Result<()> {
                                         .heartbeats_succeeded
                                         .fetch_add(1, Ordering::Relaxed);
                                 } else {
-                                    counters
-                                        .heartbeats_failed
-                                        .fetch_add(1, Ordering::Relaxed);
+                                    counters.heartbeats_failed.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
                             _ => {
