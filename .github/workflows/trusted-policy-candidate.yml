@@ -32,21 +32,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Diagnose checked-in mesh benchmark lockfile
-        env:
-          RUSTC_WRAPPER: ""
-          CARGO_BUILD_RUSTC_WRAPPER: ""
-        run: |
-          cargo metadata --manifest-path tests/performance/mesh/Cargo.toml --format-version 1 > /dev/null
-          git diff -- tests/performance/mesh/Cargo.lock
-
-      - name: Preserve resolved mesh benchmark lockfile
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: mesh-lockfile-diagnostic
-          path: tests/performance/mesh/Cargo.lock
-          retention-days: 7
-
       # Catch contract/extraction drift before waiting for the application
       # matrix. Tests still repeats these checks as its required final gate.
       - name: Validate candidate CI contracts
