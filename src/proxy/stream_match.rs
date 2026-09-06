@@ -715,17 +715,7 @@ fn valid_kubernetes_label_name(value: &str) -> bool {
 /// Extract the source namespace from a peer SPIFFE ID string when present.
 pub fn source_namespace_from_spiffe(spiffe: &str) -> Option<String> {
     let id = SpiffeId::new(spiffe).ok()?;
-    let mut segments = id.path_segments();
-    let namespace = match (
-        segments.next(),
-        segments.next(),
-        segments.next(),
-        segments.next(),
-        segments.next(),
-    ) {
-        (Some("ns"), Some(namespace), Some("sa"), Some(_service_account), None) => namespace,
-        _ => return None,
-    };
+    let (namespace, _) = id.kubernetes_identity()?;
     validate_kubernetes_namespace(namespace).ok()?;
     Some(namespace.to_owned())
 }

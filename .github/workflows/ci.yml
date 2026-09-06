@@ -1305,6 +1305,7 @@ jobs:
               functional_ai_semantic_firewall_streaming_test
               functional_body_validator_request_representation_test
               functional_body_validator_response_stream_test
+              functional_bodyless_sse_refusal_test
               functional_json_duplicate_key_test
               functional_grpc_method_pre_hook_test
               functional_grpc_plugins_test
@@ -1317,6 +1318,7 @@ jobs:
               functional_opa_key_auth_redaction_test
               functional_opa_protocol_coverage_test
               functional_plugin_extended_test
+              functional_response_caching_expires_test
               functional_plugin_test
               functional_mcp_gateway_batch_test
               functional_compression_bodyless_test
@@ -1350,6 +1352,7 @@ jobs:
               functional_h3_soap_utf16_test
               functional_http3_connect_udp_test
               functional_key_auth_query_test
+              functional_max_forwards_test
               functional_request_mirror_admission_test
               functional_request_mirror_query_parity_test
               functional_request_transformer_query_test
@@ -1415,6 +1418,7 @@ jobs:
               functional_h3_mtls_early_data_test
               functional_request_termination_h3_test
               functional_policy_path_canonicalization_test
+              functional_response_caching_conditional_test
               functional_response_mock_grpc_exclusion_test
               functional_response_mock_semantics_test
               functional_response_protocol_managed_headers_test
@@ -5818,7 +5822,7 @@ jobs:
           shared-key: "ci-ebpf-programs"
           workspaces: |
             ebpf -> target
-          cache-directories: ${{ github.workspace }}/.cache/sccache
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Install bpf-linker
         uses: ./.github/actions/setup-bpf-linker
@@ -6678,7 +6682,7 @@ jobs:
         continue-on-error: true
         with:
           shared-key: "build-${{ matrix.target }}-${{ github.event_name == 'push' && 'release' || 'prbuild' }}"
-          cache-directories: ${{ github.workspace }}/.cache/sccache
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
@@ -7480,3 +7484,29 @@ jobs:
             -t ghcr.io/${{ github.repository }}:latest \
             -t ghcr.io/${{ github.repository }}:main-${{ github.sha }} \
             $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
+
+  anonymous-pull-smoke:
+    name: Anonymous image pull smoke
+    needs: docker-manifest
+    if: always() && needs.docker-manifest.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      # The publishers above logged in before pushing, so their success does not
+      # show that a first-time user can consume the images (issue #4637). Prove
+      # it with no credentials at all: the documented Docker Hub path must be
+      # anonymously pullable; GHCR is reported until the package is public.
+      - name: Verify the documented registry path is anonymously pullable
+        env:
+          MAIN_SHA: ${{ github.sha }}
+          GHCR_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          bash scripts/smoke_anonymous_pull.sh "docker.io/ferrumedge/ferrum-edge:main-${MAIN_SHA}"
+          bash scripts/smoke_anonymous_pull.sh --warn-only "ghcr.io/${GHCR_REPOSITORY}:main-${MAIN_SHA}"

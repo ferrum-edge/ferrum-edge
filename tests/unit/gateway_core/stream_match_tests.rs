@@ -292,6 +292,13 @@ fn virtual_service_tls_order_precedes_generic_sni_specificity() {
 
 #[test]
 fn source_namespace_requires_canonical_unambiguous_istio_spiffe_path() {
+    for account in ["backend", "frontend", "sa"] {
+        assert_eq!(
+            source_namespace_from_spiffe(&format!("spiffe://cluster.local/ns/sa/sa/{account}"))
+                .as_deref(),
+            Some("sa")
+        );
+    }
     assert_eq!(
         source_namespace_from_spiffe("spiffe://cluster.local/ns/prod/sa/client").as_deref(),
         Some("prod")

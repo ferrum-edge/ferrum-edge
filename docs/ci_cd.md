@@ -1455,6 +1455,62 @@ rust-cache producer/consumer sites keep their existing fork-only `save-if`
 contract — that workflow's caching architecture is generation-pinned
 separately (PR #3889).
 
+**Rust-cache quota diet (#4643, part 2).** The editable direct rust-cache
+calls in `ci.yml` (`build-binaries`, `build-ebpf`) and the six on-demand
+benchmark workflows now save only on
+`github.event_name == 'push' && github.ref == 'refs/heads/main'`. Because the
+benchmark workflows only have `workflow_dispatch` triggers, they restore
+existing entries but publish no new ones, including on manual `main` runs.
+Their existing keys remain isolated; they do not gain a new cache producer.
+The binary producer retains separate `release` and `prbuild` keys, so its
+PR/merge-group builds cannot restore the release-profile cache and will
+compile cold once old `prbuild` entries expire.
+
+Lanes that cache useful Cargo targets stop also archiving the bounded 2 GiB
+`.cache/sccache` directory. Comparison, connection-saturation, and
+gateways-protocol benchmarks compile their host tools in nested workspaces
+and build the gateway in Docker; their default root `target/` archive never
+covered those host tools. They now set `cache-targets: "false"`, retaining
+only Cargo downloads and the compiler-cache restore path. No new shared
+sccache service or credential export is introduced.
+
+| Lane / shared key | Expected archive after the diet (not yet measured) |
+|---|---|
+| `build-<target>-release` | Cargo downloads + target dependencies; previous archive minus its compressed sccache subset (up to 2 GiB before compression) |
+| `build-<target>-prbuild` | 0 new bytes; PR and merge-group saves disabled |
+| `ci-ebpf-programs` | Cargo downloads + `ebpf/target`; previous archive minus its compressed sccache subset, when the existing cache step runs |
+| `ci-perf-bench`, `ci-payload-bench`, `ci-scale-bench` | 0 new bytes on dispatch; restore paths are Cargo downloads + root target dependencies |
+| `ci-comparison-bench`, `ci-connection-saturation`, `ci-gateways-protocol-bench` | 0 new bytes on dispatch; restore paths are Cargo downloads + sccache, without root target |
+
+This is a partial quota reduction, not evidence that the repository fits
+under 10 GB. The frozen `setup-rust-ci` action still archives both target and
+sccache for Unit Tests (`ci-test`), Lint (`ci-lint`), Build Test Artifacts,
+coverage, and its other callers; it exposes neither `cache-targets` nor
+`cache-directories` nor `save-if` overrides. Changing that common policy
+requires a trusted direct-to-`main` generation. The frozen `fuzz-smoke` lane
+(reported at about 4.3 GB) still needs shrinking/splitting through a separate
+policy generation. FIPS, release publication, and `ci-perf` (#4090) keep
+their existing arrangements. Existing large entries are left to LRU expiry.
+
+To measure, capture this inventory before and after a subsequent `main`
+push, then again after a PR run based on that push (retain the output with
+the run IDs and head SHAs):
+
+```bash
+gh api --paginate 'repos/ferrum-edge/ferrum-edge/actions/caches?per_page=100' \
+  --jq '.actions_caches[] | [.id, .ref, .key, .size_in_bytes, .created_at, .last_accessed_at] | @tsv'
+```
+
+Compare the **same entry IDs** across snapshots: entries created before the
+later `main` push must still exist afterward and show `last_accessed_at` >
+`created_at` after the PR restore. Sum `size_in_bytes` across all pages and
+refs, including BuildKit caches, against the 10 GB repository quota; group
+by lane to replace the estimates above with measured compressed sizes. A
+newly created replacement key is not survival evidence. Confirm `Restored
+from cache key …` in Unit Tests, Lint, and Build Test Artifacts logs, and
+record Unit Tests' precompile duration. Keep #4643 open until that evidence
+is observed; no local execution can establish these acceptance criteria.
+
 #### 5c. CNI Install Lifecycle Live Workflow
 
 **Runs**: `ubuntu-24.04`
@@ -3406,6 +3462,10 @@ sha256sum -c ferrum-edge-*.sha256
 
 If automatic release fails:
 
+Before building on each host, complete the
+[one-time bootstrap](../CONTRIBUTING.md#one-time-local-bootstrap), including its platform
+requirements or explicit wrapper/system-linker fallback.
+
 ```bash
 # Build binaries manually with the same release features as CI. Install protoc
 # for every host first. Linux hosts also need libcurl4-openssl-dev, Windows
@@ -3564,6 +3624,8 @@ docker pull ghcr.io/ferrum-edge/ferrum-edge:1.2
 ```
 
 The Docker `latest` tag tracks the latest successful `main` publish, not necessarily the newest stable version tag. The `main-<sha>` tag uses the full commit SHA from `github.sha`.
+
+Publishing logs in to both registries before pushing, so a green publish job never proves that a first-time user can pull anonymously. The `anonymous-pull-smoke` job in `ci.yml` therefore runs after `docker-manifest` on every `main` push with an empty `DOCKER_CONFIG` (`scripts/smoke_anonymous_pull.sh`): it acquires an anonymous pull token, resolves the `main-<sha>` manifest, pulls the image, and runs `ferrum-edge version --json`. The Docker Hub path is the documented install path and fails the job when it is not anonymously consumable; the GHCR path is checked in `--warn-only` mode until the `ferrum-edge` package's visibility is set to public in the organization's package settings (a GHCR package inherits no visibility from the source repository; a private package answers anonymous token requests with `401`). The same script can be run by hand against any published reference, for example `bash scripts/smoke_anonymous_pull.sh docker.io/ferrumedge/ferrum-edge:v0.9.2`.
 
 The GHCR path is `ghcr.io/${{ github.repository }}` in the workflows, so it auto-tracks the GitHub repository owner/name if the repository is moved or forked. The Docker Hub repo `ferrumedge/ferrum-edge` is hardcoded in both `ci.yml` and `release.yml`; forks must edit that `name=` value (and configure their own `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`) before Docker Hub pushes will succeed.
 

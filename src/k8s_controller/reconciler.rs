@@ -1168,7 +1168,29 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         Some(ctx.revision.as_ref()),
     );
     let Some(new_config) = published else {
-        debug!("No config changes detected, skipping swap");
+        // Issue #4491: a reconcile that changes nothing used to leave no trace
+        // above debug level, so a missed delete and a quiet cluster looked
+        // identical in the logs. One rate-limited info line carrying the
+        // watch counters tells them apart from the log alone.
+        let counters = ctx.metrics.snapshot();
+        if super::metrics::should_log_idle_reconcile(
+            &ctx.metrics.idle_reconcile_last_logged_ms,
+            super::metrics::monotonic_now_ms(),
+        ) {
+            info!(
+                resource_count,
+                reconciliations = counters.reconciliations,
+                config_publications = counters.config_publications,
+                watch_deletes = counters.watch_deletes,
+                watch_idle_relists = counters.watch_idle_relists,
+                watch_relist_missed_deletes = counters.watch_relist_missed_deletes,
+                watch_relist_missed_adds = counters.watch_relist_missed_adds,
+                watch_errors = counters.watch_errors,
+                "Reconciliation found no config change"
+            );
+        } else {
+            debug!("No config changes detected, skipping swap");
+        }
         // Status writers share one immutable `Arc<[K8sObject]>` generation
         // (see [`shared_status_objects_snapshot`]). Deployments that don't
         // watch Gateway API / Istio CRDs (the default) pay zero per-
@@ -1220,11 +1242,15 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         std::sync::atomic::Ordering::Relaxed,
     );
 
+    let counters = ctx.metrics.snapshot();
     info!(
         resource_count,
         proxies = new_config.proxies.len(),
         upstreams = new_config.upstreams.len(),
         elapsed_ms = elapsed.as_millis() as u64,
+        watch_deletes = counters.watch_deletes,
+        watch_idle_relists = counters.watch_idle_relists,
+        watch_relist_missed_deletes = counters.watch_relist_missed_deletes,
         "Reconciliation complete"
     );
 }

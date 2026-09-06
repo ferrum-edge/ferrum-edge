@@ -211,6 +211,19 @@ from whether `on_request_received` ran.
 
 Any plugin can short-circuit the pipeline by returning a `Reject` result. For example, a native direct CORS policy returns a `204` preflight response in phase 1 without ever reaching authentication (an Istio projection returns its source-compatible 200). Rate limiting returns `429` in the authorize phase (phase 3) after the consumer is identified.
 
+`Max-Forwards` on `OPTIONS` (RFC 9110 §7.6.2) is decided by the gateway
+itself, not by a plugin, between `before_proxy` and backend dispatch — after the
+gateway-assertion refresh and before the final backend header policy. A zero
+budget is answered locally with `204`, and a malformed or repeated field with
+`400`; both are shaped through the same reject-path `after_proxy` and
+synthetic-response hooks as a plugin `Reject` and logged with
+`metadata.rejection_phase = "max_forwards"`. A positive budget is decremented
+once in the outbound header map that every transport and retry attempt reads.
+Request-phase hooks therefore always observe the client's original value,
+while the final backend header policy, `on_backend_path_resolved`, and later
+phases observe the decremented one. See
+[routing.md](routing.md#max-forwards-on-options).
+
 `on_backend_path_resolved` is an opt-in, route-sensitive boundary after
 route/header-shaping `before_proxy` hooks and load balancing, but before
 circuit-breaker or backend dispatch. The gateway assembles the same path

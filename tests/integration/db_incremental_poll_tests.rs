@@ -1014,3 +1014,283 @@ async fn full_reload_publishes_when_the_change_watermark_read_fails() {
         "the reload must carry fresh config, not a stale snapshot"
     );
 }
+
+// ===========================================================================
+// Issue #4116: a saturated change batch must converge through the full-reload
+// fallback within a bounded number of poll cycles, at a scale where the
+// validation sweep's per-plugin-config cost decides whether it converges.
+// ===========================================================================
+
+/// Proxies provisioned by
+/// [`saturated_change_log_fallback_converges_within_two_poll_cycles`].
+///
+/// Each proxy insert records one `config_changes` row and each of its two
+/// proxy-scoped plugin configs records two (the plugin row plus the proxy
+/// re-upsert), so 2,100 proxies append 10,500 rows — past the 10,000-row
+/// change-batch limit, exactly the shape one scale-harness wave produces.
+const SATURATED_BATCH_PROXIES: usize = 2_100;
+
+fn scale_proxy_plugin_config(
+    id: &str,
+    plugin_name: &str,
+    proxy_id: &str,
+    config: serde_json::Value,
+) -> PluginConfig {
+    PluginConfig {
+        id: id.to_string(),
+        namespace: default_namespace(),
+        plugin_name: plugin_name.to_string(),
+        config,
+        scope: PluginScope::Proxy,
+        proxy_id: Some(proxy_id.to_string()),
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn scale_proxy_state() -> ferrum_edge::proxy::ProxyState {
+    use ferrum_edge::config::env_config::OperatingMode;
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+
+    let mut config = ferrum_edge::config::types::GatewayConfig::default();
+    config.normalize_fields();
+    let env_config = ferrum_edge::config::EnvConfig {
+        mode: OperatingMode::Database,
+        ..Default::default()
+    };
+    let (state, _handles) = ferrum_edge::proxy::ProxyState::new(
+        config,
+        DnsCache::new(DnsConfig::default()),
+        env_config,
+        None,
+        None,
+    )
+    .expect("ProxyState::new");
+    state
+}
+
+/// One authoritative poll cycle, mirroring `src/modes/database.rs`: read the
+/// change log after the accepted cursor; when the read reports a saturated
+/// batch, run the SAME full-reload helper the poll loop uses, publish the
+/// snapshot through `update_config`, and commit the cursor the helper read.
+///
+/// Returns whether this cycle fell back to a full reload.
+async fn saturated_batch_poll_cycle(
+    db: &std::sync::Arc<dyn ferrum_edge::config::db_backend::DatabaseBackend>,
+    proxy_state: &ferrum_edge::proxy::ProxyState,
+    apply: &ferrum_edge::config::runtime_config_apply::RuntimeConfigApply,
+    cursor: &mut ferrum_edge::config::runtime_config_apply::LiveApplyCursor,
+) -> Result<bool, String> {
+    use ferrum_edge::_test_support::database_mode_load_full_config_with_sequence_for_test;
+    use ferrum_edge::config::runtime_config_apply::LiveApplyCursor;
+    use ferrum_edge::proxy::ConfigApplyOutcome;
+
+    match db.load_incremental_config("ferrum", cursor.sequence).await {
+        Ok(result) => {
+            let next = LiveApplyCursor::new(cursor.topology_epoch, result.sequence_cursor);
+            match proxy_state.apply_incremental(result).await {
+                ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged => {
+                    *cursor = next;
+                    apply.record_accepted_cursor(next);
+                    Ok(false)
+                }
+                ConfigApplyOutcome::Rejected { errors } => Err(format!(
+                    "incremental candidate rejected: {}",
+                    errors.join("; ")
+                )),
+            }
+        }
+        Err(error) => {
+            let message = error.to_string();
+            if !(message.contains("reached limit") && message.contains("forcing full reload")) {
+                return Err(format!(
+                    "incremental poll failed for another reason: {message}"
+                ));
+            }
+            let (config, sequence) =
+                database_mode_load_full_config_with_sequence_for_test(db, "ferrum")
+                    .await
+                    .map_err(|error| format!("full fallback reload failed: {error}"))?;
+            let next = LiveApplyCursor::new(cursor.topology_epoch, sequence);
+            match proxy_state.update_config(config) {
+                ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged => {
+                    *cursor = next;
+                    apply.record_accepted_cursor(next);
+                    Ok(true)
+                }
+                ConfigApplyOutcome::Rejected { errors } => Err(format!(
+                    "full fallback candidate rejected: {}",
+                    errors.join("; ")
+                )),
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn saturated_change_log_fallback_converges_within_two_poll_cycles() {
+    use ferrum_edge::_test_support::{
+        database_mode_load_full_config_with_sequence_for_test, plugin_http_client_builds_for_test,
+    };
+    use ferrum_edge::config::db_backend::{BatchConfigWriteMode, DatabaseBackend};
+    use ferrum_edge::config::runtime_config_apply::{LiveApplyCursor, RuntimeConfigApply};
+    use ferrum_edge::proxy::ConfigApplyOutcome;
+    use std::sync::Arc;
+
+    let (store, _temp_dir) = sqlite_store().await;
+    let db: Arc<dyn DatabaseBackend> = Arc::new(store);
+    let proxy_state = scale_proxy_state();
+    let apply = RuntimeConfigApply::new("ferrum", 0);
+
+    // Seed the accepted cursor from the startup full load exactly as
+    // database mode does.
+    let (initial, initial_sequence) =
+        database_mode_load_full_config_with_sequence_for_test(&db, "ferrum")
+            .await
+            .expect("startup full load must succeed on an empty store");
+    assert!(
+        matches!(
+            proxy_state.update_config(initial),
+            ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged
+        ),
+        "startup snapshot must publish"
+    );
+    let topology_epoch = {
+        let permit = db.acquire_write_topology_permit().await;
+        permit.topology_epoch()
+    };
+    let mut cursor = LiveApplyCursor::new(topology_epoch, initial_sequence);
+    apply.record_accepted_cursor(cursor);
+
+    // One scale-harness wave: proxies, then the two proxy-scoped plugins each
+    // wave attaches, written through the same batch admission path the admin
+    // API uses. This appends more change rows than one incremental read may
+    // consume.
+    let proxies: Vec<Proxy> = (0..SATURATED_BATCH_PROXIES)
+        .map(|i| test_proxy(&format!("scale-proxy-{i}"), &format!("/scale/{i}"), vec![]))
+        .collect();
+    db.batch_create_proxies_without_plugins(&proxies, &BatchConfigWriteMode::Admission)
+        .await
+        .expect("batch proxy create must succeed");
+    let plugin_configs: Vec<PluginConfig> = (0..SATURATED_BATCH_PROXIES)
+        .flat_map(|i| {
+            let proxy_id = format!("scale-proxy-{i}");
+            [
+                scale_proxy_plugin_config(
+                    &format!("scale-keyauth-{i}"),
+                    "key_auth",
+                    &proxy_id,
+                    json!({ "key_location": "header:X-API-Key" }),
+                ),
+                scale_proxy_plugin_config(
+                    &format!("scale-acl-{i}"),
+                    "access_control",
+                    &proxy_id,
+                    json!({ "allowed_consumers": [format!("scale-user-{i}")] }),
+                ),
+            ]
+        })
+        .collect();
+    db.batch_create_plugin_configs(&plugin_configs, &BatchConfigWriteMode::Admission)
+        .await
+        .expect("batch plugin config create must succeed");
+
+    let watermark = db
+        .latest_change_sequence("ferrum")
+        .await
+        .expect("watermark must load");
+    let appended = watermark - cursor.sequence;
+    assert!(
+        appended >= 10_000,
+        "the wave must append at least one saturated change batch, appended {appended}"
+    );
+
+    // Cycle 1: the saturated batch routes through the full-reload fallback,
+    // and the reload commits the watermark it read as the accepted cursor.
+    let builds_before = plugin_http_client_builds_for_test();
+    let fell_back = saturated_batch_poll_cycle(&db, &proxy_state, &apply, &mut cursor)
+        .await
+        .expect("cycle 1 must publish");
+    let builds_during_reload = plugin_http_client_builds_for_test() - builds_before;
+    assert!(
+        fell_back,
+        "a saturated change batch must route through the full-reload fallback"
+    );
+    assert_eq!(
+        cursor.sequence, watermark,
+        "the fallback reload must commit the watermark it read as the accepted cursor"
+    );
+    assert_eq!(
+        apply.accepted_cursor(),
+        LiveApplyCursor::new(topology_epoch, watermark),
+        "the live-apply status must report the reload's cursor as accepted"
+    );
+
+    // The defect behind issue #4116: the full-load validation sweep built the
+    // two-client plugin validation stack (plus its resolver) once PER enabled
+    // plugin config, ~20 ms per proxy on SQLite and PostgreSQL alike. At 30k
+    // proxies that reload took longer than bulk provisioning needs to append
+    // the next saturated batch, so the fallback re-triggered itself instead of
+    // converging. Client construction must be bounded per sweep, not per row.
+    let enabled_plugin_configs = plugin_configs.len() as u64;
+    assert!(
+        builds_during_reload < enabled_plugin_configs,
+        "the fallback reload built {builds_during_reload} plugin HTTP clients while validating \
+         {enabled_plugin_configs} plugin configs; validation must build a bounded number of \
+         clients per sweep, not one per plugin config (issue #4116)"
+    );
+
+    let served = proxy_state.current_config();
+    assert_eq!(
+        served.proxies.len(),
+        SATURATED_BATCH_PROXIES,
+        "the reload must serve every proxy of the wave"
+    );
+    assert_eq!(
+        served.plugin_configs.len(),
+        2 * SATURATED_BATCH_PROXIES,
+        "the reload must serve every plugin config of the wave"
+    );
+
+    // Cycle 2: nothing was left behind, so the next poll is an ordinary empty
+    // incremental read and the cursor stays at the watermark.
+    let fell_back = saturated_batch_poll_cycle(&db, &proxy_state, &apply, &mut cursor)
+        .await
+        .expect("cycle 2 must complete");
+    assert!(
+        !fell_back,
+        "the poll after a fallback reload must be incremental, not another full reload"
+    );
+    assert_eq!(cursor.sequence, watermark);
+    assert_eq!(apply.accepted_sequence(), watermark);
+
+    // A write after the fallback is picked up incrementally from the
+    // committed cursor, proving the reload neither skipped ahead of the rows
+    // it loaded nor left the poller re-reading the wave.
+    db.create_proxy(&test_proxy("scale-proxy-after", "/scale/after", vec![]))
+        .await
+        .expect("post-reload proxy create must succeed");
+    let after_watermark = db
+        .latest_change_sequence("ferrum")
+        .await
+        .expect("watermark must load");
+    assert!(after_watermark > watermark);
+    let fell_back = saturated_batch_poll_cycle(&db, &proxy_state, &apply, &mut cursor)
+        .await
+        .expect("cycle 3 must publish");
+    assert!(
+        !fell_back,
+        "a single post-reload write must apply incrementally"
+    );
+    assert_eq!(cursor.sequence, after_watermark);
+    assert_eq!(apply.accepted_sequence(), after_watermark);
+    assert_eq!(
+        proxy_state.current_config().proxies.len(),
+        SATURATED_BATCH_PROXIES + 1,
+        "the incremental poll after the fallback must publish the new proxy"
+    );
+}

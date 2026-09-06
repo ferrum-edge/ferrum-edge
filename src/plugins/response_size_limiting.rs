@@ -34,6 +34,9 @@ use super::utils::size_limit::{
     transferable_content_length_refusal,
 };
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
+use super::utils::synthetic_response::{
+    request_method_omits_response_body, synthetic_response_omits_body,
+};
 use super::{Plugin, PluginResult, RequestContext};
 use crate::util::unknown_keys::reject_unknown_keys;
 
@@ -118,11 +121,13 @@ impl Plugin for ResponseSizeLimiting {
         self.is_enabled().then_some(self.max_bytes)
     }
 
-    fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
+    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         // A request Accept value cannot waive the configured route ceiling.
         // Buffer ordinary responses conservatively until pristine backend
         // headers are available.
-        self.require_buffered_check && self.is_enabled()
+        self.require_buffered_check
+            && self.is_enabled()
+            && !request_method_omits_response_body(&ctx.method)
     }
 
     fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
@@ -132,31 +137,34 @@ impl Plugin for ResponseSizeLimiting {
     fn should_release_response_body_under_retries(
         &self,
         ctx: &RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
-            && original_response_is_event_stream(ctx, response_headers)
+            && (synthetic_response_omits_body(&ctx.method, response_status)
+                || original_response_is_event_stream(ctx, response_headers))
     }
 
     fn should_release_response_body_before_content_type_rewrite(
         &self,
         ctx: &RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
-            && original_response_is_event_stream(ctx, response_headers)
+            && (synthetic_response_omits_body(&ctx.method, response_status)
+                || original_response_is_event_stream(ctx, response_headers))
     }
 
     fn should_buffer_response_body_for_content_type(
         &self,
         ctx: &RequestContext,
         content_type: Option<&str>,
-        _response_status: u16,
+        response_status: u16,
         _response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
+            && !synthetic_response_omits_body(&ctx.method, response_status)
             && !content_type.is_some_and(is_text_event_stream_media_type)
     }
 
@@ -207,7 +215,10 @@ impl Plugin for ResponseSizeLimiting {
             None => {}
         }
 
-        if self.require_buffered_check && original_response_is_event_stream(ctx, response_headers) {
+        if self.require_buffered_check
+            && !synthetic_response_omits_body(&ctx.method, response_status)
+            && original_response_is_event_stream(ctx, response_headers)
+        {
             // The strict route limit is a whole-body policy. Until it has an
             // event-aware streaming counter, fail before committing headers
             // rather than silently fall back to the generally larger global
@@ -224,12 +235,12 @@ impl Plugin for ResponseSizeLimiting {
 
     async fn on_final_response_body(
         &self,
-        _ctx: &mut RequestContext,
-        _response_status: u16,
+        ctx: &mut RequestContext,
+        response_status: u16,
         _response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if !self.is_enabled() {
+        if !self.is_enabled() || synthetic_response_omits_body(&ctx.method, response_status) {
             return PluginResult::Continue;
         }
 

@@ -4547,6 +4547,93 @@ async fn handle_h3_request(
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
         crate::proxy::refresh_backend_gateway_assertion_headers(&ctx, headers);
     }
+    // RFC 9110 §7.6.2 `Max-Forwards` on OPTIONS (issue #4647): the same
+    // single hop-budget decision the H1/H2 ladder takes in
+    // `src/proxy/mod.rs::handle_proxy_request_inner`, at the same point —
+    // after every request-phase plugin and before the outbound map is owned
+    // and handed to the native H3 client or the cross-protocol bridge. A
+    // decremented budget lands in the map every H3 dispatch and retry reads.
+    // Keep both call sites in sync.
+    match crate::proxy::max_forwards::apply_options_max_forwards(
+        &method,
+        &mut owned_proxy_headers,
+        &mut ctx.headers,
+    ) {
+        crate::proxy::max_forwards::MaxForwardsDecision::Forward
+        | crate::proxy::max_forwards::MaxForwardsDecision::Decremented => {}
+        crate::proxy::max_forwards::MaxForwardsDecision::Terminal(terminal) => {
+            // Heap-pinned like the `boxed_*` reject helpers on the H1/H2
+            // ladder: this handler's state machine is already close to the
+            // worker stack budget of a debug build, and inlining one more
+            // full reject path overflowed it on the H3-plain mesh functional
+            // tests. The branch runs only on a terminal Max-Forwards.
+            Box::pin(async {
+                let hook_start = std::time::Instant::now();
+                let mut headers = crate::proxy::max_forwards::max_forwards_response_headers(
+                    terminal,
+                    proxy.allowed_methods.as_deref(),
+                );
+                let mut reject_status = terminal.status().as_u16();
+                let mut reject_body = terminal.body();
+                // Same reject-path shaping as a `before_proxy` rejection so the
+                // `cors` plugin and other response-header hooks decorate the
+                // local answer exactly as they would on H1/H2.
+                apply_reject_after_proxy_and_synthetic_body_hooks(
+                    &plugins,
+                    &mut ctx,
+                    &mut reject_status,
+                    &mut headers,
+                    &mut reject_body,
+                    matches!(http_flavor, HttpFlavor::Grpc),
+                    false,
+                )
+                .await;
+                plugin_execution_ns += hook_start.elapsed().as_nanos() as u64;
+                let http_status = StatusCode::from_u16(reject_status).unwrap_or(terminal.status());
+                run_h3_reject_response_committed_hooks(
+                    &plugins,
+                    &mut ctx,
+                    http_flavor,
+                    grpc_web_response_content_type,
+                    http_status,
+                    reject_body.clone(),
+                    &headers,
+                )
+                .await;
+                let log_status_code = h3_reject_log_status_and_metadata(
+                    &mut ctx,
+                    http_flavor,
+                    http_status,
+                    &reject_body,
+                    &headers,
+                );
+                record_request(&state, log_status_code);
+                log_rejected_request(
+                    &plugins,
+                    &ctx,
+                    log_status_code,
+                    start_time,
+                    crate::proxy::max_forwards::MAX_FORWARDS_REJECTION_PHASE,
+                    plugin_execution_ns,
+                )
+                .await;
+                send_h3_plugin_reject_flavor_aware(
+                    &mut stream,
+                    &plugins,
+                    &mut ctx,
+                    http_flavor,
+                    grpc_web_response_content_type,
+                    http_status,
+                    reject_body,
+                    &headers,
+                )
+                .await?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+            return Ok(());
+        }
+    }
     // Resolve proxy_headers into an owned HashMap to avoid borrowing
     // ctx.headers while ctx is passed as &mut to proxy functions downstream.
     //

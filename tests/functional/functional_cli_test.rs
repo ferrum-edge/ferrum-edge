@@ -181,6 +181,50 @@ async fn functional_cli_validate_valid_spec() {
 
 #[ignore]
 #[tokio::test]
+async fn functional_cli_validate_quoted_conf_mode_with_comment() {
+    let temp_dir = TempDir::new().unwrap();
+    let spec_path = temp_dir.path().join("resources.yaml");
+    std::fs::write(
+        &spec_path,
+        "version: \"1\"\nproxies: []\nconsumers: []\nplugin_configs: []\n",
+    )
+    .unwrap();
+    let conf_path = temp_dir.path().join("quoted-mode.conf");
+
+    for quote in ['"', '\''] {
+        std::fs::write(
+            &conf_path,
+            format!("FERRUM_MODE = {quote}file{quote} # file mode\n"),
+        )
+        .unwrap();
+
+        let output = hermetic_validate_command(
+            &temp_dir,
+            &[
+                "--settings",
+                conf_path.to_str().unwrap(),
+                "--spec",
+                spec_path.to_str().unwrap(),
+            ],
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "quoted conf mode must validate: stdout={stdout}, stderr={stderr}"
+        );
+        assert!(stdout.contains("Mode: File"), "unexpected mode: {stdout}");
+        assert!(stdout.contains("Validation passed."));
+    }
+}
+
+#[ignore]
+#[tokio::test]
 async fn functional_cli_validate_nonexistent_spec() {
     let temp_dir = TempDir::new().unwrap();
 

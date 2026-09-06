@@ -728,6 +728,13 @@ async fn test_registry_renders_k8s_controller_istio_status_counters() {
     metrics.watch_idle_relists.store(15, Ordering::Relaxed);
     metrics.watch_deletes.store(17, Ordering::Relaxed);
     metrics.config_publications.store(18, Ordering::Relaxed);
+    metrics.watch_errors.store(19, Ordering::Relaxed);
+    metrics
+        .watch_relist_missed_deletes
+        .store(20, Ordering::Relaxed);
+    metrics
+        .watch_relist_missed_adds
+        .store(21, Ordering::Relaxed);
     metrics
         .route_status_publications
         .store(16, Ordering::Relaxed);
@@ -771,6 +778,12 @@ async fn test_registry_renders_k8s_controller_istio_status_counters() {
         ("ferrum_k8s_controller_watch_idle_relists_total", "15"),
         ("ferrum_k8s_controller_watch_deletes_total", "17"),
         ("ferrum_k8s_controller_config_publications_total", "18"),
+        ("ferrum_k8s_controller_watch_errors_total", "19"),
+        (
+            "ferrum_k8s_controller_watch_relist_missed_deletes_total",
+            "20",
+        ),
+        ("ferrum_k8s_controller_watch_relist_missed_adds_total", "21"),
     ];
     for (family, value) in k8s_controller_families {
         assert!(

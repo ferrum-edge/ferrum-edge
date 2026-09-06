@@ -152,6 +152,9 @@ COPY src ./src
 RUN if [ "${TARGETARCH}" = "arm64" ]; then export ${FERRUM_ARM64_RELEASE_PROFILE_ENV}; fi && \
     touch src/main.rs && cargo build --features "${FEATURES}" --release
 
+# Distroless has no shell; stage the empty SQLite volume directory here.
+RUN mkdir -m 0755 /data
+
 # Stage 2: common distroless runtime. It intentionally has no shell, package
 # manager, eBPF ELF, or `ip` executable.
 FROM runtime-base AS runtime-common
@@ -161,6 +164,7 @@ WORKDIR /app
 # Copy binary from builder
 COPY --from=builder --chown=65532:65532 /build/target/release/ferrum-edge /app/ferrum-edge
 COPY --from=builder --chown=65532:65532 /build/target/release/ferrum-cni /app/ferrum-cni
+COPY --from=builder --chown=65532:65532 /data/ /data/
 
 # Set environment variables. `FERRUM_LOG_LEVEL` defaults to `warn` so the startup
 # operability warnings stay visible; every published runtime stage must agree with

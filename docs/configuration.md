@@ -254,8 +254,15 @@ replica-set pollers read ordered `config_changes` rows/documents after the
 accepted cursor, collapse each resource to the final operation in the batch, and
 point-load only those changed IDs. Delete records carry removals, so normal
 incremental polling does not scan every runtime collection or table ID.
-Retained-history gaps and saturated change batches force the same authoritative
-full-reload path.
+Retained-history gaps, saturated change batches (10,000 or more unread
+`config_changes` rows for the namespace), and consumer changes (which rehydrate
+quarantined credentials) force the same authoritative full-reload path. The
+reload records the change-log watermark it read before loading as its accepted
+cursor, so rows committed while it ran are picked up by the next incremental
+poll, and its validation cost is linear in cheap per-row work: the plugin
+validation sweep builds one screening client per reload rather than one per
+plugin config, so a 30k-proxy full reload finishes well inside the time bulk
+provisioning needs to append another saturated batch (issue #4116).
 
 Repeated rejected database deltas use bounded backoff and low-cardinality
 metrics. After `FERRUM_DB_REJECTED_DELTA_FULL_RELOAD_THRESHOLD` identical
@@ -693,7 +700,7 @@ For NodeWaypoint discovery, `FERRUM_K8S_CONTROLLER_NAMESPACE` identifies the nam
 | `FERRUM_GATEWAY_API_STATUS_ADDRESS` | No | — | Optional Gateway API address advertised in `Gateway.status.addresses`. IP strings are reported as `IPAddress`; other values are reported as `Hostname` |
 | `FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS` | No | `false` | Whether an active dynamic Gateway API listener bind failure also degrades `/health` readiness (`ready: false`, HTTP 503, `status: "degraded"`) in file, database, and data-plane modes. Default `false` reports `status: "degraded"` with HTTP 200 and `ready: true`, because a Gateway listener port is control-plane input and its failure is recoverable on the 30s retry — one unbindable port should not withdraw a replica whose other listeners serve normally. `/live` stays healthy and no healthy listener is closed either way |
 | `FERRUM_K8S_FULL_SYNC_INTERVAL_SECS` | No | `300` | Periodic re-reconcile interval (seconds) for the K8s controller. Re-translates the current reflector-store contents; it does **not** re-list Kubernetes, so it cannot recover objects a stalled watch never delivered — see `FERRUM_K8S_WATCH_IDLE_RELIST_SECS` |
-| `FERRUM_K8S_WATCH_IDLE_RELIST_SECS` | No | `300` | Rebuild a watch scope's reflector from an authoritative Kubernetes list once that scope has delivered no event for this many seconds. Bounds how long a watch that stalls without failing (kube-rs raises an error only when a watch *fails*) can keep objects invisible to every reconcile. Watch bookmarks are consumed inside kube-rs, so a healthy quiet scope also relists on every window — with dozens of scope watchers per controller, lowering this raises the full-list rate against the API server. The replacement is swapped in make-before-break, so the scope never briefly reports zero objects. `0` disables recovery. Clamped to `0`–`86400` |
+| `FERRUM_K8S_WATCH_IDLE_RELIST_SECS` | No | `300` | Rebuild a watch scope's reflector from an authoritative Kubernetes list once that scope has delivered no event for this many seconds. Bounds how long a watch that stalls without failing (kube-rs raises an error only when a watch *fails*) can keep objects invisible to every reconcile. Watch bookmarks are consumed inside kube-rs, so a healthy quiet scope also relists on every window — with dozens of scope watchers per controller, lowering this raises the full-list rate against the API server. The replacement is swapped in make-before-break, so the scope never briefly reports zero objects. A relist whose authoritative list disagrees with the store it replaces logs a warning naming the objects that vanished or appeared without a watch event and advances `ferrum_k8s_controller_watch_relist_missed_deletes_total` / `_missed_adds_total`. A scope whose list the API server refuses (HTTP 403) or fails is held between attempts instead, and its idle clock pauses while the hold runs — the hold is the retry, so a refused scope does not relist into the same refusal. `0` disables recovery. Clamped to `0`–`86400` |
 | `FERRUM_K8S_RECONCILE_DEBOUNCE_MS` | No | `500` | Debounce window (ms) for the K8s controller — watch events arriving within this window are batched into a single reconciliation |
 | `FERRUM_K8S_KUBECONFIG_PATH` | No | — | Override kubeconfig path for out-of-cluster development. When unset, the controller tries the in-cluster service-account config first, then falls back to standard kubeconfig inference (`KUBECONFIG` / `~/.kube/config`) |
 | `FERRUM_INJECTOR_LISTEN_ADDR` | Injector mode | `0.0.0.0:9443` | Admission webhook bind address for `POST /mutate` |
@@ -1025,6 +1032,14 @@ See [client_ip_resolution.md](client_ip_resolution.md) for the security model an
 
 ### Runtime Tuning
 
+The `response_caching` plugin's freshness settings live in its plugin configuration,
+not environment variables. With the default `respect_cache_control: true`, origin
+`s-maxage`, `max-age`, and then `Expires - Date` precede the `ttl_seconds` fallback.
+Missing `Date` uses response receipt time; invalid or repeated expiry metadata is
+conservatively expired. Setting `respect_cache_control: false` explicitly overrides
+origin freshness with `ttl_seconds`, while Age and response-delay accounting remain
+active. See [response_caching](plugins.md#response_caching) for the complete rules.
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_WORKER_THREADS` | No | CPU cores | Tokio async worker threads |
@@ -1196,8 +1211,10 @@ FERRUM_FRONTEND_TLS_CERT_PATH = "/path/with spaces/cert.pem"
 ```
 
 - Lines starting with `#` are comments
-- Inline comments are supported: `KEY = value # comment`
-- Values can be quoted with double or single quotes (quotes are stripped)
+- Unquoted values support inline comments starting with a space followed by `#`: `KEY = value # comment`
+- Values can be quoted with double or single quotes. The first matching quote closes the value; surrounding quotes are stripped, and everything inside (including whitespace, `#`, the other quote character, and backslashes) is literal. There is no escape processing.
+- After a closing quote, only whitespace and an optional `#` comment are allowed: `FERRUM_MODE = "file" # file mode`. A comment can also immediately follow the closing quote.
+- Unclosed quotes or other text after a closing quote are parse errors identifying the key and line number.
 - Empty lines are ignored
 
 A reference `ferrum.conf` with all available fields and descriptions is included in the repository root.

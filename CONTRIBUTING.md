@@ -44,13 +44,64 @@ This project and everyone participating in it is governed by our [Code of Conduc
 
 ### One-time local bootstrap
 
-The checked-in `.cargo/config.toml` wires two toolchain extras that local builds and CI both rely on: **sccache** (compiler cache) and a **fast linker** (`mold` on Linux, `lld` on macOS). Run the bootstrap script once per workstation to install them:
+The checked-in [`.cargo/config.toml`](.cargo/config.toml) requires **sccache** for all
+targets, **clang + mold** for x86_64/aarch64 GNU/Linux, and **lld** (`ld64.lld` on PATH)
+for x86_64/aarch64 macOS. Install these tools before the first build, or use the explicit
+fallback below. From the cloned repository, run the bootstrap once per workstation:
 
 ```bash
 ./scripts/install-build-deps.sh
 ```
 
-This installs `sccache` + `lld` via Homebrew on macOS, or `sccache` + `mold` + `clang` via apt/cargo on Linux. CI installs the same tools automatically. If a tool is missing locally, `cargo build` will error with a clear "command not found" pointing back here. To relocate sccache's cache (e.g., onto an external volume), `export SCCACHE_DIR=...` in your shell profile.
+The [script](scripts/install-build-deps.sh) supports macOS with Homebrew already installed
+and apt-based Linux with `sudo` access and Rust/Cargo on PATH. On macOS it installs
+`sccache` and `lld` via Homebrew; on Linux it installs `mold` and `clang` via apt, then
+`sccache` via `cargo install --locked` if missing. It does not install Rust, `protoc`, or
+all native build dependencies. It detects the OS, not the architecture; package availability
+depends on the host's repositories. It does not set up cross-compilation toolchains.
+
+On other Linux distributions, install the same tools through your distribution's package
+manager or use the fallback. The script rejects other operating systems, including Windows.
+Windows keeps its system linker (`link.exe` for MSVC), but still needs `sccache` installed
+manually or the wrapper disabled. Targets outside the four triples above have no fast-linker
+override in the checked-in configuration.
+
+CI installs these tools through separate setup actions. Missing tools locally cause a build
+failure; there is no automatic local fallback. To relocate the compiler cache, set
+`SCCACHE_DIR` in your shell profile.
+
+#### Build without sccache or fast linkers
+
+With the normal native compiler/linker and other build prerequisites installed, use these
+POSIX-shell commands for a native GNU/Linux or macOS build:
+
+```bash
+# Native GNU/Linux (x86_64 or ARM64): use cc and its system linker.
+env -u RUSTC_WRAPPER -u CARGO_ENCODED_RUSTFLAGS \
+  CARGO_BUILD_RUSTC_WRAPPER="" RUSTFLAGS="" \
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc \
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=cc \
+  cargo build --release
+
+# Native macOS (Intel or Apple Silicon): use the Apple toolchain linker.
+env -u RUSTC_WRAPPER -u CARGO_ENCODED_RUSTFLAGS \
+  CARGO_BUILD_RUSTC_WRAPPER="" RUSTFLAGS="" cargo build --release
+```
+
+`CARGO_BUILD_RUSTC_WRAPPER=""` overrides `[build] rustc-wrapper` and disables the wrapper.
+To disable only sccache, use that setting without changing linker flags (and unset any
+separate `RUSTC_WRAPPER`). On Windows PowerShell, use
+`$env:RUSTC_WRAPPER = ""; $env:CARGO_BUILD_RUSTC_WRAPPER = ""` before `cargo build --release`.
+See Cargo's [environment precedence](https://doc.rust-lang.org/cargo/reference/config.html#environment-variables),
+[wrapper configuration](https://doc.rust-lang.org/cargo/reference/config.html#buildrustc-wrapper),
+and [empty-wrapper behavior](https://doc.rust-lang.org/cargo/reference/environment-variables.html).
+
+Empty `RUSTFLAGS` bypasses the configured `-fuse-ld` flags; clearing only
+`CARGO_TARGET_<TRIPLE>_RUSTFLAGS` does not remove them because those values merge.
+The commands unset `CARGO_ENCODED_RUSTFLAGS` because it has higher
+[precedence](https://doc.rust-lang.org/cargo/reference/config.html#buildrustflags).
+These examples replace custom Rust flags for that invocation. Repeat the environment
+overrides for subsequent Cargo commands that compile code, or install the bootstrap tools.
 
 ### Building
 

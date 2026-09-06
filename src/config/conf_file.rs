@@ -118,7 +118,9 @@ impl ConfFile {
     /// - Empty lines are ignored
     /// - Key-value pairs: `KEY = VALUE` or `KEY=VALUE`
     /// - Values are trimmed of surrounding whitespace
-    /// - Quoted values (`"..."` or `'...'`) have quotes stripped
+    /// - Quoted values (`"..."` or `'...'`) are literal, with no escape processing
+    /// - After a closing quote, only whitespace and an optional `#` comment are allowed
+    /// - Unquoted values end at the first ` #` inline comment
     pub fn parse(contents: &str) -> Result<Self, String> {
         let mut values = HashMap::new();
 
@@ -138,21 +140,6 @@ impl ConfFile {
             };
 
             let key = trimmed[..eq_pos].trim().to_string();
-            let mut value = trimmed[eq_pos + 1..].trim().to_string();
-
-            // Strip surrounding quotes
-            if value.len() >= 2
-                && ((value.starts_with('"') && value.ends_with('"'))
-                    || (value.starts_with('\'') && value.ends_with('\'')))
-            {
-                value = value[1..value.len() - 1].to_string();
-            }
-
-            // Strip inline comments (only outside quotes)
-            if let Some(comment_pos) = value.find(" #") {
-                value = value[..comment_pos].trim_end().to_string();
-            }
-
             if key.is_empty() {
                 return Err(format!(
                     "Invalid conf file syntax at line {}: empty key",
@@ -160,7 +147,32 @@ impl ConfFile {
                 ));
             }
 
-            values.insert(key, value);
+            let value = trimmed[eq_pos + 1..].trim();
+            let value = if let Some(quote @ ('"' | '\'')) = value.chars().next() {
+                // Both delimiters are ASCII; find the first matching quote without escapes.
+                let quoted = &value[1..];
+                let Some(end) = quoted.find(quote) else {
+                    return Err(format!(
+                        "Invalid conf file syntax at line {}: unclosed quote for key '{key}'",
+                        line_num + 1
+                    ));
+                };
+                let trailing = quoted[end + 1..].trim_start();
+                if !trailing.is_empty() && !trailing.starts_with('#') {
+                    return Err(format!(
+                        "Invalid conf file syntax at line {}: \
+                         unexpected text after closing quote for key '{key}'",
+                        line_num + 1
+                    ));
+                }
+                &quoted[..end]
+            } else if let Some(comment_pos) = value.find(" #") {
+                value[..comment_pos].trim_end()
+            } else {
+                value
+            };
+
+            values.insert(key, value.to_string());
         }
 
         Ok(Self { values })

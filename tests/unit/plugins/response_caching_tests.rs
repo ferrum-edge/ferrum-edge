@@ -996,7 +996,222 @@ async fn test_cache_control_private_response() {
     assert!(matches!(result, PluginResult::Continue));
 }
 
-// === Cache-Control: max-age ===
+// === Explicit response freshness ===
+
+#[tokio::test]
+async fn test_expires_invalid_or_past_releases_invalidates_and_never_hits() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let past = http_date_seconds_ago(60);
+    let future = http_date_seconds_ago(-120);
+    let date = http_date_seconds_ago(0);
+    let repeated = format!("{future}, {future}");
+    let conflicting = format!("{future}, {past}");
+    let cases = [
+        vec![("expires", past.as_str()), ("date", date.as_str())],
+        vec![("expires", past.as_str())],
+        vec![("expires", "0")],
+        vec![("expires", "not-a-date")],
+        vec![("expires", repeated.as_str())],
+        vec![("expires", conflicting.as_str())],
+        vec![("expires", future.as_str()), ("Expires", past.as_str())],
+        vec![("expires", future.as_str()), ("date", "invalid")],
+        vec![("expires", future.as_str()), ("date", repeated.as_str())],
+        vec![
+            ("expires", future.as_str()),
+            ("date", date.as_str()),
+            ("Date", past.as_str()),
+        ],
+        vec![("expires", future.as_str()), ("cache-control", "max-age=0")],
+        vec![("cache-control", "max-age=120, max-age=0")],
+        vec![("cache-control", "max-age=0, max-age=120")],
+        vec![("cache-control", "max-age=120, max-age=invalid")],
+        vec![("cache-control", "max-age=invalid, max-age=120")],
+        vec![
+            ("cache-control", "max-age=120"),
+            ("Cache-Control", "max-age=0"),
+        ],
+        vec![
+            ("Cache-Control", "max-age=120"),
+            ("cache-control", "max-age=0"),
+        ],
+        vec![("cache-control", "max-age")],
+        vec![("cache-control", "s-maxage=120, s-maxage=invalid")],
+        vec![("cache-control", "max-age=120, s-maxage=0")],
+    ];
+
+    for pairs in cases {
+        let plugin = Arc::new(default_plugin());
+        let path = "/api/expires-refusal";
+        cache_response(&plugin, "GET", path, 200, &HashMap::new(), b"old").await;
+        assert!(!response_caching_cache_keys_for_test(&plugin).is_empty());
+
+        // A pure no-cache refresh addresses the old entry and must evict it
+        // even when the new response body is released before collection.
+        let mut ctx = refresh_ctx(&plugin, path).await;
+        let response = advisory_headers(&pairs);
+        assert!(
+            !plugin.should_buffer_response_body_for_content_type(&ctx, None, 200, &response),
+            "explicitly expired response must release: {pairs:?}"
+        );
+        assert!(!run_final_response_header_phase(&plugin, &mut ctx, 200, &response).await);
+        assert!(response_caching_cache_keys_for_test(&plugin).is_empty());
+
+        // Another plugin may still collect the body. It must not restore the
+        // entry that the final-header classifier just invalidated.
+        plugin
+            .on_final_response_body(&mut ctx, 200, &response, b"expired")
+            .await;
+        assert!(response_caching_cache_keys_for_test(&plugin).is_empty());
+        assert!(matches!(
+            advisory_lookup(&plugin, path, &HashMap::new()).await,
+            PluginResult::Continue
+        ));
+
+        // Also exercise direct storage, without a preceding header phase.
+        let direct = default_plugin();
+        cache_response(&direct, "GET", path, 200, &response, b"expired").await;
+        assert!(response_caching_cache_keys_for_test(&direct).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn test_expires_freshness_precedence_age_and_fallback_with_clock() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let date = http_date_seconds_ago(0);
+    let future = http_date_seconds_ago(-120);
+    let past = http_date_seconds_ago(60);
+    // Lifetime, Age, and residency have wide margins around wall-clock HTTP
+    // date rounding. Every expiry is driven by the instance clock, not sleeps.
+    let cases = [
+        (
+            vec![("expires", future.as_str()), ("date", date.as_str())],
+            100,
+        ),
+        (vec![("expires", future.as_str())], 100),
+        (
+            vec![
+                ("expires", future.as_str()),
+                ("date", date.as_str()),
+                ("age", "80"),
+            ],
+            20,
+        ),
+        (
+            vec![("expires", past.as_str()), ("cache-control", "max-age=120")],
+            100,
+        ),
+        (
+            vec![
+                ("expires", "0"),
+                ("cache-control", "max-age=0, s-maxage=120"),
+            ],
+            100,
+        ),
+        (vec![("cache-control", "max-age=300, max-age=120")], 100),
+        (vec![("cache-control", "max-age=120, max-age=300")], 100),
+        (vec![("cache-control", "s-maxage=300, s-maxage=120")], 100),
+        (vec![("cache-control", "s-maxage=120, s-maxage=300")], 100),
+        (vec![], 280),
+    ];
+
+    for (pairs, fresh_seconds) in cases {
+        let plugin = Arc::new(default_plugin());
+        let path = "/api/expires-lifetime";
+        let mut ctx = make_ctx("GET", path);
+        plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
+        let response = advisory_headers(&pairs);
+        assert!(plugin.should_buffer_response_body_for_content_type(&ctx, None, 200, &response));
+        assert!(!run_final_response_header_phase(&plugin, &mut ctx, 200, &response).await);
+        plugin
+            .on_final_response_body(&mut ctx, 200, &response, b"fresh")
+            .await;
+        let (_, body, headers) =
+            expect_reject(advisory_lookup(&plugin, path, &HashMap::new()).await);
+        assert_eq!(body, b"fresh");
+        let initial_age = cached_age(&headers);
+
+        let residency = std::time::Duration::from_secs(fresh_seconds);
+        advance_response_caching_clock_for_test(&plugin, residency);
+        let (_, _, headers) = expect_reject(advisory_lookup(&plugin, path, &HashMap::new()).await);
+        assert!(cached_age(&headers) >= initial_age + fresh_seconds);
+        advance_response_caching_clock_for_test(&plugin, std::time::Duration::from_secs(30));
+        assert!(
+            matches!(
+                advisory_lookup(&plugin, path, &HashMap::new()).await,
+                PluginResult::Continue
+            ),
+            "freshness must expire without resetting its baseline on HIT: {pairs:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_expires_response_delay_consumes_freshness_with_clock() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+    let path = "/api/expires-delay";
+    let mut ctx = make_ctx("GET", path);
+    plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
+    let response = advisory_headers(&[
+        ("date", &http_date_seconds_ago(0)),
+        ("expires", &http_date_seconds_ago(-120)),
+        ("age", "80"),
+    ]);
+    advance_response_caching_clock_for_test(&plugin, std::time::Duration::from_secs(20));
+    plugin
+        .on_final_response_body(&mut ctx, 200, &response, b"delayed")
+        .await;
+    let (_, _, headers) = expect_reject(advisory_lookup(&plugin, path, &HashMap::new()).await);
+    assert!(cached_age(&headers) >= 100);
+    advance_response_caching_clock_for_test(&plugin, std::time::Duration::from_secs(25));
+    assert!(matches!(
+        advisory_lookup(&plugin, path, &HashMap::new()).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn test_expires_crossed_during_body_collection_is_not_stored() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = Arc::new(default_plugin());
+    let path = "/api/expires-body-delay";
+    let mut ctx = make_ctx("GET", path);
+    plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
+    let response = advisory_headers(&[
+        ("date", &http_date_seconds_ago(0)),
+        ("expires", &http_date_seconds_ago(-120)),
+    ]);
+    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, None, 200, &response));
+    assert!(!run_final_response_header_phase(&plugin, &mut ctx, 200, &response).await);
+    advance_response_caching_clock_for_test(&plugin, std::time::Duration::from_secs(130));
+    plugin
+        .on_final_response_body(&mut ctx, 200, &response, b"expired during collection")
+        .await;
+    assert!(response_caching_cache_keys_for_test(&plugin).is_empty());
+    assert!(matches!(
+        advisory_lookup(&plugin, path, &HashMap::new()).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn test_expires_operator_override_uses_configured_ttl() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({
+        "respect_cache_control": false,
+        "ttl_seconds": 120,
+    }));
+    let response = advisory_headers(&[("expires", "0"), ("cache-control", "max-age=0")]);
+    let path = "/api/expires-override";
+    cache_response(&plugin, "GET", path, 200, &response, b"override").await;
+    advance_response_caching_clock_for_test(&plugin, std::time::Duration::from_secs(100));
+    expect_reject(advisory_lookup(&plugin, path, &HashMap::new()).await);
+    advance_response_caching_clock_for_test(&plugin, std::time::Duration::from_secs(30));
+    assert!(matches!(
+        advisory_lookup(&plugin, path, &HashMap::new()).await,
+        PluginResult::Continue
+    ));
+}
 
 #[tokio::test]
 async fn test_cache_control_max_age() {
@@ -2166,6 +2381,173 @@ async fn test_if_none_match_returns_304_from_cache() {
         headers.get("x-cache-status"),
         Some(&"REVALIDATED".to_string())
     );
+}
+
+#[tokio::test]
+async fn test_conditional_success_eligibility_and_wildcard_without_etag() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({"cacheable_status_codes": [200, 203]}));
+    let last_modified = "Wed, 01 Jan 2020 00:00:00 GMT";
+    let later = "Wed, 01 Jan 2025 00:00:00 GMT";
+    let cases = [
+        (Some("*"), None, true),
+        (Some(" \t*\t "), None, true),
+        (Some("*"), Some("Tue, 01 Jan 2019 00:00:00 GMT"), true),
+        (Some(r#"*, "v1""#), Some(later), false),
+        (Some(r#""v1", *"#), Some(later), false),
+        (Some("**"), Some(later), false),
+        (Some("* trailing"), Some(later), false),
+        (Some("\n*"), Some(later), false),
+        (Some(r#""other""#), Some(later), false),
+        (Some(""), Some(later), false),
+        (None, Some(later), true),
+        (None, Some(last_modified), true),
+        (None, Some("Tue, 01 Jan 2019 00:00:00 GMT"), false),
+        (None, Some("invalid-date"), false),
+        (None, None, false),
+    ];
+
+    for method in ["GET", "HEAD"] {
+        for stored_status in [200, 203] {
+            for etag in [None, Some(r#"W/"v1""#)] {
+                let path = format!("/conditional-{method}-{stored_status}-{}", etag.is_some());
+                let mut response_headers = HashMap::from([
+                    ("cache-control".to_string(), "max-age=60".to_string()),
+                    ("last-modified".to_string(), last_modified.to_string()),
+                ]);
+                if let Some(etag) = etag {
+                    response_headers.insert("etag".to_string(), etag.to_string());
+                }
+                let stored_body = if method == "HEAD" {
+                    &b""[..]
+                } else {
+                    b"cached-body"
+                };
+                cache_response(
+                    &plugin,
+                    method,
+                    &path,
+                    stored_status,
+                    &response_headers,
+                    stored_body,
+                )
+                .await;
+
+                for (if_none_match, if_modified_since, should_match) in cases {
+                    let mut ctx = make_ctx(method, &path);
+                    if let Some(value) = if_none_match {
+                        ctx.headers
+                            .insert("if-none-match".to_string(), value.to_string());
+                    }
+                    if let Some(value) = if_modified_since {
+                        ctx.headers
+                            .insert("if-modified-since".to_string(), value.to_string());
+                    }
+                    let mut headers = ctx.headers.clone();
+                    let (status, body, headers) =
+                        expect_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
+                    assert_eq!(
+                        status,
+                        if should_match { 304 } else { stored_status },
+                        "{path}: INM={if_none_match:?}, IMS={if_modified_since:?}"
+                    );
+                    let expected_body = if should_match { &b""[..] } else { stored_body };
+                    assert_eq!(body, expected_body);
+                    assert_eq!(headers.get("etag"), response_headers.get("etag"));
+                    let cache_status = if should_match { "REVALIDATED" } else { "HIT" };
+                    assert_eq!(
+                        headers.get("x-cache-status").map(String::as_str),
+                        Some(cache_status)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_conditional_non_success_preserves_cached_status_body_and_headers() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let statuses = [301, 302, 307, 308, 404, 410, 412, 500, 503];
+    let plugin = plugin_with_config(json!({"cacheable_status_codes": statuses}));
+    let conditions = [
+        None,
+        Some(("if-none-match", "*")),
+        Some(("if-none-match", r#"W/"v1""#)),
+        Some(("if-none-match", r#""other", "v1""#)),
+        Some(("if-none-match", r#""other""#)),
+        Some(("if-modified-since", "Wed, 01 Jan 2025 00:00:00 GMT")),
+        Some(("if-modified-since", "Tue, 01 Jan 2019 00:00:00 GMT")),
+    ];
+
+    for method in ["GET", "HEAD"] {
+        for stored_status in statuses {
+            let path = format!("/conditional-{method}-{stored_status}");
+            let mut response_headers = HashMap::from([
+                ("cache-control".to_string(), "max-age=60".to_string()),
+                ("etag".to_string(), r#""v1""#.to_string()),
+                (
+                    "last-modified".to_string(),
+                    "Wed, 01 Jan 2020 00:00:00 GMT".to_string(),
+                ),
+                ("content-type".to_string(), "text/plain".to_string()),
+            ]);
+            if stored_status < 400 {
+                response_headers.insert("location".to_string(), "/destination".to_string());
+            }
+            let stored_body = if method == "HEAD" {
+                &b""[..]
+            } else {
+                b"cached-body"
+            };
+            cache_response(
+                &plugin,
+                method,
+                &path,
+                stored_status,
+                &response_headers,
+                stored_body,
+            )
+            .await;
+
+            for condition in conditions {
+                let mut ctx = make_ctx(method, &path);
+                if let Some((name, value)) = condition {
+                    ctx.headers.insert(name.to_string(), value.to_string());
+                }
+                let mut headers = ctx.headers.clone();
+                let (status, body, headers) =
+                    expect_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
+                assert_eq!(status, stored_status, "{path}: {condition:?}");
+                assert_eq!(body, stored_body, "{path}: {condition:?}");
+                for (name, value) in &response_headers {
+                    assert_eq!(headers.get(name), Some(value), "{path}: {condition:?}");
+                }
+                assert_eq!(
+                    headers.get("x-cache-status").map(String::as_str),
+                    Some("HIT")
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_conditional_wildcard_cache_miss_reaches_origin() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+    for method in ["GET", "HEAD"] {
+        let mut ctx = make_ctx(method, "/not-cached");
+        ctx.headers
+            .insert("if-none-match".to_string(), "*".to_string());
+        let mut headers = ctx.headers.clone();
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert_status(&plugin, &ctx, "MISS");
+        assert_eq!(headers.get("if-none-match").map(String::as_str), Some("*"));
+    }
 }
 
 #[tokio::test]

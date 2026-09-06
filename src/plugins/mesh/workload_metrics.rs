@@ -934,7 +934,7 @@ impl WorkloadMetrics {
         .or_else(|| {
             self.workload_spiffe_id
                 .as_ref()
-                .and_then(|identity| spiffe_path_value(identity, "sa"))
+                .and_then(SpiffeId::service_account)
         })
         .unwrap_or("unknown");
         let app = first_label(&self.labels, &["app.kubernetes.io/name", "app", "k8s-app"])
@@ -980,7 +980,7 @@ impl WorkloadMetrics {
         identity: Option<&SpiffeId>,
     ) {
         let workload = identity
-            .and_then(|identity| spiffe_path_value(identity, "sa"))
+            .and_then(SpiffeId::service_account)
             .unwrap_or("unknown");
         metadata.insert("mesh.source.workload".to_string(), workload.to_string());
         metadata.insert("mesh.source.app".to_string(), workload.to_string());
@@ -2653,10 +2653,10 @@ fn insert_source_spiffe_labels(metadata: &mut HashMap<String, String>, identity:
         MESH_SOURCE_TRUST_DOMAIN.to_string(),
         identity.trust_domain().as_str().to_string(),
     );
-    if let Some(namespace) = spiffe_path_value(identity, "ns") {
+    if let Some(namespace) = identity.namespace() {
         metadata.insert(MESH_SOURCE_NAMESPACE.to_string(), namespace.to_string());
     }
-    if let Some(service_account) = spiffe_path_value(identity, "sa") {
+    if let Some(service_account) = identity.service_account() {
         metadata.insert(
             MESH_SOURCE_SERVICE_ACCOUNT.to_string(),
             service_account.to_string(),
@@ -2669,22 +2669,12 @@ fn insert_destination_spiffe_labels(metadata: &mut HashMap<String, String>, iden
         "mesh.destination.principal".to_string(),
         identity.to_string(),
     );
-    if let Some(namespace) = spiffe_path_value(identity, "ns") {
+    if let Some(namespace) = identity.namespace() {
         metadata.insert(
             "mesh.destination.namespace".to_string(),
             namespace.to_string(),
         );
     }
-}
-
-fn spiffe_path_value<'a>(identity: &'a SpiffeId, key: &str) -> Option<&'a str> {
-    let mut segments = identity.path_segments();
-    while let Some(segment) = segments.next() {
-        if segment == key {
-            return segments.next();
-        }
-    }
-    None
 }
 
 #[cfg(test)]

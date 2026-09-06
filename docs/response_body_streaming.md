@@ -68,7 +68,16 @@ This means the client sees the first byte of the response as soon as the backend
 
 When a backend response has a known `Content-Length ≤ 64 KiB` (configurable), the gateway collects the entire body into a single allocation via `response.bytes().await` instead of streaming through the async coalescing adapter. For typical JSON API payloads, this single allocation is cheaper than spinning up `CoalescingBody` with its `BytesMut` buffer and poll loop. Responses without `Content-Length` or with `Content-Length` above the cutoff always stream.
 
-SSE responses (`Content-Type: text/event-stream`) **always stream** regardless of `Content-Length`, since they represent inherently unbounded or latency-sensitive streams.
+Body-bearing SSE responses (`Content-Type: text/event-stream`) **always stream** regardless of `Content-Length`, since they represent inherently unbounded or latency-sensitive streams.
+
+Representation metadata on a no-content response is not an uninspectable stream.
+Responses to `HEAD`, informational `1xx` responses where response hooks run, and
+statuses `204`, `205`, and `304` carry no content regardless of `Content-Type`.
+Whole-body policies (`response_size_limiting` in strict mode, `body_validator`,
+`openapi_validator`, `ai_response_guard`, and WAF response-body inspection) do not
+buffer or refuse those responses as SSE. Response-header policies still run.
+A genuine body-bearing SSE response still follows the configured streaming refusal
+policy, using the original backend headers even if another plugin relabels it.
 
 | Env Var | Default | Description |
 |---------|---------|-------------|

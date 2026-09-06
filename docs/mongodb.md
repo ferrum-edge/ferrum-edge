@@ -582,7 +582,7 @@ spec:
     spec:
       containers:
         - name: ferrum-edge
-          image: ghcr.io/ferrum-edge/ferrum-edge:latest
+          image: docker.io/ferrumedge/ferrum-edge:latest
           ports:
             - containerPort: 8000  # Proxy
             - containerPort: 9000  # Admin API

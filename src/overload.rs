@@ -1333,25 +1333,38 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn fd_count_uses_procfs_stat_aggregate_when_available() {
-        let counted = count_open_fds();
-        assert!(counted > 0, "Process should have at least some open FDs");
-        assert_ne!(counted, u64::MAX, "live /proc/self/fd must be readable");
-        if let Some(from_stat) = linux_fd_count_from_stat("/proc/self/fd") {
-            // `counted` and `from_stat` are two samples of a LIVE counter taken
-            // at different instants, and each call itself opens `/proc/self/fd`
-            // for the duration of its own read, so an exact match is not
-            // assertable: CI observed 32 vs 33. What the sampler must not do is
-            // fall back to `FDSize` (allocated slots, a power of two such as 64
-            // or 128) or to a stale value, so assert agreement within a small
-            // tolerance — wide enough for the transient descriptors, far too
-            // narrow to admit an allocation-rounded FDSize.
+        // `counted` and `from_stat` are two samples of a LIVE counter taken at
+        // different instants, each call itself opens `/proc/self/fd` for the
+        // duration of its own read, and every other test in this binary is
+        // opening and closing descriptors meanwhile, so one pair is not
+        // assertable: CI observed 32 vs 33, then 32 vs 29. Take the closest of
+        // a few back-to-back pairs. What the sampler must not do is fall back
+        // to `FDSize` (allocated slots, a power of two such as 64 or 128) or
+        // to a stale value, so the closest pair must still agree within a
+        // small tolerance — wide enough for transient descriptors, far too
+        // narrow to admit an allocation-rounded FDSize.
+        let mut closest: Option<(u64, u64, u64)> = None;
+        for _ in 0..8 {
+            let counted = count_open_fds();
+            assert!(counted > 0, "Process should have at least some open FDs");
+            assert_ne!(counted, u64::MAX, "live /proc/self/fd must be readable");
+            let Some(from_stat) = linux_fd_count_from_stat("/proc/self/fd") else {
+                return;
+            };
             let drift = counted.abs_diff(from_stat);
-            assert!(
-                drift <= 2,
-                "count_open_fds must prefer the procfs st_size aggregate: \
-                 counted={counted} from_stat={from_stat} drift={drift}"
-            );
+            if closest.is_none_or(|(_, _, best)| drift < best) {
+                closest = Some((counted, from_stat, drift));
+            }
+            if drift <= 2 {
+                break;
+            }
         }
+        let (counted, from_stat, drift) = closest.expect("at least one sample pair");
+        assert!(
+            drift <= 2,
+            "count_open_fds must prefer the procfs st_size aggregate: \
+             counted={counted} from_stat={from_stat} drift={drift}"
+        );
     }
 
     /// A non-procfs directory must take the walk fallback. Using `st_size`

@@ -43,6 +43,9 @@ use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::utils::content_encoding::{DecodeLimits, decode_content_encoding};
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
+use super::utils::synthetic_response::{
+    request_method_omits_response_body, synthetic_response_omits_body,
+};
 use super::utils::validation_diagnostics::{
     MAX_DIAGNOSTIC_CHARS, SafeFieldNames, bound_detail, safe_keyword, safe_location,
     schema_violation_detail, xml_error_category,
@@ -1346,6 +1349,7 @@ impl Plugin for OpenapiValidator {
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         self.requires_response_body_buffering()
+            && !request_method_omits_response_body(&ctx.method)
             && self.bypass_reason(ctx).is_none()
             && self.operation_for_context(ctx).is_some_and(|operation| {
                 operation.has_response_schema() || self.fail_on_missing_response_schema
@@ -1357,7 +1361,7 @@ impl Plugin for OpenapiValidator {
         ctx: &RequestContext,
         response_status: u16,
     ) -> bool {
-        !response_has_no_body_semantics(&ctx.method, response_status)
+        !synthetic_response_omits_body(&ctx.method, response_status)
     }
 
     fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
@@ -1367,41 +1371,45 @@ impl Plugin for OpenapiValidator {
     fn should_release_response_body_under_retries(
         &self,
         ctx: &RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
-            && original_response_is_event_stream(ctx, response_headers)
+            && (synthetic_response_omits_body(&ctx.method, response_status)
+                || original_response_is_event_stream(ctx, response_headers))
     }
 
     fn should_release_response_body_before_content_type_rewrite(
         &self,
         ctx: &RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
-            && original_response_is_event_stream(ctx, response_headers)
+            && (synthetic_response_omits_body(&ctx.method, response_status)
+                || original_response_is_event_stream(ctx, response_headers))
     }
 
     fn should_buffer_response_body_for_content_type(
         &self,
         ctx: &RequestContext,
         content_type: Option<&str>,
-        _response_status: u16,
+        response_status: u16,
         _response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
+            && !synthetic_response_omits_body(&ctx.method, response_status)
             && !content_type.is_some_and(is_text_event_stream_media_type)
     }
 
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         if self.should_buffer_response_body(ctx)
+            && !synthetic_response_omits_body(&ctx.method, response_status)
             && original_response_is_event_stream(ctx, response_headers)
         {
             let operation_label = self
@@ -1444,7 +1452,7 @@ impl Plugin for OpenapiValidator {
         // apply. Every other status reaches media selection even with an empty
         // body, so an empty payload under a schema-bearing content type is
         // parsed and rejected rather than silently continuing.
-        if response_has_no_body_semantics(&ctx.method, response_status) {
+        if synthetic_response_omits_body(&ctx.method, response_status) {
             self.mark_skip(ctx, "no_body_expected");
             return PluginResult::Continue;
         }
@@ -1539,18 +1547,6 @@ impl Plugin for OpenapiValidator {
 /// finding #89.
 fn anchor_path_regex(raw: &str) -> String {
     format!("^(?:{raw})$")
-}
-
-/// Statuses and methods for which HTTP defines no response body.
-///
-/// A HEAD response, an informational status, `204 No Content`, `205 Reset
-/// Content`, and `304 Not Modified` carry no representation, so response schema
-/// selection is skipped instead of treating an absent body as a contract
-/// violation.
-fn response_has_no_body_semantics(method: &str, status: u16) -> bool {
-    method.eq_ignore_ascii_case("HEAD")
-        || (100..200).contains(&status)
-        || matches!(status, 204 | 205 | 304)
 }
 
 fn parse_operation(
