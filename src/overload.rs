@@ -1304,7 +1304,6 @@ pub async fn wait_for_drain(state: &Arc<OverloadState>, timeout: Duration) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
 
     #[cfg(unix)]
     #[test]
