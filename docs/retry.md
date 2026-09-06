@@ -333,3 +333,7 @@ This is equivalent to the minimal configuration since `retryable_status_codes` d
 - `retryable_methods` must contain valid HTTP methods (GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS, TRACE)
 - For exponential backoff, `base_ms` must not exceed `max_ms`
 - `delay_ms` (fixed) and `max_ms` (exponential) must not exceed 300,000ms (5 minutes)
+
+### TCP passthrough connection retries
+
+TCP passthrough honors `retry_on_connect_failure` and `max_retries` for DNS, circuit-breaker admission, per-target connection-cap admission, and plain TCP connect failures. Each retry uses the existing healthy-target selection and mesh enforcement, preserves the original stream authorization deadline, and updates connection accounting for the selected target. ClientHello peeking and stream-connect plugins run once; outbound PROXY framing and encrypted client bytes are forwarded only after connection setup succeeds. No retry occurs after outbound framing or relay begins.
