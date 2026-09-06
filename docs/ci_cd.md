@@ -1554,53 +1554,43 @@ clears 1.10x, a selection miss is still a hard failure. Its 4-target
 small-cardinality fixture is measured but informational, because an Arc
 strong-count hotspot dominates it.
 
-The **RoundRobin** guard does not assert a parallel speedup at all
-(issue #4484). Its only fixture is a 2-target upstream, whose measurement
-is dominated by a shared-line hotspot: hosted runs of an unmodified tree
-land near 0.6x-0.7x, so a 1.10x floor sat above the workload's own typical
-value and ejected green pull requests from the merge queue. That fixture is
-the RoundRobin analogue of the WRR 4-target one, and is now treated the
-same way: `verify_rr_selection_benchmark.py` still prints its wall times and
-its throughput speedup against `--min-parallel-speedup`, but reports a miss
-as a `::notice::` instead of failing on it.
+The **RoundRobin** guard compares the complete 2-target selection workload
+against an immutable baseline revision (issue #4708). A bare shared atomic is
+not a representative scaling control for snapshot loads, reference counts and
+selection together; their costs need not inflate proportionally on a busy
+runner. The old 0.50 multiplier could reject unchanged selection code.
 
-What it enforces instead is a **per-selection contention bound** built from
-the same two measurements the fixture already records:
+`run_rr_selection_comparison.sh` builds candidate and baseline binaries using
+the same candidate benchmark harness and locked dependency graphs. Only that
+harness is overlaid on the baseline checkout. The PR base SHA, merge-group base
+SHA, or main push's before SHA selects the baseline; manual dispatch defaults
+to the preceding commit. Both binaries are preserved before measurements start,
+so rebuilding the shared target directory cannot replace one with the other.
+Compiler work finishes before timing starts. Both commands use the runner-root
+Cargo configuration and toolchain; the baseline manifest resolves its own source
+and locked dependencies from the separate checkout.
 
-```
-contention_ratio = parallel_ns / (8 * serial_ns)
-                 = parallel ns/selection / serial ns/selection
-```
+The harness performs 50,000 operations per thread at one and eight threads.
+Its timer starts before the worker-release barrier. Three baseline and three
+candidate runs alternate order on the same hosted runner. At each thread count,
+the gate fails if the lowest candidate 95% interval bound exceeds the highest
+baseline bound by more than Criterion's default 1% noise threshold. This detects
+a consistent regression in the same workload without assuming a relationship
+to a different operation. The envelope is conservative, not a joint confidence
+interval or proof of equivalence; noise can hide small regressions. Missing,
+incomplete, non-finite, or invalid interval evidence fails.
 
-`contention_ratio` is 1.00x for a workload that scales perfectly and rises
-toward 8.00x as the batch serializes on one cache line. The reference for
-"serialized on one cache line" is not a constant: the Criterion bench adds
-`shared_counter_control_{1,8}_threads`, which drives the same
-barrier-synchronized worker pool at the same thread counts over one
-genuinely shared `AtomicU64` — the exact cost the sharded `CachePadded`
-selection counters exist to avoid, measured on the same runner in the same
-run. The gate passes when
+The artifact includes exact source revisions, the shared harness hash, binary
+hashes, compilation durations, run order, raw Criterion samples and intervals,
+and `rr-comparison/comparison.json`. The temporary baseline checkout and large
+executables stay outside the artifact. The additional baseline compilation
+cost is reported separately and must be assessed with hosted readiness time.
 
-```
-selection contention_ratio <= 0.50 * shared_counter_control contention_ratio
-```
-
-An oversubscribed or coherence-degraded runner inflates both readings
-together, so the verdict does not flip; a regression that puts every worker
-back on one shared counter drives the selection reading up to the control's
-own, whatever absolute value that runner produces that day. This is what
-makes the control representative — unlike the independent-process CPU
-control, which measures whether cores are free rather than what a contended
-cache line costs, and therefore cleared on all three of the readings that
-ejected #4466.
-
-Two fallbacks apply the wide absolute backstop `contention_ratio <= 4.00x`
-(healthy hosted readings are ~1.3x-1.7x; full serialization is >= 8.00x)
-and say so with a `::warning::`: a control below 2.00x, meaning the runner
-resolves no shared-line penalty at all so the comparison has no signal; and
-an unreadable control fixture, which is fail-closed. Serial-ratio and
-missing-artifact contracts stay hard either way. The WRR floor value is not
-lowered.
+Throughput speedup remains descriptive. Its reciprocal,
+`parallel_ns / (8 * serial_ns)`, is 1/8 for ideal eight-way scaling and 1 for
+flat throughput. The bare shared-counter fixture remains available for manual
+exploration but no longer determines the gate. WRR's separate contract is
+unchanged.
 
 **Failures**:
 - Indicate performance regression issues
