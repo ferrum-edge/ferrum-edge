@@ -423,13 +423,15 @@ controller_metric() {
 }
 
 # Space-separated snapshot: watch Delete events observed, reconciles that
-# committed a changed config, reconcile passes started, watch-scope relists.
+# committed a changed config, reconcile passes started, watch-scope relists,
+# and objects a relist found withdrawn without a Delete event (issue #4491).
 controller_reconcile_observable() {
-  printf '%s %s %s %s\n' \
+  printf '%s %s %s %s %s\n' \
     "$(controller_metric ferrum_k8s_controller_watch_deletes_total)" \
     "$(controller_metric ferrum_k8s_controller_config_publications_total)" \
     "$(controller_metric ferrum_k8s_controller_reconciliations_total)" \
-    "$(controller_metric ferrum_k8s_controller_watch_idle_relists_total)"
+    "$(controller_metric ferrum_k8s_controller_watch_idle_relists_total)" \
+    "$(controller_metric ferrum_k8s_controller_watch_relist_missed_deletes_total)"
 }
 
 wait_for_tlsroute_parent_condition() {
@@ -577,9 +579,10 @@ YAML
   # and leaves the data-plane assertion below exactly as it was.
   local observable_ok=0
   local pre_deletes="" pre_publications="" pre_reconciles="" pre_relists=""
+  local pre_missed_deletes=""
   if start_controller_metrics_forward; then
     observable_ok=1
-    read -r pre_deletes pre_publications pre_reconciles pre_relists \
+    read -r pre_deletes pre_publications pre_reconciles pre_relists pre_missed_deletes \
       < <(controller_reconcile_observable) || true
   fi
 
@@ -599,26 +602,29 @@ YAML
   done
 
   local post_deletes="" post_publications="" post_reconciles="" post_relists=""
+  local post_missed_deletes=""
   local observable_line="controller reconcile observable unavailable"
   if [ "$observable_ok" -eq 1 ]; then
-    read -r post_deletes post_publications post_reconciles post_relists \
+    read -r post_deletes post_publications post_reconciles post_relists post_missed_deletes \
       < <(controller_reconcile_observable) || true
     printf -v observable_line \
-      'watch_deletes %s->%s config_publications %s->%s reconciliations %s->%s watch_idle_relists %s->%s' \
+      'watch_deletes %s->%s config_publications %s->%s reconciliations %s->%s watch_idle_relists %s->%s watch_relist_missed_deletes %s->%s' \
       "${pre_deletes:-?}" "${post_deletes:-?}" \
       "${pre_publications:-?}" "${post_publications:-?}" \
       "${pre_reconciles:-?}" "${post_reconciles:-?}" \
-      "${pre_relists:-?}" "${post_relists:-?}"
+      "${pre_relists:-?}" "${post_relists:-?}" \
+      "${pre_missed_deletes:-?}" "${post_missed_deletes:-?}"
   fi
   stop_controller_metrics_forward
 
+  local observable_read=0
+  if [ -n "$pre_deletes" ] && [ -n "$post_deletes" ] \
+    && [ -n "$pre_publications" ] && [ -n "$post_publications" ]; then
+    observable_read=1
+  fi
+
   if [ "$delete_ok" -ne 1 ]; then
     # Two faults, one symptom. Say which one this run hit.
-    local observable_read=0
-    if [ -n "$pre_deletes" ] && [ -n "$post_deletes" ] \
-      && [ -n "$pre_publications" ] && [ -n "$post_publications" ]; then
-      observable_read=1
-    fi
     if [ "$observable_read" -eq 1 ] \
       && [ "$post_deletes" = "$pre_deletes" ] \
       && [ "$post_publications" = "$pre_publications" ]; then
@@ -629,6 +635,28 @@ YAML
       echo "deleted TLSRoute kept serving TLS echo on :${TLS_BLACKBOX_PORT_DELETE}; ${observable_line}" >&2
     fi
     return 1
+  fi
+
+  # Issue #4491: the port going dark is not enough. The lab relists every scope
+  # on a 20s window, so a withdrawal the watch MISSED is repaired by a relist
+  # inside this probe budget and the data plane still goes dark in time. That
+  # is exactly the failure this check exists to catch, so it must not pass
+  # green with the evidence buried in the report. Both TLSRoute alias scopes
+  # deliver a watch Delete for one withdrawal; a flat watch_deletes counter
+  # across the deletion therefore means no watch delivered it.
+  if [ "$observable_read" -eq 1 ] && [ "$post_deletes" = "$pre_deletes" ]; then
+    echo "::error::deleted TLSRoute stopped serving on :${TLS_BLACKBOX_PORT_DELETE}, but the control plane never observed the withdrawal: no watch Delete event reached it and the store was repaired by a relist instead (issue #4491); ${observable_line}"
+    echo "deleted TLSRoute stopped serving on :${TLS_BLACKBOX_PORT_DELETE} only because a relist repaired a missed watch Delete — FAILED (${observable_line})" >> "$report"
+    echo "deleted TLSRoute was withdrawn by a relist, not by a watch Delete event; ${observable_line}" >&2
+    return 1
+  fi
+  # A rising missed-deletes counter alongside an observed Delete names some
+  # OTHER object's repair during this window. An object deleted while a relist
+  # was in flight is counted there too, so this is surfaced, not failed.
+  if [ -n "$pre_missed_deletes" ] && [ -n "$post_missed_deletes" ] \
+    && [ "$post_missed_deletes" != "$pre_missed_deletes" ]; then
+    echo "::warning::a relist repaired a missed watch Delete on some watched scope during the TLSRoute delete check (issue #4491); ${observable_line}"
+    echo "WARNING: a relist repaired a missed watch Delete during the delete check (${observable_line})" >> "$report"
   fi
   echo "deleted TLSRoute stopped serving on :${TLS_BLACKBOX_PORT_DELETE} (${observable_line})" >> "$report"
 }

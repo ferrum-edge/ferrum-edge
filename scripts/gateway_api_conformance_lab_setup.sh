@@ -258,6 +258,10 @@ deploy_control_plane() {
   # keeps serving it (issue #4491). Keep the window well inside the black-box
   # probe budgets rather than at the 300s production default; this matches the
   # standalone gateway_api_data_plane_conformance.sh control-plane deployment.
+  # The short window buys convergence, not cover: the TLSRoute delete check in
+  # gateway_api_tlsroute_conformance.sh fails when the withdrawal was repaired
+  # by a relist instead of observed as a watch Delete event, so a missed delete
+  # still turns the run red.
   # Harness owns GatewayClass/ferrum create/delete/recreate out of band; Helm must
   # not claim or recreate the cluster-scoped object (chart default is create=true).
   helm upgrade --install ferrum "$ROOT_DIR/charts/ferrum-mesh" \
