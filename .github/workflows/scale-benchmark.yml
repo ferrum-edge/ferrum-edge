@@ -19,6 +19,19 @@ name: Resources Scale Benchmark
 on:
   workflow_dispatch:
     inputs:
+      benchmark:
+        description: "Benchmark workload"
+        required: false
+        default: "resources"
+        type: choice
+        options:
+          - resources
+          - route-status
+      baseline_ref:
+        description: "Baseline revision for isolated route-status comparison"
+        required: false
+        default: "main"
+        type: string
       db_type:
         description: "Database backend"
         required: false
@@ -32,6 +45,7 @@ on:
 jobs:
   scale-benchmark:
     name: Scale Benchmark (${{ inputs.db_type }})
+    if: inputs.benchmark != 'route-status'
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -449,3 +463,99 @@ jobs:
             /tmp/scale_bench_output.txt
             /tmp/scale_bench_results.json
           retention-days: 90
+
+  route-status-profile:
+    name: Isolated route status (${{ matrix.revision }})
+    if: inputs.benchmark == 'route-status'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        revision: [baseline, candidate]
+    env:
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_TERM_COLOR: never
+      PROFILE_REVISION: ${{ matrix.revision }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          ref: ${{ matrix.revision == 'baseline' && inputs.baseline_ref || github.sha }}
+          persist-credentials: false
+
+      - name: Record revision and runner memory
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/route-status-profile"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/route-status-profile/revision.txt"
+          sudo fallocate -l 12G /mnt/ferrum-route-status-swap
+          sudo chmod 600 /mnt/ferrum-route-status-swap
+          sudo mkswap /mnt/ferrum-route-status-swap
+          sudo swapon /mnt/ferrum-route-status-swap
+          free -h
+          lscpu
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: ci-test
+
+      - name: Compile the unchanged external unit target
+        run: cargo test --test unit_tests --no-run
+
+      - name: Measure the isolated scale regression three times
+        run: |
+          set -euo pipefail
+          for round in 1 2 3; do
+            /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M exit_status=%x' \
+              --output="$RUNNER_TEMP/route-status-profile/round-$round.time" \
+              cargo test --test unit_tests -- \
+              --exact unit::gateway_core::k8s_status_planning_tests::large_route_snapshots_scale_indexing_while_budget_bounds_planning \
+              --nocapture 2>&1 | tee "$RUNNER_TEMP/route-status-profile/round-$round.log"
+          done
+
+      - name: Verify selection and summarize isolated measurements
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import statistics
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "route-status-profile"
+          name = "unit::gateway_core::k8s_status_planning_tests::large_route_snapshots_scale_indexing_while_budget_bounds_planning"
+          measurements = []
+          for round in range(1, 4):
+              log = (root / f"round-{round}.log").read_text()
+              if f"test {name} ... ok" not in log:
+                  raise SystemExit("The exact scale regression did not pass")
+              results = re.findall(r"^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; (\d+) filtered out; finished in ([0-9.]+)s$", log, re.MULTILINE)
+              if len(results) != 1 or int(results[0][0]) == 0:
+                  raise SystemExit("Expected exactly one isolated passing test from the complete unit target")
+              usage = re.fullmatch(r"wall_seconds=([0-9.]+) max_child_rss_kib=(\d+) exit_status=0\n?", (root / f"round-{round}.time").read_text())
+              if usage is None:
+                  raise SystemExit("Missing successful timing proof")
+              measurements.append({"round": round, "wall_seconds": float(usage[1]), "max_child_rss_kib": int(usage[2]), "test_seconds": float(results[0][1]), "filtered_tests": int(results[0][0])})
+          result = {"revision": (root / "revision.txt").read_text().strip(), "role": os.environ["PROFILE_REVISION"], "measurements": measurements}
+          (root / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
+          summary = f"## Isolated route-status profile: {result['role']}\n\nRevision: `{result['revision']}`\n\n"
+          summary += f"Median wall time: {statistics.median(m['wall_seconds'] for m in measurements):.2f}s. "
+          summary += f"Median maximum child RSS: {statistics.median(m['max_child_rss_kib'] for m in measurements):,.0f} KiB.\n\n"
+          summary += "Each process runs both original cardinalities, both planning calls, and all existing assertions. Compile time is excluded. The baseline and candidate run on separate standard hosted runners; these repetitions are descriptive, not a same-host confidence interval. Normal CI still runs the complete unit target.\n"
+          print(summary)
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as output:
+              output.write(summary)
+          PY
+
+      - name: Preserve isolated profile evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: route-status-profile-${{ matrix.revision }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/route-status-profile/
+          retention-days: 14
+          if-no-files-found: warn
