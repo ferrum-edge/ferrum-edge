@@ -2427,8 +2427,9 @@ async fn handle_h3_request(
         return Ok(());
     }
 
-    // Match H1/H2 admission: acquire pairs with begin_drain's release store
-    // when rejecting new streams on already-established connections.
+    // Global request admission control (HTTP/3). Match H1/H2: acquire pairs
+    // with begin_drain's release store when rejecting new streams on
+    // already-established connections.
     if state
         .overload
         .reject_new_requests
