@@ -3,13 +3,14 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
 import sys
 import textwrap
 from pathlib import Path
+
+from test_release_dispatch import run_self_test as release_dispatch_self_test
 
 from check_markdown_links import check_repository, run_self_test
 from check_node_agent_chart_runtime import (
@@ -102,7 +103,6 @@ REQUIRED_JOBS = {
     "two-cluster-mesh-live",
     "performance-regression",
     "build-binaries",
-    "build-arm64-cross",
 }
 
 # These jobs do not depend on another full-CI validation job, so each must
@@ -119,7 +119,6 @@ DIRECT_FULL_CI_JOBS = {
     "build-ebpf-userspace",
     "performance-regression",
     "build-binaries",
-    "build-arm64-cross",
 }
 
 PATH_GATED_JOBS = {
@@ -323,7 +322,7 @@ ARTIFACT_GATE_REQUIRED_IDS = {
     "multicluster.eastwest.endpoint_recovers_when_dest_returns",
 }
 
-MAIN_PUBLISH_WORKFLOWS = {
+RELEASE_GATE_WORKFLOWS = {
     ".github/workflows/coverage.yml": "Coverage",
     ".github/workflows/gateway-api-conformance.yml": "Gateway API Conformance",
     ".github/workflows/mesh-e2e-sidecar-live.yml": (
@@ -332,7 +331,7 @@ MAIN_PUBLISH_WORKFLOWS = {
 }
 
 DEDICATED_WORKFLOW_NAMES = {
-    **MAIN_PUBLISH_WORKFLOWS,
+    **RELEASE_GATE_WORKFLOWS,
     ".github/workflows/multicluster-federation-live.yml": (
         "Multicluster Federation Live Datapath"
     ),
@@ -417,17 +416,6 @@ MERGE_GROUP_CONCURRENCY_MARKERS = (
     "merge_group",
     "merge_group.head_sha",
 )
-
-# The polling implementation is a release-integrity boundary. Pinning the exact
-# job body prevents a later pull request from satisfying individual substring
-# checks with comments while changing the array, query, row validation, or
-# fail-closed conclusions the publishing jobs actually consume. The protected
-# Cross verifier independently freezes this complete job, so changing either
-# the implementation or this diagnostic digest requires a trusted-base update.
-MAIN_PUBLISH_GATE_SHA256 = (
-    "51d93dead7e8337df4cd85a8c034d11436ee8d1935d8e6b2e58509c5e7da8fb4"
-)
-
 
 def extract_test_needs(ci_yml: str) -> set[str]:
     match = re.search(r"(?ms)^  test:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", ci_yml)
@@ -769,8 +757,8 @@ def native_binary_compile_gate_self_test() -> list[str]:
             "merge_group binary matrix must keep Linux, both macOS targets, and Windows"
         )
     push_targets = [row.get("target") for row in push_rows]
-    if push_targets != list(NATIVE_BINARY_TARGETS):
-        failures.append("push-to-main native matrix must keep the four production targets")
+    if push_targets != ["x86_64-unknown-linux-gnu"]:
+        failures.append("push-to-main verification must build Linux x86_64 only")
 
     build_body = extract_job_body(ci_yml, "build-binaries")
     macos_check_gate = (
@@ -784,43 +772,17 @@ def native_binary_compile_gate_self_test() -> list[str]:
             "jobs.build-binaries merge_group macOS must use a static cargo check step"
         )
     native_build_gate = (
-        "- name: Build PR / merge-group verification binary\n"
-        "        if: github.event_name == 'pull_request' || "
-        "(github.event_name == 'merge_group' && runner.os != 'macOS')\n"
+        "- name: Build fast verification binary\n"
+        "        if: github.event_name != 'merge_group' || runner.os != 'macOS'\n"
         "        run: cargo build --features cloud-secrets --profile pr-build "
         "--target ${{ matrix.target }}"
     )
     if native_build_gate not in build_body:
-        failures.append(
-            "jobs.build-binaries pull_request and merge_group Linux/Windows must "
-            "use a static linked pr-build step"
-        )
-    if "run: cargo ${{" in build_body:
-        failures.append("jobs.build-binaries must not select a Cargo subcommand dynamically")
-    if (
-        "run: cargo build --features cloud-secrets --release --target ${{ matrix.target }}"
-        not in build_body
-    ):
-        failures.append("jobs.build-binaries push path must keep cargo build --release")
-    if build_body.count(
-        "if: github.event_name == 'push' && github.ref == 'refs/heads/main'"
-    ) < 2:
-        failures.append(
-            "jobs.build-binaries must keep both Prepare release assets and "
-            "Upload artifacts on push-to-main"
-        )
-    cache_key = (
-        'shared-key: "build-${{ matrix.target }}-'
-        "${{ github.event_name == 'push' && 'release' || 'prbuild' }}\""
-    )
-    if cache_key not in build_body:
-        failures.append(
-            "jobs.build-binaries rust-cache key must split prbuild/check vs release lanes"
-        )
-    if 'shared-key: "build-${{ matrix.target }}"\n' in build_body:
-        failures.append(
-            "jobs.build-binaries must not share one rust-cache key across pr-build and release"
-        )
+        failures.append("CI must use linked pr-build binaries on Linux/Windows")
+    if "--release" in build_body or "LINUX_GNU_PROFILE: release" in build_body:
+        failures.append("CI must not compile production release binaries")
+    if 'shared-key: "build-${{ matrix.target }}-prbuild"' not in build_body:
+        failures.append("CI verification must use the prbuild cache namespace")
     if "./.github/actions/setup-sccache" not in build_body:
         failures.append(
             "jobs.build-binaries must install sccache via the pinned repository action"
@@ -828,13 +790,6 @@ def native_binary_compile_gate_self_test() -> list[str]:
     if '"${FERRUM_SCCACHE_BIN}" --show-stats' not in build_body:
         failures.append(
             "jobs.build-binaries must report pinned sccache --show-stats telemetry"
-        )
-    if (
-        "name: Prepare release assets" not in build_body
-        or "name: Upload artifacts" not in build_body
-    ):
-        failures.append(
-            "jobs.build-binaries must keep push-to-main asset prepare/upload steps"
         )
     return failures
 
@@ -1681,48 +1636,6 @@ def main() -> int:
     if "(CI mirror)" in ci_yml:
         planner_errors.append("ci.yml must not contain runner-holding CI mirror jobs")
 
-    publish_gate_body = extract_job_body(ci_yml, "main-publish-gate")
-    publish_gate_sha256 = hashlib.sha256(publish_gate_body.encode()).hexdigest()
-    if publish_gate_sha256 != MAIN_PUBLISH_GATE_SHA256:
-        planner_errors.append(
-            "jobs.main-publish-gate differs from the trusted same-SHA polling "
-            "contract"
-        )
-    if not all(
-        job_needs(publish_gate_body, dependency)
-        for dependency in ("test", "build-binaries")
-    ):
-        planner_errors.append(
-            "jobs.main-publish-gate must depend on Tests and build-binaries"
-        )
-    for workflow_path, workflow in sorted(MAIN_PUBLISH_WORKFLOWS.items()):
-        workflow_file = Path(workflow_path).name
-        specification = f"{workflow_file}|{workflow_path}|{workflow}"
-        if f'            "{specification}"' not in publish_gate_body:
-            planner_errors.append(
-                "jobs.main-publish-gate must bind canonical workflow "
-                f"`{workflow_path}` to display name `{workflow}`"
-            )
-    # The gate polls the Actions API, so it must stay scoped to `main` pushes.
-    # Without this it would become a runner-holding mirror job on every pull
-    # request, which is exactly what the dedicated workflows replaced.
-    for condition in (
-        "github.event_name == 'push'",
-        "github.ref == 'refs/heads/main'",
-    ):
-        if condition not in publish_gate_body:
-            planner_errors.append(
-                f"jobs.main-publish-gate must stay scoped by `{condition}`"
-            )
-    for job in ("latest-release", "docker"):
-        body = extract_job_body(ci_yml, job)
-        if not job_needs(body, "main-publish-gate"):
-            planner_errors.append(f"jobs.{job} must depend on main-publish-gate")
-        if "needs.main-publish-gate.result == 'success'" not in body:
-            planner_errors.append(
-                f"jobs.{job} must require a successful main-publish-gate"
-            )
-
     for job in sorted(DIRECT_FULL_CI_JOBS):
         body = extract_job_body(ci_yml, job)
         if not job_needs(body, "ci-plan"):
@@ -1871,7 +1784,7 @@ def main() -> int:
     # COMPLETE repository-required product check set succeeded for the exact
     # product SHA. `.github/required-publication-checks.json` is the one
     # canonical, machine-consumed inventory. These PR-mutable checks compare the
-    # frozen `main-publish-gate` array, the hosted
+    # required product set, the hosted
     # `main-publication-required-checks` job, and release.yml's
     # `validate-release-sha` with that inventory so independent subsets cannot
     # drift. They do not protect their own hosted-gate enforcement surface.
@@ -1891,14 +1804,14 @@ def main() -> int:
             entry["workflow_path"]: entry["workflow_name"]
             for entry in publication_entries_by_mode(
                 publication_inventory,
-                "ci_main_publish_gate",
+                "release_gate",
             )
         }
-        if inventory_main_gate != MAIN_PUBLISH_WORKFLOWS:
+        if inventory_main_gate != RELEASE_GATE_WORKFLOWS:
             planner_errors.append(
-                "MAIN_PUBLISH_WORKFLOWS must equal the `ci_main_publish_gate` "
+                "RELEASE_GATE_WORKFLOWS must equal the `release_gate` "
                 "entries of .github/required-publication-checks.json; the "
-                "frozen ci.yml array has exactly one source of truth"
+                "release evidence inventory has exactly one source of truth"
             )
         # Adversarial fixture: a context that branch protection newly requires
         # but that nothing publishes against must fail this policy run.
@@ -1912,6 +1825,7 @@ def main() -> int:
                 "must fail the publication contract"
             )
 
+    planner_errors.extend(release_dispatch_self_test())
     planner_errors.extend(merge_group_self_test())
     planner_errors.extend(optional_live_suite_self_test())
 

@@ -355,6 +355,7 @@ jobs:
           file: Dockerfile
           target: runtime-ebpf-tools
           build-args: |
+            CARGO_PROFILE=pr-build
             FEATURES=cloud-secrets,ebpf
           load: true
           tags: ferrum-edge-ebpf-tools:ci
@@ -401,6 +402,7 @@ jobs:
           file: Dockerfile
           target: runtime-ebpf
           build-args: |
+            CARGO_PROFILE=pr-build
             FEATURES=cloud-secrets,ebpf
           load: true
           tags: ferrum-edge-ebpf:ci

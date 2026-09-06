@@ -52,7 +52,6 @@ def check_operator_install_docs(
     errors: list[str] = []
     for workflow_label, workflow in (
         ("stable release workflow", release_workflow),
-        ("moving latest workflow", latest_workflow),
     ):
         gateway_assets = release_gateway_assets(workflow)
         if LINUX_X86_64_BINARY not in gateway_assets:
@@ -144,7 +143,7 @@ def run_self_test() -> list[str]:
         failures.append("broken tarball install recipe was not rejected")
 
     broken_ci_cd = ci_cd_md.replace(
-        'gh release download --repo ferrum-edge/ferrum-edge latest',
+        'gh release download --repo ferrum-edge/ferrum-edge "$TAG"',
         "curl -s https://api.github.com/repos/ferrum-edge/ferrum-edge/releases/latest",
         1,
     )
