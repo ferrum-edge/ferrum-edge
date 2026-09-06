@@ -5,7 +5,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -939,6 +939,51 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
 
 // ── TCP ──────────────────────────────────────────────────────────────────────
 
+// A reader must only wait for a payload the writer has admitted. Independent
+// deadline loops can otherwise ask for one extra echo just as the writer sends
+// close_notify. Counters preserve the existing pipelined byte stream without an
+// unbounded per-request queue. Notify has a single reader and stores a permit.
+#[derive(Default)]
+struct TcpWriteProgress {
+    admitted: AtomicU64,
+    finished: AtomicBool,
+    changed: tokio::sync::Notify,
+}
+
+impl TcpWriteProgress {
+    fn admit(&self) {
+        self.admitted.fetch_add(1, Ordering::Release);
+        self.changed.notify_one();
+    }
+
+    fn finish(&self) {
+        self.finished.store(true, Ordering::Release);
+        self.changed.notify_one();
+    }
+
+    async fn wait_for_request(&self, received: u64) -> bool {
+        loop {
+            if received < self.admitted.load(Ordering::Acquire) {
+                return true;
+            }
+            if self.finished.load(Ordering::Acquire) {
+                // The first load can precede the final admission. Observing
+                // finished synchronizes with every admission before it.
+                return received < self.admitted.load(Ordering::Acquire);
+            }
+            self.changed.notified().await;
+        }
+    }
+}
+
+struct FinishTcpWrites(Arc<TcpWriteProgress>);
+
+impl Drop for FinishTcpWrites {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
+
 async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -988,7 +1033,10 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
                 let (mut rd, mut wr) = tokio::io::split(stream);
                 let payload_bytes = payload.clone();
                 let write_deadline = deadline;
+                let progress = Arc::new(TcpWriteProgress::default());
+                let write_progress = progress.clone();
                 let write_task = tokio::spawn(async move {
+                    let _finished = FinishTcpWrites(write_progress.clone());
                     // Chunk the write + yield_now() between chunks.
                     // tokio::io::split over tokio_rustls::TlsStream shares a
                     // BiLock between the read and write halves. poll_write
@@ -1005,6 +1053,9 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
                     // can acquire the BiLock and drain the echo stream.
                     const CHUNK: usize = 65_536;
                     while Instant::now() < write_deadline {
+                        // Publish before writing so large payloads retain
+                        // full-duplex progress even when socket buffers fill.
+                        write_progress.admit();
                         let mut offset = 0;
                         while offset < payload_bytes.len() {
                             let end = (offset + CHUNK).min(payload_bytes.len());
@@ -1027,7 +1078,7 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
                     // until the process wallclock-kills. Reproduced locally
                     // at 500 KiB × 100 conns: ~6/100 connections wedge in
                     // ESTABLISHED with half-received payloads.
-                    let _ = wr.shutdown().await;
+                    wr.shutdown().await.map_err(|_| ())?;
                     Ok(())
                 });
 
@@ -1038,14 +1089,26 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
                 // TLS connections on shared runners). The previous 5s caused
                 // false-positive errors on every run.
                 let mut buf = vec![0u8; payload.len()];
+                let mut received = 0;
+                let mut read_failed = false;
                 while Instant::now() < deadline {
                     let start = Instant::now();
                     let read_timeout = Duration::from_secs(15);
-                    match tokio::time::timeout(read_timeout, rd.read_exact(&mut buf)).await {
-                        Ok(Ok(_)) => {
+                    let response = async {
+                        if !progress.wait_for_request(received).await {
+                            return Ok(None);
+                        }
+                        rd.read_exact(&mut buf).await?;
+                        Ok::<_, std::io::Error>(Some(()))
+                    };
+                    match tokio::time::timeout(read_timeout, response).await {
+                        Ok(Ok(None)) => break,
+                        Ok(Ok(Some(()))) => {
+                            received += 1;
                             let latency = start.elapsed().as_micros() as u64;
                             if !record_echo_result(&mut metrics, "TCP+TLS", &buf, &payload, latency)
                             {
+                                read_failed = true;
                                 break;
                             }
                         }
@@ -1055,6 +1118,7 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
                                 metrics.total_requests
                             );
                             metrics.record_error();
+                            read_failed = true;
                             break;
                         }
                         Err(_) => {
@@ -1063,6 +1127,7 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
                                 metrics.total_requests
                             );
                             metrics.record_error();
+                            read_failed = true;
                             break;
                         }
                     }
@@ -1071,7 +1136,17 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
                 // or error) — otherwise it could keep writing into a dropped
                 // socket until the write fails.
                 write_task.abort();
-                let _ = write_task.await;
+                match write_task.await {
+                    Ok(Err(())) if !read_failed => {
+                        eprintln!("[tcp-tls] writer failed before clean shutdown");
+                        metrics.record_error();
+                    }
+                    Err(error) if !error.is_cancelled() && !read_failed => {
+                        eprintln!("[tcp-tls] writer task failed: {error}");
+                        metrics.record_error();
+                    }
+                    _ => {}
+                }
             } else {
                 let (mut rd, mut wr) = tcp.into_split();
                 let mut buf = vec![0u8; payload.len()];
@@ -1852,4 +1927,61 @@ async fn run_saturate(args: &SaturateArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tcp_admission_tests {
+    use super::{FinishTcpWrites, TcpWriteProgress};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn completed_writer_does_not_admit_an_extra_eof_read() {
+        let progress = TcpWriteProgress::default();
+        progress.admit();
+        progress.finish();
+        assert!(progress.wait_for_request(0).await);
+        assert!(!progress.wait_for_request(1).await);
+    }
+
+    #[tokio::test]
+    async fn completion_before_wait_and_coalesced_notifications_keep_all_requests() {
+        let progress = Arc::new(TcpWriteProgress::default());
+        {
+            let _finished = FinishTcpWrites(progress.clone());
+            progress.admit();
+            progress.admit();
+        }
+        assert!(progress.wait_for_request(0).await);
+        assert!(progress.wait_for_request(1).await);
+        assert!(!progress.wait_for_request(2).await);
+    }
+
+    #[tokio::test]
+    async fn pending_reader_wakes_when_writer_finishes_without_a_request() {
+        let progress = TcpWriteProgress::default();
+        let reader = progress.wait_for_request(0);
+        tokio::pin!(reader);
+        assert!(futures_util::poll!(&mut reader).is_pending());
+        progress.finish();
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), reader)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_partial_payload_is_still_an_io_failure() {
+        let progress = TcpWriteProgress::default();
+        let (mut reader, mut writer) = tokio::io::duplex(4);
+        progress.admit();
+        writer.write_all(b"ab").await.unwrap();
+        drop(writer);
+        progress.finish();
+        assert!(progress.wait_for_request(0).await);
+        let mut payload = [0; 4];
+        assert!(reader.read_exact(&mut payload).await.is_err());
+    }
 }

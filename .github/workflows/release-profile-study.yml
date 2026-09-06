@@ -6,11 +6,13 @@ on:
     paths:
       - .github/workflows/release-profile-study.yml
       - .github/scripts/verify_release_profile_study.py
+      - tests/performance/multi_protocol/**
   push:
     branches: [main]
     paths:
       - .github/workflows/release-profile-study.yml
       - .github/scripts/verify_release_profile_study.py
+      - tests/performance/multi_protocol/**
 
 permissions:
   contents: read
@@ -26,10 +28,37 @@ jobs:
           persist-credentials: false
       - run: python3 .github/scripts/verify_release_profile_study.py --self-test
 
+  tcp-admission:
+    name: TCP benchmark admission contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Check protocol tool formatting
+        run: cargo fmt --manifest-path tests/performance/multi_protocol/Cargo.toml -- --check
+      - name: Install native protocol test dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources \
+            -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 -o Acquire::Retries=3
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libssl-dev
+      - name: Verify admission and shutdown races without timing sleeps
+        run: cargo test --manifest-path tests/performance/multi_protocol/Cargo.toml --locked --bin proto_bench tcp_admission_tests -- --nocapture
+
   benchmark:
     name: Paired native Linux release profiles
     if: github.event_name == 'workflow_dispatch'
-    needs: validation
+    needs: [validation, tcp-admission]
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -111,9 +140,14 @@ jobs:
               sha256sum target/release/ferrum-edge > "benchmark-results/$profile/round-$round.sha256"
               target/release/ferrum-edge version > "benchmark-results/$profile/round-$round.version"
               vmstat 1 3 > "benchmark-results/$profile/round-$round.vmstat"
+              set +e
               bash tests/performance/multi_protocol/run_protocol_test.sh all \
                 --skip-build --duration 5 --concurrency 100 --payload-size 10240 --json \
                 2>&1 | tee "benchmark-results/$profile/round-$round.log"
+              study_round_status=$?
+              set -e
+              cp tests/performance/multi_protocol/backend.log "benchmark-results/$profile/round-$round.backend.log"
+              if [ "$study_round_status" -ne 0 ]; then exit "$study_round_status"; fi
             done
           done
       - name: Validate complete samples and summarize paired measurements

@@ -63,5 +63,28 @@ The CPU-model mismatch confounds both compilation and protocol comparisons;
 raw throughput differences cannot be attributed to LTO/codegen settings. The
 observed thin executable is 21.6% larger. These are preliminary measurements,
 not evidence for shipping adoption. The paired workflow above addresses the host mismatch and validates complete
-samples. Its measurements are pending; the platform/ABI and agreed-budget
-gates still apply.
+samples. Its first result and required repair are documented below; the
+platform/ABI and agreed-budget gates still apply.
+
+## Paired study and TCP benchmark shutdown correction
+
+Run [34059438160](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34059438160)
+built both profiles on the same Xeon Platinum 8573C runner. Fat/thin compile
+time was 2,642.42s / 1,413.38s; executable sizes were 92,918,592 / 112,983,168
+bytes. All 120 protocol samples were present, but thin round 1's direct TCP+TLS
+control reported two EOF errors. The strict verifier correctly rejected the
+study, so these runtime measurements do not approve a profile change.
+
+The TCP+TLS benchmark used independent writer/reader deadline loops. Its reader
+could start one more echo read as the writer stopped admitting payloads. The
+client now records each admitted payload before writing and only reads an echo
+for an admitted request. Atomic counters and a single-reader notification keep
+constant bookkeeping memory and preserve full-duplex pipelining, the existing
+deadline and the 15-second per-attempt bound. A completed writer with no pending
+request ends the loop; an admitted partial payload remains an I/O failure.
+Writer failures remain errors, and the direct TLS backend sends close_notify
+after its echo copy drains. No EOF error is exempted from measurement validation.
+
+The focused hosted contract covers completion before waiting, coalesced
+notifications, a pending reader and an admitted partial write. Backend logs
+are retained per round. A new full paired study is required after this repair.
