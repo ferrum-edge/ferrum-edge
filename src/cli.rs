@@ -1016,6 +1016,31 @@ pub fn execute_validate() -> Result<(), String> {
         println!("Mesh runtime: OK");
     }
 
+    // These modes have admission beyond EnvConfig. Reuse startup's parsers
+    // and file loaders without starting listeners, kernel capture, or migrations.
+    match env_config.mode {
+        OperatingMode::Injector => {
+            crate::modes::injector::load_startup_config(&env_config)
+                .map_err(|e| format!("Injector runtime validation failed: {e}"))?;
+            println!("Injector runtime and serving TLS: OK");
+        }
+        OperatingMode::NodeAgent => {
+            crate::modes::node_agent::NodeAgentConfig::from_env_config(&env_config)
+                .map_err(|e| format!("Node-agent runtime validation failed: {e}"))?;
+            println!("Node-agent runtime: OK");
+        }
+        OperatingMode::Migrate if env_config.migrate_action == "config" => {
+            let path = env_config
+                .file_config_path
+                .as_deref()
+                .ok_or("FERRUM_FILE_CONFIG_PATH is required for config migration")?;
+            crate::config::config_migration::ConfigMigrator::detect_version(path)
+                .map_err(|e| format!("Migration config validation failed: {e}"))?;
+            println!("Migration config file and version: OK");
+        }
+        _ => {}
+    }
+
     println!("\nValidation passed.");
     Ok(())
 }
