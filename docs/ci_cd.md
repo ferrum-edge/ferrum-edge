@@ -2652,7 +2652,7 @@ The `anonymous-pull-smoke` job now runs in `release.yml` after the standard
 version manifest is published, with an empty Docker configuration. Docker Hub
 must permit anonymous pulls and pass the version smoke; GHCR remains warn-only
 until the package is public. The same script supports manual verification:
-`bash scripts/smoke_anonymous_pull.sh docker.io/ferrumedge/ferrum-edge:v1.2.3`.
+`bash scripts/smoke_anonymous_pull.sh docker.io/ferrumedge/ferrum-edge:v0.9.3`.
 
 The GHCR path is `ghcr.io/${{ github.repository }}` in the workflows, so it auto-tracks the GitHub repository owner/name if the repository is moved or forked. The Docker Hub repo `ferrumedge/ferrum-edge` is hardcoded in `release.yml`; forks must edit that `name=` value (and configure their own `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`) before Docker Hub pushes will succeed.
 
@@ -3024,3 +3024,20 @@ gh secret set DOCKERHUB_TOKEN --body "new-token"
 - [Docker Deployment](docker.md) - Building and running Docker images
 - [Main README](../README.md) - Project overview and configuration
 - [GitHub Actions Documentation](https://docs.github.com/en/actions)
+
+### Test artifact profile reuse experiment (#4667)
+
+The gateway, ferrum-cni, and nextest archive producer use the dev/test output
+family with debug info disabled. Keeping the gateway in a separate `pr-build`
+directory duplicated dependency compilation before any integration or functional
+shard could start. Artifact names, `target/debug` paths, archive profiles, and
+shipping release profiles are unchanged.
+
+Baseline PR run [34005446618](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34005446618)
+spent 12m08s building the gateway, 7m33s building ferrum-cni, and 10m14s building
+the integration archive. Compare these individual steps and the final `Tests`
+completion time on the experiment PR; record cache restores alongside timings.
+The expected saving is dependency reuse in the second binary build, not removal
+of tests. Dev-dependency feature unification can still require recompilation
+when the archive build starts. Repository-wide cache capacity is tracked in
+[#4643](https://github.com/ferrum-edge/ferrum-edge/issues/4643).

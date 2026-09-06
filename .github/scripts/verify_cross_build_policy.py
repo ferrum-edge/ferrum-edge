@@ -6540,7 +6540,7 @@ def nonpublishing_ci_errors(contents: str, source: str) -> list[str]:
     if permission != "permissions:\n  contents: read\n":
         errors.append(f"{source} must default to contents: read only")
     active = "\n".join(line for line in contents.splitlines() if not line.lstrip().startswith("#"))
-    if re.search(r"\b(?:contents|packages|id-token):\s*write\b|\bwrite-all\b", active):
+    if re.search(r"\b(?:actions|contents|packages|id-token):\s*write\b|\bwrite-all\b", active):
         errors.append(f"{source} must not grant publication write permissions")
     for job in ("latest-release", "docker", "docker-manifest", "build-arm64-cross",
                 "main-publish-gate", "verify-pr-linux-gnu-abi",
@@ -26342,6 +26342,7 @@ pre_build = []
         failures.append("read-only nonpublishing CI was rejected")
     for mutation in (
         no_publish.replace("contents: read", "contents: write"),
+        no_publish.replace("    steps: []", "    permissions:\n      actions: write\n    steps: []"),
         no_publish + "  docker:\n    steps: []\n",
         no_publish.replace("steps: []", "steps:\n      - run: docker push evil/image:latest"),
         no_publish.replace("steps: []", "steps:\n      - uses: softprops/action-gh-release@deadbeef"),
