@@ -1,6 +1,11 @@
 # Minimal distroless runtime image for pre-built binaries (used by CI/CD)
 # For local builds from source, use: docker build -f Dockerfile .
 #
+# Distroless has no shell; only this empty directory crosses into the runtime.
+# Use the same digest-pinned Debian base as Dockerfile's tooling stages.
+FROM debian:13-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2 AS data-dir
+RUN mkdir -m 0755 /data
+
 # Debian 13 (trixie) distroless has glibc 2.40. Published GNU binaries are
 # built to the declared GLIBC_2.34 runtime floor (x86_64 from a digest-pinned
 # AlmaLinux 8.10 sysroot; ARM64 from the isolated Xenial Cross image) and
@@ -14,6 +19,7 @@ WORKDIR /app
 
 COPY --chmod=755 bin/${TARGETARCH}/ferrum-edge /app/ferrum-edge
 COPY --chmod=755 bin/${TARGETARCH}/ferrum-cni /app/ferrum-cni
+COPY --from=data-dir --chown=65532:65532 /data/ /data/
 
 ENV PATH="/app:${PATH}" \
     FERRUM_MODE=database \
