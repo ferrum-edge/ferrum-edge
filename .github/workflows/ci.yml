@@ -756,11 +756,11 @@ jobs:
           tool: cargo-nextest
 
       - name: Build gateway binary
-        run: |
-          set -euo pipefail
-          cargo build --profile pr-build --bin ferrum-edge
-          mkdir -p target/debug
-          cp target/pr-build/ferrum-edge target/debug/ferrum-edge
+        # Match ferrum-cni and the nextest archives below: a separate pr-build
+        # directory compiles the dependency graph again before shards can run.
+        # This binary is used only for tests; release producers keep their
+        # shipping profile and all consumers keep the target/debug contract.
+        run: cargo build --config profile.dev.debug=0 --bin ferrum-edge
 
       - name: Build ferrum-cni binary
         # `cni_tests` launches `env!("CARGO_BIN_EXE_ferrum-cni")`, which
@@ -797,8 +797,7 @@ jobs:
             --archive-file "$archive_file"
 
       - name: Upload gateway binary
-        # Consumers expect the existing target/debug path and OS/arch-keyed
-        # artifact name even though the fast pr-build profile produced it.
+        # Consumers use the target/debug path and OS/arch-keyed artifact name.
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}
