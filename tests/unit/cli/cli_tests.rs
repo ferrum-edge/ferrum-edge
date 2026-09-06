@@ -1284,6 +1284,7 @@ where
     });
 
     let args = HealthArgs {
+        settings: None,
         port: Some(port),
         host: "127.0.0.1".to_string(),
         tls: false,
@@ -1356,6 +1357,7 @@ fn run_health_against_tls_response(response: &[u8]) -> Result<(), String> {
     });
 
     let result = execute_health(&HealthArgs {
+        settings: None,
         port: Some(port),
         host: "127.0.0.1".to_string(),
         tls: true,

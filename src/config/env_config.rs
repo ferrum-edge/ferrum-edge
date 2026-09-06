@@ -1422,7 +1422,7 @@ impl std::fmt::Display for BackendEgressPolicy {
 }
 
 /// Resolve a configuration value: env var takes precedence over conf file.
-fn resolve_var(conf: &ConfFile, key: &str) -> Option<String> {
+pub(crate) fn resolve_var(conf: &ConfFile, key: &str) -> Option<String> {
     if let Ok(env_val) = env::var(key) {
         if conf.get(key).is_some_and(|conf_val| conf_val != env_val) {
             tracing::info!("{key}: environment variable overrides ferrum.conf default");
