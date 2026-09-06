@@ -1,0 +1,48 @@
+name: Cache Payload Study
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    name: Measure restored sanitizer cache components
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      # Exact existing main-owned key and ordered paths from its saved log.
+      # Restore only: no compiled file from this archive is executed.
+      - uses: actions/cache/restore@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
+        with:
+          key: v0-rust-fuzz-smoke-Linux-x64-cf8601f0-5e0ec017
+          fail-on-cache-miss: true
+          path: |
+            /home/runner/.cargo/bin
+            /home/runner/.cargo/.crates.toml
+            /home/runner/.cargo/.crates2.json
+            /home/runner/.cargo/registry
+            /home/runner/.cargo/git
+            ${{ github.workspace }}/fuzz/target
+            ${{ github.workspace }}/.cache/sccache
+      - name: Measure components without invoking cached tools
+        run: |
+          set -euo pipefail
+          mkdir -p cache-study-results
+          git rev-parse HEAD > cache-study-results/source.txt
+          du -sb fuzz/target .cache/sccache > cache-study-results/component-bytes.txt
+          /usr/bin/tar -cf - fuzz/target | /usr/bin/zstd -T0 -c | /usr/bin/wc -c > cache-study-results/target-compressed-bytes.txt
+          /usr/bin/tar -cf - .cache/sccache | /usr/bin/zstd -T0 -c | /usr/bin/wc -c > cache-study-results/sccache-compressed-bytes.txt
+          cat cache-study-results/component-bytes.txt
+          cat cache-study-results/target-compressed-bytes.txt
+          cat cache-study-results/sccache-compressed-bytes.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: sanitizer-cache-component-sizes
+          path: cache-study-results/
+          retention-days: 7
