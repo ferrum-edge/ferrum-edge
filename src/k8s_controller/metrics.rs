@@ -45,16 +45,20 @@ pub struct ControllerMetrics {
     pub config_publications: AtomicU64,
     /// Watch stream errors across every watched scope (issue #4491): refused
     /// initial lists, failed watch starts, mid-stream failures, and API-server
-    /// `Status` errors. kube-rs backs the stream off between attempts and the
-    /// watcher logs the fault once per transition, so this counter is the
-    /// per-attempt view: a steady rise is a scope that cannot succeed — most
-    /// often an RBAC gap on a served kind.
+    /// `Status` errors. The watcher holds a refused or failed list between
+    /// attempts and logs the fault at error level only when the failure
+    /// streak begins or changes class (repeats stay at debug), so this counter
+    /// is the per-attempt view: a steady rise is a scope that cannot succeed —
+    /// most often an RBAC gap on a served kind.
     pub watch_errors: AtomicU64,
     /// Objects an authoritative relist found missing from the store it
     /// replaced (issue #4491): withdrawals no `Delete` event delivered. This is
     /// the proof of a missed delete, as opposed to a delete that was observed
-    /// and reconciled. A small count on a churning scope can also be an object
-    /// deleted inside the relist's own list window.
+    /// and reconciled. The window it covers runs from the moment the retiring
+    /// generation's stream was dropped to the successful list that replaced
+    /// it — including every replacement attempt that timed out in between —
+    /// so a small count on a churning scope can also be an object deleted
+    /// during that window rather than a stalled watch.
     pub watch_relist_missed_deletes: AtomicU64,
     /// Objects an authoritative relist found that the store it replaced never
     /// held: creations no `Apply` event delivered.
