@@ -63,9 +63,20 @@ jobs:
         with:
           python-version: '3.13'
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        if: matrix.target == 'x86_64-apple-darwin'
         with:
           toolchain: '1.98.1'
-          targets: ${{ matrix.target }}
+          targets: x86_64-apple-darwin
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        if: matrix.target == 'aarch64-apple-darwin'
+        with:
+          toolchain: '1.98.1'
+          targets: aarch64-apple-darwin
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        with:
+          toolchain: '1.98.1'
+          targets: x86_64-pc-windows-msvc
       - uses: ./.github/actions/setup-fast-linker
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
@@ -117,9 +128,18 @@ jobs:
 
       - name: Verify telemetry parsers on this platform
         run: python .github/scripts/profile_release_platform.py --self-test
-      - name: Measure the unchanged shipping profile
+      - name: Measure the unchanged shipping profile (x86_64-apple-darwin)
+        if: matrix.target == 'x86_64-apple-darwin'
         timeout-minutes: 165
-        run: python .github/scripts/profile_release_platform.py --target ${{ matrix.target }}
+        run: python .github/scripts/profile_release_platform.py --target x86_64-apple-darwin
+      - name: Measure the unchanged shipping profile (aarch64-apple-darwin)
+        if: matrix.target == 'aarch64-apple-darwin'
+        timeout-minutes: 165
+        run: python .github/scripts/profile_release_platform.py --target aarch64-apple-darwin
+      - name: Measure the unchanged shipping profile (x86_64-pc-windows-msvc)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        timeout-minutes: 165
+        run: python .github/scripts/profile_release_platform.py --target x86_64-pc-windows-msvc
       - name: Upload data-only build evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

@@ -28,11 +28,6 @@ PROFILE = {"opt-level": 3, "lto": "fat", "codegen-units": 1,
            "strip": True, "incremental": False, "panic": "abort"}
 
 
-def capture(command, timeout=20):
-    return subprocess.check_output(command, text=True, timeout=timeout,
-                                   stderr=subprocess.STDOUT).strip()
-
-
 def mac_processes(raw):
     result = []
     for line in raw.splitlines():
@@ -63,17 +58,18 @@ def descendants(rows, root):
 
 def snapshot():
     if platform.system() == "Darwin":
-        rows = mac_processes(capture(["ps", "-axo", "pid=,ppid=,rss=,comm="]))
-        host = {"vm_stat": capture(["vm_stat"]),
-                "swap": capture(["sysctl", "vm.swapusage"])}
+        rows = mac_processes(subprocess.check_output(["ps", "-axo", "pid=,ppid=,rss=,comm="], text=True, timeout=20))
+        host = {"vm_stat": subprocess.check_output(["vm_stat"], text=True, timeout=20),
+                "swap": subprocess.check_output(["sysctl", "vm.swapusage"], text=True, timeout=20)}
         return rows, host
-    raw = capture(["pwsh", "-NoProfile", "-Command",
+    raw = subprocess.check_output(["pwsh", "-NoProfile", "-Command",
                    "$ErrorActionPreference='Stop'; "
                    "[ordered]@{processes=@(Get-CimInstance Win32_Process | "
                    "Select-Object ProcessId,ParentProcessId,Name,WorkingSetSize); "
                    "memory=(Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory | "
                    "Select-Object AvailableMBytes,CommittedBytes,CommitLimit,"
-                   "PagesInputPersec,PagesOutputPersec)} | ConvertTo-Json -Depth 4"])
+                   "PagesInputPersec,PagesOutputPersec)} | ConvertTo-Json -Depth 4"],
+                  text=True, timeout=20)
     data = json.loads(raw)
     return windows_processes(data["processes"]), data["memory"]
 
@@ -120,9 +116,13 @@ def stop_tree(child):
     if child.poll() is not None:
         return
     if platform.system() == "Windows":
-        subprocess.run(["taskkill", "/PID", str(child.pid), "/T", "/F"],
-                       check=False, timeout=20, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL)
+        # The fixed PowerShell program treats the owned PID only as numeric data.
+        kill_env = os.environ.copy()
+        kill_env["FERRUM_STUDY_CHILD_PID"] = str(child.pid)
+        subprocess.run(["pwsh", "-NoProfile", "-Command",
+                        "taskkill /PID ([int]$env:FERRUM_STUDY_CHILD_PID) /T /F; exit $LASTEXITCODE"],
+                       env=kill_env, check=False, timeout=20,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     else:
         try:
             os.killpg(child.pid, signal.SIGTERM)
@@ -151,9 +151,11 @@ def profile_build(target, output):
         raise ValueError("Shipping profile differs from the measured baseline")
     if any(k.startswith("CARGO_PROFILE_RELEASE_") for k in os.environ):
         raise ValueError("Release profile environment overrides are not permitted")
-    rust = capture(["rustc", "-Vv"])
-    cargo = capture(["cargo", "-V"])
-    installed = capture(["rustup", "target", "list", "--installed", "--toolchain", TOOLCHAIN])
+    rust = subprocess.check_output(["rustc", "-Vv"], text=True, timeout=20).strip()
+    cargo = subprocess.check_output(["cargo", "-V"], text=True, timeout=20).strip()
+    installed = subprocess.check_output(
+        ["rustup", "target", "list", "--installed", "--toolchain", "1.98.1"],
+        text=True, timeout=20).strip()
     verify_toolchain(rust, cargo, installed, target)
     output.mkdir(parents=True, exist_ok=True)
     target_dir = Path(tempfile.mkdtemp(prefix="release-platform-", dir=os.environ["RUNNER_TEMP"]))
@@ -163,7 +165,7 @@ def profile_build(target, output):
     command = ["cargo", "build", "--release", "--features", "cloud-secrets",
                "--target", target, "--locked", "--timings"]
     provenance = {
-        "sha": capture(["git", "rev-parse", "HEAD"]),
+        "sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, timeout=20).strip(),
         "rust": rust, "cargo": cargo, "installed_targets": installed.splitlines(),
         "platform": platform.platform(), "machine": platform.machine(),
         "target": target, "command": command, "profile": manifest["profile"]["release"],
@@ -173,19 +175,34 @@ def profile_build(target, output):
         "cache": "empty target and disabled compiler wrappers; no cache publication",
     }
     if platform.system() == "Darwin":
-        provenance["cpu"] = capture(["sysctl", "machdep.cpu.brand_string", "hw.memsize", "hw.ncpu"])
+        provenance["cpu"] = subprocess.check_output(["sysctl", "machdep.cpu.brand_string", "hw.memsize", "hw.ncpu"], text=True, timeout=20).strip()
     else:
-        provenance["cpu"] = capture(["pwsh", "-NoProfile", "-Command",
+        provenance["cpu"] = subprocess.check_output(["pwsh", "-NoProfile", "-Command",
                                     "Get-CimInstance Win32_Processor | Select-Object "
-                                    "Name,NumberOfCores,NumberOfLogicalProcessors | ConvertTo-Json"])
+                                    "Name,NumberOfCores,NumberOfLogicalProcessors | ConvertTo-Json"],
+                                   text=True, timeout=20).strip()
     (output / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
     start = time.monotonic()
     samples, errors, peak = 0, 0, None
     result = {"build_complete": False, "validation_complete": False, "target": target}
     try:
         with (output / "build.log").open("wb") as log, (output / "memory.jsonl").open("w") as memory:
-            options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if platform.system() == "Windows" else {"start_new_session": True}
-            child = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT, **options)
+            if target == "x86_64-apple-darwin":
+                child = subprocess.Popen(
+                    ["cargo", "build", "--release", "--features", "cloud-secrets",
+                     "--target", "x86_64-apple-darwin", "--locked", "--timings"],
+                    env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            elif target == "aarch64-apple-darwin":
+                child = subprocess.Popen(
+                    ["cargo", "build", "--release", "--features", "cloud-secrets",
+                     "--target", "aarch64-apple-darwin", "--locked", "--timings"],
+                    env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            else:
+                child = subprocess.Popen(
+                    ["cargo", "build", "--release", "--features", "cloud-secrets",
+                     "--target", "x86_64-pc-windows-msvc", "--locked", "--timings"],
+                    env=env, stdout=log, stderr=subprocess.STDOUT,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
             finished = threading.Event()
             completion = {}
 
@@ -249,9 +266,18 @@ def profile_build(target, output):
             raise ValueError("Successful build has no valid Cargo timing data")
         binary = target_dir / target / "release" / ("ferrum-edge.exe" if platform.system() == "Windows" else "ferrum-edge")
         result.update(binary_bytes=binary.stat().st_size, binary_sha256=digest(binary))
-        (output / "version.txt").write_text(capture([str(binary), "version"], timeout=30) + "\n")
-        if platform.system() == "Darwin":
-            (output / "load-commands.txt").write_text(capture(["otool", "-l", str(binary)]) + "\n")
+        if platform.system() == "Windows":
+            version = subprocess.check_output(
+                ["pwsh", "-NoProfile", "-Command",
+                 "& './ferrum-edge.exe' version; exit $LASTEXITCODE"],
+                cwd=binary.parent, text=True, timeout=30)
+        else:
+            version = subprocess.check_output(["./ferrum-edge", "version"],
+                                              cwd=binary.parent, text=True, timeout=30)
+            load_commands = subprocess.check_output(["otool", "-l", "ferrum-edge"],
+                                                    cwd=binary.parent, text=True, timeout=20)
+            (output / "load-commands.txt").write_text(load_commands)
+        (output / "version.txt").write_text(version)
         if not samples:
             raise ValueError("No process-tree memory samples captured")
         rows = ["# Platform release build", "", f"Target: {target}",
@@ -297,10 +323,11 @@ class Contracts(unittest.TestCase):
             self.assertEqual((output / "cargo-timing.html").read_text(), source.read_text())
 
     def test_stop_tree_terminates_an_owned_process(self):
-        options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if platform.system() == "Windows" else {"start_new_session": True}
-        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+        child = subprocess.Popen(["python", "-c", "import time; time.sleep(60)"],
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 **options)
+                                 start_new_session=platform.system() != "Windows",
+                                 creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP
+                                                if platform.system() == "Windows" else 0))
         try:
             stop_tree(child)
             self.assertIsNotNone(child.poll())

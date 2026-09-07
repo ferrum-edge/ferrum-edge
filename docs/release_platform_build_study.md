@@ -15,6 +15,10 @@ release profile, preserves Apple deployment floors and the canonical fast
 linker setup, and copies the checksum-pinned Windows protoc/NASM setup from
 the release producer. Each run starts with an empty target directory and
 compiler wrappers disabled. It does not restore or publish build caches.
+The workflow and profiler spell each platform command explicitly so the trusted
+policy can inspect every executable and target without interpreting dynamic argv
+or expanded process options. Windows termination passes only the owned numeric
+PID as data to a fixed process-tree termination command.
 A changed shipping-profile value or release-profile environment override fails
 the study rather than silently measuring different settings.
 
