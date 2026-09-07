@@ -62,14 +62,9 @@ def snapshot():
         host = {"vm_stat": subprocess.check_output(["vm_stat"], text=True, timeout=20),
                 "swap": subprocess.check_output(["sysctl", "vm.swapusage"], text=True, timeout=20)}
         return rows, host
-    raw = subprocess.check_output(["pwsh", "-NoProfile", "-Command",
-                   "$ErrorActionPreference='Stop'; "
-                   "[ordered]@{processes=@(Get-CimInstance Win32_Process | "
-                   "Select-Object ProcessId,ParentProcessId,Name,WorkingSetSize); "
-                   "memory=(Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory | "
-                   "Select-Object AvailableMBytes,CommittedBytes,CommitLimit,"
-                   "PagesInputPersec,PagesOutputPersec)} | ConvertTo-Json -Depth 4"],
-                  text=True, timeout=20)
+    raw = subprocess.check_output(
+        ["pwsh", "-NoProfile", "-File", ".github/scripts/release_platform_windows.ps1", "-Mode", "Memory"],
+        text=True, timeout=20)
     data = json.loads(raw)
     return windows_processes(data["processes"]), data["memory"]
 
@@ -119,8 +114,8 @@ def stop_tree(child):
         # The fixed PowerShell program treats the owned PID only as numeric data.
         kill_env = os.environ.copy()
         kill_env["FERRUM_STUDY_CHILD_PID"] = str(child.pid)
-        subprocess.run(["pwsh", "-NoProfile", "-Command",
-                        "taskkill /PID ([int]$env:FERRUM_STUDY_CHILD_PID) /T /F; exit $LASTEXITCODE"],
+        subprocess.run(["pwsh", "-NoProfile", "-File",
+                        ".github/scripts/release_platform_windows.ps1", "-Mode", "Stop"],
                        env=kill_env, check=False, timeout=20,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     else:
@@ -177,10 +172,9 @@ def profile_build(target, output):
     if platform.system() == "Darwin":
         provenance["cpu"] = subprocess.check_output(["sysctl", "machdep.cpu.brand_string", "hw.memsize", "hw.ncpu"], text=True, timeout=20).strip()
     else:
-        provenance["cpu"] = subprocess.check_output(["pwsh", "-NoProfile", "-Command",
-                                    "Get-CimInstance Win32_Processor | Select-Object "
-                                    "Name,NumberOfCores,NumberOfLogicalProcessors | ConvertTo-Json"],
-                                   text=True, timeout=20).strip()
+        provenance["cpu"] = subprocess.check_output(
+            ["pwsh", "-NoProfile", "-File", ".github/scripts/release_platform_windows.ps1", "-Mode", "Cpu"],
+            text=True, timeout=20).strip()
     (output / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
     start = time.monotonic()
     samples, errors, peak = 0, 0, None
@@ -266,18 +260,15 @@ def profile_build(target, output):
             raise ValueError("Successful build has no valid Cargo timing data")
         binary = target_dir / target / "release" / ("ferrum-edge.exe" if platform.system() == "Windows" else "ferrum-edge")
         result.update(binary_bytes=binary.stat().st_size, binary_sha256=digest(binary))
-        if platform.system() == "Windows":
-            version = subprocess.check_output(
-                ["pwsh", "-NoProfile", "-Command",
-                 "& './ferrum-edge.exe' version; exit $LASTEXITCODE"],
-                cwd=binary.parent, text=True, timeout=30)
-        else:
-            version = subprocess.check_output(["./ferrum-edge", "version"],
-                                              cwd=binary.parent, text=True, timeout=30)
+        # Keep generated executables outside the checkout. Explicit workflow
+        # steps perform the host smoke check after these measurements validate.
+        smoke_dir = Path(os.environ["RUNNER_TEMP"]) / "ferrum-platform-study"
+        smoke_dir.mkdir(exist_ok=True)
+        shutil.copy2(binary, smoke_dir / binary.name)
+        if platform.system() == "Darwin":
             load_commands = subprocess.check_output(["otool", "-l", "ferrum-edge"],
                                                     cwd=binary.parent, text=True, timeout=20)
             (output / "load-commands.txt").write_text(load_commands)
-        (output / "version.txt").write_text(version)
         if not samples:
             raise ValueError("No process-tree memory samples captured")
         rows = ["# Platform release build", "", f"Target: {target}",
@@ -300,6 +291,14 @@ def profile_build(target, output):
 
 
 class Contracts(unittest.TestCase):
+    @unittest.skipUnless(platform.system() in {"Darwin", "Windows"}, "native telemetry runner required")
+    def test_native_snapshot_records_the_owned_python_process(self):
+        rows, host = snapshot()
+        owned = [row for row in rows if row["pid"] == os.getpid()]
+        self.assertEqual(len(owned), 1)
+        self.assertGreater(owned[0]["rss_bytes"], 0)
+        self.assertTrue(host)
+
     def test_wrong_active_compiler_and_missing_target_are_rejected(self):
         target = "x86_64-apple-darwin"
         verify_toolchain(f"rustc metadata\nrelease: {TOOLCHAIN}", f"cargo {TOOLCHAIN} (hash)", target, target)

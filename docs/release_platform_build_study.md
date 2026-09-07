@@ -18,7 +18,8 @@ compiler wrappers disabled. It does not restore or publish build caches.
 The workflow and profiler spell each platform command explicitly so the trusted
 policy can inspect every executable and target without interpreting dynamic argv
 or expanded process options. Windows termination passes only the owned numeric
-PID as data to a fixed process-tree termination command.
+PID as data to a fixed process-tree termination command. Native Windows
+telemetry resides in a separate, directly inspected PowerShell script.
 A changed shipping-profile value or release-profile environment override fails
 the study rather than silently measuring different settings.
 
@@ -39,7 +40,10 @@ physical-memory measurements. Sampling itself has overhead. Cargo units overlap,
 codegen does not isolate LLVM optimization from linking, and build-script time
 is not exclusively native compilation. Keep those distinctions in any report.
 
-A successful build must execute the gateway's version command on the runner.
+After build evidence validates, explicit workflow steps execute the generated
+gateway's version command from RUNNER_TEMP; the full job fails if that smoke
+check fails. The profiler's validation_complete field covers build evidence,
+while version.txt and the successful smoke step establish host execution.
 macOS also records Mach-O load commands. This is a host smoke check, not proof
 of the oldest supported OS, complete ABI compatibility, installation behavior,
 or a full protocol/performance matrix. ARM64 Cross and GNU sysroot profiling
@@ -49,7 +53,10 @@ producers or their ABI gates.
 Only data/log/report extensions from study-results are uploaded. Executables
 remain in the runner's temporary target directory; no image, release asset or
 version tag is published. PR/main events execute only telemetry contracts;
-expensive platform compilation requires manual dispatch. Process sampling is
+expensive platform compilation requires manual dispatch. The eight contracts
+run on Linux, macOS and Windows before any build; native hosts also validate
+a live memory snapshot of the owned Python process (that one check skips on
+Linux). Process sampling is
 limited to the Cargo process and descendants and excludes command arguments.
 Existing Cargo timing reports are copied even when compilation fails, before
 parsing validation. Logs and samples are flushed during compilation and retained by the always-run
