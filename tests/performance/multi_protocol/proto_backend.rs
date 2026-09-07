@@ -363,6 +363,9 @@ async fn run_tcp_tls_echo(
             };
             let (mut rd, mut wr) = tokio::io::split(tls_stream);
             let _ = tokio::io::copy(&mut rd, &mut wr).await;
+            // Complete the TLS response-side shutdown after the echo drains.
+            // Dropping the stream alone omits the peer's close_notify.
+            let _ = tokio::io::AsyncWriteExt::shutdown(&mut wr).await;
         });
     }
 }
