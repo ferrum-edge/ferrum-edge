@@ -220,7 +220,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         with:
-          shared-key: "ci-ambient-host-udp-live"
+          shared-key: "ci-netns-capture-live"
 
       - name: Build live test binaries
         id: build_test_bin
