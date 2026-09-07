@@ -41,7 +41,7 @@ codegen does not isolate LLVM optimization from linking, and build-script time
 is not exclusively native compilation. Keep those distinctions in any report.
 
 After build evidence validates, explicit workflow steps execute the generated
-gateway's version command from RUNNER_TEMP; the full job fails if that smoke
+gateway's version command from RUNNER_TEMP using the hosted Bash shell; the full job fails if that smoke
 check fails. The profiler's validation_complete field covers build evidence,
 while version.txt and the successful smoke step establish host execution.
 macOS also records Mach-O load commands. This is a host smoke check, not proof

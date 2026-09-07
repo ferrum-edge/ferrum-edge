@@ -153,11 +153,8 @@ jobs:
       - name: Verify the generated gateway on Windows
         if: runner.os == 'Windows'
         timeout-minutes: 2
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          & "$env:RUNNER_TEMP/ferrum-platform-study/ferrum-edge.exe" version > study-results/version.txt
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        shell: bash
+        run: '"$RUNNER_TEMP/ferrum-platform-study/ferrum-edge.exe" version > study-results/version.txt'
       - name: Upload data-only build evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
