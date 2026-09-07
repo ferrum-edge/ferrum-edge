@@ -143,3 +143,24 @@ traffic into `corpus/`.
 
 Production `rust-toolchain.toml` remains `stable`; fuzz dependencies stay isolated
 in the `fuzz/` crate per `docs/dependency-policy.md`.
+
+## Compile-time resource observations (#4694)
+
+The existing main/manual sanitizer smoke step emits `Fuzz build resources:`
+JSON records during compilation and its unchanged seven-target run. Samples
+are spaced 30 seconds apart, capped at 240 records and two hours, and written
+directly to the hosted log so runner loss does not depend on artifact cleanup.
+The observer stops with the owning shell and preserves its original exit code.
+
+Records contain host available memory/swap, swap page counters, root cgroup
+memory limits/events when exposed, and an RSS summary of at most 1,024 visible
+processes. No process arguments, environment, request bytes or corpus data are
+read or logged. Missing kernel counters are reported as null. RSS sums double
+count shared pages, sampled maxima are not exact peaks, and root cgroup counters
+may include other runner processes; none alone proves that rustc exhausted
+memory. Compare the final samples and cgroup OOM counters with the runner's
+termination annotation before attributing a shutdown to resource pressure.
+
+This is diagnostic only: compiler/profile/cache settings, AddressSanitizer,
+all seven targets and every libFuzzer bound remain unchanged. The scheduled
+longer discovery workflow is unchanged.
