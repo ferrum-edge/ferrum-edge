@@ -1,0 +1,162 @@
+name: Release Profile Study
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/release-profile-study.yml
+      - .github/scripts/verify_release_profile_study.py
+      - tests/performance/multi_protocol/**
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/release-profile-study.yml
+      - .github/scripts/verify_release_profile_study.py
+      - tests/performance/multi_protocol/**
+
+permissions:
+  contents: read
+
+jobs:
+  validation:
+    name: Release study evidence verifier
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - run: python3 .github/scripts/verify_release_profile_study.py --self-test
+
+  tcp-admission:
+    name: TCP benchmark admission contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Check protocol tool formatting
+        run: cargo fmt --manifest-path tests/performance/multi_protocol/Cargo.toml -- --check
+      - name: Install native protocol test dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources \
+            -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 -o Acquire::Retries=3
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libssl-dev
+      - name: Verify admission and shutdown races without timing sleeps
+        run: cargo test --manifest-path tests/performance/multi_protocol/Cargo.toml --locked --bin proto_bench tcp_admission_tests -- --nocapture
+
+  benchmark:
+    name: Paired native Linux release profiles
+    if: github.event_name == 'workflow_dispatch'
+    needs: [validation, tcp-admission]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - uses: ./.github/actions/setup-fast-linker
+      - name: Install benchmark dependencies and memory headroom
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev lsof
+          sudo fallocate -l 12G /mnt/ferrum-release-study-swap
+          sudo chmod 600 /mnt/ferrum-release-study-swap
+          sudo mkswap /mnt/ferrum-release-study-swap
+          sudo swapon /mnt/ferrum-release-study-swap
+      - name: Compile both profiles on the same host
+        env:
+          RUSTC_WRAPPER: ""
+          CARGO_BUILD_RUSTC_WRAPPER: ""
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark-results target/release
+          {
+            git rev-parse HEAD
+            rustc -Vv
+            cargo -V
+            lscpu
+            free -k
+            printf 'Native Linux study; fixed fat-then-thin compilation order; no shipping ABI claim.\n'
+          } > benchmark-results/provenance.txt
+          for profile in fat thin; do
+            target_dir="$(mktemp -d "$RUNNER_TEMP/release-study.XXXXXX")"
+            export CARGO_TARGET_DIR="$target_dir"
+            export CARGO_PROFILE_RELEASE_LTO="$profile"
+            if [ "$profile" = fat ]; then
+              export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+            else
+              export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+            fi
+            evidence="benchmark-results/$profile"
+            mkdir -p "$evidence"
+            vmstat 5 > "$evidence/vmstat.txt" &
+            study_sampler_pid=$!
+            trap 'kill "$study_sampler_pid" 2>/dev/null || true; wait "$study_sampler_pid" || true' EXIT
+            /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' \
+              --output="$evidence/gateway.time" \
+              cargo build --release --features cloud-secrets --bin ferrum-edge --locked --timings \
+              2>&1 | tee "$evidence/gateway.log"
+            kill "$study_sampler_pid"
+            wait "$study_sampler_pid" || true
+            trap - EXIT
+            cp "$target_dir/cargo-timings/cargo-timing.html" "$evidence/"
+            cp "$target_dir/release/ferrum-edge" "$RUNNER_TEMP/ferrum-edge-$profile"
+            sha256sum "$RUNNER_TEMP/ferrum-edge-$profile" > "$evidence/gateway.sha256"
+            stat -c '%s' "$RUNNER_TEMP/ferrum-edge-$profile" > "$evidence/gateway-bytes.txt"
+            # This directory was created above for this single compilation.
+            # Keep the binary/evidence, free intermediates before the next build.
+            rm -rf "$target_dir"
+          done
+      - name: Build common benchmark tools
+        working-directory: tests/performance/multi_protocol
+        env:
+          RUSTC_WRAPPER: ""
+          CARGO_BUILD_RUSTC_WRAPPER: ""
+        run: cargo build --release --locked
+      - name: Run three interleaved pairs of all ten protocols
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+          for round in 1 2 3; do
+            profiles="fat thin"
+            if [ "$round" = 2 ]; then profiles="thin fat"; fi
+            for profile in $profiles; do
+              cp "$RUNNER_TEMP/ferrum-edge-$profile" target/release/ferrum-edge
+              sha256sum target/release/ferrum-edge > "benchmark-results/$profile/round-$round.sha256"
+              target/release/ferrum-edge version > "benchmark-results/$profile/round-$round.version"
+              vmstat 1 3 > "benchmark-results/$profile/round-$round.vmstat"
+              set +e
+              bash tests/performance/multi_protocol/run_protocol_test.sh all \
+                --skip-build --duration 5 --concurrency 100 --payload-size 10240 --json \
+                2>&1 | tee "benchmark-results/$profile/round-$round.log"
+              study_round_status=$?
+              set -e
+              cp tests/performance/multi_protocol/backend.log "benchmark-results/$profile/round-$round.backend.log"
+              if [ "$study_round_status" -ne 0 ]; then exit "$study_round_status"; fi
+            done
+          done
+      - name: Validate complete samples and summarize paired measurements
+        if: always()
+        run: python3 .github/scripts/verify_release_profile_study.py benchmark-results
+      - name: Upload study evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: paired-release-study-${{ github.sha }}
+          path: benchmark-results/
+          retention-days: 7

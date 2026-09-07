@@ -6269,7 +6269,11 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         with:
-          shared-key: "ci-two-cluster-mesh-live"
+          # Same default-feature/profile dependency graph as netns-capture-live.
+          # That job also builds the functional target; either completed archive
+          # supplies this lane's dependencies. Cargo still builds this checkout's
+          # workspace binaries and every live assertion runs independently.
+          shared-key: "ci-netns-capture-live"
 
       - name: Install pinned SPIRE server and agent
         env:

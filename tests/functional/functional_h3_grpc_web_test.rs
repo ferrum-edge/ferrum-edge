@@ -24,7 +24,7 @@ use crate::scaffolding::backends::{
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{GetOptions, Http3Client, Http3Response};
 use crate::scaffolding::harness::GatewayHarness;
-use crate::scaffolding::ports::{reserve_port, unbound_port};
+use crate::scaffolding::ports::{reserve_port, reserve_refused_tcp_port};
 
 fn grpc_frame(message: &[u8]) -> Vec<u8> {
     let mut framed = Vec::with_capacity(message.len() + 5);
@@ -525,9 +525,9 @@ async fn h3_grpc_web_without_translation_plugin_keeps_plain_backend_transport() 
     .step(TcpStep::Drop)
     .spawn()
     .expect("spawn pass-through backend");
-    let unavailable_port = unbound_port()
-        .await
-        .expect("reserve unavailable backend port");
+    // Keep the refused endpoint bound so another parallel fixture cannot
+    // receive this test's TLS connection after reusing a released port.
+    let unavailable = reserve_refused_tcp_port().expect("reserve unavailable backend port");
 
     let config = json!({
         "version": "1",
@@ -563,7 +563,7 @@ async fn h3_grpc_web_without_translation_plugin_keeps_plain_backend_transport() 
                 "listen_path": "/unavailable",
                 "backend_scheme": "https",
                 "backend_host": "127.0.0.1",
-                "backend_port": unavailable_port,
+                "backend_port": unavailable.port,
                 "strip_listen_path": true,
                 "backend_connect_timeout_ms": 500,
                 "backend_read_timeout_ms": 1000,
