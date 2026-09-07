@@ -42,8 +42,8 @@ use crate::scaffolding::matrix::{BackendKind, FrontendKind};
 // ────────────────────────────────────────────────────────────────────────────
 //
 // For every supported (frontend, backend) combination, point the
-// gateway at a backend that accepts then immediately drops every TCP
-// connection (`TcpStep::RefuseNextConnect`). The gateway must
+// gateway at a bound-but-not-listening backend port held by the matrix
+// handle. Every TCP connect receives a kernel refusal. The gateway must
 // surface the failure as 502 / UNAVAILABLE depending on the frontend.
 //
 // Generated tests (after skips):
