@@ -2516,7 +2516,7 @@ AMBIENT_HOST_UDP_LIVE_JOB = (
 
       - uses: ./.github/actions/setup-rust-ci
         with:
-          shared-key: "ci-netns-capture-live"
+          shared-key: "ci-ambient-host-udp-live"
 
       - name: Build live test binaries
         id: build_test_bin
@@ -28838,11 +28838,6 @@ pre_build = []
             "ambient-host-udp-live.yml": mutated,
         }
 
-    ambient_mutation(
-        "separate default-profile cache",
-        '          shared-key: "ci-netns-capture-live"\n',
-        '          shared-key: "ci-ambient-host-udp-live"\n',
-    )
     ambient_mutation(
         "job-level continue-on-error",
         "    runs-on: ubuntu-24.04\n    timeout-minutes: 45\n",

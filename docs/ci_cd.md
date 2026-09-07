@@ -760,7 +760,7 @@ links `ferrum-cni` (`ci-cni-lifecycle-live`), NodeWaypoint rebuilds with
 `--features cloud-secrets,ebpf` plus a nightly bpfel toolchain
 (`ci-node-waypoint-ebpf-live`). Ambient Host UDP instead shares the default
 debug-profile lib/functional dependencies with Netns and Two-Cluster through
-`ci-netns-capture-live`. Kind, kubectl, and Helm downloads used by those labs
+`ci-ambient-host-udp-live`. Kind, kubectl, and Helm downloads used by those labs
 are restored inside
 `.github/actions/setup-kubernetes-tools` under an exact key of pinned
 versions/checksums, install subset, and runner OS/arch; checksums are verified
@@ -3173,7 +3173,7 @@ its separate local-cache contract. All package and billing settings stay as-is.
 ### Shared default-profile live dependency cache (#4643)
 
 Netns Source Capture, Two-Cluster Mesh Live and Ambient host-UDP live-kernel
-use the existing `ci-netns-capture-live` key. All use `setup-rust-ci`, default
+use the existing `ci-ambient-host-udp-live` key. All use `setup-rust-ci`, default
 features, the default Cargo profile, native dependencies, workspace and
 compiler flags. Ambient pins Ubuntu 24.04; the other two use `ubuntu-latest`,
 which currently resolves to the same image family. The cache still includes
@@ -3184,22 +3184,23 @@ binaries and keeps external dependencies plus the compiler store, so any
 completed producer supplies the shared dependency archive. Cargo still checks
 source fingerprints and each job independently executes its own required tests.
 
-The 2026-09-06 main inventory held separate Netns/Two-Cluster archives of
-2,638,376,752 / 2,638,386,367 bytes. Sharing their existing namespace removes a
-duplicate roughly 2.64 GB producer without invalidating the Netns cache.
-Ambient held another 2,637,841,434-byte archive on September 7 with the same
-platform/environment and dependency-key suffixes. Its native build now uses
-the same shared namespace; its separate GHCR image cache is unaffected. The
-trusted-main-only save rule and all job triggers, budgets, commands, dependency
-edges and test assertions are unchanged. Unit, lint, feature-specific and
-archive-builder profiles keep their separate keys. Reassess this sharing if
-any job changes its build profile, features, toolchain or target layout.
+The September 7 inventory held Ambient's completed 2,637,841,434-byte archive
+while the prior Netns entry was absent. The previous Netns/Two-Cluster archive
+was 2,638,376,752 bytes, with the same platform/environment and dependency-key
+suffixes. Reusing the existing Ambient namespace avoids a cold namespace
+migration and removes another roughly 2.64 GB duplicate producer. Its separate
+GHCR image cache is unaffected. The trusted-main-only save rule and all job
+triggers, budgets, commands, dependency edges and test assertions are unchanged.
+Unit, lint, feature-specific and archive-builder profiles keep separate keys.
+Reassess this sharing if any job changes its build profile, features, toolchain
+or target layout.
 
-Hosted validation must confirm that each reader restores the shared key and
-passes its own complete live suite. Only after integration and a successful
-shared-cache read should an unused legacy Ambient archive be retired. The
-broader quota issue still requires Unit/Lint/Artifacts retention across subsequent main runs; this change alone
-is not evidence that every required cache survives.
+Hosted validation must confirm that Netns and Two-Cluster restore the Ambient
+key and pass their own complete live suites. Only after integration and a
+successful shared-cache read should an unused legacy Netns archive be retired.
+The broader quota issue still requires Unit/Lint/Artifacts retention across
+subsequent main runs; this change alone is not evidence that every required
+cache survives.
 
 ### Completed-job Rust cache saves (#4643)
 

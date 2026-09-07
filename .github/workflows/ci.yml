@@ -6137,7 +6137,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         with:
-          shared-key: "ci-netns-capture-live"
+          shared-key: "ci-ambient-host-udp-live"
 
       - name: Build and locate live test binary
         id: build_test_bin
@@ -6273,7 +6273,7 @@ jobs:
           # That job also builds the functional target; either completed archive
           # supplies this lane's dependencies. Cargo still builds this checkout's
           # workspace binaries and every live assertion runs independently.
-          shared-key: "ci-netns-capture-live"
+          shared-key: "ci-ambient-host-udp-live"
 
       - name: Install pinned SPIRE server and agent
         env:
