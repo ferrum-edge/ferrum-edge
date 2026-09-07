@@ -760,7 +760,7 @@ links `ferrum-cni` (`ci-cni-lifecycle-live`), NodeWaypoint rebuilds with
 `--features cloud-secrets,ebpf` plus a nightly bpfel toolchain
 (`ci-node-waypoint-ebpf-live`). Ambient Host UDP instead shares the default
 debug-profile lib/functional dependencies with Netns and Two-Cluster through
-`ci-ambient-host-udp-live`. Kind, kubectl, and Helm downloads used by those labs
+`ci-netns-capture-live`. Kind, kubectl, and Helm downloads used by those labs
 are restored inside
 `.github/actions/setup-kubernetes-tools` under an exact key of pinned
 versions/checksums, install subset, and runner OS/arch; checksums are verified
@@ -3173,7 +3173,7 @@ its separate local-cache contract. All package and billing settings stay as-is.
 ### Shared default-profile live dependency cache (#4643)
 
 Netns Source Capture, Two-Cluster Mesh Live and Ambient host-UDP live-kernel
-use the existing `ci-ambient-host-udp-live` key. All use `setup-rust-ci`, default
+use the existing `ci-netns-capture-live` key. All use `setup-rust-ci`, default
 features, the default Cargo profile, native dependencies, workspace and
 compiler flags. Ambient pins Ubuntu 24.04; the other two use `ubuntu-latest`,
 which currently resolves to the same image family. The cache still includes
@@ -3184,23 +3184,30 @@ binaries and keeps external dependencies plus the compiler store, so any
 completed producer supplies the shared dependency archive. Cargo still checks
 source fingerprints and each job independently executes its own required tests.
 
-The September 7 inventory held Ambient's completed 2,637,841,434-byte archive
-while the prior Netns entry was absent. The previous Netns/Two-Cluster archive
-was 2,638,376,752 bytes, with the same platform/environment and dependency-key
-suffixes. Reusing the existing Ambient namespace avoids a cold namespace
-migration and removes another roughly 2.64 GB duplicate producer. Its separate
-GHCR image cache is unaffected. The trusted-main-only save rule and all job
-triggers, budgets, commands, dependency edges and test assertions are unchanged.
-Unit, lint, feature-specific and archive-builder profiles keep separate keys.
-Reassess this sharing if any job changes its build profile, features, toolchain
-or target layout.
+The September 7 logs showed an additional key split: Ambient's environment
+hash was `c3076958`, while Netns/Two-Cluster used `08f74bf7`. The main CI
+workflow exports `CARGO_NET_RETRY=10` and `CARGO_HTTP_MULTIPLEXING=false`;
+Ambient previously relied on the same values in `.cargo/config.toml`. The
+pinned Rust cache hashes the exported variables even though these two settings
+only affect downloading. Ambient now explicitly exports the same values and
+uses the existing Netns namespace, so the complete key can match. Merely
+changing the shared-key label without matching those inputs would still
+create two archives.
 
-Hosted validation must confirm that Netns and Two-Cluster restore the Ambient
-key and pass their own complete live suites. Only after integration and a
-successful shared-cache read should an unused legacy Netns archive be retired.
-The broader quota issue still requires Unit/Lint/Artifacts retention across
-subsequent main runs; this change alone is not evidence that every required
-cache survives.
+The completed Ambient/Netns archives were 2,637,841,434 / 2,637,871,806 bytes.
+Sharing removes another roughly 2.64 GB duplicate producer. Ambient's separate
+GHCR image cache is unaffected. The trusted-main-only save rule and all job
+triggers, budgets, build commands, dependency edges and test assertions are
+unchanged. The frozen Ambient contract and regression mutations require the
+matching namespace and explicit network settings. Unit, lint, feature-specific
+and archive-builder profiles keep separate keys. Reassess this sharing if any
+job changes its build profile, features, toolchain, environment or target layout.
+
+Hosted validation must confirm Ambient restores the full Netns key and passes
+its complete live suite. Only after integration and a successful shared-cache
+read should an unused legacy Ambient archive be retired. The broader quota
+issue still requires Unit/Lint/Artifacts retention across subsequent main runs;
+this change alone is not evidence that every required cache survives.
 
 ### Completed-job Rust cache saves (#4643)
 
