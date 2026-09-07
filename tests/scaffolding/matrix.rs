@@ -83,7 +83,7 @@ use super::backends::{
 };
 use super::clients::{ClientResponse, GrpcClient, GrpcResponse, Http1Client, Http2Client};
 use super::harness::GatewayHarness;
-use super::ports::{PortReservation, reserve_port};
+use super::ports::{PortReservation, RefusedTcpPort, reserve_port, reserve_refused_tcp_port};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Kinds
@@ -327,19 +327,12 @@ impl BackendKind {
         )
     }
 
-    /// Spawn a backend of this kind that closes every accepted
-    /// connection without reading or writing. Returns the running
-    /// backend handle wrapped so the caller doesn't need to know the
-    /// concrete type.
+    /// Hold a backend port that refuses every TCP connection at the kernel.
     ///
-    /// Implementation note: we deliberately use [`TcpStep::Drop`]
-    /// (repeatable, fires on every connection) rather than
-    /// [`TcpStep::RefuseNextConnect`] — the latter is one-shot per
-    /// backend lifetime, so any pool warmup probe, capability probe,
-    /// or retry attempt could consume the single refusal and leave
-    /// later connections falling through to the (empty) remainder of
-    /// the script. `Drop` gives stable refusal semantics regardless of
-    /// how many times the gateway connects.
+    /// The socket remains bound without listening for the handle's lifetime.
+    /// Accepting then dropping a connection instead exercises post-connect
+    /// FIN/read timing and can report a read timeout rather than a refusal.
+    /// A held reservation also prevents parallel fixtures from taking the port.
     ///
     /// Panics for reserved variants.
     pub async fn spawn_refuse_connect(
@@ -347,16 +340,11 @@ impl BackendKind {
     ) -> Result<MatrixBackend, Box<dyn std::error::Error + Send + Sync>> {
         match self {
             BackendKind::H1 | BackendKind::Tcp | BackendKind::H2 | BackendKind::Grpc => {
-                // For "connection refused" semantics every HTTP-family
-                // backend collapses to "accept the TCP, then drop"
-                // — the gateway's pool sees the same observable
-                // signal regardless of upper-layer protocol.
-                let reservation = reserve_port().await?;
-                let port = reservation.port;
-                let backend = ScriptedTcpBackend::builder(reservation.into_listener())
-                    .step(TcpStep::Drop)
-                    .spawn()?;
-                Ok(MatrixBackend::new_tcp(port, backend))
+                let reservation = reserve_refused_tcp_port()?;
+                Ok(MatrixBackend {
+                    port: reservation.port,
+                    _backend: BackendHandle::Refused(reservation),
+                })
             }
             BackendKind::H3 | BackendKind::Udp => {
                 panic!(
@@ -499,19 +487,19 @@ impl MatrixResponse {
     }
 }
 
-/// Backend handle returned by the spawn helpers. Holds the running
-/// backend so the matrix scenario can drop it at the end of the test
-/// without leaking. Generic over backend type via this struct + an
-/// internal handle enum.
+/// Backend handle returned by the spawn helpers. Holds the running backend
+/// or refused-port reservation until the matrix scenario ends. Generic over
+/// backend type via this struct and an internal handle enum.
 pub struct MatrixBackend {
-    /// Port the backend is listening on.
+    /// Port owned by the listening backend or refusal reservation.
     port: u16,
-    /// The actual scripted backend (kept alive until drop).
+    /// The scripted backend or bound socket (kept alive until drop).
     _backend: BackendHandle,
 }
 
 #[allow(dead_code)]
 enum BackendHandle {
+    Refused(RefusedTcpPort),
     Tcp(ScriptedTcpBackend),
     Http1(ScriptedHttp1Backend),
     H2(ScriptedH2Backend),
@@ -795,6 +783,33 @@ macro_rules! __gateway_matrix_test_emit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn refusal_matrix_handle_keeps_connect_refused_and_port_owned() {
+        for kind in [
+            BackendKind::H1,
+            BackendKind::H2,
+            BackendKind::Grpc,
+            BackendKind::Tcp,
+        ] {
+            let backend = kind.spawn_refuse_connect().await.expect("refused backend");
+            let address = ("127.0.0.1", backend.port());
+            for _ in 0..2 {
+                let error = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    tokio::net::TcpStream::connect(address),
+                )
+                .await
+                .expect("kernel refusal must not time out")
+                .expect_err("matrix refusal must never complete a TCP handshake");
+                assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+            }
+            assert!(
+                tokio::net::TcpListener::bind(address).await.is_err(),
+                "matrix handle must retain exclusive ownership of the refused port"
+            );
+        }
+    }
 
     #[test]
     fn frontend_label_round_trip() {
