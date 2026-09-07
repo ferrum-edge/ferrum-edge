@@ -2509,6 +2509,9 @@ AMBIENT_HOST_UDP_LIVE_JOB = (
     if: needs.changes.outputs.relevant == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      CARGO_NET_RETRY: "10"
+      CARGO_HTTP_MULTIPLEXING: "false"
 
     steps:
       - name: Checkout Ferrum Edge
@@ -2516,7 +2519,7 @@ AMBIENT_HOST_UDP_LIVE_JOB = (
 
       - uses: ./.github/actions/setup-rust-ci
         with:
-          shared-key: "ci-ambient-host-udp-live"
+          shared-key: "ci-netns-capture-live"
 
       - name: Build live test binaries
         id: build_test_bin
@@ -3814,6 +3817,94 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
           set -euo pipefail
 
           sanitizer_started=$SECONDS
+          # Emit bounded, non-payload snapshots while the compiler runs. Stdout
+          # survives runner loss even when post-job artifact upload cannot run.
+          python3 -u - <<'PYRES' &
+          import json
+          import os
+          import time
+          from pathlib import Path
+
+
+          def counters(path, names=None):
+              try:
+                  text = Path(path).read_text()[:8192]
+              except (OSError, UnicodeError):
+                  return None
+              result = {}
+              for line in text.splitlines():
+                  parts = line.replace(":", " ").split()
+                  if len(parts) >= 2 and (names is None or parts[0] in names):
+                      try:
+                          result[parts[0]] = int(parts[1])
+                      except ValueError:
+                          continue
+              return result
+
+
+          def scalar(path):
+              try:
+                  value = Path(path).read_text()[:64].strip()
+                  return int(value) if value.isdecimal() else value
+              except (OSError, UnicodeError):
+                  return None
+
+
+          started = time.monotonic()
+          for sample_index in range(240):
+              rss_sum = 0
+              rss_max = 0
+              process_count = 0
+              scan_truncated = False
+              try:
+                  with os.scandir("/proc") as entries:
+                      for entry in entries:
+                          if not entry.name.isdecimal():
+                              continue
+                          if process_count == 1024:
+                              scan_truncated = True
+                              break
+                          process_count += 1
+                          values = counters(entry.path + "/status", {"VmRSS"})
+                          rss = values.get("VmRSS", 0) if values is not None else 0
+                          rss_sum += rss
+                          rss_max = max(rss_max, rss)
+              except OSError:
+                  scan_truncated = True
+              snapshot = {
+                  "sample": sample_index,
+                  "elapsed_seconds": round(time.monotonic() - started, 3),
+                  "host_memory_kib": counters("/proc/meminfo", {
+                      "MemTotal", "MemAvailable", "SwapTotal", "SwapFree", "Dirty"
+                  }),
+                  "host_swap_pages": counters("/proc/vmstat", {"pswpin", "pswpout"}),
+                  "root_cgroup_memory_current_bytes": scalar("/sys/fs/cgroup/memory.current"),
+                  "root_cgroup_memory_max": scalar("/sys/fs/cgroup/memory.max"),
+                  "root_cgroup_memory_events": counters("/sys/fs/cgroup/memory.events"),
+                  "process_count_scanned": process_count,
+                  "process_scan_truncated": scan_truncated,
+                  "process_rss_sum_kib": rss_sum,
+                  "largest_process_rss_kib": rss_max,
+              }
+              print("Fuzz build resources: " + json.dumps(snapshot, sort_keys=True), flush=True)
+              remaining = 7200.0 - (time.monotonic() - started)
+              if remaining <= 0:
+                  break
+              time.sleep(min(30.0, remaining))
+          PYRES
+          fuzz_resource_pid=$!
+          stop_fuzz_resource_observer() {
+            local original_status=$?
+            trap - EXIT
+            if ! kill -0 "$fuzz_resource_pid" 2>/dev/null; then
+              echo "::warning::fuzz resource observer ended before the sanitizer step"
+            fi
+            kill "$fuzz_resource_pid" 2>/dev/null || true
+            wait "$fuzz_resource_pid" 2>/dev/null || true
+            exit "$original_status"
+          }
+          trap stop_fuzz_resource_observer EXIT
+
           sccache_bin="${RUSTC_WRAPPER:-}"
           echo "Fuzz sanitizer lane sccache statistics before the sanitizer build:"
           if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
@@ -28838,6 +28929,16 @@ pre_build = []
             "ambient-host-udp-live.yml": mutated,
         }
 
+    ambient_mutation(
+        "separate default-profile cache",
+        '          shared-key: "ci-netns-capture-live"\n',
+        '          shared-key: "ci-ambient-host-udp-live"\n',
+    )
+    ambient_mutation(
+        "split default-profile network environment",
+        '      CARGO_NET_RETRY: "10"\n      CARGO_HTTP_MULTIPLEXING: "false"\n',
+        '',
+    )
     ambient_mutation(
         "job-level continue-on-error",
         "    runs-on: ubuntu-24.04\n    timeout-minutes: 45\n",

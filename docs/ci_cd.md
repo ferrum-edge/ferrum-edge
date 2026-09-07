@@ -758,9 +758,10 @@ Live labs that compile the same default-feature `cargo build --profile pr-build
 Lanes whose cache-affecting inputs differ keep private keys: CNI additionally
 links `ferrum-cni` (`ci-cni-lifecycle-live`), NodeWaypoint rebuilds with
 `--features cloud-secrets,ebpf` plus a nightly bpfel toolchain
-(`ci-node-waypoint-ebpf-live`), and Ambient Host UDP compiles the debug-profile
-lib/functional test binaries (`ci-ambient-host-udp-live`). Kind, kubectl, and
-Helm downloads used by those labs are restored inside
+(`ci-node-waypoint-ebpf-live`). Ambient Host UDP instead shares the default
+debug-profile lib/functional dependencies with Netns and Two-Cluster through
+`ci-netns-capture-live`. Kind, kubectl, and Helm downloads used by those labs
+are restored inside
 `.github/actions/setup-kubernetes-tools` under an exact key of pinned
 versions/checksums, install subset, and runner OS/arch; checksums are verified
 after both restore and download. That compile-cache and tool-download sharing
@@ -3171,27 +3172,42 @@ its separate local-cache contract. All package and billing settings stay as-is.
 
 ### Shared default-profile live dependency cache (#4643)
 
-Netns Source Capture and Two-Cluster Mesh Live use the existing
-`ci-netns-capture-live` key. Both run on the same Linux runner/toolchain setup,
-with the same default features, Cargo profile, native dependencies, workspace
-and compiler flags. Both build the gateway and `functional_tests`; Netns also
-builds the inline library tests. The pinned Rust cache removes workspace
-binaries and keeps external dependencies plus the compiler store, so either
+Netns Source Capture, Two-Cluster Mesh Live and Ambient host-UDP live-kernel
+use the existing `ci-netns-capture-live` key. All use `setup-rust-ci`, default
+features, the default Cargo profile, native dependencies, workspace and
+compiler flags. Ambient pins Ubuntu 24.04; the other two use `ubuntu-latest`,
+which currently resolves to the same image family. The cache still includes
+its platform/toolchain/environment hash, and Cargo checks build fingerprints.
+All three build the gateway and `functional_tests`; Netns and Ambient also
+build the inline library tests. The pinned Rust cache removes workspace
+binaries and keeps external dependencies plus the compiler store, so any
 completed producer supplies the shared dependency archive. Cargo still checks
 source fingerprints and each job independently executes its own required tests.
 
-The 2026-09-06 main inventory held separate Netns/Two-Cluster archives of
-2,638,376,752 / 2,638,386,367 bytes. Sharing their existing namespace removes a
-duplicate roughly 2.64 GB producer without invalidating the Netns cache. The
-trusted-main-only save rule and all job triggers, budgets, commands, dependency
-edges and test assertions are unchanged. Unit, lint, feature-specific and
-archive-builder profiles keep their separate keys. Reassess this pairing if
-either job changes its build profile, features, toolchain or target layout.
+The September 7 logs showed an additional key split: Ambient's environment
+hash was `c3076958`, while Netns/Two-Cluster used `08f74bf7`. The main CI
+workflow exports `CARGO_NET_RETRY=10` and `CARGO_HTTP_MULTIPLEXING=false`;
+Ambient previously relied on the same values in `.cargo/config.toml`. The
+pinned Rust cache hashes the exported variables even though these two settings
+only affect downloading. Ambient now explicitly exports the same values and
+uses the existing Netns namespace, so the complete key can match. Merely
+changing the shared-key label without matching those inputs would still
+create two archives.
 
-Hosted validation must confirm the Two-Cluster reader restores the Netns key
-and passes its complete live suite. The broader quota issue still requires
-Unit/Lint/Artifacts retention across subsequent main runs; this change alone
-is not evidence that every required cache survives.
+The completed Ambient/Netns archives were 2,637,841,434 / 2,637,871,806 bytes.
+Sharing removes another roughly 2.64 GB duplicate producer. Ambient's separate
+GHCR image cache is unaffected. The trusted-main-only save rule and all job
+triggers, budgets, build commands, dependency edges and test assertions are
+unchanged. The frozen Ambient contract and regression mutations require the
+matching namespace and explicit network settings. Unit, lint, feature-specific
+and archive-builder profiles keep separate keys. Reassess this sharing if any
+job changes its build profile, features, toolchain, environment or target layout.
+
+Hosted validation must confirm Ambient restores the full Netns key and passes
+its complete live suite. Only after integration and a successful shared-cache
+read should an unused legacy Ambient archive be retired. The broader quota
+issue still requires Unit/Lint/Artifacts retention across subsequent main runs;
+this change alone is not evidence that every required cache survives.
 
 ### Completed-job Rust cache saves (#4643)
 

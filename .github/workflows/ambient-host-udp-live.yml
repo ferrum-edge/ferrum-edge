@@ -213,6 +213,9 @@ jobs:
     if: needs.changes.outputs.relevant == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      CARGO_NET_RETRY: "10"
+      CARGO_HTTP_MULTIPLEXING: "false"
 
     steps:
       - name: Checkout Ferrum Edge
@@ -220,7 +223,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         with:
-          shared-key: "ci-ambient-host-udp-live"
+          shared-key: "ci-netns-capture-live"
 
       - name: Build live test binaries
         id: build_test_bin
