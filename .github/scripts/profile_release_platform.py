@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""Nonpublishing release-build telemetry; run only on hosted study runners."""
+
+import argparse
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import platform
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tomllib
+import unittest
+
+TARGETS = {
+    "x86_64-apple-darwin": "Darwin",
+    "aarch64-apple-darwin": "Darwin",
+    "x86_64-pc-windows-msvc": "Windows",
+}
+PROFILE = {"opt-level": 3, "lto": "fat", "codegen-units": 1,
+           "strip": True, "incremental": False, "panic": "abort"}
+
+
+def capture(command, timeout=20):
+    return subprocess.check_output(command, text=True, timeout=timeout,
+                                   stderr=subprocess.STDOUT).strip()
+
+
+def mac_processes(raw):
+    result = []
+    for line in raw.splitlines():
+        pid, parent, rss, name = line.split(None, 3)
+        result.append({"pid": int(pid), "parent": int(parent),
+                       "rss_bytes": int(rss) * 1024, "name": name})
+    return result
+
+
+def windows_processes(rows):
+    return [{"pid": int(p["ProcessId"]), "parent": int(p["ParentProcessId"]),
+             "rss_bytes": int(p["WorkingSetSize"]), "name": p["Name"]}
+            for p in rows]
+
+
+def descendants(rows, root):
+    by_pid = {row["pid"]: row for row in rows}
+    if root not in by_pid:
+        return []
+    selected = {root}
+    while True:
+        children = {p["pid"] for p in rows if p["parent"] in selected}
+        expanded = selected | children
+        if expanded == selected:
+            return [by_pid[pid] for pid in sorted(selected)]
+        selected = expanded
+
+
+def snapshot():
+    if platform.system() == "Darwin":
+        rows = mac_processes(capture(["ps", "-axo", "pid=,ppid=,rss=,comm="]))
+        host = {"vm_stat": capture(["vm_stat"]),
+                "swap": capture(["sysctl", "vm.swapusage"])}
+        return rows, host
+    raw = capture(["pwsh", "-NoProfile", "-Command",
+                   "$ErrorActionPreference='Stop'; "
+                   "[ordered]@{processes=@(Get-CimInstance Win32_Process | "
+                   "Select-Object ProcessId,ParentProcessId,Name,WorkingSetSize); "
+                   "memory=(Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory | "
+                   "Select-Object AvailableMBytes,CommittedBytes,CommitLimit,"
+                   "PagesInputPersec,PagesOutputPersec)} | ConvertTo-Json -Depth 4"])
+    data = json.loads(raw)
+    return windows_processes(data["processes"]), data["memory"]
+
+
+def timing_units(html):
+    marker = "const UNIT_DATA = "
+    if marker not in html:
+        raise ValueError("Cargo unit timing data missing")
+    units, _ = json.JSONDecoder().raw_decode(html.split(marker, 1)[1])
+    if not isinstance(units, list) or not units:
+        raise ValueError("Cargo unit timing list empty")
+    for unit in units:
+        for key in ("start", "duration"):
+            value = unit[key]
+            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                raise ValueError("Invalid Cargo unit time")
+        for _, section in unit.get("sections") or []:
+            start, end = section["start"], section["end"]
+            if not (math.isfinite(start) and math.isfinite(end)
+                    and 0 <= start <= end <= unit["duration"] + 0.02):
+                raise ValueError("Invalid Cargo unit section")
+    return units
+
+
+def stop_tree(child):
+    if child.poll() is not None:
+        return
+    if platform.system() == "Windows":
+        subprocess.run(["taskkill", "/PID", str(child.pid), "/T", "/F"],
+                       check=False, timeout=20, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+    else:
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    child.wait(timeout=20)
+
+
+def digest(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def profile_build(target, output):
+    if platform.system() != TARGETS[target]:
+        raise ValueError("Study target does not match this runner OS")
+    manifest = tomllib.loads(Path("Cargo.toml").read_text())
+    if any(manifest["profile"]["release"].get(k) != v for k, v in PROFILE.items()):
+        raise ValueError("Shipping profile differs from the measured baseline")
+    if any(k.startswith("CARGO_PROFILE_RELEASE_") for k in os.environ):
+        raise ValueError("Release profile environment overrides are not permitted")
+    output.mkdir(parents=True, exist_ok=True)
+    target_dir = Path(tempfile.mkdtemp(prefix="release-platform-", dir=os.environ["RUNNER_TEMP"]))
+    env = os.environ.copy()
+    env.update(CARGO_TARGET_DIR=str(target_dir), RUSTC_WRAPPER="",
+               CARGO_BUILD_RUSTC_WRAPPER="")
+    command = ["cargo", "build", "--release", "--features", "cloud-secrets",
+               "--target", target, "--locked", "--timings"]
+    provenance = {
+        "sha": capture(["git", "rev-parse", "HEAD"]),
+        "rust": capture(["rustc", "-Vv"]), "cargo": capture(["cargo", "-V"]),
+        "platform": platform.platform(), "machine": platform.machine(),
+        "target": target, "command": command, "profile": manifest["profile"]["release"],
+        "cargo_config_sha256": digest(Path(".cargo/config.toml")),
+        "deployment_target": os.environ.get("MACOSX_DEPLOYMENT_TARGET"),
+        "rustflags": os.environ.get("RUSTFLAGS"),
+        "cache": "empty target and disabled compiler wrappers; no cache publication",
+    }
+    if platform.system() == "Darwin":
+        provenance["cpu"] = capture(["sysctl", "machdep.cpu.brand_string", "hw.memsize", "hw.ncpu"])
+    else:
+        provenance["cpu"] = capture(["pwsh", "-NoProfile", "-Command",
+                                    "Get-CimInstance Win32_Processor | Select-Object "
+                                    "Name,NumberOfCores,NumberOfLogicalProcessors | ConvertTo-Json"])
+    (output / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
+    start = time.monotonic()
+    samples, errors, peak = 0, 0, None
+    result = {"build_complete": False, "validation_complete": False, "target": target}
+    try:
+        with (output / "build.log").open("wb") as log, (output / "memory.jsonl").open("w") as memory:
+            options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if platform.system() == "Windows" else {"start_new_session": True}
+            child = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT, **options)
+            finished = threading.Event()
+            completion = {}
+
+            def wait_for_build():
+                try:
+                    try:
+                        completion["exit_code"] = child.wait(timeout=150 * 60)
+                    except subprocess.TimeoutExpired:
+                        completion["timed_out"] = True
+                        stop_tree(child)
+                        completion["exit_code"] = child.wait()
+                except Exception as error:
+                    completion["observer_error"] = str(error)
+                finally:
+                    completion["wall_seconds"] = time.monotonic() - start
+                    finished.set()
+
+            waiter = threading.Thread(target=wait_for_build, daemon=True)
+            waiter.start()
+            try:
+                while not finished.is_set():
+                    elapsed = time.monotonic() - start
+                    try:
+                        rows, host = snapshot()
+                        tree = descendants(rows, child.pid)
+                        rss = sum(p["rss_bytes"] for p in tree)
+                        if tree:
+                            samples += 1
+                            peak = max(peak or 0, rss)
+                        observation = {"elapsed_seconds": elapsed, "processes": tree,
+                                       "tree_rss_bytes": rss if tree else None, "host": host}
+                    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+                        errors += 1
+                        observation = {"elapsed_seconds": elapsed, "sampling_error": str(error)}
+                    memory.write(json.dumps(observation) + "\n")
+                    memory.flush()
+                    print(f"Build elapsed={elapsed:.0f}s samples={samples} sampled_peak_rss={peak}", flush=True)
+                    finished.wait(10)
+                waiter.join(timeout=30)
+                if not finished.is_set():
+                    raise RuntimeError("Cargo completion observer did not finish")
+                if "observer_error" in completion:
+                    raise RuntimeError(completion["observer_error"])
+                result.update(exit_code=completion["exit_code"],
+                              build_wall_seconds=completion["wall_seconds"],
+                              timed_out=completion.get("timed_out", False))
+            finally:
+                stop_tree(child)
+        result.update(build_complete=True,
+                      sampled_peak_tree_rss_bytes=peak, memory_samples=samples,
+                      sampling_errors=errors)
+        if result.get("timed_out") or result["exit_code"] != 0:
+            return 124 if result.get("timed_out") else result["exit_code"]
+        timing = target_dir / "cargo-timings/cargo-timing.html"
+        shutil.copyfile(timing, output / "cargo-timing.html")
+        units = timing_units(timing.read_text())
+        (output / "units.json").write_text(json.dumps(units, indent=2) + "\n")
+        binary = target_dir / target / "release" / ("ferrum-edge.exe" if platform.system() == "Windows" else "ferrum-edge")
+        result.update(binary_bytes=binary.stat().st_size, binary_sha256=digest(binary))
+        (output / "version.txt").write_text(capture([str(binary), "version"], timeout=30) + "\n")
+        if platform.system() == "Darwin":
+            (output / "load-commands.txt").write_text(capture(["otool", "-l", str(binary)]) + "\n")
+        if not samples:
+            raise ValueError("No process-tree memory samples captured")
+        rows = ["# Platform release build", "", f"Target: {target}",
+                f"Build wall time: {result['build_wall_seconds']:.2f}s",
+                f"Sampled peak process-tree RSS: {peak} bytes", "",
+                "The ten-second samples are lower bounds on peak memory; shared pages may be counted repeatedly.",
+                "Units overlap in wall time. Codegen sections do not isolate LLVM optimization from final linking.",
+                "Build-script execution may include native builds but is not exclusively native compilation.", "",
+                "| Longest Cargo units | Target | Seconds |", "| --- | --- | ---: |"]
+        for unit in sorted(units, key=lambda u: u["duration"], reverse=True)[:20]:
+            rows.append(f"| {unit['name']} | {unit['target']} | {unit['duration']:.2f} |")
+        (output / "summary.md").write_text("\n".join(rows) + "\n")
+        result["validation_complete"] = True
+        return 0
+    finally:
+        result.update(wall_seconds=time.monotonic() - start,
+                      sampled_peak_tree_rss_bytes=peak, memory_samples=samples,
+                      sampling_errors=errors)
+        (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+
+
+class Contracts(unittest.TestCase):
+    def test_stop_tree_terminates_an_owned_process(self):
+        options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if platform.system() == "Windows" else {"start_new_session": True}
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 **options)
+        try:
+            stop_tree(child)
+            self.assertIsNotNone(child.poll())
+            self.assertNotEqual(child.returncode, 0)
+        finally:
+            stop_tree(child)
+
+    def test_tree_excludes_siblings_and_handles_out_of_order_children(self):
+        rows = mac_processes("12 11 3 compiler\n20 1 99 unrelated\n10 1 1 cargo\n11 10 2 shell")
+        tree = descendants(rows, 10)
+        self.assertEqual([r["pid"] for r in tree], [10, 11, 12])
+        self.assertEqual(sum(r["rss_bytes"] for r in tree), 6 * 1024)
+        self.assertEqual(descendants(rows, 99), [])
+
+    def test_parent_cycle_cannot_repeat_or_include_an_unrelated_process(self):
+        rows = mac_processes("10 11 1 cargo\n11 10 2 compiler\n20 1 99 unrelated")
+        self.assertEqual([r["pid"] for r in descendants(rows, 10)], [10, 11])
+
+    def test_windows_units_remain_bytes(self):
+        rows = windows_processes([{"ProcessId": 7, "ParentProcessId": 1,
+                                  "Name": "cargo.exe", "WorkingSetSize": "4096"}])
+        self.assertEqual(descendants(rows, 7)[0]["rss_bytes"], 4096)
+
+    def test_missing_and_nonfinite_timings_fail(self):
+        unit = {"start": 0, "duration": 2, "sections": [["frontend", {"start": 0, "end": 1}]]}
+        self.assertEqual(timing_units("const UNIT_DATA = " + json.dumps([unit]) + ";"), [unit])
+        for raw in ("", "const UNIT_DATA = []", 'const UNIT_DATA = [{"start":0,"duration":NaN}]',
+                    'const UNIT_DATA = [{"start":0,"duration":-1}]'):
+            with self.assertRaises(ValueError):
+                timing_units(raw)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--target", choices=TARGETS)
+    parser.add_argument("--output", type=Path, default=Path("study-results"))
+    args = parser.parse_args()
+    if args.self_test:
+        unittest.main(argv=[sys.argv[0]])
+    if not args.target:
+        parser.error("--target is required")
+    raise SystemExit(profile_build(args.target, args.output))

@@ -1,0 +1,133 @@
+name: Release Platform Build Study
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/release-platform-study.yml
+      - .github/scripts/profile_release_platform.py
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/release-platform-study.yml
+      - .github/scripts/profile_release_platform.py
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  contracts:
+    name: Platform build telemetry contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - run: python .github/scripts/profile_release_platform.py --self-test
+
+  study:
+    name: Release build study (${{ matrix.target }})
+    if: github.event_name == 'workflow_dispatch'
+    needs: contracts
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    env:
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.target == 'x86_64-apple-darwin' && '10.12' || matrix.target == 'aarch64-apple-darwin' && '11.0' || '' }}
+      RUSTC_WRAPPER: ''
+      CARGO_BUILD_RUSTC_WRAPPER: ''
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.98.1'
+          targets: ${{ matrix.target }}
+      - uses: ./.github/actions/setup-fast-linker
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+      - name: Install protoc and NASM (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $protocVersion = "35.1"
+          $protocRoot = Join-Path $env:RUNNER_TEMP "protoc-$protocVersion"
+          $protocZip = Join-Path $env:RUNNER_TEMP "protoc-$protocVersion-win64.zip"
+          Invoke-WebRequest `
+            -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$protocVersion/protoc-$protocVersion-win64.zip" `
+            -OutFile $protocZip
+          $expectedProtocSha256 = "5d3ff218d7d91eea95f7569bcb5a98f3030f8996d44151279d9772edcff76082"
+          $actualProtocSha256 = (Get-FileHash -Algorithm SHA256 $protocZip).Hash.ToLowerInvariant()
+          if ($actualProtocSha256 -ne $expectedProtocSha256) {
+            throw "protoc archive SHA-256 mismatch: expected $expectedProtocSha256, got $actualProtocSha256"
+          }
+          Expand-Archive -Path $protocZip -DestinationPath $protocRoot -Force
+          $protocBin = Join-Path $protocRoot "bin"
+          $protocExe = Join-Path $protocBin "protoc.exe"
+          if (!(Test-Path $protocExe)) {
+            throw "protoc.exe was not found after extracting $protocZip"
+          }
+          $protocBin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+          "PROTOC=$protocExe" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+
+          $nasmVersion = "3.02"
+          $nasmZip = Join-Path $env:RUNNER_TEMP "nasm-$nasmVersion-win64.zip"
+          $nasmRoot = Join-Path $env:RUNNER_TEMP "nasm"
+          Invoke-WebRequest `
+            -Uri "https://www.nasm.us/pub/nasm/releasebuilds/$nasmVersion/win64/nasm-$nasmVersion-win64.zip" `
+            -OutFile $nasmZip
+          $expectedNasmSha256 = "161d0bfaff53c2f9e9f3e69fd0672323ebabafd1268976a5cec11be92a19aee7"
+          $actualNasmSha256 = (Get-FileHash -Algorithm SHA256 $nasmZip).Hash.ToLowerInvariant()
+          if ($actualNasmSha256 -ne $expectedNasmSha256) {
+            throw "NASM archive SHA-256 mismatch: expected $expectedNasmSha256, got $actualNasmSha256"
+          }
+          Expand-Archive -Path $nasmZip -DestinationPath $nasmRoot -Force
+          $nasmBin = Join-Path $nasmRoot "nasm-$nasmVersion"
+          $nasmExe = Join-Path $nasmBin "nasm.exe"
+          if (!(Test-Path $nasmExe)) {
+            throw "nasm.exe was not found after extracting $nasmZip"
+          }
+          $nasmBin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+
+      - name: Verify telemetry parsers on this platform
+        run: python .github/scripts/profile_release_platform.py --self-test
+      - name: Measure the unchanged shipping profile
+        timeout-minutes: 165
+        run: python .github/scripts/profile_release_platform.py --target ${{ matrix.target }}
+      - name: Upload data-only build evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-platform-study-${{ matrix.target }}-${{ github.sha }}
+          path: |
+            study-results/*.json
+            study-results/*.jsonl
+            study-results/*.log
+            study-results/*.md
+            study-results/*.html
+            study-results/*.txt
+          if-no-files-found: error
+          retention-days: 7
