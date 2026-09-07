@@ -10,10 +10,10 @@ description: >-
   cache-service credential is never exported into later PR-controlled `run:`
   steps. rust-cache persists that directory together with Cargo and target
   directories using isolated shared keys so incompatible job/profile/target
-  artifacts do not mix. rust-cache saves on ordinary later-phase failures
-  (`cache-on-failure`) when post-job cleanup still executes. Abrupt runner loss
-  cannot publish that runner's unsaved state, although retries can still restore
-  an already-published warm cache.
+  artifacts do not mix. rust-cache saves only after successful jobs. Saving
+  during fetch/build cancellation can reserve an immutable key with incomplete
+  contents that later exact-hit consumers cannot enrich. Failed jobs can still
+  restore a previously completed cache; their new state is not published.
   GitHub Actions cache is a 10 GB repository quota with LRU eviction across
   every ref, so pull requests and merge groups restore this cache and do not
   save: `save-if` is true only for a trusted `refs/heads/main` run (push or
@@ -227,7 +227,7 @@ runs:
         shared-key: ${{ inputs.shared-key }}
         workspaces: ${{ inputs.workspaces }}
         cache-directories: ${{ github.workspace }}/.cache/sccache
-        cache-on-failure: "true"
+        cache-on-failure: "false"
         save-if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.fork != true }}
 
     - name: Pre-fetch crate dependencies (isolate transient registry flakes)

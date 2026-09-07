@@ -3168,3 +3168,57 @@ logs provide actual layer-reuse evidence. Telemetry records unknown hit/bytes
 for registry reads rather than claiming an Actions cache hit. A missing cache
 can still produce a correct cold build. The ordinary default image retains
 its separate local-cache contract. All package and billing settings stay as-is.
+
+### Shared default-profile live dependency cache (#4643)
+
+Netns Source Capture and Two-Cluster Mesh Live use the existing
+`ci-netns-capture-live` key. Both run on the same Linux runner/toolchain setup,
+with the same default features, Cargo profile, native dependencies, workspace
+and compiler flags. Both build the gateway and `functional_tests`; Netns also
+builds the inline library tests. The pinned Rust cache removes workspace
+binaries and keeps external dependencies plus the compiler store, so either
+completed producer supplies the shared dependency archive. Cargo still checks
+source fingerprints and each job independently executes its own required tests.
+
+The 2026-09-06 main inventory held separate Netns/Two-Cluster archives of
+2,638,376,752 / 2,638,386,367 bytes. Sharing their existing namespace removes a
+duplicate roughly 2.64 GB producer without invalidating the Netns cache. The
+trusted-main-only save rule and all job triggers, budgets, commands, dependency
+edges and test assertions are unchanged. Unit, lint, feature-specific and
+archive-builder profiles keep their separate keys. Reassess this pairing if
+either job changes its build profile, features, toolchain or target layout.
+
+Hosted validation must confirm the Two-Cluster reader restores the Netns key
+and passes its complete live suite. The broader quota issue still requires
+Unit/Lint/Artifacts retention across subsequent main runs; this change alone
+is not evidence that every required cache survives.
+
+### Completed-job Rust cache saves (#4643)
+
+Main run 34064592905 was cancelled during dependency fetching before its Istio
+job compiled anything. Its failure-save post-action published a 168,625,963-byte
+archive under the normal immutable cache key. Later exact-hit consumers cannot
+enrich that entry because the pinned cache action treats an exact hit as up to
+date. This compounds cancellation amplification and quota eviction.
+
+
+`setup-rust-ci` now sets `cache-on-failure: "false"`. The pinned cache action's
+post-step runs on job success, so cancellation during fetch or compilation
+cannot reserve a normal immutable key with an incomplete archive. Cache writes
+remain restricted to trusted main events; PRs and merge groups only restore.
+This changes the shared action only: direct cache sites, including the separate
+FIPS producer contract, retain their existing policies.
+
+A failed job no longer publishes new dependency/compiler state even if its
+compilation completed before a later test failed. It can still read a previously
+completed archive. This tradeoff prevents the observed fetch-only archive from
+remaining the exact-key baseline indefinitely. The runtime-cache verifier covers
+enabled, commented-out, expression-based and duplicate failure-save regressions.
+Hosted adoption and subsequent main reuse must be verified before treating
+#4643 as resolved; this policy does not by itself bring all archives under quota.
+
+The action's frozen trusted-base comparison requires the explicitly authorized
+reviewed policy adoption. No generation admission or ruleset change is retained.
+Known incomplete archives need separate evidence-based retirement so a subsequent
+successful main producer can populate their keys. Do not purge unrelated caches.
+Capacity stays at 10 GB and spending budgets stay at $0.
