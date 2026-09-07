@@ -7,7 +7,10 @@ x86_64 and ARM64 on macos-latest, and Windows x86_64 on windows-latest. The
 macOS x86_64 target may cross-compile on an ARM64 host; recorded host and target
 identities must be used when interpreting it.
 
-The study pins Rust 1.98.1, uses cloud-secrets and the existing fat-LTO/one-unit
+The study installs and explicitly selects Rust 1.98.1 with RUSTUP_TOOLCHAIN,
+then checks the active rustc/Cargo versions and installed target before building.
+This prevents rust-toolchain.toml from selecting an older cached stable toolchain.
+It uses cloud-secrets and the existing fat-LTO/one-unit
 release profile, preserves Apple deployment floors and the canonical fast
 linker setup, and copies the checksum-pinned Windows protoc/NASM setup from
 the release producer. Each run starts with an empty target directory and
@@ -44,7 +47,8 @@ remain in the runner's temporary target directory; no image, release asset or
 version tag is published. PR/main events execute only telemetry contracts;
 expensive platform compilation requires manual dispatch. Process sampling is
 limited to the Cargo process and descendants and excludes command arguments.
-Logs and samples are flushed during compilation and retained by the always-run
+Existing Cargo timing reports are copied even when compilation fails, before
+parsing validation. Logs and samples are flushed during compilation and retained by the always-run
 upload step when possible; an abrupt runner loss can still prevent upload.
 
 Before adopting a shipping-profile change, require an agreed runtime-regression

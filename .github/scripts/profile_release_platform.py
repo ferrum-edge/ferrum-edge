@@ -23,6 +23,7 @@ TARGETS = {
     "aarch64-apple-darwin": "Darwin",
     "x86_64-pc-windows-msvc": "Windows",
 }
+TOOLCHAIN = "1.98.1"
 PROFILE = {"opt-level": 3, "lto": "fat", "codegen-units": 1,
            "strip": True, "incremental": False, "panic": "abort"}
 
@@ -97,6 +98,24 @@ def timing_units(html):
     return units
 
 
+def verify_toolchain(rust, cargo, installed, target):
+    if f"release: {TOOLCHAIN}" not in rust.splitlines():
+        raise ValueError("Active rustc differs from the study toolchain")
+    if cargo.split()[:2] != ["cargo", TOOLCHAIN]:
+        raise ValueError("Active Cargo differs from the study toolchain")
+    if target not in installed.splitlines():
+        raise ValueError("Study target missing from the active toolchain")
+
+
+def retain_timings(source, output):
+    if not source.exists():
+        return None
+    shutil.copyfile(source, output / "cargo-timing.html")
+    units = timing_units(source.read_text())
+    (output / "units.json").write_text(json.dumps(units, indent=2) + "\n")
+    return units
+
+
 def stop_tree(child):
     if child.poll() is not None:
         return
@@ -132,6 +151,10 @@ def profile_build(target, output):
         raise ValueError("Shipping profile differs from the measured baseline")
     if any(k.startswith("CARGO_PROFILE_RELEASE_") for k in os.environ):
         raise ValueError("Release profile environment overrides are not permitted")
+    rust = capture(["rustc", "-Vv"])
+    cargo = capture(["cargo", "-V"])
+    installed = capture(["rustup", "target", "list", "--installed", "--toolchain", TOOLCHAIN])
+    verify_toolchain(rust, cargo, installed, target)
     output.mkdir(parents=True, exist_ok=True)
     target_dir = Path(tempfile.mkdtemp(prefix="release-platform-", dir=os.environ["RUNNER_TEMP"]))
     env = os.environ.copy()
@@ -141,7 +164,7 @@ def profile_build(target, output):
                "--target", target, "--locked", "--timings"]
     provenance = {
         "sha": capture(["git", "rev-parse", "HEAD"]),
-        "rust": capture(["rustc", "-Vv"]), "cargo": capture(["cargo", "-V"]),
+        "rust": rust, "cargo": cargo, "installed_targets": installed.splitlines(),
         "platform": platform.platform(), "machine": platform.machine(),
         "target": target, "command": command, "profile": manifest["profile"]["release"],
         "cargo_config_sha256": digest(Path(".cargo/config.toml")),
@@ -214,12 +237,16 @@ def profile_build(target, output):
         result.update(build_complete=True,
                       sampled_peak_tree_rss_bytes=peak, memory_samples=samples,
                       sampling_errors=errors)
+        units = None
+        try:
+            units = retain_timings(target_dir / "cargo-timings/cargo-timing.html", output)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            result["timing_error"] = str(error)
+        result["timing_report_available"] = (output / "cargo-timing.html").is_file()
         if result.get("timed_out") or result["exit_code"] != 0:
             return 124 if result.get("timed_out") else result["exit_code"]
-        timing = target_dir / "cargo-timings/cargo-timing.html"
-        shutil.copyfile(timing, output / "cargo-timing.html")
-        units = timing_units(timing.read_text())
-        (output / "units.json").write_text(json.dumps(units, indent=2) + "\n")
+        if units is None:
+            raise ValueError("Successful build has no valid Cargo timing data")
         binary = target_dir / target / "release" / ("ferrum-edge.exe" if platform.system() == "Windows" else "ferrum-edge")
         result.update(binary_bytes=binary.stat().st_size, binary_sha256=digest(binary))
         (output / "version.txt").write_text(capture([str(binary), "version"], timeout=30) + "\n")
@@ -247,6 +274,28 @@ def profile_build(target, output):
 
 
 class Contracts(unittest.TestCase):
+    def test_wrong_active_compiler_and_missing_target_are_rejected(self):
+        target = "x86_64-apple-darwin"
+        verify_toolchain(f"rustc metadata\nrelease: {TOOLCHAIN}", f"cargo {TOOLCHAIN} (hash)", target, target)
+        for rust, cargo, installed in (
+            ("release: 1.97.1", f"cargo {TOOLCHAIN}", target),
+            (f"release: {TOOLCHAIN}", "cargo 1.97.1", target),
+            (f"release: {TOOLCHAIN}", f"cargo {TOOLCHAIN}", "aarch64-apple-darwin"),
+        ):
+            with self.assertRaises(ValueError):
+                verify_toolchain(rust, cargo, installed, target)
+
+    def test_partial_timing_report_is_copied_before_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "partial.html"
+            output = root / "evidence"
+            output.mkdir()
+            source.write_text("incomplete Cargo timing report")
+            with self.assertRaises(ValueError):
+                retain_timings(source, output)
+            self.assertEqual((output / "cargo-timing.html").read_text(), source.read_text())
+
     def test_stop_tree_terminates_an_owned_process(self):
         options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if platform.system() == "Windows" else {"start_new_session": True}
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],

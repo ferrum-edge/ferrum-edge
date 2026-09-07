@@ -49,6 +49,9 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     env:
+      # Override rust-toolchain.toml's cached stable selection as well as
+      # installing this version and its target libraries below.
+      RUSTUP_TOOLCHAIN: '1.98.1'
       MACOSX_DEPLOYMENT_TARGET: ${{ matrix.target == 'x86_64-apple-darwin' && '10.12' || matrix.target == 'aarch64-apple-darwin' && '11.0' || '' }}
       RUSTC_WRAPPER: ''
       CARGO_BUILD_RUSTC_WRAPPER: ''
