@@ -15418,7 +15418,7 @@ fn emit_periodic_snapshot(
         .snapshot_emits_total
         .fetch_add(event_count as u64, Ordering::Relaxed);
     for event in events {
-        enqueue_charge_event(runtime, event);
+        enqueue_pre_spooled_charge_event(runtime, event);
     }
     invalidate_status_cache();
     Ok(event_count)
@@ -15953,9 +15953,29 @@ fn charge_event_retained_bytes(event: &ChargeEvent) -> usize {
 }
 
 fn enqueue_charge_event(runtime: &SinkRuntime, event: ChargeEvent) {
-    let accounting = PendingCharge::new(Arc::clone(&runtime.metrics));
-    // Charge the Arc allocation and lifetime bookkeeping to the existing budget.
-    let retained = charge_event_retained_bytes(&event).saturating_add(128);
+    enqueue_charge_event_with_accounting(
+        runtime,
+        event,
+        Some(PendingCharge::new(Arc::clone(&runtime.metrics))),
+    );
+}
+
+/// Queue an event whose durable ownership was established before this
+/// low-latency delivery attempt. Snapshot deltas are excluded from the
+/// per-event ledger even if this in-memory delivery is later cancelled.
+fn enqueue_pre_spooled_charge_event(runtime: &SinkRuntime, event: ChargeEvent) {
+    enqueue_charge_event_with_accounting(runtime, event, None);
+}
+
+fn enqueue_charge_event_with_accounting(
+    runtime: &SinkRuntime,
+    event: ChargeEvent,
+    accounting: Option<PendingCharge>,
+) {
+    // Charge the Arc allocation and lifetime bookkeeping only when this queue
+    // entry owns per-event accounting.
+    let accounting_retained = if accounting.is_some() { 128 } else { 0 };
+    let retained = charge_event_retained_bytes(&event).saturating_add(accounting_retained);
     if retained > MAX_CHARGE_EVENT_BYTES {
         let budget = runtime.byte_budget.as_ref();
         budget.record_drop(
@@ -15976,7 +15996,7 @@ fn enqueue_charge_event(runtime: &SinkRuntime, event: ChargeEvent) {
     match runtime.logger.try_send_outcome(QueuedChargeEvent {
         event,
         lease,
-        accounting: Some(Arc::new(accounting)),
+        accounting: accounting.map(Arc::new),
     }) {
         TrySendOutcome::ChannelAccepted | TrySendOutcome::DiversionAccepted => {
             runtime

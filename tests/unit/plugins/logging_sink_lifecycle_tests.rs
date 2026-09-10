@@ -1151,10 +1151,18 @@ async fn chargeback_snapshot_tick_racing_finalization_advances_exactly_one_path(
         .expect("start tick-first sink");
     tick_first.commit_background_tasks();
     tick_first.log(&create_test_transaction_summary()).await;
+    let accounting_before: Value =
+        serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("baseline status");
 
     assert_eq!(
         api_chargeback_sink_emit_snapshot_tick_for_test(&tick_first),
         Some(Ok(1))
+    );
+    let accounting_after: Value = serde_json::from_str(&api_chargeback_sink::render_status_json())
+        .expect("status after tick");
+    assert_eq!(
+        accounting_after["totals"]["per_event"], accounting_before["totals"]["per_event"],
+        "an already-spooled snapshot delta must not enter the per-event accounting ledger"
     );
     let tick_rows = chargeback_spool_rows(&spool_dir);
     assert_eq!(
