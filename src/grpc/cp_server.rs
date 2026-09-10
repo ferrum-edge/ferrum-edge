@@ -1942,10 +1942,14 @@ impl CpGrpcServer {
         update: ConfigUpdate,
         namespace: &str,
     ) -> bool {
-        if Self::check_message_size(&update, namespace).is_err() {
-            return false;
-        }
-        tx.send(update).is_ok()
+        let within_limit = Self::check_message_size(&update, namespace).is_ok();
+        // Existing subscribers must observe an oversized publication. Their
+        // outgoing stream guard converts it to RESOURCE_EXHAUSTED and closes
+        // the stream instead of letting heartbeats mask stale configuration.
+        // Still report the publication as rejected so registry freshness is
+        // not advanced.
+        let delivered = tx.send(update).is_ok();
+        within_limit && delivered
     }
 
     /// Encode a [`GatewayTrustPublication`] for the side channel.

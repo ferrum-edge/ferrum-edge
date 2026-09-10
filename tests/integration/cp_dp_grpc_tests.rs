@@ -7317,7 +7317,7 @@ mod configsync_size_bounds {
     }
 
     #[test]
-    fn configsync_rejected_broadcasts_log_namespace_without_reporting_delivery() {
+    fn configsync_rejected_broadcasts_disconnect_subscribers_without_reporting_delivery() {
         let config = oversized_config();
         let (server, tx) = CpGrpcServer::new(
             Arc::new(ArcSwap::from_pointee(create_test_config(1))),
@@ -7354,10 +7354,11 @@ mod configsync_size_bounds {
                 &CpScope::Single("ferrum".to_string()),
             );
         });
-        assert!(matches!(
-            rx.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
+        // The stream-level size guard turns these publications into terminal
+        // RESOURCE_EXHAUSTED errors. They must enter the channel first so an
+        // established subscriber cannot remain healthy on heartbeats alone.
+        assert!(rx.try_recv().unwrap().encoded_len() > LIMIT);
+        assert!(rx.try_recv().unwrap().encoded_len() > LIMIT);
         assert_eq!(registry.snapshot()[0].last_update_at, before);
         let logs = logs.contents();
         assert_eq!(
@@ -7370,8 +7371,8 @@ mod configsync_size_bounds {
         assert!(logs.contains(&format!("max_bytes={LIMIT}")));
         assert!(!logs.contains("configuration-canary"));
 
-        // A real receiver and a subsequent accepted publication make the
-        // negative assertion meaningful; this is not an unsubscribed channel.
+        // A subsequent accepted publication remains deliverable to a receiver
+        // that has not modeled tonic's terminal stream behavior.
         CpGrpcServer::broadcast_namespace_update(
             &broadcasts,
             "ferrum",

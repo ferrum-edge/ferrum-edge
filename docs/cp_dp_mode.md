@@ -60,8 +60,9 @@ The CP checks each namespace's snapshot, delta, unary response, and stream
 recovery before transmission. An oversized message is refused with a warning
 containing `namespace`, `encoded_bytes`, and `max_bytes`, without configuration
 contents. Initial subscription and unary retrieval return `RESOURCE_EXHAUSTED`;
-an oversized recovery terminates the stream. Rejected broadcasts do not advance
-the DP registry's last-update timestamp. DPs retain their last-known-good
+an oversized recovery or live broadcast terminates each affected stream.
+Rejected broadcasts do not advance the DP registry's last-update timestamp.
+DPs retain their last-known-good
 configuration under the existing staleness policy. Reduce the affected
 namespace's configuration below the bound to restore delivery. CP liveness alone
 does not certify that every namespace's configuration is deliverable.
