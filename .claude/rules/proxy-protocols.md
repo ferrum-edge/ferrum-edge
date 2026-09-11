@@ -135,7 +135,7 @@ paths:
 - For H3, `H3PoolError::request_on_wire()` is authoritative for `connection_error`; do not AND it with generic error-class labels.
 - Connect-phase reset/refused is a pre-wire connection failure. Mid-stream transport failures can still be capability-downgrade signals.
 - Active health is shared per upstream target. Passive health is isolated per proxy. Never merge these maps or key passive health by upstream.
-- `compute_health_bitset()` should keep O(1) map lookups and stack `u128` bitset for up to 128 targets, with Vec fallback above that.
+- `compute_health_bitset()` keeps a stack `u128` bitset for up to 128 targets, with Vec fallback above that. It must not probe the health maps per selection: active eligibility comes from the per-balancer `ActiveEligibility` snapshot keyed on `ActiveUnhealthyTargets::{id, generation}`, passive from the per-`(balancer, proxy)` `PassiveEligibility` table keyed on `PassiveUnhealthyTargets::generation()`. Every mutation of either map must go through the wrapper (`insert`/`insert_if*`/`remove*`/`retain`/`clear`/`get_mut`) so it publishes a generation bump; never call `DashMap::is_empty()`/`len()`/`iter()` on them from the request path (each locks — and `iter()` allocates for — every shard).
 
 ## Performance Guards
 

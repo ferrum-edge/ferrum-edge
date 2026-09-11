@@ -18,11 +18,11 @@
 //! per protocol.
 
 use chrono::Utc;
-use dashmap::DashMap;
 use ferrum_edge::config::types::{
     GatewayConfig, LoadBalancerAlgorithm, SubsetDefinition, Upstream, UpstreamPortOverride,
     UpstreamTarget,
 };
+use ferrum_edge::health_check::ActiveUnhealthyTargets;
 use ferrum_edge::load_balancer::{
     HealthContext, LoadBalancer, LoadBalancerCache, sticky_session_token, target_key,
 };
@@ -63,7 +63,7 @@ fn untiered(host: &str, weight: u32) -> UpstreamTarget {
     }
 }
 
-fn health_ctx(active: &DashMap<String, u64>) -> HealthContext<'_> {
+fn health_ctx(active: &ActiveUnhealthyTargets) -> HealthContext<'_> {
     HealthContext {
         active_unhealthy: active,
         proxy_passive: None,
@@ -71,7 +71,7 @@ fn health_ctx(active: &DashMap<String, u64>) -> HealthContext<'_> {
     }
 }
 
-fn mark_unhealthy(active: &DashMap<String, u64>, targets: &[UpstreamTarget], hosts: &[&str]) {
+fn mark_unhealthy(active: &ActiveUnhealthyTargets, targets: &[UpstreamTarget], hosts: &[&str]) {
     active.clear();
     for target in targets {
         if hosts.contains(&target.host.as_str()) {
@@ -116,7 +116,7 @@ fn rr(targets: &[UpstreamTarget]) -> LoadBalancer {
 fn two_healthy_tiers_select_only_priority_ten() {
     let targets = two_tier_targets();
     let lb = rr(&targets);
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
 
     assert_eq!(
         selected_hosts(&lb, Some(&health_ctx(&active)), 200),
@@ -129,7 +129,7 @@ fn two_healthy_tiers_select_only_priority_ten() {
 fn priority_twenty_becomes_selectable_only_after_every_priority_ten_peer_is_unhealthy() {
     let targets = two_tier_targets();
     let lb = rr(&targets);
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
 
     // One primary down: the surviving primary still blocks the DR tier.
     mark_unhealthy(&active, &targets, &["p1"]);
@@ -164,7 +164,7 @@ fn three_tiers_walk_down_and_back_up_one_step_at_a_time() {
         tiered("far", 1, "20"),
     ];
     let lb = rr(&targets);
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
 
     for (down, expected) in [
         (vec![], "p"),
@@ -185,7 +185,7 @@ fn three_tiers_walk_down_and_back_up_one_step_at_a_time() {
 fn every_target_unhealthy_keeps_the_existing_degraded_fallback() {
     let targets = two_tier_targets();
     let lb = rr(&targets);
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
     mark_unhealthy(&active, &targets, &["p1", "p2", "dr1", "dr2"]);
 
     let sel = lb
@@ -205,7 +205,7 @@ fn tier_selection_is_independent_of_target_order() {
         tiered("p2", 1, "10"),
     ];
     let reversed: Vec<UpstreamTarget> = forward.iter().rev().cloned().collect();
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
 
     assert_eq!(
         selected_hosts(&rr(&forward), Some(&health_ctx(&active)), 200),
@@ -222,7 +222,7 @@ fn tier_selection_is_independent_of_target_order() {
 fn priority_zero_is_a_real_tier_not_an_unset_marker() {
     let targets = vec![tiered("zero", 1, "0"), tiered("ten", 1, "10")];
     let lb = rr(&targets);
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
 
     assert_eq!(
         selected_hosts(&lb, Some(&health_ctx(&active)), 100),
@@ -243,7 +243,7 @@ fn max_priority_is_a_real_tier_and_distinguishable_from_untagged() {
     // not collide with it.
     let targets = vec![tiered("hi", 1, "10"), tiered("lowest", 1, "65535")];
     let lb = rr(&targets);
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
 
     assert_eq!(
         selected_hosts(&lb, Some(&health_ctx(&active)), 100),
@@ -266,7 +266,7 @@ fn untagged_static_targets_stay_eligible_in_every_tier() {
         untiered("static1", 1),
     ];
     let lb = rr(&targets);
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
 
     assert_eq!(
         selected_hosts(&lb, Some(&health_ctx(&active)), 200),
@@ -299,7 +299,7 @@ fn untagged_static_targets_stay_eligible_in_every_tier() {
 fn an_all_untagged_upstream_is_completely_unaffected() {
     let targets = vec![untiered("a", 1), untiered("b", 1), untiered("c", 1)];
     let lb = rr(&targets);
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
 
     assert_eq!(
         selected_hosts(&lb, Some(&health_ctx(&active)), 200),
@@ -312,7 +312,7 @@ fn an_all_untagged_upstream_is_completely_unaffected() {
 fn a_single_tier_upstream_behaves_exactly_like_an_untagged_one() {
     let targets = vec![tiered("a", 1, "10"), tiered("b", 1, "10")];
     let lb = rr(&targets);
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
 
     assert_eq!(
         selected_hosts(&lb, Some(&health_ctx(&active)), 200),
@@ -332,7 +332,7 @@ fn a_malformed_priority_tag_disables_tiering_instead_of_inventing_one() {
             tiered("forged", 1, spoof),
         ];
         let lb = rr(&targets);
-        let active = DashMap::new();
+        let active = ActiveUnhealthyTargets::new();
         assert_eq!(
             selected_hosts(&lb, Some(&health_ctx(&active)), 300),
             vec!["dr1".to_string(), "forged".to_string(), "p1".to_string()],
@@ -348,7 +348,7 @@ fn more_tiers_than_the_bound_disables_tiering() {
         .map(|i| tiered(&format!("h{i}"), 1, &(i as u16 * 10).to_string()))
         .collect();
     let lb = rr(&targets);
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
 
     assert_eq!(
         selected_hosts(&lb, Some(&health_ctx(&active)), 600).len(),
@@ -372,7 +372,7 @@ fn weighted_round_robin_respects_weights_inside_the_selected_tier_only() {
         &targets,
         None,
     );
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
     let ctx = health_ctx(&active);
 
     let mut counts: HashMap<String, usize> = HashMap::new();
@@ -408,7 +408,7 @@ fn consistent_hash_is_stable_within_the_selected_tier() {
         &targets,
         None,
     );
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
     let ctx = health_ctx(&active);
 
     let first = lb
@@ -439,7 +439,7 @@ fn least_connections_and_random_also_stay_inside_the_selected_tier() {
     ] {
         let targets = two_tier_targets();
         let lb = LoadBalancer::new(UPSTREAM, algorithm, &targets, None);
-        let active = DashMap::new();
+        let active = ActiveUnhealthyTargets::new();
         let hosts = selected_hosts(&lb, Some(&health_ctx(&active)), 300);
         assert!(
             hosts.iter().all(|h| h == "p1" || h == "p2"),
@@ -477,7 +477,7 @@ fn subset_selection_applies_the_same_tier_filter() {
         None,
         Some(&subsets),
     );
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
 
     for i in 0..100 {
         let sel = lb
@@ -509,7 +509,7 @@ fn per_port_selection_applies_the_same_tier_filter() {
         None,
         None,
     );
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
 
     // No override registered for this port: `select_for_port` delegates to
     // `select`, which is the same shared candidate filter.
@@ -529,7 +529,7 @@ fn per_port_selection_applies_the_same_tier_filter() {
 fn retry_exclusion_falls_over_within_the_tier_before_leaving_it() {
     let targets = two_tier_targets();
     let lb = rr(&targets);
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
 
     // Excluding one primary must land on the OTHER primary, not on the DR tier.
     let retry = lb
@@ -554,7 +554,7 @@ fn sticky_session_eligibility_follows_the_tier_filter() {
         &targets,
         Some("cookie:lb-affinity-fe-0123456789abcdef".to_string()),
     );
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
 
     // Resolve the DR target's sticky token through the balancer's own index by
     // selecting it while the primary tier is down.
@@ -589,7 +589,7 @@ fn vec_fallback_path_applies_the_same_tier_filter() {
         .collect();
     targets.push(tiered("dr", 1, "20"));
     let lb = rr(&targets);
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
 
     let hosts = selected_hosts(&lb, Some(&health_ctx(&active)), 600);
     assert!(
@@ -669,7 +669,7 @@ fn subset_indexed_path_filters_tiers_with_a_present_empty_health_context() {
 
     // Present health context whose active map is empty and whose passive map is
     // absent: the indexed helper's all-healthy fast return.
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
     assert!(
         active.is_empty(),
         "this test must exercise the empty-health fast return, not the ejection path"
@@ -811,7 +811,7 @@ fn per_port_indexed_path_filters_tiers_with_a_present_empty_health_context() {
     // `select_for_port` had fallen through to whole-upstream `select`. Its
     // absence below is the proof that the registered override's indexed
     // candidate-pool arm — the one being pinned here — actually ran.
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
     let mut seen: Vec<String> = Vec::new();
     for i in 0..300 {
         let sel = lb

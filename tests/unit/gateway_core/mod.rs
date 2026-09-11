@@ -89,6 +89,7 @@ mod k8s_udproute_translation_tests;
 mod k8s_watch_failure_policy_tests;
 mod ktls_handoff_tests;
 mod lazy_timeout_tests;
+mod load_balancer_eligibility_snapshot_tests;
 mod load_balancer_rr_counter_sharding_tests;
 mod load_balancer_srv_priority_tests;
 mod load_balancer_tests;
