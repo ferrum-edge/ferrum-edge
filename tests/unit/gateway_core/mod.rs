@@ -107,6 +107,7 @@ mod mesh_startup_rollback_tests;
 mod mesh_stream_lifecycle_tests;
 mod mesh_tls_reload_watch_tests;
 mod mesh_transport_error_label_tests;
+mod mesh_udp_batch_tests;
 mod mesh_udp_capture_outcome_tests;
 mod mesh_websocket_establishment_timeout_tests;
 mod metrics_tests;
