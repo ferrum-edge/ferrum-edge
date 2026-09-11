@@ -758,9 +758,9 @@ observability:
     enabled: true
     certExpiringSeconds: 604800
     # Critical alert when an SVID has less than this long until expiry.
-    # Default 3600s (1h) matches the SPIRE default workload SVID TTL — at this
-    # point rotation has almost certainly stalled.
-    svidExpiringCriticalSeconds: 3600
+    # Default 600s (10m) is comfortably below the half-life rotation point for
+    # SPIRE's default 1h workload SVID TTL.
+    svidExpiringCriticalSeconds: 600
     cpStaleConfigSeconds: 300
     policyDenyRatePerSecond: 1
     mtlsHandshakeFailureRatePerSecond: 0
