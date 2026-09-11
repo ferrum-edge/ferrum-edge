@@ -711,8 +711,11 @@ async fn reserved_publication_is_invisible_and_protects_commit_capacity() {
         "a reservation must not become listener-visible before commit"
     );
 
-    publish(&broker, "sess-reserved", 2)
-        .expect("one direct publication fits beside the promised event");
+    assert_eq!(
+        publish(&broker, "sess-reserved", 2).unwrap_err(),
+        SseError::RetentionOverflow,
+        "an assigned POST cursor serializes later publication until commit"
+    );
     let third = broker.open_stream("sess-reserved", &number_id(3)).unwrap();
     let third_payload = encode(&json!({"jsonrpc": "2.0", "id": 3, "result": {}}));
     assert_eq!(
@@ -724,9 +727,9 @@ async fn reserved_publication_is_invisible_and_protects_commit_capacity() {
     reserved
         .commit()
         .expect("a successful reservation must remain commit-capable");
-    let seen = drain_until(&mut body, &["\"id\":2", "\"id\":1"], 5).await;
-    assert!(seen.contains("\"id\":2"));
+    let seen = drain_until(&mut body, &["\"id\":1"], 5).await;
     assert!(seen.contains("\"id\":1"));
+    assert!(!seen.contains("\"id\":2"));
     assert!(!seen.contains("\"id\":3"));
 }
 

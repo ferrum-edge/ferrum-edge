@@ -663,61 +663,6 @@ impl SessionInner {
         self.last_activity = Instant::now();
         Ok(event_id)
     }
-
-    /// Retain an ALREADY-DELIVERED POST-attached event for `Last-Event-ID`
-    /// replay, and return the id it was framed under.
-    ///
-    /// The bytes have already been written to the POST that carried the
-    /// request, so this ring entry is replay history only. The event is marked
-    /// delivered and the attached listener's cursor is advanced past it, which
-    /// is what keeps a plain `GET` listener from ever receiving a response to a
-    /// request that arrived on a POST. Only an explicit resumption cursor older
-    /// than the event replays it — the one placement Streamable HTTP permits.
-    ///
-    /// Retention is best effort BY DESIGN, unlike [`Self::retain_event`]: the
-    /// client already holds these bytes, so a ring too small to keep them costs
-    /// resumability, never delivery. A refused retention advances
-    /// `evicted_through`, so a later cursor that would have needed this event
-    /// fails closed as `LastEventIdTooOld` instead of silently resuming across
-    /// a gap.
-    fn retain_delivered_event(&mut self, bounds: &AggregateSseBounds, encoded: &[u8]) -> u64 {
-        let event_id = self.last_event_id.saturating_add(1);
-        let framed = frame_sse_event(event_id, encoded);
-        self.last_event_id = event_id;
-        self.delivered_through = self.delivered_through.max(event_id);
-        if let Some(listener) = self.listener.as_mut() {
-            listener.cursor = listener.cursor.max(event_id);
-        }
-        self.last_activity = Instant::now();
-        self.trim_for_admission(
-            bounds,
-            self.reserved_events.saturating_add(1),
-            self.reserved_bytes.saturating_add(framed.len()),
-        );
-        let projected_events = self
-            .history
-            .len()
-            .saturating_add(self.reserved_events)
-            .saturating_add(1);
-        let projected_bytes = self
-            .history_bytes
-            .saturating_add(self.reserved_bytes)
-            .saturating_add(framed.len());
-        if projected_events > bounds.max_retained_events
-            || projected_bytes > bounds.max_retained_bytes
-        {
-            self.evicted_through = self.evicted_through.max(event_id);
-            return event_id;
-        }
-        self.history_bytes = self.history_bytes.saturating_add(framed.len());
-        self.history.push_back(RetainedEvent { event_id, framed });
-        // Apply the replay policy immediately: with `max_replay_events: 0` this
-        // event is history the moment the POST carried it, so it must not
-        // linger in the ring.
-        self.trim(bounds);
-        event_id
-    }
-
     /// Move an OPEN identity to a terminal phase and return its capacity.
     ///
     /// Idempotent by construction: an unknown or already-terminal identity is
@@ -855,6 +800,11 @@ impl SessionState {
                 Some(StreamPhase::Cancelled) => return Err(AggregateSseError::StreamCancelled),
                 None => return Err(AggregateSseError::UnknownStream),
             }
+            if inner.reserved_events != 0 {
+                inner.terminalize_stream(identity, StreamPhase::Completed, max_open);
+                inner.last_activity = Instant::now();
+                return Err(AggregateSseError::RetentionOverflow);
+            }
             match inner.retain_event(&self.bounds, encoded) {
                 Ok(event_id) => {
                     inner.terminalize_stream(identity, StreamPhase::Completed, max_open);
@@ -882,7 +832,7 @@ impl SessionState {
         &self,
         identity: &StreamIdentity,
         reserved_bytes: usize,
-    ) -> Result<(), AggregateSseError> {
+    ) -> Result<u64, AggregateSseError> {
         let max_open = self.bounds.max_streams_per_session;
         let mut inner = self.lock();
         if inner.closed {
@@ -894,7 +844,14 @@ impl SessionState {
             Some(StreamPhase::Cancelled) => return Err(AggregateSseError::StreamCancelled),
             None => return Err(AggregateSseError::UnknownStream),
         }
-        let incoming_events = inner.reserved_events.saturating_add(1);
+        // Keep event-id assignment and publication ordered. A concurrent
+        // response falls back to inline JSON while this very short-lived
+        // pre-commit reservation crosses policy and authorization.
+        if inner.reserved_events != 0 {
+            inner.terminalize_stream(identity, StreamPhase::Completed, max_open);
+            return Err(AggregateSseError::RetentionOverflow);
+        }
+        let incoming_events = 1;
         let incoming_bytes = inner.reserved_bytes.saturating_add(reserved_bytes);
         inner.trim_for_admission(&self.bounds, incoming_events, incoming_bytes);
         if inner.history.len().saturating_add(incoming_events) > self.bounds.max_retained_events
@@ -907,7 +864,8 @@ impl SessionState {
         inner.reserved_events = incoming_events;
         inner.reserved_bytes = incoming_bytes;
         inner.last_activity = Instant::now();
-        Ok(())
+        inner.last_event_id = inner.last_event_id.saturating_add(1);
+        Ok(inner.last_event_id)
     }
 
     /// Commit a previously reserved payload after the POST-side response has
@@ -917,11 +875,12 @@ impl SessionState {
     fn commit_reserved_terminal(
         &self,
         identity: &StreamIdentity,
+        event_id: u64,
         encoded: &[u8],
         reserved_bytes: usize,
     ) -> Result<u64, AggregateSseError> {
         let max_open = self.bounds.max_streams_per_session;
-        let (outcome, waker) = {
+        {
             let mut inner = self.lock();
             inner.reserved_events = inner.reserved_events.saturating_sub(1);
             inner.reserved_bytes = inner.reserved_bytes.saturating_sub(reserved_bytes);
@@ -934,26 +893,31 @@ impl SessionState {
                 Some(StreamPhase::Cancelled) => return Err(AggregateSseError::StreamCancelled),
                 None => return Err(AggregateSseError::UnknownStream),
             }
-            match inner.retain_event(&self.bounds, encoded) {
-                Ok(event_id) => {
-                    inner.terminalize_stream(identity, StreamPhase::Completed, max_open);
-                    let waker = inner.take_waker();
-                    (Ok(event_id), waker)
+            let framed = frame_sse_event(event_id, encoded);
+            if inner.history.len() < self.bounds.max_retained_events
+                && inner.history_bytes.saturating_add(framed.len())
+                    <= self.bounds.max_retained_bytes
+            {
+                inner.history_bytes = inner.history_bytes.saturating_add(framed.len());
+                inner.history.push_back(RetainedEvent { event_id, framed });
+                inner.delivered_through = inner.delivered_through.max(event_id);
+                if let Some(listener) = inner.listener.as_mut() {
+                    listener.cursor = listener.cursor.max(event_id);
                 }
-                Err(error) => {
-                    // This means reservation accounting drifted. Stay
-                    // fail-closed and return the identity capacity rather than
-                    // panicking on a production request path.
+                inner.trim(&self.bounds);
+                {
                     inner.terminalize_stream(identity, StreamPhase::Completed, max_open);
-                    inner.last_activity = Instant::now();
-                    (Err(error), None)
+                    Ok(event_id)
                 }
+            } else {
+                // This means reservation accounting drifted. Stay
+                // fail-closed and return the identity capacity rather than
+                // panicking on a production request path.
+                inner.terminalize_stream(identity, StreamPhase::Completed, max_open);
+                inner.last_activity = Instant::now();
+                Err(AggregateSseError::RetentionOverflow)
             }
-        };
-        if let Some(waker) = waker {
-            waker.wake();
         }
-        outcome
     }
 
     /// Release a reservation whose POST-side response was replaced or whose
@@ -1012,35 +976,6 @@ impl SessionState {
         inner.last_activity = Instant::now();
         Ok(())
     }
-
-    /// Complete an open identity because its response is being written to the
-    /// POST that carried the request, and retain that event for resumption.
-    ///
-    /// Phase check, retention, cursor advance and terminalization all happen in
-    /// ONE critical section, so a concurrent cancel or a duplicate response can
-    /// never interleave and the attached listener can never observe the event
-    /// as new work. No waker is taken: nothing became deliverable here.
-    fn deliver_on_post(
-        &self,
-        identity: &StreamIdentity,
-        encoded: &[u8],
-    ) -> Result<u64, AggregateSseError> {
-        let max_open = self.bounds.max_streams_per_session;
-        let mut inner = self.lock();
-        if inner.closed {
-            return Err(AggregateSseError::StaleSession);
-        }
-        match inner.streams.get(identity).copied() {
-            Some(StreamPhase::Open) => {}
-            Some(StreamPhase::Completed) => return Err(AggregateSseError::StreamCompleted),
-            Some(StreamPhase::Cancelled) => return Err(AggregateSseError::StreamCancelled),
-            None => return Err(AggregateSseError::UnknownStream),
-        }
-        let event_id = inner.retain_delivered_event(&self.bounds, encoded);
-        inner.terminalize_stream(identity, StreamPhase::Completed, max_open);
-        Ok(event_id)
-    }
-
     fn poll_next_frame(&self, epoch: u64, waker: &Waker) -> NextFrame {
         let mut inner = self.lock();
         if inner.closed {
@@ -1654,7 +1589,8 @@ impl AggregateSseStream {
         // width. Unrelated direct publications may advance the id before this
         // response commits; the fixed ceiling keeps that harmless.
         let reserved_bytes = encoded.len().saturating_add(SSE_FRAME_OVERHEAD_BYTES);
-        self.0
+        let event_id = self
+            .0
             .session
             .reserve_terminal(&self.0.identity, reserved_bytes)?;
         Ok(AggregateSsePublication::new(
@@ -1662,6 +1598,7 @@ impl AggregateSseStream {
             self.0.identity.clone(),
             Bytes::copy_from_slice(encoded),
             reserved_bytes,
+            event_id,
         ))
     }
 
@@ -1712,44 +1649,10 @@ impl AggregateSseStream {
     /// all; every other `Err` means the caller answers this POST with the
     /// ordinary inline JSON response instead.
     pub fn post_attached_response(&self, encoded: &[u8]) -> Result<Bytes, AggregateSseError> {
-        if self.0.settled.swap(true, Ordering::AcqRel) {
-            // A second terminal attempt on one lease is a duplicate response.
-            return Err(AggregateSseError::StreamCompleted);
-        }
-        if let Err(refusal) = self.validate_post_attached_payload(encoded) {
-            // The identity is terminal whatever happens, so release it here and
-            // report the phase in preference to the payload: a response the
-            // client already cancelled must be reported as cancelled, not as an
-            // envelope the gateway declined to frame.
-            return Err(match self.0.session.settle_open_stream(&self.0.identity) {
-                Ok(()) => refusal,
-                Err(phase) => phase,
-            });
-        }
-        let event_id = self.0.session.deliver_on_post(&self.0.identity, encoded)?;
-        Ok(frame_post_attached_response(event_id, encoded))
-    }
-
-    /// Whether these governed bytes may be framed as this identity's event.
-    fn validate_post_attached_payload(&self, encoded: &[u8]) -> Result<(), AggregateSseError> {
-        let max_event_bytes = self.0.session.bounds.max_event_bytes;
-        if encoded.len() > max_event_bytes {
-            return Err(AggregateSseError::EventTooLarge);
-        }
-        // The HTTP request and its terminal JSON-RPC body must name the same
-        // type-sensitive identity. A body naming a different id is not this
-        // request's answer, so it is never framed as one — the caller replaces
-        // it with a correlated gateway error instead.
-        if !response_matches_stream_identity(
-            encoded,
-            &self.0.identity,
-            self.0.session.bounds.max_stream_id_bytes,
-        ) {
-            return Err(AggregateSseError::ResponseEnvelopeInvalid);
-        }
-        // Only a correctly correlated response may use the inline framing
-        // fallback (for example, pretty-printed JSON containing newlines).
-        validate_event_bytes(encoded, max_event_bytes)
+        let publication = self.reserve_encoded(encoded)?;
+        let body = publication.post_attached_body();
+        publication.commit()?;
+        Ok(body)
     }
 }
 
@@ -1767,6 +1670,7 @@ struct PublicationLease {
     identity: StreamIdentity,
     encoded: Bytes,
     reserved_bytes: usize,
+    event_id: u64,
     finished: AtomicBool,
 }
 
@@ -1793,12 +1697,14 @@ impl AggregateSsePublication {
         identity: StreamIdentity,
         encoded: Bytes,
         reserved_bytes: usize,
+        event_id: u64,
     ) -> Self {
         Self(Arc::new(PublicationLease {
             session,
             identity,
             encoded,
             reserved_bytes,
+            event_id,
             finished: AtomicBool::new(false),
         }))
     }
@@ -1812,9 +1718,18 @@ impl AggregateSsePublication {
         }
         self.0.session.commit_reserved_terminal(
             &self.0.identity,
+            self.0.event_id,
             &self.0.encoded,
             self.0.reserved_bytes,
         )
+    }
+
+    pub fn post_attached_body(&self) -> Bytes {
+        frame_post_attached_response(self.0.event_id, &self.0.encoded)
+    }
+
+    pub fn matches_post_attached_body(&self, body: &[u8]) -> bool {
+        self.post_attached_body().as_ref() == body
     }
 
     /// Settle the identity without publication because final policy replaced

@@ -27237,6 +27237,37 @@ pub(crate) async fn enforce_buffered_final_client_visible_response_header_policy
     true
 }
 
+/// Re-close policy over a representation selected by a legacy final-body hook.
+pub(crate) async fn enforce_late_buffered_final_response_policy(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Bytes,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> bool {
+    if run_final_client_visible_response_body_policy(
+        plugins,
+        ctx,
+        response_status,
+        response_headers,
+        response_body,
+        InitialResponseHeaderPolicySource::Prefiltered(initial_response_header_policy_plugins),
+    )
+    .await
+    {
+        return true;
+    }
+    enforce_buffered_final_client_visible_response_header_policy(
+        plugins,
+        ctx,
+        response_status,
+        response_headers,
+        response_body,
+    )
+    .await
+}
+
 /// Run buffered response transforms under the request's absolute gRPC
 /// deadline. A transform that exhausts the deadline selects the same
 /// flavor-aware terminal response as every other buffered response phase.
@@ -38840,6 +38871,22 @@ async fn handle_proxy_request_inner(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
+    if ctx.mcp_sse_publication.is_some()
+        && let ResponseBody::Buffered(ref mut data) = response_body
+    {
+        let phase_start = Instant::now();
+        let _ = enforce_late_buffered_final_response_policy(
+            &plugins,
+            &mut ctx,
+            &mut response_status,
+            &mut response_headers,
+            data,
+            initial_response_header_policy_plugins.as_ref(),
+        )
+        .await;
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    }
+
     // Inject the sticky-session cookie before committed exporters observe the
     // final header view. This remains after every rejection/body replacement so
     // the cookie lands on the same response that will be sent downstream.
@@ -38926,6 +38973,18 @@ async fn handle_proxy_request_inner(
         // The terminal is fully buffered, so the summary and the latency
         // derivation below must not describe this as a streamed response.
         is_streaming_response = false;
+    }
+    if let Some(publication) = ctx.mcp_sse_publication.take() {
+        let accepted = response_status == 200
+            && response_headers
+                .get("content-type")
+                .is_some_and(|value| value.starts_with("text/event-stream"))
+            && matches!(&response_body, ResponseBody::Buffered(body) if publication.matches_post_attached_body(body));
+        if accepted {
+            let _ = publication.commit();
+        } else {
+            publication.abort();
+        }
     }
     // Whether the gate above could ever have fired for this request. The
     // buffered terminal-log arm below uses this to decide whether it may await

@@ -7396,6 +7396,7 @@ async fn handle_h3_request(
         response_headers
             .entry("content-type".to_string())
             .or_insert_with(|| "application/json".to_string());
+
         let status_code = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
         let resp_builder =
             apply_response_headers(Response::builder().status(status_code), &response_headers);
@@ -9461,6 +9462,23 @@ async fn handle_h3_request(
             .entry("content-type".to_string())
             .or_insert_with(|| "application/json".to_string());
 
+        if ctx.mcp_sse_publication.is_some() {
+            let phase_start = std::time::Instant::now();
+            if crate::proxy::enforce_late_buffered_final_response_policy(
+                &plugins,
+                &mut ctx,
+                &mut response_status,
+                &mut response_headers,
+                &mut response_body,
+                initial_response_header_policy_plugins.as_ref(),
+            )
+            .await
+            {
+                response_trailers = None;
+            }
+            plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        }
+
         if capabilities.has(crate::plugin_cache::PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK) {
             let phase_start = std::time::Instant::now();
             if crate::proxy::run_deadline_bounded_response_committed_hooks(
@@ -9657,12 +9675,27 @@ async fn handle_h3_request(
                 }
             }};
         }
+        let mcp_publication_accepted =
+            ctx.mcp_sse_publication.as_ref().is_some_and(|publication| {
+                response_status == 200
+                    && response_headers
+                        .get("content-type")
+                        .is_some_and(|value| value.starts_with("text/event-stream"))
+                    && publication.matches_post_attached_body(&response_body)
+            });
         let response_headers_sent = await_buffered_h3_write!(stream.send_response(resp));
         if response_headers_sent
             && !response_body.is_empty()
             && await_buffered_h3_write!(stream.send_data(response_body))
         {
             bytes_received = response_body_bytes;
+        }
+        if let Some(publication) = ctx.mcp_sse_publication.take() {
+            if mcp_publication_accepted && bytes_received == response_body_bytes {
+                let _ = publication.commit();
+            } else {
+                publication.abort();
+            }
         }
 
         // Backend trailers survive to here only when no response-body plugin

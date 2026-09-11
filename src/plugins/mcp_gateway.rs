@@ -2457,8 +2457,10 @@ impl McpGateway {
             Self::note_sse_delivery(ctx, "inline");
             return None;
         }
-        match stream.post_attached_response(body) {
-            Ok(framed) => {
+        match stream.reserve_encoded(body) {
+            Ok(publication) => {
+                let framed = publication.post_attached_body();
+                ctx.mcp_sse_publication = Some(publication);
                 Self::note_route_decision(ctx, "sse_post_stream");
                 Self::note_sse_delivery(ctx, "post_stream");
                 Some(Self::post_attached_stream_response(framed))
@@ -2504,6 +2506,9 @@ impl McpGateway {
     /// Release the request's stream identity because this POST is answering
     /// inline. Idempotent, and a no-op when no stream was opened.
     fn settle_sse_stream_inline(ctx: &mut RequestContext) {
+        if let Some(publication) = ctx.mcp_sse_publication.take() {
+            publication.abort();
+        }
         if let Some(stream) = ctx.mcp_sse_stream.take() {
             stream.settle_inline();
             Self::note_sse_delivery(ctx, "inline");
