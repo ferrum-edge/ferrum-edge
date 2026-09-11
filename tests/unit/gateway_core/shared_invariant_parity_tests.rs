@@ -351,7 +351,6 @@ fn probe_breaker_config() -> CircuitBreakerConfig {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
-        half_open_probe_dwell_seconds: None,
     }
 }
 
