@@ -2236,27 +2236,29 @@ fn rewrite_request_path(
             _ => return replacement.to_string(),
         },
     };
-    // Join `replacement` + `tail` without doubling a `/` and — outside the
-    // dot-leading case above — without synthesizing one at a boundary that had
-    // none: inserting a separator would move the request into a different path
-    // segment than the literal prefix substitution Istio `HTTPRewrite` and
-    // Envoy `prefix_rewrite` specify.
+    // Join `replacement` + `tail` without doubling a `/`. Preserve a missing
+    // boundary only when the tail opens with a complete dot segment; otherwise
+    // inserting a separator would change literal prefix-substitution semantics.
     let mut out = String::with_capacity(replacement.len() + tail.len() + 1);
     out.push_str(replacement);
     let replacement_slash = replacement.ends_with('/');
     match tail.strip_prefix('/') {
         // Both sides carry the separator — drop the duplicate.
         Some(rest) if replacement_slash => out.push_str(rest),
-        // Neither side carries it and the suffix opens a dot-leading segment:
-        // preserve the boundary so the caller's canonical check still sees a
-        // whole `.` / `..` segment instead of a fused ordinary one.
-        None if !replacement_slash && tail.starts_with('.') => {
+        // Keep a complete traversal operand visible to the caller's canonical
+        // check, without turning ordinary names such as `.env` into segments.
+        None if !replacement_slash && tail_opens_dot_segment(tail) => {
             out.push('/');
             out.push_str(tail);
         }
         _ => out.push_str(tail),
     }
     out
+}
+
+#[inline]
+fn tail_opens_dot_segment(tail: &str) -> bool {
+    tail == "." || tail == ".." || tail.starts_with("./") || tail.starts_with("../")
 }
 
 /// Re-sync the forwarded `Host` header to the original client value, undoing a
@@ -2321,11 +2323,21 @@ fn build_redirect_response(
                 None => authority.to_string(),
             },
         );
-    let path = redirect
+    let mut path = redirect
         .uri
         .as_deref()
         .map(|uri| rewrite_request_path(&ctx.path, uri, redirect.match_prefix.as_deref()))
         .unwrap_or_else(|| ctx.path.clone());
+    if redirect.uri.is_some() {
+        // Redirect URIs may carry their own query; canonicalize only the path
+        // component so query text cannot conceal a terminal dot segment.
+        let path_end = path.find('?').unwrap_or(path.len());
+        match crate::policy_path::canonicalize_policy_path(&path[..path_end]) {
+            Ok(std::borrow::Cow::Borrowed(_)) => {}
+            Ok(std::borrow::Cow::Owned(canonical)) => path.replace_range(..path_end, &canonical),
+            Err(rejection) => return crate::proxy::reject_route_override_path(rejection),
+        }
+    }
 
     // Istio/Envoy preserve the original request query string on redirect by
     // default (Envoy `RedirectAction.strip_query` defaults to `false`), unless
