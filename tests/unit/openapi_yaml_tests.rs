@@ -16385,6 +16385,11 @@ fn ai_semantic_firewall_schema_matches_runtime_admission() {
             "provider": provider,
             "builtins": {"prompt_injection": {"examples_mode": "replace"}}
         }),
+        // Disabled nested packs still validate the tuning blocks they carry.
+        json!({
+            "enabled": false,
+            "builtins": {"prompt_injection": {"enabled": false, "examples_mode": "replace"}}
+        }),
         json!({"provider": provider, "streaming": {}}),
         json!({
             "provider": provider,
