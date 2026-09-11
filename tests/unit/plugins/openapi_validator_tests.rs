@@ -3542,6 +3542,7 @@ async fn xml_scalar_shapes_are_consistent_on_requests_and_responses() {
                 ("<value><child/></value>", false),
                 ("<value label=\"sample\">text</value>", false),
                 ("<value><?note sample?>text</value>", false),
+                ("<value><?note sample?></value>", false),
             ],
         ),
         (
@@ -3554,6 +3555,10 @@ async fn xml_scalar_shapes_are_consistent_on_requests_and_responses() {
                 ("<record><count>3<child/></count></record>", false),
                 ("<record><count unit=\"items\">3</count></record>", false),
                 ("<record><count>3<!-- note -->0</count></record>", false),
+                (
+                    "<record><count>3</count><?backend mode=\"admin\"?></record>",
+                    false,
+                ),
             ],
         ),
     ] {
@@ -9687,8 +9692,8 @@ async fn xml_depth_screen_does_not_false_reject_legal_constructs() {
         // Comment and CDATA payloads that look like deep nesting.
         "<root><!-- <a><b><c> --><a>x</a></root>".to_string(),
         "<root><a><![CDATA[<b><c><d>]]></a></root>".to_string(),
-        // XML declaration plus a processing instruction.
-        r#"<?xml version="1.0"?><root><?target <a><b> ?><a>x</a></root>"#.to_string(),
+        // An XML declaration does not contribute to element nesting.
+        r#"<?xml version="1.0"?><root><a>x</a></root>"#.to_string(),
         // Self-closing elements never accumulate depth.
         self_closing,
     ];
