@@ -9,6 +9,8 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_prometheus
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{TestGateway, spawn_http_echo};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -16,7 +18,7 @@ use tokio::net::TcpListener;
 use tokio::time::sleep;
 
 async fn spawn_ai_usage_backend() -> (u16, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind AI usage backend");
     let port = listener.local_addr().expect("AI backend address").port();

@@ -68,6 +68,8 @@ pub mod scheduled_scaling;
 pub mod trusted_projected_gateway;
 pub mod workload_api_socket_paths;
 
+pub use crate::scaffolding::port_registry;
+
 pub use backend_availability::{
     IsolatedSqlDatabase, continue_if_backend_available, continue_if_tls_fixture_available,
     db_backends_required, db_tls_required, ensure_shared_sql_containers_resumed,

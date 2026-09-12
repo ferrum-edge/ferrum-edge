@@ -20,6 +20,8 @@
 //!   cargo test --test functional_tests -- --ignored \
 //!       functional_service_discovery --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::io::Write;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -111,10 +113,9 @@ async fn wait_for_owned_gateway(
 }
 
 async fn ephemeral_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
+    crate::scaffolding::ports::unbound_port()
+        .await
+        .expect("lease test port")
 }
 
 /// Retry-style gateway startup — fresh ephemeral ports per attempt, gateway
@@ -162,7 +163,7 @@ fn write_config(temp_dir: &TempDir, content: &str) -> std::path::PathBuf {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_service_discovery_dns_sd_config_parses() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_echo_server_on(echo_listener));
     sleep(Duration::from_millis(200)).await;
@@ -224,7 +225,7 @@ plugin_configs: []
 #[tokio::test(flavor = "multi_thread")]
 async fn test_service_discovery_kubernetes_config_parses() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_echo_server_on(echo_listener));
     sleep(Duration::from_millis(200)).await;
@@ -286,7 +287,7 @@ plugin_configs: []
 #[tokio::test(flavor = "multi_thread")]
 async fn test_service_discovery_consul_unreachable_does_not_crash_gateway() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_echo_server_on(echo_listener));
     sleep(Duration::from_millis(200)).await;
@@ -365,7 +366,7 @@ async fn test_service_discovery_consul_stub_routes_to_discovered_target() {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // Backend echo server on an ephemeral port.
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_echo_server_on(echo_listener));
     sleep(Duration::from_millis(200)).await;

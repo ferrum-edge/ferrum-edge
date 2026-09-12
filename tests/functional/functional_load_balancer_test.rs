@@ -8,6 +8,8 @@
 //!
 //! Run with: cargo test --test functional_load_balancer_test -- --ignored --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::HashMap;
 use std::io::Write;
 use std::time::Duration;
@@ -23,7 +25,7 @@ use tokio::time::sleep;
 /// Start an HTTP server that responds with a JSON body identifying itself.
 /// Optionally serves a health endpoint at /health with a configurable status.
 async fn start_identifying_server(port: u16, name: &'static str) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .unwrap_or_else(|_| {
             panic!(
@@ -81,7 +83,7 @@ async fn serve_identifying_listener(listener: TcpListener, name: &'static str) {
 
 /// Start an HTTP server that always responds with a specific status code (for health check testing).
 async fn start_status_server(port: u16, name: &'static str, status_code: u16) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .unwrap_or_else(|_| panic!("Failed to bind status server {} on port {}", name, port));
 
@@ -155,7 +157,7 @@ async fn start_retry_accounting_server_on(
 /// Start a server that initially returns errors then switches to healthy.
 /// Uses a shared atomic counter to track call count.
 async fn start_flapping_server(port: u16, name: &'static str, fail_count: u32) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .unwrap_or_else(|_| panic!("Failed to bind flapping server {} on port {}", name, port));
 
@@ -278,11 +280,11 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
         // Allocate fresh ephemeral ports each attempt
-        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let proxy_port = proxy_listener.local_addr().unwrap().port();
         drop(proxy_listener);
 
-        let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
 
@@ -316,7 +318,7 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
 /// Start an HTTP server that identifies itself but delays its response.
 /// This keeps connections alive long enough for least-connections to see non-zero counts.
 async fn start_slow_identifying_server(port: u16, name: &'static str, delay_ms: u64) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .unwrap_or_else(|_| {
             panic!(
@@ -1275,9 +1277,9 @@ async fn test_retry_final_status_marks_rotated_target_passively_unhealthy() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let config_path = temp_dir.path().join("config.yaml");
 
-    let initial_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let initial_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let initial_port = initial_listener.local_addr().unwrap().port();
-    let retry_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let retry_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let retry_port = retry_listener.local_addr().unwrap().port();
 
     let config = format!(
@@ -2361,11 +2363,11 @@ async fn test_active_health_check_tcp_probe() {
     // second distinct ephemeral port through gateway startup so the harness
     // cannot allocate it for another listener. Releasing that reservation
     // below gives the TCP probe a deterministic refused target.
-    let healthy_listener = TcpListener::bind("127.0.0.1:0")
+    let healthy_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("reserve healthy TCP-probe backend");
     let healthy_port = healthy_listener.local_addr().unwrap().port();
-    let unavailable_reservation = TcpListener::bind("127.0.0.1:0")
+    let unavailable_reservation = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("reserve unavailable TCP-probe target");
     let unavailable_port = unavailable_reservation.local_addr().unwrap().port();

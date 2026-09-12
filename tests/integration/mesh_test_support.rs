@@ -14,6 +14,8 @@
 //! test from local helpers to this module should be a mechanical swap.
 #![allow(dead_code)]
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -531,7 +533,7 @@ pub fn build_mesh_proxy_state(
 /// Spawn an HTTP proxy listener for the given `ProxyState`. Returns the bound
 /// address and a shutdown sender. Drops both to tear down the gateway.
 pub async fn start_mesh_gateway(state: ProxyState) -> (SocketAddr, watch::Sender<bool>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind mesh gateway");
     let addr = listener.local_addr().expect("gateway local addr");
@@ -563,7 +565,7 @@ pub async fn start_http_backend(
     responder: BackendResponder,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind http backend");
     let addr = listener.local_addr().expect("backend addr");

@@ -37,9 +37,9 @@
 //!
 //! # Process identity (issue #3428)
 //!
-//! [`ephemeral_port`] binds `127.0.0.1:0` and drops the listener, so between
-//! reservation and the child's own bind another parallel gateway can claim
-//! either port. Readiness alone cannot tell the two apart: a bare TCP accept
+//! [`ephemeral_port`] leases a port across test processes and releases the socket
+//! for the child's own bind. Unrelated OS processes can still claim the port.
+//! Readiness alone cannot tell the two apart: a bare TCP accept
 //! proves only that *some* listener answers, and an unauthenticated `/health`
 //! is served identically by every gateway on the box.
 //!
@@ -80,6 +80,8 @@
 //! Callers that pin `FERRUM_ADMIN_JWT_SECRET` / `FERRUM_METRICS_BEARER_TOKEN`
 //! (or open `FERRUM_METRICS_ALLOWED_CIDRS`) keep their explicit value; identity
 //! is then only as unique as what they chose.
+
+use super::port_registry::TestSocket;
 
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
@@ -1661,22 +1663,18 @@ fn parse_listen_addr_port(addr: &str) -> Option<u16> {
     port_str.parse().ok()
 }
 
-/// Bind an ephemeral port, then drop the listener. Not race-free — the
-/// caller must retry if the gateway binds fail. This is what the
-/// `max_attempts` loop in [`TestGatewayBuilder::spawn`] exists for.
+/// Lease a port until test-process exit, releasing its socket for a gateway.
+/// The `max_attempts` loop still covers residual collisions with OS users that
+/// do not participate in the registry.
 pub async fn ephemeral_port() -> Result<u16, std::io::Error> {
-    let l = TcpListener::bind("127.0.0.1:0").await?;
-    let port = l.local_addr()?.port();
-    drop(l);
-    Ok(port)
+    let listener = TcpListener::bind_test("127.0.0.1:0").await?;
+    Ok(listener.local_addr()?.port())
 }
 
 /// An ephemeral port kept bound until the caller hands it over.
 ///
-/// [`ephemeral_port_excluding`] frees its port the instant it returns, so
-/// every step between allocation and the child's own bind is a window in which
-/// another process on the runner can take the number. Holding the listener
-/// collapses that window to the spawn call itself.
+/// The registry lease survives socket release; holding the socket additionally
+/// excludes unrelated OS users until the child's spawn call.
 pub struct HeldEphemeralPort {
     /// The held port.
     pub port: u16,
@@ -1690,7 +1688,7 @@ pub async fn hold_ephemeral_port_excluding(
 ) -> Result<HeldEphemeralPort, std::io::Error> {
     const MAX_ATTEMPTS: u32 = 50;
     for _ in 0..MAX_ATTEMPTS {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let listener = TcpListener::bind_test("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         if excluded.contains(&port) {
             continue;
@@ -2307,11 +2305,11 @@ mod port_allocation_tests {
         let port = hold.port;
         assert!(excluded.contains(&port));
         assert!(
-            TcpListener::bind(("127.0.0.1", port)).await.is_err(),
+            TcpListener::bind_test(("127.0.0.1", port)).await.is_err(),
             "a held reservation must keep the port from being stolen"
         );
         drop(hold);
-        TcpListener::bind(("127.0.0.1", port))
+        TcpListener::bind_test(("127.0.0.1", port))
             .await
             .expect("released port must be bindable again");
     }
@@ -2349,7 +2347,7 @@ mod ownership_proof_tests {
     }
 
     async fn spawn_fake_admin(behavior: FakeAdminBehavior) -> (u16, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind fake admin");
         let port = listener.local_addr().expect("addr").port();

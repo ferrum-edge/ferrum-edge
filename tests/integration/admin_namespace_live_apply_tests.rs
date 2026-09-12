@@ -13,6 +13,8 @@
 //! must never wait, because `latest_change_sequence` is a namespace-wide `MAX`
 //! and waiting on it would block them behind an unrelated concurrent writer.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use ferrum_edge::admin::{
@@ -168,7 +170,7 @@ fn namespace_admin_state(
 async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr parses");
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
+    let listener = tokio::net::TcpListener::bind_test(addr).await.expect("bind");
     let actual = listener.local_addr().expect("local addr");
     tokio::spawn(async move {
         let _ = serve_admin_on_listener(

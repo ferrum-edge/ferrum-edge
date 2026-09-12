@@ -186,8 +186,7 @@ pub fn sample_upstream(id: &str, name: &str, backend_port: u16) -> Value {
 /// Not race-free — use the retry-with-rebind pattern for listeners the gateway
 /// itself will bind.
 pub async fn ephemeral_port() -> u16 {
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let p = l.local_addr().unwrap().port();
-    drop(l);
-    p
+    crate::scaffolding::ports::unbound_port()
+        .await
+        .expect("lease test port")
 }

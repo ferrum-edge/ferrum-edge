@@ -6,6 +6,8 @@
 //! Covers: pool construction, pool_size tracking, get_sender error paths,
 //! and live connection lifecycle against a real TLS+H2 echo backend.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use bytes::Bytes;
 use ferrum_edge::backend_conn_limit::BackendConnectionLimiter;
 use ferrum_edge::config::PoolConfig;
@@ -170,7 +172,7 @@ async fn start_h2_tls_backend_with_cert(
     cert_pem: &str,
     key_pem: &str,
 ) -> Result<(tokio::task::JoinHandle<()>, u16), Box<dyn std::error::Error>> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let handle = start_tls_backend_on(listener, cert_pem, key_pem, vec![b"h2".to_vec()]).await?;
 
@@ -248,7 +250,7 @@ struct TestDnsServer {
 
 impl TestDnsServer {
     async fn spawn(answers: Vec<IpAddr>) -> Self {
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        let socket = tokio::net::UdpSocket::bind_test("127.0.0.1:0")
             .await
             .expect("bind test DNS server");
         let addr = socket.local_addr().expect("test DNS server address");
@@ -327,7 +329,7 @@ fn report_missing_secondary_loopback(test: &str) {
 /// The first secondary IPv4 loopback address this host actually assigns.
 async fn secondary_loopback_address() -> Option<Ipv4Addr> {
     for candidate in SECONDARY_LOOPBACK_CANDIDATES {
-        if let Ok(probe) = tokio::net::TcpListener::bind((candidate, 0)).await {
+        if let Ok(probe) = tokio::net::TcpListener::bind_test((candidate, 0)).await {
             drop(probe);
             return Some(candidate);
         }
@@ -348,14 +350,14 @@ type DualLoopbackListeners = (
 async fn bind_dual_loopback_listeners() -> Option<DualLoopbackListeners> {
     let failing_ip = secondary_loopback_address().await?;
     for _ in 0..10 {
-        let healthy = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        let healthy = tokio::net::TcpListener::bind_test((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind healthy loopback listener");
         let port = healthy
             .local_addr()
             .expect("healthy loopback listener address")
             .port();
-        if let Ok(failing) = tokio::net::TcpListener::bind((failing_ip, port)).await {
+        if let Ok(failing) = tokio::net::TcpListener::bind_test((failing_ip, port)).await {
             return Some((healthy, failing, failing_ip, port));
         }
     }
@@ -875,7 +877,7 @@ async fn test_grpc_h2c_pool_fails_over_after_tcp_success_but_h2_failure() {
 
 #[tokio::test]
 async fn test_grpc_h2c_accepts_settings_with_zero_concurrent_streams() {
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+    let listener = tokio::net::TcpListener::bind_test((Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("bind scripted h2c backend");
     let port = listener
@@ -1285,7 +1287,7 @@ async fn test_http2_pool_sender_is_not_closed() {
 
 /// h2c echo backend that counts every accepted TCP connection.
 async fn start_counting_h2c_backend() -> (u16, Arc<AtomicUsize>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind h2c backend");
     let port = listener.local_addr().expect("backend addr").port();
@@ -1952,7 +1954,7 @@ async fn start_h2_tls_host_echo_backend()
 -> Result<(tokio::task::JoinHandle<()>, u16), Box<dyn std::error::Error>> {
     let cert_pem = include_str!("../certs/server.crt");
     let key_pem = include_str!("../certs/server.key");
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
 
     let mut cert_reader = cert_pem.as_bytes();
@@ -2013,7 +2015,7 @@ async fn start_h2_tls_host_echo_backend()
 async fn start_direct_h2_test_gateway(
     state: ProxyState,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind gateway");
     let gateway_addr = listener.local_addr().expect("gateway addr");

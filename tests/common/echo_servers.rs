@@ -10,6 +10,8 @@
 //! full hyper server so they compile quickly (tests/common/ is built
 //! alongside every functional test binary).
 
+use super::port_registry::TestSocket;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -106,7 +108,7 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
 /// Special path `/health` returns `{"status":"healthy"}` so the same server
 /// can double as a health-check backend.
 pub async fn spawn_http_echo() -> std::io::Result<EchoServer> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listener = TcpListener::bind_test("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let handle = tokio::spawn(async move {
         loop {
@@ -147,7 +149,7 @@ pub async fn spawn_http_echo() -> std::io::Result<EchoServer> {
 /// once", because only the second rules out a duplicate side effect.
 pub async fn spawn_http_counting_mutations()
 -> std::io::Result<(EchoServer, Arc<std::sync::atomic::AtomicU32>)> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listener = TcpListener::bind_test("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let mutations = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let counter = Arc::clone(&mutations);
@@ -187,7 +189,7 @@ pub async fn spawn_http_counting_mutations()
 /// Replies with `{"server":"<name>","path":"<path>"}`. Used by
 /// load-balancer tests to verify distribution across backends.
 pub async fn spawn_http_identifying(name: &'static str) -> std::io::Result<EchoServer> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listener = TcpListener::bind_test("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let handle = tokio::spawn(async move {
         loop {
@@ -220,7 +222,7 @@ pub async fn spawn_http_identifying(name: &'static str) -> std::io::Result<EchoS
 /// HTTP server that always responds with a specific status code.
 /// Body is `{"server":"<name>","status_code":<n>}`.
 pub async fn spawn_http_status(name: &'static str, status: u16) -> std::io::Result<EchoServer> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listener = TcpListener::bind_test("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let handle = tokio::spawn(async move {
         loop {
@@ -249,7 +251,7 @@ pub async fn spawn_http_flapping(
     name: &'static str,
     fail_count: u32,
 ) -> std::io::Result<EchoServer> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listener = TcpListener::bind_test("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let counter: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
     let handle = tokio::spawn(async move {
@@ -285,7 +287,7 @@ pub async fn spawn_http_slow_identifying(
     name: &'static str,
     delay_ms: u64,
 ) -> std::io::Result<EchoServer> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listener = TcpListener::bind_test("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let handle = tokio::spawn(async move {
         loop {
@@ -312,7 +314,7 @@ pub async fn spawn_http_slow_identifying(
 /// Raw TCP echo server — reads a chunk and writes it back unchanged. Used
 /// for TCP/TLS stream-proxy tests.
 pub async fn spawn_tcp_echo() -> std::io::Result<EchoServer> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listener = TcpListener::bind_test("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let handle = tokio::spawn(async move {
         loop {
@@ -343,7 +345,7 @@ pub async fn spawn_tcp_echo() -> std::io::Result<EchoServer> {
 /// UDP echo server — echoes each received datagram back to its sender.
 /// Used for UDP / DTLS stream-proxy tests.
 pub async fn spawn_udp_echo() -> std::io::Result<EchoServer> {
-    let socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let socket = UdpSocket::bind_test("127.0.0.1:0").await?;
     let port = socket.local_addr()?.port();
     let handle = tokio::spawn(async move {
         let mut buf = vec![0u8; 65_536];

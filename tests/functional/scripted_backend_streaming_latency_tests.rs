@@ -291,8 +291,7 @@ async fn spawn_native_h3_logging_gateway(
     let mut last_err = String::new();
     for _ in 0..5 {
         let reservation = reserve_port().await.expect("reserve https port");
-        let https_port = reservation.port;
-        drop(reservation);
+        let https_port = reservation.drop_and_take_port();
 
         let scratch = tempfile::tempdir().expect("scratch");
         let (cert_path, key_path) = write_frontend_certs(scratch.path());

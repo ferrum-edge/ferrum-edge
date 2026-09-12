@@ -5,6 +5,8 @@
 //! path still preserves unknown-length response size limiting and unlimited
 //! direct streaming behavior.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 
 use std::time::Duration;
@@ -19,7 +21,7 @@ struct TrackingHarness {
 
 impl TrackingHarness {
     async fn new(extra_env: &[(&str, &str)]) -> Self {
-        let backend_listener = TcpListener::bind("127.0.0.1:0")
+        let backend_listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind backend");
         let backend_port = backend_listener.local_addr().expect("backend addr").port();

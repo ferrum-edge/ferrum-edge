@@ -1,5 +1,7 @@
 //! Integration coverage for per-upstream backend TLS SAN allow-lists.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::sync::Arc;
 use std::sync::Once;
 
@@ -161,7 +163,7 @@ async fn start_h2_tls_backend(
     tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
 
     let handle = tokio::spawn(async move {

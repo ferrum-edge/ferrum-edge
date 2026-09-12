@@ -17,6 +17,8 @@
 //!   cargo build --bin ferrum-edge && \
 //!     cargo test --test functional_tests -- functional_mtls_acl --ignored --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 use std::io::Write;
@@ -189,7 +191,7 @@ async fn start_tcp_echo_on(listener: TcpListener) -> tokio::task::JoinHandle<()>
 }
 
 async fn start_udp_echo_server() -> (u16, tokio::task::JoinHandle<()>) {
-    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let socket = UdpSocket::bind_test("127.0.0.1:0").await.unwrap();
     let port = socket.local_addr().unwrap().port();
     let handle = tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
@@ -206,12 +208,13 @@ async fn start_udp_echo_server() -> (u16, tokio::task::JoinHandle<()>) {
 // ============================================================================
 
 async fn alloc_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    l.local_addr().unwrap().port()
+    crate::scaffolding::ports::unbound_port()
+        .await
+        .expect("lease test port")
 }
 
 async fn alloc_udp_port() -> u16 {
-    let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let s = UdpSocket::bind_test("127.0.0.1:0").await.unwrap();
     s.local_addr().unwrap().port()
 }
 
@@ -297,7 +300,7 @@ async fn test_http_mtls_auth_with_acl() {
     let server_cert = write_pem(&td, "server.crt", &server.cert_pem);
     let server_key = write_pem(&td, "server.key", &server.key_pem);
 
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let echo = start_http_echo_on(backend_listener).await;
 
@@ -480,7 +483,7 @@ async fn test_tcp_mtls_auth_with_acl() {
     let server_cert = write_pem(&td, "server.crt", &server.cert_pem);
     let server_key = write_pem(&td, "server.key", &server.key_pem);
 
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let echo = start_tcp_echo_on(backend_listener).await;
 
@@ -611,7 +614,7 @@ async fn dtls_send(
     client_cert: dimpl::DtlsCertificateChain,
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let socket = UdpSocket::bind("127.0.0.1:0")
+    let socket = UdpSocket::bind_test("127.0.0.1:0")
         .await
         .map_err(|e| format!("client udp bind: {e}"))?;
     socket

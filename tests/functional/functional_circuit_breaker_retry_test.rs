@@ -10,6 +10,8 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_circuit_breaker
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::ports::reserve_refused_tcp_port;
 use serde_json::json;
@@ -35,7 +37,9 @@ async fn start_controllable_backend(
     fail_flag: Arc<AtomicBool>,
     request_count: Arc<AtomicU32>,
 ) -> (u16, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let port = listener.local_addr().unwrap().port();
     let handle = tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
@@ -621,7 +625,9 @@ struct ProbeBackend {
 }
 
 async fn start_probe_backend() -> ProbeBackend {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let port = listener.local_addr().unwrap().port();
     let fail = Arc::new(AtomicBool::new(false));
     let delay_ms = Arc::new(AtomicU64::new(0));

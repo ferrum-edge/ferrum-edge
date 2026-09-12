@@ -1,5 +1,9 @@
 //! Integration tests for the dimpl-based DTLS module.
 
+use crate::scaffolding::ports::bind_dtls;
+
+use crate::scaffolding::port_registry::TestSocket;
+
 use ferrum_edge::config::types::Proxy;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 use std::sync::Arc;
@@ -163,7 +167,7 @@ async fn strict_dtls13_round_trip(
     server_addr: std::net::SocketAddr,
     payload: &[u8],
 ) -> Result<Vec<u8>, anyhow::Error> {
-    let socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let socket = UdpSocket::bind_test("127.0.0.1:0").await?;
     socket.connect(server_addr).await?;
 
     let config = Arc::new(
@@ -306,10 +310,14 @@ async fn test_dimpl_raw_handshake() {
     );
 
     // Bind sockets
-    let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_socket = tokio::net::UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let server_addr = server_socket.local_addr().unwrap();
 
-    let client_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_socket = tokio::net::UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     client_socket.connect(server_addr).await.unwrap();
     let _client_addr = client_socket.local_addr().unwrap();
 
@@ -528,7 +536,7 @@ async fn test_dtls_client_server_handshake_and_echo() {
     };
 
     let server = Arc::new(
-        ferrum_edge::dtls::DtlsServer::bind(server_addr, frontend_config)
+        bind_dtls(server_addr, frontend_config)
             .await
             .expect("bind server"),
     );
@@ -561,7 +569,7 @@ async fn test_dtls_client_server_handshake_and_echo() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let client_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+    let client_socket = tokio::net::UdpSocket::bind_test("127.0.0.1:0")
         .await
         .expect("bind client");
     client_socket
@@ -633,7 +641,7 @@ async fn test_dtls_pem_cert_handshake() {
 
     let server_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = Arc::new(
-        ferrum_edge::dtls::DtlsServer::bind(server_addr, frontend_config)
+        bind_dtls(server_addr, frontend_config)
             .await
             .expect("bind server"),
     );
@@ -664,7 +672,9 @@ async fn test_dtls_pem_cert_handshake() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let client_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_socket = tokio::net::UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     client_socket.connect(actual_addr).await.unwrap();
 
     let client_config = dimpl::Config::builder().build().expect("client config");
@@ -862,7 +872,7 @@ async fn test_dtls_server_transmits_intermediate_to_root_only_client() {
         ferrum_edge::dtls::build_frontend_dtls_config(&cert_path, &key_path, None, &[], None)
             .expect("build chained frontend");
     let server = Arc::new(
-        ferrum_edge::dtls::DtlsServer::bind(
+        bind_dtls(
             "127.0.0.1:0".parse().expect("server bind address"),
             frontend_config,
         )
@@ -883,7 +893,9 @@ async fn test_dtls_server_transmits_intermediate_to_root_only_client() {
         }
     });
 
-    let client_socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+    let client_socket = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind client");
     client_socket
         .connect(server_addr)
         .await
@@ -968,7 +980,7 @@ async fn test_dtls_server_accepts_strict_dtls13_client() {
     };
 
     let server = Arc::new(
-        ferrum_edge::dtls::DtlsServer::bind("127.0.0.1:0".parse().unwrap(), frontend_config)
+        bind_dtls("127.0.0.1:0".parse().unwrap(), frontend_config)
             .await
             .expect("bind server"),
     );
@@ -1021,7 +1033,7 @@ async fn test_backend_dtls_verification_rejects_hostname_mismatch() {
         ferrum_edge::dtls::build_frontend_dtls_config(&cert_path, &key_path, None, &[], None)
             .expect("build frontend config");
     let server = Arc::new(
-        ferrum_edge::dtls::DtlsServer::bind("127.0.0.1:0".parse().unwrap(), frontend_config)
+        bind_dtls("127.0.0.1:0".parse().unwrap(), frontend_config)
             .await
             .expect("bind server"),
     );
@@ -1029,7 +1041,7 @@ async fn test_backend_dtls_verification_rejects_hostname_mismatch() {
     let server_runner = server.clone();
     let run_task = tokio::spawn(async move { server_runner.run().await });
 
-    let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_socket = UdpSocket::bind_test("127.0.0.1:0").await.unwrap();
     client_socket.connect(server_addr).await.unwrap();
 
     let proxy = build_dtls_proxy("wrong.example", server_addr.port(), Some(ca_path));
@@ -1071,7 +1083,7 @@ async fn test_dtls_server_close_releases_socket() {
     };
 
     let server = Arc::new(
-        ferrum_edge::dtls::DtlsServer::bind("127.0.0.1:0".parse().unwrap(), frontend_config)
+        bind_dtls("127.0.0.1:0".parse().unwrap(), frontend_config)
             .await
             .expect("bind server"),
     );
@@ -1083,7 +1095,7 @@ async fn test_dtls_server_close_releases_socket() {
     let _ = run_task.await.expect("run task join");
     drop(server);
 
-    let rebound = UdpSocket::bind(server_addr)
+    let rebound = UdpSocket::bind_test(server_addr)
         .await
         .expect("server close should release UDP socket");
     drop(rebound);
@@ -1126,7 +1138,7 @@ async fn dtls12_client_handshake(
     budget: Duration,
     payload: Option<&[u8]>,
 ) -> Result<Dtls12ClientOutcome, anyhow::Error> {
-    let socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let socket = UdpSocket::bind_test("127.0.0.1:0").await?;
     socket.connect(server_addr).await?;
     dtls12_client_handshake_on(socket, certificate, budget, payload).await
 }
@@ -1370,7 +1382,7 @@ async fn test_frontend_dtls_refuses_untrusted_client_without_completing_the_hand
     };
 
     let server = Arc::new(
-        ferrum_edge::dtls::DtlsServer::bind(
+        bind_dtls(
             "127.0.0.1:0".parse().expect("server bind address"),
             frontend_config,
         )
@@ -1405,7 +1417,7 @@ async fn test_frontend_dtls_refuses_untrusted_client_without_completing_the_hand
     // Reserve the accepted client's UDP port before the withdrawn peer starts
     // so a leftover demux session at a recycled ephemeral port cannot swallow
     // the positive-control ClientHello.
-    let accepted_socket = UdpSocket::bind("127.0.0.1:0")
+    let accepted_socket = UdpSocket::bind_test("127.0.0.1:0")
         .await
         .expect("reserve accepted client port");
     accepted_socket

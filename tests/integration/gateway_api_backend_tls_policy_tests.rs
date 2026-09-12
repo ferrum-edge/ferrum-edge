@@ -5,6 +5,8 @@
 //! projection, System well-known roots, invalid CA fail-closed, and policy
 //! withdrawal on delete from the translated snapshot.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
@@ -2334,7 +2336,7 @@ async fn start_h2_first_raw_h1_backend(cert_pem: &str, key_pem: &str) -> ProbeFi
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let port = listener.local_addr().expect("backend addr").port();

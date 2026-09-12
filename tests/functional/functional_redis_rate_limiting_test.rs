@@ -19,6 +19,8 @@
 //!
 //! Compatible with Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 
 use futures_util::{SinkExt, StreamExt};
@@ -486,7 +488,7 @@ async fn spawn_file_gateway(config: String, extra_env: Vec<(String, String)>) ->
 async fn start_header_echo_backend(
     port: u16,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    let listener = tokio::net::TcpListener::bind_test(format!("127.0.0.1:{}", port)).await?;
     let handle = tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -793,7 +795,7 @@ async fn start_ai_backend(
     port: u16,
     total_tokens: u64,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    let listener = tokio::net::TcpListener::bind_test(format!("127.0.0.1:{}", port)).await?;
     start_ai_backend_on(listener, total_tokens).await
 }
 
@@ -810,7 +812,7 @@ async fn start_ai_backend_with_usage(
     prompt_tokens: u64,
     completion_tokens: u64,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    let listener = tokio::net::TcpListener::bind_test(format!("127.0.0.1:{}", port)).await?;
     start_ai_backend_with_usage_on(listener, prompt_tokens, completion_tokens).await
 }
 
@@ -876,7 +878,7 @@ async fn start_ai_backend_with_usage_on(
 // from inside a pattern guard.
 #[allow(clippy::collapsible_match)]
 async fn start_ws_echo_server(port: u16) {
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = tokio::net::TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind WS echo server");
 
@@ -982,7 +984,9 @@ async fn test_rate_limiting_redis_centralized() {
         .await
         .expect("Failed to create harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
     let _backend = start_header_echo_backend(backend_port).await.unwrap();
@@ -1077,7 +1081,9 @@ async fn test_rate_limiting_redis_one_second_previous_bucket_decays() {
     let harness = RedisRateLimitHarness::new()
         .await
         .expect("Failed to create harness");
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
     let _backend = start_header_echo_backend(backend_port).await.unwrap();
@@ -1195,7 +1201,9 @@ async fn test_rate_limiting_redis_fallback_to_local() {
         .await
         .expect("Failed to create harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
     let _backend = start_header_echo_backend(backend_port).await.unwrap();
@@ -1274,7 +1282,9 @@ async fn test_rate_limiting_redis_unavailable_fails_closed_by_default() {
         .await
         .expect("Failed to create harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
     let _backend = start_header_echo_backend(backend_port).await.unwrap();
@@ -1358,7 +1368,9 @@ async fn test_ai_rate_limiter_redis_centralized() {
         .expect("Failed to create harness");
 
     // Start a mock AI backend that returns 500 tokens per response
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
     let _backend = start_ai_backend(backend_port, 500).await.unwrap();
@@ -1448,7 +1460,9 @@ async fn test_ai_rate_limiter_redis_shared_across_instances() {
         return;
     }
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let _backend = start_ai_backend_on(backend_listener, 500).await.unwrap();
 
@@ -1585,7 +1599,9 @@ async fn test_ai_rate_limiter_redis_expose_headers_match_reconciled_bucket() {
 
     // --- Positive delta: reserve 50 completion tokens, actual completion = 80 ---
     {
-        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let backend_port = backend_listener.local_addr().unwrap().port();
         drop(backend_listener);
         let reserved: u64 = 50;
@@ -1693,7 +1709,9 @@ async fn test_ai_rate_limiter_redis_expose_headers_match_reconciled_bucket() {
 
     // --- Negative delta: reserve 200 completion tokens, actual completion = 10 ---
     {
-        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let backend_port = backend_listener.local_addr().unwrap().port();
         drop(backend_listener);
         let reserved: u64 = 200;
@@ -1813,7 +1831,9 @@ async fn test_ws_rate_limiting_redis_centralized() {
     }
 
     let backend_port = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let l = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let p = l.local_addr().unwrap().port();
         drop(l);
         p
@@ -1932,7 +1952,9 @@ async fn test_ws_rate_limiting_redis_namespaces_instance_connections() {
     }
 
     let backend_port = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let l = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let p = l.local_addr().unwrap().port();
         drop(l);
         p
@@ -2048,7 +2070,9 @@ async fn test_rate_limiting_redis_shared_across_instances() {
     }
 
     // Start a shared backend
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
     let _backend = start_header_echo_backend(backend_port).await.unwrap();
@@ -2300,14 +2324,18 @@ async fn test_request_deduplication_redis_blocks_concurrent_cross_instance() {
         return;
     }
 
-    let audit_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let audit_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let audit_port = audit_listener.local_addr().unwrap().port();
     let audit_records = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let _audit_collector = start_audit_collector_on(audit_listener, Arc::clone(&audit_records))
         .await
         .unwrap();
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_hits = Arc::new(AtomicUsize::new(0));
     let backend_blocked = Arc::new(AtomicBool::new(false));
@@ -2325,7 +2353,9 @@ async fn test_request_deduplication_redis_blocks_concurrent_cross_instance() {
     // base64 Redis representation exceeds that limit and retains the owned
     // terminal in-flight lock.
     const LARGE_FUNCTION_BODY_LEN: usize = 800 * 1024;
-    let function_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let function_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let function_port = function_listener.local_addr().unwrap().port();
     let function_hits = Arc::new(AtomicUsize::new(0));
     let _function = start_counting_large_function_on(
@@ -2784,7 +2814,9 @@ async fn test_request_deduplication_redis_same_proxy_sibling_instances_do_not_se
         return;
     }
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_hits = Arc::new(AtomicUsize::new(0));
     let _backend = start_counting_backend_on(backend_listener, Arc::clone(&backend_hits))
@@ -2944,7 +2976,9 @@ async fn test_request_deduplication_redis_distinct_header_instances_complete_ind
         return;
     }
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_hits = Arc::new(AtomicUsize::new(0));
     let _backend = start_counting_backend_on(backend_listener, Arc::clone(&backend_hits))
@@ -3115,7 +3149,9 @@ async fn test_rate_limiting_redis_namespace_key_prefix_isolation() {
     }
 
     // Shared backend.
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
     let _backend = start_header_echo_backend(backend_port).await.unwrap();
@@ -3311,7 +3347,7 @@ const REPLAY_HMAC_SECRET: &str = "shared-replay-hmac-secret-at-least-32-bytes";
 /// readiness probe, pool warmup, or capability `HEAD /` cannot be mistaken
 /// for an HMAC/DPoP mutation.
 async fn spawn_replay_counting_backend() -> (u16, Arc<AtomicUsize>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind counting backend");
     let port = listener.local_addr().expect("backend addr").port();

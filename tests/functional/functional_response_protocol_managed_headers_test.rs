@@ -6,6 +6,8 @@
 //! upstream responses, Content-Length repair on buffered bodies, and the
 //! already-fixed correlation-id echo behavior on ordinary responses.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::common::protocol_managed_response_headers::PROTOCOL_MANAGED_RESPONSE_DESTINATIONS;
 use crate::scaffolding::clients::{GetOptions, Http3Client, Http3Response};
@@ -85,7 +87,7 @@ plugin_configs:
 }
 
 async fn start_scripted_backend(hits: Arc<AtomicUsize>) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let port = listener.local_addr().expect("addr").port();
@@ -140,7 +142,7 @@ async fn spawn_gateway(backend_port: u16) -> (TestGateway, u16) {
     let mut last_error = String::new();
 
     for _ in 0..MAX_ATTEMPTS {
-        let reservation = match TcpListener::bind("127.0.0.1:0").await {
+        let reservation = match TcpListener::bind_test("127.0.0.1:0").await {
             Ok(listener) => listener,
             Err(error) => {
                 last_error = error.to_string();
@@ -467,7 +469,7 @@ const STREAMED_BODY_LEN: usize = 70_000;
 /// Backend that declares a perfectly valid `Content-Length` on a body large
 /// enough to be streamed rather than buffered by the gateway.
 async fn start_streaming_backend(hits: Arc<AtomicUsize>) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind streaming backend");
     let port = listener.local_addr().expect("addr").port();

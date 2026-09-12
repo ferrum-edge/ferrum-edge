@@ -15,6 +15,8 @@
 //! It is **not** a file-loader escape hatch, env bypass, or allowlist. Operator
 //! YAML/admin inputs remain fail-closed via `validate_operator_provided_fields`.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
@@ -392,7 +394,7 @@ async fn bind_ephemeral_excluding(
     held_rejected: &mut Vec<TcpListener>,
 ) -> Result<TcpListener, Box<dyn std::error::Error + Send + Sync>> {
     for _ in 0..64 {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let listener = TcpListener::bind_test("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         if excluded.contains(&port) {
             held_rejected.push(listener);

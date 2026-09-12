@@ -33,6 +33,8 @@
 //! Run: `cargo build --bin ferrum-edge && cargo test --test functional_tests
 //! functional_mcp_aggregate_sse -- --ignored --nocapture`
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::scaffolding::clients::{GetOptions, Http3Client, Http3ResponseStream};
 use crate::scaffolding::{reserve_colocated_tcp_udp, reserve_port};
 
@@ -290,7 +292,7 @@ impl SseFixture {
     async fn start_mode(mode: &str) -> Self {
         // Pre-bound fixture listener: the socket is never dropped and rebound,
         // so it cannot race a port the gateway is about to claim.
-        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+        let upstream_listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind scripted MCP upstream");
         let upstream_port = upstream_listener

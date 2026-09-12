@@ -15,6 +15,8 @@
 //! HTTP/3 because the screen lives in a protocol-independent plugin hook and
 //! must behave identically on all three.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{TestGateway, TestGatewayBuilder};
 use crate::scaffolding::clients::{GetOptions, Http3Client};
 
@@ -266,7 +268,7 @@ struct Backend {
 
 impl Backend {
     async fn spawn() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind recording backend");
         let port = listener.local_addr().expect("local addr").port();

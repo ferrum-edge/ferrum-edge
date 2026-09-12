@@ -11,6 +11,8 @@
 //!   cargo test --test functional_tests response_mock_grpc_exclusion -- --ignored --nocapture
 //! ```
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::time::Duration;
 
 use crate::scaffolding::backends::{GrpcStep, MatchRpc, ScriptedGrpcBackend};
@@ -130,8 +132,7 @@ async fn spawn_h3_gateway(backend_port: u16) -> (GatewayHarness, u16) {
     let mut last_err = String::new();
     for _ in 0..5 {
         let reservation = reserve_port().await.expect("reserve https port");
-        let https_port = reservation.port;
-        drop(reservation);
+        let https_port = reservation.drop_and_take_port();
 
         let scratch = tempfile::tempdir().expect("scratch");
         let (cert_path, key_path) = write_frontend_certs(scratch.path());
@@ -279,7 +280,7 @@ async fn h2_response_mock_excludes_native_grpc_unary_error() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h3_response_mock_excludes_native_grpc_unary_success() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -331,7 +332,7 @@ async fn h3_response_mock_excludes_native_grpc_unary_success() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h3_response_mock_excludes_native_grpc_unary_error() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();

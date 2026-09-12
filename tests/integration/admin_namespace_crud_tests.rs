@@ -12,6 +12,8 @@
 //! the path/body name themselves (list filtering plus per-name 403s, including
 //! a rename's target name).
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use ferrum_edge::_test_support::lock_namespace_registry_admission_for_test;
@@ -251,7 +253,7 @@ fn file_mode_state() -> AdminState {
 async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr parses");
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
+    let listener = tokio::net::TcpListener::bind_test(addr).await.expect("bind");
     let actual = listener.local_addr().expect("local addr");
     tokio::spawn(async move {
         let _ = serve_admin_on_listener(

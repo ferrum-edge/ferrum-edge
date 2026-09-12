@@ -7,6 +7,8 @@
 //! `tests/functional/scripted_backend_tests.rs` (binary mode, `#[ignore]`).
 //! See `tests/scaffolding/mod.rs` for the API docs.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::scaffolding::backends::{
     GrpcStep, HttpStep, MatchRpc, RequestMatcher, ScriptedGrpcBackend, ScriptedHttp1Backend,
     ScriptedTcpBackend, ScriptedTlsBackend, TcpStep, TlsConfig,
@@ -572,7 +574,7 @@ async fn serve_blocks_until_shutdown_when_no_listener_handles() {
 // ────────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn in_process_harness_rejects_invalid_backend_allow_ips_override() {
-    let backend_port = reserve_port().await.expect("port").port;
+    let backend_port = reserve_port().await.expect("port").drop_and_take_port();
     let yaml = file_mode_yaml_for_backend(backend_port);
     let result = GatewayHarness::builder()
         .mode_in_process()
@@ -609,7 +611,7 @@ async fn in_process_harness_rejects_invalid_backend_allow_ips_override() {
 // ────────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn in_process_stop_and_collect_logs_returns_empty_without_aborting_join() {
-    let backend_port = reserve_port().await.expect("port").port;
+    let backend_port = reserve_port().await.expect("port").drop_and_take_port();
     let _backend = ScriptedHttp1Backend::builder(
         reserve_port()
             .await
@@ -664,7 +666,7 @@ async fn in_process_stop_and_collect_logs_returns_empty_without_aborting_join() 
 // ────────────────────────────────────────────────────────────────────────────
 #[tokio::test]
 async fn in_process_harness_rejects_db_mode_after_file_config() {
-    let backend_port = reserve_port().await.expect("port").port;
+    let backend_port = reserve_port().await.expect("port").drop_and_take_port();
     let yaml = file_mode_yaml_for_backend(backend_port);
     let result = GatewayHarness::builder()
         .file_config(yaml)
@@ -714,10 +716,10 @@ async fn serve_drains_spawned_tasks_when_late_startup_fails() {
     use ferrum_edge::modes::file::{self, ServeOptions};
 
     // Reserve and bind the proxy + admin ports we'll hand to serve().
-    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind proxy");
-    let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind admin");
     let proxy_port = proxy_listener.local_addr().unwrap().port();
@@ -726,7 +728,7 @@ async fn serve_drains_spawned_tasks_when_late_startup_fails() {
     // Occupy a stream port so the gateway's `initial_reconcile_stream_listeners`
     // bind fails. We hold this for the lifetime of the test so the
     // gateway's bind attempt can't race in.
-    let stream_blocker = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let stream_blocker = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind stream blocker");
     let stream_port = stream_blocker.local_addr().unwrap().port();
@@ -810,7 +812,7 @@ async fn serve_drains_spawned_tasks_when_late_startup_fails() {
     // finish dropping the listener after the task exits — generous
     // compared to the actual cost.
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let rebind = tokio::net::TcpListener::bind(format!("127.0.0.1:{proxy_port}")).await;
+    let rebind = tokio::net::TcpListener::bind_test(format!("127.0.0.1:{proxy_port}")).await;
     rebind.expect(
         "proxy port should be free after serve() failure cleaned up the orphan listener task",
     );
@@ -898,7 +900,7 @@ async fn abandoned_bind_failure_does_not_probe_backend_before_successful_retry()
 
     // Hold the exclusive proxy port so the first serve() bind fails the same
     // way TestGateway's stolen ephemeral listen does.
-    let proxy_blocker = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let proxy_blocker = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind proxy blocker");
     let occupied_proxy_port = proxy_blocker.local_addr().unwrap().port();
@@ -906,7 +908,7 @@ async fn abandoned_bind_failure_does_not_probe_backend_before_successful_retry()
     // Exercise both ways capability work can begin: the asynchronous initial
     // refresh when warmup is off and synchronous pool warmup when it is on.
     for pool_warmup_enabled in [false, true] {
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind admin");
         let admin_port = admin_listener.local_addr().unwrap().port();
@@ -955,10 +957,10 @@ async fn abandoned_bind_failure_does_not_probe_backend_before_successful_retry()
     }
 
     // Successful retry on a free exclusive listen, same caller-owned backend.
-    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind retry proxy");
-    let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind retry admin");
     let proxy_port = proxy_listener.local_addr().unwrap().port();
@@ -1049,7 +1051,7 @@ async fn serve_drops_prebound_admin_https_without_tls_before_reserved_ports() {
     // racing the kernel's ephemeral allocator.
     let mut admin_https_listener = None;
     for port in 20_000..30_000 {
-        if let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+        if let Ok(listener) = tokio::net::TcpListener::bind_test(("127.0.0.1", port)).await {
             admin_https_listener = Some(listener);
             break;
         }
@@ -1163,7 +1165,7 @@ async fn serve_drop_prebound_admin_https_without_tls_does_not_reserve_env_https_
             reserve_port().await.expect("reserve env admin HTTPS port");
         let env_admin_https_port = env_admin_https_reservation.port;
 
-        let admin_https_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let admin_https_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind prebound admin HTTPS");
 
@@ -1353,7 +1355,7 @@ async fn serve_still_reserves_env_admin_https_port_without_prebound_drop() {
 // ────────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn in_process_pool_warmup_helper_wins_over_earlier_env_call() {
-    let backend_port = reserve_port().await.expect("port").port;
+    let backend_port = reserve_port().await.expect("port").drop_and_take_port();
     let _backend = ScriptedHttp1Backend::builder(
         reserve_port()
             .await

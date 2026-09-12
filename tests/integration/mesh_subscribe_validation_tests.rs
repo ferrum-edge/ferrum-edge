@@ -13,6 +13,8 @@
 //!    last-good slice, and must fail over to a control plane that answers
 //!    correctly.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -513,7 +515,7 @@ impl CpHandle {
 }
 
 async fn start_cp(updates: Vec<MeshConfigUpdate>) -> CpHandle {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind stub CP");
     let addr = listener.local_addr().expect("stub CP addr");
@@ -661,7 +663,7 @@ impl StallingCpHandle {
 }
 
 async fn start_stalling_cp(updates: Vec<MeshConfigUpdate>) -> StallingCpHandle {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind stalling stub CP");
     let addr = listener.local_addr().expect("stalling stub CP addr");
@@ -1048,7 +1050,7 @@ impl MeshConfigSync for WithholdingHeadersCp {
 }
 
 async fn start_withholding_headers_cp() -> CpHandle {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind withholding stub CP");
     let addr = listener.local_addr().expect("withholding stub CP addr");
@@ -1107,7 +1109,7 @@ impl MeshConfigSync for HeartbeatOnlyCp {
 }
 
 async fn start_heartbeat_only_cp() -> CpHandle {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind heartbeat-only stub CP");
     let addr = listener.local_addr().expect("heartbeat-only stub CP addr");

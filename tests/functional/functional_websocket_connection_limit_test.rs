@@ -4,6 +4,8 @@
 //! `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP` is the per-source session bound,
 //! keyed on the trusted-proxy-resolved client IP.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{TestGateway, TestGatewayBuilder};
 use crate::scaffolding::clients::{Http3Client, WebSocketOptions};
 
@@ -404,7 +406,7 @@ async fn wait_for_h1_reconnect(url: &str, xff: &str) {
 }
 
 async fn spawn_ws_backend() -> (u16, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind WebSocket backend");
     let port = listener.local_addr().expect("backend addr").port();

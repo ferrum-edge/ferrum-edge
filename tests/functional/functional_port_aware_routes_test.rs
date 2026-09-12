@@ -28,6 +28,8 @@
 //!   cargo build --bin ferrum-edge
 //!   cargo test --test functional_tests -- --ignored functional_port_aware_routes --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -38,7 +40,7 @@ use tokio::time::sleep;
 const HOST: &str = "app.example.com";
 
 async fn spawn_backend(identifier: &'static str) -> (u16, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let handle = tokio::spawn(async move {
         loop {
@@ -68,8 +70,8 @@ async fn spawn_backend(identifier: &'static str) -> (u16, JoinHandle<()>) {
 /// after the drop can belong to a sibling. Reload callers also retry when an
 /// undeclared port reservation is stolen before the negative assertion runs.
 async fn reserve_free_port_pair() -> (u16, u16) {
-    let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
+    let second = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let ports = (
         first.local_addr().unwrap().port(),
         second.local_addr().unwrap().port(),

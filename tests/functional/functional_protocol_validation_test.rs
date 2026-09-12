@@ -71,6 +71,8 @@
 //!
 //! Run: `cargo test --test functional_tests -- --ignored functional_protocol_validation --nocapture`
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http2Client, Http3Client, Http3Response};
 
@@ -673,7 +675,7 @@ impl Harness {
     }
 
     async fn with_env(with_host: bool, env: &[(&str, &str)]) -> Self {
-        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let echo_port = echo_listener.local_addr().unwrap().port();
         let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
         sleep(Duration::from_millis(150)).await;
@@ -726,7 +728,7 @@ async fn start_h3_validation_gateway_with_config(
     // fresh HTTPS TCP/UDP port as well.
     let mut last_error = None;
     for attempt in 1..=3 {
-        let https_reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let https_reservation = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let https_port = https_reservation.local_addr().unwrap().port();
         drop(https_reservation);
 
@@ -1508,7 +1510,7 @@ async fn functional_protocol_validation_http2_extended_connect_websocket_authori
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_http3_authority_only_still_routes() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -1534,7 +1536,7 @@ async fn functional_protocol_validation_http3_authority_only_still_routes() {
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_http3_extended_connect_websocket_authority_only() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -1855,7 +1857,7 @@ async fn functional_protocol_validation_trace_rejected_http2() {
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h2_total_header_size_limit_rejects_from_env() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -1979,7 +1981,7 @@ async fn functional_protocol_validation_h2_url_length_zero_allows_long_url() {
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h2_query_param_zero_allows_extra_params() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -2021,7 +2023,7 @@ async fn functional_protocol_validation_h2_query_param_zero_allows_extra_params(
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h2_header_count_limit_rejects_from_env() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -2062,7 +2064,7 @@ async fn functional_protocol_validation_h2_header_count_limit_rejects_from_env()
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h2_header_count_zero_allows_extra_headers() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -2107,7 +2109,7 @@ async fn functional_protocol_validation_h2_header_count_zero_allows_extra_header
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h2_url_length_limit_rejects_from_env() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -2177,7 +2179,7 @@ async fn functional_protocol_validation_h2_url_length_limit_rejects_from_env() {
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h2_query_param_limit_rejects_from_env() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -2243,7 +2245,7 @@ async fn functional_protocol_validation_h2_query_param_limit_rejects_from_env() 
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h2_single_header_size_limit_rejects_from_env() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -2310,7 +2312,7 @@ async fn functional_protocol_validation_h2_single_header_size_limit_rejects_from
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_trace_rejected_http3() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -2372,7 +2374,7 @@ async fn functional_protocol_validation_trace_rejected_http3() {
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h3_transfer_encoding_rejected() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -2400,7 +2402,7 @@ async fn functional_protocol_validation_h3_transfer_encoding_rejected() {
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h3_query_param_limit_ignores_empty_segments() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -2436,7 +2438,7 @@ async fn functional_protocol_validation_h3_query_param_limit_ignores_empty_segme
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h3_query_param_limit_rejects_from_env() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -2465,7 +2467,7 @@ async fn functional_protocol_validation_h3_query_param_limit_rejects_from_env() 
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h3_url_length_limit_rejects_from_env() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -2498,7 +2500,7 @@ async fn functional_protocol_validation_h3_url_length_limit_rejects_from_env() {
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h3_header_count_limit_rejects_from_env() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -2529,7 +2531,7 @@ async fn functional_protocol_validation_h3_header_count_limit_rejects_from_env()
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h3_single_header_size_limit_rejects_from_env() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -2565,7 +2567,7 @@ async fn functional_protocol_validation_h3_single_header_size_limit_rejects_from
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h3_total_header_size_limit_rejects_from_env() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -2604,7 +2606,7 @@ async fn functional_protocol_validation_h3_total_header_size_limit_rejects_from_
 #[tokio::test]
 async fn functional_protocol_validation_h3_response_body_limit_rejects_from_env() {
     let backend_body = "this backend response body exceeds the configured limit";
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_task = tokio::spawn(start_fixed_body_server_on(backend_listener, backend_body));
     sleep(Duration::from_millis(150)).await;
@@ -2636,7 +2638,7 @@ async fn functional_protocol_validation_h3_response_body_limit_rejects_from_env(
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h1_total_header_size_limit_rejects_from_env() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -2678,7 +2680,7 @@ async fn functional_protocol_validation_h1_total_header_size_limit_rejects_from_
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h1_single_header_size_limit_rejects_from_env() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -2722,7 +2724,7 @@ async fn functional_protocol_validation_h1_single_header_size_limit_rejects_from
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h3_connect_udp_disabled_returns_501() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -2775,7 +2777,7 @@ async fn functional_protocol_validation_h3_connect_udp_disabled_returns_501() {
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h3_request_body_limit_rejects_from_env() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -2888,7 +2890,7 @@ async fn functional_protocol_validation_h3_request_body_limit_rejects_from_env()
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h3_header_count_zero_allows_extra_headers() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -2921,7 +2923,7 @@ async fn functional_protocol_validation_h3_header_count_zero_allows_extra_header
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h3_query_param_zero_allows_extra_params() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -2950,7 +2952,7 @@ async fn functional_protocol_validation_h3_query_param_zero_allows_extra_params(
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h3_url_length_zero_allows_long_url() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -3518,7 +3520,7 @@ async fn functional_protocol_validation_response_hop_by_hop_stripped_http2() {
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_response_hop_by_hop_stripped_http3() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
@@ -3573,7 +3575,7 @@ async fn functional_protocol_validation_response_hop_by_hop_stripped_http3() {
 #[ignore]
 #[tokio::test]
 async fn functional_protocol_validation_h3_strips_hop_headers_after_response_plugins() {
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;

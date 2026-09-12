@@ -6,6 +6,8 @@
 //! certificates exist, who wins a hostname collision) are covered by
 //! `tests/unit/config/gateway_api_frontend_tls_tests.rs`.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use ferrum_edge::config::EnvConfig;
 use ferrum_edge::tls::TlsPolicy;
 use ferrum_edge::tls::multi_cert::{
@@ -82,7 +84,7 @@ fn server_config(certificates: &[GatewayCertificateInput]) -> Arc<rustls::Server
 /// Complete one real handshake with the given SNI and return the leaf the
 /// server presented.
 async fn presented_leaf(server_config: Arc<rustls::ServerConfig>, server_name: &str) -> Vec<u8> {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
     let acceptor = TlsAcceptor::from(server_config);
 

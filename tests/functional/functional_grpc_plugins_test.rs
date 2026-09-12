@@ -25,7 +25,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
-use tokio::net::TcpListener;
 use tokio::time::sleep;
 
 // ============================================================================
@@ -33,10 +32,9 @@ use tokio::time::sleep;
 // ============================================================================
 
 async fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    crate::scaffolding::ports::unbound_port()
         .await
-        .expect("Failed to bind to port 0");
-    listener.local_addr().unwrap().port()
+        .expect("lease test port")
 }
 
 /// Per-path request witnesses for the mock gRPC echo backend.

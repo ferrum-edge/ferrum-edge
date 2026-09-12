@@ -4,6 +4,8 @@
 //! exercise real H1 Upgrade, H2 Extended CONNECT, and H3 Extended CONNECT
 //! requests to ensure disallowed origins are rejected before backend dispatch.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::{Http3Client, WebSocketOptions};
 
@@ -93,7 +95,7 @@ struct CountingWsBackend {
 
 impl CountingWsBackend {
     async fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind ws backend");
         let port = listener.local_addr().expect("backend addr").port();

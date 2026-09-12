@@ -1,3 +1,5 @@
+use crate::scaffolding::port_registry::TestSocket;
+
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use chrono::Utc;
@@ -210,7 +212,7 @@ fn proxy_for_test() -> Proxy {
 async fn start_hbone_echo_server(
     server_slot: SharedSvidBundle,
 ) -> (std::net::SocketAddr, oneshot::Receiver<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind hbone server");
     let addr = listener.local_addr().expect("listener addr");
@@ -282,7 +284,7 @@ async fn start_hbone_echo_server(
 async fn start_hbone_counting_echo_server(
     server_slot: SharedSvidBundle,
 ) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind hbone counting server");
     let addr = listener.local_addr().expect("listener addr");
@@ -351,7 +353,7 @@ async fn start_hbone_reject_server(
     server_slot: SharedSvidBundle,
     status: StatusCode,
 ) -> std::net::SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind hbone reject server");
     let addr = listener.local_addr().expect("listener addr");
@@ -1024,7 +1026,7 @@ async fn a_commit_that_withdraws_no_root_never_clears_a_pooled_mesh_entry() {
 async fn start_hbone_blackhole_then_echo_server(
     server_slot: SharedSvidBundle,
 ) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind hbone blackhole server");
     let addr = listener.local_addr().expect("listener addr");
@@ -1338,7 +1340,7 @@ async fn start_hbone_oversize_response_header_server(
     pad_headers: usize,
     pad_value_len: usize,
 ) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind hbone oversize header server");
     let addr = listener.local_addr().expect("listener addr");
@@ -1568,7 +1570,7 @@ const BLACK_HOLE_HOLD: Duration = Duration::from_millis(750);
 /// for the cohort — the deterministic evidence issue #5046 asks for in place of
 /// a benchmark.
 async fn start_counting_black_hole(hold: Duration) -> (u16, Arc<AtomicUsize>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind black-hole listener");
     let port = listener.local_addr().expect("black-hole addr").port();

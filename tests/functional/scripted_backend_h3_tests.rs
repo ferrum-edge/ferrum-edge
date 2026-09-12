@@ -27,6 +27,8 @@
 
 #![allow(clippy::bool_assert_comparison)]
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::scaffolding::backends::{
     H2Step, H3Step, H3TlsConfig, HttpStep, MatchHeaders, QuicRefuser, RequestMatcher,
     ScriptedH2Backend, ScriptedH3Backend, ScriptedHttp1Backend, ScriptedTcpBackend,
@@ -1029,7 +1031,7 @@ async fn h3_backend_recovers_after_periodic_refresh() {
     // Briefly wait for the UDP socket to actually free in the kernel.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let recovered_udp = match tokio::net::UdpSocket::bind(("127.0.0.1", backend_port)).await {
+    let recovered_udp = match tokio::net::UdpSocket::bind_test(("127.0.0.1", backend_port)).await {
         Ok(s) => s,
         Err(e) => panic!(
             "failed to rebind UDP port {backend_port} after refuser drop: {e} \

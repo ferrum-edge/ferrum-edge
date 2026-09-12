@@ -72,6 +72,8 @@
 
 #![allow(dead_code, unused_imports)] // Macro consumers pick subsets.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -805,7 +807,7 @@ mod tests {
                 assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
             }
             assert!(
-                tokio::net::TcpListener::bind(address).await.is_err(),
+                tokio::net::TcpListener::bind_test(address).await.is_err(),
                 "matrix handle must retain exclusive ownership of the refused port"
             );
         }
