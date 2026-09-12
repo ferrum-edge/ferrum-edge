@@ -44,9 +44,7 @@ pub(crate) fn maybe_warn_https_to_plaintext_backend(
 
     let now_ms = crate::socket_opts::monotonic_now_ms();
     let emitted = {
-        let instance = per_proxy_warn()
-            .entry(proxy.id.clone())
-            .or_default();
+        let instance = per_proxy_warn().entry(proxy.id.clone()).or_default();
         AtomicLogRateLimiter::dual_gate_emit(&instance, &GLOBAL_WARN, now_ms)
     };
     let Some((suppressed, globally_suppressed)) = emitted else {
