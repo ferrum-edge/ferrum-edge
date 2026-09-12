@@ -678,7 +678,8 @@ impl SessionInner {
             .history
             .partition_point(|event| event.event_id < event_id);
         self.history_bytes = self.history_bytes.saturating_add(framed.len());
-        self.history.insert(index, RetainedEvent { event_id, framed });
+        self.history
+            .insert(index, RetainedEvent { event_id, framed });
     }
 
     /// Retain an ALREADY-DELIVERED POST-attached event under the cursor its
