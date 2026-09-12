@@ -12524,6 +12524,47 @@ fn delete_proxy_cleanup_orphaned_upstream_query_has_openapi_parity() {
 }
 
 #[test]
+fn omitted_backend_scheme_https_default_has_openapi_and_docs_parity() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let scheme_desc =
+        spec["components"]["schemas"]["Proxy"]["properties"]["backend_scheme"]["description"]
+            .as_str()
+            .expect("Proxy.backend_scheme description");
+    assert!(
+        scheme_desc.contains("defaults to `https` when omitted"),
+        "OpenAPI must document the HTTP-family https default: {scheme_desc}"
+    );
+    assert!(
+        scheme_desc.contains("Plaintext backends must set `backend_scheme: http`"),
+        "OpenAPI must tell operators how to reach plaintext backends: {scheme_desc}"
+    );
+
+    let created = spec["paths"]["/proxies"]["post"]["responses"]["201"]["description"]
+        .as_str()
+        .expect("POST /proxies 201 description");
+    assert!(
+        created.contains("defaults to `https` when omitted"),
+        "POST /proxies 201 must document the stored https default: {created}"
+    );
+
+    let create_desc = spec["components"]["schemas"]["ProxyCreate"]["description"]
+        .as_str()
+        .expect("ProxyCreate description");
+    assert!(
+        create_desc.contains("Plaintext backends must set `backend_scheme: http`"),
+        "ProxyCreate must document the plaintext-backend requirement: {create_desc}"
+    );
+
+    let admin_docs = include_str!("../../docs/admin_api.md");
+    assert!(
+        admin_docs.contains("Plaintext backends need `backend_scheme: http`"),
+        "docs/admin_api.md must note the plaintext-backend scheme next to POST /proxies"
+    );
+}
+
+#[test]
 fn admin_referential_delete_conflicts_have_openapi_parity() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
