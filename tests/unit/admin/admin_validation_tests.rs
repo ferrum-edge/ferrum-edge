@@ -1909,3 +1909,43 @@ fn put_replace_semantics_are_documented_in_the_spec_and_admin_docs() {
         );
     }
 }
+
+#[test]
+fn proxy_ws_origin_star_is_rejected_on_admin_and_validate_admission() {
+    let crud = include_str!("../../../src/admin/crud.rs");
+    let proxy_impl = crud
+        .find("impl AdminResource for Proxy")
+        .expect("Proxy admin implementation must exist");
+    let validate = crud[proxy_impl..]
+        .find("fn validate(")
+        .map(|offset| proxy_impl + offset)
+        .expect("Proxy admin validate");
+    let region_end = crud[validate..]
+        .find("fn cached_items(")
+        .map(|offset| validate + offset)
+        .expect("Proxy admin cached_items follows validate");
+    let validate = &crud[validate..region_end];
+    assert!(
+        validate.contains("self.validate_fields()"),
+        "Admin Proxy POST/PUT/PATCH/batch must reject '*' via validate_fields"
+    );
+
+    let restore = include_str!("../../../src/admin/mod.rs");
+    assert!(
+        restore.contains("candidate.allowed_ws_origins_admission_errors()"),
+        "POST /restore must reject '*' the same way as Proxy admission"
+    );
+
+    let cli = include_str!("../../../src/cli.rs");
+    let execute_validate = cli
+        .split("pub fn execute_validate(")
+        .nth(1)
+        .expect("execute_validate")
+        .split("pub fn execute_health(")
+        .next()
+        .unwrap_or(cli);
+    assert!(
+        execute_validate.contains("allowed_ws_origins_admission_errors()"),
+        "ferrum-edge validate must reject '*' after loading the file spec"
+    );
+}

@@ -867,9 +867,13 @@ UDP capture (`FERRUM_MESH_CAPTURE_UDP_ENABLED`, default off) is read by both the
 **Per-proxy WebSocket Origin (`allowed_ws_origins`).** Each proxy may set
 `allowed_ws_origins: ["https://app.example.com"]` to require a matching browser
 `Origin` on WebSocket upgrades (HTTP/1.1, H2 Extended CONNECT, H3 Extended CONNECT).
-The default empty list allows every origin. This gate is independent of the `cors`
-plugin, which does not run on WebSocket upgrades; operators with a strict CORS
-allowlist on the same route should mirror those origins in `allowed_ws_origins`. See
+The default empty list allows every origin. Entries are literal origins of the form
+`scheme://host[:port]`; `*` is not a wildcard and is rejected at Admin API admission
+and `ferrum-edge validate`. Existing file/database/CP rows containing `*` still load,
+with one warning per proxy; they continue to match the literal origin string `*` only.
+This gate is independent of the `cors` plugin, which does not run on WebSocket
+upgrades; operators with a strict CORS allowlist on the same route should mirror those
+origins in `allowed_ws_origins`. See
 [routing.md](routing.md#websocket-origin-admission) and
 [cors_plugin.md](cors_plugin.md#websocket-upgrades-and-cswsh).
 

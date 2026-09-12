@@ -1,8 +1,8 @@
 use chrono::Utc;
 use ferrum_edge::config::types::{
-    ActiveHealthCheck, AuthMode, BackendScheme, BackoffStrategy, CircuitBreakerConfig,
-    ConsulConfig, Consumer, DispatchKind, GatewayConfig, HealthCheckConfig, KubernetesConfig,
-    LoadBalancerAlgorithm, MAX_BACKEND_HOST_LENGTH, MAX_BACKEND_PATH_LENGTH,
+    ALLOWED_WS_ORIGINS_STAR_GUIDANCE, ActiveHealthCheck, AuthMode, BackendScheme, BackoffStrategy,
+    CircuitBreakerConfig, ConsulConfig, Consumer, DispatchKind, GatewayConfig, HealthCheckConfig,
+    KubernetesConfig, LoadBalancerAlgorithm, MAX_BACKEND_HOST_LENGTH, MAX_BACKEND_PATH_LENGTH,
     MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH,
     MAX_CREDENTIAL_VALUE_LENGTH, MAX_CREDENTIALS_SIZE, MAX_FILE_PATH_LENGTH, MAX_HOSTS_PER_PROXY,
     MAX_HTTP2_MAX_FRAME_SIZE, MAX_HTTP3_CONNECTIONS_PER_BACKEND, MAX_LISTEN_PATH_LENGTH,
@@ -15,6 +15,7 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::modes::mesh::config::MeshTrafficPolicyTls;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// Helper to create a minimal valid proxy.
 fn make_proxy(id: &str, listen_path: &str) -> Proxy {
@@ -2311,6 +2312,157 @@ fn test_proxy_allowed_ws_origins_rejects_whitespace_only() {
         errs.iter()
             .any(|e| e.contains("allowed_ws_origins") && e.contains("must not be empty"))
     );
+}
+
+#[test]
+fn test_proxy_allowed_ws_origins_rejects_star_wildcard() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.allowed_ws_origins = vec!["*".into()];
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter().any(|e| {
+            e.contains("allowed_ws_origins")
+                && e.contains("'*'")
+                && e.contains(ALLOWED_WS_ORIGINS_STAR_GUIDANCE)
+        }),
+        "star must be rejected as a non-wildcard literal: {errs:?}"
+    );
+}
+
+#[test]
+fn test_proxy_allowed_ws_origins_rejects_star_among_valid_origins() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.allowed_ws_origins = vec!["https://example.com".into(), " * ".into()];
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("allowed_ws_origins[1]") && e.contains("'*'")),
+        "trimmed star must still be rejected: {errs:?}"
+    );
+}
+
+#[test]
+fn test_proxy_allowed_ws_origins_rejects_non_origin_entry() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.allowed_ws_origins = vec!["https://example.com/path".into()];
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter().any(|e| {
+            e.contains("allowed_ws_origins")
+                && e.contains("scheme://host[:port]")
+                && e.contains(ALLOWED_WS_ORIGINS_STAR_GUIDANCE)
+        }),
+        "path-bearing entries must be rejected: {errs:?}"
+    );
+}
+
+#[test]
+fn test_proxy_allowed_ws_origins_accepts_http_ws_and_ports() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.allowed_ws_origins = vec![
+        "http://localhost:8080".into(),
+        "wss://app.example.com".into(),
+        "https://[::1]".into(),
+        "null".into(),
+    ];
+    assert!(proxy.validate_fields().is_ok());
+}
+
+#[test]
+fn test_proxy_allowed_ws_origins_star_does_not_fail_load_validation() {
+    let mut proxy = make_proxy("star-proxy", "/api");
+    proxy.allowed_ws_origins = vec!["*".into()];
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        consumers: vec![],
+        plugin_configs: vec![],
+        upstreams: vec![],
+        ..Default::default()
+    };
+    assert!(
+        config.validate_all_fields(30).is_ok(),
+        "file/database/CP load must keep serving proxies whose stored allow-list is '*'"
+    );
+}
+
+#[test]
+fn test_proxy_allowed_ws_origins_load_warns_once_per_proxy() {
+    let mut proxy = make_proxy("star-proxy", "/api");
+    proxy.allowed_ws_origins = vec!["*".into(), "not an origin".into()];
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        consumers: vec![],
+        plugin_configs: vec![],
+        upstreams: vec![],
+        ..Default::default()
+    };
+    let (logs, _guard) = capture_ws_origin_logs();
+    config
+        .validate_all_fields(30)
+        .expect("legacy star must not fail load validation");
+    let output = logs.contents();
+    let warn_count = output.matches("allowed_ws_origins contains '*'").count();
+    assert_eq!(
+        warn_count, 1,
+        "exactly one warning per proxy, got: {output}"
+    );
+    assert!(output.contains("star-proxy"), "warning must name the proxy");
+    assert!(
+        output.contains(ALLOWED_WS_ORIGINS_STAR_GUIDANCE),
+        "warning must carry the admission guidance: {output}"
+    );
+}
+
+#[derive(Clone, Default)]
+struct CapturedWsOriginLogs {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl CapturedWsOriginLogs {
+    fn contents(&self) -> String {
+        String::from_utf8_lossy(&self.buffer.lock().expect("log buffer")).into_owned()
+    }
+}
+
+struct CapturedWsOriginLogsWriter {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl std::io::Write for CapturedWsOriginLogsWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buffer
+            .lock()
+            .expect("log buffer")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedWsOriginLogs {
+    type Writer = CapturedWsOriginLogsWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        CapturedWsOriginLogsWriter {
+            buffer: Arc::clone(&self.buffer),
+        }
+    }
+}
+
+fn capture_ws_origin_logs() -> (CapturedWsOriginLogs, tracing::subscriber::DefaultGuard) {
+    let writer = CapturedWsOriginLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_target(false)
+        .without_time()
+        .with_writer(writer.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    (writer, guard)
 }
 
 // ---- Retryable methods validation tests ----
