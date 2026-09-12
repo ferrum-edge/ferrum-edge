@@ -28215,14 +28215,18 @@ components:
             Effective OpenAPI path template used for metadata and path specificity
             ordering. When generated from a spec, this is the Paths key joined to the
             effective Server Object pathname (OpenAPI 3.x) or Swagger `basePath`, with
-            one entry per distinct server pathname when multiple servers apply.
+            the literal proxy listen_path prefix prepended (trailing prefix slashes
+            trimmed). Root, host-only, exact, and regex listen routes add no prefix.
+            One entry is emitted per distinct server pathname when multiple servers
+            apply. strip_listen_path affects backend forwarding only.
         path_regex:
           type: string
           minLength: 1
           description: >-
             Regex used to match the full inbound request path, compiled at plugin load.
             Auto-generated specs derive it from the effective path template (including
-            server/`basePath` prefix); operator-supplied patterns are automatically
+            literal listen prefix and server/`basePath` prefix); operator-supplied
+            full-path patterns are not prefixed or stripped and are automatically
             anchored as `^(?:...)$` (full-path match) so a loose pattern cannot
             substring-match an unintended superstring path.
         operation_label:
