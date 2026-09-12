@@ -1833,7 +1833,9 @@ impl WafInstanceScoreState {
     pub(crate) fn total(&self) -> u32 {
         self.replaceable
             .iter()
-            .fold(self.accumulated, |total, phase| total.saturating_add(*phase))
+            .fold(self.accumulated, |total, phase| {
+                total.saturating_add(*phase)
+            })
     }
 }
 

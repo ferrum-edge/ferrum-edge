@@ -10882,7 +10882,10 @@ async fn aggregate_sse_post_stream_framing_that_trips_a_rule_is_refused() {
         &mut late_body,
     )
     .await;
-    assert!(replaced, "a representation that trips a rule must be refused");
+    assert!(
+        replaced,
+        "a representation that trips a rule must be refused"
+    );
     assert_ne!(late_status, 200);
 
     // The client receives the refusal, and the refused answer is not replayable.

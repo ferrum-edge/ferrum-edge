@@ -2237,9 +2237,11 @@ impl AggregateSsePublication {
         if self.0.finished.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.0
-            .session
-            .abort_reserved_terminal(&self.0.admission, self.0.budget(), self.0.reserved_bytes);
+        self.0.session.abort_reserved_terminal(
+            &self.0.admission,
+            self.0.budget(),
+            self.0.reserved_bytes,
+        );
     }
 }
 

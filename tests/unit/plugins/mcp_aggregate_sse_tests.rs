@@ -1467,8 +1467,7 @@ async fn a_stale_publication_cannot_act_on_a_reused_identity() {
 
     // An unrelated request completes, which evicts the cancellation record for
     // id 1: the terminal set is bounded by the open-stream bound.
-    publish(&broker, session, 2)
-        .expect("an unrelated response publishes");
+    publish(&broker, session, 2).expect("an unrelated response publishes");
 
     // The same id is now admissible again, and belongs to a NEW request.
     let reopened = broker.open_stream(session, &number_id(1)).unwrap();
