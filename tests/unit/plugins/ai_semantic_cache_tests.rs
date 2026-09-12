@@ -180,6 +180,7 @@ fn plugin_http_client_with_ip_policy(policy: BackendAllowIps) -> PluginHttpClien
 /// when `identified_consumer` is set.
 fn make_consumer(username: &str) -> Arc<Consumer> {
     Arc::new(Consumer {
+        labels: Default::default(),
         id: format!("consumer-{}", username),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),

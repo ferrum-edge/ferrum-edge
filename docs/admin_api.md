@@ -2256,3 +2256,46 @@ Returns `404 Not Found` outside mesh mode (when the mesh runtime state is not wi
 ## Mesh Policy Denies (mesh mode)
 
 `GET /mesh/policy-denies/recent` is JWT-authenticated and mesh-only. It returns the top-N most recent `mesh_authz` deny events grouped by the `(rule, source, destination, reason)` tuple, for ad-hoc triage. The recorder is a process-singleton bounded FIFO ring (`FERRUM_MESH_POLICY_DENY_LOG_CAPACITY`, default `10000`) written only on the `mesh_authz` deny branch — allowed requests never touch it, and a denied request takes the recorder mutex once to push the event (so under a deny storm the cost is on the deny path, not on normal traffic). The endpoint reads a one-shot snapshot, filters to a recent `window`, groups by the 4-tuple, sorts by count descending, and truncates to `limit`. Identity / route / policy metadata only; no request bodies, headers, or credentials. Set `FERRUM_MESH_POLICY_DENY_LOG_CAPACITY=0` to disable the recorder (the endpoint still serves an empty `grouped` array).
+
+## Resource labels and application attribution
+
+Proxies, consumers, upstreams, and plugin configurations accept a `labels`
+map of strings, for example:
+
+```json
+{"labels": {"provisioned-by": "ferrum-nexus", "team": "platform"}}
+```
+
+Labels appear on GET/list, backup/restore, file configuration, and CP/DP
+configuration, and survive namespace renames. Empty maps are omitted from
+responses. A resource PUT without
+`labels` preserves the current map; a supplied map replaces it, and `{}` clears
+it. At most 64 labels are allowed, with nonblank keys up to 128 UTF-8 bytes and
+values up to 512 bytes; neither may contain control characters.
+
+Provisioning clients can send `X-Ferrum-Provisioned-By: ferrum-foundry`.
+CRUD creates, batch creates, and non-spec-owned restore rows fill an absent
+`provisioned-by` label from this header, retaining all existing labels.
+API-spec POST/PUT also label extracted proxies, upstreams, plugins and generated
+validators; PUT carries forward missing labels on existing resource identities.
+Spec-owned restore graphs remain verbatim to preserve their resource hashes.
+The three companion values are `ferrum-edge-git-forge-ops`, `ferrum-nexus`, and
+`ferrum-foundry`. Existing unlabeled resources remain unknown until explicitly
+labeled or reconciled by their provisioning tool; editing one through another
+application does not establish its original creator.
+
+Labels are informational, not authorization, ownership, audit identity or
+routing selectors. In particular they do not replace `api_spec_id`, the GitOps
+managed-resource ledger, consumer identities, or upstream target `tags`.
+The gateway namespace registry and fleet-global TLS/ACME/trust management
+surfaces are separate from these four gateway configuration resource types.
+
+This schema change follows the build-out policy: the SQL baseline includes the
+labels column for PostgreSQL, MySQL and SQLite; initialize/rebuild the development
+database from that baseline when deploying it. MongoDB stores labels through its
+existing BSON resource serialization. Upgrade the gateway and file validator
+before upgrading clients that emit labels in resource bodies. In control-plane
+deployments, upgrade every data plane before the control plane: `config_json`
+is parsed with `deny_unknown_fields`, so a data plane that predates this field
+rejects a namespace snapshot as soon as any resource in it carries a non-empty
+`labels` map, and it does not converge until it is upgraded.

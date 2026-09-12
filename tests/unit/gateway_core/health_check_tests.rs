@@ -1282,6 +1282,7 @@ fn make_upstream_with_active_probe(
     interval_seconds: u64,
 ) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         name: Some(format!("upstream-{}", id)),
@@ -1826,6 +1827,7 @@ fn make_upstream_passive_only(
     healthy_after_seconds: u64,
 ) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         name: Some(format!("upstream-{}", id)),

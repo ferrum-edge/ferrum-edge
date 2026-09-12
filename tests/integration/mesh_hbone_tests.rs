@@ -49,6 +49,7 @@ use ferrum_edge::proxy::{
 
 fn create_mesh_proxy(backend_port: u16) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: "mesh-hbone".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("Mesh HBONE".to_string()),
@@ -177,6 +178,7 @@ fn create_hmac_consumer(secret: &str) -> Consumer {
     )]);
 
     Consumer {
+        labels: Default::default(),
         id: "hmac-consumer".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "hmacuser".to_string(),
@@ -190,6 +192,7 @@ fn create_hmac_consumer(secret: &str) -> Consumer {
 
 fn hmac_auth_plugin_config() -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: "hmac-auth".to_string(),
         plugin_name: "hmac_auth".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -214,6 +217,7 @@ fn hmac_auth_plugin_config() -> PluginConfig {
 /// `ctx.peer_spiffe_id` from the verified mTLS peer cert.
 fn spiffe_identity_plugin_config(proxy_id: &str) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: "spiffe-identity".to_string(),
         plugin_name: "spiffe_identity".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -478,6 +482,7 @@ fn mesh_route_dispatch_connect_timeout_plugin(
     timeout_ms: u64,
 ) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: "mesh-route-dispatch-cfg".to_string(),
         plugin_name: "mesh_route_dispatch".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -819,6 +824,7 @@ fn egress_udp_mesh_config_with_endpoints(
 
 fn spiffe_identity_global_plugin_config() -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: "spiffe-identity-global".to_string(),
         plugin_name: "spiffe_identity".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -4081,6 +4087,7 @@ async fn discover_bindable_non_loopback_local_ip() -> IpAddr {
 
 fn global_mesh_route_dispatch_to(host: &str, port: u16) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: "third-workload-route-override".to_string(),
         plugin_name: "mesh_route_dispatch".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),

@@ -118,6 +118,7 @@ fn generate_near_expiry_jwt(node_id: &str, audience: Option<&str>) -> String {
 /// Create a test Proxy entry.
 fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("Test Proxy {}", id)),
@@ -2236,6 +2237,7 @@ async fn test_dp_keeps_last_good_snapshot_after_case_ambiguous_mtls_dns_update()
     .expect("DP should receive the initial snapshot");
 
     let mut upper = Consumer {
+        labels: Default::default(),
         id: "upper".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "alice".to_string(),
@@ -2259,6 +2261,7 @@ async fn test_dp_keeps_last_good_snapshot_after_case_ambiguous_mtls_dns_update()
     let mut invalid_config = create_test_config(2);
     invalid_config.consumers = vec![upper, lower];
     invalid_config.plugin_configs = vec![PluginConfig {
+        labels: Default::default(),
         id: "dns-mtls".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "mtls_auth".to_string(),
@@ -3410,6 +3413,7 @@ async fn test_cp_rejects_dp_with_empty_version() {
 
 fn create_test_upstream(id: &str, hosts: &[(&str, u16)]) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("upstream-{}", id)),
@@ -3454,6 +3458,7 @@ fn create_test_upstream(id: &str, hosts: &[(&str, u16)]) -> Upstream {
 
 fn create_test_consumer(id: &str, username: &str) -> Consumer {
     Consumer {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),
@@ -7156,6 +7161,7 @@ async fn test_xds_simultaneous_client_disconnect_releases_every_permit() {
 async fn test_cp_refuses_unconstructible_plugin_config_and_dp_reports_rejection() {
     let mut unconstructible = create_test_config(1);
     unconstructible.plugin_configs = vec![PluginConfig {
+        labels: Default::default(),
         id: "rsl-typo".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "request_size_limiting".to_string(),

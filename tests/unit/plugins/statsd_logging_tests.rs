@@ -536,6 +536,7 @@ async fn test_statsd_logging_valid_complete_config_and_open_global_tags_map() {
 fn test_statsd_logging_disabled_config_skips_construction_validation() {
     let mut gateway = GatewayConfig {
         plugin_configs: vec![PluginConfig {
+            labels: Default::default(),
             id: "statsd-disabled".to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "statsd_logging".to_string(),
@@ -571,6 +572,7 @@ async fn test_statsd_logging_optional_fail_open_on_file_mode_load_and_cache_rebu
     .expect("minimal proxy deserializes");
 
     let bad_plugin = PluginConfig {
+        labels: Default::default(),
         id: "statsd-typo".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "statsd_logging".to_string(),

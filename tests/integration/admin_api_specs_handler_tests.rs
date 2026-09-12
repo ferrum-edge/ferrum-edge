@@ -435,6 +435,7 @@ fn manual_proxy_plugin(
     config: Value,
 ) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: plugin_id.to_string(),
         namespace: "ferrum".to_string(),
         plugin_name: plugin_name.to_string(),
@@ -1560,6 +1561,7 @@ async fn delete_rejects_removing_last_global_tcp_throttle_target_with_422() {
     let now = Utc::now();
     store
         .create_plugin_config(&PluginConfig {
+            labels: Default::default(),
             id: throttle_id,
             namespace: "ferrum".to_string(),
             plugin_name: "tcp_connection_throttle".to_string(),
@@ -1820,6 +1822,7 @@ async fn api_spec_post_and_exact_put_validate_against_prospective_schema_graph()
     let store = make_store(&dir).await;
     let schema_name = uid("api-spec-schema");
     let schema_plugin = PluginConfig {
+        labels: Default::default(),
         id: uid("schema-plugin"),
         namespace: "ferrum".to_string(),
         plugin_name: "transaction_log_schema".to_string(),
@@ -1889,6 +1892,7 @@ async fn api_spec_writes_ignore_an_unchanged_invalid_persisted_schema_graph() {
 
     store
         .create_plugin_config(&PluginConfig {
+            labels: Default::default(),
             id: uid("preexisting-dangling-logger"),
             namespace: "ferrum".to_string(),
             plugin_name: "stdout_logging".to_string(),
@@ -1945,6 +1949,7 @@ async fn api_spec_put_and_delete_validate_removed_spec_owned_schema_definitions(
     let schema_id = uid("spec-owned-schema-plugin");
     store
         .create_plugin_config(&PluginConfig {
+            labels: Default::default(),
             id: schema_id.clone(),
             namespace: "ferrum".to_string(),
             plugin_name: "transaction_log_schema".to_string(),
@@ -1977,6 +1982,7 @@ async fn api_spec_put_and_delete_validate_removed_spec_owned_schema_definitions(
     );
     store
         .create_plugin_config(&PluginConfig {
+            labels: Default::default(),
             id: uid("manual-schema-referrer"),
             namespace: "ferrum".to_string(),
             plugin_name: "stdout_logging".to_string(),
@@ -2050,6 +2056,7 @@ async fn api_spec_delete_models_proxy_and_orphaned_group_plugin_cascades() {
     let schema_id = uid("cascade-schema-owner");
     store
         .create_plugin_config(&PluginConfig {
+            labels: Default::default(),
             id: schema_id.clone(),
             namespace: "ferrum".to_string(),
             plugin_name: "transaction_log_schema".to_string(),
@@ -2084,6 +2091,7 @@ async fn api_spec_delete_models_proxy_and_orphaned_group_plugin_cascades() {
 
     let group_logger_id = uid("cascade-group-logger");
     let group_logger = PluginConfig {
+        labels: Default::default(),
         id: group_logger_id.clone(),
         namespace: "ferrum".to_string(),
         plugin_name: "stdout_logging".to_string(),
@@ -2869,6 +2877,7 @@ async fn post_mtls_dns_policy_conflict_returns_409() {
     let dir = TempDir::new().unwrap();
     let store = make_store(&dir).await;
     let mut upper = Consumer {
+        labels: Default::default(),
         id: uid("mtls-upper"),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: uid("mtls-upper-user"),

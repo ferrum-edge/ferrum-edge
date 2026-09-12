@@ -2018,6 +2018,7 @@ mod tests {
 
     fn plugin_config(id: &str, config: Value) -> PluginConfig {
         PluginConfig {
+            labels: Default::default(),
             id: id.to_string(),
             plugin_name: "rate_limiting".to_string(),
             namespace: "ferrum".to_string(),

@@ -17,6 +17,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn make_upstream(id: &str) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         name: None,

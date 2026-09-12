@@ -81,6 +81,7 @@ fn terminal_final_body_dispatch_follows_path_policy_and_precedes_backend_breaker
 
 fn test_proxy() -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: "test".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("Test Proxy".into()),
@@ -967,6 +968,7 @@ fn basic_auth_dispatch_consumer() -> Consumer {
     let password_hash = format!("hmac_sha256:{}", hex::encode(mac.finalize().into_bytes()));
 
     Consumer {
+        labels: Default::default(),
         id: "basic-dispatch-consumer".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "alice".to_string(),
@@ -3326,6 +3328,7 @@ fn test_request_context_effective_identity_prefers_consumer_then_external_identi
     ctx.authenticated_identity = Some("external-user".to_string());
 
     ctx.identified_consumer = Some(Arc::new(Consumer {
+        labels: Default::default(),
         id: "consumer-1".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "mapped-consumer".to_string(),
@@ -3357,6 +3360,7 @@ fn test_request_context_backend_consumer_username_prefers_consumer_then_header_t
     assert_eq!(ctx.backend_consumer_username(), Some("external-user"));
 
     ctx.identified_consumer = Some(Arc::new(Consumer {
+        labels: Default::default(),
         id: "consumer-1".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "mapped-consumer".to_string(),

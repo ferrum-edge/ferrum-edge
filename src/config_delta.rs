@@ -687,6 +687,7 @@ mod tests {
         updated_at: DateTime<Utc>,
     ) -> PluginConfig {
         PluginConfig {
+            labels: Default::default(),
             id: id.to_string(),
             plugin_name: "request_transformer".to_string(),
             namespace: default_namespace(),
@@ -704,6 +705,7 @@ mod tests {
 
     fn consumer(namespace: &str, id: &str, updated_at: DateTime<Utc>) -> Consumer {
         Consumer {
+            labels: Default::default(),
             id: id.to_string(),
             namespace: namespace.to_string(),
             username: format!("{namespace}-{id}"),

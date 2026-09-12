@@ -17,6 +17,7 @@ use serde_json::json;
 
 fn test_proxy() -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: "grpc-test".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("gRPC Test Proxy".into()),

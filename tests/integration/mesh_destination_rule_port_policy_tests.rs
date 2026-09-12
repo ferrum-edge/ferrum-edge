@@ -79,6 +79,7 @@ fn runtime() -> MeshRuntimeConfig {
 fn upstream() -> Upstream {
     let now = Utc::now();
     Upstream {
+        labels: Default::default(),
         id: "reviews-u".to_string(),
         namespace: "default".to_string(),
         name: Some("reviews".to_string()),

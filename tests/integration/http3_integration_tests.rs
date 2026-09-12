@@ -57,6 +57,7 @@ impl Default for Http3TestConfig {
 /// Create a test proxy configuration for HTTP/3
 fn create_http3_test_proxy() -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: "http3-test-proxy".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("HTTP/3 Test Proxy".to_string()),
@@ -871,6 +872,7 @@ async fn test_http3_streaming_decision_logic() {
 
     // --- Case 1: No plugins, no retry → should stream ---
     let proxy_stream = Proxy {
+        labels: Default::default(),
         id: "h3-stream".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("H3 Streaming".to_string()),
@@ -974,6 +976,7 @@ async fn test_http3_streaming_decision_logic() {
         ],
         consumers: vec![],
         plugin_configs: vec![ferrum_edge::config::types::PluginConfig {
+            labels: Default::default(),
             id: "ai-token-metrics-cfg".to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "ai_token_metrics".to_string(),
@@ -1519,6 +1522,7 @@ impl ferrum_edge::plugins::Plugin for H3StickyStalledCommittedHook {
 
 fn create_sticky_cookie_upstream() -> ferrum_edge::config::types::Upstream {
     ferrum_edge::config::types::Upstream {
+        labels: Default::default(),
         id: "sticky-upstream".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("sticky upstream".to_string()),

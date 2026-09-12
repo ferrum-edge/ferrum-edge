@@ -3758,6 +3758,7 @@ mod tests {
     fn test_proxy(connect_timeout_ms: u64) -> Proxy {
         let now = Utc::now();
         Proxy {
+            labels: Default::default(),
             id: "hbone-test".to_string(),
             namespace: crate::config::types::default_namespace(),
             name: None,

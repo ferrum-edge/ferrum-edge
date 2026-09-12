@@ -40,6 +40,7 @@ async fn sqlite_store() -> (Arc<DatabaseStore>, TempDir) {
 
 fn test_proxy(id: &str, listen_path: &str) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         name: Some(format!("proxy-{id}")),
@@ -108,6 +109,7 @@ fn test_proxy(id: &str, listen_path: &str) -> Proxy {
 
 fn test_consumer(id: &str) -> Consumer {
     Consumer {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         username: format!("user-{id}"),

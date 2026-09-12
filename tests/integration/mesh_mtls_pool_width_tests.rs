@@ -125,6 +125,7 @@ fn proxy_for_test(max_connections: Option<u32>) -> Proxy {
         overrides
     });
     Proxy {
+        labels: Default::default(),
         id: "mesh-mtls-pool-width".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("Mesh mTLS pool width".to_string()),

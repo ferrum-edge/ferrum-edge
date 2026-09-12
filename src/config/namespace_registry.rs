@@ -349,6 +349,7 @@ pub const NAMESPACE_RENAME_COPY_TABLES: &[(&str, &[&str])] = &[
     (
         "upstreams",
         &[
+            "labels",
             "id",
             "namespace",
             "name",
@@ -373,6 +374,7 @@ pub const NAMESPACE_RENAME_COPY_TABLES: &[(&str, &[&str])] = &[
     (
         "proxies",
         &[
+            "labels",
             "id",
             "namespace",
             "name",
@@ -432,6 +434,7 @@ pub const NAMESPACE_RENAME_COPY_TABLES: &[(&str, &[&str])] = &[
     (
         "plugin_configs",
         &[
+            "labels",
             "id",
             "namespace",
             "plugin_name",

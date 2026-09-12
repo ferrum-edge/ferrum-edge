@@ -96,6 +96,7 @@ fn svid_slot(bundle: SvidBundle) -> SharedSvidBundle {
 fn proxy_for_test() -> Proxy {
     let now = Utc::now();
     Proxy {
+        labels: Default::default(),
         id: "hbone-width".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("HBONE width".to_string()),

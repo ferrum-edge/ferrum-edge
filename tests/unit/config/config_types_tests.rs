@@ -14,6 +14,7 @@ use std::collections::HashMap;
 /// Helper to create a minimal proxy with required fields.
 fn make_proxy(id: &str, listen_path: &str) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
@@ -84,6 +85,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
 /// Helper to create a minimal consumer.
 fn make_consumer(id: &str, username: &str) -> Consumer {
     Consumer {
+        labels: Default::default(),
         id: id.into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: username.into(),
@@ -98,6 +100,7 @@ fn make_consumer(id: &str, username: &str) -> Consumer {
 /// Helper to create a minimal upstream.
 fn make_upstream(id: &str) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: id.into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
@@ -1001,6 +1004,7 @@ fn mtls_plugin(
     config: serde_json::Value,
 ) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         plugin_name: "mtls_auth".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -1297,6 +1301,7 @@ fn test_unique_listen_paths_valid() {
         version: "1".to_string(),
         proxies: vec![
             Proxy {
+                labels: Default::default(),
                 id: "1".into(),
                 namespace: ferrum_edge::config::types::default_namespace(),
                 name: None,
@@ -1363,6 +1368,7 @@ fn test_unique_listen_paths_valid() {
                 pending_limit_scope: None,
             },
             Proxy {
+                labels: Default::default(),
                 id: "2".into(),
                 namespace: ferrum_edge::config::types::default_namespace(),
                 name: None,
@@ -1445,6 +1451,7 @@ fn test_unique_listen_paths_duplicate() {
         version: "1".to_string(),
         proxies: vec![
             Proxy {
+                labels: Default::default(),
                 id: "1".into(),
                 namespace: ferrum_edge::config::types::default_namespace(),
                 name: None,
@@ -1511,6 +1518,7 @@ fn test_unique_listen_paths_duplicate() {
                 pending_limit_scope: None,
             },
             Proxy {
+                labels: Default::default(),
                 id: "2".into(),
                 namespace: ferrum_edge::config::types::default_namespace(),
                 name: None,
@@ -2775,6 +2783,7 @@ fn sni_plugin_config(
         _ => Some("p1".to_string()),
     };
     PluginConfig {
+        labels: Default::default(),
         id: id.into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: plugin_name.into(),
@@ -3522,6 +3531,7 @@ fn retry_proxy_allows_mesh_route_dispatch_override_upstream() {
         .insert("mesh.hbone".to_string(), "true".to_string());
 
     let dispatch = PluginConfig {
+        labels: Default::default(),
         id: "route-dispatch".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "mesh_route_dispatch".into(),
@@ -3772,6 +3782,7 @@ fn retry_proxy_allows_same_upstream_dispatch_rule_that_adds_retry() {
         .insert("mesh.hbone".to_string(), "true".to_string());
 
     let dispatch = PluginConfig {
+        labels: Default::default(),
         id: "route-dispatch".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "mesh_route_dispatch".into(),
@@ -3825,6 +3836,7 @@ fn retry_proxy_allows_when_local_dispatch_shadows_conflicting_global() {
         .insert("mesh.hbone".to_string(), "true".to_string());
 
     let global_dispatch = PluginConfig {
+        labels: Default::default(),
         id: "global-dispatch".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "mesh_route_dispatch".into(),
@@ -3844,6 +3856,7 @@ fn retry_proxy_allows_when_local_dispatch_shadows_conflicting_global() {
     };
     // Local instance that shadows the global; routes only to the plain upstream.
     let local_dispatch = PluginConfig {
+        labels: Default::default(),
         id: "local-dispatch".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "mesh_route_dispatch".into(),
@@ -3891,6 +3904,7 @@ fn retry_proxy_allows_unshadowed_global_dispatch_to_mesh() {
         .insert("mesh.hbone".to_string(), "true".to_string());
 
     let global_dispatch = PluginConfig {
+        labels: Default::default(),
         id: "global-dispatch".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "mesh_route_dispatch".into(),
@@ -3933,6 +3947,7 @@ fn retry_proxy_allows_foreign_namespace_global_dispatch() {
         .insert("mesh.hbone".to_string(), "true".to_string());
 
     let foreign_dispatch = PluginConfig {
+        labels: Default::default(),
         id: "global-dispatch".into(),
         namespace: "tenant-b".into(),
         plugin_name: "mesh_route_dispatch".into(),
@@ -3980,6 +3995,7 @@ fn route_dispatch_association_resolves_same_namespace_plugin_id() {
         .insert("mesh.hbone".to_string(), "true".to_string());
 
     let foreign_dispatch = PluginConfig {
+        labels: Default::default(),
         id: "shared-dispatch".into(),
         namespace: "tenant-b".into(),
         plugin_name: "mesh_route_dispatch".into(),
@@ -4028,6 +4044,7 @@ fn route_dispatch_association_resolves_same_namespace_plugin_id() {
 #[test]
 fn test_plugin_config_priority_override_valid() {
     let pc = PluginConfig {
+        labels: Default::default(),
         id: "pc1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "rate_limiting".into(),
@@ -4047,6 +4064,7 @@ fn test_plugin_config_priority_override_valid() {
 #[test]
 fn test_plugin_config_priority_override_none_valid() {
     let pc = PluginConfig {
+        labels: Default::default(),
         id: "pc1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "rate_limiting".into(),
@@ -4066,6 +4084,7 @@ fn test_plugin_config_priority_override_none_valid() {
 #[test]
 fn test_plugin_config_priority_override_too_high() {
     let pc = PluginConfig {
+        labels: Default::default(),
         id: "pc1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "rate_limiting".into(),
@@ -4086,6 +4105,7 @@ fn test_plugin_config_priority_override_too_high() {
 #[test]
 fn test_plugin_config_priority_override_boundary() {
     let pc = PluginConfig {
+        labels: Default::default(),
         id: "pc1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "rate_limiting".into(),
@@ -4105,6 +4125,7 @@ fn test_plugin_config_priority_override_boundary() {
 #[test]
 fn test_plugin_config_priority_override_zero() {
     let pc = PluginConfig {
+        labels: Default::default(),
         id: "pc1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "rate_limiting".into(),
@@ -4124,6 +4145,7 @@ fn test_plugin_config_priority_override_zero() {
 #[test]
 fn test_plugin_config_priority_override_serde_roundtrip() {
     let pc = PluginConfig {
+        labels: Default::default(),
         id: "pc1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".into(),
@@ -4176,6 +4198,7 @@ fn test_plugin_config_priority_override_null_in_json() {
 fn test_validate_plugin_references_rejects_global_plugin_association() {
     let mut config = empty_config();
     config.plugin_configs = vec![PluginConfig {
+        labels: Default::default(),
         id: "pc1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".into(),
@@ -4206,6 +4229,7 @@ fn test_validate_plugin_references_rejects_global_plugin_association() {
 fn test_validate_plugin_references_rejects_wrong_proxy_target() {
     let mut config = empty_config();
     config.plugin_configs = vec![PluginConfig {
+        labels: Default::default(),
         id: "pc1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "key_auth".into(),
@@ -4238,6 +4262,7 @@ fn test_validate_plugin_references_rejects_wrong_proxy_target() {
 fn test_validate_plugin_references_accepts_proxy_group_association() {
     let mut config = empty_config();
     config.plugin_configs = vec![PluginConfig {
+        labels: Default::default(),
         id: "pg1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".into(),
@@ -4265,6 +4290,7 @@ fn test_validate_plugin_references_accepts_proxy_group_association() {
 fn test_validate_plugin_references_proxy_group_shared_across_proxies() {
     let mut config = empty_config();
     config.plugin_configs = vec![PluginConfig {
+        labels: Default::default(),
         id: "pg1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".into(),
@@ -4296,6 +4322,7 @@ fn test_validate_plugin_references_proxy_group_shared_across_proxies() {
 fn test_validate_plugin_references_rejects_proxy_group_with_proxy_id() {
     let mut config = empty_config();
     config.plugin_configs = vec![PluginConfig {
+        labels: Default::default(),
         id: "pg1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".into(),
@@ -4321,6 +4348,7 @@ fn test_validate_plugin_references_rejects_proxy_group_with_proxy_id() {
 #[test]
 fn test_plugin_scope_proxy_group_serde_round_trip() {
     let pc = PluginConfig {
+        labels: Default::default(),
         id: "pg1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".into(),
@@ -4526,6 +4554,7 @@ fn test_validate_unique_resource_ids_allows_proxy_upstream_plugin_id_in_differen
     let mut staging_upstream = make_upstream("shared");
     staging_upstream.namespace = "staging".to_string();
     let prod_plugin = PluginConfig {
+        labels: Default::default(),
         id: "shared".into(),
         namespace: "prod".into(),
         plugin_name: "rate_limiting".into(),
@@ -6068,6 +6097,7 @@ fn locality_preference_same_zone_requires_zone_present() {
 
 fn transaction_log_schema_pc(scope: PluginScope, proxy_id: Option<&str>) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: "tls-schema".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "transaction_log_schema".into(),
@@ -6085,6 +6115,7 @@ fn transaction_log_schema_pc(scope: PluginScope, proxy_id: Option<&str>) -> Plug
 
 fn prometheus_metrics_pc(id: &str, scope: PluginScope, proxy_id: Option<&str>) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "prometheus_metrics".into(),
@@ -6239,6 +6270,7 @@ fn api_chargeback_rejects_duplicate_effective_instances_on_one_proxy() {
     config.proxies = vec![proxy];
     config.plugin_configs = vec![
         PluginConfig {
+            labels: Default::default(),
             id: "charge-a".into(),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "api_chargeback".into(),
@@ -6256,6 +6288,7 @@ fn api_chargeback_rejects_duplicate_effective_instances_on_one_proxy() {
             updated_at: Utc::now(),
         },
         PluginConfig {
+            labels: Default::default(),
             id: "charge-b".into(),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "api_chargeback".into(),
@@ -6300,6 +6333,7 @@ async fn api_chargeback_sink_rejects_duplicate_effective_instances_on_one_proxy(
     config.proxies = vec![proxy];
     config.plugin_configs = vec![
         PluginConfig {
+            labels: Default::default(),
             id: "charge-a".into(),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "api_chargeback_sink".into(),
@@ -6318,6 +6352,7 @@ async fn api_chargeback_sink_rejects_duplicate_effective_instances_on_one_proxy(
             updated_at: Utc::now(),
         },
         PluginConfig {
+            labels: Default::default(),
             id: "charge-b".into(),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "api_chargeback_sink".into(),
@@ -6384,6 +6419,7 @@ fn api_chargeback_rejects_conflicting_shared_tunables_in_plugin_references() {
     config.proxies = vec![p1, p2];
     config.plugin_configs = vec![
         PluginConfig {
+            labels: Default::default(),
             id: "charge-a".into(),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "api_chargeback".into(),
@@ -6402,6 +6438,7 @@ fn api_chargeback_rejects_conflicting_shared_tunables_in_plugin_references() {
             updated_at: Utc::now(),
         },
         PluginConfig {
+            labels: Default::default(),
             id: "charge-b".into(),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "api_chargeback".into(),
@@ -6441,6 +6478,7 @@ fn admin_admitted_plugin_scope_implies_runtime_reference_admit() {
     // `validate_plugin_references` but not in `validate_fields`.
     for plugin_name in ferrum_edge::plugins::available_plugins() {
         let pc = PluginConfig {
+            labels: Default::default(),
             id: format!("pc-{plugin_name}"),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: plugin_name.to_string(),
@@ -6487,6 +6525,7 @@ fn admin_admitted_plugin_scope_implies_runtime_reference_admit() {
 
 fn dedup_plugin_config(id: &str, scope: PluginScope, proxy_id: Option<&str>) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "request_deduplication".into(),
@@ -6504,6 +6543,7 @@ fn dedup_plugin_config(id: &str, scope: PluginScope, proxy_id: Option<&str>) -> 
 
 fn mcp_gateway_plugin_config(id: &str, scope: PluginScope, proxy_id: Option<&str>) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "mcp_gateway".into(),
@@ -6852,6 +6892,7 @@ fn a2a_gateway_plugin_config(
     discovery: serde_json::Value,
 ) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "a2a_gateway".into(),

@@ -3436,6 +3436,7 @@ fn cli_config_validation_admits_oidc_without_a_tokio_runtime() {
     ] {
         let config = GatewayConfig {
             plugin_configs: vec![PluginConfig {
+                labels: Default::default(),
                 id: format!("oidc-{case}"),
                 plugin_name: "oidc_relying_party".to_string(),
                 namespace: "default".to_string(),

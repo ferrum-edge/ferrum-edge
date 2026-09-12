@@ -71,6 +71,7 @@ const MAX_GATEWAY_ATTEMPTS: u32 = crate::scaffolding::ports::BIND_DROP_SPAWN_ATT
 
 fn tcp_proxy(listen_port: u16, backend_port: u16) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: PROXY_ID.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("t5b stream tcp proxy".to_string()),

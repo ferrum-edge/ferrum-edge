@@ -36,6 +36,7 @@ fn http_proxy(id: &str, port: u16) -> Proxy {
 
 fn stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,

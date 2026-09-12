@@ -76,6 +76,7 @@ fn plugin_config(
     config: Value,
 ) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         plugin_name: plugin_name.to_string(),

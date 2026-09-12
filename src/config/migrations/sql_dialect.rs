@@ -609,6 +609,7 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS upstreams (
+                labels MEDIUMTEXT NOT NULL DEFAULT ('{}'),
                 id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
                 namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT 'ferrum',
                 name VARCHAR(255) COLLATE utf8mb4_0900_bin,
@@ -634,6 +635,7 @@ impl V001SqlBuilder {
         } else {
             r#"
             CREATE TABLE IF NOT EXISTS upstreams (
+                labels TEXT NOT NULL DEFAULT ('{}'),
                 id TEXT NOT NULL,
                 namespace TEXT NOT NULL DEFAULT 'ferrum',
                 name TEXT,
@@ -1328,6 +1330,7 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS consumers (
+                labels MEDIUMTEXT NOT NULL DEFAULT ('{}'),
                 id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
                 namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT 'ferrum',
                 username VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
@@ -1342,6 +1345,7 @@ impl V001SqlBuilder {
         } else {
             r#"
             CREATE TABLE IF NOT EXISTS consumers (
+                labels TEXT NOT NULL DEFAULT ('{}'),
                 id TEXT NOT NULL,
                 namespace TEXT NOT NULL DEFAULT 'ferrum',
                 username TEXT NOT NULL,
@@ -1419,6 +1423,7 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS proxies (
+                labels MEDIUMTEXT NOT NULL DEFAULT ('{}'),
                 id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
                 namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT 'ferrum',
                 name VARCHAR(255) COLLATE utf8mb4_0900_bin,
@@ -1486,6 +1491,7 @@ impl V001SqlBuilder {
         } else {
             r#"
             CREATE TABLE IF NOT EXISTS proxies (
+                labels TEXT NOT NULL DEFAULT ('{}'),
                 id TEXT NOT NULL,
                 namespace TEXT NOT NULL DEFAULT 'ferrum',
                 name TEXT,
@@ -1557,6 +1563,7 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS plugin_configs (
+                labels MEDIUMTEXT NOT NULL DEFAULT ('{}'),
                 id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
                 namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT 'ferrum',
                 plugin_name VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
@@ -1576,6 +1583,7 @@ impl V001SqlBuilder {
         } else {
             r#"
             CREATE TABLE IF NOT EXISTS plugin_configs (
+                labels TEXT NOT NULL DEFAULT ('{}'),
                 id TEXT NOT NULL,
                 namespace TEXT NOT NULL DEFAULT 'ferrum',
                 plugin_name TEXT NOT NULL,

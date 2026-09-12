@@ -76,3 +76,5 @@ mod udp_amplification_default_tests;
 mod workload_entry_cross_namespace_tests;
 mod workload_entry_local_inbound_slice_tests;
 mod yaml_alias_budget_tests;
+
+mod resource_labels_tests;

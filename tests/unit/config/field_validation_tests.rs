@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 /// Helper to create a minimal valid proxy.
 fn make_proxy(id: &str, listen_path: &str) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
@@ -88,6 +89,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
 
 fn make_consumer(id: &str, username: &str) -> Consumer {
     Consumer {
+        labels: Default::default(),
         id: id.into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: username.into(),
@@ -101,6 +103,7 @@ fn make_consumer(id: &str, username: &str) -> Consumer {
 
 fn make_upstream(id: &str) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: id.into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
@@ -142,6 +145,7 @@ fn make_upstream(id: &str) -> Upstream {
 
 fn make_plugin_config(id: &str) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".into(),
@@ -3246,6 +3250,7 @@ fn test_validate_backend_ip_policy_hostname_skipped() {
 #[test]
 fn test_validate_backend_ip_policy_upstream_target_denied() {
     let upstream = Upstream {
+        labels: Default::default(),
         id: "up1".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("test-upstream".to_string()),
@@ -3302,6 +3307,7 @@ fn test_validate_backend_ip_policy_upstream_target_denied() {
 #[test]
 fn test_validate_backend_ip_policy_mesh_route_dispatch_trims_direct_ip() {
     let plugin = PluginConfig {
+        labels: Default::default(),
         id: "mrd-private-ip".to_string(),
         plugin_name: "mesh_route_dispatch".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),

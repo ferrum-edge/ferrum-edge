@@ -962,6 +962,7 @@ fn mongo_mesh_route_dispatch_upstream_ref_lookup_filters_by_namespace() {
 
 fn ns_upstream(namespace: &str, id: &str) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: namespace.to_string(),
         name: None,
@@ -1003,6 +1004,7 @@ fn ns_upstream(namespace: &str, id: &str) -> Upstream {
 
 fn ns_plugin_config(namespace: &str, id: &str, scope: PluginScope) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: namespace.to_string(),
         plugin_name: "stdout_logging".to_string(),
@@ -1020,6 +1022,7 @@ fn ns_plugin_config(namespace: &str, id: &str, scope: PluginScope) -> PluginConf
 
 fn ns_proxy(namespace: &str, id: &str, listen_path: &str) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: namespace.to_string(),
         name: None,

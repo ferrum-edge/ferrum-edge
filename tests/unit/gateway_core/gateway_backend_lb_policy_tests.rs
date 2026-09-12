@@ -295,6 +295,7 @@ fn sticky_session_cookie_omits_max_age_on_set_cookie() {
 
     // Translated Upstream shape must still pass field validation.
     let upstream = Upstream {
+        labels: Default::default(),
         id: "u1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("u1".into()),

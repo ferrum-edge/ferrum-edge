@@ -839,6 +839,7 @@ async fn malformed_persisted_serverless_url_is_wholly_redacted_from_views_and_au
     let plugin_id = "malformed-serverless-redaction";
     store
         .create_plugin_config(&PluginConfig {
+            labels: Default::default(),
             id: plugin_id.to_string(),
             plugin_name: "serverless_function".to_string(),
             namespace: "ferrum".to_string(),

@@ -5128,6 +5128,7 @@ async fn test_multi_instance_plugin_cache_reload_preserves_ownership() {
             plugin_configs: ids_and_configs
                 .iter()
                 .map(|(id, config, priority)| PluginConfig {
+                    labels: Default::default(),
                     id: (*id).to_string(),
                     namespace: ferrum_edge::config::types::default_namespace(),
                     plugin_name: "compression".to_string(),

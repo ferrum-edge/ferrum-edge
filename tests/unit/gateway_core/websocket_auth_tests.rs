@@ -18,6 +18,7 @@ const VALID_API_KEY: &str = "ws-valid-api-key-112233";
 
 fn keyauth_proxy() -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: PROXY_ID.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("WebSocket secured proxy".to_string()),
@@ -88,6 +89,7 @@ fn keyauth_proxy() -> Proxy {
 
 fn keyauth_plugin_config() -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: PLUGIN_ID.to_string(),
         plugin_name: "key_auth".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -114,6 +116,7 @@ fn keyauth_consumer() -> Consumer {
     );
 
     Consumer {
+        labels: Default::default(),
         id: "consumer-ws-client".to_string(),
         username: "ws-test-client".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),

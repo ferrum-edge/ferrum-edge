@@ -39,6 +39,7 @@ async fn sqlite_store() -> (DatabaseStore, TempDir) {
 
 fn named_upstream(namespace: &str, id: &str, name: Option<&str>) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: namespace.to_string(),
         name: name.map(str::to_string),

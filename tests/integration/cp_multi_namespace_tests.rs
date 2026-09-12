@@ -75,6 +75,7 @@ fn mint_token_with_ns_and_audience(
 /// the giant Proxy fixture from cp_dp_grpc_tests.rs.
 fn proxy_in(id: &str, namespace: &str) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: namespace.to_string(),
         name: Some(id.to_string()),

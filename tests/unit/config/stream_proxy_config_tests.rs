@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 
 fn make_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
@@ -81,6 +82,7 @@ fn make_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
 
 fn make_http_proxy(id: &str, listen_path: &str) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,

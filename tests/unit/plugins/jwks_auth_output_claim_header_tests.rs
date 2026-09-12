@@ -33,6 +33,7 @@ fn ctx() -> RequestContext {
 
 fn consumer_index() -> ConsumerIndex {
     ConsumerIndex::new(&[Consumer {
+        labels: Default::default(),
         id: "alice-id".to_string(),
         username: "alice".to_string(),
         namespace: default_namespace(),

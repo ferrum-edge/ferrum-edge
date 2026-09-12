@@ -25,6 +25,7 @@ fn fixture_timestamp() -> DateTime<Utc> {
 fn make_proxy(namespace: &str, id: &str, listen_path: &str) -> Proxy {
     let now = fixture_timestamp();
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: namespace.to_string(),
         name: None,
@@ -94,6 +95,7 @@ fn make_proxy(namespace: &str, id: &str, listen_path: &str) -> Proxy {
 fn make_upstream(namespace: &str, id: &str, host: &str) -> Upstream {
     let now = fixture_timestamp();
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: namespace.to_string(),
         name: None,
@@ -136,6 +138,7 @@ fn make_upstream(namespace: &str, id: &str, host: &str) -> Upstream {
 fn make_plugin_config(namespace: &str, id: &str) -> PluginConfig {
     let now = fixture_timestamp();
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: namespace.to_string(),
         plugin_name: "request_transformer".to_string(),
@@ -154,6 +157,7 @@ fn make_plugin_config(namespace: &str, id: &str) -> PluginConfig {
 fn make_consumer(namespace: &str, id: &str) -> Consumer {
     let now = fixture_timestamp();
     Consumer {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: namespace.to_string(),
         username: format!("{namespace}-{id}"),

@@ -12,6 +12,7 @@ pub mod mesh_remote_clusters;
 pub mod mesh_slice_drift;
 pub mod metrics;
 pub mod plugin_config_projection;
+pub mod provisioning;
 pub mod spec_codec;
 mod tls_management;
 
@@ -3772,6 +3773,42 @@ async fn handle_admin_request_inner(
     } else {
         1
     };
+    let labels_create_route = method == Method::POST
+        && matches!(
+            segments_peek.as_slice(),
+            ["proxies"]
+                | ["consumers"]
+                | ["upstreams"]
+                | ["plugins", "config"]
+                | ["batch"]
+                | ["restore"]
+        );
+    // The header lives in the request line, so it is validated before the
+    // shared body read below. The route's own role gate is replayed here first
+    // so a malformed header can never preempt the `403` the arm would return
+    // (the same rule pagination follows above); the in-arm gates remain
+    // authoritative and simply re-run idempotently.
+    let provisioner = if labels_create_route {
+        if let Some(Some(role)) = body_consuming_route_role(&method, segments_peek.as_slice())
+            && let Some(resp) = require_admin_role(&auth, role)
+        {
+            drop(req.into_body());
+            return Ok(resp);
+        }
+        match provisioning::provisioner(req.headers()) {
+            Ok(value) => value,
+            Err(error) => {
+                drop(req.into_body());
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": error}),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
     let body_bytes = match body_consuming_route_role(&method, segments_peek.as_slice()) {
         Some(required_role) => {
             if let Some(role) = required_role
@@ -3882,6 +3919,7 @@ async fn handle_admin_request_inner(
                 &body_bytes,
                 &namespace,
                 route_live_apply_mode!(),
+                provisioner.as_deref(),
             )
             .await
         }
@@ -3929,6 +3967,7 @@ async fn handle_admin_request_inner(
                 &body_bytes,
                 &namespace,
                 route_live_apply_mode!(),
+                provisioner.as_deref(),
             )
             .await
         }
@@ -4041,6 +4080,7 @@ async fn handle_admin_request_inner(
                 &body_bytes,
                 &namespace,
                 route_live_apply_mode!(),
+                provisioner.as_deref(),
             )
             .await
         }
@@ -4091,6 +4131,7 @@ async fn handle_admin_request_inner(
                 &body_bytes,
                 &namespace,
                 route_live_apply_mode!(),
+                provisioner.as_deref(),
             )
             .await
         }
@@ -4157,6 +4198,7 @@ async fn handle_admin_request_inner(
                 &body_bytes,
                 &namespace,
                 route_live_apply_mode!(),
+                provisioner.as_deref(),
             )
             .await
         }
@@ -4220,6 +4262,7 @@ async fn handle_admin_request_inner(
                 &body_bytes,
                 &namespace,
                 route_live_apply_mode!(),
+                provisioner.as_deref(),
             )
             .await
         }
@@ -4265,7 +4308,15 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            handle_restore(&state, &auth, &body_bytes, query.as_deref(), &namespace).await
+            handle_restore(
+                &state,
+                &auth,
+                &body_bytes,
+                query.as_deref(),
+                &namespace,
+                provisioner.as_deref(),
+            )
+            .await
         }
 
         // Audit log
@@ -8175,6 +8226,7 @@ async fn handle_batch_create(
     body: &[u8],
     namespace: &str,
     apply_mode: LiveApplyMode,
+    provisioner: Option<&str>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
@@ -8213,6 +8265,14 @@ async fn handle_batch_create(
             ));
         }
     };
+    provisioning::stamp_resources(
+        &mut batch.proxies,
+        &mut batch.consumers,
+        &mut batch.upstreams,
+        &mut batch.plugin_configs,
+        provisioner,
+        false,
+    );
 
     let now = Utc::now();
     let validation_ctx = crud::ValidationCtx::from_state(state);
@@ -9533,6 +9593,7 @@ async fn handle_restore(
     body: &[u8],
     query: Option<&str>,
     namespace: &str,
+    provisioner: Option<&str>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let apply_mode = match parse_live_apply_mode_query(query) {
         Ok(mode) => mode,
@@ -9595,6 +9656,14 @@ async fn handle_restore(
             ));
         }
     };
+    provisioning::stamp_resources(
+        &mut payload.proxies,
+        &mut payload.consumers,
+        &mut payload.upstreams,
+        &mut payload.plugin_configs,
+        provisioner,
+        true,
+    );
 
     // Validate config version compatibility when present
     if !payload.version.is_empty()

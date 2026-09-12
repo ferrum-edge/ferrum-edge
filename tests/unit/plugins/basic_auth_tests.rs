@@ -76,6 +76,7 @@ fn create_basic_auth_consumer() -> ferrum_edge::config::types::Consumer {
     );
 
     ferrum_edge::config::types::Consumer {
+        labels: Default::default(),
         id: "basic-consumer".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "testuser".to_string(),
@@ -102,6 +103,7 @@ fn create_basic_auth_consumer_with_hash(
     );
 
     ferrum_edge::config::types::Consumer {
+        labels: Default::default(),
         id: format!("{username}-consumer"),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),
@@ -411,6 +413,7 @@ async fn test_basic_auth_rejects_non_hmac_hash() {
     );
 
     let consumer = ferrum_edge::config::types::Consumer {
+        labels: Default::default(),
         id: "non-hmac-consumer".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "nonhmacuser".to_string(),
@@ -502,6 +505,7 @@ fn create_basic_auth_consumer_with_two_passwords() -> ferrum_edge::config::types
     );
 
     ferrum_edge::config::types::Consumer {
+        labels: Default::default(),
         id: "basic-consumer".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "testuser".to_string(),
@@ -575,6 +579,7 @@ fn timing_consumer_with_hashes(hashes: Vec<String>) -> ferrum_edge::config::type
     use std::collections::HashMap;
 
     ferrum_edge::config::types::Consumer {
+        labels: Default::default(),
         id: "basic-timing".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "alice".to_string(),

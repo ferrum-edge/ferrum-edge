@@ -164,6 +164,7 @@ fn is_mysql_lock_deadlock(error: &anyhow::Error) -> bool {
 
 fn make_namespace_upstream(namespace: &str, id: &str) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: namespace.to_string(),
         name: Some(format!("{namespace}-{id}")),
@@ -205,6 +206,7 @@ fn make_namespace_upstream(namespace: &str, id: &str) -> Upstream {
 
 fn make_consumer(namespace: &str, id: &str, username: &str) -> Consumer {
     Consumer {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: namespace.to_string(),
         username: username.to_string(),

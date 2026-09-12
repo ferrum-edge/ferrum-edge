@@ -47,6 +47,7 @@ fn make_upstream(
     sd: Option<ServiceDiscoveryConfig>,
 ) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         name: None,

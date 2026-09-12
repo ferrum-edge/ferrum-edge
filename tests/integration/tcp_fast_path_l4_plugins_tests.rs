@@ -74,6 +74,7 @@ const PER_ATTEMPT_STARTED_TIMEOUT: Duration = Duration::from_secs(2);
 /// path that has no plugin loop of its own).
 fn fast_path_tcp_proxy(listen_port: u16, backend_port: u16, plugin_config_ids: &[String]) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: PROXY_ID.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("fast-path tcp throttle".to_string()),
@@ -161,6 +162,7 @@ fn fast_path_tcp_proxy(listen_port: u16, backend_port: u16, plugin_config_ids: &
 /// observability surface we use to verify both lifecycle hooks fired.
 fn throttle_plugin_config() -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: PLUGIN_CONFIG_ID.to_string(),
         plugin_name: "tcp_connection_throttle".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),

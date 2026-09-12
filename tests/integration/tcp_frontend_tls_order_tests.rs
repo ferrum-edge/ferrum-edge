@@ -53,6 +53,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn tcp_tls_proxy(listen_port: u16, backend_port: u16, plugin_config_ids: &[String]) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: PROXY_ID.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("frontend tls ordering".to_string()),
@@ -126,6 +127,7 @@ fn tcp_tls_proxy(listen_port: u16, backend_port: u16, plugin_config_ids: &[Strin
 
 fn deny_localhost_plugin_config() -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: DENY_LOCALHOST_PLUGIN_ID.to_string(),
         plugin_name: "ip_restriction".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -146,6 +148,7 @@ fn deny_localhost_plugin_config() -> PluginConfig {
 
 fn allow_localhost_plugin_config() -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: ALLOW_LOCALHOST_PLUGIN_ID.to_string(),
         plugin_name: "ip_restriction".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -166,6 +169,7 @@ fn allow_localhost_plugin_config() -> PluginConfig {
 
 fn stdout_logging_plugin_config() -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: STDOUT_LOGGING_PLUGIN_ID.to_string(),
         plugin_name: "stdout_logging".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),

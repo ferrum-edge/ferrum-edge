@@ -557,6 +557,7 @@ fn make_consumer(
     credentials: std::collections::HashMap<String, serde_json::Value>,
 ) -> ferrum_edge::config::types::Consumer {
     ferrum_edge::config::types::Consumer {
+        labels: Default::default(),
         id: "test-consumer".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "test-user".to_string(),
@@ -625,6 +626,7 @@ fn test_basic_credential_server_configuration_failures_are_internal_errors() {
 fn test_disabled_basic_auth_config_skips_plugin_construction() {
     let now = chrono::Utc::now();
     let mut plugin_config = ferrum_edge::config::types::PluginConfig {
+        labels: Default::default(),
         id: "disabled-basic-auth".to_string(),
         plugin_name: "basic_auth".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -712,6 +714,7 @@ fn restore_admission_covers_batch_contracts_before_the_namespace_clear() {
 fn test_disabled_unknown_plugin_name_remains_invalid() {
     let now = chrono::Utc::now();
     let plugin_config = ferrum_edge::config::types::PluginConfig {
+        labels: Default::default(),
         id: "disabled-unknown-plugin".to_string(),
         plugin_name: "not_a_registered_plugin".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -745,6 +748,7 @@ fn test_admin_stdout_logging_validation_rejects_unknown_paths() {
         ),
     ] {
         let plugin_config = ferrum_edge::config::types::PluginConfig {
+            labels: Default::default(),
             id: format!("invalid-{path}"),
             plugin_name: "stdout_logging".to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
@@ -772,6 +776,7 @@ fn test_admin_stdout_logging_validation_preserves_null_defaults() {
         .enumerate()
     {
         let plugin_config = ferrum_edge::config::types::PluginConfig {
+            labels: Default::default(),
             id: format!("stdout-null-default-{index}"),
             plugin_name: "stdout_logging".to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
@@ -825,6 +830,7 @@ fn test_admin_transaction_log_schema_rejects_unknown_closed_object_keys() {
         ),
     ] {
         let plugin_config = ferrum_edge::config::types::PluginConfig {
+            labels: Default::default(),
             id: id.to_string(),
             plugin_name: "transaction_log_schema".to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
@@ -1034,6 +1040,7 @@ fn recovery_plugin(
     config: serde_json::Value,
 ) -> ferrum_edge::config::types::PluginConfig {
     ferrum_edge::config::types::PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: plugin_name.to_string(),

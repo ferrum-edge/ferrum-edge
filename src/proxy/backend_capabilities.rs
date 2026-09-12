@@ -990,6 +990,7 @@ mod tests {
     fn minimal_proxy() -> Proxy {
         let now = Utc::now();
         Proxy {
+            labels: Default::default(),
             id: "p1".to_string(),
             namespace: crate::config::types::default_namespace(),
             name: None,

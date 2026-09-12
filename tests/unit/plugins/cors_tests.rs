@@ -2483,6 +2483,7 @@ fn cors_plugin_config(
     proxy_id: Option<&str>,
 ) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".to_string(),

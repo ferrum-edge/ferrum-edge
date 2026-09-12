@@ -19,6 +19,26 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 use std::time::SystemTime;
 
+/// Informational labels are never routing selectors or proof of ownership.
+/// Bounds keep labels small enough for every supported database backend.
+pub fn validate_resource_labels(labels: &BTreeMap<String, String>) -> Result<(), String> {
+    if labels.len() > 64 {
+        return Err("labels must not have more than 64 entries".to_string());
+    }
+    for (key, value) in labels {
+        if key.trim().is_empty() || key.len() > 128 || key.chars().any(char::is_control) {
+            return Err("labels keys must be nonblank, at most 128 UTF-8 bytes, and contain no control characters".to_string());
+        }
+        if value.len() > 512 || value.chars().any(char::is_control) {
+            return Err(
+                "labels values must be at most 512 UTF-8 bytes and contain no control characters"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Maximum length for resource IDs.
 pub(crate) const MAX_ID_LENGTH: usize = 254;
 
@@ -1804,6 +1824,9 @@ impl BackendTlsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Upstream {
+    /// Operator metadata, independent of routing, credentials and API-spec ownership.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub id: String,
     #[serde(default)]
@@ -2584,6 +2607,9 @@ pub enum PluginScope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Proxy {
+    /// Operator metadata, independent of routing, credentials and API-spec ownership.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub id: String,
     #[serde(default)]
@@ -2997,6 +3023,9 @@ pub struct PluginAssociation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Consumer {
+    /// Operator metadata, independent of routing, credentials and API-spec ownership.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub id: String,
     pub username: String,
@@ -3022,6 +3051,9 @@ pub struct Consumer {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginConfig {
+    /// Operator metadata, independent of routing, credentials and API-spec ownership.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub id: String,
     pub plugin_name: String,
@@ -7765,6 +7797,9 @@ impl Proxy {
         cert_expiry_warning_days: u64,
     ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+        if let Err(error) = validate_resource_labels(&self.labels) {
+            errors.push(error);
+        }
         // `validate_fields_inner` runs on a serde-deserialized Proxy BEFORE
         // `normalize_fields()` populates `dispatch_kind` (file_loader's
         // pipeline orders field validation first, normalization second).
@@ -8464,6 +8499,9 @@ impl Consumer {
     /// Validate all fields of a consumer for correctness and safe lengths.
     pub fn validate_fields(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+        if let Err(error) = validate_resource_labels(&self.labels) {
+            errors.push(error);
+        }
 
         // Username
         if self.username.trim().is_empty() {
@@ -9118,6 +9156,9 @@ impl Upstream {
     /// Validate all fields of an upstream for correctness and safe lengths.
     pub fn validate_fields(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+        if let Err(error) = validate_resource_labels(&self.labels) {
+            errors.push(error);
+        }
 
         if self.targets.is_empty() && self.service_discovery.is_none() {
             errors.push("must have at least one target or service_discovery".to_string());
@@ -9771,6 +9812,9 @@ impl PluginConfig {
     /// Validate all fields of a plugin config for correctness and safe lengths.
     pub fn validate_fields(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+        if let Err(error) = validate_resource_labels(&self.labels) {
+            errors.push(error);
+        }
 
         // Plugin name length (should already be validated against known plugins,
         // but enforce a length limit as defense-in-depth)

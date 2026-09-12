@@ -57,6 +57,7 @@ fn overlay(key: &str, enabled: bool) -> MeshRuntimeOverlay {
 
 fn test_proxy(id: &str, plugin_ids: &[&str]) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         name: Some(id.to_string()),
@@ -130,6 +131,7 @@ fn test_proxy(id: &str, plugin_ids: &[&str]) -> Proxy {
 
 fn plugin_config(id: &str, plugin_name: &str, config: Value) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         plugin_name: plugin_name.to_string(),

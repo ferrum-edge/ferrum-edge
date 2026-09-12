@@ -34,6 +34,7 @@ fn ctx() -> RequestContext {
 
 fn consumer(id: &str, username: &str) -> Consumer {
     Consumer {
+        labels: Default::default(),
         id: id.to_string(),
         username: username.to_string(),
         namespace: default_namespace(),

@@ -2520,6 +2520,10 @@ pub(crate) trait AdminResource:
         Ok(())
     }
 
+    fn labels_mut(&mut self) -> Option<&mut std::collections::BTreeMap<String, String>> {
+        None
+    }
+
     fn prepare_for_update(&mut self, _existing: &Self) {}
 
     /// Presence-aware repair for fields whose serde default is unsafe on a full
@@ -2862,6 +2866,7 @@ pub(crate) async fn handle_create<R: AdminResource>(
     body: &[u8],
     namespace: &str,
     apply_mode: LiveApplyMode,
+    provisioner: Option<&str>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     handle_write::<R>(
         state,
@@ -2870,6 +2875,7 @@ pub(crate) async fn handle_create<R: AdminResource>(
         namespace,
         WriteAction::Create,
         apply_mode,
+        provisioner,
     )
     .await
 }
@@ -2889,6 +2895,7 @@ pub(crate) async fn handle_update<R: AdminResource>(
         namespace,
         WriteAction::Update { id },
         apply_mode,
+        None,
     )
     .await
 }
@@ -3472,6 +3479,20 @@ pub(crate) async fn check_credential_value_uniqueness(
 
 #[async_trait::async_trait]
 impl AdminResource for Upstream {
+    fn labels_mut(&mut self) -> Option<&mut std::collections::BTreeMap<String, String>> {
+        Some(&mut self.labels)
+    }
+
+    fn restore_absent_update_fields(
+        &mut self,
+        existing: &Self,
+        raw: &serde_json::Map<String, serde_json::Value>,
+    ) {
+        if !raw.contains_key("labels") {
+            self.labels = existing.labels.clone();
+        }
+    }
+
     const RESOURCE_NAME: &'static str = "upstream";
     const RESOURCE_LABEL: &'static str = "Upstream";
     const VALIDATION_ERROR_LABEL: &'static str = "upstream fields";
@@ -3886,6 +3907,20 @@ pub(crate) const GATEWAY_TRUST_BUNDLE_SINGLETON_CONFLICT_MESSAGE: &str =
 
 #[async_trait::async_trait]
 impl AdminResource for PluginConfig {
+    fn labels_mut(&mut self) -> Option<&mut std::collections::BTreeMap<String, String>> {
+        Some(&mut self.labels)
+    }
+
+    fn restore_absent_update_fields(
+        &mut self,
+        existing: &Self,
+        raw: &serde_json::Map<String, serde_json::Value>,
+    ) {
+        if !raw.contains_key("labels") {
+            self.labels = existing.labels.clone();
+        }
+    }
+
     const RESOURCE_NAME: &'static str = "plugin config";
     const RESOURCE_LABEL: &'static str = "Plugin config";
     const VALIDATION_ERROR_LABEL: &'static str = "plugin config fields";
@@ -4374,6 +4409,10 @@ async fn enabled_prometheus_metrics_owner_exists_inner(
 
 #[async_trait::async_trait]
 impl AdminResource for Proxy {
+    fn labels_mut(&mut self) -> Option<&mut std::collections::BTreeMap<String, String>> {
+        Some(&mut self.labels)
+    }
+
     const RESOURCE_NAME: &'static str = "proxy";
     const RESOURCE_LABEL: &'static str = "Proxy";
     const VALIDATION_ERROR_LABEL: &'static str = "proxy fields";
@@ -4391,6 +4430,10 @@ impl AdminResource for Proxy {
         existing: &Self,
         raw: &serde_json::Map<String, serde_json::Value>,
     ) {
+        if !raw.contains_key("labels") {
+            self.labels = existing.labels.clone();
+        }
+
         if !raw.contains_key("plugins") {
             self.plugins = existing.plugins.clone();
         }
@@ -5065,6 +5108,20 @@ impl AdminResource for Proxy {
 
 #[async_trait::async_trait]
 impl AdminResource for Consumer {
+    fn labels_mut(&mut self) -> Option<&mut std::collections::BTreeMap<String, String>> {
+        Some(&mut self.labels)
+    }
+
+    fn restore_absent_update_fields(
+        &mut self,
+        existing: &Self,
+        raw: &serde_json::Map<String, serde_json::Value>,
+    ) {
+        if !raw.contains_key("labels") {
+            self.labels = existing.labels.clone();
+        }
+    }
+
     const RESOURCE_NAME: &'static str = "consumer";
     const RESOURCE_LABEL: &'static str = "Consumer";
     const VALIDATION_ERROR_LABEL: &'static str = "consumer fields";
@@ -5308,6 +5365,7 @@ async fn handle_write<R: AdminResource>(
     namespace: &str,
     action: WriteAction<'_>,
     apply_mode: LiveApplyMode,
+    provisioner: Option<&str>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
@@ -5358,6 +5416,11 @@ async fn handle_write<R: AdminResource>(
             ));
         }
     };
+    if matches!(action, WriteAction::Create)
+        && let Some(labels) = resource.labels_mut()
+    {
+        super::provisioning::stamp(labels, provisioner);
+    }
 
     let mut undecodable_update_repair = false;
     let existing = match action {

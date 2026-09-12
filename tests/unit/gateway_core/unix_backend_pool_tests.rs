@@ -95,6 +95,7 @@ fn roots(root: &Path) -> Vec<String> {
 
 fn test_proxy(id: &str) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,

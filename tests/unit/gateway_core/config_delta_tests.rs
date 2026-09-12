@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 fn make_proxy(id: &str, listen_path: &str, updated_at: DateTime<Utc>) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         name: None,
@@ -77,6 +78,7 @@ fn make_proxy(id: &str, listen_path: &str, updated_at: DateTime<Utc>) -> Proxy {
 
 fn make_upstream(id: &str, targets: Vec<UpstreamTarget>, updated_at: DateTime<Utc>) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         name: None,
@@ -128,6 +130,7 @@ fn make_plugin_config(
     updated_at: DateTime<Utc>,
 ) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         plugin_name: name.to_string(),
@@ -145,6 +148,7 @@ fn make_plugin_config(
 
 fn make_consumer(id: &str, username: &str, updated_at: DateTime<Utc>) -> Consumer {
     Consumer {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         username: username.to_string(),

@@ -34,6 +34,7 @@ fn mesh_target(host: &str, port: u16, tags: &[(&str, &str)]) -> UpstreamTarget {
 
 fn upstream_with_target(id: &str, target: UpstreamTarget, updated_at: DateTime<Utc>) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         name: None,
@@ -67,6 +68,7 @@ fn upstream_with_target(id: &str, target: UpstreamTarget, updated_at: DateTime<U
 
 fn proxy_for_upstream(id: &str, upstream_id: &str, updated_at: DateTime<Utc>) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         name: None,

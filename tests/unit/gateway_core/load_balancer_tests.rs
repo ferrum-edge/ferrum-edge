@@ -224,6 +224,7 @@ fn test_load_balancer_cache() {
     let config = GatewayConfig {
         version: "1".to_string(),
         upstreams: vec![Upstream {
+            labels: Default::default(),
             id: "us1".into(),
             namespace: ferrum_edge::config::types::default_namespace(),
             name: Some("test".into()),
@@ -609,6 +610,7 @@ fn test_least_latency_cache_record_and_select() {
     let config = GatewayConfig {
         version: "1".to_string(),
         upstreams: vec![Upstream {
+            labels: Default::default(),
             id: "us1".into(),
             namespace: ferrum_edge::config::types::default_namespace(),
             name: Some("test".into()),
@@ -1239,6 +1241,7 @@ fn test_load_balancer_cache_get_hash_on_strategy() {
     let config = GatewayConfig {
         version: "1".to_string(),
         upstreams: vec![Upstream {
+            labels: Default::default(),
             id: "us1".into(),
             namespace: ferrum_edge::config::types::default_namespace(),
             name: Some("test".into()),
@@ -1359,6 +1362,7 @@ fn test_load_balancer_cache_get_subset_hash_on_strategy() {
 
 fn make_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("upstream-{}", id)),
@@ -3109,6 +3113,7 @@ fn least_latency_passive_recovery_does_not_restore_warmup_bias() {
     let targets = make_targets(2);
     let config = GatewayConfig {
         upstreams: vec![Upstream {
+            labels: Default::default(),
             id: TEST_UPSTREAM.into(),
             namespace: ferrum_edge::config::types::default_namespace(),
             name: Some("ll".into()),

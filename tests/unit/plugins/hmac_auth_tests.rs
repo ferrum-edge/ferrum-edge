@@ -59,6 +59,7 @@ fn create_hmac_consumer_named(id: &str, username: &str, secret: &str) -> Consume
     );
 
     Consumer {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),
@@ -81,6 +82,7 @@ fn create_consumer_without_hmac_creds() -> Consumer {
     );
 
     Consumer {
+        labels: Default::default(),
         id: "no-hmac-consumer".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "nokeyuser".to_string(),
@@ -1593,6 +1595,7 @@ fn create_hmac_consumer_with_secrets(secrets: &[&str]) -> Consumer {
     credentials.insert("hmac_auth".to_string(), Value::Array(arr));
 
     Consumer {
+        labels: Default::default(),
         id: "hmac-consumer".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "hmacuser".to_string(),
