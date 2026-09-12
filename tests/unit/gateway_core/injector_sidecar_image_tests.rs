@@ -59,8 +59,8 @@ fn injected_container_images(config: &InjectorConfig) -> Vec<String> {
             }
         }
     });
-    let response = admission_response(review.to_string().as_bytes(), config)
-        .expect("admission response");
+    let response =
+        admission_response(review.to_string().as_bytes(), config).expect("admission response");
     assert_eq!(
         response.pointer("/response/allowed"),
         Some(&Value::Bool(true)),
