@@ -191,6 +191,12 @@ cargo test
 cargo test -- --ignored  # includes E2E tests
 ```
 
+Unit tests isolate ambient `FERRUM_*` variables automatically through
+`tests/unit/env_lock.rs`. Running a local `ferrum-edge` gateway in the same
+shell is safe: guarded unit tests snapshot, clear, and restore every `FERRUM_*`
+key so host environment cannot poison assertions. A test that needs a specific
+`FERRUM_*` value must set it explicitly inside the guard.
+
 ### Test Coverage
 
 - Write tests for new functionality

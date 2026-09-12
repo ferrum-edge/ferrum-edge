@@ -13,35 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use tempfile::NamedTempFile;
 
-use crate::unit::env_lock::ENV_LOCK;
-
-/// Helper to set env vars, run an async closure, then clean them up.
-fn with_env_vars_async<F, Fut>(vars: &[(&str, &str)], f: F)
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = ()>,
-{
-    let _guard = ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for (k, v) in vars {
-        // SAFETY: We hold a mutex preventing concurrent access.
-        unsafe {
-            std::env::set_var(k, v);
-        }
-    }
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(f());
-    for (k, _) in vars {
-        // SAFETY: We hold a mutex preventing concurrent access.
-        unsafe {
-            std::env::remove_var(k);
-        }
-    }
-}
+use crate::unit::env_lock::{EnvGuard, with_env_vars_async};
 
 #[test]
 fn test_resolve_secret_from_env_var() {
@@ -529,7 +501,7 @@ fn test_resolve_all_env_secrets_reports_first_unsupported_suffix_deterministical
 /// `secrets::file_tests::file_secret_reads_use_detached_os_thread_not_spawn_blocking`.
 ///
 /// The env vars are set and left in place for the worker (which only reads
-/// them) and are cleared after the bounded wait; `ENV_LOCK` is held throughout.
+/// them) and are cleared after the bounded wait; `EnvGuard` is held throughout.
 #[cfg(unix)]
 fn assert_non_regular_file_source_fails_immediately_and_tears_down<F>(
     file_env_key: &str,
@@ -556,13 +528,9 @@ fn assert_non_regular_file_source_fails_immediately_and_tears_down<F>(
         return;
     }
 
-    let _guard = ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // SAFETY: ENV_LOCK is held for the whole test, including the worker thread.
-    unsafe {
-        std::env::set_var(file_env_key, &fifo);
-    }
+    let env = EnvGuard::new(&[]);
+    let fifo_path = fifo.to_string_lossy().into_owned();
+    env.set(file_env_key, &fifo_path);
 
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
@@ -573,10 +541,7 @@ fn assert_non_regular_file_source_fails_immediately_and_tears_down<F>(
 
     let received = receiver.recv_timeout(WATCHDOG);
 
-    // SAFETY: ENV_LOCK is still held.
-    unsafe {
-        std::env::remove_var(file_env_key);
-    }
+    env.unset(file_env_key);
 
     let (result, elapsed) = received.expect(
         "resolution and runtime teardown must complete; a non-regular _FILE source \
