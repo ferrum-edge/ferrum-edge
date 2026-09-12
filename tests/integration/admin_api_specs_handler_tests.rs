@@ -759,6 +759,108 @@ async fn post_happy_path_returns_201_with_id() {
 }
 
 #[tokio::test]
+async fn post_swagger_with_listen_path_persists_a_working_validator() {
+    use ferrum_edge::plugins::{
+        Plugin, PluginResult, RequestContext, openapi_validator::OpenapiValidator,
+    };
+    use std::collections::HashMap;
+
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("mounted-validator");
+    let spec = format!(
+        r#"swagger: "2.0"
+info:
+  title: Mounted API
+  version: "1.0.0"
+x-ferrum-validate: true
+x-ferrum-proxy:
+  id: {proxy_id}
+  listen_path: /p2/oas2
+  backend_host: backend.internal
+  backend_port: 8080
+consumes: [application/json]
+paths:
+  /items:
+    post:
+      parameters:
+        - name: body
+          in: body
+          required: true
+          schema:
+            type: object
+            required: [name]
+            properties:
+              name:
+                type: string
+      responses:
+        "201":
+          description: created
+"#
+    );
+    let (status, body) = client.post_yaml("/api-specs", &spec).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "body: {body}");
+    let spec_id = body["id"].as_str().unwrap();
+    let generated = store
+        .list_spec_owned_plugin_configs("ferrum", spec_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|plugin| plugin.plugin_name == "openapi_validator")
+        .expect("POST must persist the generated validator");
+    assert_eq!(
+        generated.config["operations"][0]["path_template"],
+        "/p2/oas2/items"
+    );
+    assert_eq!(
+        generated.config["operations"][0]["path_regex"],
+        "^/p2/oas2/items$"
+    );
+    let proxy = store.get_proxy("ferrum", &proxy_id).await.unwrap().unwrap();
+    assert!(
+        proxy
+            .plugins
+            .iter()
+            .any(|association| association.plugin_config_id == generated.id)
+    );
+    let proxy = Arc::new(proxy);
+    let plugin = OpenapiValidator::new(&generated.config).unwrap();
+    for (path, body, allowed) in [
+        ("/p2/oas2/items", r#"{"name":"book"}"#, true),
+        ("/p2/oas2/items", "{}", false),
+        ("/p2/oas2/unknown", r#"{"name":"book"}"#, false),
+        ("/items", r#"{"name":"book"}"#, false),
+    ] {
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "POST".into(), path.into());
+        ctx.matched_proxy = Some(Arc::clone(&proxy));
+        let mut headers = HashMap::from([("content-type".into(), "application/json".into())]);
+        ctx.headers = headers.clone();
+        let mut result = plugin
+            .validate_client_request_body_contract(&mut ctx, &headers, body.as_bytes())
+            .await;
+        if matches!(result, PluginResult::Continue) {
+            result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        }
+        if allowed {
+            assert!(matches!(result, PluginResult::Continue), "{path}: {result:?}");
+            assert_eq!(
+                ctx.metadata
+                    .get("openapi_validator.matched_operation")
+                    .map(String::as_str),
+                Some("POST /p2/oas2/items")
+            );
+        } else {
+            match result {
+                PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 400),
+                other => panic!("{path} must reject: {other:?}"),
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn post_returns_id_that_can_be_fetched() {
     let dir = TempDir::new().unwrap();
     let store = make_store(&dir).await;

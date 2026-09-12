@@ -487,6 +487,62 @@ async fn valid_request_and_gzip_body_continue() {
 }
 
 #[tokio::test]
+async fn hand_authored_full_paths_match_independently_of_listen_path_stripping() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [
+            {
+                "method": "POST",
+                "path_template": "/p2/oas2/items",
+                "path_regex": "^/p2/oas2/items$"
+            },
+            {
+                "method": "POST",
+                "path_template": "/p2/oas2/items/{id}",
+                "path_regex": "^/p2/oas2/items/[^/]+$"
+            }
+        ]
+    }))
+    .unwrap();
+
+    for strip_listen_path in [true, false] {
+        let mut proxy = create_test_proxy();
+        proxy.listen_path = Some("/p2/oas2".to_string());
+        proxy.strip_listen_path = strip_listen_path;
+        let proxy = Arc::new(proxy);
+
+        for (path, label) in [
+            ("/p2/oas2/items", "POST /p2/oas2/items"),
+            ("/p2/oas2/items/42", "POST /p2/oas2/items/{id}"),
+        ] {
+            let mut ctx = post_ctx(path);
+            ctx.matched_proxy = Some(Arc::clone(&proxy));
+            let mut headers = json_headers();
+            assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+            assert_eq!(
+                ctx.metadata
+                    .get("openapi_validator.matched_operation")
+                    .map(String::as_str),
+                Some(label)
+            );
+        }
+
+        for path in [
+            "/items",
+            "/items/42",
+            "/p2/oas2/unknown",
+            "/p2/oas2/items/",
+            "/p2/oas2/items/42/extra",
+            "/p2/oas2/p2/oas2/items",
+        ] {
+            let mut ctx = post_ctx(path);
+            ctx.matched_proxy = Some(Arc::clone(&proxy));
+            let mut headers = json_headers();
+            assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+        }
+    }
+}
+
+#[tokio::test]
 async fn unknown_operation_is_rejected_before_proxy() {
     let plugin = OpenapiValidator::new(&validator_config("block")).unwrap();
     let mut ctx = post_ctx("/missing");

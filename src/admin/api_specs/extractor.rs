@@ -599,8 +599,13 @@ pub fn extract_with_external_refs(
     };
 
     if let Some(validate_ext) = parse_x_ferrum_validate_extension(&root)? {
-        let operations =
-            extract_operation_schemas(&root, &version, &effective.document_base, &external_docs)?;
+        let operations = extract_operation_schemas(
+            &root,
+            &version,
+            proxy.listen_path.as_deref(),
+            &effective.document_base,
+            &external_docs,
+        )?;
         auto_inject_openapi_validator(
             &mut plugins,
             &proxy,
@@ -1079,9 +1084,17 @@ fn merge_bypass_config(
 fn extract_operation_schemas(
     root: &Value,
     version: &str,
+    listen_path: Option<&str>,
     document_base: &Url,
     externals: &HashMap<String, LoadedExternalDocument>,
 ) -> Result<Vec<Value>, ExtractError> {
+    // The validator matches the full inbound path. Only literal prefix routes
+    // contribute a mount path; exact/regex routes already describe full paths.
+    // strip_listen_path affects backend forwarding, not operation matching.
+    let listen_prefix = listen_path
+        .filter(|path| path.starts_with('/'))
+        .unwrap_or("")
+        .trim_end_matches('/');
     let resolver = LocalSchemaResolver::build(root, version, document_base, externals)?;
     let root = resolver.primary_root();
     let Some(paths) = root.get("paths").and_then(Value::as_object) else {
@@ -1200,7 +1213,8 @@ fn extract_operation_schemas(
             // pathnames are deduplicated while preserving document order.
             let mut seen_templates = HashSet::new();
             for base in &effective_bases {
-                let effective_template = join_server_base_and_path(base, path_template)?;
+                let spec_template = join_server_base_and_path(base, path_template)?;
+                let effective_template = format!("{listen_prefix}{spec_template}");
                 if !seen_templates.insert(effective_template.clone()) {
                     continue;
                 }
@@ -1215,7 +1229,7 @@ fn extract_operation_schemas(
                 );
                 entry.insert(
                     "path_regex".to_string(),
-                    Value::String(path_template_to_regex(&effective_template)?),
+                    Value::String(path_template_to_regex(&spec_template, listen_prefix)?),
                 );
                 if let Some((required, content)) = &request_body {
                     entry.insert("request_required".to_string(), Value::Bool(*required));
@@ -4516,8 +4530,12 @@ fn add_null_type(schema: Value) -> Value {
     }
 }
 
-fn path_template_to_regex(path_template: &str) -> Result<String, ExtractError> {
-    let mut regex = String::from("^");
+fn path_template_to_regex(
+    path_template: &str,
+    literal_prefix: &str,
+) -> Result<String, ExtractError> {
+    // A literal route prefix must never introduce regex syntax or parameters.
+    let mut regex = format!("^{}", regex::escape(literal_prefix));
     let mut literal = String::new();
     let mut chars = path_template.chars().peekable();
     while let Some(ch) = chars.next() {

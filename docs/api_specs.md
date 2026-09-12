@@ -101,7 +101,7 @@ x-ferrum-plugins:        # OPTIONAL — array (all must be proxy-scoped)
 x-ferrum-validate: true  # OPTIONAL — auto-generate openapi_validator
 
 paths:
-  /orders:
+  /:
     get: ...
 ```
 
@@ -125,6 +125,10 @@ An array of `PluginConfig` objects. Fields follow the same schema as `POST /plug
 ### `x-ferrum-validate` (optional)
 
 Set `x-ferrum-validate: true` to generate a proxy-scoped `openapi_validator` plugin from the spec's operation schemas. The generated plugin config embeds the resolved request and response schemas plus their media types; the gateway runtime never reads the `api_specs` row on the request path.
+
+Operation matching uses the full canonical inbound path (`ctx.path`, without the query string), before backend listen-path stripping. Generated `path_template` / `path_regex` include the literal `x-ferrum-proxy.listen_path` prefix followed by the effective server/`basePath` pathname and Paths key. For example, listen path `/p2/oas2` plus Paths key `/items` matches `/p2/oas2/items`; a server pathname `/v1` makes that `/p2/oas2/v1/items`. Do not repeat the listen prefix in Paths keys or server/basePath unless the intended inbound path contains it twice.
+
+Trailing slashes on the listen prefix are trimmed before joining; `/p2/oas2/` plus `/items/{id}` generates `^/p2/oas2/items/[^/]+$`. Paths-key trailing slashes are preserved, so `/` with no server base is mounted as `/p2/oas2/`. Root (`/`), host-only, exact (`=...`), and regex (`~...`) listen routes add no prefix. For exact and regex routes, the spec must describe the full inbound paths. `strip_listen_path` affects forwarding only: generated matchers are the same whether it is `true` or `false`. Hand-authored plugin operations and `bypass.paths` retain full-path matching as written; bypass patterns are not prefixed. Unmatched requests still return HTTP 400 with the default blocking configuration.
 
 ```yaml
 x-ferrum-validate:
@@ -171,7 +175,7 @@ The object form is a **closed** fixed-field object. Accepted keys are exactly `m
 The importer walks `paths.{path}`, resolves local Path Item `$ref`s first, then enumerates HTTP methods and resolves local schema `$ref`s inside request/response content:
 
 - **Path Item Objects** — local `$ref` targets such as `#/components/pathItems/Pets` (OpenAPI 3.1+) or `#/paths/~1shared` (Swagger 2.0 / OpenAPI 3.x) are expanded before method keys are read, so referenced operations enter the generated `openapi_validator` table.
-- **Server / `basePath` bases** — generated `openapi_validator` operation matchers honor the effective request pathname from Swagger 2.0 `basePath` and OpenAPI 3.x Server Objects. OpenAPI precedence is operation `servers` → Path Item `servers` → root `servers`; absence at a narrower scope inherits the next outer scope. Each server URL contributes only its pathname (scheme, authority, query, and fragment are dropped). Absolute-path references (`/v1`), relative references (`v1`), and absolute URIs (`https://api.example.com/v1`) are supported; because uploaded specs have no document URL, relative references resolve from a synthetic document root. Server variables are substituted with declared `default` values only (enum members are not explored); missing defaults, defaults outside `enum`, malformed variables, empty `servers` arrays, and raw or percent-encoded `.` / `..` path segments fail closed. Empty path segments remain literal and safe because generated operation regexes are fully anchored. Multiple servers emit one operation matcher per distinct effective pathname in document order, deduplicating equivalents. Root-only / absent servers keep raw Paths-key matching. Bases join Paths keys with exactly one slash boundary (`/v1` + `/pets` → `/v1/pets`; `/v1` + `/` → `/v1`).
+- **Server / `basePath` bases** — generated `openapi_validator` operation matchers honor the effective request pathname from Swagger 2.0 `basePath` and OpenAPI 3.x Server Objects. OpenAPI precedence is operation `servers` → Path Item `servers` → root `servers`; absence at a narrower scope inherits the next outer scope. Each server URL contributes only its pathname (scheme, authority, query, and fragment are dropped). Absolute-path references (`/v1`), relative references (`v1`), and absolute URIs (`https://api.example.com/v1`) are supported; because uploaded specs have no document URL, relative references resolve from a synthetic document root. Server variables are substituted with declared `default` values only (enum members are not explored); missing defaults, defaults outside `enum`, malformed variables, empty `servers` arrays, and raw or percent-encoded `.` / `..` path segments fail closed. Empty path segments remain literal and safe because generated operation regexes are fully anchored. Multiple servers emit one operation matcher per distinct effective pathname in document order, deduplicating equivalents. Root-only / absent servers add no server prefix; the listen prefix still applies. Bases join Paths keys with exactly one slash boundary (`/v1` + `/pets` → `/v1/pets`; `/v1` + `/` → `/v1`), before the listen prefix is prepended.
 - OpenAPI 3.x request schemas from `requestBody.content.{mediaType}.schema`, preserving `encoding` for `application/x-www-form-urlencoded` and `multipart/form-data` in the strict generated `{schema, encoding}` shape (unsupported media types, unknown properties, invalid field types/styles, reserved headers, case-insensitive duplicate multipart encoding header names, Header Object `schema`/`content` exclusivity with closed per-form field sets, exactly one concrete content media type with full-key header-value validation, and other unsupported combinations fail closed).
 - OpenAPI 3.x response schemas from `responses.{status}.content.{mediaType}.schema`.
 - Swagger 2.0 request schemas from `parameters[].in == "body"`.
@@ -488,6 +492,8 @@ When `x-ferrum-validate` is enabled, the generated `openapi_validator.config.ope
 
 Persistent validator changes belong in `x-ferrum-validate` and should be applied with `PUT /api-specs/{id}`.
 
+Resubmit an existing spec with `PUT /api-specs/{id}` to regenerate a validator whose stored paths omit the listen prefix. Runtime loading does not rewrite stored plugin configs.
+
 Emergency direct edits to the generated `openapi_validator` row via `PUT /plugins/config/{id}` are allowed for incident response, but they are ephemeral. The next spec `PUT` regenerates the spec-owned plugin and replaces direct edits.
 
 ## Worked examples
@@ -616,7 +622,7 @@ x-ferrum-proxy:
   backend_port: 8080
 
 paths:
-  /orders:
+  /:
     post:
       requestBody:
         required: true
@@ -641,7 +647,7 @@ paths:
                     type: boolean
 ```
 
-Submitting this spec creates one generated `openapi_validator` plugin attached to `orders-contract`. A request body missing `id` is rejected with HTTP 400 in `block` mode.
+Submitting this spec creates one generated `openapi_validator` plugin attached to `orders-contract` for `POST /orders/`. A request body missing `id` is rejected with HTTP 400 in `block` mode.
 
 ### 5. Updating a spec via PUT — what survives
 
