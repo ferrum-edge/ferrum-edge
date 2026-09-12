@@ -729,10 +729,19 @@ fn non_websocket_mesh_tunnel_dials_still_resolve_their_own_admission_lane() {
         "both the cold path and pool growth must dial through dial_and_publish"
     );
 
-    let hbone_pooled = method_body(hbone, "async fn get_or_create_sender(");
+    // The HBONE pool follows the same split (issue #5465): the cold path and
+    // stream-load growth both dial through `dial_and_publish`, which is where
+    // the physical connection acquires its admission.
+    let hbone_pooled = method_body(hbone, "async fn dial_and_publish(");
     assert!(
         hbone_pooled.contains("self.conn_admission("),
         "the pooled HBONE tunnel owns its physical connection"
+    );
+    let hbone_cold = method_body(hbone, "async fn get_or_create_sender(");
+    let hbone_growth = method_body(hbone, "async fn try_grow_sender(");
+    assert!(
+        hbone_cold.contains(".dial_and_publish(") && hbone_growth.contains(".dial_and_publish("),
+        "both the HBONE cold path and pool growth must dial through dial_and_publish"
     );
 }
 

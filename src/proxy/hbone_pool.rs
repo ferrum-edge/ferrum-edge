@@ -14,7 +14,7 @@ use http::{Method, Request, StatusCode, Version};
 use std::cell::RefCell;
 use std::fmt::Write;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -101,6 +101,17 @@ const ADAPTIVE_CONNECTION_WINDOW_SIZE: u32 = 64 * 1024 * 1024;
 /// frame, so this resolves in well under a millisecond on a healthy connection.
 const EXTENDED_CONNECT_SETTINGS_POLL_ATTEMPTS: u32 = 10;
 const EXTENDED_CONNECT_SETTINGS_POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// Open CONNECT streams the least-loaded pooled HBONE connection may carry
+/// before a checkout tries to add another connection to the key (issue
+/// #5465). One raw-`h2` connection is one driver task and one TLS session, so
+/// its throughput is bounded no matter how many tunnels it multiplexes;
+/// growth is triggered by measured load, never eagerly, and is capped by
+/// `http2_connections_per_host`. Same threshold the Sidecar mesh-mTLS pool
+/// uses for pending response heads (`MESH_MTLS_GROWTH_PENDING_PER_CONNECTION`).
+pub const HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION: usize = 8;
+/// After a growth dial fails, the key stays at its current width for this long
+/// instead of re-dialing on every pressured checkout.
+const HBONE_GROWTH_BACKOFF_SECS: u64 = 10;
 
 thread_local! {
     static HBONE_POOL_KEY_BUF: RefCell<String> = RefCell::new(String::with_capacity(160));
@@ -117,22 +128,121 @@ struct HbonePoolEntry {
     idle_timeout_seconds: u64,
 }
 
-enum CachedSender {
-    Ready(MeshH2Transport),
-    Pending(MeshH2Transport),
+/// Outcome of the write-path scan of one key's connections.
+enum HboneCheckout {
+    /// A live connection with room under its peer's stream cap; `active_streams`
+    /// is its load at selection time and `live_connections` the key's width.
+    Available {
+        transport: MeshH2Transport,
+        live_connections: usize,
+        active_streams: usize,
+    },
+    /// Every live connection is at its peer's `SETTINGS_MAX_CONCURRENT_STREAMS`;
+    /// `transport` is the least-loaded of them.
+    Saturated {
+        transport: MeshH2Transport,
+        live_connections: usize,
+    },
+    /// No live connection under this key.
+    Empty,
+}
+
+/// Result of the shared-lock fast path: a live, ready connection with room
+/// under its stream cap, plus what the caller needs to decide about growth.
+struct HboneFastCheckout {
+    transport: MeshH2Transport,
+    live_connections: usize,
+    active_streams: usize,
+}
+
+/// Measured load of one pooled HBONE connection (issue #5465), shared by the
+/// pooled transport, every clone handed out, and every tunnel opened on it.
+///
+/// `h2::client::SendRequest::clone()` resets the handle's pending-open state,
+/// so `ready()` on a fresh clone is always `Ready` on a live connection and
+/// says nothing about how many streams the connection is carrying or whether
+/// the peer's `SETTINGS_MAX_CONCURRENT_STREAMS` is already reached. The pool
+/// therefore counts open CONNECT streams itself and samples the peer's cap off
+/// every CONNECT response (which cannot arrive before the peer's SETTINGS).
+#[derive(Clone, Default)]
+pub(crate) struct HboneConnectionLoad(Arc<HboneConnectionLoadInner>);
+
+struct HboneConnectionLoadInner {
+    /// CONNECT streams sent on this connection whose tunnel is still alive
+    /// (including ones whose CONNECT response is still pending).
+    active_streams: AtomicUsize,
+    /// Peer's `SETTINGS_MAX_CONCURRENT_STREAMS` as of the last CONNECT
+    /// response; `usize::MAX` until sampled or when the peer advertises none.
+    peer_max_streams: AtomicUsize,
+}
+
+impl Default for HboneConnectionLoadInner {
+    fn default() -> Self {
+        Self {
+            active_streams: AtomicUsize::new(0),
+            peer_max_streams: AtomicUsize::new(usize::MAX),
+        }
+    }
+}
+
+impl HboneConnectionLoad {
+    #[inline]
+    fn active_streams(&self) -> usize {
+        self.0.active_streams.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn peer_max_streams(&self) -> usize {
+        self.0.peer_max_streams.load(Ordering::Relaxed)
+    }
+
+    /// True when one more CONNECT would only queue pending-open inside `h2`
+    /// behind the peer's stream cap.
+    #[inline]
+    fn is_saturated(&self) -> bool {
+        self.active_streams() >= self.peer_max_streams()
+    }
+
+    /// Account one CONNECT stream from the moment it is sent until the lease
+    /// drops with its tunnel (or with the failed open).
+    fn lease(&self) -> HboneStreamLease {
+        self.0.active_streams.fetch_add(1, Ordering::Relaxed);
+        HboneStreamLease(self.clone())
+    }
+
+    /// Record the peer's current stream cap. Called once a CONNECT response has
+    /// arrived, so the value already reflects the peer's SETTINGS; the h2
+    /// lookup takes the connection's internal lock, which is why it runs here
+    /// (outside every pool lock) rather than on the checkout scan.
+    fn record_peer_max_streams(&self, sender: &SendRequest<Bytes>) {
+        self.0
+            .peer_max_streams
+            .store(sender.current_max_send_streams(), Ordering::Relaxed);
+    }
+}
+
+/// RAII decrement for [`HboneConnectionLoad::active_streams`].
+pub(crate) struct HboneStreamLease(HboneConnectionLoad);
+
+impl Drop for HboneStreamLease {
+    fn drop(&mut self) {
+        self.0.0.active_streams.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// One established gateway-to-mesh HTTP/2 transport, carried together with the
-/// retirement gate that owns it (issue #3859).
+/// retirement gate that owns it (issue #3859) and its measured stream load
+/// (issue #5465).
 ///
 /// The gate travels WITH the sender rather than living in the pool map, which
 /// is the whole point: a caller that clones the sender, takes a tunnel out of
 /// the pool, or holds a 1:1 WebSocket/datagram bridge still carries a handle the
-/// trust-withdrawal sweep can reach. Cloning is two `Arc` bumps.
+/// trust-withdrawal sweep can reach. Cloning is three `Arc` bumps.
 #[derive(Clone)]
 pub(crate) struct MeshH2Transport {
     pub(crate) sender: SendRequest<Bytes>,
     pub(crate) gate: MeshTransportGate,
+    pub(crate) load: HboneConnectionLoad,
 }
 
 impl std::fmt::Debug for MeshH2Transport {
@@ -144,6 +254,7 @@ impl std::fmt::Debug for MeshH2Transport {
             .debug_struct("MeshH2Transport")
             .field("retired", &self.is_retired())
             .field("keepalive_failed", &self.keepalive_failed())
+            .field("active_streams", &self.load.active_streams())
             .finish_non_exhaustive()
     }
 }
@@ -156,6 +267,7 @@ impl MeshH2Transport {
         Self {
             sender,
             gate: MeshTransportGate::new(),
+            load: HboneConnectionLoad::default(),
         }
     }
 
@@ -711,6 +823,10 @@ pub struct HboneConnectionPool {
     /// caller queued behind a failed dial instead of letting each repeat it
     /// (issue #5046).
     creation_locks: DashMap<String, Arc<HboneCreationSlot>>,
+    /// Per-key unix-seconds deadline before which a failed growth dial is not
+    /// retried (issue #5465). Written only when growth fails; pruned with the
+    /// idle sweep.
+    growth_backoff_until: DashMap<String, u64>,
     gateway_svid: SharedSvidBundle,
     crls: crate::tls::SharedCrlList,
     svid_identity_cache: ArcSwap<Option<HboneSvidIdentityCache>>,
@@ -833,6 +949,7 @@ impl HboneConnectionPool {
         Self {
             entries: Arc::new(DashMap::with_shard_amount(shard_amount)),
             creation_locks: DashMap::with_shard_amount(shard_amount),
+            growth_backoff_until: DashMap::new(),
             gateway_svid,
             crls,
             svid_identity_cache: ArcSwap::new(Arc::new(None)),
@@ -946,8 +1063,9 @@ impl HboneConnectionPool {
             |key| self.try_cached_sender_read(key),
         );
 
-        let sender = if let Some(sender) = fast_sender {
-            sender
+        // A capability probe is one short-lived stream: it never widens the key.
+        let sender = if let Some(checkout) = fast_sender {
+            checkout.transport
         } else {
             let key = with_hbone_pool_key(
                 dial_host,
@@ -1210,6 +1328,7 @@ impl HboneConnectionPool {
         };
         let hbone_source_identity = asserted_source_identity.unwrap_or(&source_identity);
         let pool_config = self.pool_config.for_proxy(proxy);
+        let max_entries = pool_config.http2_connections_per_host.max(1);
         let effective_connect_timeout_ms =
             effective_connect_timeout_ms_for_policy_port(proxy, app_policy_port);
         let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
@@ -1228,8 +1347,51 @@ impl HboneConnectionPool {
                 |key| self.try_cached_sender_read(key),
             );
 
-            let sender = if let Some(sender) = fast_sender {
-                sender
+            let sender = if let Some(checkout) = fast_sender {
+                // The least-loaded connection is carrying at least the growth
+                // threshold of open tunnels and the key has room: try to widen
+                // (issue #5465). Growth is opportunistic — a busy creation
+                // lock, a backoff, or a failed dial all leave this tunnel on
+                // the connection it already has.
+                if checkout.live_connections < max_entries
+                    && checkout.active_streams >= HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION
+                {
+                    let key = with_hbone_pool_key(
+                        dial_host,
+                        app_port,
+                        hbone_port,
+                        proxy.dns_override.as_deref(),
+                        fingerprint.as_ref(),
+                        expected_peer,
+                        sni_override,
+                        expected_trust_domain,
+                        &pool_config,
+                        |key| key.to_string(),
+                    );
+                    match self
+                        .try_grow_sender(
+                            proxy,
+                            dial_host,
+                            app_host,
+                            app_port,
+                            app_policy_port,
+                            hbone_port,
+                            expected_peer,
+                            expected_trust_domain,
+                            sni_override,
+                            &key,
+                            &pool_config,
+                            max_entries,
+                            connect_timeout,
+                        )
+                        .await
+                    {
+                        Some(grown) => grown,
+                        None => checkout.transport,
+                    }
+                } else {
+                    checkout.transport
+                }
             } else {
                 let key = with_hbone_pool_key(
                     dial_host,
@@ -1603,56 +1765,66 @@ impl HboneConnectionPool {
             .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
             .unwrap_or(proxy.backend_connect_timeout_ms);
         let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
-        match self.cached_sender(key, max_entries) {
-            Some(CachedSender::Ready(transport)) => return Ok(transport),
-            Some(CachedSender::Pending(transport)) => {
-                let authority = authority_for_host_port(app_host, app_port);
-                let MeshH2Transport { sender, gate } = transport;
-                match tokio::time::timeout(connect_timeout, sender.ready()).await {
-                    Ok(Ok(sender)) => {
-                        let transport = MeshH2Transport { sender, gate };
-                        if !transport.is_retired() && !transport.keepalive_failed() {
-                            return Ok(transport);
-                        }
-                        debug!(
+        match self.cached_sender(key) {
+            HboneCheckout::Available {
+                transport,
+                live_connections,
+                active_streams,
+            } => {
+                if live_connections < max_entries
+                    && active_streams >= HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION
+                    && let Some(grown) = self
+                        .try_grow_sender(
+                            proxy,
                             dial_host,
                             app_host,
                             app_port,
+                            app_policy_port,
                             hbone_port,
-                            "Cached HBONE HTTP/2 transport became unusable while waiting for readiness; creating a replacement"
-                        );
-                    }
-                    Ok(Err(err)) => {
-                        debug!(
-                            dial_host,
-                            app_host,
-                            app_port,
-                            hbone_port,
-                            error = %err,
-                            "Cached HBONE HTTP/2 sender closed while waiting for readiness; creating a replacement"
-                        );
-                    }
-                    Err(_) => {
-                        return Err(HbonePoolError::ConnectStream {
-                            authority,
-                            message: format!(
-                                "timed out after {}ms waiting for cached HBONE HTTP/2 sender readiness",
-                                effective_connect_timeout_ms
-                            ),
-                        });
-                    }
+                            expected_peer,
+                            expected_trust_domain,
+                            sni_override,
+                            key,
+                            pool_config,
+                            max_entries,
+                            connect_timeout,
+                        )
+                        .await
+                {
+                    return Ok(grown);
                 }
+                return Ok(transport);
             }
-            None => {}
+            HboneCheckout::Saturated {
+                transport,
+                live_connections,
+            } if live_connections >= max_entries => {
+                // Every connection is at the peer's stream cap and the key is
+                // at its configured width: queue on the least-loaded one. h2
+                // parks the CONNECT pending-open until a sibling stream closes,
+                // bounded by the caller's connect timeout, so a burst above
+                // `cap × width` drains instead of failing outright.
+                debug!(
+                    dial_host,
+                    app_host,
+                    app_port,
+                    hbone_port,
+                    connections = live_connections,
+                    max_connections = max_entries,
+                    peer_max_streams = transport.load.peer_max_streams(),
+                    "Every pooled HBONE HTTP/2 connection is at the peer's stream cap; queueing on the least-loaded one"
+                );
+                return Ok(transport);
+            }
+            // Saturated with room to widen, or no connection at all: dial one,
+            // coalescing with every other caller that reached the same
+            // conclusion for this key.
+            HboneCheckout::Saturated { .. } | HboneCheckout::Empty => {}
         }
 
         let creation_started = Instant::now();
         let authority = authority_for_host_port(app_host, app_port);
-        let creation_slot = self
-            .creation_locks
-            .entry(key.to_string())
-            .or_insert_with(|| Arc::new(HboneCreationSlot::new()))
-            .clone();
+        let creation_slot = self.creation_slot(key);
         // Join the cohort BEFORE awaiting the lock: subscribing is what scopes
         // this caller to the attempt that is in flight right now, so it can be
         // released by that attempt's failure instead of repeating the dial
@@ -1672,59 +1844,15 @@ impl HboneConnectionPool {
                 });
             }
         };
-        match self.cached_sender(key, max_entries) {
-            Some(CachedSender::Ready(transport)) => {
-                return Ok(transport);
-            }
-            Some(CachedSender::Pending(transport)) => {
-                let remaining = crate::pool::remaining_connect_timeout(
-                    creation_started,
-                    connect_timeout,
-                )
-                .ok_or_else(|| HbonePoolError::ConnectStream {
-                    authority: authority.clone(),
-                    message: format!(
-                        "timed out after {}ms waiting for coalesced HBONE HTTP/2 sender creation",
-                        effective_connect_timeout_ms
-                    ),
-                })?;
-                let MeshH2Transport { sender, gate } = transport;
-                match tokio::time::timeout(remaining, sender.ready()).await {
-                    Ok(Ok(sender)) => {
-                        let transport = MeshH2Transport { sender, gate };
-                        if !transport.is_retired() && !transport.keepalive_failed() {
-                            return Ok(transport);
-                        }
-                        debug!(
-                            dial_host,
-                            app_host,
-                            app_port,
-                            hbone_port,
-                            "Coalesced HBONE HTTP/2 transport became unusable; creating a replacement"
-                        );
-                    }
-                    Ok(Err(err)) => {
-                        debug!(
-                            dial_host,
-                            app_host,
-                            app_port,
-                            hbone_port,
-                            error = %err,
-                            "Cached HBONE HTTP/2 sender closed after coalesced creation wait; creating a replacement"
-                        );
-                    }
-                    Err(_) => {
-                        return Err(HbonePoolError::ConnectStream {
-                            authority,
-                            message: format!(
-                                "timed out after {}ms waiting for coalesced HBONE HTTP/2 sender readiness",
-                                effective_connect_timeout_ms
-                            ),
-                        });
-                    }
-                }
-            }
-            None => {}
+        // Double-check under the creation lock: a coalesced waiter may find the
+        // creator's connection already inserted, or the width filled meanwhile.
+        match self.cached_sender(key) {
+            HboneCheckout::Available { transport, .. } => return Ok(transport),
+            HboneCheckout::Saturated {
+                transport,
+                live_connections,
+            } if live_connections >= max_entries => return Ok(transport),
+            HboneCheckout::Saturated { .. } | HboneCheckout::Empty => {}
         }
 
         // A concurrent creator for this key failed while this caller was queued
@@ -1736,6 +1864,149 @@ impl HboneConnectionPool {
             return Err(shared.clone_for_broadcast());
         }
 
+        self.dial_and_publish(
+            Some(&creation_lease),
+            proxy,
+            dial_host,
+            app_host,
+            app_port,
+            app_policy_port,
+            hbone_port,
+            expected_peer,
+            expected_trust_domain,
+            sni_override,
+            key,
+            pool_config,
+            creation_started,
+            connect_timeout,
+            effective_connect_timeout_ms,
+        )
+        .await
+    }
+
+    fn creation_slot(&self, key: &str) -> Arc<HboneCreationSlot> {
+        self.creation_locks
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(HboneCreationSlot::new()))
+            .clone()
+    }
+
+    /// Add one physical connection to a key that already has a usable one
+    /// (issue #5465). Returns the new transport, or `None` whenever growth is
+    /// not possible right now — the caller then opens its tunnel on the
+    /// connection it already selected. Never waits for the creation lock: a
+    /// cold dial or another grower in flight means "not now", not "queue".
+    #[allow(clippy::too_many_arguments)]
+    async fn try_grow_sender(
+        &self,
+        proxy: &Proxy,
+        dial_host: &str,
+        app_host: &str,
+        app_port: u16,
+        app_policy_port: u16,
+        hbone_port: u16,
+        expected_peer: Option<&crate::identity::SpiffeId>,
+        expected_trust_domain: Option<&crate::identity::spiffe::TrustDomain>,
+        sni_override: Option<&str>,
+        key: &str,
+        pool_config: &PoolConfig,
+        max_entries: usize,
+        connect_timeout: Duration,
+    ) -> Option<MeshH2Transport> {
+        let now = unix_secs();
+        if self
+            .growth_backoff_until
+            .get(key)
+            .is_some_and(|until| *until.value() > now)
+        {
+            return None;
+        }
+        let creation_slot = self.creation_slot(key);
+        let creation_lease = creation_slot.try_claim()?;
+        // Re-check under the lock: another grower may have widened the key
+        // (or a prune may have narrowed it) since the fast-path read.
+        let live_connections = self
+            .entries
+            .get(key)
+            .map(|entries| entries.value().len())
+            .unwrap_or(0);
+        if live_connections >= max_entries {
+            return None;
+        }
+        let effective_connect_timeout_ms = connect_timeout.as_millis().min(u64::MAX as u128) as u64;
+        let dialed = self
+            .dial_and_publish(
+                None,
+                proxy,
+                dial_host,
+                app_host,
+                app_port,
+                app_policy_port,
+                hbone_port,
+                expected_peer,
+                expected_trust_domain,
+                sni_override,
+                key,
+                pool_config,
+                Instant::now(),
+                connect_timeout,
+                effective_connect_timeout_ms,
+            )
+            .await;
+        drop(creation_lease);
+        match dialed {
+            Ok(transport) => {
+                debug!(
+                    dial_host,
+                    app_host,
+                    app_port,
+                    hbone_port,
+                    connections = live_connections + 1,
+                    max_connections = max_entries,
+                    "Widened gateway HBONE HTTP/2 pool under load"
+                );
+                Some(transport)
+            }
+            Err(err) => {
+                self.growth_backoff_until
+                    .insert(key.to_string(), now + HBONE_GROWTH_BACKOFF_SECS);
+                debug!(
+                    dial_host,
+                    app_host,
+                    app_port,
+                    hbone_port,
+                    error = %err,
+                    "HBONE pool growth dial failed; continuing on existing connections"
+                );
+                None
+            }
+        }
+    }
+
+    /// Dial one physical connection for `key` while holding its creation lock,
+    /// then pool it if the TLS material it was built from is still current.
+    /// `cohort` is the cold path's lease, whose waiters receive a dial failure
+    /// (issue #5046); growth passes `None` because nobody is queued behind it.
+    #[allow(clippy::too_many_arguments)]
+    async fn dial_and_publish(
+        &self,
+        cohort: Option<&crate::pool::SharedCreationLease<'_, Arc<HbonePoolError>>>,
+        proxy: &Proxy,
+        dial_host: &str,
+        app_host: &str,
+        app_port: u16,
+        app_policy_port: u16,
+        hbone_port: u16,
+        expected_peer: Option<&crate::identity::SpiffeId>,
+        expected_trust_domain: Option<&crate::identity::spiffe::TrustDomain>,
+        sni_override: Option<&str>,
+        key: &str,
+        pool_config: &PoolConfig,
+        creation_started: Instant,
+        connect_timeout: Duration,
+        effective_connect_timeout_ms: u64,
+    ) -> Result<MeshH2Transport, HbonePoolError> {
+        let authority = authority_for_host_port(app_host, app_port);
         let remaining = match crate::pool::remaining_connect_timeout(
             creation_started,
             connect_timeout,
@@ -1801,7 +2072,9 @@ impl HboneConnectionPool {
                 // can slip past the broadcast. `record_pool_failure` stays on
                 // the creator alone — one physical dial, one pool failure —
                 // while each waiter still reports its own logical outcome.
-                creation_lease.publish_failure(Arc::new(err.clone_for_broadcast()));
+                if let Some(cohort) = cohort {
+                    cohort.publish_failure(Arc::new(err.clone_for_broadcast()));
+                }
                 return Err(err);
             }
             Err(_) => {
@@ -1902,92 +2175,72 @@ impl HboneConnectionPool {
         Ok(transport)
     }
 
-    fn cached_sender(&self, key: &str, max_entries: usize) -> Option<CachedSender> {
-        let mut entries = self.entries.get_mut(key)?;
+    /// Exclusive-lock checkout: prune dead, retired, keepalive-failed and
+    /// idle-expired entries, then pick the least-loaded live connection with
+    /// room under its peer's stream cap (issue #5465).
+    fn cached_sender(&self, key: &str) -> HboneCheckout {
+        let Some(mut entries) = self.entries.get_mut(key) else {
+            return HboneCheckout::Empty;
+        };
         record_hbone_evictions(prune_pool_entries(&mut entries));
-        let mut pending = None;
-        let mut pending_idx = None;
-        let mut idx = 0;
-        while idx < entries.len() {
-            let entry = &mut entries[idx];
-            // A retired or keepalive-failed transport is never handed out
-            // again, even before its socket has finished closing. One relaxed
-            // load each (issues #3859 / #4162).
-            if entry.transport.is_retired() || entry.transport.keepalive_failed() {
-                entries.remove(idx);
-                record_hbone_evictions(1);
-                continue;
-            }
-            let transport = entry.transport.clone();
-            match transport.sender.clone().ready().now_or_never() {
-                Some(Ok(ready)) => {
-                    entry.last_used_at.store(unix_secs(), Ordering::Relaxed);
-                    return Some(CachedSender::Ready(MeshH2Transport {
-                        sender: ready,
-                        gate: transport.gate,
-                    }));
-                }
-                Some(Err(_)) => {
-                    entries.remove(idx);
-                    record_hbone_evictions(1);
-                    continue;
-                }
-                None => {
-                    if pending.is_none() {
-                        pending = Some(transport);
-                        pending_idx = Some(idx);
-                    }
-                }
-            }
-            idx += 1;
+        let now = unix_secs();
+        let selection = select_least_loaded(&entries, now);
+        if let Some((index, active_streams)) = selection.chosen {
+            let entry = &entries[index];
+            entry.last_used_at.store(now, Ordering::Relaxed);
+            return HboneCheckout::Available {
+                transport: entry.transport.clone(),
+                live_connections: selection.live,
+                active_streams,
+            };
         }
-        if entries.len() >= max_entries {
-            if let Some(idx) = pending_idx
-                && let Some(entry) = entries.get_mut(idx)
-            {
-                entry.last_used_at.store(unix_secs(), Ordering::Relaxed);
+        match selection.least_loaded {
+            Some((index, _)) => {
+                let entry = &entries[index];
+                entry.last_used_at.store(now, Ordering::Relaxed);
+                HboneCheckout::Saturated {
+                    transport: entry.transport.clone(),
+                    live_connections: selection.live,
+                }
             }
-            pending.map(CachedSender::Pending)
-        } else {
-            None
+            None => HboneCheckout::Empty,
         }
     }
 
-    /// Shared-lock fast path: scan for a ready sender and refresh its
-    /// `last_used_at` via a relaxed atomic store, avoiding the exclusive shard
-    /// write lock that `cached_sender` holds during prune + scan + clone.
-    /// Refreshing recency here keeps a connection served only by this path from
-    /// being pruned as idle. Expired entries are skipped (not removed); dead
-    /// senders fall through to the write path.
-    fn try_cached_sender_read(&self, key: &str) -> Option<MeshH2Transport> {
+    /// Shared-lock fast path: pick the least-loaded live connection with room
+    /// under its peer's stream cap and refresh its `last_used_at` via a relaxed
+    /// atomic store, avoiding the exclusive shard write lock that
+    /// `cached_sender` holds during prune + scan + clone. Refreshing recency
+    /// here keeps a connection served only by this path from being pruned as
+    /// idle. Expired entries are skipped (not removed); a dead sender, a
+    /// saturated key and an empty key all fall through to the write path.
+    fn try_cached_sender_read(&self, key: &str) -> Option<HboneFastCheckout> {
         let entries = self.entries.get(key)?;
         let now = unix_secs();
-        for entry in entries.value().iter() {
-            let last_used = entry.last_used_at.load(Ordering::Relaxed);
-            if entry_idle_expired(last_used, entry.idle_timeout_seconds, now) {
-                continue;
-            }
-            // Retired or keepalive-failed transports are skipped here and
-            // removed by the write path (this path holds only a shared lock).
-            if entry.transport.is_retired() || entry.transport.keepalive_failed() {
-                continue;
-            }
-            let transport = entry.transport.clone();
-            match transport.sender.clone().ready().now_or_never() {
-                Some(Ok(ready)) => {
-                    // Refresh recency on the shared-lock fast path so a busy
-                    // connection is not pruned as idle. This is the whole point
-                    // of this path existing: avoid the exclusive write lock.
-                    entry.last_used_at.store(now, Ordering::Relaxed);
-                    return Some(MeshH2Transport {
-                        sender: ready,
+        let selection = select_least_loaded(entries.value(), now);
+        let (index, active_streams) = selection.chosen?;
+        let entry = &entries.value()[index];
+        // One liveness probe, for the chosen connection only: a closed sender
+        // reports `Err` here and is removed by the write path.
+        let transport = entry.transport.clone();
+        match transport.sender.ready().now_or_never() {
+            Some(Ok(sender)) => {
+                // Refresh recency on the shared-lock fast path so a busy
+                // connection is not pruned as idle. This is the whole point
+                // of this path existing: avoid the exclusive write lock.
+                entry.last_used_at.store(now, Ordering::Relaxed);
+                Some(HboneFastCheckout {
+                    transport: MeshH2Transport {
+                        sender,
                         gate: transport.gate,
-                    });
-                }
-                _ => continue,
+                        load: transport.load,
+                    },
+                    live_connections: selection.live,
+                    active_streams,
+                })
             }
+            _ => None,
         }
-        None
     }
 
     fn maybe_prune_idle_entries(&self) {
@@ -2016,6 +2269,7 @@ impl HboneConnectionPool {
         self.creation_locks.retain(|key, lock| {
             self.entries.contains_key(key.as_str()) || Arc::strong_count(lock) > 1
         });
+        self.growth_backoff_until.retain(|_, until| *until > now);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2114,6 +2368,9 @@ pub struct H2ConnectTunnel {
     /// poll halves consult it, so the relay stops forwarding on its very next
     /// poll instead of waiting for the socket close to propagate through h2.
     gate: MeshTransportGate,
+    /// Keeps this stream counted against its connection's measured load for
+    /// exactly as long as the tunnel exists (issue #5465).
+    _stream_lease: HboneStreamLease,
 }
 
 impl AsyncRead for H2ConnectTunnel {
@@ -2534,7 +2791,11 @@ pub(crate) async fn dial_h2_connect_sender(
                     }
                 }
             });
-            Ok(MeshH2Transport { sender, gate })
+            Ok(MeshH2Transport {
+                sender,
+                gate,
+                load: HboneConnectionLoad::default(),
+            })
         }
     })
     .await
@@ -2576,7 +2837,7 @@ pub(crate) async fn open_h2_connect_stream(
             message: MESH_KEEPALIVE_FAILED_MESSAGE.to_string(),
         });
     }
-    let MeshH2Transport { sender, gate } = transport;
+    let MeshH2Transport { sender, gate, load } = transport;
 
     let mut request = Request::builder()
         .method(Method::CONNECT)
@@ -2625,6 +2886,9 @@ pub(crate) async fn open_h2_connect_stream(
             message: MESH_KEEPALIVE_FAILED_MESSAGE.to_string(),
         });
     }
+    // Counted from the send: a CONNECT parked pending-open behind the peer's
+    // stream cap is load too. A failed open drops the lease on the way out.
+    let stream_lease = load.lease();
     let (response_fut, send_stream) =
         sender
             .send_request(request, false)
@@ -2638,6 +2902,8 @@ pub(crate) async fn open_h2_connect_stream(
             authority: authority.clone(),
             message: e.to_string(),
         })?;
+    // The response cannot precede the peer's SETTINGS, so the cap is known now.
+    load.record_peer_max_streams(&sender);
     if response.status() != StatusCode::OK {
         return Err(HbonePoolError::ConnectRejected {
             authority,
@@ -2651,6 +2917,7 @@ pub(crate) async fn open_h2_connect_stream(
         write_closed: false,
         write_reservation: 0,
         gate,
+        _stream_lease: stream_lease,
     })
 }
 
@@ -2718,7 +2985,7 @@ pub(crate) async fn open_h2_ws_connect_stream(
             message: MESH_KEEPALIVE_FAILED_MESSAGE.to_string(),
         });
     }
-    let MeshH2Transport { sender, gate } = transport;
+    let MeshH2Transport { sender, gate, load } = transport;
     // Owned copy for the error variants (which carry a `String`).
     let authority = authority.to_string();
     // RFC 8441 Extended CONNECT keeps `:scheme` and `:path` (unlike a bare
@@ -2816,6 +3083,7 @@ pub(crate) async fn open_h2_ws_connect_stream(
             message: MESH_KEEPALIVE_FAILED_MESSAGE.to_string(),
         });
     }
+    let stream_lease = load.lease();
     let (response_fut, send_stream) =
         sender
             .send_request(request, false)
@@ -2829,6 +3097,7 @@ pub(crate) async fn open_h2_ws_connect_stream(
             authority: authority.clone(),
             message: e.to_string(),
         })?;
+    load.record_peer_max_streams(&sender);
     if response.status() != StatusCode::OK {
         return Err(HbonePoolError::ConnectRejected {
             authority,
@@ -2847,6 +3116,7 @@ pub(crate) async fn open_h2_ws_connect_stream(
             write_closed: false,
             write_reservation: 0,
             gate,
+            _stream_lease: stream_lease,
         },
         negotiated_subprotocol,
     })
@@ -3139,6 +3409,60 @@ pub fn svid_fingerprint(bundle: &SvidBundle) -> Result<String, HbonePoolError> {
 
 fn hbone_key_svid_fingerprint(key: &str) -> Option<&str> {
     key.split('|').nth(5)
+}
+
+/// Outcome of scanning one key's connections for a checkout (issue #5465).
+struct LeastLoadedSelection {
+    /// Index and open-stream count of the live, non-expired entry with the
+    /// fewest open CONNECT streams among those still under their peer's stream
+    /// cap; ties go to the lowest index.
+    chosen: Option<(usize, usize)>,
+    /// Same, ignoring the stream cap: where a caller queues when every live
+    /// connection is saturated and the key is at its configured width.
+    least_loaded: Option<(usize, usize)>,
+    /// Live, non-expired entries seen (the key's current width).
+    live: usize,
+}
+
+/// Measured-load selection: fewest open tunnels wins, an exact tie prefers the
+/// earliest connection so light load concentrates on one connection while the
+/// ones added under pressure idle out, and a connection at its peer's
+/// `SETTINGS_MAX_CONCURRENT_STREAMS` is never chosen while a sibling has room.
+fn select_least_loaded(entries: &[HbonePoolEntry], now: u64) -> LeastLoadedSelection {
+    let mut chosen: Option<(usize, usize)> = None;
+    let mut least_loaded: Option<(usize, usize)> = None;
+    let mut live = 0;
+    for (index, entry) in entries.iter().enumerate() {
+        // A retired or keepalive-failed transport is never handed out again,
+        // even before its socket has finished closing (issues #3859 / #4162).
+        // One relaxed load each.
+        if entry.transport.is_retired()
+            || entry.transport.keepalive_failed()
+            || entry_idle_expired(
+                entry.last_used_at.load(Ordering::Relaxed),
+                entry.idle_timeout_seconds,
+                now,
+            )
+        {
+            continue;
+        }
+        live += 1;
+        let active = entry.transport.load.active_streams();
+        if least_loaded.is_none_or(|(_, best)| active < best) {
+            least_loaded = Some((index, active));
+        }
+        if entry.transport.load.is_saturated() {
+            continue;
+        }
+        if chosen.is_none_or(|(_, best)| active < best) {
+            chosen = Some((index, active));
+        }
+    }
+    LeastLoadedSelection {
+        chosen,
+        least_loaded,
+        live,
+    }
 }
 
 fn prune_pool_entries(entries: &mut Vec<HbonePoolEntry>) -> usize {

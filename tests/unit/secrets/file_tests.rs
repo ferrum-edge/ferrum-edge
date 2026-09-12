@@ -1,7 +1,7 @@
 use ferrum_edge::secrets::file::{read_secret, read_secret_detached, resolve_ref};
 use std::io::Write;
 
-use crate::unit::env_lock::ENV_LOCK;
+use crate::unit::env_lock::EnvGuard;
 
 #[test]
 fn file_secret_reads_use_detached_os_thread_not_spawn_blocking() {
@@ -163,25 +163,20 @@ fn read_secret_rejects_oversized_file_without_leaking_value() {
 
 #[test]
 fn resolve_ref_returns_none_when_not_set() {
-    let _guard = ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _env = EnvGuard::new(&[]);
     assert!(resolve_ref("FERRUM_TEST_SECRET_NOT_SET_XYZ_99999").is_none());
 }
 
 #[test]
 fn resolve_ref_returns_path_when_set() {
-    let _guard = ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let env = EnvGuard::new(&[]);
 
     let key = "FERRUM_TEST_SECRET_FILE_REF_12345";
     let file_key = format!("{}_FILE", key);
-    // SAFETY: We hold a mutex preventing concurrent env access.
-    unsafe { std::env::set_var(&file_key, "/run/secrets/db_password") };
+    env.set(&file_key, "/run/secrets/db_password");
     assert_eq!(
         resolve_ref(key),
         Some("/run/secrets/db_password".to_string())
     );
-    unsafe { std::env::remove_var(&file_key) };
+    env.unset(&file_key);
 }

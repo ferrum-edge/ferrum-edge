@@ -10,6 +10,7 @@ mod auto_bool_tests;
 mod backend_egress_policy_tests;
 mod batch_atomicity_tests;
 mod changelog_upgrade_parity_tests;
+mod circuit_breaker_config_tests;
 mod conf_file_aware_var_reads_tests;
 mod conf_file_tests;
 mod config_backup_tests;

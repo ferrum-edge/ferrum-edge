@@ -12117,7 +12117,21 @@ components:
           type: integer
           format: uint64
           default: 30
-          description: Seconds to wait in open state before transitioning to half-open
+          description: >
+            Seconds to wait in open state before transitioning to half-open.
+            `cooldown_seconds` is accepted as an input alias on Admin API, file
+            config, database rows, and batch/restore payloads, and is never
+            returned.
+        cooldown_seconds:
+          type: integer
+          format: uint64
+          writeOnly: true
+          deprecated: true
+          description: >
+            Input alias for `timeout_seconds`, accepted on Admin API, file
+            config, database rows, and batch/restore payloads. Never returned:
+            responses always carry `timeout_seconds`. Supplying both spellings
+            in one object is rejected as a duplicate field.
         failure_status_codes:
           type: array
           items:
@@ -28223,14 +28237,18 @@ components:
             Effective OpenAPI path template used for metadata and path specificity
             ordering. When generated from a spec, this is the Paths key joined to the
             effective Server Object pathname (OpenAPI 3.x) or Swagger `basePath`, with
-            one entry per distinct server pathname when multiple servers apply.
+            the literal proxy listen_path prefix prepended (trailing prefix slashes
+            trimmed). Root, host-only, exact, and regex listen routes add no prefix.
+            One entry is emitted per distinct server pathname when multiple servers
+            apply. strip_listen_path affects backend forwarding only.
         path_regex:
           type: string
           minLength: 1
           description: >-
             Regex used to match the full inbound request path, compiled at plugin load.
             Auto-generated specs derive it from the effective path template (including
-            server/`basePath` prefix); operator-supplied patterns are automatically
+            literal listen prefix and server/`basePath` prefix); operator-supplied
+            full-path patterns are not prefixed or stripped and are automatically
             anchored as `^(?:...)$` (full-path match) so a loose pattern cannot
             substring-match an unintended superstring path.
         operation_label:

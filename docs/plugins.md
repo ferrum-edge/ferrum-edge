@@ -6736,7 +6736,7 @@ Gemini function calls do not carry an OpenAI call ID in the native response shap
 | `max_response_body_bytes` | Integer | `8388608` | Bounded provider response collection (maximum `67108864`) |
 | `base_url` | String | _(provider default)_ | Custom endpoint with an explicit lowercase `https://` or `http://` scheme; userinfo, query, and fragment are rejected |
 | `allow_plaintext` | Boolean | `false` | Permit an explicit `http://` base URL; HTTPS remains the safe default |
-| `circuit_breaker` | Object | _(disabled)_ | Optional passive circuit with `failure_threshold` (3), `cooldown_seconds` (30), and `success_threshold` (1) |
+| `circuit_breaker` | Object | _(disabled)_ | Optional **provider-local** passive circuit with `failure_threshold` (3), `cooldown_seconds` (30), and `success_threshold` (1). This is not the proxy `circuit_breaker` object (`CircuitBreakerConfig`), whose canonical field is `timeout_seconds` (`cooldown_seconds` is only an input alias there). |
 
 **Azure OpenAI additional fields:** `azure_resource`, `azure_deployment`, `azure_api_version` (default `"2024-06-01"`).
 
