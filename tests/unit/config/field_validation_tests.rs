@@ -2402,7 +2402,10 @@ fn test_proxy_allowed_ws_origins_load_warns_once_per_proxy() {
         .expect("legacy star must not fail load validation");
     let output = logs.contents();
     let warn_count = output.matches("allowed_ws_origins contains '*'").count();
-    assert_eq!(warn_count, 1, "exactly one warning per proxy, got: {output}");
+    assert_eq!(
+        warn_count, 1,
+        "exactly one warning per proxy, got: {output}"
+    );
     assert!(output.contains("star-proxy"), "warning must name the proxy");
     assert!(
         output.contains(ALLOWED_WS_ORIGINS_STAR_GUIDANCE),

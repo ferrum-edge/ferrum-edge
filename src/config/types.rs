@@ -7729,12 +7729,11 @@ impl Proxy {
     /// This validates field values only — uniqueness checks (listen_path conflicts,
     /// name uniqueness, upstream_id existence) are done separately in the admin handlers.
     pub fn validate_fields(&self) -> Result<(), Vec<String>> {
-        let mut errors = match self
-            .validate_fields_inner(None, crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS)
-        {
-            Ok(()) => Vec::new(),
-            Err(errors) => errors,
-        };
+        let mut errors =
+            match self.validate_fields_inner(None, crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS) {
+                Ok(()) => Vec::new(),
+                Err(errors) => errors,
+            };
         errors.extend(self.allowed_ws_origins_admission_errors());
         if errors.is_empty() {
             Ok(())
