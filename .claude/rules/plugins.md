@@ -433,6 +433,19 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
       `text/event-stream` content type, and the byte-identical staged body;
       anything else aborts, and dropping the lease aborts, so a replaced or
       refused response is never replayable and never leaks stream capacity.
+    - Re-running a final phase is only safe when the phase's state model
+      tolerates it. `waf` marks the two final client-visible phases REPLACEABLE
+      (`plugins::WafScorePhase`) so a re-run supersedes its own previous
+      anomaly contribution instead of double-counting one response;
+      `body_validator` is a pure function of the representation;
+      `ai_response_guard` is re-entrant, but its residual-verified exemption is
+      keyed by the exact bytes it verified, so a re-framed representation is
+      re-scanned and a `redact` disposition that left detector-visible residue
+      is refused (fail-closed) rather than delivered.
+    - The SYNTHETIC short-circuit lifecycle runs this same legacy hook but its
+      writers return before that retention boundary, so `mcp_gateway` answers
+      inline there (the `ferrum:synthetic_short_circuit` marker) instead of
+      staging a reservation nothing can settle.
 12. `log`: stdout/statsd/http/tcp/kafka/loki/udp/ws/tx_debug/prometheus/chargeback
 13. `on_ws_frame`: WS size, rate, frame logging, and `waf` complete-message
     body-rule inspection

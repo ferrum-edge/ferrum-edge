@@ -27278,6 +27278,42 @@ pub(crate) fn settle_mcp_sse_publication(
 }
 
 /// Re-close policy over a representation selected by a legacy final-body hook.
+///
+/// Phases 10b/10c decide over the representation they are handed. A LEGACY
+/// final-body hook runs after them and may select a different one —
+/// `mcp_gateway` re-frames a governed JSON-RPC answer as the POST-attached
+/// `text/event-stream` body — which neither authoritative phase has seen. This
+/// re-closes both over the bytes that actually reach the client, and it is
+/// fail-closed: a representation that genuinely trips a rule is refused here and
+/// replaces the response.
+///
+/// Running a phase a SECOND time is only safe if the phase's own state model
+/// tolerates it, so the participants are:
+///
+/// * `waf` — anomaly scores accumulate across phases, so a plain re-run would
+///   count the same response-phase evidence twice and carry an instance over its
+///   own block threshold for a response that legitimately passed. The scoring
+///   model marks the two final client-visible phases REPLACEABLE
+///   (`plugins::WafScorePhase`): a re-run supersedes that phase's previous
+///   contribution and leaves independent request-phase scores alone, so a
+///   genuinely worse representation still scores higher and still blocks. The
+///   header phase additionally memoizes the map it scanned, so only a map that
+///   actually changed is rescanned.
+/// * `body_validator` — a pure function of method, status, headers, and body
+///   (plus an idempotent JSON scan memo). Re-running is exactly the intent: the
+///   re-framed representation is validated on its own terms, and a
+///   `text/event-stream` content type that no configured rule claims is simply
+///   not inspected.
+/// * `ai_response_guard` — re-entrant, and its pending-redaction promise is a
+///   one-shot the first pass already consumed, so the second pass is a fresh
+///   residual scan of the delivered bytes (it understands SSE framing natively).
+///   One deliberate consequence: its residual-verified exemption is keyed by the
+///   exact `(content-type, body)` pair it verified, so a re-framed
+///   representation does NOT inherit it. A `redact` disposition that left
+///   detector-visible residue the first pass tolerated is therefore refused
+///   here instead of delivered. That is the fail-closed direction, it replaces
+///   the response rather than leaking one, and the staged retention boundary
+///   below then correctly refuses to retain the replacement.
 pub(crate) async fn enforce_late_buffered_final_response_policy(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -39020,6 +39056,14 @@ async fn handle_proxy_request_inner(
     // authoritative pre-commit authorization gate above. Only now may the
     // staged event become `Last-Event-ID` replay history, and only if the bytes
     // that reach the client are still exactly the ones it promised.
+    //
+    // On this path the commit is a PRE-WRITE commitment: the response has been
+    // decided but not yet handed to the transport, so "retained" means "the
+    // gateway is committed to sending exactly these bytes", not "the client
+    // received them". The native-H3 writer deliberately draws the line one step
+    // later (see its own note); neither line is proof of client receipt, and a
+    // client whose connection dies mid-response resumes with `Last-Event-ID`
+    // precisely because the event was retained.
     if let Some(publication) = ctx.mcp_sse_publication.take() {
         let mut accepted = false;
         if let ResponseBody::Buffered(ref body) = response_body {

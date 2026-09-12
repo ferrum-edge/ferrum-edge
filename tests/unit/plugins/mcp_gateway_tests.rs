@@ -1,14 +1,16 @@
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
     build_aggregate_sse_reject_for_test, drop_mcp_sse_stream_for_test,
+    enforce_late_final_response_policy_for_test, mark_synthetic_short_circuit_for_test,
     mcp_aggregate_sse_listener_is_staged_for_test, mcp_sse_publication_is_staged_for_test,
     mcp_sse_stream_is_open_for_test, reject_headers_select_event_stream_for_test,
-    settle_mcp_sse_publication_for_test, take_mcp_aggregate_sse_listener_for_test,
+    settle_mcp_sse_publication_for_test, settle_mcp_sse_publication_undelivered_for_test,
+    take_mcp_aggregate_sse_listener_for_test,
 };
 use ferrum_edge::config::types::{BackendScheme, BackendTlsConfig};
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, ai_tool_governor::AiToolGovernor,
-    create_plugin, mcp_aggregate_sse::AggregateSseBody, priority,
+    create_plugin, mcp_aggregate_sse::AggregateSseBody, priority, waf::Waf,
 };
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
@@ -9767,6 +9769,23 @@ fn post_stream_event_id(body: &str) -> String {
 /// drive the plugin without the proxy, so they have to run that step themselves
 /// — through the same predicate and settle call the pipeline uses. Returns
 /// `true` when the response was retained.
+///
+/// How much of the PRODUCTION placement these tests reach, and what they cannot:
+///
+/// * The late final body/header policy re-close runs for real, through the
+///   pipeline's own entry point (`enforce_late_final_response_policy_for_test`),
+///   in both directions — an accepted representation and a refused one.
+/// * An authorization terminal, a committed-hook replacement, and a rewritten
+///   body are modelled by settling against the response those phases would
+///   produce. The gate itself lives in `handle_proxy_request_inner` and needs a
+///   full proxy request to run; what is provable here is that the shared
+///   predicate refuses anything but the exact staged representation.
+/// * A partial or failed native-H3 body write cannot be produced without a live
+///   QUIC transport, so the H3-specific term is driven straight into the shared
+///   settle call (`settle_mcp_sse_publication_undelivered_for_test`).
+/// * The SYNTHETIC short-circuit lifecycle is driven by the marker the proxy
+///   sets around that phase, which the H1/H2 and native-H3 reject writers share,
+///   so one test covers both transports' writers.
 fn commit_post_stream(
     ctx: &mut ferrum_edge::plugins::RequestContext,
     status: u16,
@@ -10661,6 +10680,257 @@ async fn aggregate_sse_post_stream_rewritten_after_staging_is_never_replayable()
     let seen = sse_drain_until(&mut listener_body, &["Partly cloudy"], 2).await;
     assert!(!seen.contains("Partly cloudy"), "replayed: {seen:?}");
     assert!(!seen.contains("tampered"));
+}
+
+/// Issue #5441: the SYNTHETIC short-circuit lifecycle answers inline.
+///
+/// Every synthetic writer — the H1/H2 `before_proxy` rejection writer and each
+/// native-H3 reject writer, which share one core — returns the finished response
+/// before the late policy re-close, the committed hooks, and the pre-commit
+/// authorization gate the staged reservation is settled at. So this lifecycle
+/// must not stage: the ordinary `application/json` answer is written on the POST
+/// instead, the identity is settled here, and nothing is left for a phase that
+/// will never run.
+#[tokio::test]
+async fn aggregate_sse_post_stream_answers_inline_on_the_synthetic_lifecycle() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = sse_tool_plugin(&server);
+    let session_id = initialize(&plugin).await;
+    let _ = aggregate_tool_names(&plugin, &session_id, 1).await;
+
+    let mut call_ctx = route_tool_call(&plugin, &session_id, 580).await;
+    assert!(mcp_sse_stream_is_open_for_test(&call_ctx));
+    mark_synthetic_short_circuit_for_test(&mut call_ctx);
+
+    let upstream = weather_tool_result(580);
+    let response_headers = known_json_response_headers(&upstream);
+    let delivered =
+        final_response_body(&plugin, &mut call_ctx, 200, &response_headers, &upstream).await;
+    assert!(
+        matches!(delivered, PluginResult::Continue),
+        "a synthetic answer stays the inline JSON representation, got {delivered:?}"
+    );
+    assert!(
+        !mcp_sse_publication_is_staged_for_test(&call_ctx),
+        "nothing may be staged on a lifecycle that never reaches the commit boundary"
+    );
+    assert!(
+        !mcp_sse_stream_is_open_for_test(&call_ctx),
+        "the identity is settled here, exactly as every other inline answer settles it"
+    );
+    assert_eq!(
+        call_ctx
+            .metadata
+            .get("mcp.sse.delivery")
+            .map(String::as_str),
+        Some("inline")
+    );
+
+    // Nothing entered replay history, so there is nothing to resume.
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    headers.insert("last-event-id".to_string(), "0".to_string());
+    let resumed = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(reject_raw(resumed).0, 200);
+    let mut listener_body = sse_body(&mut ctx);
+    let seen = sse_drain_until(&mut listener_body, &["Partly cloudy"], 2).await;
+    assert!(!seen.contains("Partly cloudy"), "replayed: {seen:?}");
+}
+
+/// A WAF instance that scores `6` for a response-body match under a block
+/// threshold of `10`, and inspects any media type.
+fn scoring_response_body_waf() -> Arc<dyn ferrum_edge::plugins::Plugin> {
+    let waf = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "response_inspection": true,
+        "response_body_inspection": true,
+        "inspect_binary_body": true,
+        "scoring": { "enabled": true, "block_threshold": 10 },
+        "custom_rules": [{
+            "id": "CUSTOM-RESP-WEATHER",
+            "name": "weather mention",
+            "category": "custom",
+            "severity": "medium",
+            "target": "response_body",
+            "match_kind": "contains",
+            "pattern": "Partly cloudy",
+            "action": "monitor",
+            "score": 6
+        }]
+    }))
+    .expect("the scoring WAF config is valid");
+    Arc::new(waf)
+}
+
+/// A WAF instance whose only enforcing rule matches the SSE FRAMING, which the
+/// JSON representation does not contain.
+fn enforcing_framing_waf() -> Arc<dyn ferrum_edge::plugins::Plugin> {
+    let waf = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "response_inspection": true,
+        "response_body_inspection": true,
+        "inspect_binary_body": true,
+        "custom_rules": [{
+            "id": "CUSTOM-RESP-FRAMING",
+            "name": "event framing",
+            "category": "custom",
+            "severity": "high",
+            "target": "response_body",
+            "match_kind": "contains",
+            "pattern": "event: message",
+            "action": "enforce"
+        }]
+    }))
+    .expect("the framing WAF config is valid");
+    Arc::new(waf)
+}
+
+/// Issue #5441 composition: re-closing the final body policy over the
+/// POST-attached event stream must not score the SAME response twice.
+///
+/// The authoritative phase accepts the JSON-RPC answer at score `6` under a
+/// threshold of `10`. The legacy `mcp_gateway` hook then re-frames those exact
+/// bytes as the event stream, and the pipeline re-closes the policy over the new
+/// representation — where the same rule matches again. Accumulating would make
+/// that `12` and refuse a response that legitimately passed, so the final
+/// client-visible phases supersede their own previous contribution instead.
+#[tokio::test]
+async fn aggregate_sse_post_stream_is_not_double_scored_by_the_late_policy() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let mcp = sse_tool_plugin(&server);
+    let waf = scoring_response_body_waf();
+    let session_id = initialize(&mcp).await;
+    let _ = aggregate_tool_names(&mcp, &session_id, 1).await;
+
+    let mut call_ctx = route_tool_call(&mcp, &session_id, 590).await;
+    let upstream = weather_tool_result(590);
+    let json_headers = known_json_response_headers(&upstream);
+
+    // The authoritative final client-visible body phase, over the JSON answer.
+    let accepted = waf
+        .finalize_client_visible_response_body(&mut call_ctx, 200, &json_headers, &upstream)
+        .await;
+    assert!(
+        matches!(accepted, PluginResult::Continue),
+        "score 6 is under the threshold of 10, got {accepted:?}"
+    );
+
+    // The legacy hook selects a representation neither final phase has seen.
+    let delivered = final_response_body(&mcp, &mut call_ctx, 200, &json_headers, &upstream).await;
+    let (status, stream_body, stream_headers) = post_stream(delivered);
+    assert_post_attached_stream(status, &stream_body, &stream_headers);
+
+    // The pipeline's late re-close, over the bytes the client receives.
+    let plugins = vec![Arc::clone(&waf)];
+    let mut late_status = status;
+    let mut late_headers = stream_headers.clone();
+    let mut late_body = Bytes::from(stream_body.clone().into_bytes());
+    let replaced = enforce_late_final_response_policy_for_test(
+        &plugins,
+        &mut call_ctx,
+        &mut late_status,
+        &mut late_headers,
+        &mut late_body,
+    )
+    .await;
+    assert!(
+        !replaced,
+        "the same response-phase evidence must not be counted twice"
+    );
+    assert_eq!(late_status, 200);
+    assert_eq!(late_body, Bytes::from(stream_body.clone().into_bytes()));
+
+    // Delivered, and therefore retained.
+    let retained = commit_post_stream(&mut call_ctx, late_status, &stream_body, &late_headers);
+    assert!(retained, "an accepted response is retained for resumption");
+}
+
+/// The same late pass stays FAIL-CLOSED: a representation that genuinely trips a
+/// rule only the framed bytes contain is refused, and the refused response is
+/// never retained for replay.
+#[tokio::test]
+async fn aggregate_sse_post_stream_framing_that_trips_a_rule_is_refused() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let mcp = sse_tool_plugin(&server);
+    let waf = enforcing_framing_waf();
+    let session_id = initialize(&mcp).await;
+    let _ = aggregate_tool_names(&mcp, &session_id, 1).await;
+
+    let mut call_ctx = route_tool_call(&mcp, &session_id, 600).await;
+    let upstream = weather_tool_result(600);
+    let json_headers = known_json_response_headers(&upstream);
+
+    // The JSON answer carries no SSE framing, so the authoritative phase passes.
+    let accepted = waf
+        .finalize_client_visible_response_body(&mut call_ctx, 200, &json_headers, &upstream)
+        .await;
+    assert!(matches!(accepted, PluginResult::Continue));
+
+    let delivered = final_response_body(&mcp, &mut call_ctx, 200, &json_headers, &upstream).await;
+    let (status, stream_body, stream_headers) = post_stream(delivered);
+
+    let plugins = vec![Arc::clone(&waf)];
+    let mut late_status = status;
+    let mut late_headers = stream_headers.clone();
+    let mut late_body = Bytes::from(stream_body.clone().into_bytes());
+    let replaced = enforce_late_final_response_policy_for_test(
+        &plugins,
+        &mut call_ctx,
+        &mut late_status,
+        &mut late_headers,
+        &mut late_body,
+    )
+    .await;
+    assert!(replaced, "a representation that trips a rule must be refused");
+    assert_ne!(late_status, 200);
+
+    // The client receives the refusal, and the refused answer is not replayable.
+    let retained = commit_post_stream(&mut call_ctx, late_status, "", &late_headers);
+    assert!(!retained, "a refused response is never retained");
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    headers.insert("last-event-id".to_string(), "0".to_string());
+    let resumed = mcp.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(reject_raw(resumed).0, 200);
+    let mut listener_body = sse_body(&mut ctx);
+    let seen = sse_drain_until(&mut listener_body, &["Partly cloudy"], 2).await;
+    assert!(!seen.contains("Partly cloudy"), "replayed: {seen:?}");
+}
+
+/// A transport that never handed the body over is not a delivery. The native-H3
+/// writer settles on `bytes_received == response_body_bytes`, so a failed or
+/// partial write reaches the shared settle call with `accepted = false`; this
+/// drives that same call directly, because a real partial QUIC write cannot be
+/// produced without a live H3 transport.
+#[tokio::test]
+async fn aggregate_sse_post_stream_undelivered_on_h3_is_never_replayable() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = sse_tool_plugin(&server);
+    let session_id = initialize(&plugin).await;
+    let _ = aggregate_tool_names(&plugin, &session_id, 1).await;
+
+    let mut call_ctx = route_tool_call(&plugin, &session_id, 610).await;
+    let upstream = weather_tool_result(610);
+    let response_headers = known_json_response_headers(&upstream);
+    let delivered =
+        final_response_body(&plugin, &mut call_ctx, 200, &response_headers, &upstream).await;
+    let (status, stream_body, stream_headers) = post_stream(delivered);
+    assert_post_attached_stream(status, &stream_body, &stream_headers);
+
+    // `mcp_sse_publication_matches_response` said yes; the H3 writer's extra
+    // term — the completed body write — said no.
+    assert!(mcp_sse_publication_is_staged_for_test(&call_ctx));
+    assert!(!settle_mcp_sse_publication_undelivered_for_test(
+        &mut call_ctx
+    ));
+
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    headers.insert("last-event-id".to_string(), "0".to_string());
+    let resumed = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(reject_raw(resumed).0, 200);
+    let mut listener_body = sse_body(&mut ctx);
+    let seen = sse_drain_until(&mut listener_body, &["Partly cloudy"], 2).await;
+    assert!(!seen.contains("Partly cloudy"), "replayed: {seen:?}");
 }
 
 /// A non-200 final response keeps its own failure semantics on the POST:

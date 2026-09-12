@@ -733,6 +733,67 @@ pub mod _test_support {
         ctx.mcp_sse_publication.is_some()
     }
 
+    /// Settle a staged POST-attached SSE publication as UNDELIVERED, the way the
+    /// native-H3 writer settles one whose body write did not complete.
+    ///
+    /// The commit predicate already matched; H3's extra term — every DATA byte
+    /// accepted by the send stream before FIN — did not. A real partial QUIC
+    /// write cannot be produced without a live H3 transport, so this drives the
+    /// same shared settle call that writer reaches.
+    pub fn settle_mcp_sse_publication_undelivered_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) -> bool {
+        let Some(publication) = ctx.mcp_sse_publication.take() else {
+            return false;
+        };
+        crate::proxy::settle_mcp_sse_publication(publication, false)
+    }
+
+    /// Mark a request context the way the proxy marks it for the duration of the
+    /// SYNTHETIC short-circuit response-body hook phase.
+    ///
+    /// The proxy sets this for every synthetic writer — the H1/H2 `before_proxy`
+    /// rejection writer and each native-H3 reject writer share one core — and
+    /// restores it afterwards. A plugin-level test sets it to drive exactly the
+    /// lifecycle those writers produce.
+    pub fn mark_synthetic_short_circuit_for_test(ctx: &mut crate::plugins::RequestContext) {
+        ctx.metadata.insert(
+            crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+    }
+
+    /// Run the proxy's LATE final-response policy re-close over a representation
+    /// a legacy final-body hook selected.
+    ///
+    /// This is the production entry point (`handle_proxy_request_inner` and the
+    /// native-H3 buffered writer both call it), so a test can prove what the
+    /// authoritative final body and header phases actually decide about a
+    /// re-framed representation rather than asserting a predicate in isolation.
+    /// Returns `true` when a policy replaced the response.
+    pub async fn enforce_late_final_response_policy_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: &mut u16,
+        response_headers: &mut HashMap<String, String>,
+        response_body: &mut bytes::Bytes,
+    ) -> bool {
+        let header_policy_plugins: Vec<Arc<dyn Plugin>> = plugins
+            .iter()
+            .filter(|plugin| plugin.is_initial_response_header_policy())
+            .cloned()
+            .collect();
+        crate::proxy::enforce_late_buffered_final_response_policy(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+            &header_policy_plugins,
+        )
+        .await
+    }
+
     /// Drop just the multiplexed stream lease, modelling a request that ended
     /// without producing a response — a backend failure, a replaced rejection,
     /// or a client transport disconnect. The identity must terminalize and its

@@ -2435,6 +2435,17 @@ impl McpGateway {
     /// committed the event is already-delivered replay history, so a broken POST
     /// stream can be resumed with `Last-Event-ID` while a freshly attached `GET`
     /// listener starts past it and never sees it.
+    ///
+    /// That boundary only exists on the PROXIED response pipeline. The synthetic
+    /// short-circuit lifecycle runs this same legacy hook, and every one of its
+    /// writers — the H1/H2 `before_proxy` rejection writer and each native-H3
+    /// reject writer — returns the finished response before the late policy
+    /// re-close, the committed hooks, and the pre-commit authorization gate that
+    /// the staged reservation is settled at. So that lifecycle answers INLINE
+    /// instead of staging (see [`Self::on_synthetic_response_lifecycle`]): a
+    /// staged event nobody can commit would be handed to the client and then
+    /// silently dropped, and a reservation nobody can settle is exactly the
+    /// shape this split exists to remove.
     fn deliver_deferred_response_on_post(
         &self,
         ctx: &mut RequestContext,
@@ -2443,6 +2454,20 @@ impl McpGateway {
         body: &[u8],
     ) -> Option<PluginResult> {
         let stream = ctx.mcp_sse_stream.take()?;
+        // A synthetic short-circuit answer (`response_mock`, a cache or
+        // federation hit, any plugin-authored 2xx) is written by a path that
+        // never reaches the retention boundary, so it is answered with the
+        // ordinary inline `application/json` representation — which is a
+        // representation MCP Streamable HTTP explicitly allows for a POST that
+        // carried a request. Fail-closed by construction: nothing is framed, so
+        // there is nothing to retain and no lease left for a phase that will not
+        // run. The identity is settled here, exactly as every other inline
+        // answer settles it.
+        if Self::on_synthetic_response_lifecycle(ctx) {
+            stream.settle_inline();
+            Self::note_sse_delivery(ctx, "inline");
+            return None;
+        }
         // A JSON-RPC response is carried as an event only when the FINAL
         // response is the protocol's ordinary 200 representation. Reframing a
         // 4xx/5xx (or any other status) as a 200 event stream would erase the
@@ -2504,6 +2529,17 @@ impl McpGateway {
                 None
             }
         }
+    }
+
+    /// Whether this response-body hook is running on the SYNTHETIC short-circuit
+    /// lifecycle rather than the proxied response pipeline.
+    ///
+    /// The proxy sets this marker for exactly the duration of that lifecycle's
+    /// body-hook phase and restores it afterwards, so its presence here is a
+    /// precise signal and the normal buffered backend path never sets it.
+    fn on_synthetic_response_lifecycle(ctx: &RequestContext) -> bool {
+        ctx.metadata
+            .contains_key(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
     }
 
     /// Release the request's stream identity because this POST is answering

@@ -9681,6 +9681,17 @@ async fn handle_h3_request(
         // transport never delivered must not become replayable either. Taking
         // the lease now also means every remaining exit — a write error, the
         // deadline terminal, a panic — drops it, and the drop aborts.
+        //
+        // What `bytes_received == response_body_bytes` actually proves, and
+        // what it does not: the QUIC send stream ACCEPTED every DATA byte
+        // before FIN. That is a local handoff to the transport, not an
+        // acknowledgement from the peer, so it is not proof of client receipt
+        // any more than the H1/H2 boundary is. It is deliberately one step
+        // LATER than H1/H2's, which commits before the write: here the write is
+        // in this frame, so the cheap stronger signal is available and a
+        // response this writer demonstrably failed to hand over is not made
+        // resumable. A client whose connection dies after acceptance resumes
+        // with `Last-Event-ID` — which is the whole point of retaining it.
         let mcp_publication = ctx.mcp_sse_publication.take();
         let mut mcp_publication_accepted = false;
         if let Some(publication) = mcp_publication.as_ref() {

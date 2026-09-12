@@ -346,6 +346,21 @@ request is rejected with `waf.block_reason = "score"` and
 `waf.scoring_instance` set to the blocking plugin-config identity. Hard per-rule
 `enforce` still blocks immediately when the global mode is `enforce`.
 
+**One response is scored once.** Phases that run exactly once per request — the
+request metadata scan, the final request body scan, and the `after_proxy`
+response-header scan — accumulate. The two authoritative **final client-visible**
+phases (response headers, response body) do not: the response pipeline can run
+them a second time over a revised representation of the same response, for
+example when `mcp_gateway` re-frames a JSON-RPC answer as a POST-attached
+`text/event-stream` body after those phases first closed. A re-run **replaces**
+that phase's previous contribution instead of adding to it, so a response that
+legitimately passed at `6` under a threshold of `10` is not refused at `12`
+purely because its bytes were re-wrapped. Independent request-phase scores are
+untouched, and a revised representation that genuinely trips more (or heavier)
+rules scores higher than its predecessor and still blocks. The header phase
+additionally skips a map it has already scanned, so only a map that actually
+changed is rescored.
+
 ### Multi-instance ownership
 
 Ferrum allows multiple scoped `waf` instances on one proxy. Anomaly scores are

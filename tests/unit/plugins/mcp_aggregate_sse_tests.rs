@@ -1410,6 +1410,236 @@ fn staging_a_post_attached_response_reports_the_phase_before_the_payload() {
     assert_eq!(publication.commit().unwrap(), 1);
 }
 
+/// A `notifications/cancelled` that lands AFTER the response was staged
+/// suppresses retention only. The commit is refused, nothing becomes
+/// replayable, and the POST body the gateway already produced is still the
+/// gateway's answer — cancellation in this window means "not resumable", not
+/// "withheld".
+#[tokio::test]
+async fn a_cancellation_after_staging_refuses_the_commit_and_retains_nothing() {
+    let session = "s-late-cancel";
+    let broker = broker();
+    broker.ensure_session(session).unwrap();
+    let stream = broker.open_stream(session, &number_id(1)).unwrap();
+    let payload = encode(&json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
+    let (framed, publication) = stream.reserve_post_attached_response(&payload).unwrap();
+    assert!(String::from_utf8_lossy(&framed).contains(r#""id":1"#));
+
+    broker.cancel_stream(session, &number_id(1)).unwrap();
+    assert_eq!(
+        publication.commit().unwrap_err(),
+        SseError::StreamCancelled,
+        "a cancelled identity refuses its own staged retention"
+    );
+
+    let resumed = broker.attach_listener(session, Some("0")).unwrap();
+    let mut body = resumed.take_body().expect("body claimed once");
+    assert_eq!(frame_text(next_frame(&mut body).await), ": mcp-sse\n\n");
+    assert!(
+        stays_idle(&mut body).await,
+        "a cancelled response must never become replay history"
+    );
+}
+
+/// The stale-lease case the generation binding exists for.
+///
+/// A terminal record is evicted once the terminal set outgrows the open-stream
+/// bound, after which the SAME JSON-RPC id may legitimately be opened again by a
+/// different request. A publication staged under the FIRST admission must then
+/// refuse: it must not retain its bytes under the live request's identity, must
+/// not terminalize it, and must not hand away its per-session capacity.
+#[tokio::test]
+async fn a_stale_publication_cannot_act_on_a_reused_identity() {
+    let session = "s-reuse";
+    let tuned = AggregateSseBounds {
+        max_streams_per_session: 1,
+        ..bounds()
+    };
+    let broker = AggregateSseBroker::new(tuned.validate().unwrap(), 4, 2);
+    broker.ensure_session(session).unwrap();
+
+    // The first admission of id 1 stages its response; the client cancels it.
+    let first = broker.open_stream(session, &number_id(1)).unwrap();
+    let payload = encode(&json!({"jsonrpc": "2.0", "id": 1, "result": {"gen": 1}}));
+    let (_framed, stale) = first.reserve_post_attached_response(&payload).unwrap();
+    broker.cancel_stream(session, &number_id(1)).unwrap();
+    drop(first);
+
+    // An unrelated request completes, which evicts the cancellation record for
+    // id 1: the terminal set is bounded by the open-stream bound.
+    publish(&broker, session, 2)
+        .expect("an unrelated response publishes");
+
+    // The same id is now admissible again, and belongs to a NEW request.
+    let reopened = broker.open_stream(session, &number_id(1)).unwrap();
+
+    assert_eq!(
+        stale.commit().unwrap_err(),
+        SseError::StreamCompleted,
+        "a lease from the previous admission is terminal for itself only"
+    );
+    // The live admission is untouched: still open, still holding the session's
+    // only stream slot.
+    assert_eq!(
+        broker.open_stream(session, &number_id(3)).unwrap_err(),
+        SseError::StreamCardinalityOverflow,
+        "the stale commit must not have released the live request's capacity"
+    );
+    let live_payload = encode(&json!({"jsonrpc": "2.0", "id": 1, "result": {"gen": 2}}));
+    let (_live_framed, live) = reopened
+        .reserve_post_attached_response(&live_payload)
+        .expect("the live admission is still open and still stageable");
+    live.commit().expect("the live response commits normally");
+
+    let resumed = broker.attach_listener(session, Some("0")).unwrap();
+    let mut body = resumed.take_body().expect("body claimed once");
+    let seen = drain_until(&mut body, &[r#""gen":2"#], 5).await;
+    assert!(
+        seen.contains(r#""gen":2"#),
+        "the live answer replays: {seen:?}"
+    );
+    assert!(
+        !seen.contains(r#""gen":1"#),
+        "the withdrawn answer must never replay: {seen:?}"
+    );
+}
+
+/// Session teardown between staging and the commit boundary refuses the commit
+/// and never resurrects the dead generation.
+#[test]
+fn a_staged_publication_refuses_after_session_teardown() {
+    let session = "s-torn-down";
+    let broker = broker();
+    broker.ensure_session(session).unwrap();
+    let stream = broker.open_stream(session, &number_id(1)).unwrap();
+    let payload = encode(&json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
+    let (_framed, publication) = stream.reserve_post_attached_response(&payload).unwrap();
+
+    broker.remove_session(session);
+    assert_eq!(publication.commit().unwrap_err(), SseError::StaleSession);
+    // The lease is spent either way, so a session that comes back under the same
+    // id starts clean rather than inheriting a withdrawn answer.
+    broker.ensure_session(session).unwrap();
+    assert!(
+        broker.open_stream(session, &number_id(1)).is_ok(),
+        "a fresh session admits the id again"
+    );
+}
+
+/// Aborting or dropping a staged reservation returns its capacity for real, not
+/// just its stream slot: a FRESH id must still be admissible at a ring sized for
+/// exactly one event and exactly one framing.
+#[tokio::test]
+async fn aborting_a_staged_reservation_returns_ring_capacity_to_the_next_request() {
+    let session = "s-returned";
+    let payload = encode(&json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
+    let tuned = AggregateSseBounds {
+        max_streams_per_session: 1,
+        max_retained_events: 1,
+        max_retained_bytes: payload.len() + 64,
+        max_replay_events: 1,
+        ..bounds()
+    };
+    let broker = AggregateSseBroker::new(tuned.validate().unwrap(), 4, 2);
+    broker.ensure_session(session).unwrap();
+
+    // Abort.
+    let first = broker.open_stream(session, &number_id(1)).unwrap();
+    first
+        .reserve_encoded(&payload)
+        .expect("the first deliverable reservation is admitted")
+        .abort();
+
+    // Drop.
+    let second = broker.open_stream(session, &number_id(2)).unwrap();
+    let second_payload = encode(&json!({"jsonrpc": "2.0", "id": 2, "result": {}}));
+    let dropped = second
+        .reserve_encoded(&second_payload)
+        .expect("the aborted reservation released the ring");
+    drop(dropped);
+
+    // A third, fresh id must still be admitted at the same tight bounds and must
+    // still commit — proving both the event and the byte budget came back.
+    let third = broker.open_stream(session, &number_id(3)).unwrap();
+    let third_payload = encode(&json!({"jsonrpc": "2.0", "id": 3, "result": {}}));
+    let reserved = third
+        .reserve_encoded(&third_payload)
+        .expect("the dropped reservation released the ring");
+    assert_eq!(reserved.commit().unwrap(), 1);
+
+    let resumed = broker.attach_listener(session, Some("0")).unwrap();
+    let mut body = resumed.take_body().expect("body claimed once");
+    let seen = drain_until(&mut body, &[r#""id":3"#], 4).await;
+    assert!(
+        seen.contains(r#""id":3"#),
+        "the third response is real: {seen:?}"
+    );
+}
+
+/// Issue #5441: the two reservation budgets are separate on purpose. A staged
+/// POST-attached response is best effort and must never consume the promise a
+/// DELIVERABLE reservation was admitted under, or a response the broker already
+/// promised could be lost to `RetentionOverflow` at commit.
+#[tokio::test]
+async fn a_staged_post_attached_reservation_never_spends_a_deliverable_promise() {
+    let session = "s-budgets";
+    let payload = encode(&json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
+    let tuned = AggregateSseBounds {
+        max_streams_per_session: 2,
+        max_retained_events: 1,
+        max_retained_bytes: 64 * 1024,
+        max_replay_events: 1,
+        ..bounds()
+    };
+    let broker = AggregateSseBroker::new(tuned.validate().unwrap(), 4, 2);
+    broker.ensure_session(session).unwrap();
+
+    // A deliverable reservation is a PROMISE: the ring admitted it.
+    let deliverable = broker.open_stream(session, &number_id(1)).unwrap();
+    let promised = deliverable
+        .reserve_encoded(&payload)
+        .expect("the one-event ring admits the promise");
+
+    // A POST-attached response is staged in between. Its bytes are already going
+    // out on its own POST, so it is best effort and is accounted apart.
+    let attached = broker.open_stream(session, &number_id(2)).unwrap();
+    let post_payload = encode(&json!({"jsonrpc": "2.0", "id": 2, "result": {}}));
+    let (_framed, staged) = attached
+        .reserve_post_attached_response(&post_payload)
+        .expect("a POST-attached response is never refused for capacity");
+    assert_eq!(
+        broker.outstanding_reservations(session),
+        Some((1, 1)),
+        "the promise and the best-effort stage are tracked apart"
+    );
+
+    let published = promised
+        .commit()
+        .expect("a promised deliverable commit must not be lost to a stage");
+    assert_eq!(
+        published, 2,
+        "the staged POST-attached response already assigned cursor 1"
+    );
+    // The best-effort commit yields instead: the one-event ring already holds
+    // the promised answer, so only this response's resumability is lost and its
+    // cursor becomes unreachable.
+    assert!(staged.commit().is_ok());
+    assert_eq!(broker.outstanding_reservations(session), Some((0, 0)));
+    assert_eq!(
+        broker.attach_listener(session, Some("0")).unwrap_err(),
+        SseError::LastEventIdTooOld,
+        "a cursor below the skipped retention fails closed"
+    );
+
+    let resumed = broker.attach_listener(session, Some("1")).unwrap();
+    let mut body = resumed.take_body().expect("body claimed once");
+    let seen = drain_until(&mut body, &[r#""id":1"#], 4).await;
+    assert!(
+        seen.contains(r#""id":1"#),
+        "the promised response is the one that publishes: {seen:?}"
+    );
+}
+
 /// Settling for an inline JSON answer reports a cancellation the caller has to
 /// honour, and stays idempotent across the lease's other exits.
 #[tokio::test]
