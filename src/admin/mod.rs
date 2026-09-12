@@ -19,7 +19,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper::header::{HeaderValue, RETRY_AFTER};
+use hyper::header::{HeaderName, HeaderValue, RETRY_AFTER};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -2246,6 +2246,33 @@ fn audit_namespace_for_request<'a>(segments: &[&str], request_namespace: &'a str
     }
 }
 
+/// Closed-set resource-kind label for an admin route operating on
+/// namespace-scoped resources selected via `X-Ferrum-Namespace`, or `None` when
+/// the header does not select a tenant on that route.
+///
+/// The label is a fixed `&'static str` taken from the route table, never a
+/// caller-supplied path segment, so it is safe to use as a log field and as
+/// half of a bounded dedup key (see [`note_unserved_namespace_mutation`]).
+fn namespace_scoped_resource_kind(segments: &[&str]) -> Option<&'static str> {
+    let kind = match *segments.first()? {
+        "proxies" => "proxies",
+        "consumers" => "consumers",
+        "upstreams" => "upstreams",
+        "api-specs" => "api-specs",
+        "batch" => "batch",
+        "backup" => "backup",
+        "restore" => "restore",
+        "audit" => "audit",
+        "gateway-trust-bundles" => "gateway-trust-bundles",
+        "gateway-trust" => "gateway-trust",
+        // `GET /plugins` lists available plugin *types* (global metadata);
+        // `/plugins/config[...]` is the namespace-scoped PluginConfig CRUD.
+        "plugins" if segments.len() > 1 => "plugins",
+        _ => return None,
+    };
+    Some(kind)
+}
+
 /// Whether an admin route operates on namespace-scoped resources selected via
 /// `X-Ferrum-Namespace`. Used by the opt-in per-namespace `ns`-claim gate
 /// (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`); global admin surfaces (TLS
@@ -2254,24 +2281,242 @@ fn audit_namespace_for_request<'a>(segments: &[&str], request_namespace: &'a str
 /// because the namespace header does not select a tenant there. Namespace
 /// registry handlers apply the `ns` claim to the path/body name themselves.
 fn is_namespace_scoped_route(segments: &[&str]) -> bool {
-    match segments.first().copied() {
-        Some(
-            "proxies"
-            | "consumers"
-            | "upstreams"
-            | "api-specs"
-            | "batch"
-            | "backup"
-            | "restore"
-            | "audit"
-            | "gateway-trust-bundles"
-            | "gateway-trust",
-        ) => true,
-        // `GET /plugins` lists available plugin *types* (global metadata);
-        // `/plugins/config[...]` is the namespace-scoped PluginConfig CRUD.
-        Some("plugins") => segments.len() > 1,
-        _ => false,
+    namespace_scoped_resource_kind(segments).is_some()
+}
+
+/// How this process's data plane is scoped relative to the deliberately
+/// multi-namespace Admin API (issue #5447).
+///
+/// The Admin API accepts any valid `X-Ferrum-Namespace`, but a proxy data plane
+/// builds its router, plugin, consumer, and load-balancer caches from exactly
+/// one namespace. This label is the closed-set answer to "will a resource I
+/// write under namespace N be routed by *this* process?", published on the
+/// authenticated `/health` and `/status` detail so provisioning clients can
+/// discover it instead of inferring it from a data-plane `404`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamespaceServingScope {
+    /// This process runs a proxy data plane bound to one namespace
+    /// (`FERRUM_NAMESPACE`): `database`, `file`, `dp`, and `mesh`. Resources in
+    /// any other namespace are stored and Admin-visible but never routed here.
+    SingleNamespaceDataPlane,
+    /// Control plane: stores and distributes every namespace in its scope
+    /// (`FERRUM_CP_NAMESPACES`) and routes no traffic itself. Multi-namespace
+    /// Admin writes are the intended usage — each data plane subscribes to its
+    /// own namespace — so nothing is unserved from the CP's point of view.
+    ControlPlane,
+    /// An admin surface with neither a local proxy nor a control-plane scope
+    /// (`node_agent`, and test states constructed without a `ProxyState`).
+    NoDataPlane,
+}
+
+impl NamespaceServingScope {
+    /// Stable wire label. Downstream tooling (Ferrum Nexus, Ferrum Foundry)
+    /// matches on these exact strings, so treat them as API.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SingleNamespaceDataPlane => "single-namespace-data-plane",
+            Self::ControlPlane => "control-plane",
+            Self::NoDataPlane => "no-data-plane",
+        }
     }
+}
+
+/// Classify this process's data-plane namespace scope.
+///
+/// Presence of a [`ProxyState`] is the authoritative signal that this process
+/// serves traffic: every serving mode constructs one and both `cp` and
+/// `node_agent` leave it `None`. Deriving the scope from it rather than from a
+/// separate flag keeps the report honest for a mode added later.
+fn namespace_serving_scope(state: &AdminState) -> NamespaceServingScope {
+    if state.proxy_state.is_some() {
+        NamespaceServingScope::SingleNamespaceDataPlane
+    } else if state.mode == "cp" {
+        NamespaceServingScope::ControlPlane
+    } else {
+        NamespaceServingScope::NoDataPlane
+    }
+}
+
+/// The single namespace this process's data plane routes, or `None` when it has
+/// no data plane (`cp`, `node_agent`).
+fn active_data_plane_namespace(state: &AdminState) -> Option<&str> {
+    state
+        .proxy_state
+        .as_ref()
+        .map(|proxy| proxy.env_config.namespace.as_str())
+}
+
+/// Documented spelling of the response header marking an accepted Admin
+/// mutation whose `X-Ferrum-Namespace` names a namespace this process's data
+/// plane does not route (issue #5447).
+///
+/// HTTP field names are case-insensitive and hyper emits the lowercase form on
+/// the wire; this constant is the spelling used in `openapi.yaml` and the docs.
+///
+/// Consumed by the external `tests/` crates (spec parity and response
+/// assertions); `src/main.rs` declares the same module tree, so in the BIN
+/// target it has no caller and `-D warnings` would reject it as dead code.
+#[allow(dead_code)]
+pub const NAMESPACE_UNSERVED_HEADER: &str = "X-Ferrum-Namespace-Unserved";
+
+/// Lowercase wire form of [`NAMESPACE_UNSERVED_HEADER`].
+///
+/// `HeaderName::from_static` panics on anything that is not a valid lowercase
+/// field name; the documented invariant is that this is a compile-time literal
+/// satisfying that grammar, and the spec-parity test pins it against
+/// `openapi.yaml`. No caller-supplied bytes ever reach the constructor.
+const NAMESPACE_UNSERVED_HEADER_WIRE: &str = "x-ferrum-namespace-unserved";
+
+/// An admin mutation whose requested namespace this process will never route,
+/// plus the closed-set context the response marker and bounded warning need.
+struct UnservedNamespaceMutation {
+    /// Validated `X-Ferrum-Namespace` value (namespace grammar, ≤254 chars).
+    namespace: String,
+    /// The namespace this process's data plane actually serves.
+    active_namespace: String,
+    /// Fixed-cardinality route label from [`namespace_scoped_resource_kind`].
+    resource_kind: &'static str,
+}
+
+/// Decide whether an admin mutation targets a namespace whose resources this
+/// process's data plane will never route (issue #5447).
+///
+/// Multi-namespace admin writes are **legitimate** on a control plane: the CP
+/// stores every tenant's configuration and each data plane subscribes to its
+/// own, so `cp` (and any admin surface with no local proxy) is never marked. A
+/// single-process deployment is different: `database`, `file`, `dp`, and `mesh`
+/// project every configuration snapshot down to `FERRUM_NAMESPACE` before
+/// serving it, so a resource written to another namespace is committed, listed
+/// by Admin, and then silently absent from the router — the failure reported in
+/// issue #5447.
+///
+/// This is an observability marker only: routing, filtering, admission, and
+/// status codes are unchanged.
+///
+/// Scoped deliberately:
+/// - only `POST`/`PUT`/`PATCH`/`DELETE`, because a read has one-call discovery
+///   through the `namespace` block on authenticated `/health` and `/status`;
+/// - only routes selected by `X-Ferrum-Namespace`
+///   ([`namespace_scoped_resource_kind`]), never a global admin surface;
+/// - never for an invalid header value, which the dispatcher rejects with `400`
+///   before any handler runs.
+fn unserved_namespace_mutation_marker(
+    state: &AdminState,
+    method: &Method,
+    segments: &[&str],
+    headers: &hyper::HeaderMap,
+) -> Option<UnservedNamespaceMutation> {
+    if !matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
+        return None;
+    }
+    let resource_kind = namespace_scoped_resource_kind(segments)?;
+    let active = active_data_plane_namespace(state)?;
+    let requested = validated_namespace_header(headers).ok()?;
+    if requested == active {
+        return None;
+    }
+    Some(UnservedNamespaceMutation {
+        namespace: requested.to_string(),
+        active_namespace: active.to_string(),
+        resource_kind,
+    })
+}
+
+/// Distinct `(namespace, resource kind)` pairs already warned about. Capped
+/// because the namespace half is caller-chosen: a client cycling values must
+/// not be able to grow this set without bound. Past the cap the shared time
+/// window below is the only rate limit.
+const UNSERVED_NAMESPACE_WARN_MAX_KEYS: usize = 256;
+
+/// Minimum spacing between warnings once the dedup set is full.
+const UNSERVED_NAMESPACE_WARN_WINDOW_MS: u64 = 5_000;
+
+static UNSERVED_NAMESPACE_WARNED: OnceLock<Mutex<HashSet<(String, &'static str)>>> =
+    OnceLock::new();
+static UNSERVED_NAMESPACE_WARN_LAST_MS: AtomicU64 = AtomicU64::new(0);
+static UNSERVED_NAMESPACE_MUTATION_COUNT: AtomicU64 = AtomicU64::new(0);
+static UNSERVED_NAMESPACE_WARN_EMITTED: AtomicU64 = AtomicU64::new(0);
+
+fn unserved_namespace_warned() -> std::sync::MutexGuard<'static, HashSet<(String, &'static str)>> {
+    UNSERVED_NAMESPACE_WARNED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Emit one bounded structured WARN for an **accepted** admin mutation that
+/// targeted a namespace this process's data plane does not route (issue #5447).
+///
+/// Deduplicated per `(namespace, resource kind)` so a provisioning client
+/// looping over one tenant logs once rather than once per resource, and rate
+/// limited to one line per [`UNSERVED_NAMESPACE_WARN_WINDOW_MS`] once the
+/// bounded dedup set is full. Called only after the dispatcher returned `2xx`:
+/// a rejected write is not the silent-success condition being reported.
+fn note_unserved_namespace_mutation(marker: &UnservedNamespaceMutation) {
+    let total = UNSERVED_NAMESPACE_MUTATION_COUNT
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    let key = (marker.namespace.clone(), marker.resource_kind);
+    let first_for_key = {
+        let mut warned = unserved_namespace_warned();
+        // Short-circuit order matters: the cap is checked before the insert so a
+        // caller cycling namespace values cannot grow the set, and `insert`
+        // answers "newly seen" for the keys that do fit.
+        warned.len() < UNSERVED_NAMESPACE_WARN_MAX_KEYS && warned.insert(key)
+    };
+    if !first_for_key {
+        let now = crate::socket_opts::monotonic_now_ms();
+        let last = UNSERVED_NAMESPACE_WARN_LAST_MS.load(Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < UNSERVED_NAMESPACE_WARN_WINDOW_MS {
+            return;
+        }
+        if UNSERVED_NAMESPACE_WARN_LAST_MS
+            .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+    }
+    UNSERVED_NAMESPACE_WARN_EMITTED.fetch_add(1, Ordering::Relaxed);
+    warn!(
+        namespace = %marker.namespace,
+        active_namespace = %marker.active_namespace,
+        resource = marker.resource_kind,
+        unserved_mutations_total = total,
+        "admin mutation accepted for a namespace this process's data plane does not serve; \
+         the resource is stored and Admin-visible but will never be routed here — write to \
+         the active namespace, or run a control plane with a data plane per namespace"
+    );
+}
+
+/// Reset the issue #5447 warning bookkeeping. Consumed only by the external
+/// `tests/` crates; `src/main.rs` declares the same module tree, so in the BIN
+/// target this has no caller and `-D warnings` would reject it as dead code.
+#[allow(dead_code)]
+#[doc(hidden)]
+pub fn reset_unserved_namespace_observability_for_test() {
+    unserved_namespace_warned().clear();
+    UNSERVED_NAMESPACE_WARN_LAST_MS.store(0, Ordering::Relaxed);
+    UNSERVED_NAMESPACE_MUTATION_COUNT.store(0, Ordering::Relaxed);
+    UNSERVED_NAMESPACE_WARN_EMITTED.store(0, Ordering::Relaxed);
+}
+
+/// Process-cumulative count of accepted admin mutations that targeted a
+/// namespace this process's data plane does not serve. Test-only observation of
+/// [`note_unserved_namespace_mutation`].
+#[allow(dead_code)]
+#[doc(hidden)]
+pub fn unserved_namespace_mutation_count_for_test() -> u64 {
+    UNSERVED_NAMESPACE_MUTATION_COUNT.load(Ordering::Relaxed)
+}
+
+/// How many `WARN` lines [`note_unserved_namespace_mutation`] actually emitted.
+/// In-process tests capture no gateway logs, so this counter is the observable
+/// proof that the `(namespace, resource kind)` deduplication holds.
+#[allow(dead_code)]
+#[doc(hidden)]
+pub fn unserved_namespace_warn_emitted_count_for_test() -> u64 {
+    UNSERVED_NAMESPACE_WARN_EMITTED.load(Ordering::Relaxed)
 }
 
 /// Enforce the admin JWT `ns` claim against the requested namespace. Returns
@@ -2389,12 +2634,23 @@ pub async fn handle_admin_request(
     // rejects them and records backup namespace_status=invalid without raw bytes.
     let header_namespace = validated_namespace_header(req.headers())
         .unwrap_or_else(|_| canonical_global_audit_namespace());
+    // Issue #5447: decided here, before `state` and `req` are moved into the
+    // dispatch future. The marker is a fact about the requested namespace
+    // rather than about any handler's outcome, and stamping it on the way out
+    // is the only way to reach every response the dispatcher can produce
+    // without touching each of the ~200 return points.
+    let unserved_namespace = unserved_namespace_mutation_marker(
+        &state,
+        req.method(),
+        request_segments.as_slice(),
+        req.headers(),
+    );
     let slot = audit::new_request_slot(
         req.method().as_str(),
         request_path,
         audit_namespace_for_request(request_segments.as_slice(), header_namespace),
     );
-    let result = audit::scope_request(
+    let mut result = audit::scope_request(
         Arc::clone(&slot),
         boxed_handle_admin_request_inner(req, state, client_ip),
     )
@@ -2408,6 +2664,22 @@ pub async fn handle_admin_request(
         .map(|response| response.status().as_u16())
         .unwrap_or(500);
     audit::finalize_unconsumed_intent(&slot, status).await;
+    // Mark the accepted-but-unrouted namespace on the way out (issue #5447).
+    // Scoped to `2xx` mutations: a rejected write never reached the store so it
+    // is not the silent-success condition, and a read has `GET /status` as its
+    // one-call discovery surface. Keeping the marker to exactly the accepted
+    // mutation responses is also what makes the `openapi.yaml` declaration
+    // exact rather than "may appear anywhere".
+    if let Some(marker) = unserved_namespace.as_ref()
+        && let Ok(response) = result.as_mut()
+        && response.status().is_success()
+    {
+        response.headers_mut().insert(
+            HeaderName::from_static(NAMESPACE_UNSERVED_HEADER_WIRE),
+            HeaderValue::from_static("true"),
+        );
+        note_unserved_namespace_mutation(marker);
+    }
     result
 }
 
@@ -2736,6 +3008,32 @@ async fn handle_admin_request_inner(
         // cryptographic module, and a status scraper must not be able to read
         // "enforcing" as "certified". See docs/fips.md.
         health_status["fips"] = crate::fips::status_metadata();
+
+        // Data-plane namespace scope (issue #5447). The Admin API is
+        // deliberately multi-namespace, but a proxy data plane serves exactly
+        // one namespace, so a client that provisions under its own
+        // `X-Ferrum-Namespace` has no way to tell from a `201` whether this
+        // process will ever route the result. These three fields are that
+        // answer: `active` is the namespace the local data plane routes (`null`
+        // when this process has none), `serving_scope` is the closed-set label
+        // from [`NamespaceServingScope`], and `data_plane_single_namespace`
+        // says whether anything outside `active` is unrouted here.
+        //
+        // Authenticated tier only: the namespace name is operator-supplied
+        // deployment topology, and the minimal probe body below carries neither
+        // this object nor anything derived from it. Three field reads, one small
+        // allocation, no lock and no I/O — and skipped entirely for an
+        // unauthenticated probe flood.
+        if detailed {
+            let namespace_scope = namespace_serving_scope(&state);
+            let data_plane_single_namespace =
+                namespace_scope == NamespaceServingScope::SingleNamespaceDataPlane;
+            health_status["namespace"] = json!({
+                "active": active_data_plane_namespace(&state),
+                "serving_scope": namespace_scope.as_str(),
+                "data_plane_single_namespace": data_plane_single_namespace,
+            });
+        }
 
         // Admin audit delivery pipeline (issue #2421). An unavailable or
         // degraded pipeline degrades `status` so a stuck audit backlog is not

@@ -48,7 +48,7 @@ The diagnostic does not echo the address or token.
 |---|---|---|---|
 | `FERRUM_CONF_PATH` | No | `./ferrum.conf` | Path to optional conf file (provides defaults; env vars override). Loaded once at process start through the shared bounded stable-file reader: opened target must be a regular file (Kubernetes/projected-secret symlinks allowed), Unix opens are non-blocking, size is capped at **1 MiB** with a streaming `limit + 1` read, and two probes separated by a **20ms settle interval** must observe byte-identical content (the same delay is used between unstable retries; worst-case synchronous sleep is 180ms). The accepted snapshot (or a precise load error) is cached for the process lifetime — a failed load is never converted into an empty config. When unset — or set to an empty / whitespace-only value, which configures nothing and is treated as unset — a genuinely absent `./ferrum.conf` still yields empty defaults; an explicit non-empty path that is missing, non-regular, oversized, unstable, invalid UTF-8, or malformed fails closed. `ferrum.conf` is not live-reloaded; restart to pick up changes. |
 | `FERRUM_MODE` | **Yes** | — | Operating mode: `database`, `file`, `cp`, `dp`, `mesh`, `injector`, `node_agent`, `migrate` |
-| `FERRUM_NAMESPACE` | No | `ferrum` | Namespace this gateway loads and manages |
+| `FERRUM_NAMESPACE` | No | `ferrum` | The single namespace this process's **data plane** serves; every config source is projected down to it before being served. The Admin API still accepts any `X-Ferrum-Namespace`, so a write outside this namespace is stored and Admin-visible but never routed by this process — see [Namespace Semantics](#namespace-semantics) |
 | `FERRUM_LOG_LEVEL` | No | `warn` | Log verbosity: `error`, `warn`, `info`, `debug`, `trace`. Controls the runtime tracing logs only; per-transaction access logs from the `stdout_logging` plugin are emitted independent of this level |
 | `FERRUM_LOG_BUFFER_CAPACITY` | No | `4096` | Per-sink hard record-slot limit (stdout/access logs share one sink; stderr is separate). Actual admission is also constrained by `FERRUM_LOG_BUFFER_BYTES`. Clamped to 1–65,536; admission is lossy and non-blocking when either limit is full |
 | `FERRUM_LOG_BUFFER_BYTES` | No | `33554432` | Per-sink aggregate serialized-payload byte budget. Admission provisionally reserves `FERRUM_LOG_MAX_RECORD_BYTES` before serialization, then queues an exact-sized allocation and shrinks that reservation to the serialized length until write completion. Clamped between `FERRUM_LOG_MAX_RECORD_BYTES` and 1 GiB |
@@ -1175,6 +1175,68 @@ See [connection_pooling.md](connection_pooling.md) for the full configuration re
 | `FERRUM_SO_BUSY_POLL_US` | No | `0` | Linux SO_BUSY_POLL duration for latency-sensitive UDP sockets |
 
 Core environment parsing lives in `src/config/env_config.rs`; early startup/pool settings use the same `FERRUM_*` names via conf-aware helpers.
+
+## Namespace Semantics
+
+`FERRUM_NAMESPACE` (default `ferrum`) is the **single namespace this process's
+data plane serves**. Every configuration source — a database load, a CP
+snapshot, a file config, an externally provisioned startup backup — is projected
+down to that namespace (`retain_namespace` in
+`src/config/namespace_filter.rs`) before cross-resource validation, router
+construction, and plugin/consumer/load-balancer cache builds. Resources owned by
+any other namespace are dropped from the served snapshot.
+
+The Admin API is deliberately **not** so restricted: it accepts any valid
+`X-Ferrum-Namespace` on namespace-scoped routes. That combination is what makes
+a multi-namespace control plane work — `cp` stores every namespace in
+`FERRUM_CP_NAMESPACES` and each `dp` subscribes to its own `FERRUM_NAMESPACE` —
+and it is also a silent-misconfiguration trap on a single process: an accepted
+`POST /proxies` under a foreign namespace is durable and Admin-visible, yet the
+local proxy answers `404` for its `listen_path` (issue #5447).
+
+Which namespaces a process serves, by mode:
+
+| Mode | Admin writes | Data-plane namespaces |
+|---|---|---|
+| `database` | read/write | exactly `FERRUM_NAMESPACE` |
+| `file` | read-only | exactly `FERRUM_NAMESPACE` |
+| `dp` | read-only | exactly `FERRUM_NAMESPACE` (its CP subscription) |
+| `mesh` | read-only | exactly `FERRUM_NAMESPACE` |
+| `cp` | read/write | none — it distributes `FERRUM_CP_NAMESPACES` to data planes |
+| `node_agent` | read-only | none — no proxy listeners |
+
+### Discovering the served namespace
+
+Read the `namespace` object on the authenticated `GET /status` (or
+`GET /health`) rather than assuming the default:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:9000/status \
+  | jq '.namespace'
+# { "active": "ferrum",
+#   "serving_scope": "single-namespace-data-plane",
+#   "data_plane_single_namespace": true }
+```
+
+`active` is the served namespace (`null` when the process has no data plane),
+`serving_scope` is one of `single-namespace-data-plane`, `control-plane`, or
+`no-data-plane`, and `data_plane_single_namespace` is `true` when everything
+outside `active` is unrouted here. The block is authenticated-tier only: the
+unauthenticated probe still returns just `status` and `ready`.
+
+### Detecting an unserved write
+
+When this process is both Admin and data plane, an **accepted** mutation
+(`2xx` on `POST`/`PUT`/`PATCH`/`DELETE`) to a namespace-scoped route under any
+other namespace carries the response header `X-Ferrum-Namespace-Unserved: true`,
+and the gateway logs one `WARN` per `(namespace, resource kind)` — deduplicated,
+bounded to 256 pairs, then rate limited to one line per five seconds. Routing,
+filtering, admission, and status codes are unchanged; both signals are
+observability only. See
+[admin_api.md](admin_api.md#admin-is-multi-namespace-one-processs-data-plane-serves-one-namespace).
+
+To serve several namespaces at once, run `cp` mode with one `dp` per namespace
+instead of pointing a multi-namespace client at a single-process gateway.
 
 ## Backend Egress / SSRF Protection
 

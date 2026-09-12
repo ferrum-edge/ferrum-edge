@@ -90,7 +90,8 @@ curl http://localhost:9000/health
 
 # Authenticated: full diagnostics.
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/health
-# Returns: {"status","timestamp","mode","database":{...},"admin_writes_enabled",
+# Returns: {"status","timestamp","mode","namespace":{...},"database":{...},
+#           "admin_writes_enabled",
 #           "ready","cached_config":{"proxy_count":...},"database_polling":{...},
 #           "config_rejected":true,"mesh":{"egress_scope":{...}},
 #           "listener_failures":{"failures_total":...},
@@ -407,6 +408,77 @@ Both admin listeners (plaintext and HTTPS) serve HTTP/1.1 and HTTP/2 — HTTPS n
 Sizing note: there is no listener-wide budget for concurrently buffered request bodies, so the theoretical ceiling on retained body bytes is `FERRUM_ADMIN_MAX_CONNECTIONS` x `FERRUM_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS` x the route's size cap. Reaching it requires credentials for a body-consuming route (every one of them is role-gated, and the role gate runs before the body is read), and in practice the binding constraint is the caller's upload bandwidth times the body deadline rather than the stream product — a caller can only hold what it has actually transmitted. Deployments that expose the admin plane to lower-trust `operator` tokens should size `FERRUM_ADMIN_MAX_CONNECTIONS`, `FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP`, and `FERRUM_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS` against the process memory limit rather than relying on the defaults.
 
 ## Namespaces
+
+### Admin is multi-namespace; one process's data plane serves one namespace
+
+The Admin API accepts any valid `X-Ferrum-Namespace`. A **proxy data plane does
+not**: it projects every configuration snapshot down to the process's single
+active namespace (`FERRUM_NAMESPACE`, default `ferrum`) before building the
+router, plugin, consumer, and load-balancer caches. Writing a resource under a
+namespace this process does not route therefore succeeds, stays visible to
+Admin reads, and is never matched by the local proxy — the data plane answers
+`404` (issue #5447).
+
+That asymmetry is deliberate, not a bug in the storage layer:
+
+| Mode | Admin writes | Data plane | Multi-namespace writes |
+|---|---|---|---|
+| `cp` | read/write | none | **Intended.** The CP stores every namespace in `FERRUM_CP_NAMESPACES` and each DP subscribes to its own. |
+| `database` | read/write | one namespace | **Unrouted here.** Accepted and durable, but only `FERRUM_NAMESPACE` is served by this process. |
+| `file`, `dp`, `mesh` | read-only | one namespace | Cannot arise — mutations are rejected with `403`. |
+| `node_agent` | read-only | none | Not applicable. |
+
+Two mechanisms make the mismatch visible instead of silent:
+
+**1. Discover the served namespace up front.** The authenticated `/health` and
+`/status` detail carries a `namespace` object:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:9000/status \
+  | jq '.namespace'
+# {
+#   "active": "ferrum",
+#   "serving_scope": "single-namespace-data-plane",
+#   "data_plane_single_namespace": true
+# }
+```
+
+- `active` — the one namespace this process's data plane routes. `null` when the
+  process has no data plane (`cp`, `node_agent`).
+- `serving_scope` — closed set: `single-namespace-data-plane` (`database`,
+  `file`, `dp`, `mesh`), `control-plane` (`cp`), `no-data-plane`
+  (`node_agent`).
+- `data_plane_single_namespace` — `true` when everything outside `active` is
+  unrouted by this process. This is the field to branch on.
+
+The block is authenticated-tier only (the namespace name is operator-supplied
+deployment topology); the unauthenticated probe still carries only `status` and
+`ready`.
+
+**2. Detect it per write.** An **accepted** mutation (`2xx` on
+`POST`/`PUT`/`PATCH`/`DELETE`) to a namespace-scoped route under a namespace this
+process does not route carries:
+
+```
+X-Ferrum-Namespace-Unserved: true
+```
+
+The header is absent when the requested namespace is the served one, on every
+non-`2xx` response (a rejected write never reached the store), on reads, on
+global admin surfaces that `X-Ferrum-Namespace` does not select, and in `cp`
+mode. A deferred `202` never carries it either: `?apply=async` is already a
+no-op for a namespace this process does not serve, so such a write returns its
+synchronous success status and no `X-Ferrum-Config-Cursor`.
+
+The gateway also logs one `WARN` per `(namespace, resource kind)` for these
+accepted-but-unrouted mutations, deduplicated so a provisioning client looping
+over one tenant logs once rather than once per resource, bounded to 256 distinct
+pairs, and rate limited to one line per five seconds past that bound.
+
+Nothing about routing, filtering, admission, or status codes changes: both
+mechanisms are observability. If you need several namespaces served at once, run
+`cp` mode with one `dp` per namespace rather than pointing a multi-namespace
+client at a single-process gateway.
 
 ### Resource identity is `(namespace, id)`
 
