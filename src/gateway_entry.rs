@@ -599,7 +599,7 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     // multi-threaded runtime. External secret suffixes resolve with the same
     // semantics as `run` so validation sees the identical configuration
     // picture (and the same provider-conflict/fetch failures).
-    if matches!(&cli.command, Some(cli::Command::Validate(_))) {
+    if let Some(cli::Command::Validate(args)) = &cli.command {
         let resolved = match resolve_startup_secrets() {
             Ok(resolved) => resolved,
             Err(error) => {
@@ -624,7 +624,7 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         // still has a live subscriber, and before `execute_validate()` so the
         // report reads in resolution order: secrets, then settings, then spec.
         print_resolved_secret_sources(&resolved);
-        match cli::execute_validate() {
+        match cli::execute_validate(args) {
             Ok(()) => return 0,
             Err(e) => {
                 // Settings and spec validation run against an environment that

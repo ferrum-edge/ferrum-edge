@@ -72,6 +72,7 @@ mod gateway_trust_bundle_admin_tests;
 mod gateway_trust_bundle_store_tests;
 mod graceful_shutdown_tests;
 mod grpc_proxy_tests;
+mod hbone_pool_width_tests;
 mod http2_pool_tests;
 mod http3_integration_tests;
 mod injector_admission_tests;
