@@ -674,13 +674,22 @@ fn circuit_breaker_config_documents_cooldown_seconds_input_alias() {
         timeout_description.contains("never returned"),
         "timeout_seconds must say the alias is never returned: {timeout_description}"
     );
-    let circuit_properties = spec
-        .pointer("/components/schemas/CircuitBreakerConfig/properties")
-        .and_then(serde_json::Value::as_object)
-        .expect("CircuitBreakerConfig properties");
+    // The alias is a real accepted input key, so the schema lists it (the
+    // serde/OpenAPI field-inventory parity test requires that) as a
+    // write-only, deprecated property pointing back at `timeout_seconds`.
+    let alias = spec
+        .pointer("/components/schemas/CircuitBreakerConfig/properties/cooldown_seconds")
+        .expect("CircuitBreakerConfig.cooldown_seconds is documented as an input alias");
+    assert_eq!(alias["writeOnly"], serde_json::Value::Bool(true));
+    assert_eq!(alias["deprecated"], serde_json::Value::Bool(true));
+    assert_eq!(alias["type"], timeout_seconds["type"]);
+    assert_eq!(alias["format"], timeout_seconds["format"]);
+    let alias_description = alias["description"]
+        .as_str()
+        .expect("cooldown_seconds description");
     assert!(
-        !circuit_properties.contains_key("cooldown_seconds"),
-        "cooldown_seconds is an input alias, not a schema property"
+        alias_description.contains("alias for `timeout_seconds`"),
+        "cooldown_seconds must point back at timeout_seconds: {alias_description}"
     );
 }
 

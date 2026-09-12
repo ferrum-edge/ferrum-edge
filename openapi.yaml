@@ -12111,6 +12111,16 @@ components:
             `cooldown_seconds` is accepted as an input alias on Admin API, file
             config, database rows, and batch/restore payloads, and is never
             returned.
+        cooldown_seconds:
+          type: integer
+          format: uint64
+          writeOnly: true
+          deprecated: true
+          description: >
+            Input alias for `timeout_seconds`, accepted on Admin API, file
+            config, database rows, and batch/restore payloads. Never returned:
+            responses always carry `timeout_seconds`. Supplying both spellings
+            in one object is rejected as a duplicate field.
         failure_status_codes:
           type: array
           items:
