@@ -10,6 +10,8 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_file_mode
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{TestGateway, spawn_http_echo};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -25,7 +27,7 @@ use tokio::time::sleep;
 // ============================================================================
 
 async fn start_header_echo_server() -> (u16, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let handle = tokio::spawn(async move {
         loop {

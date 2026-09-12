@@ -4,6 +4,8 @@
 //! admission paths that turn those limits into protocol responses before
 //! routing or backend dispatch.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client};
 
@@ -74,7 +76,7 @@ struct HeaderLimitBackend {
 
 impl HeaderLimitBackend {
     async fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind backend");
         let port = listener.local_addr().expect("backend addr").port();

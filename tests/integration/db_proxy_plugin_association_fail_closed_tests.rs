@@ -4,6 +4,8 @@
 //! must fail closed when the junction-table query or row decoding fails, and
 //! admin reads must not serialize incomplete association graphs.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use chrono::Utc;
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use tempfile::TempDir;
@@ -613,7 +615,9 @@ async fn attach_admin(store: Arc<DatabaseStore>) -> (String, tokio::sync::watch:
         runtime_config_apply: None,
     };
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {

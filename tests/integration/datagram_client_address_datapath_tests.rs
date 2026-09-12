@@ -24,6 +24,9 @@
 //! the gate — bare, unsigned, foreign-keyed, cross-listener, or replayed —
 //! allocate no association at all.
 
+use crate::scaffolding::port_registry::TestSocket;
+use crate::scaffolding::ports::bind_dtls_with_limits;
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -39,9 +42,7 @@ use ferrum_edge::adaptive_buffer::AdaptiveBufferTracker;
 use ferrum_edge::circuit_breaker::CircuitBreakerCache;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
-use ferrum_edge::dtls::{
-    BackendDtlsParams, DtlsConnection, DtlsServer, DtlsServerLimits, FrontendDtlsConfig,
-};
+use ferrum_edge::dtls::{BackendDtlsParams, DtlsConnection, DtlsServerLimits, FrontendDtlsConfig};
 use ferrum_edge::fips::approved::HmacSha256Key;
 use ferrum_edge::modes::mesh::outbound_enforcement::empty_slot;
 use ferrum_edge::overload::OverloadState;
@@ -497,7 +498,7 @@ async fn spawn_dtls_metadata_relay(
     forwarded: SocketAddr,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let socket = Arc::new(
-        UdpSocket::bind("127.0.0.1:0")
+        UdpSocket::bind_test("127.0.0.1:0")
             .await
             .expect("bind DTLS metadata relay"),
     );
@@ -598,7 +599,7 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
             attempt_binding,
             0,
         ));
-        match DtlsServer::bind_with_limits(
+        match bind_dtls_with_limits(
             SocketAddr::from(([127, 0, 0, 1], listen_port)),
             frontend_config,
             DtlsServerLimits {
@@ -639,7 +640,7 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
     // demuxer would otherwise spawn a session for, so each of these proves the
     // envelope decision happens before any per-peer state exists. They come
     // from a trusted loopback peer, so only the envelope can refuse them.
-    let hostile = UdpSocket::bind("127.0.0.1:0")
+    let hostile = UdpSocket::bind_test("127.0.0.1:0")
         .await
         .expect("bind hostile sender");
     let foreign_key =
@@ -723,7 +724,7 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
 
     // Now the replay pair, from a fresh socket so the association the first one
     // opens cannot be confused with the relay's below.
-    let replayer = UdpSocket::bind("127.0.0.1:0")
+    let replayer = UdpSocket::bind_test("127.0.0.1:0")
         .await
         .expect("bind replay sender");
     replayer
@@ -746,7 +747,7 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
     );
 
     let (relay_addr, relay_task) = spawn_dtls_metadata_relay(server_addr, binding, forwarded).await;
-    let client_socket = UdpSocket::bind("127.0.0.1:0")
+    let client_socket = UdpSocket::bind_test("127.0.0.1:0")
         .await
         .expect("bind DTLS client");
     client_socket
@@ -822,7 +823,11 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
 
 #[tokio::test]
 async fn authenticated_envelope_publishes_the_forwarded_client_and_strips_the_payload() {
-    let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend = Arc::new(
+        UdpSocket::bind_test("127.0.0.1:0")
+            .await
+            .expect("backend bind"),
+    );
     let backend_port = backend.local_addr().expect("backend addr").port();
     let backend_hits = Arc::new(AtomicU64::new(0));
     let _backend =
@@ -832,7 +837,9 @@ async fn authenticated_envelope_publishes_the_forwarded_client_and_strips_the_pa
     let gateway_addr = gateway.addr();
 
     // The balancer's own socket peer; the client it speaks for is elsewhere.
-    let balancer_socket = UdpSocket::bind("127.0.0.1:0").await.expect("balancer bind");
+    let balancer_socket = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("balancer bind");
     let balancer_ip = balancer_socket
         .local_addr()
         .expect("balancer addr")
@@ -888,7 +895,11 @@ async fn authenticated_envelope_publishes_the_forwarded_client_and_strips_the_pa
 /// backend a second time, and must not refresh the session it belongs to.
 #[tokio::test]
 async fn a_verbatim_replay_reaches_the_backend_exactly_once() {
-    let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend = Arc::new(
+        UdpSocket::bind_test("127.0.0.1:0")
+            .await
+            .expect("backend bind"),
+    );
     let backend_port = backend.local_addr().expect("backend addr").port();
     let backend_hits = Arc::new(AtomicU64::new(0));
     let _backend =
@@ -896,7 +907,9 @@ async fn a_verbatim_replay_reaches_the_backend_exactly_once() {
 
     let gateway = spawn_gateway(backend_port, true).await;
     let gateway_addr = gateway.addr();
-    let sender = UdpSocket::bind("127.0.0.1:0").await.expect("sender bind");
+    let sender = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("sender bind");
 
     let mut balancer = Balancer::new(1);
     let datagram = balancer.wrap(&gateway.binding, v4_form(gateway_addr), b"charge");
@@ -969,7 +982,11 @@ async fn a_verbatim_replay_reaches_the_backend_exactly_once() {
 /// duplicate or a stale sequence through.
 #[tokio::test]
 async fn in_window_reordering_is_admitted_once_and_stale_sequences_are_dropped() {
-    let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend = Arc::new(
+        UdpSocket::bind_test("127.0.0.1:0")
+            .await
+            .expect("backend bind"),
+    );
     let backend_port = backend.local_addr().expect("backend addr").port();
     let backend_hits = Arc::new(AtomicU64::new(0));
     let _backend =
@@ -977,7 +994,9 @@ async fn in_window_reordering_is_admitted_once_and_stale_sequences_are_dropped()
 
     let gateway = spawn_gateway(backend_port, true).await;
     let gateway_addr = gateway.addr();
-    let sender = UdpSocket::bind("127.0.0.1:0").await.expect("sender bind");
+    let sender = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("sender bind");
     let balancer = Balancer::new(1);
     let form = v4_form(gateway_addr);
     let now = unix_now_millis();
@@ -1037,12 +1056,20 @@ async fn in_window_reordering_is_admitted_once_and_stale_sequences_are_dropped()
 /// correctly minted envelope for B is still admitted.
 #[tokio::test]
 async fn two_live_listeners_sharing_one_secret_refuse_cross_listener_replay() {
-    let backend_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend_a = Arc::new(
+        UdpSocket::bind_test("127.0.0.1:0")
+            .await
+            .expect("backend bind"),
+    );
     let backend_a_port = backend_a.local_addr().expect("backend addr").port();
     let hits_a = Arc::new(AtomicU64::new(0));
     let _echo_a = spawn_counting_echo_backend(Arc::clone(&backend_a), Arc::clone(&hits_a)).await;
 
-    let backend_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend_b = Arc::new(
+        UdpSocket::bind_test("127.0.0.1:0")
+            .await
+            .expect("backend bind"),
+    );
     let backend_b_port = backend_b.local_addr().expect("backend addr").port();
     let hits_b = Arc::new(AtomicU64::new(0));
     let _echo_b = spawn_counting_echo_backend(Arc::clone(&backend_b), Arc::clone(&hits_b)).await;
@@ -1055,7 +1082,9 @@ async fn two_live_listeners_sharing_one_secret_refuse_cross_listener_replay() {
 
     // Every cross-listener replay is dropped before a session exists, so they
     // can all share one socket peer.
-    let replayer = UdpSocket::bind("127.0.0.1:0").await.expect("sender bind");
+    let replayer = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("sender bind");
     // One balancer for listener-B admissions: replay protection is keyed by
     // authenticated sender_id, so each form must consume the next sequence.
     let mut balancer_b = Balancer::new(2);
@@ -1118,7 +1147,7 @@ async fn two_live_listeners_sharing_one_secret_refuse_cross_listener_replay() {
         // above is about the binding and not about listener B being broken. It
         // needs its own socket peer: one admitted 4-tuple pins one forwarded
         // identity, and these four forms assert different ones.
-        let native = UdpSocket::bind("127.0.0.1:0")
+        let native = UdpSocket::bind_test("127.0.0.1:0")
             .await
             .expect("bind a fresh balancer flow");
         let form_b = envelope_form(label, addr_b);
@@ -1173,7 +1202,11 @@ async fn two_live_listeners_sharing_one_secret_refuse_cross_listener_replay() {
 /// pending-session insertion, hooks, and backend I/O".
 #[tokio::test]
 async fn a_stale_envelope_is_refused_before_any_session_or_hook() {
-    let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend = Arc::new(
+        UdpSocket::bind_test("127.0.0.1:0")
+            .await
+            .expect("backend bind"),
+    );
     let backend_port = backend.local_addr().expect("backend addr").port();
     let backend_hits = Arc::new(AtomicU64::new(0));
     let _backend =
@@ -1181,7 +1214,9 @@ async fn a_stale_envelope_is_refused_before_any_session_or_hook() {
 
     let gateway = spawn_gateway(backend_port, true).await;
     let gateway_addr = gateway.addr();
-    let sender = UdpSocket::bind("127.0.0.1:0").await.expect("sender bind");
+    let sender = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("sender bind");
     let balancer = Balancer::new(1);
     let form = v4_form(gateway_addr);
     let long_ago = unix_now_millis() - FRESHNESS_HORIZON_MS - 5_000;
@@ -1234,7 +1269,11 @@ async fn a_stale_envelope_is_refused_before_any_session_or_hook() {
 
 #[tokio::test]
 async fn unauthenticated_and_malformed_datagrams_are_dropped_before_the_backend() {
-    let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend = Arc::new(
+        UdpSocket::bind_test("127.0.0.1:0")
+            .await
+            .expect("backend bind"),
+    );
     let backend_port = backend.local_addr().expect("backend addr").port();
     let backend_hits = Arc::new(AtomicU64::new(0));
     let _backend =
@@ -1242,7 +1281,9 @@ async fn unauthenticated_and_malformed_datagrams_are_dropped_before_the_backend(
 
     let gateway = spawn_gateway(backend_port, true).await;
     let gateway_addr = gateway.addr();
-    let sender = UdpSocket::bind("127.0.0.1:0").await.expect("sender bind");
+    let sender = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("sender bind");
     let form = v4_form(gateway_addr);
     let foreign = HmacSha256Key::new_from_slice(b"ffffffffffffffffffffffffffffffff").expect("key");
     let foreign_balancer = Balancer::with_key(5, foreign);
@@ -1330,7 +1371,11 @@ async fn unauthenticated_and_malformed_datagrams_are_dropped_before_the_backend(
 
 #[tokio::test]
 async fn a_second_forwarded_client_on_one_socket_peer_is_refused() {
-    let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend = Arc::new(
+        UdpSocket::bind_test("127.0.0.1:0")
+            .await
+            .expect("backend bind"),
+    );
     let backend_port = backend.local_addr().expect("backend addr").port();
     let backend_hits = Arc::new(AtomicU64::new(0));
     let _backend =
@@ -1340,7 +1385,9 @@ async fn a_second_forwarded_client_on_one_socket_peer_is_refused() {
     // independent of authentication.
     let gateway = spawn_gateway(backend_port, false).await;
     let gateway_addr = gateway.addr();
-    let balancer = UdpSocket::bind("127.0.0.1:0").await.expect("balancer bind");
+    let balancer = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("balancer bind");
 
     let first = DatagramEnvelopeForm::Forwarded {
         source: forwarded_client(),
@@ -1391,7 +1438,11 @@ async fn a_second_forwarded_client_on_one_socket_peer_is_refused() {
 
 #[tokio::test]
 async fn an_untrusted_peer_cannot_assert_a_client_address() {
-    let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend = Arc::new(
+        UdpSocket::bind_test("127.0.0.1:0")
+            .await
+            .expect("backend bind"),
+    );
     let backend_port = backend.local_addr().expect("backend addr").port();
     let backend_hits = Arc::new(AtomicU64::new(0));
     let _backend =
@@ -1402,7 +1453,7 @@ async fn an_untrusted_peer_cannot_assert_a_client_address() {
 
     // 127.0.0.2 is outside the configured trust list (`127.0.0.1`), so this
     // sender is an ordinary client forging balancer metadata.
-    let Ok(untrusted) = UdpSocket::bind("127.0.0.2:0").await else {
+    let Ok(untrusted) = UdpSocket::bind_test("127.0.0.2:0").await else {
         // Some CI images do not route the whole 127/8 range; the unit-level
         // trust test covers this case unconditionally.
         eprintln!("skipping: 127.0.0.2 is not bindable on this host");

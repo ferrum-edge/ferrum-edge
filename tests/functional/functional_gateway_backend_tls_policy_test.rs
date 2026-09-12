@@ -31,6 +31,8 @@
 //! Run with:
 //!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_gateway_backend_tls_policy --ignored --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{TestGateway, captured_output_reports_listener_addr_in_use};
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
@@ -363,7 +365,7 @@ fn translated_config_yaml(objects: &[K8sObject]) -> String {
 /// Ephemeral-port reservations held until the moment the child binds them.
 ///
 /// Root cause of the flake this replaces: the previous `alloc_port()` did
-/// `TcpListener::bind("127.0.0.1:0").await.expect(..).local_addr()..port()`, so
+/// `TcpListener::bind_test("127.0.0.1:0").await.expect(..).local_addr()..port()`, so
 /// the listener was a temporary dropped at the end of that expression. Every
 /// port was released before anything owned it, which produced two distinct
 /// `Address already in use` child deaths:
@@ -404,7 +406,7 @@ impl PortReservations {
         let mut listeners = Vec::with_capacity(count);
         let mut ports = Vec::with_capacity(count);
         for _ in 0..count {
-            let listener = TcpListener::bind("127.0.0.1:0")
+            let listener = TcpListener::bind_test("127.0.0.1:0")
                 .await
                 .expect("bind ephemeral port reservation");
             ports.push(listener.local_addr().expect("addr").port());
@@ -590,7 +592,7 @@ async fn wait_for_status(
 async fn backend_tls_policy_performs_verified_backend_tls() {
     let ca = generate_ca("Reviews-CA");
     let backend = generate_signed_cert(&ca, "reviews", &[BACKEND_SNI]);
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.expect("bind");
     let backend_port = listener.local_addr().expect("addr").port();
     let (echo, observed_hosts) =
         start_https_echo_on(listener, &backend.cert_pem, &backend.key_pem).await;
@@ -651,7 +653,7 @@ async fn backend_tls_policy_untrusted_backend_ca_fails_closed() {
     let trusted_ca = generate_ca("Trusted-CA");
     let rogue_ca = generate_ca("Rogue-CA");
     let backend = generate_signed_cert(&rogue_ca, "reviews", &[BACKEND_SNI]);
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.expect("bind");
     let backend_port = listener.local_addr().expect("addr").port();
     let (echo, _observed_hosts) =
         start_https_echo_on(listener, &backend.cert_pem, &backend.key_pem).await;
@@ -680,7 +682,7 @@ async fn backend_tls_policy_untrusted_backend_ca_fails_closed() {
 async fn backend_tls_policy_hostname_mismatch_fails_closed() {
     let ca = generate_ca("Reviews-CA");
     let backend = generate_signed_cert(&ca, "reviews", &["some-other-host.example.com"]);
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.expect("bind");
     let backend_port = listener.local_addr().expect("addr").port();
     let (echo, _observed_hosts) =
         start_https_echo_on(listener, &backend.cert_pem, &backend.key_pem).await;
@@ -711,7 +713,7 @@ async fn backend_tls_policy_subject_alt_name_allow_list_is_enforced() {
     // The cert covers the policy hostname, so chain + name verification pass;
     // only the explicit `subjectAltNames` allow-list can reject it.
     let backend = generate_signed_cert(&ca, "reviews", &[BACKEND_SNI]);
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.expect("bind");
     let backend_port = listener.local_addr().expect("addr").port();
     let (echo, _observed_hosts) =
         start_https_echo_on(listener, &backend.cert_pem, &backend.key_pem).await;
@@ -748,7 +750,7 @@ async fn backend_tls_policy_subject_alt_name_allow_list_is_enforced() {
 async fn backend_tls_policy_system_roots_ignore_global_ca_bundle() {
     let cluster_ca = generate_ca("Cluster-Private-CA");
     let backend = generate_signed_cert(&cluster_ca, "reviews", &[BACKEND_SNI]);
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.expect("bind");
     let backend_port = listener.local_addr().expect("addr").port();
     let (echo, _observed_hosts) =
         start_https_echo_on(listener, &backend.cert_pem, &backend.key_pem).await;
@@ -783,7 +785,7 @@ async fn backend_tls_policy_system_roots_ignore_global_ca_bundle() {
     // Positive control on the same backend and the same global bundle: naming
     // the CA through `caCertificateRefs` is trusted, so the 502 above is about
     // trust-anchor selection and not about the fixture being unreachable.
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.expect("bind");
     let backend_port = listener.local_addr().expect("addr").port();
     let (echo, _observed_hosts) =
         start_https_echo_on(listener, &backend.cert_pem, &backend.key_pem).await;
@@ -812,7 +814,7 @@ async fn backend_tls_policy_system_roots_ignore_global_ca_bundle() {
 async fn backend_tls_policy_withdrawal_reaches_the_live_data_path() {
     let ca = generate_ca("Reviews-CA");
     let backend = generate_signed_cert(&ca, "reviews", &[BACKEND_SNI]);
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.expect("bind");
     let backend_port = listener.local_addr().expect("addr").port();
     let (echo, _observed_hosts) =
         start_https_echo_on(listener, &backend.cert_pem, &backend.key_pem).await;

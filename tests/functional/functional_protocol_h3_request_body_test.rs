@@ -2,6 +2,8 @@
 //!
 //! Run: `cargo test --test functional_tests functional_h3_request_body -- --ignored --nocapture`
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::clients::bind_quinn_client_endpoint;
 
@@ -256,7 +258,7 @@ async fn h3_post_bytes(
 #[ignore]
 #[tokio::test]
 async fn functional_h3_request_body_zero_limit_forwards_large_post() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_task = tokio::spawn(start_body_count_backend(backend_listener));
     sleep(Duration::from_millis(150)).await;
@@ -319,10 +321,10 @@ async fn functional_h3_request_body_zero_limit_forwards_large_post() {
 #[ignore]
 #[tokio::test]
 async fn functional_h3_serverless_redirect_is_not_pre_proxy_approval() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_task = tokio::spawn(start_body_count_backend(backend_listener));
-    let function_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let function_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let function_port = function_listener.local_addr().unwrap().port();
     let function_task = tokio::spawn(start_redirect_function(function_listener));
     sleep(Duration::from_millis(150)).await;
@@ -382,7 +384,7 @@ async fn functional_h3_serverless_redirect_is_not_pre_proxy_approval() {
 #[ignore]
 #[tokio::test]
 async fn functional_h3_streaming_request_logs_request_body_bytes_via_cross_protocol_bridge() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_task = tokio::spawn(start_body_count_backend(backend_listener));
     sleep(Duration::from_millis(150)).await;

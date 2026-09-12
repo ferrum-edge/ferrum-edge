@@ -19,6 +19,8 @@
 //! test in `src/proxy/gateway_listener.rs` and
 //! `tests/unit/gateway_core/gateway_listener_status_tests.rs`.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -89,12 +91,9 @@ fn is_printable_ascii(text: &str) -> bool {
 }
 
 async fn free_port() -> u16 {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    crate::scaffolding::ports::unbound_port()
         .await
-        .expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    drop(listener);
-    port
+        .expect("lease test port")
 }
 
 const PORT_STEAL_ATTEMPTS: u32 = 5;
@@ -143,7 +142,7 @@ where
 async fn an_occupied_port_is_surfaced_while_the_sibling_listener_keeps_serving() {
     let ((manager, occupied, occupied_port, status), _failures, healthy_port) =
         reconcile_fresh_port(|healthy_port| async move {
-            let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
+            let occupied = tokio::net::TcpListener::bind_test("127.0.0.1:0")
                 .await
                 .expect("occupy a port before the gateway can bind it");
             let occupied_port = occupied.local_addr().expect("addr").port();
@@ -284,7 +283,7 @@ fn admin_state(
 
 async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind admin");
     let addr = listener.local_addr().expect("admin addr");

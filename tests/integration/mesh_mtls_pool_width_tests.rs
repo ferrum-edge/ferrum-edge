@@ -12,6 +12,8 @@
 //! responses can be held back, so "pending requests" is a deterministic
 //! quantity rather than a race.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use chrono::Utc;
@@ -221,7 +223,9 @@ impl HoldingPeer {
 }
 
 async fn start_holding_peer(server_slot: SharedSvidBundle) -> HoldingPeer {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind peer");
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind peer");
     let addr = listener.local_addr().expect("peer addr");
     let connections = Arc::new(AtomicUsize::new(0));
     let (release, release_rx) = watch::channel(true);

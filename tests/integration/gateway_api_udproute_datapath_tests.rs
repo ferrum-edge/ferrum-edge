@@ -24,6 +24,8 @@
 //!   ports, backend hosts, upstream identity, and weights all come from the
 //!   translator.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -87,7 +89,9 @@ struct TaggedBackend {
 
 impl TaggedBackend {
     async fn start(tag: &'static str) -> Self {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("backend bind");
+        let socket = UdpSocket::bind_test("127.0.0.1:0")
+            .await
+            .expect("backend bind");
         let port = socket.local_addr().expect("backend addr").port();
         let join = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
@@ -514,7 +518,9 @@ async fn translated_udp_route_carries_a_datagram_to_its_declared_backend() {
         "Gateway API UDPRoute must never program an unlimited amplification relay"
     );
 
-    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+    let client = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("client bind");
     let reply = round_trip(&client, lab.gateway_addr(0), b"gwapi-udp").await;
     assert_eq!(reply, "alpha:gwapi-udp");
 
@@ -561,7 +567,9 @@ async fn each_translated_udp_route_reaches_only_its_own_declared_backend() {
     assert_eq!(lab.proxy_on_listener(0).backend_port, alpha_port);
     assert_eq!(lab.proxy_on_listener(1).backend_port, beta_port);
 
-    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+    let client = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("client bind");
     let to_alpha = round_trip(&client, lab.gateway_addr(0), b"one").await;
     let to_beta = round_trip(&client, lab.gateway_addr(1), b"two").await;
     assert_eq!(to_alpha, "alpha:one");
@@ -623,7 +631,9 @@ async fn translated_weighted_udp_route_serves_each_session_from_one_leg() {
 
     let allowed = BTreeSet::from(["alpha".to_string(), "beta".to_string()]);
     for session in 0..4u8 {
-        let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+        let client = UdpSocket::bind_test("127.0.0.1:0")
+            .await
+            .expect("client bind");
         let mut tags = BTreeSet::new();
         for datagram in 0..3u8 {
             let sent = format!("s{session}-d{datagram}");
@@ -675,7 +685,9 @@ async fn translated_udp_route_with_an_unresolved_backend_drops_the_datagram() {
     assert_eq!(proxy.backend_host, "ferrum-zero-weight.invalid.");
     assert_eq!(proxy.backend_port, 65535);
 
-    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+    let client = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("client bind");
     expect_no_reply(&client, lab.gateway_addr(0), b"dropped").await;
 
     lab.shutdown().await;
@@ -690,7 +702,9 @@ struct BurstBackend {
 
 impl BurstBackend {
     async fn start(payload: Vec<u8>, count: usize) -> Self {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("backend bind");
+        let socket = UdpSocket::bind_test("127.0.0.1:0")
+            .await
+            .expect("backend bind");
         let port = socket.local_addr().expect("backend addr").port();
         let join = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
@@ -774,7 +788,9 @@ async fn default_factor_drops_a_single_over_budget_reply() {
         Some(8.0)
     );
 
-    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+    let client = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("client bind");
     let request = vec![b'r'; 100];
     client
         .send_to(&request, lab.gateway_addr(0))
@@ -806,7 +822,9 @@ async fn cumulative_multi_datagram_replies_share_one_request_budget() {
     overrides.insert(BurstBackend::dns_name(), "127.0.0.1".to_string());
     let lab = start_translated_udp_lab(&snapshot, overrides).await;
 
-    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+    let client = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("client bind");
     let request = vec![b'r'; 100];
     client
         .send_to(&request, lab.gateway_addr(0))
@@ -837,7 +855,9 @@ async fn exhausted_exchange_does_not_fund_the_next_requests_reply() {
     let mut overrides = HashMap::new();
     overrides.insert(BurstBackend::dns_name(), "127.0.0.1".to_string());
     let lab = start_translated_udp_lab(&snapshot, overrides).await;
-    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+    let client = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("client bind");
 
     client
         .send_to(&[b'r'; 100], lab.gateway_addr(0))
@@ -885,7 +905,9 @@ async fn route_policy_tightens_then_delete_restores_default() {
         tight.sole_udp_proxy().udp_max_response_amplification_factor,
         Some(1.0)
     );
-    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+    let client = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("client bind");
     let request = vec![b'r'; 100];
     client
         .send_to(&request, tight.gateway_addr(0))

@@ -9,6 +9,8 @@
 //!   3. Spawn the admin listener on a random port.
 //!   4. Make HTTP requests using `reqwest`.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use ferrum_edge::{
@@ -150,7 +152,7 @@ fn make_admin_state(db: DatabaseStore, max_spec_mib: usize) -> AdminState {
 async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let (tx, rx) = tokio::sync::watch::channel(false);
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test(addr).await.unwrap();
     let actual = listener.local_addr().unwrap();
     let state_clone = state.clone();
     let rx_clone = rx.clone();
@@ -1516,7 +1518,9 @@ async fn delete_rejects_removing_last_global_tcp_throttle_target_with_422() {
     let store = make_store(&dir).await;
     let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
     let client = AdminClient::new(base);
-    let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let listen_port = bound.local_addr().unwrap().port();
     drop(bound);
 
@@ -5334,7 +5338,9 @@ async fn post_spec_with_unbindable_stream_port_returns_422_or_equivalent() {
 
     // Bind a TCP listener on an ephemeral port and hold it for the duration
     // of the test so the gateway's OS-level probe fails.
-    let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let occupied_port = bound.local_addr().unwrap().port();
 
     let mut state = make_admin_state(store, 25);
@@ -5383,7 +5389,9 @@ async fn post_spec_stream_port_cp_mode_skips_os_probe() {
     let store = make_store(&dir).await;
 
     // Bind a port to make it appear occupied.
-    let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let occupied_port = bound.local_addr().unwrap().port();
 
     let mut state = make_admin_state(store, 25);
@@ -7098,7 +7106,7 @@ async fn external_ref_http_admission_runs_off_the_async_worker() {
     use std::net::TcpListener;
     use std::thread;
 
-    let fixture = TcpListener::bind("127.0.0.1:0").expect("bind external-ref fixture");
+    let fixture = TcpListener::bind_test("127.0.0.1:0").expect("bind external-ref fixture");
     let fixture_port = fixture.local_addr().expect("fixture address").port();
     let fixture_thread = thread::spawn(move || {
         if let Ok((mut stream, _)) = fixture.accept() {

@@ -14,6 +14,8 @@
 //! to the polling loop in `src/modes/database.rs` to verify the cursor only
 //! advances on `Applied`/`Unchanged`, never on `Rejected`.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::{collections::HashMap, sync::Arc};
 
 use base64::Engine;
@@ -2752,7 +2754,7 @@ async fn apply_incremental_upstream_only_tls_change_reconciles_stream_listeners(
     std::fs::write(&ca_b_path, &ca_b_pem).expect("write ca b");
 
     // Backend: TLS echo server with a CA-B-signed cert.
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend echo listener");
     let backend_port = backend_listener

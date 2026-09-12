@@ -5,6 +5,8 @@
 //! refusing only the optional QUIC half. Live transitions drain or start QUIC
 //! without restarting TCP.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -212,10 +214,9 @@ fn insecure_tls_connector(alpn: &[&[u8]]) -> TlsConnector {
 }
 
 async fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    drop(listener);
-    port
+    crate::scaffolding::ports::unbound_port()
+        .await
+        .expect("lease test port")
 }
 
 const PORT_STEAL_ATTEMPTS: u32 = 5;
@@ -259,7 +260,7 @@ where
 
 async fn start_body_backend(body: &'static [u8]) -> (u16, tokio::task::JoinHandle<()>) {
     use hyper::server::conn::http1;
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let handle = tokio::spawn(async move {
         loop {

@@ -5,6 +5,8 @@
 //! `/health` as `degraded` + `config_rejected: true`, redact the boolean from
 //! unauthenticated probes, and clear on a later Applied or Unchanged reload.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::io::Write;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -140,10 +142,10 @@ async fn file_mode_rejected_reload_surfaces_authenticated_health_and_clears_on_s
     write!(config_file, "{initial_yaml}").expect("seed config");
     let config_path = config_file.path().to_str().expect("utf8 path").to_string();
 
-    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind proxy");
-    let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind admin");
     let proxy_port = proxy_listener.local_addr().unwrap().port();
@@ -306,10 +308,10 @@ async fn file_mode_apply_rejection_raises_config_rejected_and_keeps_last_good() 
     // A candidate that parses/loads but is rejected by update_config must also
     // raise the observability flag (apply-rejection path of #2979).
     let initial_yaml = good_config_yaml("proxy-good");
-    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind proxy");
-    let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind admin");
     let proxy_port = proxy_listener.local_addr().unwrap().port();

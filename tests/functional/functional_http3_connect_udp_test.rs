@@ -44,6 +44,8 @@
 //! written independently of the gateway's, so these assert wire
 //! interoperability rather than agreement between two copies of one encoder.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::time::Duration;
 
 use chrono::Utc;
@@ -70,7 +72,9 @@ struct UdpEcho {
 
 impl UdpEcho {
     async fn spawn() -> Self {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp echo");
+        let socket = UdpSocket::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind udp echo");
         let port = socket.local_addr().expect("udp echo addr").port();
         let task = tokio::spawn(async move {
             let mut buf = vec![0u8; 70_000];
@@ -181,7 +185,7 @@ async fn start_masque_gateway(config: String, extra_env: &[(&str, &str)]) -> (Te
     // harness's own port retry, so every attempt needs a fresh one.
     let mut last_error = None;
     for attempt in 1..=3 {
-        let reservation = TcpListener::bind("127.0.0.1:0")
+        let reservation = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("reserve port");
         let https_port = reservation.local_addr().expect("reserved addr").port();

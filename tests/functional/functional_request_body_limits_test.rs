@@ -4,6 +4,8 @@
 //! oversized requests at the frontend protocol boundary before opening a
 //! backend connection.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{TestGateway, TestGatewayBuilder};
 use crate::scaffolding::clients::{GetOptions, Http3Client};
 
@@ -193,7 +195,7 @@ fn body_limit_config(backend_port: u16) -> String {
 }
 
 async fn spawn_counting_backend() -> (u16, Arc<AtomicUsize>, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind counting backend");
     let port = listener.local_addr().expect("backend addr").port();

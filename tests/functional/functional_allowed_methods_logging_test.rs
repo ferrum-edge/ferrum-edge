@@ -5,6 +5,8 @@
 //! sinks must still receive one terminal summary attributed to the matched
 //! proxy with `rejection_phase = "allowed_methods"`.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client};
 
@@ -58,7 +60,7 @@ async fn start_counting_http1_backend(
 
 /// Minimal HTTP/1.1 POST sink that records JSON transaction bodies.
 async fn start_http_logging_sink() -> (u16, Arc<Mutex<Vec<Value>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind http_logging sink");
     let port = listener.local_addr().expect("sink addr").port();
@@ -247,7 +249,7 @@ async fn wait_for_sink_entries(
 #[ignore]
 #[tokio::test]
 async fn functional_allowed_methods_405_logs_stdout_and_http_sinks_h1_h2_and_grpc() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let backend_port = backend_listener.local_addr().expect("backend addr").port();
@@ -392,7 +394,7 @@ async fn functional_allowed_methods_405_logs_stdout_and_http_sinks_h1_h2_and_grp
 #[ignore]
 #[tokio::test]
 async fn functional_allowed_methods_405_logs_stdout_on_http3() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let backend_port = backend_listener.local_addr().expect("backend addr").port();

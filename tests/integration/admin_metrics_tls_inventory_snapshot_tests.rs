@@ -12,6 +12,8 @@
 //! 3. The authentication tier is unchanged (`401` without credentials) and the
 //!    snapshot's freshness is exported explicitly.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use ferrum_edge::admin::{
@@ -185,7 +187,7 @@ fn admin_state_with_proxy(proxy_state: ProxyState) -> AdminState {
 async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("parse bind addr");
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let listener = tokio::net::TcpListener::bind(addr)
+    let listener = tokio::net::TcpListener::bind_test(addr)
         .await
         .expect("bind admin listener");
     let actual = listener.local_addr().expect("local addr");

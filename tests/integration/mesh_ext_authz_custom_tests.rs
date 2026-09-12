@@ -7,6 +7,8 @@
 //! of the provider set. The translation / ordering half lives in
 //! `tests/unit/config/istio_authz_custom_action_tests.rs`.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -52,7 +54,7 @@ struct Stub {
 }
 
 async fn start_stub(behavior: StubBehavior) -> Stub {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("stub authorizer binds");
     let port = listener.local_addr().expect("stub local addr").port();
@@ -462,7 +464,7 @@ fn a_provider_set_change_alone_is_not_deduped_away() {
 
 /// Reply with an arbitrary status and a fixed short body.
 async fn start_status_stub(status: u16) -> Stub {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("stub authorizer binds");
     let port = listener.local_addr().expect("stub local addr").port();

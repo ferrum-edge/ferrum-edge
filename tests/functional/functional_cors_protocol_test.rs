@@ -1,5 +1,7 @@
 //! CORS request/response parity across H1, H2, and H3 frontends.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client};
 use crate::scaffolding::ports::reserve_port;
@@ -42,7 +44,7 @@ struct PermissiveCorsBackend {
 
 impl PermissiveCorsBackend {
     async fn spawn() -> std::io::Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let listener = TcpListener::bind_test("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let handle = tokio::spawn(async move {
             loop {

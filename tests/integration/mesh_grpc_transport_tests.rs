@@ -33,6 +33,8 @@
 //! `x-forwarded-host`. gRPC dispatch rewrites `:authority` but does not stamp
 //! `x-forwarded-host`, so that Host-survival contract has to ride the HTTP path.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use chrono::Utc;
@@ -447,7 +449,7 @@ async fn start_mesh_mtls_grpc_server(
     response_body: Bytes,
     behavior: GrpcPeerBehavior,
 ) -> (std::net::SocketAddr, oneshot::Receiver<ObservedRequest>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind mesh mtls server");
     let addr = listener.local_addr().expect("listener addr");
@@ -485,7 +487,7 @@ struct ObservedHttpRequest {
 async fn start_mesh_mtls_http_server(
     server_slot: SharedSvidBundle,
 ) -> (SocketAddr, oneshot::Receiver<ObservedHttpRequest>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind mesh mtls http server");
     let addr = listener.local_addr().expect("listener addr");
@@ -553,7 +555,7 @@ where
 }
 
 async fn start_http_test_gateway(state: ProxyState) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind gateway-to-mesh test gateway");
     let gateway_addr = listener.local_addr().expect("gateway addr");
@@ -600,7 +602,7 @@ async fn start_h2c_grpc_app(
     response_body: Bytes,
     behavior: GrpcPeerBehavior,
 ) -> (std::net::SocketAddr, oneshot::Receiver<ObservedRequest>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind h2c app");
     let addr = listener.local_addr().expect("listener addr");
@@ -635,7 +637,7 @@ struct ObservedConnect {
 async fn start_hbone_grpc_relay(
     server_slot: SharedSvidBundle,
 ) -> (std::net::SocketAddr, oneshot::Receiver<ObservedConnect>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind hbone relay");
     let addr = listener.local_addr().expect("listener addr");
@@ -1195,7 +1197,7 @@ async fn grpc_over_ambient_hbone_bounds_the_nested_h2_handshake_by_connect_timeo
     // Accept the relayed application TCP connection but never speak HTTP/2.
     // Before the regression fix this left the nested hyper handshake waiting
     // forever whenever the client supplied no grpc-timeout.
-    let app_listener = TcpListener::bind("127.0.0.1:0")
+    let app_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind stalled app");
     let app_addr = app_listener.local_addr().expect("stalled app addr");
@@ -1263,7 +1265,7 @@ async fn grpc_over_ambient_hbone_classifies_a_rejected_inner_handshake_as_h2c() 
     // rejects the nested cleartext HTTP/2 preface. That is an h2c protocol
     // failure, not evidence of a TLS failure on the already-established outer
     // mesh hop.
-    let app_listener = TcpListener::bind("127.0.0.1:0")
+    let app_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind rejecting app");
     let app_addr = app_listener.local_addr().expect("rejecting app addr");

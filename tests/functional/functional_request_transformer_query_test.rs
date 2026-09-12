@@ -4,6 +4,8 @@
 //! request-target (and the co-located mirror) rather than only the lossy
 //! plugin context map.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client};
 
@@ -121,7 +123,7 @@ impl CapturingBackend {
     }
 
     async fn spawn_with_status(fail_all: bool) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind capture backend");
         let port = listener.local_addr().expect("local addr").port();

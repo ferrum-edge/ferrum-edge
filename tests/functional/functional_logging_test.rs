@@ -9,6 +9,8 @@
 //!
 //! Run with: cargo test --test functional_tests --all-features -- --ignored functional_logging
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 
 use serde_json::{Value, json};
@@ -175,7 +177,7 @@ impl LoggingTestHarness {
 async fn start_echo_backend(
     port: u16,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    let listener = tokio::net::TcpListener::bind_test(format!("127.0.0.1:{}", port)).await?;
 
     let handle = tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
@@ -361,7 +363,7 @@ async fn test_logging_transaction_summary_on_proxied_request() {
         .expect("Failed to create harness");
 
     // Start echo backend
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("Failed to bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -537,7 +539,7 @@ async fn test_logging_rejected_request_has_rejection_phase() {
         .expect("Failed to create harness");
 
     // Start echo backend (won't be reached for rejected requests)
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("Failed to bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -727,7 +729,7 @@ async fn test_logging_multiple_requests_produce_individual_entries() {
         .expect("Failed to create harness");
 
     // Start echo backend
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("Failed to bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();

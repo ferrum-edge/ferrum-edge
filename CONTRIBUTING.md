@@ -197,6 +197,17 @@ shell is safe: guarded unit tests snapshot, clear, and restore every `FERRUM_*`
 key so host environment cannot poison assertions. A test that needs a specific
 `FERRUM_*` value must set it explicitly inside the guard.
 
+Functional and integration tests share a cross-process port registry under
+`target/test-port-leases-v1`. Use `tests/scaffolding/ports.rs` for reservations
+and gateway port handoffs; use `TestSocket::bind_test("127.0.0.1:0")` for native
+fixture sockets and pass the bound socket to its consumer. Do not bind hard-coded,
+derived or self-probed ports. Dropping an unused reservation releases its lease;
+transferring a socket or a bare port retains the lease until test-process exit,
+including the gap before a gateway binds. TCP, UDP and wildcard listeners share
+one namespace. Do not delete the registry directory during a test run. See
+[the functional testing guide](docs/functional_testing.md) for the allocation and
+readiness contracts.
+
 ### Test Coverage
 
 - Write tests for new functionality

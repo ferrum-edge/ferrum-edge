@@ -16,6 +16,8 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_ai_semantic_firewall_streaming
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{Http1Client, Http2Client, Http3Client};
 use crate::scaffolding::harness::GatewayHarness;
@@ -237,8 +239,7 @@ async fn start_encoded_response_h3_gateway(config: String) -> (GatewayHarness, T
     let mut last_error = None;
     for attempt in 1..=MAX_ATTEMPTS {
         let reservation = reserve_port().await.expect("reserve H3 frontend port");
-        let https_port = reservation.port;
-        drop(reservation);
+        let https_port = reservation.drop_and_take_port();
 
         let tls_dir = TempDir::new().expect("frontend TLS temp dir");
         let ca = TestCa::new(&format!("asf-encoded-h3-{attempt}")).expect("frontend test CA");
@@ -394,7 +395,7 @@ const JSON_LEAK: &str = "{\"choices\":[{\"index\":0,\"message\":{\"role\":\"assi
 #[ignore]
 #[tokio::test]
 async fn buffer_mode_blocks_streaming_response_with_leak() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
 
     let backend = tokio::spawn(start_sse_backend_on(backend_listener, LEAKING_SSE));
@@ -428,7 +429,7 @@ async fn buffer_mode_blocks_streaming_response_with_leak() {
 #[ignore]
 #[tokio::test]
 async fn buffer_mode_delivers_clean_streaming_response() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
 
     let backend = tokio::spawn(start_sse_backend_on(backend_listener, CLEAN_SSE));
@@ -465,7 +466,7 @@ async fn buffer_mode_delivers_clean_streaming_response() {
 #[ignore]
 #[tokio::test]
 async fn inspect_mode_cuts_leaking_stream_midflight() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
 
     let backend = tokio::spawn(start_sse_backend_on(backend_listener, LEAKING_SSE));
@@ -507,7 +508,7 @@ async fn inspect_mode_cuts_leaking_stream_midflight() {
 #[ignore]
 #[tokio::test]
 async fn inspect_mode_streams_clean_response() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
 
     let backend = tokio::spawn(start_sse_backend_on(backend_listener, CLEAN_SSE));
@@ -545,7 +546,7 @@ async fn inspect_mode_streams_clean_response() {
 #[ignore]
 #[tokio::test]
 async fn inspect_mode_cuts_leaking_tool_call_stream() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
 
     let backend = tokio::spawn(start_sse_backend_on(backend_listener, TOOL_LEAK_SSE));
@@ -582,7 +583,7 @@ async fn inspect_mode_cuts_leaking_tool_call_stream() {
 #[ignore]
 #[tokio::test]
 async fn inspect_detect_mode_forwards_leak_without_cutting() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
 
     let backend = tokio::spawn(start_sse_backend_on(backend_listener, LEAKING_SSE));
@@ -623,7 +624,7 @@ async fn inspect_mode_buffers_and_blocks_non_sse_json_leak() {
     // A backend that ignored stream:true and returned a JSON completion: inspect
     // mode must BUFFER it (the windowed inspector only handles SSE) and block the
     // leak via on_response_body — not stream it past every check uninspected.
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
 
     let backend = tokio::spawn(start_json_backend_on(backend_listener, JSON_LEAK));
@@ -664,7 +665,7 @@ async fn inspect_mode_buffers_and_blocks_non_sse_json_leak() {
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn encoded_partial_responses_are_buffered_and_enforced_over_h1_and_h2() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind encoded-range backend");
     let backend_port = backend_listener
@@ -728,7 +729,7 @@ async fn encoded_partial_responses_are_buffered_and_enforced_over_h1_and_h2() {
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn encoded_partial_response_is_buffered_and_enforced_over_h3() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind encoded-range backend");
     let backend_port = backend_listener
@@ -768,7 +769,7 @@ async fn encoded_partial_response_is_buffered_and_enforced_over_h3() {
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn decoded_sse_json_preludes_are_inspected_over_h1_h2_and_h3() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind encoded-SSE backend");
     let backend_port = backend_listener
@@ -964,9 +965,9 @@ plugin_configs:
 #[ignore]
 #[tokio::test]
 async fn inspect_mode_cuts_stream_when_hold_deadline_expires() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
-    let embeddings_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let embeddings_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let embeddings_port = embeddings_listener.local_addr().unwrap().port();
 
     // CLEAN_SSE never matches lexically, so the firewall must consult the
@@ -1015,9 +1016,9 @@ async fn inspect_mode_cuts_stream_when_hold_deadline_expires() {
 #[ignore]
 #[tokio::test]
 async fn inspect_mode_forwards_held_window_when_configured_to_fail_open() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
-    let embeddings_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let embeddings_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let embeddings_port = embeddings_listener.local_addr().unwrap().port();
 
     let backend = tokio::spawn(start_sse_backend_on(backend_listener, CLEAN_SSE));

@@ -5,6 +5,8 @@
 //! small replica of the authoritative incremental poll path — they do not invent
 //! a second apply implementation.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use ferrum_edge::admin::{
@@ -146,7 +148,9 @@ fn live_admin_state(
 }
 
 async fn start_admin(state: AdminState) -> (String, watch::Sender<bool>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {

@@ -420,6 +420,8 @@ async fn mesh_multicluster_load_balancer_fails_over_local_to_remote() {
 // assertions cover the wire path rather than a helper in isolation.
 
 mod audience_binding {
+    use crate::scaffolding::port_registry::TestSocket;
+
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
@@ -478,7 +480,9 @@ mod audience_binding {
             .cluster_audience(cluster_audience.map(str::to_string))
             .build();
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind CP");
+        let listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind CP");
         let addr = listener.local_addr().expect("CP addr");
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let incoming = TcpListenerStream::new(listener);

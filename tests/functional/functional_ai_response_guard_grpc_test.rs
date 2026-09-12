@@ -29,7 +29,6 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tempfile::TempDir;
-use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
@@ -277,10 +276,9 @@ fn frame_payloads(body: &[u8]) -> Vec<Vec<u8>> {
 // ============================================================================
 
 async fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    crate::scaffolding::ports::unbound_port()
         .await
-        .expect("bind ephemeral port");
-    listener.local_addr().unwrap().port()
+        .expect("lease test port")
 }
 
 /// Echo backend: returns the request body as the gRPC response body, and

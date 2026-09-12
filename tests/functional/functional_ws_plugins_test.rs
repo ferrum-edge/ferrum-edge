@@ -8,6 +8,8 @@
 //! All tests are #[ignore] — run with:
 //!   cargo test --test functional_tests functional_ws_plugins -- --ignored --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{TestGateway, TestGatewayBuilder};
 
 use futures_util::{SinkExt, StreamExt};
@@ -24,7 +26,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::{CloseCode, Data, O
 // ============================================================================
 
 async fn bind_ws_backend_listener() -> (u16, TcpListener) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("Failed to bind WS backend");
     let port = listener

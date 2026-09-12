@@ -3,6 +3,8 @@
 //! Verifies that `GET /metrics/runtime` is exposed only through the
 //! standard admin JWT gate and returns the combined runtime JSON shape.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use ferrum_edge::admin::{
@@ -158,7 +160,7 @@ async fn start_test_admin(state: AdminState) -> (String, tokio::sync::watch::Sen
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test(addr).await.unwrap();
     let actual_addr = listener.local_addr().unwrap();
 
     let state_clone = state.clone();

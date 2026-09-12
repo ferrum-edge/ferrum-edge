@@ -4,6 +4,8 @@
 //! the buffered path solely because matching JSON/XML requires validation.
 //! Matching JSON stays buffered and validated. Coverage spans HTTP/1.1, H2, and H3.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{TestGateway, TestGatewayBuilder};
 use crate::scaffolding::clients::{GetOptions, Http3Client};
 
@@ -208,7 +210,7 @@ fn body_validator_config(backend_port: u16) -> String {
 }
 
 async fn spawn_typed_backend() -> (u16, Arc<AtomicUsize>, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind typed backend");
     let port = listener.local_addr().expect("local addr").port();

@@ -19,6 +19,8 @@
 //!   cargo build --bin ferrum-edge
 //!   cargo test --test functional_tests -- --ignored functional_dns_cache --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -34,7 +36,7 @@ use tokio::time::sleep;
 // ============================================================================
 
 async fn spawn_backend(identifier: &'static str) -> (u16, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let handle = tokio::spawn(async move {
         loop {

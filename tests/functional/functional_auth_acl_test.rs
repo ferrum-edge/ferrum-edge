@@ -10,6 +10,8 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_auth_acl
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{
     TestGateway, content_digest_sha256_header, empty_digest_header, generate_hmac_signature,
     generate_hmac_signature_with_digest, hmac_authority_from_url,
@@ -116,7 +118,7 @@ fn parse_asn1_length(data: &[u8]) -> (usize, usize) {
 async fn start_jwks_server(
     public_key_pem: &[u8],
 ) -> Result<(tokio::task::JoinHandle<()>, String), Box<dyn std::error::Error>> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
     let jwks_url = format!(
         "http://127.0.0.1:{}/.well-known/jwks.json",
         listener.local_addr()?.port()
@@ -491,7 +493,7 @@ async fn assert_empty_body_hmac_regressions(proxy_port: u16) {
 async fn start_echo_backend(
     port: u16,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    let listener = tokio::net::TcpListener::bind_test(format!("127.0.0.1:{}", port)).await?;
     Ok(start_echo_backend_on(listener))
 }
 
@@ -769,7 +771,7 @@ async fn test_access_control_allows_jwks_authenticated_identity_when_enabled() {
         .await
         .expect("Failed to create test harness");
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("Failed to bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -961,7 +963,7 @@ async fn test_auth_acl_comprehensive() {
         .expect("Failed to create test harness");
 
     // Start echo backend
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("Failed to bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -2354,7 +2356,7 @@ async fn test_basic_auth_plus_acl() {
 
     // Pre-bound listener stays owned across the handoff to start_echo_backend_on
     // — avoids the bind-drop-rebind window that races with other parallel tests.
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("Failed to bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -2518,7 +2520,7 @@ async fn test_jwt_auth_plus_acl() {
         .expect("Failed to create test harness");
 
     // See test_basic_auth_plus_acl for the rationale on holding the listener.
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("Failed to bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -2693,7 +2695,7 @@ async fn test_hmac_auth_plus_acl() {
         .expect("Failed to create test harness");
 
     // See test_basic_auth_plus_acl for the rationale on holding the listener.
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("Failed to bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -3202,7 +3204,7 @@ async fn test_hmac_v2_content_digest_forwards_original_body() {
         .await
         .expect("Failed to create test harness");
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind capturing HMAC backend");
     let backend_port = listener

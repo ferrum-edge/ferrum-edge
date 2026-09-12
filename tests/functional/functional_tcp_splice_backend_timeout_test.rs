@@ -16,6 +16,8 @@
 
 #![cfg(target_os = "linux")]
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{TestGateway, ephemeral_port};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -208,7 +210,7 @@ async fn setup_splice_proxy(
     tcp_idle_timeout_seconds: u64,
     extra_env: &[(&str, &str)],
 ) -> SpliceTestSetup {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_task = backend_factory(backend_listener);
 

@@ -31,6 +31,8 @@
 
 #![allow(clippy::bool_assert_comparison)]
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::scaffolding::backends::{
     H2Step, H3Step, H3TlsConfig, HttpStep, MatchHeaders, RequestMatcher, ScriptedH2Backend,
     ScriptedH3Backend, ScriptedHttp1Backend, ScriptedTcpBackend, ScriptedTlsBackend, TcpStep,
@@ -55,9 +57,9 @@ use tokio::net::{TcpListener, UdpSocket};
 async fn reserve_colocated_tcp_udp()
 -> Result<(TcpListener, UdpSocket, u16), Box<dyn std::error::Error + Send + Sync>> {
     for attempt in 0..10 {
-        let tcp = TcpListener::bind("127.0.0.1:0").await?;
+        let tcp = TcpListener::bind_test("127.0.0.1:0").await?;
         let port = tcp.local_addr()?.port();
-        match StdUdpSocket::bind(("127.0.0.1", port)) {
+        match StdUdpSocket::bind_test(("127.0.0.1", port)) {
             Ok(std_udp) => {
                 std_udp.set_nonblocking(true)?;
                 let udp = UdpSocket::from_std(std_udp)?;

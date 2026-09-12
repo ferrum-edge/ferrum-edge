@@ -8,6 +8,8 @@
 //! Asserts no body bytes are emitted and pins
 //! `Content-Length` / `Content-Encoding` / `Vary` behavior.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client, Http3Response};
 
@@ -124,7 +126,7 @@ async fn spawn_gateway(backend_port: u16, extra_env: &[(&str, &str)]) -> (TestGa
     let mut last_error = String::new();
 
     for _ in 0..MAX_ATTEMPTS {
-        let reservation = match TcpListener::bind("127.0.0.1:0").await {
+        let reservation = match TcpListener::bind_test("127.0.0.1:0").await {
             Ok(listener) => listener,
             Err(error) => {
                 last_error = error.to_string();
@@ -392,7 +394,7 @@ async fn assert_h1_h2_head(
 #[ignore]
 #[tokio::test]
 async fn functional_compression_skips_head_and_205_across_h1_h2_h3() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind bodyless compression backend");
     let backend_port = backend_listener.local_addr().expect("backend addr").port();

@@ -307,11 +307,28 @@ Then start CP/DP modes normally. The database connection will use TLS.
 
 ## Subprocess Harness Process Identity
 
-`tests/common/gateway_harness.rs` reserves the admin and proxy ports by
-binding `127.0.0.1:0` and dropping the listener, so between reservation
-and the child's own bind another gateway running in a parallel test can
-claim either port. Neither readiness nor a bare TCP accept can tell them
-apart — every gateway serves the same unauthenticated `/health` body.
+All functional and integration socket allocations share
+`tests/scaffolding/port_registry.rs`. An advisory allocation lock serializes
+binding and lease-table updates under `target/test-port-leases-v1` (or
+`CARGO_TARGET_DIR`). Separate advisory owner locks track process liveness;
+the next allocation reclaims a dead owner's ports, including after an abrupt
+nextest termination. TCP, UDP, IPv4, IPv6 and wildcard listeners share one
+port-number namespace, so a wildcard fixture cannot capture another test's
+promised gateway port. No test may bind a hard-coded, derived or self-probed port.
+
+Use `reserve_port` / `reserve_udp_port` / `reserve_colocated_tcp_udp` and keep
+the bound socket. Native socket fixtures use `TestSocket::bind_test` with port
+zero; DTLS fixtures use `ports::bind_dtls`. Drop releases unused reservations.
+Transferring a native socket with `into_listener` / `into_socket`, or releasing
+only the socket with `drop_and_take_port`, retains the lease until process exit.
+The bare-port helpers have the same retention contract. This spans a whole
+nextest test; libtest conservatively retains transferred ports across all tests
+in its process. Do not delete registry files during a test run.
+
+`tests/common/gateway_harness.rs` uses these leases for gateway handoffs and
+keeps its bounded startup retries for unrelated OS users that do not participate
+in the registry. Neither readiness nor a bare TCP accept establishes identity:
+every gateway serves the same unauthenticated `/health` body.
 
 `TestGatewayBuilder::spawn` therefore mints per-spawn-attempt credentials
 (admin JWT secret/issuer plus `FERRUM_METRICS_BEARER_TOKEN`) and treats

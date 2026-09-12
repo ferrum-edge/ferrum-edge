@@ -7,6 +7,8 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_sse
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::io::Write;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -20,7 +22,7 @@ use tokio::time::sleep;
 
 /// Start a simple HTTP echo server that returns SSE-style responses.
 async fn start_sse_echo_server(port: u16) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind SSE echo server");
 
@@ -100,7 +102,7 @@ async fn wait_for_owned_gateway(
 /// Proxy and admin ports are allocated by `start_gateway_with_retry()`.
 async fn setup_sse_config() -> (TempDir, String, u16) {
     // Bind to port 0 to get an ephemeral port for the backend (same-process, safe)
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -157,11 +159,11 @@ plugin_configs:
 async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
-        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let proxy_port = proxy_listener.local_addr().unwrap().port();
         drop(proxy_listener);
 
-        let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
 

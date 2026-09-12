@@ -2,6 +2,8 @@
 //!
 //! Run: `cargo test --test functional_tests -- --ignored functional_body_limit_h3 --nocapture`
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client};
 
@@ -112,7 +114,7 @@ async fn spawn_h3_gateway(
 #[ignore]
 #[tokio::test]
 async fn functional_body_limit_h3_response_body_zero_allows_above_default_body() {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let expected_len = ABOVE_DEFAULT_BODY_LIMIT_BYTES;
     let (mut gateway, backend_task, https_port) = spawn_h3_gateway(

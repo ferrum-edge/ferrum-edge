@@ -4,6 +4,8 @@
 //! asserting serialized projection. They pin the unsupported cases that must be
 //! reported as deferred rather than represented as effective resource limits.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -110,7 +112,7 @@ fn reqwest_pool() -> ConnectionPool {
 async fn start_counting_h1_backend(
     response_delay: Duration,
 ) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind counting backend");
     let addr = listener.local_addr().expect("backend addr");
@@ -366,7 +368,7 @@ async fn distinct_reqwest_pool_keys_share_one_destination_ceiling() {
 /// additional slot, so `maxConnections: 1` never sheds an h2 backend.
 #[tokio::test]
 async fn h2_streams_multiplex_without_consuming_extra_slots() {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind h2c backend");
     let addr = listener.local_addr().expect("backend addr");

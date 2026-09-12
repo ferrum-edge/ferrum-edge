@@ -4,6 +4,8 @@
 //! RPC-open header withholding, incomplete-frame starvation, revision-gate
 //! refusal, and NACK-breaker refusal are classified on the production path.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -242,7 +244,7 @@ impl AggregatedDiscoveryService for ScriptedPrivateAds {
 
 async fn serve(behaviour: AdsBehaviour) -> (ScriptedPrivateAds, String) {
     let handle = ScriptedPrivateAds::new(behaviour);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind private ADS listener");
     let addr = listener.local_addr().expect("listener addr");

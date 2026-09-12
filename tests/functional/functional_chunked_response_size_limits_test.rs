@@ -4,6 +4,8 @@
 //! must enforce `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` while streaming or while
 //! buffering due to `response_body_mode: buffer`.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 
 use bytes::Bytes;
@@ -22,7 +24,7 @@ const STARTUP_ATTEMPTS: u32 = 3;
 #[tokio::test]
 #[ignore]
 async fn transformer_response_size_policy_status_logging_and_attribution() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = listener.local_addr().unwrap().port();
     let backend_task = tokio::spawn(async move {
         loop {
@@ -257,7 +259,7 @@ impl ChunkedHarness {
         response_body_mode: Option<&str>,
         max_response_bytes: &str,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let backend_listener = TcpListener::bind_test("127.0.0.1:0").await?;
         let backend_port = backend_listener.local_addr()?.port();
 
         let gateway = TestGateway::builder()

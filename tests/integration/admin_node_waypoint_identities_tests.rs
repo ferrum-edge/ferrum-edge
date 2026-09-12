@@ -7,6 +7,8 @@
 //! `kubectl`-style debugging answer "which pods is this waypoint serving?"
 //! without scraping eBPF maps.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use ferrum_ebpf_common::OrigDst4;
@@ -170,7 +172,7 @@ fn make_admin_state(jwt: JwtManager, with_resolver: bool) -> AdminState {
 async fn start_test_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test(addr).await.unwrap();
     let actual_addr = listener.local_addr().unwrap();
     let state_clone = state.clone();
     let shutdown_rx_clone = shutdown_rx.clone();
