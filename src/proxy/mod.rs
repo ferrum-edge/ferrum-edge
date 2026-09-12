@@ -27248,6 +27248,113 @@ pub(crate) async fn enforce_buffered_final_client_visible_response_header_policy
     true
 }
 
+/// Whether the staged MCP POST-attached SSE publication describes EXACTLY the
+/// response that is about to reach the client.
+///
+/// The reservation promised one `200 text/event-stream` body. Only those bytes,
+/// under that status and representation, may enter `Last-Event-ID` replay
+/// history: anything a later policy, header phase, committed hook, or the
+/// pre-commit authorization gate replaced or refused fails this check and is
+/// aborted instead. Fail-closed in every direction — an absent or renamed
+/// content type, a rewritten body, or a deliverable (non-POST-attached)
+/// reservation all read as "not accepted".
+pub(crate) fn mcp_sse_publication_matches_response(
+    publication: &crate::plugins::mcp_aggregate_sse::AggregateSsePublication,
+    response_status: u16,
+    response_headers: &HashMap<String, String>,
+    response_body: &[u8],
+) -> bool {
+    response_status == 200
+        && response_headers_select_event_stream(response_headers)
+        && publication.matches_post_attached_body(response_body)
+}
+
+/// Settle a staged MCP POST-attached SSE publication exactly once.
+///
+/// `accepted` is [`mcp_sse_publication_matches_response`] plus whatever else the
+/// transport knows about the write. Committing is what makes the event
+/// resumable; aborting releases the reservation and returns the request stream's
+/// per-session capacity. Both are idempotent, and dropping the lease without
+/// calling either aborts, so no path can leak capacity or a payload.
+pub(crate) fn settle_mcp_sse_publication(
+    publication: crate::plugins::mcp_aggregate_sse::AggregateSsePublication,
+    accepted: bool,
+) -> bool {
+    if accepted {
+        publication.commit().is_ok()
+    } else {
+        publication.abort();
+        false
+    }
+}
+
+/// Re-close policy over a representation selected by a legacy final-body hook.
+///
+/// Phases 10b/10c decide over the representation they are handed. A LEGACY
+/// final-body hook runs after them and may select a different one —
+/// `mcp_gateway` re-frames a governed JSON-RPC answer as the POST-attached
+/// `text/event-stream` body — which neither authoritative phase has seen. This
+/// re-closes both over the bytes that actually reach the client, and it is
+/// fail-closed: a representation that genuinely trips a rule is refused here and
+/// replaces the response.
+///
+/// Running a phase a SECOND time is only safe if the phase's own state model
+/// tolerates it, so the participants are:
+///
+/// * `waf` — anomaly scores accumulate across phases, so a plain re-run would
+///   count the same response-phase evidence twice and carry an instance over its
+///   own block threshold for a response that legitimately passed. The scoring
+///   model marks the two final client-visible phases REPLACEABLE
+///   (`plugins::WafScorePhase`): a re-run supersedes that phase's previous
+///   contribution and leaves independent request-phase scores alone, so a
+///   genuinely worse representation still scores higher and still blocks. The
+///   header phase additionally memoizes the map it scanned, so only a map that
+///   actually changed is rescanned.
+/// * `body_validator` — a pure function of method, status, headers, and body
+///   (plus an idempotent JSON scan memo). Re-running is exactly the intent: the
+///   re-framed representation is validated on its own terms, and a
+///   `text/event-stream` content type that no configured rule claims is simply
+///   not inspected.
+/// * `ai_response_guard` — re-entrant, and its pending-redaction promise is a
+///   one-shot the first pass already consumed, so the second pass is a fresh
+///   residual scan of the delivered bytes (it understands SSE framing natively).
+///   One deliberate consequence: its residual-verified exemption is keyed by the
+///   exact `(content-type, body)` pair it verified, so a re-framed
+///   representation does NOT inherit it. A `redact` disposition that left
+///   detector-visible residue the first pass tolerated is therefore refused
+///   here instead of delivered. That is the fail-closed direction, it replaces
+///   the response rather than leaking one, and the staged retention boundary
+///   below then correctly refuses to retain the replacement.
+pub(crate) async fn enforce_late_buffered_final_response_policy(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Bytes,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> bool {
+    if run_final_client_visible_response_body_policy(
+        plugins,
+        ctx,
+        response_status,
+        response_headers,
+        response_body,
+        InitialResponseHeaderPolicySource::Prefiltered(initial_response_header_policy_plugins),
+    )
+    .await
+    {
+        return true;
+    }
+    enforce_buffered_final_client_visible_response_header_policy(
+        plugins,
+        ctx,
+        response_status,
+        response_headers,
+        response_body,
+    )
+    .await
+}
+
 /// Run buffered response transforms under the request's absolute gRPC
 /// deadline. A transform that exhausts the deadline selects the same
 /// flavor-aware terminal response as every other buffered response phase.
@@ -38856,6 +38963,22 @@ async fn handle_proxy_request_inner(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
+    if ctx.mcp_sse_publication.is_some()
+        && let ResponseBody::Buffered(ref mut data) = response_body
+    {
+        let phase_start = Instant::now();
+        let _ = enforce_late_buffered_final_response_policy(
+            &plugins,
+            &mut ctx,
+            &mut response_status,
+            &mut response_headers,
+            data,
+            initial_response_header_policy_plugins.as_ref(),
+        )
+        .await;
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    }
+
     // Inject the sticky-session cookie before committed exporters observe the
     // final header view. This remains after every rejection/body replacement so
     // the cookie lands on the same response that will be sent downstream.
@@ -38942,6 +39065,32 @@ async fn handle_proxy_request_inner(
         // The terminal is fully buffered, so the summary and the latency
         // derivation below must not describe this as a streamed response.
         is_streaming_response = false;
+    }
+    // Retention boundary for an MCP POST-attached SSE response (issue #5441).
+    // Everything that can still replace or refuse this response has now run:
+    // the late final body/header policy, the committed hooks, and the
+    // authoritative pre-commit authorization gate above. Only now may the
+    // staged event become `Last-Event-ID` replay history, and only if the bytes
+    // that reach the client are still exactly the ones it promised.
+    //
+    // On this path the commit is a PRE-WRITE commitment: the response has been
+    // decided but not yet handed to the transport, so "retained" means "the
+    // gateway is committed to sending exactly these bytes", not "the client
+    // received them". The native-H3 writer deliberately draws the line one step
+    // later (see its own note); neither line is proof of client receipt, and a
+    // client whose connection dies mid-response resumes with `Last-Event-ID`
+    // precisely because the event was retained.
+    if let Some(publication) = ctx.mcp_sse_publication.take() {
+        let mut accepted = false;
+        if let ResponseBody::Buffered(ref body) = response_body {
+            accepted = mcp_sse_publication_matches_response(
+                &publication,
+                response_status,
+                &response_headers,
+                body,
+            );
+        }
+        settle_mcp_sse_publication(publication, accepted);
     }
     // Whether the gate above could ever have fired for this request. The
     // buffered terminal-log arm below uses this to decide whether it may await

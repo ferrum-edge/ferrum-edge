@@ -1765,15 +1765,78 @@ impl AiUsageExport {
     }
 }
 
+/// Which WAF scan phase a score contribution came from.
+///
+/// Most phases run exactly once per request, so their contributions simply
+/// accumulate into one instance score. The two FINAL client-visible phases are
+/// different: the response pipeline can run them a SECOND time over a revised
+/// representation of the same response. `mcp_gateway` re-frames a JSON-RPC
+/// answer as a POST-attached `text/event-stream` body inside the legacy
+/// final-body hook, and the proxy then re-closes both authoritative phases over
+/// that representation, which neither of them had seen (issue #5441). Scoring
+/// the same response-phase evidence twice would carry an instance over its own
+/// block threshold for a response that legitimately passed — a `6` under a
+/// threshold of `10` becomes `12` purely because the bytes were re-wrapped.
+///
+/// So a re-run of a replaceable phase REPLACES that phase's previous
+/// contribution instead of adding to it. Request-phase scores are independent
+/// and untouched, and a representation that genuinely trips more (or heavier)
+/// rules scores higher than its predecessor and still blocks, which is what
+/// keeps the late pass fail-closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WafScorePhase {
+    /// A phase that runs exactly once per request: the cheap request scan, the
+    /// request body scan, and the `after_proxy` response-header scan.
+    Accumulating,
+    /// The authoritative final client-visible response HEADER policy.
+    FinalResponseHeaders,
+    /// The authoritative final client-visible response BODY policy.
+    FinalResponseBody,
+}
+
+/// Number of replaceable final-response phases tracked per instance.
+const WAF_REPLACEABLE_SCORE_PHASES: usize = 2;
+
+impl WafScorePhase {
+    /// Index of the replaceable slot this phase owns, if it owns one.
+    fn replaceable_slot(self) -> Option<usize> {
+        match self {
+            Self::Accumulating => None,
+            Self::FinalResponseHeaders => Some(0),
+            Self::FinalResponseBody => Some(1),
+        }
+    }
+
+    pub(crate) fn is_replaceable(self) -> bool {
+        self.replaceable_slot().is_some()
+    }
+}
+
 /// Per-instance WAF anomaly accumulator for one request.
 ///
 /// `identity` is the stable validated plugin-config id used in transaction
-/// metadata. `score` accumulates only that instance's rule contributions across
-/// request/response phases.
+/// metadata. The total is only ever that instance's own rule contributions;
+/// sibling WAF instances never share an accumulator.
 #[derive(Debug, Clone)]
 pub(crate) struct WafInstanceScoreState {
     pub(crate) identity: std::sync::Arc<str>,
-    pub(crate) score: u32,
+    /// Contributions from phases that run exactly once. Only ever grows.
+    accumulated: u32,
+    /// The LATEST contribution from each replaceable final-response phase, so a
+    /// phase re-run over a revised representation supersedes its own previous
+    /// verdict rather than being added to it.
+    replaceable: [u32; WAF_REPLACEABLE_SCORE_PHASES],
+}
+
+impl WafInstanceScoreState {
+    /// This instance's anomaly score for the request as it currently stands.
+    pub(crate) fn total(&self) -> u32 {
+        self.replaceable
+            .iter()
+            .fold(self.accumulated, |total, phase| {
+                total.saturating_add(*phase)
+            })
+    }
 }
 
 /// Exclusive compression response-buffer permit held on a request context.
@@ -3045,6 +3108,9 @@ pub struct RequestContext {
     /// replacement, cancellation, transport disconnect — so no cleanup task is
     /// ever spawned and no identity can leak its per-session capacity.
     pub(crate) mcp_sse_stream: Option<mcp_aggregate_sse::AggregateSseStream>,
+    /// POST-attached response retained privately until final response policy
+    /// and the authoritative authorization gate have accepted it.
+    pub(crate) mcp_sse_publication: Option<mcp_aggregate_sse::AggregateSsePublication>,
     /// Whether reserved `waf.*` metadata has been cleared for this request.
     ///
     /// `metadata` is intentionally public plugin scratch space. WAF-owned log
@@ -3648,6 +3714,7 @@ impl RequestContext {
             mcp_batch_forbids_upstream: false,
             mcp_aggregate_sse: None,
             mcp_sse_stream: None,
+            mcp_sse_publication: None,
             waf_metadata_initialized: false,
             waf_owned_metadata: HashMap::new(),
             waf_instance_scores: HashMap::new(),
@@ -5031,6 +5098,7 @@ impl RequestContext {
             // state is copied back. Holding a lease here would terminalize the
             // live request's identity when the copy dropped.
             mcp_sse_stream: None,
+            mcp_sse_publication: None,
             waf_metadata_initialized: self.waf_metadata_initialized,
             waf_owned_metadata: self.waf_owned_metadata.clone(),
             waf_instance_scores: self.waf_instance_scores.clone(),
@@ -5343,13 +5411,19 @@ impl RequestContext {
         self.set_waf_metadata(key, value);
     }
 
-    /// Accumulate anomaly score for one WAF instance and return its new total.
+    /// Record one WAF instance's contribution for `phase` and return its new
+    /// total. An [`WafScorePhase::Accumulating`] phase adds; a replaceable
+    /// final-response phase SUPERSEDES its own previous contribution, so the
+    /// same response-phase evidence is never counted twice when the pipeline
+    /// re-closes policy over a revised representation.
+    ///
     /// A never-seen zero contribution remains absent so a noncontributing
     /// sibling cannot turn single-instance metadata into a multi-instance view.
     pub(crate) fn accumulate_waf_instance_score(
         &mut self,
         instance_id: u64,
         identity: &std::sync::Arc<str>,
+        phase: WafScorePhase,
         contribution: u32,
     ) -> Option<u32> {
         if contribution == 0 && !self.waf_instance_scores.contains_key(&instance_id) {
@@ -5360,10 +5434,14 @@ impl RequestContext {
             .entry(instance_id)
             .or_insert_with(|| WafInstanceScoreState {
                 identity: std::sync::Arc::clone(identity),
-                score: 0,
+                accumulated: 0,
+                replaceable: [0; WAF_REPLACEABLE_SCORE_PHASES],
             });
-        entry.score = entry.score.saturating_add(contribution);
-        Some(entry.score)
+        match phase.replaceable_slot() {
+            Some(slot) => entry.replaceable[slot] = contribution,
+            None => entry.accumulated = entry.accumulated.saturating_add(contribution),
+        }
+        Some(entry.total())
     }
 
     pub(crate) fn merge_waf_metadata(&mut self, key: &str, value: &str) {

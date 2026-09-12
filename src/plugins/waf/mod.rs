@@ -50,7 +50,8 @@ use super::utils::synthetic_response::{
 use super::{
     ALL_PROTOCOLS, HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext,
     ResponseTrailerPolicy, StreamBytesKind, StreamConnectionContext, StreamFrontendTransport,
-    UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict, WebSocketFrameDirection,
+    UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict, WafScorePhase,
+    WebSocketFrameDirection,
 };
 use crate::config::types::BackendScheme;
 use crate::util::unknown_keys::reject_unknown_keys;
@@ -635,8 +636,23 @@ impl Waf {
         outcome
     }
 
-    fn finish_scan(&self, ctx: &mut RequestContext, outcome: ScanOutcome) -> PluginResult {
+    /// Turn one scan outcome into this instance's decision for `phase`.
+    ///
+    /// `phase` is what decides whether the anomaly contribution accumulates or
+    /// supersedes an earlier contribution from the same phase — see
+    /// [`WafScorePhase`]. It changes nothing else about the decision.
+    fn finish_scan(
+        &self,
+        ctx: &mut RequestContext,
+        outcome: ScanOutcome,
+        phase: WafScorePhase,
+    ) -> PluginResult {
         if outcome.hits.is_empty() {
+            // A replaceable phase that re-ran CLEAN retires its own previous
+            // contribution: that evidence is not in the representation the
+            // client receives, so it must stop counting toward this instance's
+            // threshold.
+            self.retire_replaceable_phase_score(ctx, phase);
             if outcome.truncated && self.config.log_to_metadata {
                 ctx.set_waf_metadata("waf.scan_truncated", "true");
             }
@@ -649,7 +665,7 @@ impl Waf {
             return PluginResult::Continue;
         }
 
-        let should_block = self.record_hits(ctx, &outcome, true);
+        let should_block = self.record_hits(ctx, &outcome, true, phase);
         if should_block {
             // An over-budget cheap/body scan still ran to completion and
             // produced real matches, so a confirmed enforcing hit (or score
@@ -839,6 +855,7 @@ impl Waf {
         ctx: &mut RequestContext,
         outcome: &ScanOutcome,
         enforce_actions: bool,
+        phase: WafScorePhase,
     ) -> bool {
         let mut first_blocking_rule = None;
         let mut highest = Severity::Info;
@@ -870,12 +887,10 @@ impl Waf {
         // request-private per-instance state) so weak signals in the query,
         // body, and response add up to a single instance score that can cross
         // that instance's block threshold. Sibling WAF instances never share
-        // this accumulator.
-        let total_score = self.config.scoring.as_ref().and_then(|scoring| {
-            ctx.ensure_waf_metadata_initialized();
-            ctx.accumulate_waf_instance_score(self.instance_id, &self.identity, phase_score)
-                .map(|total| (total, scoring.block_threshold))
-        });
+        // this accumulator. A phase the response pipeline may re-run over a
+        // revised representation supersedes its own previous contribution
+        // instead (`WafScorePhase`), so one response is never scored twice.
+        let total_score = self.score_phase(ctx, phase, phase_score);
         let score_block = enforce_actions
             && self.config.mode == GlobalMode::Enforce
             && total_score.is_some_and(|(total, threshold)| total >= threshold);
@@ -914,6 +929,40 @@ impl Waf {
         first_blocking_rule.is_some() || score_block
     }
 
+    /// Record `phase_score` for `phase` and report `(total, block_threshold)`
+    /// when this instance participates in anomaly scoring at all.
+    fn score_phase(
+        &self,
+        ctx: &mut RequestContext,
+        phase: WafScorePhase,
+        phase_score: u32,
+    ) -> Option<(u32, u32)> {
+        let scoring = self.config.scoring.as_ref()?;
+        ctx.ensure_waf_metadata_initialized();
+        let total = ctx.accumulate_waf_instance_score(
+            self.instance_id,
+            &self.identity,
+            phase,
+            phase_score,
+        )?;
+        Some((total, scoring.block_threshold))
+    }
+
+    /// Retire a replaceable phase's previous contribution because this run of
+    /// it found nothing. A never-scoring instance stays absent; an instance that
+    /// scored elsewhere keeps those independent contributions.
+    fn retire_replaceable_phase_score(&self, ctx: &mut RequestContext, phase: WafScorePhase) {
+        if !phase.is_replaceable() {
+            return;
+        }
+        let Some((total, _)) = self.score_phase(ctx, phase, 0) else {
+            return;
+        };
+        if self.config.log_to_metadata {
+            self.publish_instance_score_metadata(ctx, total);
+        }
+    }
+
     /// Publish this instance's score and a deterministic multi-instance aggregate.
     ///
     /// - Always writes `waf.instances.<identity>.score` for the updating instance.
@@ -931,7 +980,7 @@ impl Waf {
         let mut parts: Vec<(&str, u32)> = ctx
             .waf_instance_scores
             .values()
-            .map(|state| (state.identity.as_ref(), state.score))
+            .map(|state| (state.identity.as_ref(), state.total()))
             .collect();
         parts.sort_unstable_by(|left, right| left.0.cmp(right.0));
         let mut aggregate = String::new();
@@ -1498,7 +1547,7 @@ impl Plugin for Waf {
             return PluginResult::Continue;
         }
         let outcome = self.run_cheap_with_budget(|| self.run_cheap_scan(ctx));
-        self.finish_scan(ctx, outcome)
+        self.finish_scan(ctx, outcome, WafScorePhase::Accumulating)
     }
 
     fn requires_request_body_buffering(&self) -> bool {
@@ -1588,7 +1637,7 @@ impl Plugin for Waf {
             .run_body_scan_with_budget(|| self.run_request_body_scan(ctx, body, content_type))
             .await;
         outcome.truncated = truncated;
-        self.finish_scan(ctx, outcome)
+        self.finish_scan(ctx, outcome, WafScorePhase::Accumulating)
     }
 
     async fn after_proxy(
@@ -1614,7 +1663,7 @@ impl Plugin for Waf {
             // untouched header set is neither rescanned nor rescored
             // (`GHSA-62jg-v563-4q23`).
             let digest = response_header_map_digest(response_headers);
-            let result = self.finish_scan(ctx, outcome);
+            let result = self.finish_scan(ctx, outcome, WafScorePhase::Accumulating);
             // A rejection can be rebuilt into the same header map and must be
             // scanned again by the bounded fail-closed recheck. Only successful
             // decisions are safe to memoize.
@@ -1821,7 +1870,7 @@ impl Plugin for Waf {
         }
         let outcome =
             self.run_cheap_with_budget(|| self.run_response_header_scan(ctx, response_headers));
-        let result = self.finish_scan(ctx, outcome);
+        let result = self.finish_scan(ctx, outcome, WafScorePhase::FinalResponseHeaders);
         // Do not memoize refused maps: the final response pipeline deliberately
         // rechecks a rebuilt rejection, which can be byte-for-byte identical.
         if matches!(&result, PluginResult::Continue) {
@@ -1866,7 +1915,7 @@ impl Plugin for Waf {
             .run_body_scan_with_budget(|| self.run_response_body_scan(ctx, body, content_type))
             .await;
         outcome.truncated = truncated;
-        self.finish_scan(ctx, outcome)
+        self.finish_scan(ctx, outcome, WafScorePhase::FinalResponseBody)
     }
 
     /// Preserve the established final-body hook contract for direct callers.
@@ -2297,7 +2346,7 @@ mod tests {
         });
 
         assert!(outcome.timed_out);
-        let result = plugin.finish_scan(&mut ctx, outcome);
+        let result = plugin.finish_scan(&mut ctx, outcome, WafScorePhase::Accumulating);
 
         assert!(matches!(result, PluginResult::Reject { .. }));
         assert_eq!(
@@ -2340,7 +2389,7 @@ mod tests {
                 ScanOutcome::default()
             })
             .await;
-        let result = plugin.finish_scan(&mut ctx, outcome);
+        let result = plugin.finish_scan(&mut ctx, outcome, WafScorePhase::Accumulating);
 
         assert!(matches!(
             result,

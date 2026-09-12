@@ -9461,6 +9461,23 @@ async fn handle_h3_request(
             .entry("content-type".to_string())
             .or_insert_with(|| "application/json".to_string());
 
+        if ctx.mcp_sse_publication.is_some() {
+            let phase_start = std::time::Instant::now();
+            if crate::proxy::enforce_late_buffered_final_response_policy(
+                &plugins,
+                &mut ctx,
+                &mut response_status,
+                &mut response_headers,
+                &mut response_body,
+                initial_response_header_policy_plugins.as_ref(),
+            )
+            .await
+            {
+                response_trailers = None;
+            }
+            plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        }
+
         if capabilities.has(crate::plugin_cache::PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK) {
             let phase_start = std::time::Instant::now();
             if crate::proxy::run_deadline_bounded_response_committed_hooks(
@@ -9657,12 +9674,46 @@ async fn handle_h3_request(
                 }
             }};
         }
+        // Retention boundary for an MCP POST-attached SSE response (issue
+        // #5441). The predicate is read here, while the body still exists, but
+        // the publication is settled only after the write below: on native H3
+        // the bytes reach the client through this send loop, so a response the
+        // transport never delivered must not become replayable either. Taking
+        // the lease now also means every remaining exit — a write error, the
+        // deadline terminal, a panic — drops it, and the drop aborts.
+        //
+        // What `bytes_received == response_body_bytes` actually proves, and
+        // what it does not: the QUIC send stream ACCEPTED every DATA byte
+        // before FIN. That is a local handoff to the transport, not an
+        // acknowledgement from the peer, so it is not proof of client receipt
+        // any more than the H1/H2 boundary is. It is deliberately one step
+        // LATER than H1/H2's, which commits before the write: here the write is
+        // in this frame, so the cheap stronger signal is available and a
+        // response this writer demonstrably failed to hand over is not made
+        // resumable. A client whose connection dies after acceptance resumes
+        // with `Last-Event-ID` — which is the whole point of retaining it.
+        let mcp_publication = ctx.mcp_sse_publication.take();
+        let mut mcp_publication_accepted = false;
+        if let Some(publication) = mcp_publication.as_ref() {
+            mcp_publication_accepted = crate::proxy::mcp_sse_publication_matches_response(
+                publication,
+                response_status,
+                &response_headers,
+                &response_body,
+            );
+        }
         let response_headers_sent = await_buffered_h3_write!(stream.send_response(resp));
         if response_headers_sent
             && !response_body.is_empty()
             && await_buffered_h3_write!(stream.send_data(response_body))
         {
             bytes_received = response_body_bytes;
+        }
+        if let Some(publication) = mcp_publication {
+            crate::proxy::settle_mcp_sse_publication(
+                publication,
+                mcp_publication_accepted && bytes_received == response_body_bytes,
+            );
         }
 
         // Backend trailers survive to here only when no response-body plugin
