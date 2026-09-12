@@ -52,6 +52,8 @@ pub mod certs;
 pub mod clients;
 pub mod dedup_dispatch;
 pub mod harness;
+#[cfg(test)]
+mod harness_readiness_tests;
 pub mod matrix;
 pub mod network;
 pub mod ocsp;
