@@ -644,8 +644,9 @@ impl SessionInner {
             ReservationBudget::PostAttached => {
                 self.post_attached_reserved_events =
                     self.post_attached_reserved_events.saturating_add(1);
-                self.post_attached_reserved_bytes =
-                    self.post_attached_reserved_bytes.saturating_add(reserved_bytes);
+                self.post_attached_reserved_bytes = self
+                    .post_attached_reserved_bytes
+                    .saturating_add(reserved_bytes);
             }
         }
     }
@@ -662,8 +663,9 @@ impl SessionInner {
             ReservationBudget::PostAttached => {
                 self.post_attached_reserved_events =
                     self.post_attached_reserved_events.saturating_sub(1);
-                self.post_attached_reserved_bytes =
-                    self.post_attached_reserved_bytes.saturating_sub(reserved_bytes);
+                self.post_attached_reserved_bytes = self
+                    .post_attached_reserved_bytes
+                    .saturating_sub(reserved_bytes);
             }
         }
     }
