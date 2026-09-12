@@ -1907,7 +1907,9 @@ async fn test_unreachable_target_with_retry() {
     let config_path = temp_dir.path().join("config.yaml");
 
     let (port1, listener1) = reserve_backend().await;
-    let unavailable_port = unbound_port().await.expect("lease unavailable backend port");
+    let unavailable_port = unbound_port()
+        .await
+        .expect("lease unavailable backend port");
 
     // One target is on a port where nothing is listening (connection refused)
     let config = format!(

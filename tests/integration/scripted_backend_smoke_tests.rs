@@ -1051,9 +1051,8 @@ async fn serve_drops_prebound_admin_https_without_tls_before_reserved_ports() {
     // racing the kernel's ephemeral allocator.
     // The registry leases the number for this process, so a nonzero rebind of
     // it later in this test is accepted, and no other test can be handed it.
-    let admin_https_reservation =
-        crate::scaffolding::ports::reserve_port_in_range(20_000..30_000)
-            .expect("bind prebound admin HTTPS outside the ephemeral range");
+    let admin_https_reservation = crate::scaffolding::ports::reserve_port_in_range(20_000..30_000)
+        .expect("bind prebound admin HTTPS outside the ephemeral range");
     let admin_https_port = admin_https_reservation.port;
     let admin_https_listener = admin_https_reservation.into_listener();
 
