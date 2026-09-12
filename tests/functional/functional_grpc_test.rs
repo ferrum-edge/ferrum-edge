@@ -13,6 +13,8 @@
 //! This test is marked with #[ignore] as it requires the binary to be built
 //! and should be run with: cargo test --test functional_tests functional_grpc -- --ignored --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
@@ -36,10 +38,9 @@ use tokio_stream::wrappers::ReceiverStream;
 
 /// Allocate a free port by binding to port 0 and returning the assigned port.
 async fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    crate::scaffolding::ports::unbound_port()
         .await
-        .expect("Failed to bind to port 0");
-    listener.local_addr().unwrap().port()
+        .expect("lease test port")
 }
 
 /// Start a mock gRPC backend server (h2c HTTP/2).
@@ -53,7 +54,7 @@ async fn free_port() -> u16 {
 /// - Supports `x-test-grpc-status` / `x-test-grpc-message` headers to override status
 /// - Echoes `authorization` header back as `x-echo-authorization` for metadata verification
 async fn start_grpc_echo_backend(port: u16) -> tokio::task::JoinHandle<()> {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind gRPC echo backend");
 
@@ -257,7 +258,7 @@ fn start_gateway_with_extra_env(
     // Fresh admin HTTP port + admin HTTPS disabled so parallel gateways in the
     // same shard never contend on the default admin ports (9000/9443); an admin
     // bind failure aborts startup. These tests do not use the admin API.
-    let admin_http_port = std::net::TcpListener::bind("127.0.0.1:0")?
+    let admin_http_port = std::net::TcpListener::bind_test("127.0.0.1:0")?
         .local_addr()?
         .port();
     let observability_token = format!("ferrum-edge-grpc-probe-{}", uuid::Uuid::new_v4().simple());
@@ -291,6 +292,8 @@ fn start_gateway_with_extra_env(
 
 /// Write a YAML config file with a gRPC proxy pointing to the given backend port.
 fn write_grpc_config(config_path: &std::path::Path, backend_port: u16) {
+    let unavailable_port =
+        crate::scaffolding::ports::unbound_tcp_port().expect("lease unavailable gRPC backend port");
     let config = format!(
         r#"
 version: "1"
@@ -313,7 +316,7 @@ proxies:
     listen_path: "/grpc-down"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: 19999
+    backend_port: {unavailable_port}
     strip_listen_path: true
 
 consumers: []
@@ -1471,7 +1474,7 @@ async fn test_grpc_streaming_holds_per_ip_request_slot() {
     // Pre-bind the streaming backend's listener so it owns the socket for its
     // whole lifetime (no free-port→bind race). Read the port before moving the
     // listener into the backend.
-    let backend_listener = TcpListener::bind("127.0.0.1:0")
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind streaming gRPC backend");
     let backend_port = backend_listener

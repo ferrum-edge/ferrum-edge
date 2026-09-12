@@ -21,6 +21,8 @@
 //! boundaries via plain TCP connect-attempt observations — no plugin
 //! introspection or counter-readback API required.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -495,7 +497,7 @@ async fn tcp_stream_accept_threads_two_binds_and_relays_connections() {
          {gateway_addr}: {foreign:?}"
     );
     assert!(
-        std::net::TcpListener::bind(gateway_addr).is_err(),
+        std::net::TcpListener::bind_test(gateway_addr).is_err(),
         "SO_REUSEADDR-only foreign bind must also fail on {gateway_addr}"
     );
 

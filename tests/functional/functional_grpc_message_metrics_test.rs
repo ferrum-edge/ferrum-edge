@@ -15,6 +15,8 @@
 //!   cargo test --test functional_tests grpc_message_metrics -- --ignored --nocapture
 //! ```
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::scaffolding::backends::{GrpcStep, MatchRpc, ScriptedGrpcBackend};
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::Http3Client;
@@ -138,7 +140,7 @@ async fn send_h2_grpc_two_messages(
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn h2_grpc_message_metrics_are_nonzero_and_exact() {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let backend_port = listener.local_addr().unwrap().port();
@@ -282,7 +284,7 @@ async fn grpc_web_message_metrics_count_native_frames_not_client_wire() {
         ("binary", "application/grpc-web+proto", false),
         ("text", "application/grpc-web-text+proto", true),
     ] {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind backend");
         let backend_port = listener.local_addr().unwrap().port();
@@ -351,7 +353,7 @@ async fn grpc_web_message_metrics_count_native_frames_not_client_wire() {
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn h3_grpc_message_metrics_are_nonzero_and_exact() {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let backend_port = listener.local_addr().unwrap().port();

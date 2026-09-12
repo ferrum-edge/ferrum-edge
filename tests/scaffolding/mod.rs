@@ -55,6 +55,9 @@ pub mod harness;
 pub mod matrix;
 pub mod network;
 pub mod ocsp;
+pub mod port_registry;
+#[cfg(test)]
+mod port_registry_tests;
 pub mod ports;
 
 // Curated re-exports so a test's imports fit on one line.

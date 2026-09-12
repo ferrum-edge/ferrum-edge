@@ -2,6 +2,8 @@
 //!
 //! Run: `cargo build --bin ferrum-edge && cargo test --test functional_tests functional_example_plugin -- --ignored --nocapture`
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client};
 use crate::scaffolding::reserve_colocated_tcp_udp;
@@ -26,7 +28,7 @@ struct HeaderEchoBackend {
 
 impl HeaderEchoBackend {
     async fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind example backend");
         let port = listener.local_addr().expect("example backend addr").port();

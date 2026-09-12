@@ -10,6 +10,8 @@
 //! Run with:
 //!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_mtls --ignored --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 use std::io::Write;
@@ -198,8 +200,9 @@ async fn start_tcp_echo_on(listener: TcpListener) -> tokio::task::JoinHandle<()>
 
 /// Allocate an ephemeral port by binding to port 0 and returning the assigned port.
 async fn alloc_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    l.local_addr().unwrap().port()
+    crate::scaffolding::ports::unbound_port()
+        .await
+        .expect("lease test port")
 }
 
 /// Port set returned by the retry wrapper. Fields are Option so tests can
@@ -349,7 +352,7 @@ async fn test_frontend_mtls_valid_client_cert() {
     let ca_p = write_pem(&td, "ca.pem", &ca.cert_pem);
     let srv_c = write_pem(&td, "s.crt", &srv.cert_pem);
     let srv_k = write_pem(&td, "s.key", &srv.key_pem);
-    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let be_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let bp = be_listener.local_addr().unwrap().port();
     let echo = start_http_echo_on(be_listener).await;
     let cp = td.path().join("c.yaml");
@@ -417,7 +420,7 @@ async fn test_frontend_mtls_no_client_cert_rejected() {
     let ca_p = write_pem(&td, "ca.pem", &ca.cert_pem);
     let srv_c = write_pem(&td, "s.crt", &srv.cert_pem);
     let srv_k = write_pem(&td, "s.key", &srv.key_pem);
-    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let be_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let bp = be_listener.local_addr().unwrap().port();
     let echo = start_http_echo_on(be_listener).await;
     let cp = td.path().join("c.yaml");
@@ -486,7 +489,7 @@ async fn test_frontend_mtls_wrong_ca_rejected() {
     let ca_p = write_pem(&td, "ca.pem", &good_ca.cert_pem);
     let srv_c = write_pem(&td, "s.crt", &srv.cert_pem);
     let srv_k = write_pem(&td, "s.key", &srv.key_pem);
-    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let be_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let bp = be_listener.local_addr().unwrap().port();
     let echo = start_http_echo_on(be_listener).await;
     let cp = td.path().join("c.yaml");
@@ -551,7 +554,7 @@ async fn test_backend_tls_ca_verification_trusted() {
     let ca = generate_ca("BE-CA");
     let be = generate_signed_cert(&ca, "Backend", &["localhost"]);
     let ca_p = write_pem(&td, "ca.pem", &ca.cert_pem);
-    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let be_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let bp = be_listener.local_addr().unwrap().port();
     let echo = start_https_echo_on(be_listener, &be.cert_pem, &be.key_pem, None).await;
     let cp = td.path().join("c.yaml");
@@ -619,7 +622,7 @@ async fn test_backend_tls_ca_verification_untrusted() {
     let bad_ca = generate_ca("Bad-BE-CA");
     let be = generate_signed_cert(&bad_ca, "BadBackend", &["localhost"]);
     let ca_p = write_pem(&td, "ca.pem", &good_ca.cert_pem);
-    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let be_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let bp = be_listener.local_addr().unwrap().port();
     let echo = start_https_echo_on(be_listener, &be.cert_pem, &be.key_pem, None).await;
     let cp = td.path().join("c.yaml");
@@ -689,7 +692,7 @@ async fn test_backend_mtls_gateway_presents_client_cert() {
     let ca_p = write_pem(&td, "ca.pem", &ca.cert_pem);
     let gwc_c = write_pem(&td, "gw.crt", &gwc.cert_pem);
     let gwc_k = write_pem(&td, "gw.key", &gwc.key_pem);
-    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let be_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let bp = be_listener.local_addr().unwrap().port();
     let echo =
         start_https_echo_on(be_listener, &be.cert_pem, &be.key_pem, Some(&ca.cert_pem)).await;
@@ -759,7 +762,7 @@ async fn test_backend_mtls_gateway_no_client_cert_rejected() {
     let ca = generate_ca("mTLS-CA2");
     let be = generate_signed_cert(&ca, "mTLS-BE2", &["localhost"]);
     let ca_p = write_pem(&td, "ca.pem", &ca.cert_pem);
-    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let be_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let bp = be_listener.local_addr().unwrap().port();
     let echo =
         start_https_echo_on(be_listener, &be.cert_pem, &be.key_pem, Some(&ca.cert_pem)).await;
@@ -830,7 +833,7 @@ async fn test_backend_mtls_global_env_vars() {
     let ca_p = write_pem(&td, "ca.pem", &ca.cert_pem);
     let gwc_c = write_pem(&td, "gw.crt", &gwc.cert_pem);
     let gwc_k = write_pem(&td, "gw.key", &gwc.key_pem);
-    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let be_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let bp = be_listener.local_addr().unwrap().port();
     let echo =
         start_https_echo_on(be_listener, &be.cert_pem, &be.key_pem, Some(&ca.cert_pem)).await;
@@ -903,7 +906,7 @@ async fn test_admin_mtls_authorized_client() {
     let ca_p = write_pem(&td, "ca.pem", &ca.cert_pem);
     let ac = write_pem(&td, "a.crt", &adm_srv.cert_pem);
     let ak = write_pem(&td, "a.key", &adm_srv.key_pem);
-    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let be_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let bp = be_listener.local_addr().unwrap().port();
     let echo = start_http_echo_on(be_listener).await;
     let cp = td.path().join("c.yaml");
@@ -971,7 +974,7 @@ async fn test_admin_mtls_unauthorized_client_rejected() {
     let ca_p = write_pem(&td, "ca.pem", &ca.cert_pem);
     let ac = write_pem(&td, "a.crt", &adm_srv.cert_pem);
     let ak = write_pem(&td, "a.key", &adm_srv.key_pem);
-    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let be_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let bp = be_listener.local_addr().unwrap().port();
     let echo = start_http_echo_on(be_listener).await;
     let cp = td.path().join("c.yaml");
@@ -1039,7 +1042,7 @@ async fn test_tcp_frontend_mtls_valid_client() {
     let ca_p = write_pem(&td, "ca.pem", &ca.cert_pem);
     let sc = write_pem(&td, "s.crt", &srv.cert_pem);
     let sk = write_pem(&td, "s.key", &srv.key_pem);
-    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let be_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let bp = be_listener.local_addr().unwrap().port();
     let echo = start_tcp_echo_on(be_listener).await;
     let cp = td.path().join("c.yaml");
@@ -1128,7 +1131,7 @@ async fn test_tcp_frontend_mtls_no_client_cert_rejected() {
     let ca_p = write_pem(&td, "ca.pem", &ca.cert_pem);
     let sc = write_pem(&td, "s.crt", &srv.cert_pem);
     let sk = write_pem(&td, "s.key", &srv.key_pem);
-    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let be_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let bp = be_listener.local_addr().unwrap().port();
     let echo = start_tcp_echo_on(be_listener).await;
     let cp = td.path().join("c.yaml");
@@ -1212,7 +1215,7 @@ async fn test_backend_tls_global_ca_bundle() {
     let ca = generate_ca("Global-CA");
     let be = generate_signed_cert(&ca, "Global-BE", &["localhost"]);
     let ca_p = write_pem(&td, "ca.pem", &ca.cert_pem);
-    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let be_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let bp = be_listener.local_addr().unwrap().port();
     let echo = start_https_echo_on(be_listener, &be.cert_pem, &be.key_pem, None).await;
     let cp = td.path().join("c.yaml");

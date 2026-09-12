@@ -827,7 +827,7 @@ impl MeshMtlsConnectionPool {
         dial_host: &'a str,
         app_policy_port: u16,
     ) -> Option<crate::backend_conn_limit::PooledConnectionAdmission<'a>> {
-        crate::backend_conn_limit::PooledConnectionAdmission::resolve(
+        crate::backend_conn_limit::PooledConnectionAdmission::resolve_tracking_uncapped(
             self.backend_conn_limit.get().map(|limiter| &**limiter),
             proxy,
             dial_host,

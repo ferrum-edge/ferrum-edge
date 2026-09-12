@@ -16,6 +16,8 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_db_failover
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use chrono::Utc;
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy, default_namespace};
@@ -198,10 +200,14 @@ async fn test_db_failover_urls_startup() {
         let temp_dir = TempDir::new().expect("temp dir");
         let failover_db_path: PathBuf = temp_dir.path().join("failover.db");
 
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let proxy_port = proxy_listener.local_addr().unwrap().port();
         drop(proxy_listener);
 
@@ -521,10 +527,14 @@ async fn test_db_config_backup_bootstrap() {
         let temp_dir = TempDir::new().expect("temp dir");
         let backup_path: PathBuf = temp_dir.path().join("backup.json");
 
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let proxy_port = proxy_listener.local_addr().unwrap().port();
         drop(proxy_listener);
 
@@ -532,7 +542,9 @@ async fn test_db_config_backup_bootstrap() {
         // task — no drop-and-rebind, so the port is held atomically from
         // allocation through server startup. This eliminates the race where
         // another process could steal the numeric port between drop and rebind.
-        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let backend_port = backend_listener.local_addr().unwrap().port();
         let _backend = start_static_backend(backend_listener, "backup-bootstrap-ok");
 
@@ -837,15 +849,21 @@ async fn test_db_config_backup_bootstrap_filters_to_configured_namespace() {
         let backup_path: PathBuf = temp_dir.path().join("backup-multi-namespace.json");
         let log_path: PathBuf = temp_dir.path().join("gateway.stderr");
 
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let proxy_port = proxy_listener.local_addr().unwrap().port();
         drop(proxy_listener);
 
         // Held atomically from allocation through server startup.
-        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let backend_port = backend_listener.local_addr().unwrap().port();
         let _backend = start_static_backend(backend_listener, "tenant-a-backend");
 
@@ -1078,10 +1096,14 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
         let backup_path: PathBuf = temp_dir.path().join("backup.json");
         let failover_db_path: PathBuf = temp_dir.path().join("failover.db");
 
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let proxy_port = proxy_listener.local_addr().unwrap().port();
         drop(proxy_listener);
 
@@ -1271,10 +1293,14 @@ async fn test_db_read_replica_startup() {
         let temp_dir = TempDir::new().expect("temp dir");
         let db_path = temp_dir.path().join("gateway.db");
 
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let proxy_port = proxy_listener.local_addr().unwrap().port();
         drop(proxy_listener);
 
@@ -1401,14 +1427,20 @@ async fn test_db_authoritative_startup_uses_primary_when_replica_is_stale() {
         let primary_db_path: PathBuf = temp_dir.path().join("primary.db");
         let replica_db_path: PathBuf = temp_dir.path().join("replica-empty.db");
 
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let proxy_port = proxy_listener.local_addr().unwrap().port();
         drop(proxy_listener);
 
-        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .unwrap();
         let backend_port = backend_listener.local_addr().unwrap().port();
         let _backend = start_static_backend(backend_listener, "primary-authoritative-ok");
 

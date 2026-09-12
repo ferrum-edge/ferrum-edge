@@ -12,6 +12,8 @@
 //! to avoid running during normal `cargo test`. Run with:
 //!   cargo test --test functional_cp_dp_test -- --ignored --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
@@ -279,7 +281,7 @@ async fn test_cp_dp_grpc_config_sync() {
     let config_arc = Arc::new(ArcSwap::new(Arc::new(initial_config.clone())));
     let (cp_server, update_tx) = CpGrpcServer::new(config_arc.clone(), GRPC_JWT_SECRET.to_string());
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("Failed to bind CP gRPC server");
     let addr = listener.local_addr().expect("Failed to get local addr");
@@ -675,7 +677,7 @@ async fn test_cp_dp_namespace_isolation_over_grpc() {
         "production".to_string(),
     );
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind CP");
     let addr = listener.local_addr().expect("CP addr");

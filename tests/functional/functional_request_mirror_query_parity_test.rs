@@ -12,6 +12,8 @@
 //! must be absent from the mirrored request while ordinary application headers
 //! still ride.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client};
 
@@ -139,7 +141,7 @@ struct CapturingBackend {
 
 impl CapturingBackend {
     async fn spawn() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind capture backend");
         let port = listener.local_addr().expect("local addr").port();

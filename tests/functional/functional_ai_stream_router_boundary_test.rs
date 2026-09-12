@@ -22,6 +22,8 @@
 //! Run with: cargo build --bin ferrum-edge && cargo test --test functional_tests \
 //!   functional_ai_stream_router_boundary -- --ignored --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client};
 
@@ -285,7 +287,7 @@ impl CapturingBackend {
     /// `fail_all` makes every response a retryable 500 so the retry ladder can
     /// be driven deterministically.
     async fn spawn(fail_all: bool) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind capture backend");
         let port = listener.local_addr().expect("local addr").port();

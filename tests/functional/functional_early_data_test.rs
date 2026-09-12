@@ -4,6 +4,8 @@
 //! gateway path also needs coverage because H1/H2 requests are rejected before
 //! routing when a replay-unsafe method arrives with `Early-Data: 1`.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 
 use std::sync::{
@@ -73,7 +75,7 @@ struct EarlyDataHarness {
 
 impl EarlyDataHarness {
     async fn new(allowed_methods: Option<&str>) -> Self {
-        let backend_listener = TcpListener::bind("127.0.0.1:0")
+        let backend_listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind backend");
         let backend_port = backend_listener.local_addr().expect("backend addr").port();

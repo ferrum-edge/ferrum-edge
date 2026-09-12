@@ -4,6 +4,8 @@
 //! streaming guard used when the backend response has no `Content-Length`, such
 //! as HTTP/1.1 chunked responses.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{TestGateway, TestGatewayBuilder};
 
 use bytes::Bytes;
@@ -155,7 +157,7 @@ fn response_limit_config(backend_port: u16) -> String {
 }
 
 async fn spawn_chunked_backend() -> (u16, Arc<AtomicUsize>, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind chunked backend");
     let port = listener.local_addr().expect("backend addr").port();

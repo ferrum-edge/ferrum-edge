@@ -1,5 +1,7 @@
 //! Functional coverage for serverless_function terminate mode on native gRPC.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{Http3Client, Http3GrpcStream};
 use crate::scaffolding::harness::GatewayHarness;
@@ -217,7 +219,7 @@ async fn send_h2_grpc(
 
 async fn spawn_counting_grpc_backend() -> (u16, Arc<AtomicUsize>, JoinHandle<()>) {
     let hits = Arc::new(AtomicUsize::new(0));
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let port = listener.local_addr().expect("backend addr").port();
@@ -255,7 +257,7 @@ async fn spawn_counting_grpc_backend() -> (u16, Arc<AtomicUsize>, JoinHandle<()>
 
 async fn spawn_grpc_terminate_function() -> (u16, Arc<AtomicUsize>, JoinHandle<()>) {
     let hits = Arc::new(AtomicUsize::new(0));
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind function");
     let port = listener.local_addr().expect("function addr").port();
@@ -487,8 +489,7 @@ async fn spawn_h3_serverless_gateway(
     let mut last_error = String::new();
     for _ in 0..5 {
         let reservation = reserve_port().await.expect("reserve H3 listener port");
-        let https_port = reservation.port;
-        drop(reservation);
+        let https_port = reservation.drop_and_take_port();
 
         let scratch = tempfile::tempdir().expect("gateway scratch dir");
         let ca = TestCa::new("h3-serverless-gateway").expect("gateway CA");
@@ -552,7 +553,7 @@ async fn spawn_terminate_function(
     response: serde_json::Value,
 ) -> (u16, Arc<AtomicUsize>, JoinHandle<()>) {
     let hits = Arc::new(AtomicUsize::new(0));
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind function");
     let port = listener.local_addr().expect("function addr").port();

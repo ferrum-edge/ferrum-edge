@@ -1,5 +1,7 @@
 //! End-to-end `spec_expose` coverage across HTTP/1.1, HTTP/2, and HTTP/3.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client, Http3Response};
 
@@ -24,7 +26,7 @@ struct StaticServer {
 
 impl StaticServer {
     async fn start(body: &'static str, content_type: &'static str) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind static server");
         let port = listener.local_addr().expect("static server addr").port();
@@ -193,7 +195,7 @@ async fn spawn_spec_gateway(backend_port: u16, spec_origin_port: u16) -> (TestGa
     let mut last_error = String::new();
 
     for _ in 0..MAX_ATTEMPTS {
-        let reservation = match TcpListener::bind("127.0.0.1:0").await {
+        let reservation = match TcpListener::bind_test("127.0.0.1:0").await {
             Ok(listener) => listener,
             Err(error) => {
                 last_error = error.to_string();

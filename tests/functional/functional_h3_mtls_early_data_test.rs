@@ -25,6 +25,8 @@
 //!   cargo build --bin ferrum-edge && \
 //!     cargo test --test functional_tests -- functional_h3_mtls_early_data --ignored --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::clients::Http3Client;
 
@@ -164,10 +166,9 @@ fn start_counting_http_backend_on(
 // ============================================================================
 
 async fn alloc_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("alloc port");
-    let port = listener.local_addr().expect("local addr").port();
-    drop(listener);
-    port
+    crate::scaffolding::ports::unbound_port()
+        .await
+        .expect("lease test port")
 }
 
 /// Start a gateway with fresh ports on each attempt. Port allocation races with
@@ -279,7 +280,7 @@ async fn functional_h3_mtls_early_data_normal_request_is_authenticated() {
     let cert_p = write_pem(&dir, "server.crt", &server.cert_pem);
     let key_p = write_pem(&dir, "server.key", &server.key_pem);
 
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.expect("bind");
     let backend_port = backend_listener.local_addr().expect("backend addr").port();
     let backend_hits = Arc::new(AtomicUsize::new(0));
     let backend = start_counting_http_backend_on(backend_listener, Arc::clone(&backend_hits));
@@ -360,7 +361,7 @@ async fn functional_h3_mtls_early_data_spiffe_identity_sees_the_peer_certificate
     let cert_p = write_pem(&dir, "server.crt", &server.cert_pem);
     let key_p = write_pem(&dir, "server.key", &server.key_pem);
 
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.expect("bind");
     let backend_port = backend_listener.local_addr().expect("backend addr").port();
     let backend_hits = Arc::new(AtomicUsize::new(0));
     let backend = start_counting_http_backend_on(backend_listener, Arc::clone(&backend_hits));
@@ -430,7 +431,7 @@ async fn functional_h3_early_data_without_client_ca_is_unchanged() {
     let cert_p = write_pem(&dir, "server.crt", &server.cert_pem);
     let key_p = write_pem(&dir, "server.key", &server.key_pem);
 
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.expect("bind");
     let backend_port = backend_listener.local_addr().expect("backend addr").port();
     let backend_hits = Arc::new(AtomicUsize::new(0));
     let backend = start_counting_http_backend_on(backend_listener, Arc::clone(&backend_hits));

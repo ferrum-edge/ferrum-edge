@@ -3,6 +3,8 @@
 //! Plugin tests cover `ws_message_size_limiting`; this module exercises the
 //! protocol parser limit wired from `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES`.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{TestGateway, TestGatewayBuilder};
 use crate::scaffolding::clients::{Http3Client, WebSocketOptions};
 
@@ -508,7 +510,7 @@ async fn spawn_recording_close_ws_backend() -> (
     mpsc::UnboundedReceiver<(CloseCode, String)>,
     JoinHandle<()>,
 ) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind recording WebSocket backend");
     let port = listener.local_addr().expect("backend addr").port();
@@ -620,7 +622,7 @@ async fn spawn_counting_ws_backend() -> (
     mpsc::UnboundedReceiver<(CloseCode, String)>,
     JoinHandle<()>,
 ) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind WebSocket backend");
     let port = listener.local_addr().expect("backend addr").port();

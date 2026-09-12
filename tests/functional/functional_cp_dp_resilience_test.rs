@@ -25,6 +25,8 @@
 //!    JSON shape on both a CP admin listener (lists DP nodes) and a DP
 //!    admin listener (reports CP connection state).
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -281,7 +283,7 @@ fn build_dp_admin_state(
 
 /// Bind the admin listener on an OS-assigned port; returns the base URL.
 async fn spawn_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind admin listener");
     let addr = listener.local_addr().expect("admin addr");
@@ -367,7 +369,7 @@ async fn spawn_cp(
         registry.clone(),
     );
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind CP gRPC");
     let addr = listener.local_addr().expect("CP gRPC addr");
@@ -534,7 +536,7 @@ async fn test_multi_cp_failover_connects_to_fallback() {
     // Bogus primary URL (no listener bound) — first connect attempt will fail.
     // We grab an ephemeral port, drop it, so the address is effectively
     // unreachable for the duration of the test.
-    let bogus_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let bogus_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind bogus");
     let bogus_addr = bogus_listener.local_addr().expect("bogus addr");
@@ -647,7 +649,7 @@ async fn test_primary_retry_reconnects_to_primary() {
     // primary. Later we bind a real CP on the same port to simulate recovery.
     // Because the port may be stolen between drop and re-bind, we do the
     // rebind inside a retry loop bounded at a few attempts.
-    let primary_probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let primary_probe = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind primary probe");
     let primary_addr = primary_probe.local_addr().expect("primary addr");
@@ -728,7 +730,7 @@ async fn test_primary_retry_reconnects_to_primary() {
     };
     let mut primary_handle_opt: Option<tokio::task::JoinHandle<()>> = None;
     for attempt in 1..=5 {
-        match tokio::net::TcpListener::bind(primary_addr).await {
+        match tokio::net::TcpListener::bind_test(primary_addr).await {
             Ok(listener) => {
                 let (cp_server, _tx) = CpGrpcServer::with_channel_capacity_and_registry(
                     Arc::new(ArcSwap::new(Arc::new(primary_config.clone()))),

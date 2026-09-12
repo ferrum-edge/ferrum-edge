@@ -9,6 +9,8 @@
 //! buffering plugin, which the gateway STREAMS, is untouched by the same
 //! ceiling and still forwards the identical payload.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{TestGateway, TestGatewayBuilder};
 
 use serde_json::json;
@@ -265,7 +267,7 @@ fn streamed_hits(hits: &RouteHits) -> usize {
 /// answering, so a large upload is not cut off by an early response, and counts
 /// per route so a streamed forward and a buffered forward stay distinguishable.
 async fn spawn_counting_backend() -> (u16, RouteHits, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind counting backend");
     let port = listener.local_addr().expect("local addr").port();

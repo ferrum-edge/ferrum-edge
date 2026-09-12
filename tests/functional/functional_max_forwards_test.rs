@@ -7,6 +7,8 @@
 //! contacted" is an exact count of zero for that path rather than a race
 //! against another case.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client};
 use crate::scaffolding::ports::reserve_port;
@@ -59,7 +61,7 @@ struct RecordingOrigin {
 
 impl RecordingOrigin {
     async fn spawn() -> std::io::Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let listener = TcpListener::bind_test("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let recorder = Arc::clone(&requests);

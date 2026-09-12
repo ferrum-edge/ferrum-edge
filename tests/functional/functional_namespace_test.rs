@@ -33,6 +33,8 @@
 //! All tests are `#[ignore]` — invoke with `cargo test --test functional_tests
 //! -- --ignored namespace`.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{
     DbType, IsolatedSqlDatabase, TestGateway, continue_if_backend_available,
     ensure_shared_sql_containers_resumed, host_port_from_db_url, mysql_test_url, postgres_test_url,
@@ -1020,7 +1022,9 @@ async fn tcp_throttle_cross_process_admission_mongodb() {
 async fn start_ns_echo_backend() -> (u16, tokio::task::JoinHandle<()>) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let port = listener.local_addr().unwrap().port();
     let handle = tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {

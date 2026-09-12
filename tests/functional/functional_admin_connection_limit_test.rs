@@ -184,8 +184,7 @@ async fn functional_admin_connection_cap_plaintext_rejects_over_limit() {
 async fn start_tls_admin_gateway(max_conns: usize) -> (TestGateway, u16) {
     for attempt in 1..=5u32 {
         let https = reserve_port().await.expect("reserve admin https port");
-        let https_port = https.port;
-        drop(https);
+        let https_port = https.drop_and_take_port();
 
         let result = TestGateway::builder()
             .mode_file(ADMIN_CONFIG)

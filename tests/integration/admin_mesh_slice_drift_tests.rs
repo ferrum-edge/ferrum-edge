@@ -1,6 +1,8 @@
 //! Integration coverage for CP `GET /mesh/slice-drift` and
 //! `ReportMeshSliceStatus` (issue #3265).
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -117,7 +119,7 @@ fn cp_admin_state(drift: Arc<MeshSliceDriftRegistry>) -> AdminState {
 async fn start_test_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let listener = TcpListener::bind(addr).await.unwrap();
+    let listener = TcpListener::bind_test(addr).await.unwrap();
     let actual_addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let _ = serve_admin_on_listener(
@@ -161,7 +163,7 @@ async fn start_mesh_cp_with_drift(
         .expected_issuer(DEFAULT_CP_DP_JWT_ISSUER.to_string())
         .build();
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let incoming = TcpListenerStream::new(listener);
     let handle = tokio::spawn(async move {

@@ -6,6 +6,8 @@
 //! exercise verifies the snapshot lands in the AdminState surface, and a
 //! second mock-endpoint test verifies fail-open vs fail-closed semantics.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use arc_swap::ArcSwap;
 use base64::Engine;
 use chrono::Utc;
@@ -133,7 +135,7 @@ async fn start_mock_federation_endpoint(
         &cert_pem, &key_pem,
     )));
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     let endpoint = format!("https://{addr}/.well-known/spiffe");
     let request_count = Arc::new(AtomicUsize::new(0));
@@ -449,7 +451,7 @@ fn build_admin_state(jwt: JwtManager, mesh_runtime_state: Option<MeshRuntimeStat
 async fn start_test_admin(state: AdminState) -> (String, watch::Sender<bool>) {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test(addr).await.unwrap();
     let actual_addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let _ = serve_admin_on_listener(

@@ -22,6 +22,8 @@
 //! * a reconnect re-subscribes with an empty nonce and the last ACCEPTED
 //!   version, never the NACKed one.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -329,7 +331,7 @@ impl StockHarness {
             close_on_nack,
         };
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind scripted ADS listener");
         let addr = listener.local_addr().expect("listener addr");
@@ -1207,7 +1209,7 @@ mod stream_lifecycle {
     /// Boot one scripted endpoint. Returns its handle and its `scheme://host:port`.
     pub(super) async fn serve(behaviour: EndpointBehaviour) -> (LifecycleAds, String) {
         let handle = LifecycleAds::new(behaviour);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind lifecycle ADS listener");
         let addr = listener.local_addr().expect("listener addr");
@@ -1916,7 +1918,7 @@ mod tls_lifecycle {
             poison_written: Arc::new(AtomicBool::new(false)),
         };
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind TLS ADS listener");
         let port = listener.local_addr().expect("listener addr").port();
@@ -3015,7 +3017,7 @@ mod tls_lifecycle {
 
     impl Blackhole {
         async fn start(upstream_port: u16) -> Self {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
                 .await
                 .expect("bind blackhole listener");
             let port = listener.local_addr().expect("blackhole addr").port();

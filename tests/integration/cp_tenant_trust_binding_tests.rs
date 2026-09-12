@@ -15,6 +15,8 @@
 //! hand-minted tokens, so they exercise the wire path rather than the
 //! resolver in isolation.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -373,7 +375,9 @@ async fn start_all_stream_surfaces(
 }
 
 async fn bind_loopback() -> (tokio::net::TcpListener, SocketAddr) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     (listener, addr)
 }

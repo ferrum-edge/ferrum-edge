@@ -22,6 +22,8 @@
 //!   cargo build --bin ferrum-edge && \
 //!   cargo test --test functional_tests -- --ignored functional_tls_lifecycle --nocapture
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateRevocationListParams, IsCa, Issuer, KeyPair,
     KeyUsagePurpose, RevocationReason, RevokedCertParams, SerialNumber,
@@ -158,10 +160,11 @@ fn gw_bin() -> &'static str {
     }
 }
 
-/// Allocate an ephemeral port by binding to port 0 and returning the assigned port.
+/// Lease a gateway port until the test process exits.
 async fn alloc_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    l.local_addr().unwrap().port()
+    crate::scaffolding::ports::unbound_port()
+        .await
+        .expect("lease test port")
 }
 
 /// Wait for the gateway admin HTTP health endpoint. Returns `true` if healthy
@@ -600,7 +603,7 @@ async fn test_crl_revoked_backend_cert_rejected() {
     let cfg_path = td.path().join("cfg.yaml");
 
     // Start HTTPS backend
-    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let be_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let bp = be_listener.local_addr().unwrap().port();
     let echo = start_https_echo_on(be_listener, &backend.cert_pem, &backend.key_pem).await;
 
@@ -701,7 +704,7 @@ async fn test_crl_unrelated_issuer_allows_request() {
     let crl_path = write_file(&td, "unrelated.crl", &crl_pem);
     let cfg_path = td.path().join("cfg.yaml");
 
-    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let be_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let bp = be_listener.local_addr().unwrap().port();
     let echo = start_https_echo_on(be_listener, &backend.cert_pem, &backend.key_pem).await;
 
@@ -1302,7 +1305,7 @@ impl TrustRetirementFixture {
         let mut backends = Vec::new();
         let mut proxies = String::new();
 
-        let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let be_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let backend_port = be_listener.local_addr().unwrap().port();
         backends.push(start_plain_echo_on(be_listener));
         proxies.push_str(&format!(
@@ -1316,7 +1319,7 @@ impl TrustRetirementFixture {
         ));
 
         if surfaces.websocket {
-            let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let ws_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
             let ws_port = ws_listener.local_addr().unwrap().port();
             backends.push(start_ws_echo_on(ws_listener));
             // WebSocket is a runtime flavor, not a backend scheme: an ordinary
@@ -1333,7 +1336,7 @@ impl TrustRetirementFixture {
         }
 
         if surfaces.tcp_tls {
-            let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let tcp_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
             let tcp_port = tcp_listener.local_addr().unwrap().port();
             backends.push(start_tcp_echo_on(tcp_listener));
             let listen_port = ports.stream_tcp;
@@ -1636,7 +1639,7 @@ fn start_tcp_echo_on(listener: TcpListener) -> tokio::task::JoinHandle<()> {
 /// Minimal UDP echo backend for the frontend DTLS relay. Binds first and
 /// reports its own port so there is no reserve-then-rebind race.
 async fn start_udp_echo() -> (u16, tokio::task::JoinHandle<()>) {
-    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+    let socket = tokio::net::UdpSocket::bind_test("127.0.0.1:0")
         .await
         .expect("bind udp echo backend");
     let port = socket.local_addr().expect("udp echo addr").port();
@@ -1987,7 +1990,7 @@ impl TrustRetirementFixture {
 
     /// A DTLS client presenting this fixture's client certificate.
     async fn connect_dtls(&self) -> Result<ferrum_edge::dtls::DtlsConnection, anyhow::Error> {
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let socket = tokio::net::UdpSocket::bind_test("127.0.0.1:0").await?;
         socket
             .connect(format!("127.0.0.1:{}", self.ports.stream_udp))
             .await?;

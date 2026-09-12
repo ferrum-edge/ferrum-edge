@@ -6,6 +6,8 @@
 //! Marked with `#[ignore]` — run with:
 //!   cargo test --test functional_tests -- --ignored functional_cli
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -37,10 +39,9 @@ fn binary_abs_path() -> std::path::PathBuf {
 }
 
 async fn ephemeral_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
+    crate::scaffolding::ports::unbound_port()
+        .await
+        .expect("lease test port")
 }
 
 /// Wait until `child` owns `admin_port`. Unauthenticated `/health` and
@@ -672,7 +673,7 @@ async fn functional_cli_file_admission_validate_and_run_agree() {
                     .mode_file(serde_json::to_string(&config).unwrap())
                     .reserve_listener_port(port)
                     .env("FERRUM_POOL_WARMUP_ENABLED", "false");
-                drop(reservation);
+                reservation.drop_and_take_port();
                 match builder.spawn_classified().await {
                     Ok(mut gateway) => {
                         gateway.shutdown();
@@ -1872,8 +1873,8 @@ async fn functional_cli_run_starts_and_stops() {
             "--mode",
             "file",
         ])
-        .env("FERRUM_PROXY_HTTP_PORT", "18990")
-        .env("FERRUM_ADMIN_HTTP_PORT", "18991")
+        .env("FERRUM_PROXY_HTTP_PORT", ephemeral_port().await.to_string())
+        .env("FERRUM_ADMIN_HTTP_PORT", ephemeral_port().await.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1946,8 +1947,8 @@ async fn functional_cli_run_with_verbose() {
             "file",
             "-v",
         ])
-        .env("FERRUM_PROXY_HTTP_PORT", "18992")
-        .env("FERRUM_ADMIN_HTTP_PORT", "18993")
+        .env("FERRUM_PROXY_HTTP_PORT", ephemeral_port().await.to_string())
+        .env("FERRUM_ADMIN_HTTP_PORT", ephemeral_port().await.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1999,8 +2000,8 @@ async fn functional_cli_reload_sends_sighup() {
             "--mode",
             "file",
         ])
-        .env("FERRUM_PROXY_HTTP_PORT", "18994")
-        .env("FERRUM_ADMIN_HTTP_PORT", "18995")
+        .env("FERRUM_PROXY_HTTP_PORT", ephemeral_port().await.to_string())
+        .env("FERRUM_ADMIN_HTTP_PORT", ephemeral_port().await.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -2290,7 +2291,7 @@ async fn functional_cli_spec_flag_infers_file_mode() {
         let proxy_port = ephemeral_port().await;
         let admin_port = ephemeral_port().await;
 
-        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let echo_port = echo_listener.local_addr().unwrap().port();
         let echo_server = tokio::spawn(async move {
             loop {
@@ -2398,7 +2399,7 @@ async fn functional_cli_precedence_flag_beats_env_var() {
         let proxy_port = ephemeral_port().await;
         let admin_port = ephemeral_port().await;
 
-        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
         let echo_port = echo_listener.local_addr().unwrap().port();
         let echo_server = tokio::spawn(async move {
             loop {
@@ -2511,11 +2512,11 @@ async fn functional_cli_precedence_env_beats_conf_file() {
         // Hold decoy port listeners so that (a) no other CI process can
         // grab them (eliminating false-positive port collisions) and
         // (b) the gateway would fatal-fail if it tried to bind them.
-        let conf_proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let conf_proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind decoy proxy");
         let conf_proxy_port = conf_proxy_listener.local_addr().unwrap().port();
-        let conf_admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let conf_admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind decoy admin");
         let conf_admin_port = conf_admin_listener.local_addr().unwrap().port();
@@ -3315,7 +3316,7 @@ async fn functional_cli_validate_injector_loads_tls_without_binding() {
         .unwrap();
     std::fs::write(&key_path, key.serialize_pem()).unwrap();
     // An already-bound port proves validation does not start the webhook.
-    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let occupied = std::net::TcpListener::bind_test("127.0.0.1:0").unwrap();
     let listen_addr = occupied.local_addr().unwrap().to_string();
     for (material, valid) in [
         (None, false),
@@ -3481,7 +3482,9 @@ async fn start_gateway_with_one_pool_shard(
             "dp" => builder.mode_dp(vec![format!("http://{}", cp_address.unwrap())]),
             _ => panic!("unsupported fixture mode {mode}"),
         };
-        drop(reservation);
+        if let Some(reservation) = reservation {
+            reservation.drop_and_take_port();
+        }
         match builder.spawn_classified().await {
             Ok(gateway) => return (gateway, address),
             Err(error) if error.is_retryable_port_race(attempt, attempts) => {}
@@ -3734,7 +3737,7 @@ async fn reserve_cli_probe_listener(host: &str) -> (u16, TcpListener) {
         }
         // Keep the IPv4 reservation until the fixture owns the other address.
         // Retry a competing bind with a new reservation, never the same port.
-        match TcpListener::bind((host, port)).await {
+        match TcpListener::bind_test((host, port)).await {
             Ok(listener) => return (port, listener),
             Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
             Err(error) => panic!("bind health fixture: {error}"),

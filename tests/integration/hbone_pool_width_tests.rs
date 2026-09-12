@@ -9,6 +9,8 @@
 //! connection, and check that the pool spreads by measured load, widens on
 //! stream-cap saturation and on pressure, and never past its configured bound.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use chrono::Utc;
@@ -174,7 +176,9 @@ struct Peer {
 
 impl Peer {
     async fn start(server_slot: SharedSvidBundle, max_concurrent_streams: u32) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind peer");
+        let listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind peer");
         let port = listener.local_addr().expect("peer addr").port();
         let accepted = Arc::new(AtomicUsize::new(0));
         let per_connection_active: Arc<Mutex<Vec<Arc<AtomicUsize>>>> =

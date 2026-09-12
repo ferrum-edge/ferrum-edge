@@ -1,3 +1,5 @@
+use crate::scaffolding::port_registry::TestSocket;
+
 use bytes::Bytes;
 use chrono::Utc;
 use hyper::{Method, Request, StatusCode};
@@ -345,7 +347,7 @@ async fn start_gateway_mtls(
     state: ProxyState,
     server_config: Arc<rustls::ServerConfig>,
 ) -> (std::net::SocketAddr, watch::Sender<bool>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind gateway");
     let addr = listener.local_addr().expect("gateway local addr");
@@ -390,7 +392,7 @@ async fn connect_hbone_h2_mtls(
 }
 
 async fn start_gateway(state: ProxyState) -> (std::net::SocketAddr, watch::Sender<bool>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind gateway");
     let addr = listener.local_addr().expect("gateway local addr");
@@ -403,7 +405,7 @@ async fn start_gateway(state: ProxyState) -> (std::net::SocketAddr, watch::Sende
 }
 
 async fn start_echo_backend() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind echo backend");
     let addr = listener.local_addr().expect("echo backend local addr");
@@ -423,7 +425,7 @@ async fn start_echo_backend() -> (std::net::SocketAddr, tokio::task::JoinHandle<
 }
 
 async fn start_idle_backend() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind idle backend");
     let addr = listener.local_addr().expect("idle backend local addr");
@@ -447,7 +449,7 @@ async fn start_quiet_backend() -> (
     tokio::task::JoinHandle<()>,
     tokio::sync::oneshot::Sender<()>,
 ) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind quiet backend");
     let addr = listener.local_addr().expect("quiet backend local addr");
@@ -894,7 +896,7 @@ async fn start_egress_udp_gateway(
     state: ProxyState,
     server_config: Arc<rustls::ServerConfig>,
 ) -> (std::net::SocketAddr, watch::Sender<bool>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind gateway");
     let addr = listener.local_addr().expect("gateway local addr");
@@ -916,7 +918,7 @@ async fn start_egress_udp_gateway(
 /// A stand-in "external" UDP service: echoes `pong:<payload>` back to whoever
 /// sent the datagram.
 async fn start_external_udp_echo() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+    let socket = tokio::net::UdpSocket::bind_test("127.0.0.1:0")
         .await
         .expect("bind external udp echo");
     let addr = socket.local_addr().expect("external udp echo addr");
@@ -1106,7 +1108,7 @@ async fn egress_udp_admitted_destination_still_requires_authenticated_peer() {
         external_addr.port(),
         external_addr.port(),
     ));
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind gateway");
     let gateway_addr = listener.local_addr().expect("gateway local addr");
@@ -4028,7 +4030,7 @@ async fn probe_udp_egress_local_ip(dest: SocketAddr) -> Result<IpAddr, String> {
     } else {
         SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
     };
-    let socket = tokio::net::UdpSocket::bind(bind)
+    let socket = tokio::net::UdpSocket::bind_test(bind)
         .await
         .map_err(|e| format!("probe bind {bind}: {e}"))?;
     socket
@@ -4066,7 +4068,7 @@ async fn discover_bindable_non_loopback_local_ip() -> IpAddr {
                     ));
                     continue;
                 }
-                match TcpListener::bind(SocketAddr::new(ip, 0)).await {
+                match TcpListener::bind_test(SocketAddr::new(ip, 0)).await {
                     Ok(listener) => {
                         drop(listener);
                         return ip;
@@ -4386,7 +4388,7 @@ async fn start_counting_tcp_backend(
     mpsc::UnboundedReceiver<()>,
     tokio::task::JoinHandle<()>,
 ) {
-    let listener = TcpListener::bind(SocketAddr::new(ip, 0))
+    let listener = TcpListener::bind_test(SocketAddr::new(ip, 0))
         .await
         .unwrap_or_else(|e| panic!("bind post-plugin TCP backend on {ip}: {e}"));
     let addr = listener.local_addr().expect("post-plugin TCP backend addr");
@@ -4418,7 +4420,7 @@ async fn start_counting_udp_backend(
     mpsc::UnboundedReceiver<()>,
     tokio::task::JoinHandle<()>,
 ) {
-    let socket = tokio::net::UdpSocket::bind(SocketAddr::new(ip, 0))
+    let socket = tokio::net::UdpSocket::bind_test(SocketAddr::new(ip, 0))
         .await
         .unwrap_or_else(|e| panic!("bind post-plugin UDP backend on {ip}: {e}"));
     let addr = socket.local_addr().expect("post-plugin UDP backend addr");

@@ -12,6 +12,8 @@
 //! 3. Existing in-flight TLS sessions are NOT torn down by a swap (rustls
 //!    consults the `ServerConfig` only during the handshake).
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -807,7 +809,7 @@ async fn start_admin_https_listener(
         let reservation = reserve_port().await.expect("reserve admin port");
         let port = reservation.drop_and_take_port();
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-        let listener = match tokio::net::TcpListener::bind(addr).await {
+        let listener = match tokio::net::TcpListener::bind_test(addr).await {
             Ok(listener) => listener,
             Err(error) => {
                 errors.push(format!("attempt {attempt}: bind failed: {error}"));

@@ -5,6 +5,8 @@
 //! (issue #4152) from peers that never leave the H1-vs-H2 version sniff or an
 //! HTTP/2 SETTINGS exchange. Setting it to `0` intentionally disables the guard.
 
+use crate::scaffolding::port_registry::TestSocket;
+
 use crate::common::{TestGateway, TestGatewayBuilder};
 
 use std::sync::{
@@ -199,7 +201,7 @@ async fn send_slow_header_request(
 }
 
 async fn spawn_header_backend() -> (u16, Arc<AtomicUsize>, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind header backend");
     let port = listener.local_addr().expect("backend addr").port();
