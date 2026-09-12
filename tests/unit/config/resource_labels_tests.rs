@@ -45,7 +45,10 @@ fn provisioner_header_is_bounded_trimmed_and_rejects_non_text_values() {
         provisioner(&headers)
     };
     assert_eq!(provisioner(&hyper::HeaderMap::new()).unwrap(), None);
-    assert_eq!(header(b"  ferrum-nexus  ").unwrap().as_deref(), Some("ferrum-nexus"));
+    assert_eq!(
+        header(b"  ferrum-nexus  ").unwrap().as_deref(),
+        Some("ferrum-nexus")
+    );
     assert!(header(b"").is_err());
     assert!(header(b"   ").is_err());
     assert!(header(b"ferrum\tnexus").is_err());
