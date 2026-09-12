@@ -9396,12 +9396,12 @@ components:
           description: |
             Optional list of allowed WebSocket Origin values (e.g., ["https://example.com"]).
             When non-empty, WebSocket upgrade requests must include an Origin header matching
-            one of these values (case-insensitive comparison). Empty array (default) allows
-            all origins. Entries are literal origins of the form `scheme://host[:port]`;
-            `*` is not a wildcard and is rejected at Admin API create/update (POST/PUT/PATCH
-            proxies, batch, restore) and `ferrum-edge validate`. Existing file/database/CP
-            rows containing `*` still load, with a warning naming the proxy. Protects against
-            Cross-Site WebSocket Hijacking (CSWSH).
+            one of these values (case-insensitive comparison).
+            Empty array (default) allows all origins. Entries are literal origins of the
+            form `scheme://host[:port]`; `*` is not a wildcard and is rejected at Admin API
+            create/update (POST/PUT/PATCH proxies, batch, restore) and `ferrum-edge validate`.
+            Existing file/database/CP rows containing `*` still load, with a warning naming
+            the proxy. Protects against Cross-Site WebSocket Hijacking (CSWSH).
 
             Independent of the `cors` plugin, which does not run on WebSocket upgrades.
             Operators with a strict CORS allowlist on the same proxy should mirror those
