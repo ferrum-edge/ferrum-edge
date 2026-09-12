@@ -99,17 +99,17 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   still compared byte for byte, and the wiring cannot be removed once adopted. A
   committed `.cargo/config[.toml]` below the repository root is rejected
   outright.
-- The `fuzz-smoke` job carries TWO admitted generations, now for issue #4442
+- The `fuzz-smoke` job carries TWO admitted generations
   (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first): `CI_FUZZ_SMOKE_RETIRED_JOB`
-  is #4238's shape — the deterministic property smoke as the required
-  `pull_request`/`merge_group` gate, the six-target libFuzzer budget on push to
-  `main` / `workflow_dispatch` only, and `./.github/actions/setup-sccache` plus
-  a `main`-push-only `save-if` cache (`pull_request`, fork, `merge_group`, and
-  `workflow_dispatch` restore but never publish a `fuzz-smoke` cache);
-  `CI_FUZZ_SMOKE_JOB` adds a seventh bounded invocation for
-  `datagram_client_address` at `-max_len=65536`, that target's documented 64 KiB
-  budget, so one hostile-UDP parser's length boundaries are reachable in BOTH
-  required lanes rather than only the scheduled one. The
+  is #4442's shape (the seven-target bounded budget, always scheduled in full
+  mode, sccache store persisted in the lane); `CI_FUZZ_SMOKE_JOB` is the
+  PR-gated shape from the CI plan rework — identical except that the job
+  `if:` also requires the planner's `run_fuzz_smoke` gate (the fuzz crate, its
+  `fuzz_support` parsers, `Cargo.*`, `vendor/`, or `ci.yml` changed; every
+  push to `main` still runs it) and the lane no longer persists the sccache
+  store. The `test` aggregate wiring
+  (`CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS`) anchors on the `require_planned_gate`
+  Lint line and inserts the `require_planned_gate "Fuzz Smoke"` line. The
   transition is exact on both ends and
   one-way — withholding is symmetric, so `admitted_fuzz_smoke_removal_errors` is
   what refuses a revert. `CI_FUZZ_SMOKE_BOUNDED_BUDGET` must appear exactly once

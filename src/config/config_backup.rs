@@ -19,14 +19,21 @@
 //!
 //! Before serving, the loader applies the same rejecting runtime validation
 //! contract as database full loads (`collect_rejecting_runtime_config_errors`).
+//! It also applies database consumer quarantine after namespace projection and
+//! enforces the canonical credential and resource uniqueness contracts that a
+//! file cannot inherit from database constraints.
 //! Warning-only / node-local checks (certificate paths, optional plugin file
 //! dependencies such as MaxMind `.mmdb`) stay out of this path: they are not
 //! runtime-fatal for DB-mode snapshots and must not block backup bootstrap.
 
 use crate::config::config_migration::ConfigMigrator;
 use crate::config::namespace_filter::{NamespaceRetention, retain_namespace};
+use crate::config::stable_file::{
+    MAX_GATEWAY_CONFIG_FILE_BYTES, StableFileError, StableFileReadOptions, read_stable_file,
+};
 use crate::config::types::{CURRENT_CONFIG_VERSION, GatewayConfig};
 use crate::config::validation_pipeline::collect_rejecting_runtime_config_errors;
+use std::path::Path;
 use tracing::{error, info, warn};
 
 /// Attempt to load a GatewayConfig from an externally provided backup JSON file.
@@ -61,12 +68,15 @@ pub fn load_config_backup(
         );
     }
 
-    // Read once and classify the result directly. `Path::exists()` both creates
-    // a check/use race and returns false for some metadata errors, which would
-    // incorrectly collapse an inaccessible configured backup to `Ok(None)`.
-    let content = match std::fs::read_to_string(path) {
+    // Use the same bounded, regular-file, stable-read contract as file mode.
+    // A half-written file must not seed a partial generation, and an invalid
+    // backup must not wedge the eager check on an otherwise healthy startup.
+    let content = match read_stable_file(
+        Path::new(path),
+        StableFileReadOptions::new(MAX_GATEWAY_CONFIG_FILE_BYTES, "config backup"),
+    ) {
         Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Err(StableFileError::NotFound) => {
             warn!("No config backup file found at {}", path);
             return Ok(None);
         }
@@ -79,6 +89,24 @@ pub fn load_config_backup(
 
     let mut value: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| anyhow::anyhow!("Failed to parse config backup at {path}: {e}"))?;
+
+    // GET /backup wraps the runtime resources in administrative metadata.
+    // Remove only its known envelope fields: unknown runtime fields must still
+    // fail GatewayConfig's deny_unknown_fields admission. In particular, an
+    // export is never an authority for gateway trust, and API specs are not
+    // runtime configuration. Do not deserialize or apply either section here.
+    if let Some(object) = value.as_object_mut() {
+        for field in [
+            "ferrum_version",
+            "exported_at",
+            "source",
+            "counts",
+            "gateway_trust_bundles",
+            "api_specs",
+        ] {
+            object.remove(field);
+        }
+    }
 
     normalize_backup_version_field(&mut value)?;
     ConfigMigrator::migrate_in_memory(&mut value)
@@ -112,10 +140,62 @@ pub fn load_config_backup(
     // and the SQL unique indexes do, so running them over a multi-namespace file
     // would reject a candidate that is valid for the namespace being served.
     // Duplicates within the active namespace are untouched by the filter and
-    // still reject.
-    let (config, filter_summary) = retain_namespace(config, namespace, NamespaceRetention::SERVING);
+    // remain subject to the admission checks below.
+    let (mut config, filter_summary) =
+        retain_namespace(config, namespace, NamespaceRetention::SERVING);
 
-    let validation_errors = collect_rejecting_runtime_config_errors(&config);
+    // A file has no database primary keys. Reject duplicate resource IDs
+    // before quarantine can hide two different records for the same ID.
+    if let Err(errors) = config.validate_unique_resource_ids() {
+        anyhow::bail!(
+            "Config backup at {path} failed runtime validation ({} duplicate resource ID(s))",
+            errors.len()
+        );
+    }
+
+    // Match SQL/Mongo full-load ordering and admission, after tenant projection.
+    // Never let export ordering decide which identity survives a reload.
+    config.consumers.sort_by(|a, b| a.id.cmp(&b.id));
+    let quarantined = config.quarantine_colliding_consumer_identities();
+    if !quarantined.is_empty() {
+        warn!(
+            "Config backup quarantined {} consumer(s) with conflicting identities; repair the backup source",
+            quarantined.len()
+        );
+    }
+    let quarantined = config.quarantine_invalid_hmac_credentials();
+    if !quarantined.is_empty() {
+        warn!(
+            "Config backup quarantined {} invalid hmac_auth credential(s); repair the backup source",
+            quarantined.len()
+        );
+    }
+
+    // Backup credentials use the canonical Consumer wire format. Do not
+    // canonicalize malformed input or log validator messages that may contain
+    // credential metadata. These checks require no node-local TLS files.
+    for consumer in &config.consumers {
+        if let Err(errors) = consumer.validate_fields() {
+            anyhow::bail!(
+                "Config backup at {path} failed consumer validation ({} error(s)); repair the consumer fields or credentials",
+                errors.len()
+            );
+        }
+    }
+    if let Err(errors) = config.validate_unique_consumer_credentials() {
+        anyhow::bail!(
+            "Config backup at {path} failed consumer validation ({} duplicate credential(s))",
+            errors.len()
+        );
+    }
+
+    let mut validation_errors = collect_rejecting_runtime_config_errors(&config);
+    if let Err(errors) = config.validate_unique_proxy_names() {
+        validation_errors.extend(errors);
+    }
+    if let Err(errors) = config.validate_unique_upstream_names() {
+        validation_errors.extend(errors);
+    }
     if !validation_errors.is_empty() {
         for message in &validation_errors {
             error!("Config backup rejected — {}", message);

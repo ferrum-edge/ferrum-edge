@@ -1,0 +1,64 @@
+{
+  "source": "https://api.github.com/repos/ferrum-edge/ferrum-edge/actions/caches?per_page=100",
+  "observed_utc_window": "2026-09-08T00:41:00Z..2026-09-08T00:43:00Z",
+  "total_count": 7,
+  "total_size_in_bytes": 5785469165,
+  "actions_caches": [
+    {
+      "id": 7409369539,
+      "ref": "refs/heads/main",
+      "key": "ferrum-k8s-tools-v1-Linux-X64-kind-v0.27.0-a6875aaea358acf0ac07786b1a6755d08fd640f4c79b7a2e46681cc13f49a04b-kubectl-v1.32.3-ab209d0c5134b61486a0486585604a616a5bb2fc07df46d304b3c95817b2d79f-helm-v3.17.3-ee88b3c851ae6466a3de507f7be73fe94d54cbf2987cbaa3d1a3832ea331f2cd-ik-true-ic-true-ih-true",
+      "size_in_bytes": 36938833,
+      "created_at": "2026-09-07T09:32:59.913704000Z",
+      "last_accessed_at": "2026-09-08T00:41:48.744015000Z"
+    },
+    {
+      "id": 7410260875,
+      "ref": "refs/heads/main",
+      "key": "v0-rust-ci-fips-contract-a8915d0b1e97b52240fbef9a6f812eb41e51595a413b1b9812dcd9b81e9128d2-Linux-x64-09839406-ae313cd2",
+      "size_in_bytes": 926258182,
+      "created_at": "2026-09-07T09:58:17.125760000Z",
+      "last_accessed_at": "2026-09-08T00:41:32.393498000Z"
+    },
+    {
+      "id": 7411848327,
+      "ref": "refs/heads/main",
+      "key": "v0-rust-ci-debug-Linux-x64-364cb90d-ae313cd2",
+      "size_in_bytes": 883476251,
+      "created_at": "2026-09-07T10:44:31.268280000Z",
+      "last_accessed_at": "2026-09-08T00:35:45.507914000Z"
+    },
+    {
+      "id": 7411340788,
+      "ref": "refs/heads/main",
+      "key": "v0-rust-ci-lint-Linux-x64-08f74bf7-ae313cd2",
+      "size_in_bytes": 542721628,
+      "created_at": "2026-09-07T10:29:17.116295000Z",
+      "last_accessed_at": "2026-09-08T00:35:38.151735000Z"
+    },
+    {
+      "id": 7418593947,
+      "ref": "refs/heads/main",
+      "key": "v0-rust-ci-ebpf-programs-Linux-x64-d1838ec3-d8b84b31",
+      "size_in_bytes": 19780291,
+      "created_at": "2026-09-07T13:53:23.793224000Z",
+      "last_accessed_at": "2026-09-08T00:33:39.819755000Z"
+    },
+    {
+      "id": 7412846220,
+      "ref": "refs/heads/main",
+      "key": "v0-rust-fuzz-smoke-Linux-x64-cf8601f0-5e0ec017",
+      "size_in_bytes": 2475701225,
+      "created_at": "2026-09-07T11:14:42.805404000Z",
+      "last_accessed_at": "2026-09-08T00:33:22.051669000Z"
+    },
+    {
+      "id": 7428219550,
+      "ref": "refs/heads/main",
+      "key": "v0-rust-ci-coverage-Linux-x64-88b30fa5-ae313cd2",
+      "size_in_bytes": 900592755,
+      "created_at": "2026-09-07T19:09:15.477135000Z",
+      "last_accessed_at": "2026-09-08T00:33:12.622055000Z"
+    }
+  ]
+}

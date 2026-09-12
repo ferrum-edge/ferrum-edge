@@ -1386,3 +1386,101 @@ fn k8s_pod_discovery_rejects_noncanonical_downward_api_field_path() {
         "noncanonical field_path/spec.node_name must not resolve trusted NodeWaypoint identity"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selectorless_numeric_and_named_targets_reach_the_endpoint_slice_backend() {
+    use crate::scaffolding::backends::{HttpStep, RequestMatcher, ScriptedHttp1Backend};
+    use crate::scaffolding::harness::GatewayHarness;
+    use crate::scaffolding::ports::{reserve_port, reserve_refused_tcp_port};
+    use std::time::Duration;
+
+    let reservation = reserve_port().await.expect("reserve backend");
+    let backend_port = reservation.port;
+    // Hold the defaulted Service port closed throughout the test. A gateway
+    // using the old numeric-target shortcut cannot accidentally reach a peer.
+    let service_port = reserve_refused_tcp_port().expect("reserve Service port");
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
+            "GET",
+            "/slice-port",
+        )))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: "4".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(b"pong".to_vec()))
+        .step(HttpStep::RespondBodyEnd)
+        .spawn()
+        .expect("spawn endpoint backend");
+    for (case_index, target_port) in [json!(service_port.port), json!("container-http")]
+        .into_iter()
+        .enumerate()
+    {
+        let service = object(
+            "Service",
+            "default",
+            "manual",
+            json!({
+                "clusterIP": "10.96.0.10",
+                "ports": [{"name": "http", "port": service_port.port, "targetPort": target_port}]
+            }),
+        );
+        let mut slice = object(
+            "EndpointSlice",
+            "default",
+            "manual-ip4",
+            json!({
+                "addressType": "IPv4", "ports": [{"name": "http", "port": backend_port}],
+                "endpoints": [{"addresses": ["127.0.0.1"], "conditions": {"ready": true}}]
+            }),
+        );
+        slice
+            .metadata
+            .labels
+            .insert("kubernetes.io/service-name".into(), "manual".into());
+        let mut route = object(
+            "HTTPRoute",
+            "default",
+            "manual",
+            json!({
+                "rules": [{"matches": [{"path": {"type": "Exact", "value": "/slice-port"}}],
+                    "backendRefs": [{"name": "manual", "port": service_port.port}]}]
+            }),
+        );
+        route.api_version = "gateway.networking.k8s.io/v1".into();
+        let mut translated =
+            translate_k8s_objects(&[service, slice, route], options_for_namespace("default"))
+                .expect("translate manual endpoint route");
+        assert_eq!(translated.config.proxies.len(), 1);
+        assert_eq!(translated.config.proxies[0].backend_host, "127.0.0.1");
+        assert_eq!(translated.config.proxies[0].backend_port, backend_port);
+        translated.config.proxies[0].listen_port = None;
+        translated.config.version = ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string();
+        let yaml = serde_yaml::to_string(&translated.config).expect("serialize translated config");
+        let gateway = GatewayHarness::builder()
+            .mode_in_process()
+            .file_config(yaml)
+            .env("FERRUM_NAMESPACE", "default")
+            .pool_warmup_enabled(false)
+            .spawn()
+            .await
+            .expect("start translated gateway");
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("client")
+            .get(gateway.proxy_url("/slice-port"))
+            .send()
+            .await
+            .expect("translated route response");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "pong");
+        backend.assert_no_matcher_mismatches().await;
+        assert_eq!(backend.received_requests().await.len(), case_index + 1);
+    }
+}

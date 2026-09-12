@@ -1609,12 +1609,27 @@ impl MeshAuthz {
         config: &Value,
         http_client: Option<PluginHttpClient>,
     ) -> Result<Self, String> {
-        // Unknown root keys fail closed. A non-object config keeps its existing
-        // behavior (every `config.get` below yields `None`, producing a
-        // default, policy-free instance) — closing that shape is a separate
-        // change, not an admission fix.
-        if let Some(object) = config.as_object() {
-            reject_unknown_keys(object, "config", MESH_AUTHZ_CONFIG_KEYS, "mesh_authz: ")?;
+        // Unknown root keys fail closed, and so does a malformed root shape.
+        // `null` is the ONE non-object root that survives: `PluginConfig.config`
+        // is `#[serde(default)]`, so an omitted `config:` block deserializes to
+        // `Value::Null` for every plugin, and that means "no configuration
+        // supplied", not "a policy document that failed to parse". A scalar or
+        // array root, by contrast, IS a document the operator meant as policy
+        // config; letting every `config.get` below miss would build a
+        // zero-policy instance where `saw_allow` never becomes true, the
+        // implicit-deny floor never engages, and every request is ALLOWED.
+        match config {
+            Value::Object(object) => {
+                reject_unknown_keys(object, "config", MESH_AUTHZ_CONFIG_KEYS, "mesh_authz: ")?;
+            }
+            Value::Null => {}
+            _ => {
+                return Err(
+                    "mesh_authz: config must be a JSON object; a scalar or array root would \
+                     silently build a policy-free instance that allows every request"
+                        .to_string(),
+                );
+            }
         }
 
         // Whether the policies arrived via a `mesh_slice` (the slice-apply path
@@ -1682,14 +1697,8 @@ impl MeshAuthz {
         validate_policy_ip_inputs(&slice.mesh_policies)?;
         validate_waypoint_target_ref_evidence(&slice)?;
 
-        let per_pod_policy_scoping = config
-            .get("per_pod_policy_scoping")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let ambient_udp_source_scoping = config
-            .get("ambient_udp_source_scoping")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let per_pod_policy_scoping = parse_scoping_flag(config, "per_pod_policy_scoping")?;
+        let ambient_udp_source_scoping = parse_scoping_flag(config, "ambient_udp_source_scoping")?;
         let mut relay_policy_superset = if ambient_udp_source_scoping {
             slice.mesh_policies.clone()
         } else {
@@ -3902,6 +3911,23 @@ fn validate_policy_ip_inputs(policies: &[MeshPolicy]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Parse one of the root topology-scoping booleans, refusing a wrong-typed
+/// value instead of silently reading it as `false`.
+///
+/// `and_then(Value::as_bool).unwrap_or(false)` read `per_pod_policy_scoping:
+/// "true"` as FALSE, which re-enables the construction-time scope filter on a
+/// node-waypoint listener that serves many pods — the whole policy set is then
+/// filtered against ONE workload identity and the per-request pod-scoped
+/// evaluation never runs. Absent and explicit `null` both mean "not supplied",
+/// matching how `trust_domain_aliases` / `trusted_hbone_assertors` treat null.
+fn parse_scoping_flag(config: &Value, key: &str) -> Result<bool, String> {
+    match config.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(format!("mesh_authz: {key} must be a boolean")),
+    }
 }
 
 pub(crate) fn parse_trust_domain_aliases(config: &Value) -> Result<Vec<TrustDomain>, String> {

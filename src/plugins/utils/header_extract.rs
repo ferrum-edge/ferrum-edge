@@ -1,8 +1,9 @@
 //! Header lookup helpers for auth plugins reading credentials from request headers.
 //!
-//! `RequestContext::materialize_headers()` uses `HeaderValue::to_str()`, which
-//! rejects bytes outside visible ASCII. Auth plugins must not treat a present
-//! but non-materialized field line as absent.
+//! `RequestContext::materialize_headers()` decodes field values as UTF-8, so
+//! the folded map cannot answer a visible-ASCII question and omits values that
+//! are not valid UTF-8 at all. Auth plugins must not treat a present but
+//! non-materialized (or non-conforming) field line as absent.
 //!
 //! Two decode policies exist. Do not mix them up:
 //!
@@ -29,7 +30,8 @@ pub(crate) enum ConfiguredHeaderLookup<'a> {
     /// Borrowed for the common single-field-line case; repeated field lines
     /// allocate only when they actually need folding.
     Value(Cow<'a, str>),
-    /// Raw field line(s) exist but cannot be represented as one visible-ASCII value.
+    /// Raw field line(s) exist but cannot be represented as one visible-ASCII
+    /// value. The field is PRESENT and malformed for this grammar — never absent.
     PresentNonMaterialized,
 }
 
@@ -55,10 +57,13 @@ enum DecodedHeader<'a> {
 
 /// Look up a configured header as visible ASCII + HTAB.
 ///
-/// This matches `HeaderValue::to_str()` / `materialize_headers()`. RFC-bound
-/// auth plugins (`basic_auth`, `hmac_auth`, `jwt_auth`, `ldap_auth`, plus
-/// JWKS/OAuth2 bearer extraction) must use this entry point. For operator-
-/// chosen UTF-8 API keys, use [`lookup_configured_header_utf8`] instead.
+/// This matches `HeaderValue::to_str()`, which is STRICTER than
+/// `materialize_headers()` (UTF-8). RFC-bound auth plugins (`basic_auth`,
+/// `hmac_auth`, `jwt_auth`, `ldap_auth`, plus JWKS/OAuth2 bearer extraction)
+/// must use this entry point, and must read the retained raw map rather than
+/// the folded one so an obs-text field line is reported as malformed instead of
+/// being parsed. For operator-chosen UTF-8 API keys, use
+/// [`lookup_configured_header_utf8`] instead.
 pub(crate) fn lookup_configured_header<'a>(
     ctx: &'a RequestContext,
     lower: &'a str,
@@ -96,10 +101,9 @@ fn lookup_with_decoder<'a>(
     original: Option<&'a str>,
     decode_line: fn(&[u8]) -> Option<&str>,
 ) -> DecodedHeader<'a> {
-    // Retained raw field lines are authoritative. `materialize_headers()` can
-    // preserve one visible-ASCII repeated line while omitting a malformed
-    // sibling, so consulting the folded map first would let the valid line mask
-    // hostile input.
+    // Retained raw field lines are authoritative. The folded map joins repeated
+    // lines and is decoded under a looser policy than this lookup's, so
+    // consulting it first would let a conforming line mask a hostile sibling.
     if ctx.has_raw_headers() {
         for name in [Some(lower), original] {
             let Some(name) = name else {
@@ -150,12 +154,11 @@ fn raw_header_field_lines<'a>(
 }
 
 fn visible_ascii_header_value(bytes: &[u8]) -> Option<&str> {
-    // Keep this boundary identical to `HeaderValue::to_str()`, which is also
-    // what `RequestContext::materialize_headers()` uses: SP through `~`, plus
-    // HTAB. Merely checking UTF-8 would admit non-ASCII Unicode here even
-    // though the materialized map deliberately omitted it, letting malformed
-    // credential bytes reach a later parser as if the raw/materialized views
-    // agreed.
+    // Keep this boundary identical to `HeaderValue::to_str()`: SP through `~`,
+    // plus HTAB. Merely checking UTF-8 would admit non-ASCII Unicode here, and
+    // an RFC-bound credential grammar (base64, JWT compact, structured digest)
+    // has no obs-text spelling — such bytes are malformed credential material,
+    // not a legitimate credential.
     if !bytes
         .iter()
         .all(|byte| (*byte >= 0x20 && *byte < 0x7f) || *byte == b'\t')

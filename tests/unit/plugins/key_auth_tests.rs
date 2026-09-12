@@ -56,12 +56,21 @@ fn context_with_materialized_raw_header_bytes(name: &str, value: &[u8]) -> Reque
     );
     ctx.set_raw_headers(raw);
     ctx.materialize_headers();
-    if value.iter().any(|byte| *byte > 0x7F) {
-        assert!(
+    match std::str::from_utf8(value) {
+        // Valid UTF-8 — including non-ASCII — is materialized byte-exact so the
+        // outbound builders can forward it (issue #5010).
+        Ok(decoded) => assert_eq!(
+            ctx.headers
+                .get(name.to_ascii_lowercase().as_str())
+                .map(String::as_str),
+            Some(decoded),
+            "valid UTF-8 header values must be materialized byte-exact in this repro"
+        ),
+        Err(_) => assert!(
             !ctx.headers.contains_key(name.to_ascii_lowercase().as_str())
                 && !ctx.headers.contains_key(name),
-            "non-ASCII header values must stay out of the materialized map in this repro"
-        );
+            "non-UTF-8 header values must stay out of the materialized map in this repro"
+        ),
     }
     ctx
 }
@@ -664,4 +673,102 @@ async fn test_key_auth_repeated_header_with_invalid_line_returns_invalid_format(
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject_body(result, r#"{"error":"Invalid API key format"}"#);
     assert!(ctx.identified_consumer.is_none());
+}
+
+// ── Issue #5010: a preserved non-ASCII API key must reach the backend ────────
+//
+// `hide_credentials: false` documents that the reusable key is forwarded for a
+// legacy backend. `RequestContext::materialize_headers()` used to decode field
+// values with `HeaderValue::to_str()` (visible ASCII only), so a valid UTF-8
+// key was absent from the materialized map — and the outbound merge treats
+// absence as a plugin removal. Authentication succeeded and the key silently
+// disappeared upstream, while the same route preserved an ASCII key.
+
+#[tokio::test]
+async fn test_key_auth_preserved_unicode_header_credential_reaches_the_backend() {
+    let plugin = KeyAuth::new(&json!({
+        "key_location": "header:X-API-Key",
+        "hide_credentials": false
+    }))
+    .unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_unicode_key_consumer()]);
+    let mut ctx = context_with_materialized_raw_header("X-API-Key", UNICODE_API_KEY);
+
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    let mut backend_headers = ctx.headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut backend_headers).await);
+
+    assert!(!plugin.modifies_request_headers());
+    assert_eq!(
+        backend_headers.get("x-api-key").map(String::as_str),
+        Some(UNICODE_API_KEY),
+        "an explicitly preserved Unicode key must be forwarded byte-exact"
+    );
+}
+
+#[tokio::test]
+async fn test_key_auth_preserved_unicode_credential_on_a_custom_header_name() {
+    let plugin = KeyAuth::new(&json!({
+        "key_location": "header:X-Tenant-Credential",
+        "hide_credentials": false
+    }))
+    .unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_unicode_key_consumer()]);
+    let mut ctx = context_with_materialized_raw_header("X-Tenant-Credential", UNICODE_API_KEY);
+
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    let mut backend_headers = ctx.headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut backend_headers).await);
+
+    assert_eq!(
+        backend_headers
+            .get("x-tenant-credential")
+            .map(String::as_str),
+        Some(UNICODE_API_KEY)
+    );
+}
+
+#[tokio::test]
+async fn test_key_auth_default_hide_credentials_still_strips_a_unicode_header_key() {
+    // Non-vacuity for the two tests above: the byte-exact materialization must
+    // not resurrect a credential the default policy removes.
+    let plugin = KeyAuth::new(&json!({"key_location": "header:X-API-Key"})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_unicode_key_consumer()]);
+    let mut ctx = context_with_materialized_raw_header("X-API-Key", UNICODE_API_KEY);
+
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    let mut backend_headers = ctx.headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut backend_headers).await);
+
+    assert!(plugin.modifies_request_headers());
+    assert!(
+        backend_headers
+            .keys()
+            .all(|name| !name.eq_ignore_ascii_case("x-api-key")),
+        "the default policy must still remove a Unicode key"
+    );
+}
+
+#[tokio::test]
+async fn test_key_auth_preserved_invalid_utf8_header_key_is_still_not_forwarded() {
+    // A field line that is not valid UTF-8 cannot be represented in the
+    // materialized map at all, so it stays out of the backend request. It also
+    // never authenticates: extraction reports invalid format, not absent.
+    let plugin = KeyAuth::new(&json!({
+        "key_location": "header:X-API-Key",
+        "hide_credentials": false
+    }))
+    .unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_unicode_key_consumer()]);
+    let mut ctx = context_with_materialized_raw_header_bytes("X-API-Key", b"\xFF\xFE");
+
+    assert_reject_body(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        r#"{"error":"Invalid API key format"}"#,
+    );
+    assert!(
+        ctx.headers
+            .keys()
+            .all(|name| !name.eq_ignore_ascii_case("x-api-key"))
+    );
 }

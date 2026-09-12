@@ -13,6 +13,10 @@ use ferrum_edge::plugins::utils::query::{
     CanonicalQuery, QueryAmbiguity, canonical_query_for_policy, has_conflicting_duplicate_query_key,
 };
 use ferrum_edge::plugins::utils::scope_role_check::{ScopeRoleRequirements, check};
+use ferrum_edge::plugins::utils::sse::{
+    MAX_ANTHROPIC_CONTENT_BLOCKS, MAX_GEMINI_CANDIDATES, SseReassembler, SseText, SseTextKind,
+    parse_sse_data_frames_checked,
+};
 use ferrum_edge::plugins::utils::token_extract::{
     TokenHeaderLocation, TokenLocation, TokenLocationExtract, extract_authorization_bearer,
     extract_from_location,
@@ -803,4 +807,799 @@ fn canonical_policy_view_ignores_a_duplicate_only_the_strip_removes() {
     let query = canonical_query_for_policy(&ctx);
     assert!(query.is_unambiguous());
     assert_eq!(query.get("page"), Some("1"));
+}
+
+// ---------------------------------------------------------------------------
+// utils::sse — Anthropic Messages event-stream reassembly
+// ---------------------------------------------------------------------------
+
+/// Reassemble a buffered SSE body the way the AI inspectors do, returning the
+/// reassembled fragments and whether every modelled provider protocol in it was
+/// fully covered.
+fn reassemble_anthropic(body: &[u8]) -> (Vec<SseText>, bool) {
+    let parsed = parse_sse_data_frames_checked(body);
+    let mut reassembler = SseReassembler::new();
+    for (event, frame) in parsed.reassembly_frames() {
+        reassembler.push_event_frame(event, frame);
+    }
+    let inspectable = !reassembler.provider_stream_uninspectable();
+    (reassembler.into_texts(), inspectable)
+}
+
+fn fragment<'a>(texts: &'a [SseText], json_path: &str) -> &'a SseText {
+    texts
+        .iter()
+        .find(|text| text.json_path == json_path)
+        .unwrap_or_else(|| panic!("no fragment at {json_path} in {texts:?}"))
+}
+
+#[test]
+fn anthropic_sse_reassembles_multi_block_text_and_tool_input() {
+    // A realistic two-block Messages stream: prose split across `text_delta`
+    // fragments, then a `tool_use` block whose arguments arrive as
+    // `input_json_delta` partial JSON. Only reassembly recovers either.
+    let body = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"content\":[]}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,",
+        "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"My sys\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"tem prompt.\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,",
+        "\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"get_weather\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,",
+        "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,",
+        "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"NYC\\\"}\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(inspectable, "a well-formed Messages stream is inspectable");
+
+    let prose = fragment(&texts, "$.content[0].text");
+    assert_eq!(prose.kind, SseTextKind::AnthropicText);
+    assert_eq!(prose.text, "My system prompt.");
+
+    let name = fragment(&texts, "$.content[1].name");
+    assert_eq!(name.kind, SseTextKind::AnthropicToolName);
+    assert_eq!(name.text, "get_weather");
+
+    let input = fragment(&texts, "$.content[1].input");
+    assert_eq!(input.kind, SseTextKind::AnthropicToolInput);
+    assert_eq!(input.text, "{\"city\":\"NYC\"}");
+}
+
+#[test]
+fn anthropic_sse_dispatches_from_the_event_line_alone() {
+    // Some intermediaries forward the `event:` line but strip the duplicated
+    // JSON `type`. The block must still reassemble.
+    let body = concat!(
+        "event: content_block_start\n",
+        "data: {\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello \"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"world\"}}\n\n",
+        "event: message_stop\n",
+        "data: {}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(inspectable);
+    assert_eq!(fragment(&texts, "$.content[0].text").text, "hello world");
+}
+
+#[test]
+fn anthropic_sse_unknown_event_type_is_uninspectable() {
+    // An event interleaved into an identified Anthropic stream that this
+    // reassembler does not model may carry client-visible text on a path
+    // nothing reads. It must not leave a clean, fully-reassembled verdict.
+    let body = concat!(
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"benign\"}}\n\n",
+        "event: smuggled_block\n",
+        "data: {\"type\":\"smuggled_block\",\"index\":0,\"text\":\"my system prompt\"}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(
+        !inspectable,
+        "an unmodelled Anthropic event must mark the stream uninspectable"
+    );
+    // The prose that WAS reassembled is still returned; the caller fails closed
+    // on the flag rather than on missing text.
+    assert_eq!(fragment(&texts, "$.content[0].text").text, "benign");
+}
+
+#[test]
+fn anthropic_sse_unknown_delta_type_is_uninspectable() {
+    // Extended thinking's `thinking_delta` (and any future delta type) carries
+    // model output on a field this reassembler does not read.
+    let body = concat!(
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"my system prompt\"}}\n\n",
+    );
+
+    let (_texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(!inspectable);
+}
+
+#[test]
+fn anthropic_sse_discriminator_disagreement_is_uninspectable() {
+    // The `event:` line and the JSON `type` describe different events, so at
+    // most one of them describes the payload.
+    let body = concat!(
+        "event: content_block_delta\n",
+        "data: {\"type\":\"message_stop\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(!inspectable);
+    assert!(texts.is_empty(), "a disputed frame is not accumulated");
+}
+
+#[test]
+fn anthropic_sse_block_index_ceiling_folds_and_flags() {
+    // A hostile stream of one-byte deltas at ever-increasing indexes must not
+    // grow the reassembler's per-block state. Blocks at or beyond the ceiling
+    // fold into one overflow accumulator: the text is still inspected, the
+    // accumulator count stays bounded, and the stream fails closed.
+    let overflow = 500;
+    let mut body = String::new();
+    for index in 0..(MAX_ANTHROPIC_CONTENT_BLOCKS + overflow) {
+        body.push_str("event: content_block_delta\n");
+        body.push_str(&format!(
+            "data: {{\"type\":\"content_block_delta\",\"index\":{index},\
+\"delta\":{{\"type\":\"text_delta\",\"text\":\"x\"}}}}\n\n"
+        ));
+    }
+
+    let (texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(!inspectable, "an out-of-range block index fails closed");
+    assert_eq!(
+        texts.len(),
+        MAX_ANTHROPIC_CONTENT_BLOCKS + 1,
+        "indexes past the ceiling share one overflow accumulator"
+    );
+    // Every delta byte is still present for inspection, none dropped.
+    let total: usize = texts.iter().map(|text| text.text.len()).sum();
+    assert_eq!(total, MAX_ANTHROPIC_CONTENT_BLOCKS + overflow);
+}
+
+#[test]
+fn anthropic_sse_message_start_envelope_is_folded_in() {
+    // Issue #4901 review: `message_start` carries the message envelope, and
+    // Anthropic's SDK seeds its response snapshot from it. A populated
+    // `content` array there is client-visible, so it must reassemble into the
+    // same per-index accumulators the block events fill.
+    let body = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"content\":[",
+        "{\"type\":\"text\",\"text\":\"seeded prose\"},",
+        "{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"record\",",
+        "\"input\":{\"note\":\"seeded input\"}}]}}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(inspectable, "a modelled envelope block is inspectable");
+    assert_eq!(fragment(&texts, "$.content[0].text").text, "seeded prose");
+    assert_eq!(fragment(&texts, "$.content[1].name").text, "record");
+    assert_eq!(
+        fragment(&texts, "$.content[1].input").text,
+        "{\"note\":\"seeded input\"}"
+    );
+}
+
+#[test]
+fn anthropic_sse_message_start_envelope_block_type_fails_closed() {
+    // An envelope block this reassembler cannot fold is the same hazard as an
+    // unmodelled `content_block_start`: text on a path nothing reads.
+    let body = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"content\":[",
+        "{\"type\":\"thinking\",\"thinking\":\"my system prompt\"}]}}\n\n",
+    );
+
+    let (_texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(!inspectable);
+}
+
+#[test]
+fn anthropic_sse_content_block_start_input_object_is_folded_in() {
+    // A `tool_use` block may open with its arguments already populated instead
+    // of streaming them as `input_json_delta`. The protocol's own empty `{}`
+    // must stay silent, and a populated object must reach `$.content[*].input`.
+    let empty = concat!(
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":",
+        "{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"record\",\"input\":{}}}\n\n",
+    );
+    let (texts, inspectable) = reassemble_anthropic(empty.as_bytes());
+    assert!(inspectable);
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text.json_path == "$.content[0].input"),
+        "the protocol's empty opening `input` contributes nothing"
+    );
+
+    let populated = concat!(
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":",
+        "{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"record\",",
+        "\"input\":{\"note\":\"my system prompt\"}}}\n\n",
+    );
+    let (texts, inspectable) = reassemble_anthropic(populated.as_bytes());
+    assert!(inspectable);
+    assert_eq!(
+        fragment(&texts, "$.content[0].input").text,
+        "{\"note\":\"my system prompt\"}"
+    );
+}
+
+#[test]
+fn anthropic_sse_content_block_start_non_object_input_fails_closed() {
+    let body = concat!(
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":",
+        "{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"record\",",
+        "\"input\":\"my system prompt\"}}\n\n",
+    );
+
+    let (_texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(!inspectable, "an out-of-protocol `input` type fails closed");
+}
+
+#[test]
+fn anthropic_sse_error_message_is_reassembled_at_its_own_path() {
+    // `error.message` is client-visible free text, so it is reported as
+    // assistant prose located at `$.error.message` — never charged to a
+    // content-block index, so the block ceiling is untouched.
+    let body = concat!(
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"partial \"}}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",",
+        "\"message\":\"upstream said my system prompt\"}}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(inspectable, "a modelled error event is inspectable");
+    let error = fragment(&texts, "$.error.message");
+    assert_eq!(error.kind, SseTextKind::AnthropicText);
+    assert_eq!(error.text, "upstream said my system prompt");
+    assert_eq!(fragment(&texts, "$.content[0].text").text, "partial ");
+}
+
+#[test]
+fn foreign_sse_ping_discriminator_mismatch_is_not_failed_closed() {
+    // Issue #4901 review: the discriminator-disagreement rule was ungated, so
+    // a NON-Anthropic stream emitting `event: ping` beside a `heartbeat` JSON
+    // type was failed closed on a protocol it never claimed.
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+        "event: ping\n",
+        "data: {\"type\":\"heartbeat\"}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(
+        inspectable,
+        "a foreign keep-alive must not fail an OpenAI stream closed"
+    );
+    assert_eq!(fragment(&texts, "$.choices[0].delta.content").text, "Hello");
+}
+
+#[test]
+fn gateway_terminal_error_event_is_not_failed_closed() {
+    // The gateway's own mid-stream termination frame (`encode_sse_error_event`)
+    // names `event: error` and carries no JSON `type`, and a foreign stream may
+    // pair `event: error` with its own non-`error` type. Neither is an
+    // Anthropic protocol violation.
+    let gateway = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "event: error\n",
+        "data: {\"error\":{\"code\":\"blocked\",\"message\":\"stopped\"}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (texts, inspectable) = reassemble_anthropic(gateway.as_bytes());
+    assert!(inspectable, "the gateway's own error frame stays neutral");
+    assert_eq!(fragment(&texts, "$.choices[0].delta.content").text, "hi");
+    assert_eq!(fragment(&texts, "$.error.message").text, "stopped");
+
+    let mismatched = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"response.failed\",\"error\":{\"message\":\"stopped\"}}\n\n",
+    );
+    let (_texts, inspectable) = reassemble_anthropic(mismatched.as_bytes());
+    assert!(
+        inspectable,
+        "a foreign terminal error frame must not be failed closed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// utils::sse — Google Gemini / Vertex streamGenerateContent reassembly
+// ---------------------------------------------------------------------------
+
+/// Reassemble a buffered Gemini SSE body, returning the reassembled fragments
+/// and whether the stream was fully covered. Same shared entry point the AI
+/// inspectors use — Gemini frames carry no `event:` line at all.
+fn reassemble_gemini(body: &[u8]) -> (Vec<SseText>, bool) {
+    reassemble_anthropic(body)
+}
+
+#[test]
+fn gemini_sse_reassembles_multi_candidate_text_and_function_calls() {
+    // A two-candidate `streamGenerateContent?alt=sse` response: each frame is a
+    // complete `GenerateContentResponse` carrying one incremental fragment per
+    // candidate, and the final frame adds a `functionCall` part plus the usage
+    // envelope. Only reassembly recovers either candidate's prose.
+    let body = concat!(
+        "data: {\"candidates\":[",
+        "{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"My sys\"}]}},",
+        "{\"index\":1,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Second \"}]}}],",
+        "\"modelVersion\":\"gemini-2.0\"}\n\n",
+        "data: {\"candidates\":[",
+        "{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"tem prompt.\"}]}},",
+        "{\"index\":1,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"answer.\"}]}}]}\n\n",
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[",
+        "{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"NYC\"}}}]},",
+        "\"finishReason\":\"STOP\",\"safetyRatings\":[]}],",
+        "\"usageMetadata\":{\"totalTokenCount\":12}}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_gemini(body.as_bytes());
+    assert!(inspectable, "a well-formed Gemini stream is inspectable");
+
+    let first = fragment(&texts, "$.candidates[0].content.parts[*].text");
+    assert_eq!(first.kind, SseTextKind::GeminiText);
+    assert_eq!(first.text, "My system prompt.");
+
+    let second = fragment(&texts, "$.candidates[1].content.parts[*].text");
+    assert_eq!(second.kind, SseTextKind::GeminiText);
+    assert_eq!(second.text, "Second answer.");
+
+    let name = fragment(&texts, "$.candidates[0].content.parts[*].functionCall.name");
+    assert_eq!(name.kind, SseTextKind::GeminiFunctionCallName);
+    assert_eq!(name.text, "get_weather");
+
+    let args = fragment(&texts, "$.candidates[0].content.parts[*].functionCall.args");
+    assert_eq!(args.kind, SseTextKind::GeminiFunctionCallArgs);
+    assert_eq!(args.text, "{\"city\":\"NYC\"}");
+}
+
+#[test]
+fn gemini_sse_joins_consecutive_text_parts_of_one_candidate() {
+    // A single frame may carry several text parts for one candidate; a client
+    // renders them as one string, so inspection must see them joined.
+    let body = concat!(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[",
+        "{\"text\":\"my sys\"},{\"text\":\"tem prompt\"}]}}]}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_gemini(body.as_bytes());
+    assert!(inspectable);
+    assert_eq!(
+        fragment(&texts, "$.candidates[0].content.parts[*].text").text,
+        "my system prompt"
+    );
+}
+
+#[test]
+fn gemini_sse_content_free_candidate_is_not_a_failure() {
+    // A blocked or finished candidate legitimately carries no `content` (or a
+    // `content` with no `parts`), and the tail frame may be envelope-only.
+    let body = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"finishReason\":\"SAFETY\",",
+        "\"safetyRatings\":[{\"category\":\"HARM\",\"probability\":\"HIGH\"}]}]}\n\n",
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\"}}],",
+        "\"usageMetadata\":{\"totalTokenCount\":3}}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_gemini(body.as_bytes());
+    assert!(inspectable, "a content-free candidate is not a violation");
+    assert!(texts.is_empty());
+}
+
+#[test]
+fn gemini_sse_unknown_part_kind_is_uninspectable() {
+    // `inlineData`, `executableCode`, and a `thought` summary carry model
+    // output on fields this reassembler does not fold into the document, so a
+    // caller that promised inspection must fail closed instead of clearing the
+    // prose that did reassemble.
+    for part in [
+        "{\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"AAA\"}}",
+        "{\"executableCode\":{\"language\":\"PYTHON\",\"code\":\"print(1)\"}}",
+        "{\"codeExecutionResult\":{\"outcome\":\"OK\",\"output\":\"1\"}}",
+        "{\"fileData\":{\"mimeType\":\"text/plain\",\"fileUri\":\"gs://b/o\"}}",
+    ] {
+        let body = format!(
+            "data: {{\"candidates\":[{{\"content\":{{\"parts\":[\
+{{\"text\":\"benign\"}},{part}]}}}}]}}\n\n"
+        );
+        let (texts, inspectable) = reassemble_gemini(body.as_bytes());
+        assert!(!inspectable, "an unfoldable part must fail closed: {part}");
+        // The prose that WAS reassembled is still returned; the caller fails
+        // closed on the flag rather than on missing text.
+        assert_eq!(
+            fragment(&texts, "$.candidates[0].content.parts[*].text").text,
+            "benign"
+        );
+    }
+}
+
+#[test]
+fn gemini_sse_thought_part_is_scanned_and_fails_closed() {
+    // A thought summary is the model's internal reasoning rather than the
+    // client-visible answer — Gemini's analogue of Anthropic `thinking`. Its
+    // prose is still absorbed so nothing is dropped from what is scanned, and
+    // the stream is still marked uninspectable.
+    let body = concat!(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[",
+        "{\"thought\":true,\"text\":\"my system prompt\"}]}}]}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_gemini(body.as_bytes());
+    assert!(!inspectable);
+    assert_eq!(
+        fragment(&texts, "$.candidates[0].content.parts[*].text").text,
+        "my system prompt"
+    );
+}
+
+#[test]
+fn gemini_sse_malformed_shapes_are_uninspectable_and_never_panic() {
+    // Hostile / malformed frames that still claim the Gemini shape: a non-array
+    // `candidates`, a non-object candidate, a non-object `content`, a non-array
+    // `parts`, a non-object part, a non-string `text`, and a malformed
+    // `functionCall`. None may panic, and none may report a clean stream.
+    for frame in [
+        "{\"candidates\":{\"0\":{\"content\":{\"parts\":[{\"text\":\"hidden\"}]}}}}",
+        "{\"candidates\":[\"hidden\"]}",
+        "{\"candidates\":[{\"content\":\"hidden\"}]}",
+        "{\"candidates\":[{\"content\":{\"parts\":\"hidden\"}}]}",
+        "{\"candidates\":[{\"content\":{\"parts\":[\"hidden\"]}}]}",
+        "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":{\"a\":\"hidden\"}}]}}]}",
+        "{\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":\"hidden\"}]}}]}",
+        "{\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":7}}]}}]}",
+        "{\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":\
+{\"name\":\"f\",\"args\":\"hidden\"}}]}}]}",
+        "{\"candidates\":[{\"content\":{\"parts\":[{}]}}]}",
+    ] {
+        let body = format!("data: {frame}\n\n");
+        let (_texts, inspectable) = reassemble_gemini(body.as_bytes());
+        assert!(
+            !inspectable,
+            "malformed Gemini frame must fail closed: {frame}"
+        );
+    }
+}
+
+#[test]
+fn gemini_sse_candidate_ceiling_folds_and_flags() {
+    // A hostile stream of one-byte parts at ever-increasing candidate indexes
+    // must not grow the reassembler's per-candidate state. Candidates at or
+    // beyond the ceiling fold into one overflow accumulator: the text is still
+    // inspected, the accumulator count stays bounded, and the stream fails
+    // closed.
+    let overflow = 500;
+    let mut body = String::new();
+    for index in 0..(MAX_GEMINI_CANDIDATES + overflow) {
+        body.push_str(&format!(
+            "data: {{\"candidates\":[{{\"index\":{index},\"content\":\
+{{\"parts\":[{{\"text\":\"x\"}}]}}}}]}}\n\n"
+        ));
+    }
+
+    let (texts, inspectable) = reassemble_gemini(body.as_bytes());
+    assert!(!inspectable, "an out-of-range candidate index fails closed");
+    assert_eq!(
+        texts.len(),
+        MAX_GEMINI_CANDIDATES + 1,
+        "indexes past the ceiling share one overflow accumulator"
+    );
+    let total: usize = texts.iter().map(|text| text.text.len()).sum();
+    assert_eq!(total, MAX_GEMINI_CANDIDATES + overflow);
+}
+
+#[test]
+fn gemini_sse_frame_carrying_choices_or_type_stays_on_its_own_path() {
+    // Detection is by shape, so a frame that also carries `choices` or an event
+    // `type` belongs to the OpenAI / Anthropic paths and must not be read a
+    // second time as a Gemini candidate.
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],",
+        "\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"dup\"}]}}]}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_gemini(body.as_bytes());
+    assert!(inspectable);
+    assert_eq!(fragment(&texts, "$.choices[0].delta.content").text, "Hello");
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text.kind == SseTextKind::GeminiText),
+        "an OpenAI frame is not also reassembled as a Gemini candidate"
+    );
+}
+
+#[test]
+fn openai_and_anthropic_sse_reassembly_are_unaffected_by_gemini_support() {
+    // Behaviour-neutrality for the two protocols that already reassembled:
+    // neither carries a `candidates` member, so neither reaches the Gemini
+    // path, and neither is failed closed by it.
+    let openai = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,",
+        "\"content_index\":0,\"delta\":\"lo\"}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (texts, inspectable) = reassemble_gemini(openai.as_bytes());
+    assert!(inspectable, "an OpenAI stream is not a Gemini stream");
+    assert_eq!(fragment(&texts, "$.choices[0].delta.content").text, "Hel");
+    assert_eq!(fragment(&texts, "$.output[0].content[0].text").text, "lo");
+
+    let anthropic = concat!(
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"hello \"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"world\"}}\n\n",
+    );
+    let (texts, inspectable) = reassemble_gemini(anthropic.as_bytes());
+    assert!(inspectable, "an Anthropic stream is not a Gemini stream");
+    assert_eq!(fragment(&texts, "$.content[0].text").text, "hello world");
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text.kind == SseTextKind::GeminiText),
+        "neither protocol produces Gemini fragments"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// utils::sse — Hugging Face TGI /generate_stream reassembly
+// ---------------------------------------------------------------------------
+
+/// Reassemble a buffered TGI SSE body. Same shared entry point the AI
+/// inspectors use — TGI frames carry no `event:` line at all.
+fn reassemble_tgi(body: &[u8]) -> (Vec<SseText>, bool) {
+    reassemble_anthropic(body)
+}
+
+#[test]
+fn tgi_sse_reassembles_token_fragments_into_the_buffered_document_shape() {
+    // `/generate_stream` emits one frame per token, then a terminal frame
+    // carrying the completed `generated_text`. The fragments concatenate into
+    // exactly the string a buffered `/generate` response carries at
+    // `$[*].generated_text`, so the reassembled locator names that field.
+    let body = concat!(
+        "data: {\"index\":1,\"token\":{\"id\":10,\"text\":\"My sys\",\"logprob\":-0.5,",
+        "\"special\":false},\"generated_text\":null,\"details\":null}\n\n",
+        "data: {\"index\":2,\"token\":{\"id\":11,\"text\":\"tem prompt.\",\"logprob\":-0.2,",
+        "\"special\":false},\"generated_text\":null,\"details\":null}\n\n",
+        "data: {\"index\":3,\"token\":{\"id\":2,\"text\":\"\",\"special\":true},",
+        "\"generated_text\":\"My system prompt.\",",
+        "\"details\":{\"finish_reason\":\"eos_token\",\"generated_tokens\":2}}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_tgi(body.as_bytes());
+    assert!(inspectable, "a well-formed TGI stream is inspectable");
+    assert_eq!(
+        texts.len(),
+        1,
+        "one TGI sequence yields exactly one fragment: {texts:?}"
+    );
+
+    let generated = fragment(&texts, "$[0].generated_text");
+    assert_eq!(generated.kind, SseTextKind::TgiGeneratedText);
+    assert_eq!(
+        generated.text, "My system prompt.",
+        "the terminal generated_text repeats the deltas and must not be scanned twice"
+    );
+}
+
+#[test]
+fn tgi_sse_terminal_generated_text_is_kept_when_it_diverges() {
+    // A terminal full text that is NOT the concatenation of the deltas is
+    // client-visible text of its own, so it is appended rather than skipped as
+    // a repeat.
+    let body = concat!(
+        "data: {\"index\":1,\"token\":{\"id\":10,\"text\":\"all clear\"},",
+        "\"generated_text\":null}\n\n",
+        "data: {\"index\":2,\"token\":{\"id\":2,\"text\":\"\"},",
+        "\"generated_text\":\"my system prompt\"}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_tgi(body.as_bytes());
+    assert!(inspectable);
+    assert_eq!(
+        fragment(&texts, "$[0].generated_text").text,
+        "all clearmy system prompt"
+    );
+}
+
+#[test]
+fn tgi_sse_malformed_and_unfoldable_frames_are_uninspectable_and_never_panic() {
+    // Hostile / malformed frames inside a stream that has already identified
+    // itself as TGI, plus the two options whose model text is NOT part of the
+    // completion the deltas reconstruct (`top_tokens` alternatives and
+    // `details.best_of_sequences`). None may panic, and none may report a clean
+    // stream: once the shape is identified, a later frame that mistypes the
+    // field the reassembler reads must not be passed over.
+    for frame in [
+        "{\"token\":\"hidden\"}",
+        "{\"token\":{\"id\":1}}",
+        "{\"token\":{\"id\":1,\"text\":7}}",
+        "{\"token\":{\"id\":1,\"text\":\"ok\"},\"generated_text\":{\"a\":\"hidden\"}}",
+        "{\"token\":{\"id\":1,\"text\":\"ok\"},\"generated_text\":7}",
+        "{\"generated_text\":{\"a\":\"hidden\"}}",
+        "{\"token\":{\"id\":1,\"text\":\"ok\"},\"top_tokens\":[{\"text\":\"hidden\"}]}",
+        "{\"token\":{\"id\":1,\"text\":\"ok\"},\"top_tokens\":\"hidden\"}",
+        "{\"generated_text\":\"ok\",\"details\":{\"best_of_sequences\":\
+[{\"generated_text\":\"hidden\"}]}}",
+    ] {
+        let body = format!(
+            "data: {{\"index\":1,\"token\":{{\"id\":0,\"text\":\"all clear\"}},\
+\"generated_text\":null}}\n\ndata: {frame}\n\n"
+        );
+        let (_texts, inspectable) = reassemble_tgi(body.as_bytes());
+        assert!(
+            !inspectable,
+            "malformed TGI frame must fail closed: {frame}"
+        );
+    }
+}
+
+#[test]
+fn tgi_selection_is_structural_so_an_unrelated_stream_is_not_claimed() {
+    // `token` is an ordinary field name on unrelated event streams, so
+    // selection is by SHAPE: a `token` object or a string `generated_text`.
+    // A foreign stream carrying neither must be left alone rather than failed
+    // closed — the fail-closed rules above apply only once a frame has
+    // identified the stream as TGI.
+    let body = concat!(
+        "data: {\"token\":\"eyJhbGciOi.session\",\"expires_in\":300}\n\n",
+        "data: {\"generated_text\":42}\n\n",
+        "data: {\"generated_text\":{\"a\":\"b\"}}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_tgi(body.as_bytes());
+    assert!(
+        inspectable,
+        "an unrelated stream whose fields collide must not be failed closed"
+    );
+    assert!(
+        texts.is_empty(),
+        "and must contribute no reassembled text: {texts:?}"
+    );
+}
+
+#[test]
+fn tgi_sse_empty_top_tokens_and_absent_generated_text_stay_inspectable() {
+    // The two benign shapes the fail-closed rules above must not catch: an
+    // empty `top_tokens` array (the `top_n_tokens: 0` default some clients
+    // send explicitly) and an ordinary non-terminal frame.
+    let body = concat!(
+        "data: {\"index\":1,\"token\":{\"id\":1,\"text\":\"hel\"},\"top_tokens\":[]}\n\n",
+        "data: {\"index\":2,\"token\":{\"id\":2,\"text\":\"lo\"}}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_tgi(body.as_bytes());
+    assert!(inspectable, "a benign TGI stream must not fail closed");
+    assert_eq!(fragment(&texts, "$[0].generated_text").text, "hello");
+}
+
+#[test]
+fn tgi_sse_frame_carrying_another_protocols_discriminator_stays_on_its_own_path() {
+    // Detection is by shape, so a frame that also carries `choices`, an event
+    // `type`, or `candidates` belongs to the OpenAI / Anthropic / Gemini paths
+    // and must not be read a second time as a TGI token.
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],",
+        "\"token\":{\"id\":1,\"text\":\"dup\"}}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_tgi(body.as_bytes());
+    assert!(inspectable);
+    assert_eq!(fragment(&texts, "$.choices[0].delta.content").text, "Hello");
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text.kind == SseTextKind::TgiGeneratedText),
+        "an OpenAI frame is not also reassembled as a TGI token"
+    );
+}
+
+#[test]
+fn openai_anthropic_and_gemini_reassembly_are_unaffected_by_tgi_support() {
+    // Behaviour-neutrality for the three protocols that already reassembled:
+    // none carries a bare `token` / `generated_text` member, so none reaches
+    // the TGI path, and none is failed closed by it.
+    let openai = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,",
+        "\"content_index\":0,\"delta\":\"lo\"}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (texts, inspectable) = reassemble_tgi(openai.as_bytes());
+    assert!(inspectable, "an OpenAI stream is not a TGI stream");
+    assert_eq!(fragment(&texts, "$.choices[0].delta.content").text, "Hel");
+
+    let anthropic = concat!(
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"hello world\"}}\n\n",
+    );
+    let (texts, inspectable) = reassemble_tgi(anthropic.as_bytes());
+    assert!(inspectable, "an Anthropic stream is not a TGI stream");
+    assert_eq!(fragment(&texts, "$.content[0].text").text, "hello world");
+
+    let gemini = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",",
+        "\"parts\":[{\"text\":\"hello world\"}]}}]}\n\n",
+    );
+    let (texts, inspectable) = reassemble_tgi(gemini.as_bytes());
+    assert!(inspectable, "a Gemini stream is not a TGI stream");
+    assert_eq!(
+        fragment(&texts, "$.candidates[0].content.parts[*].text").text,
+        "hello world"
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text.kind == SseTextKind::TgiGeneratedText),
+        "no already-modelled protocol produces TGI fragments"
+    );
+}
+
+#[test]
+fn openai_sse_reassembly_is_unaffected_by_anthropic_support() {
+    // Behaviour-neutrality for the OpenAI paths: chat deltas still reassemble
+    // per choice, and nothing about them trips the Anthropic fail-closed flag.
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,",
+        "\"content_index\":0,\"delta\":\"lo\"}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(inspectable, "an OpenAI stream is not an Anthropic stream");
+
+    let chat = fragment(&texts, "$.choices[0].delta.content");
+    assert_eq!(chat.kind, SseTextKind::ChatContent);
+    assert_eq!(chat.text, "Hel");
+
+    let responses = fragment(&texts, "$.output[0].content[0].text");
+    assert_eq!(responses.kind, SseTextKind::ResponsesText);
+    assert_eq!(responses.text, "lo");
 }

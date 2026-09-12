@@ -36,6 +36,10 @@ Supported options:
 
 If `module`, `module_path`, and `module_env` are omitted, Ferrum reads `FERRUM_PKCS11_MODULE_PATH`. PIN values are optional for tokens that expose the key without login, but production HSMs normally require `pin_env`.
 
+Module overrides (`module`, `module_path`, and `module_env`) require the operator setting `FERRUM_PKCS11_MODULE_ALLOWED_PATHS`: a comma-separated list of absolute existing directories or exact module files. Ferrum canonicalizes both the module and every allowlist entry, rejects symlink or traversal escapes, and loads the canonical file path. Empty, relative, missing, or unresolvable entries fail closed. With the setting unset, omit **all** module options; only `FERRUM_PKCS11_MODULE_PATH` supplies the module. The default is also checked against the allowlist when one is set.
+
+The policy is checked at configuration admission and again before loading the library. Each DP applies its own operator policy to CP-distributed references; CP approval cannot grant a DP permission to load a module. Install the allowed modules on each admitting node. Keep allowed files and directories, their ancestors, and native-library dependencies writable only by trusted operators; this path policy does not protect against local replacement of trusted library files.
+
 ## Runtime Behavior
 
 Ferrum validates the token key at TLS config load by opening a read-only session, logging in when `pin_env` is set, and finding exactly one RSA private key for the configured selector. Each TLS signature opens a fresh read-only session because PKCS#11 sessions are not generally thread-safe.

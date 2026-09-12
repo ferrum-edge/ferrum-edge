@@ -18,6 +18,42 @@ use super::{
 use crate::plugins::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metadata_key};
 use crate::plugins::{StreamTransactionSummary, TransactionSummary};
 
+/// Output keys already claimed by the schema's own fields, consulted by
+/// `flatten` metadata to decide whether a promoted metadata key collides.
+///
+/// The bulk of the set — every static key, and every native key on a schema
+/// that is not capability-scoped — is invariant across records and lives on
+/// the compiled [`SummarySchema::flatten_reserved`], borrowed here rather than
+/// rebuilt. Only the genuinely per-record reservations are pushed into
+/// `per_record`: derived keys, which reserve only when the value was actually
+/// emitted, and (under a capability schema) the native keys the concrete entry
+/// kind owns. Those are borrowed `&str` from the compiled schema, so nothing
+/// is cloned. In the common case — a BASE schema with no derived fields —
+/// `per_record` stays empty and never allocates.
+pub struct EmittedKeys<'s> {
+    reserved: &'s HashSet<Box<str>>,
+    per_record: Vec<&'s str>,
+}
+
+impl<'s> EmittedKeys<'s> {
+    fn new(schema: &'s SummarySchema) -> Self {
+        Self {
+            reserved: &schema.flatten_reserved,
+            per_record: Vec::new(),
+        }
+    }
+
+    /// Claim an output key for this record only.
+    fn reserve(&mut self, out_key: &'s str) {
+        self.per_record.push(out_key);
+    }
+
+    /// `true` when some field of this record already owns `key`.
+    pub(crate) fn contains(&self, key: &str) -> bool {
+        self.reserved.contains(key) || self.per_record.contains(&key)
+    }
+}
+
 /// Bridge between a typed summary and the schema serializer. Each native
 /// field name is dispatched here so the typed value is emitted with
 /// `serialize_entry` — no intermediate `serde_json::Value`.
@@ -67,7 +103,7 @@ pub trait SchemaSerializable {
     fn serialize_metadata<S>(
         &self,
         policy: &MetadataPolicy,
-        emitted: &mut HashSet<String>,
+        emitted: &EmittedKeys<'_>,
         map: &mut S,
     ) -> Result<(), S::Error>
     where
@@ -85,21 +121,28 @@ impl<'a, T: SchemaSerializable> Serialize for SchemaView<'a, T> {
     where
         S: Serializer,
     {
+        // Bind the compiled schema once: every borrow below (the reservation
+        // set and each output key) lives as long as the schema itself, not as
+        // long as this `&self`.
+        let schema: &'a SummarySchema = self.schema;
         let mut map = ser.serialize_map(None)?;
 
         // The emitted-key set is ONLY consulted by `flatten_metadata` for
         // collision detection. For `Nested` / `Omit` policies it is dead
-        // weight — populating it for every native / static / derived
-        // entry would force a `String` clone per field on every log call
-        // and a per-call `HashSet` allocation. Gate it.
-        let track_emitted = matches!(self.schema.metadata, MetadataPolicy::Flatten { .. });
-        let mut emitted: HashSet<String> = if track_emitted {
-            HashSet::with_capacity(self.schema.fields.len() + 8)
-        } else {
-            HashSet::new()
-        };
+        // weight, so nothing is reserved at all. Under `Flatten` the
+        // invariant half of the set is already compiled onto the schema
+        // (`SummarySchema::flatten_reserved`) and is borrowed, not rebuilt;
+        // only per-record reservations are pushed below.
+        let track_emitted = matches!(schema.metadata, MetadataPolicy::Flatten { .. });
+        let mut emitted = EmittedKeys::new(schema);
+        if track_emitted && schema.capability_scoped {
+            // A capability schema resolves native ownership per entry kind, so
+            // its native reservations really are per record. One reservation
+            // up front beats growing the vec field by field.
+            emitted.per_record.reserve(schema.fields.len());
+        }
 
-        for spec in &self.schema.fields {
+        for spec in &schema.fields {
             match spec {
                 FieldSpec::Native {
                     source,
@@ -111,7 +154,7 @@ impl<'a, T: SchemaSerializable> Serialize for SchemaView<'a, T> {
                     extension: _,
                 } => {
                     let ts_format = if *is_timestamp {
-                        self.schema.timestamp_format
+                        schema.timestamp_format
                     } else {
                         TimestampFormat::Rfc3339
                     };
@@ -140,32 +183,30 @@ impl<'a, T: SchemaSerializable> Serialize for SchemaView<'a, T> {
                     // instead of being silently dropped under `on_collision:
                     // skip`. `extension` is unused here (kept for `order`
                     // completeness) because `owns_native` subsumes it.
-                    let reserve = if self.schema.capability_scoped {
-                        self.summary.owns_native(source)
-                    } else {
-                        true
-                    };
-                    if track_emitted && reserve {
-                        emitted.insert(out_key.clone());
+                    //
+                    // A non-capability schema reserved every native key at
+                    // compile time, so only the capability case reserves here.
+                    if track_emitted && schema.capability_scoped && self.summary.owns_native(source)
+                    {
+                        emitted.reserve(out_key);
                     }
                 }
                 FieldSpec::Static { out_key, value } => {
+                    // Static keys are unconditional and already compiled into
+                    // `SummarySchema::flatten_reserved`.
                     map.serialize_entry(out_key, value)?;
-                    if track_emitted {
-                        emitted.insert(out_key.clone());
-                    }
                 }
                 FieldSpec::Derived { out_key, kind } => {
                     let emitted_now = self.summary.serialize_derived(*kind, out_key, &mut map)?;
                     if track_emitted && emitted_now {
-                        emitted.insert(out_key.clone());
+                        emitted.reserve(out_key);
                     }
                 }
             }
         }
 
         self.summary
-            .serialize_metadata(&self.schema.metadata, &mut emitted, &mut map)?;
+            .serialize_metadata(&schema.metadata, &emitted, &mut map)?;
 
         map.end()
     }
@@ -357,6 +398,23 @@ impl SchemaSerializable for TransactionSummary {
                     Ok(())
                 }
             }
+            // Native serialization emits both counters only when nonzero
+            // (zero means "not gRPC"). Keep the same guard so a schema-shaped
+            // record matches the unschemed line field for field.
+            "grpc_request_messages" => {
+                if self.grpc_request_messages != 0 {
+                    map.serialize_entry(out_key, &self.grpc_request_messages)
+                } else {
+                    Ok(())
+                }
+            }
+            "grpc_response_messages" => {
+                if self.grpc_response_messages != 0 {
+                    map.serialize_entry(out_key, &self.grpc_response_messages)
+                } else {
+                    Ok(())
+                }
+            }
             "mirror" => {
                 if self.mirror {
                     map.serialize_entry(out_key, &true)
@@ -419,7 +477,7 @@ impl SchemaSerializable for TransactionSummary {
     fn serialize_metadata<S>(
         &self,
         policy: &MetadataPolicy,
-        emitted: &mut HashSet<String>,
+        emitted: &EmittedKeys<'_>,
         map: &mut S,
     ) -> Result<(), S::Error>
     where
@@ -552,7 +610,7 @@ impl SchemaSerializable for StreamTransactionSummary {
     fn serialize_metadata<S>(
         &self,
         policy: &MetadataPolicy,
-        emitted: &mut HashSet<String>,
+        emitted: &EmittedKeys<'_>,
         map: &mut S,
     ) -> Result<(), S::Error>
     where
@@ -580,12 +638,16 @@ fn flatten_metadata<S>(
     metadata: &std::collections::HashMap<String, String>,
     prefix: Option<&str>,
     on_collision: CollisionMode,
-    emitted: &mut HashSet<String>,
+    emitted: &EmittedKeys<'_>,
     map: &mut S,
 ) -> Result<(), S::Error>
 where
     S: SerializeMap,
 {
+    // A promoted key is never re-checked against an earlier promoted key:
+    // `flatten_key` prepends one constant prefix, so it is injective over the
+    // metadata map's already-unique keys and two metadata entries cannot
+    // produce the same output key.
     for (key, value) in metadata {
         if crate::plugins::utils::metadata_redaction::is_internal_only_metadata_key(key) {
             continue;
@@ -605,7 +667,6 @@ where
         } else {
             map.serialize_entry(&out_key, value)?;
         }
-        emitted.insert(out_key);
     }
     Ok(())
 }
@@ -618,7 +679,7 @@ where
 pub(crate) fn serialize_schema_metadata<S>(
     metadata: &std::collections::HashMap<String, String>,
     policy: &MetadataPolicy,
-    emitted: &mut HashSet<String>,
+    emitted: &EmittedKeys<'_>,
     map: &mut S,
 ) -> Result<(), S::Error>
 where

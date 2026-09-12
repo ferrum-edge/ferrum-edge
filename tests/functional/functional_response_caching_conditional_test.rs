@@ -242,6 +242,14 @@ async fn functional_response_caching_conditional_eligibility_h1_h2_h3() {
                 let stored = frontend.request(&url, &method, None, None).await;
                 assert_eq!(stored.status, stored_status, "{url}");
                 assert_eq!(stored.headers["x-cache-status"], "MISS", "{url}");
+                // The initial publicly cacheable response is the one a
+                // downstream shared cache stores, so it must already nominate
+                // the mandatory caller dimensions rather than waiting for the
+                // first hit.
+                assert_eq!(
+                    stored.headers["vary"], "authorization, cookie, proxy-authorization",
+                    "{url}: MISS must publish the downstream Vary contract"
+                );
                 assert_eq!(hits.load(Ordering::SeqCst), before + 1, "{url}: seed");
                 assert_eq!(stored.headers.contains_key("etag"), route != "no-etag");
                 if method == Method::GET {
@@ -256,6 +264,13 @@ async fn functional_response_caching_conditional_eligibility_h1_h2_h3() {
                     (Some(r#"W/"v1""#), None, route != "no-etag"),
                     (Some(r#"W/"v1""#), Some(EARLIER), route != "no-etag"),
                     (Some(r#""other", W/"v1""#), None, route != "no-etag"),
+                    // RFC 9110 §5.6.1.2: a bounded number of empty list
+                    // members must be parsed and ignored, not treated as a
+                    // malformed entity-tag.
+                    (Some(r#", W/"v1""#), None, route != "no-etag"),
+                    (Some(r#"W/"v1","#), None, route != "no-etag"),
+                    (Some(r#""other",, W/"v1""#), None, route != "no-etag"),
+                    (Some(r#", "other","#), Some(LATER), false),
                     (Some(r#""other""#), Some(LATER), false),
                     (Some(r#"*, "v1""#), Some(LATER), false),
                     (Some(r#""v1", *"#), Some(LATER), false),
@@ -280,6 +295,7 @@ async fn functional_response_caching_conditional_eligibility_h1_h2_h3() {
                     let cache_status = if not_modified { "REVALIDATED" } else { "HIT" };
                     assert_eq!(response.headers["x-cache-status"], cache_status);
                     assert_eq!(response.headers.get("etag"), stored.headers.get("etag"));
+                    assert_eq!(response.headers.get("vary"), stored.headers.get("vary"));
                     assert_eq!(response.headers["last-modified"], LAST_MODIFIED);
                     assert_eq!(response.headers["cache-control"], "public, max-age=3600");
                     assert!(

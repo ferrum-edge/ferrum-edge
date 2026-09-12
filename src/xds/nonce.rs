@@ -98,7 +98,10 @@ impl XdsNonceTracker {
         }
 
         if let Some(message) = error_message {
-            let message = message.to_string();
+            // Bound the peer-supplied NACK message at the boundary so both the
+            // stored `last_error` and the value surfaced to the server's warn
+            // lines stay bounded regardless of input length (issue #4813).
+            let message = super::bounded_xds_log_value(message);
             state.last_error = Some(message.clone());
             return AckOutcome::Nacked { message };
         }
@@ -189,5 +192,29 @@ mod tests {
             AckOutcome::Acked
         );
         assert_eq!(tracker.last_error("node-a", "type-a"), None);
+    }
+
+    #[test]
+    fn hostile_megabyte_nack_message_is_bounded_in_outcome_and_state() {
+        let tracker = XdsNonceTracker::new();
+        let nonce = tracker.issue_nonce("node-a", "type-a", "v1");
+        let hostile = "n".repeat(1024 * 1024);
+
+        let outcome = tracker.record_response("node-a", "type-a", &nonce, "", Some(&hostile));
+
+        let AckOutcome::Nacked { message } = outcome else {
+            panic!("expected a NACK outcome for an error message");
+        };
+        assert!(
+            message.len() <= crate::xds::MAX_XDS_LOG_VALUE_CHARS + "(truncated)".len(),
+            "the NACK message must be bounded, got {} bytes",
+            message.len()
+        );
+        assert!(message.ends_with("(truncated)"));
+
+        let stored = tracker
+            .last_error("node-a", "type-a")
+            .expect("NACK message is stored as the last error");
+        assert_eq!(stored, message);
     }
 }

@@ -104,12 +104,29 @@ pub fn http_billing_outcome(summary: &TransactionSummary) -> HttpBillingOutcome 
     let grpc_status = summary.grpc_status();
     let status_code = grpc_status
         .map(crate::proxy::grpc_proxy::grpc_status_to_http_status)
-        .unwrap_or(summary.response_status_code);
+        .unwrap_or_else(|| {
+            if is_websocket_handshake(summary) {
+                101
+            } else {
+                summary.response_status_code
+            }
+        });
     HttpBillingOutcome {
         status_code,
         http_status_code: summary.response_status_code,
         grpc_status,
     }
+}
+
+/// Successful WebSocket handshakes share one billing tier across HTTP transports.
+/// Rejected Extended CONNECT requests retain their ordinary error status.
+pub fn is_websocket_handshake(summary: &TransactionSummary) -> bool {
+    summary.response_status_code == 101
+        || ((200..300).contains(&summary.response_status_code)
+            && summary
+                .metadata
+                .get("request_protocol")
+                .is_some_and(|protocol| protocol == "ws"))
 }
 
 pub mod pricing {
@@ -235,17 +252,13 @@ pub mod pricing {
             bytes_sent: u64,
             bytes_received: u64,
         ) -> Option<ChargeComputation> {
-            let call_price = self
-                .price_by_status
-                .get(&status_code)
-                .copied()
-                .unwrap_or(0.0);
+            let call_price = self.price_by_status.get(&status_code).copied();
             let has_bandwidth =
                 self.bandwidth_price_sent > 0.0 || self.bandwidth_price_received > 0.0;
-            if call_price == 0.0 && !has_bandwidth {
+            if call_price.is_none() && !has_bandwidth {
                 return None;
             }
-            Some(self.compute_amounts(1, call_price, bytes_sent, bytes_received))
+            Some(self.compute_amounts(1, call_price.unwrap_or(0.0), bytes_sent, bytes_received))
         }
 
         pub fn compute_stream(

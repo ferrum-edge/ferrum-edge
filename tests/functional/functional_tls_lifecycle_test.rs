@@ -263,6 +263,7 @@ fn spawn_gateway_piped(
     envs: &[(&str, &str)],
 ) -> (TokioChild, OutputCapture) {
     let mut cmd = TokioCommand::new(gw_bin());
+    cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", ports.proxy_http.to_string())
@@ -1229,8 +1230,25 @@ struct TrustRetirementFixture {
     _backends: Vec<tokio::task::JoinHandle<()>>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+enum GlobalCrlFixture {
+    #[default]
+    Baseline,
+    OutsideWithAki,
+    OutsideWithoutAki,
+    AnchoredWithoutAki,
+    UnarmedWithoutAki,
+}
+
 impl TrustRetirementFixture {
     async fn try_new_with(surfaces: FixtureSurfaces) -> Option<Self> {
+        Self::try_new_with_crl(surfaces, GlobalCrlFixture::Baseline).await
+    }
+
+    async fn try_new_with_crl(
+        surfaces: FixtureSurfaces,
+        crl_case: GlobalCrlFixture,
+    ) -> Option<Self> {
         let dir = TempDir::new().unwrap();
         let server_ca = generate_ca("Retirement-Server-CA");
         let server = generate_signed_cert(&server_ca, "localhost", &["localhost", "127.0.0.1"]);
@@ -1242,7 +1260,26 @@ impl TrustRetirementFixture {
         // A baseline CRL revoking an unrelated serial: the file exists and
         // parses, so the first accepted generation is a genuine one and a later
         // rewrite is a real semantic delta rather than "a CRL appeared".
-        let baseline_crl = generate_crl_pem(&client_ca, &[SerialNumber::from(1u64)]);
+        let outside_ca = generate_ca("Outside-Client-Trust-CA");
+        let crl_signer = match crl_case {
+            GlobalCrlFixture::Baseline | GlobalCrlFixture::AnchoredWithoutAki => &client_ca,
+            _ => &outside_ca,
+        };
+        let baseline_crl = generate_crl_pem(crl_signer, &[SerialNumber::from(1u64)]);
+        let baseline_crl = if matches!(
+            crl_case,
+            GlobalCrlFixture::OutsideWithoutAki
+                | GlobalCrlFixture::AnchoredWithoutAki
+                | GlobalCrlFixture::UnarmedWithoutAki
+        ) {
+            crate::common::crl_fixtures::without_authority_key_identifier(
+                &baseline_crl,
+                crl_signer.issuer.key(),
+                &crl_signer.cert_pem,
+            )
+        } else {
+            baseline_crl
+        };
 
         let cert_path = write_file(&dir, "server.crt", &server.cert_pem);
         let key_path = write_file(&dir, "server.key", &server.key_pem);
@@ -1341,6 +1378,9 @@ impl TrustRetirementFixture {
             ("FERRUM_FRONTEND_TLS_WATCH_INTERVAL_SECONDS", "1"),
             ("FERRUM_POOL_WARMUP_ENABLED", "false"),
         ];
+        if matches!(crl_case, GlobalCrlFixture::UnarmedWithoutAki) {
+            envs.retain(|(name, _)| *name != "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH");
+        }
         if surfaces.http3 {
             envs.push(("FERRUM_ENABLE_HTTP3", "true"));
         }
@@ -2410,4 +2450,42 @@ async fn test_frontend_dtls_session_is_retired_and_reconnect_refused_after_crl_r
 
     session.close().await;
     fixture.shutdown().await;
+}
+
+#[ignore]
+#[tokio::test]
+async fn test_global_crl_without_aki_allows_frontend_mtls_startup() {
+    for crl_case in [
+        GlobalCrlFixture::OutsideWithoutAki,
+        GlobalCrlFixture::OutsideWithAki,
+        GlobalCrlFixture::AnchoredWithoutAki,
+        GlobalCrlFixture::UnarmedWithoutAki,
+    ] {
+        let mut started = None;
+        for _ in 0..3 {
+            started =
+                TrustRetirementFixture::try_new_with_crl(FixtureSurfaces::default(), crl_case)
+                    .await;
+            if started.is_some() {
+                break;
+            }
+            // Only the classified bind-race return reaches this retry.
+            sleep(Duration::from_secs(1)).await;
+        }
+        let mut fixture = started.unwrap_or_else(|| panic!("CRL startup case {crl_case:?}"));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut transport = establish_h1(fixture.ports.proxy_https, fixture.h1_config())
+                .await
+                .unwrap_or_else(|error| panic!("CRL {crl_case:?} mTLS handshake: {error}"));
+            assert_eq!(
+                transport.request("localhost").await,
+                AttemptOutcome::Status(200),
+                "CRL startup case {crl_case:?} must serve"
+            );
+        })
+        .await
+        .expect("CRL startup case must complete a real frontend request");
+        fixture.assert_still_running("global CRL startup control");
+        fixture.shutdown().await;
+    }
 }

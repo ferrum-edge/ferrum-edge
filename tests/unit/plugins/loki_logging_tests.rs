@@ -9,14 +9,16 @@ use ferrum_edge::plugins::{
         LOKI_DEFAULT_BUFFER_MAX_BYTES, LOKI_DEFAULT_MAX_ENTRY_BYTES, LOKI_LOGGING_CONFIG_KEYS,
         LOKI_MAX_CUSTOM_HEADER_NAME_BYTES, LokiLogging,
     },
-    utils::byte_budget::RetainedByteCeiling,
+    utils::{
+        byte_budget::RetainedByteCeiling,
+        sink_loss::{SinkLossReason, dropped_total},
+    },
 };
 use serde_json::json;
-use std::io::{self, Read};
+use std::io::Read;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tracing_subscriber::fmt::MakeWriter;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -27,42 +29,6 @@ use super::plugin_utils::{
 
 fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
-}
-
-#[derive(Clone, Default)]
-struct SharedWriter {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
-
-impl SharedWriter {
-    fn contents(&self) -> String {
-        String::from_utf8(self.buffer.lock().unwrap().clone()).unwrap_or_default()
-    }
-}
-
-struct SharedGuard {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
-
-impl io::Write for SharedGuard {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buffer.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for SharedWriter {
-    type Writer = SharedGuard;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        SharedGuard {
-            buffer: Arc::clone(&self.buffer),
-        }
-    }
 }
 
 fn delivery_config(endpoint_url: String) -> serde_json::Value {
@@ -601,14 +567,7 @@ async fn test_loki_stream_disconnects_keep_source_time_in_line_and_emit_in_queue
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_loki_status_260_is_terminal_and_diagnostics_are_redacted() {
-    let writer = SharedWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_target(false)
-        .without_time()
-        .with_writer(writer.clone())
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
+    let (writer, guard) = super::plugin_utils::capture_debug_logs();
 
     let server = MockServer::start().await;
     let response_secret = "blocked-body-secret-canary";
@@ -658,7 +617,14 @@ async fn test_loki_status_260_is_terminal_and_diagnostics_are_redacted() {
     drop(guard);
 
     let logs = writer.contents();
-    assert!(logs.contains("status 260"));
+    let terminal = logs
+        .lines()
+        .find(|line| {
+            line.contains("DEBUG")
+                && line.contains("Loki logging: batch discarded after terminal delivery failure")
+        })
+        .expect("each terminal failure retains its debug diagnostic");
+    assert!(terminal.contains("status 260"), "{logs}");
     for secret in [
         response_secret,
         "private-path-secret",
@@ -705,14 +671,7 @@ async fn test_loki_retries_408_429_and_5xx() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_loki_accepts_empty_200_but_rejects_nonempty_200_without_retry() {
-    let writer = SharedWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_target(false)
-        .without_time()
-        .with_writer(writer.clone())
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
+    let (writer, guard) = super::plugin_utils::capture_debug_logs();
 
     let server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -755,12 +714,16 @@ async fn test_loki_accepts_empty_200_but_rejects_nonempty_200_without_retry() {
     drop(guard);
 
     let logs = writer.contents();
-    assert!(logs.contains("unexpected non-empty response"));
+    let terminals: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("DEBUG") && line.contains("returned status 200"))
+        .collect();
     assert_eq!(
-        logs.matches("returned status 200").count(),
+        terminals.len(),
         1,
         "the empty 200 must be delivered while the non-empty 200 is terminal: {logs}"
     );
+    assert!(terminals[0].contains("unexpected non-empty response"));
 }
 
 #[tokio::test]
@@ -1575,4 +1538,127 @@ fn test_loki_provisional_reservation_shrinks_to_exact_and_releases_on_drop() {
         ceiling_used_after_drop, 0,
         "drop must release the shrunk process reservation exactly"
     );
+}
+
+fn loki_batch_discard_dropped() -> u64 {
+    dropped_total("loki_logging", SinkLossReason::BatchDiscard)
+}
+
+async fn wait_for_loki_batch_discard(before: u64, at_least: u64) -> u64 {
+    for _ in 0..100 {
+        let now = loki_batch_discard_dropped();
+        if now.saturating_sub(before) >= at_least {
+            return now;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "loki_logging batch_discard counter did not increase by {at_least} from {before}; now {}",
+        loki_batch_discard_dropped()
+    );
+}
+
+#[tokio::test]
+async fn test_loki_terminal_and_exhausted_delivery_counts_batch_discard() {
+    for status in [260_u16, 400_u16] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/loki/api/v1/push"))
+            .respond_with(ResponseTemplate::new(status).set_body_string("blocked"))
+            .mount(&server)
+            .await;
+        let mut config = delivery_config(format!("{}/loki/api/v1/push", server.uri()));
+        config["batch_size"] = json!(2);
+        config["flush_interval_ms"] = json!(100);
+        config["max_retries"] = json!(2);
+        let plugin = LokiLogging::new(&config, default_client()).unwrap();
+        plugin.start_background_tasks().expect("live start");
+        plugin.commit_background_tasks();
+        let before = loki_batch_discard_dropped();
+        plugin.log(&create_test_transaction_summary()).await;
+        plugin.log(&create_test_transaction_summary()).await;
+        wait_for_requests(&server, 1).await;
+        wait_for_loki_batch_discard(before, 2).await;
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            1,
+            "status {status} must not retry"
+        );
+        drop(plugin);
+    }
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/loki/api/v1/push"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let mut config = delivery_config(format!("{}/loki/api/v1/push", server.uri()));
+    config["max_retries"] = json!(1);
+    let plugin = LokiLogging::new(&config, default_client()).unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let before = loki_batch_discard_dropped();
+    plugin.log(&create_test_transaction_summary()).await;
+    wait_for_requests(&server, 2).await;
+    wait_for_loki_batch_discard(before, 1).await;
+    drop(plugin);
+
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/loki/api/v1/push"))
+        .respond_with({
+            let calls = Arc::clone(&calls);
+            move |_: &wiremock::Request| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(503)
+                } else {
+                    ResponseTemplate::new(204)
+                }
+            }
+        })
+        .mount(&server)
+        .await;
+    let mut config = delivery_config(format!("{}/loki/api/v1/push", server.uri()));
+    config["max_retries"] = json!(1);
+    let plugin = LokiLogging::new(&config, default_client()).unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    plugin.log(&create_test_transaction_summary()).await;
+    wait_for_requests(&server, 2).await;
+    // A failed attempt followed by 204 must keep retrying rather than treating
+    // the 503 as a counted terminal discard. Two collector calls are that proof.
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    drop(plugin);
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/loki/api/v1/push"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let plugin = LokiLogging::new(
+        &delivery_config(format!("{}/loki/api/v1/push", server.uri())),
+        default_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    plugin.log(&create_test_transaction_summary()).await;
+    wait_for_requests(&server, 1).await;
+    drop(plugin);
+
+    let discarded = loki_batch_discard_dropped();
+    assert!(discarded > 0, "prior terminal losses must remain counted");
+    let replacement = LokiLogging::new(
+        &json!({"endpoint_url": "http://127.0.0.1:1/loki/api/v1/push"}),
+        default_client(),
+    )
+    .unwrap();
+    assert!(
+        loki_batch_discard_dropped() >= discarded,
+        "constructing a replacement instance must not reset process sink-loss counters"
+    );
+    drop(replacement);
 }

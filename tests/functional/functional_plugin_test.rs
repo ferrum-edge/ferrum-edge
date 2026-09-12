@@ -2074,3 +2074,276 @@ async fn test_plugin_chain_multiple_plugins() {
         "Backend should have received X-Source header from request transformer"
     );
 }
+
+/// Hosted transport coverage for the shared WAF body view policy. Keep this
+/// under the existing plugin module so the functional shard selects it.
+mod waf_wide_charset {
+    use super::*;
+    use http_body_util::{StreamBody, combinators::BoxBody};
+    use hyper::body::Frame;
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn encode(text: &str, charset: &str, bom: bool) -> Vec<u8> {
+        assert!(
+            text.is_ascii(),
+            "transport fixtures use ASCII policy markers"
+        );
+        let (width, big, prefix): (usize, bool, &[u8]) = match charset {
+            "utf-16le" => (2, false, &[0xFF, 0xFE]),
+            "utf-16be" => (2, true, &[0xFE, 0xFF]),
+            "utf-32le" => (4, false, &[0xFF, 0xFE, 0, 0]),
+            "utf-32be" => (4, true, &[0, 0, 0xFE, 0xFF]),
+            "utf-8" => return text.as_bytes().to_vec(),
+            _ => panic!("unknown fixture charset"),
+        };
+        let mut body = if bom { prefix.to_vec() } else { Vec::new() };
+        for ch in text.chars() {
+            let bytes = if big {
+                (ch as u32).to_be_bytes()
+            } else {
+                (ch as u32).to_le_bytes()
+            };
+            body.extend_from_slice(if big {
+                &bytes[4 - width..]
+            } else {
+                &bytes[..width]
+            });
+        }
+        body
+    }
+
+    async fn backend_response(
+        request: Request<Incoming>,
+        hits: Arc<AtomicUsize>,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let (parts, body) = request.into_parts();
+        let received = body.collect().await.unwrap().to_bytes();
+        hits.fetch_add(1, Ordering::SeqCst);
+        let header = |name: &str| parts.headers.get(name).and_then(|v| v.to_str().ok());
+        let status: u16 = header("x-fixture-status").unwrap_or("200").parse().unwrap();
+        let bytes = if parts.method == http::Method::HEAD || matches!(status, 204 | 205 | 304) {
+            Vec::new()
+        } else if let Some(value) = header("x-fixture-value") {
+            encode(
+                value,
+                header("x-fixture-charset").unwrap_or("utf-8"),
+                header("x-fixture-bom") == Some("true"),
+            )
+        } else {
+            received.to_vec()
+        };
+        let body = if header("x-fixture-chunked") == Some("true") {
+            let frames: Vec<_> = bytes
+                .chunks(3)
+                .map(|chunk| Ok::<_, Infallible>(Frame::data(Bytes::copy_from_slice(chunk))))
+                .collect();
+            StreamBody::new(futures_util::stream::iter(frames)).boxed()
+        } else {
+            Full::new(Bytes::from(bytes)).boxed()
+        };
+        Ok(Response::builder()
+            .status(status)
+            .header(
+                "content-type",
+                header("x-fixture-type").unwrap_or("text/plain"),
+            )
+            .body(body)
+            .unwrap())
+    }
+
+    async fn exercise(http2: bool) {
+        let reservation = crate::scaffolding::ports::reserve_port().await.unwrap();
+        let port = reservation.port;
+        let listener = reservation.into_listener();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let backend_hits = Arc::clone(&hits);
+        let backend = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let hits = Arc::clone(&backend_hits);
+                tokio::spawn(async move {
+                    let service =
+                        service_fn(move |request| backend_response(request, Arc::clone(&hits)));
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        for mode in ["buffer", "stream"] {
+            let config = json!({
+                "version": "1",
+                "proxies": [{
+                    "id": "wide", "listen_path": "/", "backend_scheme": "http",
+                    "backend_host": "127.0.0.1", "backend_port": port,
+                    "strip_listen_path": false, "pool_enable_http2": false,
+                    "response_body_mode": mode,
+                    "plugins": [{"plugin_config_id": "wide-waf"}]
+                }],
+                "consumers": [], "upstreams": [],
+                "plugin_configs": [{
+                    "id": "wide-waf", "plugin_name": "waf", "scope": "proxy",
+                    "proxy_id": "wide", "enabled": true,
+                    "config": {
+                        "include_default_rules": false,
+                        "response_inspection": true, "response_body_inspection": true,
+                        "custom_rules": [
+                            {
+                                "id": "WIDE-REQUEST", "name": "request marker",
+                                "category": "custom", "severity": "high", "target": "body_text",
+                                "match_kind": "contains", "pattern": "request-marker", "action": "enforce"
+                            },
+                            {
+                                "id": "WIDE-RESPONSE", "name": "response marker",
+                                "category": "custom", "severity": "high", "target": "response_body",
+                                "match_kind": "contains", "pattern": "response-marker", "action": "enforce"
+                            },
+                            {
+                                "id": "FE-ENCODING-001", "name": "encoding policy",
+                                "category": "encoding_evasion", "severity": "medium", "target": "full_url",
+                                "match_kind": "contains", "pattern": "unused-url-marker", "action": "enforce"
+                            }
+                        ]
+                    }
+                }]
+            });
+            let mut gateway = TestGateway::builder()
+                .mode_file(serde_yaml::to_string(&config).unwrap())
+                .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+                .log_level("warn")
+                .spawn()
+                .await
+                .unwrap();
+            let builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
+            let client = if http2 {
+                builder.http2_prior_knowledge()
+            } else {
+                builder.http1_only()
+            }
+            .build()
+            .unwrap();
+            for charset in ["utf-8", "utf-16le", "utf-16be", "utf-32le", "utf-32be"] {
+                for presentation in ["undeclared", "declared", "bom"] {
+                    let content_type = if presentation == "declared" {
+                        format!("application/json; charset={charset}")
+                    } else {
+                        "application/json".to_string()
+                    };
+                    let bom = presentation == "bom";
+                    let before = hits.load(Ordering::SeqCst);
+                    let body = encode(r#"{"value":"request%2Dmarker"}"#, charset, bom);
+                    // Unknown-length uploads split code units across DATA/chunks.
+                    let chunks: Vec<_> = body
+                        .chunks(3)
+                        .map(|chunk| Ok::<_, Infallible>(Bytes::copy_from_slice(chunk)))
+                        .collect();
+                    let response = client
+                        .post(gateway.proxy_url("/inspect"))
+                        .header("content-type", &content_type)
+                        .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
+                            chunks,
+                        )))
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        response.status(),
+                        403,
+                        "request {charset}/{presentation}/{mode}"
+                    );
+                    assert_eq!(
+                        hits.load(Ordering::SeqCst),
+                        before,
+                        "blocked upload reached origin"
+                    );
+
+                    for value in ["response%2Dmarker", "value=%00", "ordinary response"] {
+                        let before = hits.load(Ordering::SeqCst);
+                        let response = client
+                            .post(gateway.proxy_url("/inspect"))
+                            .header("content-type", "text/plain; charset=utf-8")
+                            .header("x-fixture-charset", charset)
+                            .header("x-fixture-bom", if bom { "true" } else { "false" })
+                            .header("x-fixture-type", &content_type)
+                            .header("x-fixture-value", value)
+                            .header(
+                                "x-fixture-chunked",
+                                if mode == "stream" { "true" } else { "false" },
+                            )
+                            .body("ordinary request")
+                            .send()
+                            .await
+                            .unwrap();
+                        assert_eq!(hits.load(Ordering::SeqCst), before + 1);
+                        let benign = value == "ordinary response";
+                        assert_eq!(response.status(), if benign { 200 } else { 403 });
+                        let bytes = response.bytes().await.unwrap();
+                        if benign {
+                            assert_eq!(bytes.as_ref(), encode(value, charset, bom));
+                        } else {
+                            assert!(!bytes.windows(6).any(|window| window == b"marker"));
+                        }
+                    }
+                }
+                // Successful uploads prove byte preservation and origin reachability.
+                let body = encode("ordinary request", charset, false);
+                let before = hits.load(Ordering::SeqCst);
+                let response = client
+                    .post(gateway.proxy_url("/inspect"))
+                    .header("content-type", "text/plain")
+                    .body(body.clone())
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 200);
+                assert_eq!(response.bytes().await.unwrap().as_ref(), body);
+                assert_eq!(hits.load(Ordering::SeqCst), before + 1);
+            }
+            // Excluded media stays releasable even on a streaming route.
+            let response = client
+                .get(gateway.proxy_url("/inspect"))
+                .header("x-fixture-type", "application/octet-stream")
+                .header("x-fixture-charset", "utf-16le")
+                .header("x-fixture-value", "response-marker")
+                .header("x-fixture-chunked", "true")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            assert_eq!(
+                response.bytes().await.unwrap().as_ref(),
+                encode("response-marker", "utf-16le", false)
+            );
+            for (method, status) in [
+                (reqwest::Method::HEAD, 200),
+                (reqwest::Method::GET, 204),
+                (reqwest::Method::GET, 205),
+                (reqwest::Method::GET, 304),
+            ] {
+                let response = client
+                    .request(method, gateway.proxy_url("/inspect"))
+                    .header("x-fixture-type", "text/plain; charset=utf-7")
+                    .header("x-fixture-status", status.to_string())
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), status);
+                assert!(response.bytes().await.unwrap().is_empty());
+            }
+            gateway.shutdown();
+        }
+        backend.abort();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn waf_wide_charset_http1_buffered_and_streaming() {
+        exercise(false).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn waf_wide_charset_http2_buffered_and_streaming() {
+        exercise(true).await;
+    }
+}

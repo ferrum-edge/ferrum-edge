@@ -49,6 +49,7 @@ async fn list_tables(sqlite_path: &str) -> Result<HashSet<String>, Box<dyn std::
 fn run_migrate(action: &str, db_type: &str, db_url: &str) -> std::process::Output {
     let bin = binary_path();
     Command::new(bin)
+        .arg("run")
         .env("FERRUM_MODE", "migrate")
         .env("FERRUM_MIGRATE_ACTION", action)
         .env("FERRUM_DB_TYPE", db_type)

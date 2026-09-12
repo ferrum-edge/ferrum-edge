@@ -446,6 +446,105 @@ pub async fn start_redpanda_container() -> Result<RedpandaContainer, BoxError> {
     })
 }
 
+/// TLS listeners have their own advertised addresses, so metadata cannot move
+/// the client onto the fixture's plaintext management/consume listener.
+pub struct RedpandaTlsContainer {
+    pub broker: RedpandaContainer,
+    pub ssl_bootstrap: String,
+    pub sasl_ssl_bootstrap: String,
+    pub ca_path: std::path::PathBuf,
+    pub wrong_ca_path: std::path::PathBuf,
+    _certificates: tempfile::TempDir,
+}
+
+pub async fn start_redpanda_tls_container() -> Result<RedpandaTlsContainer, BoxError> {
+    use rcgen::{CertificateParams, KeyPair};
+
+    // Fresh self-signed trust anchors for this fixture only; the unrelated
+    // certificate proves rejection by verification, not a missing-file error.
+    let certificates = tempfile::tempdir()?;
+    let key = KeyPair::generate()?;
+    let cert =
+        CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()])?.self_signed(&key)?;
+    let wrong_cert = CertificateParams::new(vec!["untrusted.example".into()])?
+        .self_signed(&KeyPair::generate()?)?;
+    let ca_path = certificates.path().join("ca.pem");
+    let wrong_ca_path = certificates.path().join("wrong-ca.pem");
+    std::fs::write(&ca_path, cert.pem())?;
+    std::fs::write(&wrong_ca_path, wrong_cert.pem())?;
+
+    let (container, ports) = retry_on_host_port_collision(|| async {
+        let ports = [allocate_host_port()?, allocate_host_port()?, allocate_host_port()?];
+        let config = serde_json::json!({
+            "redpanda": {
+                "data_directory": "/var/lib/redpanda/data",
+                "node_id": 0,
+                "developer_mode": true,
+                "seed_servers": [],
+                "rpc_server": {"address": "0.0.0.0", "port": 33145},
+                "advertised_rpc_api": {"address": "127.0.0.1", "port": 33145},
+                "admin": [{"address": "0.0.0.0", "port": 9644}],
+                "auto_create_topics_enabled": false,
+                "kafka_enable_authorization": false,
+                "kafka_api": [
+                    {"name": "internal", "address": "0.0.0.0", "port": 9092, "authentication_method": "none"},
+                    {"name": "external", "address": "0.0.0.0", "port": 9093, "authentication_method": "none"},
+                    {"name": "ssl", "address": "0.0.0.0", "port": 9094, "authentication_method": "none"},
+                    {"name": "sasl", "address": "0.0.0.0", "port": 9095, "authentication_method": "sasl"}
+                ],
+                "advertised_kafka_api": [
+                    {"name": "internal", "address": "127.0.0.1", "port": 9092},
+                    {"name": "external", "address": "127.0.0.1", "port": ports[0]},
+                    {"name": "ssl", "address": "127.0.0.1", "port": ports[1]},
+                    {"name": "sasl", "address": "127.0.0.1", "port": ports[2]}
+                ],
+                "kafka_api_tls": [
+                    {"name": "ssl", "enabled": true, "require_client_auth": false,
+                     "cert_file": "/tmp/broker.pem", "key_file": "/tmp/broker.key"},
+                    {"name": "sasl", "enabled": true, "require_client_auth": false,
+                     "cert_file": "/tmp/broker.pem", "key_file": "/tmp/broker.key"}
+                ]
+            },
+            "rpk": {"kafka_api": {"brokers": ["127.0.0.1:9092"]}}
+        });
+        let image = GenericImage::new("redpandadata/redpanda", "v24.2.4")
+            .with_entrypoint("/bin/sh")
+            .with_exposed_port(9093.tcp())
+            .with_exposed_port(9094.tcp())
+            .with_exposed_port(9095.tcp())
+            .with_mapped_port(ports[0], 9093.tcp())
+            .with_mapped_port(ports[1], 9094.tcp())
+            .with_mapped_port(ports[2], 9095.tcp())
+            .with_copy_to("/tmp/kafka-tls.yaml", serde_json::to_vec(&config)?)
+            .with_copy_to("/tmp/broker.pem", cert.pem().into_bytes())
+            .with_copy_to("/tmp/broker.key", key.serialize_pem().into_bytes())
+            // Docker copies files as root. rpk atomically rewrites/chowns its
+            // config, so first create a copy owned by the image's redpanda user.
+            .with_cmd(["-ec", "cp /tmp/kafka-tls.yaml /tmp/kafka-run.yaml\nexec rpk redpanda start --config /tmp/kafka-run.yaml --overprovisioned --smp 1 --memory 512M --reserve-memory 0M --check=false"]);
+        let container = start_within_deadline("Redpanda TLS", image.start()).await?;
+        Ok((container, ports))
+    }).await?;
+    let broker = RedpandaContainer {
+        container,
+        bootstrap: format!("127.0.0.1:{}", ports[0]),
+    };
+    wait_redpanda_ready(&broker.bootstrap).await?;
+    let created = broker.exec_sh(
+        "rpk security user create ferrum-test -p fixture-password --mechanism SCRAM-SHA-256 -X admin.hosts=127.0.0.1:9644"
+    ).await?;
+    if created.exit_code != Some(0) {
+        return Err("Redpanda TLS: could not create fixture SCRAM user".into());
+    }
+    Ok(RedpandaTlsContainer {
+        broker,
+        ssl_bootstrap: format!("127.0.0.1:{}", ports[1]),
+        sasl_ssl_bootstrap: format!("127.0.0.1:{}", ports[2]),
+        ca_path,
+        wrong_ca_path,
+        _certificates: certificates,
+    })
+}
+
 /// Poll librdkafka metadata until the broker answers (or 30s elapses).
 async fn wait_redpanda_ready(bootstrap: &str) -> Result<(), BoxError> {
     for _ in 0..60 {

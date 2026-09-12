@@ -32,7 +32,7 @@
 //! See [`GrpcStep`] for the full step set.
 
 use super::http2::{
-    ConnectionSettings, H2Step, MatchHeaders, ReceivedStream, ScriptedH2Backend,
+    AcceptRecord, ConnectionSettings, H2Step, MatchHeaders, ReceivedStream, ScriptedH2Backend,
     ScriptedH2BackendBuilder,
 };
 use bytes::{BufMut, Bytes, BytesMut};
@@ -302,6 +302,12 @@ impl ScriptedGrpcBackend {
     /// Non-empty after a script step failed to execute.
     pub async fn step_errors(&self) -> Vec<String> {
         self.inner.step_errors().await
+    }
+
+    /// Bounded, non-payload ledger of accepted connections (issue #4720). See
+    /// [`ScriptedH2Backend::accept_log`].
+    pub fn accept_log(&self) -> Vec<AcceptRecord> {
+        self.inner.accept_log()
     }
 
     /// Panic if any step failed.

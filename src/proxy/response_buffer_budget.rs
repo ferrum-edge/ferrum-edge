@@ -1477,6 +1477,7 @@ pub(crate) struct BoundedResponseBodySink {
     ceiling: usize,
     data: Vec<u8>,
     overflowed: bool,
+    size_refused_at: Option<usize>,
 }
 
 impl BoundedResponseBodySink {
@@ -1485,6 +1486,7 @@ impl BoundedResponseBodySink {
             ceiling,
             data: Vec::new(),
             overflowed: false,
+            size_refused_at: None,
         }
     }
 
@@ -1513,6 +1515,11 @@ impl BoundedResponseBodySink {
         self.overflowed
     }
 
+    /// Produced length including the first refused write, not the full document.
+    pub(crate) fn size_refused_at(&self) -> Option<usize> {
+        self.size_refused_at
+    }
+
     /// After `reserve_exact`, refuse immediately if the allocator reported more
     /// capacity than this sink's admitted ceiling. Sticky-overflow and release
     /// the partial allocation so the over-ceiling bytes cannot outlive the
@@ -1539,6 +1546,7 @@ impl BoundedResponseBodySink {
         if prospective > self.ceiling {
             // Release what was written: the output is refused, so retaining a
             // partial buffer would be resident bytes nobody will ever use.
+            self.size_refused_at = Some(prospective);
             self.overflowed = true;
             self.data = Vec::new();
             return false;

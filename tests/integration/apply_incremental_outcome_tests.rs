@@ -2020,7 +2020,8 @@ async fn ldap_plaintext_reload_keeps_last_known_good_dial_policy() {
     plugin.plugin_name = "ldap_auth".to_string();
     plugin.config = serde_json::json!({
         "ldap_url": "ldaps://directory.example.test:636",
-        "bind_dn_template": "uid={username},ou=users,dc=example,dc=test"
+        "bind_dn_template": "uid={username},ou=users,dc=example,dc=test",
+        "canonical_identity_attribute": "uid"
     });
     let valid = GatewayConfig {
         proxies: vec![test_proxy("p1", "/api")],
@@ -2044,7 +2045,8 @@ async fn ldap_plaintext_reload_keeps_last_known_good_dial_policy() {
     let mut invalid = valid;
     invalid.plugin_configs[0].config = serde_json::json!({
         "ldap_url": "ldap://directory.example.test:389",
-        "bind_dn_template": "uid={username},ou=users,dc=example,dc=test"
+        "bind_dn_template": "uid={username},ou=users,dc=example,dc=test",
+        "canonical_identity_attribute": "uid"
     });
     invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
     let outcome = state.update_config(invalid);

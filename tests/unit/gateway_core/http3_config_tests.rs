@@ -285,3 +285,227 @@ fn validation_refuses_a_header_policy_above_the_field_count_bound() {
     assert!(validate_h3_field_section_limits(32_768).is_ok());
     assert!(validate_h3_field_section_limits(1_048_575).is_err());
 }
+
+// ── Backend-plane transport parameters (issues #4755 and #4756) ───────────
+
+/// The backend pools must default to the documented backend flow-control
+/// windows, not to the hardened frontend triple they used to share.
+#[test]
+fn backend_windows_default_to_the_documented_backend_constants() {
+    use ferrum_edge::http3::config::{
+        H3_RECEIVE_WINDOW_DEFAULT, H3_SEND_WINDOW_DEFAULT, H3_STREAM_RECEIVE_WINDOW_DEFAULT,
+    };
+
+    for config in [
+        Http3ServerConfig::default(),
+        Http3ServerConfig::from_env_config(&EnvConfig::default()),
+    ] {
+        assert_eq!(
+            config.backend_stream_receive_window,
+            H3_STREAM_RECEIVE_WINDOW_DEFAULT
+        );
+        assert_eq!(config.backend_receive_window, H3_RECEIVE_WINDOW_DEFAULT);
+        assert_eq!(config.backend_send_window, H3_SEND_WINDOW_DEFAULT);
+
+        // And they are genuinely distinct from the frontend triple, which is
+        // the whole point of the split.
+        assert_eq!(
+            config.stream_receive_window,
+            H3_FRONTEND_STREAM_RECEIVE_WINDOW
+        );
+        assert_ne!(
+            config.backend_stream_receive_window,
+            config.stream_receive_window
+        );
+        assert_ne!(config.backend_receive_window, config.receive_window);
+        assert_ne!(config.backend_send_window, config.send_window);
+    }
+}
+
+/// Tuning one trust plane must not move the other.
+#[test]
+fn frontend_and_backend_window_overrides_are_independent() {
+    use ferrum_edge::http3::config::{
+        H3_RECEIVE_WINDOW_DEFAULT, H3_SEND_WINDOW_DEFAULT, H3_STREAM_RECEIVE_WINDOW_DEFAULT,
+    };
+
+    let frontend_only = Http3ServerConfig::from_env_config(&EnvConfig {
+        http3_stream_receive_window: 1_048_576,
+        http3_receive_window: 4_194_304,
+        http3_send_window: 4_194_304,
+        ..Default::default()
+    });
+    assert_eq!(frontend_only.stream_receive_window, 1_048_576);
+    assert_eq!(frontend_only.receive_window, 4_194_304);
+    assert_eq!(frontend_only.send_window, 4_194_304);
+    assert_eq!(
+        frontend_only.backend_stream_receive_window,
+        H3_STREAM_RECEIVE_WINDOW_DEFAULT
+    );
+    assert_eq!(
+        frontend_only.backend_receive_window,
+        H3_RECEIVE_WINDOW_DEFAULT
+    );
+    assert_eq!(frontend_only.backend_send_window, H3_SEND_WINDOW_DEFAULT);
+
+    let backend_only = Http3ServerConfig::from_env_config(&EnvConfig {
+        http3_backend_stream_receive_window: 16_777_216,
+        http3_backend_receive_window: 67_108_864,
+        http3_backend_send_window: 16_777_216,
+        ..Default::default()
+    });
+    assert_eq!(backend_only.backend_stream_receive_window, 16_777_216);
+    assert_eq!(backend_only.backend_receive_window, 67_108_864);
+    assert_eq!(backend_only.backend_send_window, 16_777_216);
+    assert_eq!(
+        backend_only.stream_receive_window,
+        H3_FRONTEND_STREAM_RECEIVE_WINDOW
+    );
+    assert_eq!(backend_only.receive_window, H3_FRONTEND_RECEIVE_WINDOW);
+    assert_eq!(backend_only.send_window, H3_FRONTEND_SEND_WINDOW);
+}
+
+/// The parameters the backend pools resolve are the backend windows and the
+/// configured `FERRUM_HTTP3_IDLE_TIMEOUT` — never the frontend windows and
+/// never quinn's implicit 30 s idle default.
+#[test]
+fn backend_transport_params_carry_the_backend_windows_and_idle_timeout() {
+    use ferrum_edge::http3::config::H3BackendTransportParams;
+
+    let config = Http3ServerConfig::from_env_config(&EnvConfig {
+        http3_idle_timeout: 90,
+        http3_initial_mtu: 1400,
+        // Frontend values that must NOT leak onto the backend plane.
+        http3_stream_receive_window: 262_144,
+        http3_receive_window: 2_097_152,
+        http3_send_window: 2_097_152,
+        http3_backend_stream_receive_window: 8_388_608,
+        http3_backend_receive_window: 33_554_432,
+        http3_backend_send_window: 8_388_608,
+        ..Default::default()
+    });
+
+    let params = H3BackendTransportParams::resolve(&config).expect("resolvable parameters");
+
+    assert_eq!(params.initial_mtu, 1400);
+    assert_eq!(
+        params.stream_receive_window,
+        quinn::VarInt::from_u64(8_388_608).unwrap()
+    );
+    assert_eq!(
+        params.receive_window,
+        quinn::VarInt::from_u64(33_554_432).unwrap()
+    );
+    assert_eq!(params.send_window, 8_388_608);
+    assert_eq!(
+        params.max_idle_timeout,
+        Some(quinn::IdleTimeout::try_from(Duration::from_secs(90)).unwrap()),
+        "the configured idle timeout must reach the backend transport config"
+    );
+}
+
+/// `FERRUM_HTTP3_IDLE_TIMEOUT=0` disables the idle timer on the backend plane
+/// too (RFC 9000 §10.1), rather than silently meaning "30 seconds".
+#[test]
+fn backend_zero_idle_timeout_disables_the_idle_timer() {
+    use ferrum_edge::http3::config::H3BackendTransportParams;
+
+    let config = Http3ServerConfig::from_env_config(&EnvConfig {
+        http3_idle_timeout: 0,
+        ..Default::default()
+    });
+
+    let params = H3BackendTransportParams::resolve(&config).expect("resolvable parameters");
+    assert_eq!(params.max_idle_timeout, None);
+}
+
+/// The CONNECT-UDP frontend derivation must not follow the backend plane: the
+/// backend pools keep the configured value verbatim.
+#[test]
+fn connect_udp_idle_floor_does_not_reach_the_backend_plane() {
+    use ferrum_edge::http3::config::H3BackendTransportParams;
+
+    let config = Http3ServerConfig::from_env_config(&EnvConfig {
+        http3_idle_timeout: 30,
+        http3_connect_udp_enabled: true,
+        http3_connect_udp_idle_timeout_seconds: 120,
+        ..Default::default()
+    });
+
+    assert_eq!(config.frontend_idle_timeout, Duration::from_secs(120));
+    assert_eq!(config.idle_timeout, Duration::from_secs(30));
+
+    let params = H3BackendTransportParams::resolve(&config).expect("resolvable parameters");
+    assert_eq!(
+        params.max_idle_timeout,
+        Some(quinn::IdleTimeout::try_from(Duration::from_secs(30)).unwrap())
+    );
+}
+
+/// The resolved parameters are actually installed on the `quinn::TransportConfig`
+/// the backend pools dial with. `TransportConfig`'s fields are private, so its
+/// `Debug` rendering is the only observation point.
+#[test]
+fn backend_transport_config_installs_the_resolved_parameters() {
+    use ferrum_edge::http3::config::build_backend_transport_config;
+
+    let config = Http3ServerConfig::from_env_config(&EnvConfig {
+        http3_idle_timeout: 45,
+        http3_backend_stream_receive_window: 8_388_608,
+        http3_backend_receive_window: 33_554_432,
+        http3_backend_send_window: 8_388_608,
+        ..Default::default()
+    });
+
+    let transport = build_backend_transport_config(&config).expect("buildable transport config");
+    let rendered = format!("{transport:?}");
+
+    assert!(
+        rendered.contains("stream_receive_window: 8388608"),
+        "backend stream receive window missing: {rendered}"
+    );
+    assert!(
+        rendered.contains("receive_window: 33554432"),
+        "backend connection receive window missing: {rendered}"
+    );
+    assert!(
+        rendered.contains("send_window: 8388608"),
+        "backend send window missing: {rendered}"
+    );
+    assert!(
+        rendered.contains("max_idle_timeout: Some(45000)"),
+        "configured idle timeout missing: {rendered}"
+    );
+}
+
+/// `H3_SEND_WINDOW_DEFAULT` had no runtime consumer at all before the split.
+/// Pin every backend constant to a live consumer so the dead-constant
+/// condition cannot recur.
+#[test]
+fn every_backend_window_constant_has_a_runtime_consumer() {
+    use ferrum_edge::http3::config::{
+        H3_RECEIVE_WINDOW_DEFAULT, H3_SEND_WINDOW_DEFAULT, H3_STREAM_RECEIVE_WINDOW_DEFAULT,
+        build_backend_transport_config,
+    };
+
+    let transport = build_backend_transport_config(&Http3ServerConfig::default())
+        .expect("buildable transport config");
+    let rendered = format!("{transport:?}");
+
+    let stream = H3_STREAM_RECEIVE_WINDOW_DEFAULT;
+    let connection = H3_RECEIVE_WINDOW_DEFAULT;
+    let send = H3_SEND_WINDOW_DEFAULT;
+
+    assert!(
+        rendered.contains(&format!("stream_receive_window: {stream}")),
+        "H3_STREAM_RECEIVE_WINDOW_DEFAULT has no runtime consumer: {rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("receive_window: {connection}")),
+        "H3_RECEIVE_WINDOW_DEFAULT has no runtime consumer: {rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("send_window: {send}")),
+        "H3_SEND_WINDOW_DEFAULT has no runtime consumer: {rendered}"
+    );
+}

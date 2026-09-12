@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 
-use dashmap::DashMap;
 use ferrum_edge::config::types::{
     LoadBalancerAlgorithm, UPSTREAM_TARGET_SERVICE_NAME_TAG, UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG,
     UPSTREAM_TARGET_SERVICE_PORT_TAG,
@@ -10,6 +9,7 @@ use ferrum_edge::config::types::{
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
+use ferrum_edge::health_check::ActiveUnhealthyTargets;
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::load_balancer::{HealthContext, LoadBalancerCache, target_key};
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
@@ -302,7 +302,7 @@ fn virtual_service_tcp_weighted_split_failover_skips_unhealthy_target() {
     let lb = LoadBalancerCache::new(&result.config);
     let namespaced_id =
         ferrum_edge::config::db_backend::namespaced_runtime_key("default", &upstream.id);
-    let active_unhealthy = DashMap::new();
+    let active_unhealthy = ActiveUnhealthyTargets::new();
     active_unhealthy.insert(target_key(&namespaced_id, unhealthy), 1u64);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,

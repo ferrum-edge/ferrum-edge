@@ -100,6 +100,31 @@ fn canonical_query_string(raw_query: &str) -> String {
     canonical
 }
 
+/// The `Host` field value the request actually carries on the wire, which is
+/// what SigV4 signs.
+///
+/// [`Url::host_str`] is the host alone. An endpoint with a NONDEFAULT port —
+/// a LocalStack or VPC-internal Lambda endpoint, a Bedrock gateway, a test
+/// mock — still sends `host:port` in the `Host` field, and a verifying
+/// endpoint recomputes the canonical request over that exact value, so signing
+/// the bare hostname produces a signature the service rejects.
+///
+/// [`Url::port`] is exactly "the port that appears in the authority": the URL
+/// parser normalizes a scheme's default port away at parse time, so `:443` on
+/// `https` and `:80` on `http` are already absent here. That is the same rule
+/// the AWS SDKs apply (botocore's `_host_from_url` appends the port only when
+/// it differs from the scheme default). IPv6 literals keep their brackets
+/// because `host_str` returns the serialized host form.
+fn canonical_signed_host(parsed_url: &Url) -> Result<String, String> {
+    let host = parsed_url
+        .host_str()
+        .ok_or_else(|| "AWS SigV4 request URL must include a host".to_string())?;
+    match parsed_url.port() {
+        Some(port) => Ok(format!("{host}:{port}")),
+        None => Ok(host.to_string()),
+    }
+}
+
 /// SHA-256 hash of data, returned as lowercase hex.
 pub fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -157,10 +182,7 @@ pub fn sign_request(
     let parsed_url =
         Url::parse(url_str).map_err(|e| format!("AWS SigV4 invalid request URL: {e}"))?;
 
-    let host = parsed_url
-        .host_str()
-        .ok_or_else(|| "AWS SigV4 request URL must include a host".to_string())?
-        .to_string();
+    let host = canonical_signed_host(&parsed_url)?;
 
     let canonical_uri = uri_encode(parsed_url.path(), false);
     let canonical_querystring = canonical_query_string(parsed_url.query().unwrap_or(""));

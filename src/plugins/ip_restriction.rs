@@ -10,11 +10,13 @@
 //! canonicalized once by the request/stream context and reused by every
 //! `ip_restriction` instance.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -154,7 +156,7 @@ impl IpRestriction {
     /// Check a context-cached, canonical client IP against the compiled policy.
     fn check_ip(&self, client_ip: Option<IpAddr>, client_ip_label: &str) -> PluginResult {
         let Some(client_ip) = client_ip else {
-            warn!(
+            warn_sampled!(
                 client_ip = %client_ip_label,
                 plugin = "ip_restriction",
                 reason = "unparseable_client_ip",
@@ -245,7 +247,12 @@ impl Plugin for IpRestriction {
 }
 
 fn reject_not_allowed(client_ip: &str) -> PluginResult {
-    warn!(client_ip = %client_ip, plugin = "ip_restriction", reason = "not_in_allow_list", "IP address not in allow list");
+    warn_sampled!(
+        client_ip = %client_ip,
+        plugin = "ip_restriction",
+        reason = "not_in_allow_list",
+        "IP address not in allow list"
+    );
     PluginResult::Reject {
         status_code: 403,
         body: r#"{"error":"IP address not allowed"}"#.to_string(),
@@ -254,7 +261,12 @@ fn reject_not_allowed(client_ip: &str) -> PluginResult {
 }
 
 fn reject_denied(client_ip: &str) -> PluginResult {
-    warn!(client_ip = %client_ip, plugin = "ip_restriction", reason = "ip_denied", "IP address denied");
+    warn_sampled!(
+        client_ip = %client_ip,
+        plugin = "ip_restriction",
+        reason = "ip_denied",
+        "IP address denied"
+    );
     PluginResult::Reject {
         status_code: 403,
         body: r#"{"error":"IP address denied"}"#.to_string(),

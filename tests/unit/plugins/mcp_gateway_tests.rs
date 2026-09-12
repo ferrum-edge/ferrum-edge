@@ -1,9 +1,8 @@
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
     build_aggregate_sse_reject_for_test, drop_mcp_sse_stream_for_test,
-    mcp_aggregate_sse_listener_is_staged_for_test, mcp_sse_publication_is_pending_for_test,
-    mcp_sse_stream_is_open_for_test, reject_headers_select_event_stream_for_test,
-    take_mcp_aggregate_sse_listener_for_test,
+    mcp_aggregate_sse_listener_is_staged_for_test, mcp_sse_stream_is_open_for_test,
+    reject_headers_select_event_stream_for_test, take_mcp_aggregate_sse_listener_for_test,
 };
 use ferrum_edge::config::types::{BackendScheme, BackendTlsConfig};
 use ferrum_edge::plugins::{
@@ -19,7 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::plugin_utils::create_test_context;
+use super::plugin_utils::{create_test_consumer, create_test_context};
 
 fn transparent_config(upstream_url: &str) -> Value {
     json!({
@@ -3223,7 +3222,7 @@ async fn aggregate_unsupported_http_methods_fail_closed() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     let (status, body, _) = reject_json(result);
     assert_eq!(status, 405);
-    assert_eq!(body["error"], "unsupported MCP aggregate HTTP method");
+    assert_eq!(body["error"], "unsupported MCP HTTP method");
     assert_eq!(
         ctx.metadata.get("mcp.route_decision").map(String::as_str),
         Some("deny")
@@ -8205,57 +8204,65 @@ async fn validate_tool_results_rejects_malformed_json_rpc_protocol_errors() {
     .unwrap()
     .unwrap();
     let session_id = initialize(&plugin).await;
+    // An output-validation refusal names the ADMITTED REQUEST id (JSON-RPC 2.0
+    // section 5): the gateway knows exactly which call is still pending, and the
+    // id a malformed upstream envelope claims is untrusted — reflecting it would
+    // answer an id the client never sent. Only a request that admitted no
+    // singleton id is eligible for `id: null`.
     let malformed = [
         (
             "non-object envelope",
             json!(["not", "a", "response"]),
-            Value::Null,
+            json!(161),
         ),
         (
             "missing jsonrpc",
             json!({"id": 1, "error": {"code": -32603, "message": "bad"}}),
-            json!(1),
+            json!(163),
         ),
         (
             "wrong jsonrpc",
             json!({"jsonrpc": "1.0", "id": 2, "error": {"code": -32603, "message": "bad"}}),
-            json!(2),
+            json!(165),
         ),
         (
             "missing id",
             json!({"jsonrpc": "2.0", "error": {"code": -32603, "message": "bad"}}),
-            Value::Null,
+            json!(167),
         ),
         (
             "object id",
             json!({"jsonrpc": "2.0", "id": {}, "error": {"code": -32603, "message": "bad"}}),
-            Value::Null,
+            json!(169),
         ),
         (
             "array id",
             json!({"jsonrpc": "2.0", "id": [], "error": {"code": -32603, "message": "bad"}}),
-            Value::Null,
+            json!(171),
         ),
         (
             "boolean id",
             json!({"jsonrpc": "2.0", "id": true, "error": {"code": -32603, "message": "bad"}}),
-            Value::Null,
+            json!(173),
         ),
         (
             "non-integer error code",
             json!({"jsonrpc": "2.0", "id": 3, "error": {"code": 1.5, "message": "bad"}}),
-            json!(3),
+            json!(175),
         ),
         (
             "non-string error message",
             json!({"jsonrpc": "2.0", "id": 4, "error": {"code": -32603, "message": 4}}),
-            json!(4),
+            json!(177),
         ),
     ];
 
     for (offset, (case, upstream_value, expected_id)) in malformed.into_iter().enumerate() {
-        let mut ctx =
-            route_validated_tool_call(&plugin, &session_id, 160 + offset as i64 * 2).await;
+        // The table names the id of the request THIS iteration dispatches:
+        // `route_validated_tool_call` sends its tools/call under `base + 1`.
+        let base = 160 + offset as i64 * 2;
+        assert_eq!(expected_id, json!(base + 1), "{case}");
+        let mut ctx = route_validated_tool_call(&plugin, &session_id, base).await;
         let upstream_response = serde_json::to_vec(&upstream_value).unwrap();
         let headers = known_json_response_headers(&upstream_response);
         let (status, body, _) = reject_json(
@@ -8320,42 +8327,47 @@ async fn validate_tool_results_rejects_malformed_json_rpc_result_envelopes() {
             "conditions": "Clear"
         }
     });
+    // The same contract as the protocol-error corpus above: the refusal carries
+    // the admitted REQUEST id, never the id the malformed envelope claimed.
     let malformed = [
         (
             "missing jsonrpc",
             json!({"id": 157, "result": valid_result}),
-            json!(157),
+            json!(221),
         ),
         (
             "wrong jsonrpc",
             json!({"jsonrpc": "1.0", "id": 158, "result": valid_result}),
-            json!(158),
+            json!(223),
         ),
         (
             "missing id",
             json!({"jsonrpc": "2.0", "result": valid_result}),
-            Value::Null,
+            json!(225),
         ),
         (
             "object id",
             json!({"jsonrpc": "2.0", "id": {}, "result": valid_result}),
-            Value::Null,
+            json!(227),
         ),
         (
             "array id",
             json!({"jsonrpc": "2.0", "id": [], "result": valid_result}),
-            Value::Null,
+            json!(229),
         ),
         (
             "boolean id",
             json!({"jsonrpc": "2.0", "id": false, "result": valid_result}),
-            Value::Null,
+            json!(231),
         ),
     ];
 
     for (offset, (case, upstream_value, expected_id)) in malformed.into_iter().enumerate() {
-        let mut ctx =
-            route_validated_tool_call(&plugin, &session_id, 220 + offset as i64 * 2).await;
+        // The table names the id of the request THIS iteration dispatches:
+        // `route_validated_tool_call` sends its tools/call under `base + 1`.
+        let base = 220 + offset as i64 * 2;
+        assert_eq!(expected_id, json!(base + 1), "{case}");
+        let mut ctx = route_validated_tool_call(&plugin, &session_id, base).await;
         let upstream_response = serde_json::to_vec(&upstream_value).unwrap();
         let headers = known_json_response_headers(&upstream_response);
         let (status, body, _) = reject_json(
@@ -8387,6 +8399,7 @@ async fn validate_tool_results_rejects_malformed_and_oversized_results() {
     );
     assert_eq!(status, 200);
     assert_eq!(body["error"]["code"], -32012);
+    assert_eq!(body["id"], json!(161));
 
     let oversized = vec![b'x'; 8 * 1024];
     let oversized_headers = known_json_response_headers(&oversized);
@@ -8397,6 +8410,9 @@ async fn validate_tool_results_rejects_malformed_and_oversized_results() {
     );
     assert_eq!(status, 200);
     assert_eq!(body["error"]["code"], -32012);
+    // The oversized body carries no readable id at all; the retained request id
+    // is what keeps the client's pending call correlated.
+    assert_eq!(body["id"], json!(161));
 }
 
 #[tokio::test]
@@ -8476,11 +8492,14 @@ async fn validate_tool_results_rejects_uninspectable_response_headers() {
         ),
     ];
     for (offset, (case, mut headers)) in cases.into_iter().enumerate() {
-        let mut ctx =
-            route_validated_tool_call(&plugin, &session_id, 172 + offset as i64 * 2).await;
+        let request_id = 172 + offset as i64 * 2;
+        let mut ctx = route_validated_tool_call(&plugin, &session_id, request_id).await;
         let (status, body, _) = reject_json(plugin.after_proxy(&mut ctx, 200, &mut headers).await);
         assert_eq!(status, 200, "{case}");
         assert_eq!(body["error"]["code"], -32012, "{case}");
+        // A header-time refusal is authored with no response body to read an id
+        // from, so it must name the admitted request the client is waiting on.
+        assert_eq!(body["id"], json!(request_id + 1), "{case}");
     }
 }
 
@@ -9655,57 +9674,30 @@ async fn sse_drain_until(body: &mut AggregateSseBody, wanted: &[&str], max: usiz
     seen
 }
 
-/// Drive the final body hook and the observe-only committed boundary over the
-/// response it selected. The production funnel inserts the remaining header
-/// phases between these calls; focused tests can stop before the second call
-/// when they need to prove reservation invisibility.
-async fn final_body_and_commit(
+/// Drive the final client-visible response-body hook over the response the
+/// proxy selected.
+///
+/// Aggregate delivery is decided entirely in this one phase: a request that was
+/// routed upstream is answered with its own POST-attached event stream, and
+/// everything else keeps the governed representation it arrived with.
+async fn final_response_body(
     plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
     ctx: &mut ferrum_edge::plugins::RequestContext,
     status_code: u16,
     headers: &HashMap<String, String>,
     body: &[u8],
 ) -> PluginResult {
-    let result = plugin
+    plugin
         .on_final_response_body(ctx, status_code, headers, body)
-        .await;
-    match &result {
-        PluginResult::Continue => {
-            plugin
-                .on_response_committed(ctx, status_code, headers, body)
-                .await;
-        }
-        PluginResult::Reject {
-            status_code,
-            body,
-            headers,
-        } => {
-            plugin
-                .on_response_committed(ctx, *status_code, headers, body.as_bytes())
-                .await;
-        }
-        PluginResult::RejectBinary {
-            status_code,
-            body,
-            headers,
-        } => {
-            plugin
-                .on_response_committed(ctx, *status_code, headers, body)
-                .await;
-        }
-    }
-    result
+        .await
 }
 
-/// The final client-visible response-body and committed phases of Ferrum's
-/// synthetic rejection lifecycle, driven over the exact representation
-/// `before_proxy` produced.
+/// The final client-visible response-body phase of Ferrum's synthetic rejection
+/// lifecycle, driven over the exact representation `before_proxy` produced.
 ///
-/// Aggregate SSE reserves at the final body phase and publishes only at the
-/// committed phase — a gateway-authored JSON-RPC response is merely *staged* in
-/// `before_proxy` so response-body guardrails, semantic transforms, and final
-/// policy see the real payload rather than an empty `202`. A test that wants the
-/// client-visible outcome must therefore drive both phases.
+/// A gateway-authored answer is already complete at dispatch, so it normally
+/// passes through unchanged; driving the phase anyway is what proves the hook
+/// leaves it alone rather than reshaping it.
 async fn finalize_synthetic_response(
     plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
     ctx: &mut ferrum_edge::plugins::RequestContext,
@@ -9719,7 +9711,7 @@ async fn finalize_synthetic_response(
         } => (status_code, body, headers),
         other => return other,
     };
-    match final_body_and_commit(plugin, ctx, status_code, &headers, body.as_bytes()).await {
+    match final_response_body(plugin, ctx, status_code, &headers, body.as_bytes()).await {
         PluginResult::Continue => PluginResult::Reject {
             status_code,
             body,
@@ -9727,6 +9719,68 @@ async fn finalize_synthetic_response(
         },
         replacement => replacement,
     }
+}
+
+/// The POST-attached `text/event-stream` representation: status, exact body,
+/// and the headers that select it.
+fn post_stream(result: PluginResult) -> (u16, String, HashMap<String, String>) {
+    match result {
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => (
+            status_code,
+            String::from_utf8(body.to_vec()).expect("a POST-attached SSE body is UTF-8"),
+            headers,
+        ),
+        other => panic!("expected a POST-attached SSE response, got {other:?}"),
+    }
+}
+
+/// The single JSON-RPC message a POST-attached event stream carried.
+fn post_stream_message(body: &str) -> Value {
+    let data = body
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .expect("the POST stream must carry exactly one data line");
+    serde_json::from_str(data).expect("the event payload is JSON")
+}
+
+/// The `Last-Event-ID` cursor a POST-attached stream published, so a test can
+/// resume it exactly as a client whose connection broke would.
+fn post_stream_event_id(body: &str) -> String {
+    body.lines()
+        .find_map(|line| line.strip_prefix("id: "))
+        .expect("a POST-attached event must publish its resumption cursor")
+        .to_string()
+}
+
+/// Assert the response really is an established event stream on the POST, with
+/// no representation length invented for a body the client streams.
+fn assert_post_attached_stream(status: u16, body: &str, headers: &HashMap<String, String>) {
+    assert_eq!(status, 200, "a POST-attached stream is an ordinary 200");
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("text/event-stream"),
+        "the POST must answer with the event-stream representation"
+    );
+    assert!(
+        body.starts_with(": mcp-sse\n\n"),
+        "the stream must open with the established-stream comment: {body:?}"
+    );
+    assert!(
+        body.ends_with("\n\n"),
+        "the stream must end on a complete record: {body:?}"
+    );
+}
+
+/// The `Accept` a conforming MCP client sends on a POST: it offers both
+/// representations and lets the server choose (2025-11-25 transports).
+const CLIENT_ACCEPTS_BOTH: &str = "application/json, text/event-stream";
+
+fn accept_both_representations(headers: &mut HashMap<String, String>) {
+    headers.insert("accept".to_string(), CLIENT_ACCEPTS_BOTH.to_string());
 }
 
 async fn ping(
@@ -9738,7 +9792,7 @@ async fn ping(
 }
 
 /// A `ping` driven through the complete gateway-authored lifecycle, returning
-/// the request context so a test can assert the committed outcome metadata.
+/// the request context so a test can assert the delivery outcome metadata.
 async fn ping_with_context(
     plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
     session_id: &str,
@@ -9750,6 +9804,7 @@ async fn ping_with_context(
         "method": "ping",
         "params": {}
     }));
+    accept_both_representations(&mut headers);
     headers.insert("mcp-session-id".to_string(), session_id.to_string());
     let dispatched = plugin.before_proxy(&mut ctx, &mut headers).await;
     let delivered = finalize_synthetic_response(plugin, &mut ctx, dispatched).await;
@@ -9771,13 +9826,22 @@ async fn cancel_notification(
     (result, ctx)
 }
 
+/// Aggregate plugin with the SSE surfaces explicitly enabled.
+///
+/// `sessions.sse_multiplexing` defaults to `false` because the session `GET`
+/// listener is optional: with it off the gateway answers `405` on `GET` and
+/// `application/json` on every POST, which is equally conforming. Every test
+/// that exercises the event-stream surfaces opts in exactly as an operator must.
 fn mcp_plugin() -> Arc<dyn ferrum_edge::plugins::Plugin> {
-    let config = aggregate_config("http://github-mcp.example:8080/mcp");
+    let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
+    config["sessions"] = json!({ "sse_multiplexing": true });
     create_plugin("mcp_gateway", &config).unwrap().unwrap()
 }
 
+/// The session `GET` stream is the server-to-client channel. A request that
+/// arrived on a POST is answered on that POST and never appears here.
 #[tokio::test]
-async fn aggregate_sse_get_attaches_listener_and_multiplexes_streams() {
+async fn aggregate_sse_get_listener_never_carries_a_post_response() {
     let plugin = mcp_plugin();
     let session_id = initialize(&plugin).await;
 
@@ -9795,17 +9859,35 @@ async fn aggregate_sse_get_attaches_listener_and_multiplexes_streams() {
 
     let mut stream = sse_body(&mut ctx);
 
-    // Two request identities of DIFFERENT JSON-RPC types share the one stream.
-    let first = ping(&plugin, &session_id, json!("stream-a")).await;
-    assert_eq!(reject_raw(first).0, 202);
-    let second = ping(&plugin, &session_id, json!(7)).await;
-    assert_eq!(reject_raw(second).0, 202);
+    // Two request identities of DIFFERENT JSON-RPC types. Both are answered by
+    // the gateway itself, so both stay plain JSON on their own POST.
+    for id in [json!("stream-a"), json!(7)] {
+        let (delivered, post_ctx) = ping_with_context(&plugin, &session_id, id.clone()).await;
+        let (status, body, response_headers) = reject_json(delivered);
+        assert_eq!(status, 200, "a ready result answers on its own POST");
+        assert_eq!(body["id"], id);
+        assert_eq!(
+            response_headers.get("content-type").map(String::as_str),
+            Some("application/json"),
+            "a result the gateway already holds needs no event stream"
+        );
+        assert_eq!(
+            post_ctx
+                .metadata
+                .get("mcp.sse.delivery")
+                .map(String::as_str),
+            Some("inline")
+        );
+        assert!(!mcp_sse_stream_is_open_for_test(&post_ctx));
+    }
 
-    let wanted = ["stream-a", "\"id\":7"];
-    let seen = sse_drain_until(&mut stream, &wanted, 8).await;
+    // The listener is established and idle: the greeting is all it ever saw.
+    let seen = sse_drain_until(&mut stream, &["stream-a"], 2).await;
     assert!(seen.contains(": mcp-sse"));
-    assert!(seen.contains("stream-a"), "string identity multiplexed");
-    assert!(seen.contains("\"id\":7"), "number identity multiplexed");
+    assert!(
+        !seen.contains("stream-a") && !seen.contains("\"id\":7"),
+        "a POST request's response must never reach the GET listener: {seen:?}"
+    );
 }
 
 #[tokio::test]
@@ -9854,25 +9936,17 @@ async fn aggregate_sse_transport_construction_is_streaming_without_length() {
         Some(b"text/event-stream".as_slice())
     );
 
-    // The response body is fed by the broker's retained ring, so an event
-    // published after the response was built still reaches the client.
-    let published = ping(&plugin, &session_id, json!("after-build")).await;
-    assert_eq!(reject_raw(published).0, 202);
+    // The stream really is live: it opens with the established-stream comment
+    // fed by the broker rather than by a copy of it.
     let window = std::time::Duration::from_secs(2);
-    let mut collected = String::new();
-    for _ in 0..6 {
-        if collected.contains("after-build") {
-            break;
-        }
-        let next = tokio::time::timeout(window, response_body.frame()).await;
-        let Ok(Some(Ok(frame))) = next else {
-            break;
-        };
-        if let Ok(data) = frame.into_data() {
-            collected.push_str(&String::from_utf8_lossy(&data));
-        }
-    }
-    assert!(collected.contains("after-build"));
+    let first = tokio::time::timeout(window, response_body.frame()).await;
+    let Ok(Some(Ok(frame))) = first else {
+        panic!("the attached listener must produce its greeting");
+    };
+    let Ok(greeting) = frame.into_data() else {
+        panic!("the greeting must be a DATA frame");
+    };
+    assert_eq!(greeting.as_ref(), b": mcp-sse\n\n");
 }
 
 #[tokio::test]
@@ -9963,14 +10037,14 @@ async fn aggregate_sse_cancel_is_a_side_effect_with_fixed_tokens() {
     let plugin = mcp_plugin();
     let session_id = initialize(&plugin).await;
 
-    let (mut ctx, mut headers) = sse_get(&session_id);
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
-    let mut stream = sse_body(&mut ctx);
-
-    let opened = ping(&plugin, &session_id, json!("to-cancel")).await;
-    assert_eq!(reject_raw(opened).0, 202);
-    let seen = sse_drain_until(&mut stream, &["to-cancel"], 4).await;
-    assert!(seen.contains("to-cancel"));
+    // A completed identity: the ping opened it before dispatch and settled it
+    // when the gateway answered on the POST.
+    let (answered, ping_ctx) = ping_with_context(&plugin, &session_id, json!("to-cancel")).await;
+    assert_eq!(reject_json(answered).0, 200);
+    assert_eq!(
+        ping_ctx.metadata.get("mcp.sse.stream").map(String::as_str),
+        Some("open")
+    );
 
     // A JSON-RPC notification is acknowledged either way; cancelling a
     // COMPLETED stream records a fixed token instead of changing the outcome.
@@ -10038,7 +10112,7 @@ async fn aggregate_sse_delete_and_reload_end_the_listener() {
             Err(_) => break,
         }
     }
-    assert!(ended, "DELETE must end the multiplexed SSE body");
+    assert!(ended, "DELETE must end the attached SSE body");
 
     // A replacement generation starts empty: a prior session id is unknown.
     drop(plugin);
@@ -10059,12 +10133,16 @@ async fn aggregate_sse_disabled_keeps_the_405_and_transparent_forwards() {
     assert_eq!(status, 405);
     assert!(body["error"].as_str().unwrap().contains("disabled"));
 
-    // Ordinary JSON responses are preserved when multiplexing is disabled.
+    // Ordinary JSON responses are preserved when the SSE surfaces are off.
     let session_id = initialize(&disabled).await;
-    let pinged = ping(&disabled, &session_id, json!("plain")).await;
+    let (pinged, ctx) = ping_with_context(&disabled, &session_id, json!("plain")).await;
     let (status, body, _) = reject_json(pinged);
     assert_eq!(status, 200);
     assert_eq!(body["id"], json!("plain"));
+    assert!(
+        !ctx.metadata.contains_key("mcp.sse.stream"),
+        "no stream identity may be opened while the SSE surfaces are off"
+    );
 
     let transparent = transparent_config("http://github-mcp.example:8080/mcp");
     let plugin = create_plugin("mcp_gateway", &transparent).unwrap().unwrap();
@@ -10074,24 +10152,38 @@ async fn aggregate_sse_disabled_keeps_the_405_and_transparent_forwards() {
     assert_eq!(ctx.route_override_backend_scheme, Some(BackendScheme::Http));
 }
 
+/// A result the gateway already holds needs no stream, with or without a
+/// listener attached: the POST gets `application/json`.
 #[tokio::test]
-async fn aggregate_sse_without_listener_keeps_the_inline_json_response() {
+async fn aggregate_sse_ready_result_answers_json_without_a_listener() {
     let plugin = mcp_plugin();
     let session_id = initialize(&plugin).await;
-    let pinged = ping(&plugin, &session_id, json!("no-listener")).await;
-    let (status, body, _) = reject_json(pinged);
+    let (pinged, ctx) = ping_with_context(&plugin, &session_id, json!("no-listener")).await;
+    let (status, body, response_headers) = reject_json(pinged);
     assert_eq!(status, 200);
     assert_eq!(body["id"], json!("no-listener"));
+    assert_eq!(
+        response_headers.get("content-type").map(String::as_str),
+        Some("application/json")
+    );
+    // The identity is still opened before dispatch — that is what bounds
+    // per-session concurrency and makes a duplicate id refusable — and settled
+    // as soon as the gateway answers.
+    assert_eq!(
+        ctx.metadata.get("mcp.sse.stream").map(String::as_str),
+        Some("open")
+    );
+    assert!(!mcp_sse_stream_is_open_for_test(&ctx));
+    assert_eq!(
+        ctx.metadata.get("mcp.sse.delivery").map(String::as_str),
+        Some("inline")
+    );
 }
 
 #[tokio::test]
 async fn aggregate_sse_unrepresentable_id_falls_back_to_inline_json() {
     let plugin = mcp_plugin();
     let session_id = initialize(&plugin).await;
-
-    let (mut ctx, mut headers) = sse_get(&session_id);
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
-    let _stream = sse_body(&mut ctx);
 
     // An object id is not a representable stream identity. The response is
     // still delivered — inline, on the POST — never silently dropped.
@@ -10102,6 +10194,7 @@ async fn aggregate_sse_unrepresentable_id_falls_back_to_inline_json() {
         "method": "ping",
         "params": {}
     }));
+    accept_both_representations(&mut headers);
     headers.insert("mcp-session-id".to_string(), session_id.clone());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     let (status, body, _) = reject_json(result);
@@ -10109,37 +10202,6 @@ async fn aggregate_sse_unrepresentable_id_falls_back_to_inline_json() {
     assert_eq!(body["id"], json!({ "not": "representable" }));
     let reason = ctx.metadata.get("mcp.sse.error").map(String::as_str);
     assert_eq!(reason, Some("stream_id_invalid"));
-}
-
-#[tokio::test]
-async fn aggregate_sse_retention_overflow_answers_inline_and_keeps_listener() {
-    let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
-    config["sessions"] = json!({
-        "sse_max_retained_events": 1,
-        "sse_max_replay_events": 0
-    });
-    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
-    let session_id = initialize(&plugin).await;
-
-    let (mut ctx, mut headers) = sse_get(&session_id);
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
-    let mut stream = sse_body(&mut ctx);
-
-    let first = ping(&plugin, &session_id, json!("one")).await;
-    assert_eq!(reject_raw(first).0, 202);
-
-    // The ring is full and nothing has been consumed yet, so the second
-    // response falls back to the POST instead of being dropped.
-    let (second, ctx) = ping_with_context(&plugin, &session_id, json!("two")).await;
-    let (status, body, _) = reject_json(second);
-    assert_eq!(status, 200);
-    assert_eq!(body["id"], json!("two"));
-    let reason = ctx.metadata.get("mcp.sse.error").map(String::as_str);
-    assert_eq!(reason, Some("retention_overflow"));
-
-    // The listener is not stranded: it still delivers the first response.
-    let seen = sse_drain_until(&mut stream, &["\"one\""], 4).await;
-    assert!(seen.contains("\"one\""));
 }
 
 #[tokio::test]
@@ -10196,6 +10258,7 @@ fn mcp_request(
         "method": method,
         "params": {}
     }));
+    accept_both_representations(&mut headers);
     headers.insert("mcp-session-id".to_string(), session_id.to_string());
     (ctx, headers)
 }
@@ -10211,12 +10274,24 @@ fn weather_tool_result(id: i64) -> Vec<u8> {
     .unwrap()
 }
 
-/// Route a real `tools/call` upstream with a listener already attached, and
-/// prove the stream identity is open BEFORE that dispatch happens.
-async fn route_tool_call_with_listener(
+/// An aggregate plugin with the SSE surfaces on, in front of a real tool server.
+fn sse_tool_plugin(server: &MockServer) -> Arc<dyn ferrum_edge::plugins::Plugin> {
+    let mut config = aggregate_output_validation_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({ "sse_multiplexing": true });
+    create_plugin("mcp_gateway", &config).unwrap().unwrap()
+}
+
+/// Route a real `tools/call` upstream, and prove the stream identity is open
+/// BEFORE that dispatch happens.
+///
+/// `accept` is the client's own `Accept` header: a conforming MCP client offers
+/// both representations and lets the server choose, and a client that offers
+/// only JSON must be answered with JSON.
+async fn route_tool_call_with_accept(
     plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
     session_id: &str,
     id: i64,
+    accept: &str,
 ) -> ferrum_edge::plugins::RequestContext {
     let request_body = json!({
         "jsonrpc": "2.0",
@@ -10228,22 +10303,12 @@ async fn route_tool_call_with_listener(
         }
     });
     let (mut ctx, mut headers) = mcp_ctx(request_body.clone());
+    headers.insert("accept".to_string(), accept.to_string());
     headers.insert("mcp-session-id".to_string(), session_id.to_string());
     let routed = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(
         matches!(routed, PluginResult::Continue),
-        "tools/call must keep routing upstream while multiplexing"
-    );
-    // The identity is open while the request is still in flight: this is what a
-    // concurrent notifications/cancelled has to be able to mark.
-    assert!(mcp_sse_stream_is_open_for_test(&ctx));
-    assert_eq!(
-        ctx.metadata.get("mcp.sse.stream").map(String::as_str),
-        Some("open")
-    );
-    assert!(
-        plugin.should_buffer_response_body(&ctx),
-        "an open multiplexed stream must pull the response through buffering"
+        "tools/call must keep routing upstream"
     );
     let _ = plugin
         .transform_request_body_with_context(
@@ -10256,382 +10321,260 @@ async fn route_tool_call_with_listener(
     ctx
 }
 
+/// The ordinary conforming client: it accepts both representations.
+async fn route_tool_call(
+    plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
+    session_id: &str,
+    id: i64,
+) -> ferrum_edge::plugins::RequestContext {
+    let ctx = route_tool_call_with_accept(plugin, session_id, id, CLIENT_ACCEPTS_BOTH).await;
+    // The identity is open while the request is still in flight: this is what a
+    // concurrent notifications/cancelled has to be able to mark.
+    assert!(mcp_sse_stream_is_open_for_test(&ctx));
+    assert_eq!(
+        ctx.metadata.get("mcp.sse.stream").map(String::as_str),
+        Some("open")
+    );
+    assert!(
+        plugin.should_buffer_response_body(&ctx),
+        "an open request stream must pull the response through buffering"
+    );
+    ctx
+}
+
+/// Issue #5410: a POST whose result had to be fetched is answered with its OWN
+/// `text/event-stream` on that POST, and a result the gateway already holds
+/// stays a plain JSON reply. Neither ever reaches the session `GET` listener.
 #[tokio::test]
-async fn aggregate_sse_multiplexes_a_synthetic_list_and_a_routed_call_on_one_listener() {
+async fn aggregate_sse_deferred_call_answers_its_own_post_event_stream() {
     let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
-    let plugin = create_plugin(
-        "mcp_gateway",
-        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
-    )
-    .unwrap()
-    .unwrap();
+    let plugin = sse_tool_plugin(&server);
     let session_id = initialize(&plugin).await;
-    // Warm the per-session catalog before attaching so the multiplexed
-    // tools/list below is answered from cache rather than upstream discovery.
     let names = aggregate_tool_names(&plugin, &session_id, 1).await;
     assert!(names.iter().any(|name| name == "github.create_pr"));
 
     let mut stream = attach_sse_body(&plugin, &session_id).await;
 
-    // 1) A gateway-authored non-ping method under a STRING identity. It is
-    //    STAGED by `before_proxy`, never published there: the POST still
-    //    carries the real JSON-RPC payload so the response-body policies run
-    //    over it, and the stream identity is still open.
+    // 1) READY: a gateway-authored method under a STRING identity. The answer
+    //    exists the moment `before_proxy` returns it, so the POST carries the
+    //    ordinary JSON representation and no stream is opened for it.
     let (mut list_ctx, mut list_headers) = mcp_request(&session_id, json!("list-1"), "tools/list");
     let dispatched = plugin.before_proxy(&mut list_ctx, &mut list_headers).await;
-    let (staged_status, staged_body, staged_headers) = reject_raw(dispatched);
+    let (status, body, response_headers) = reject_raw(dispatched);
+    assert_eq!(status, 200);
+    assert!(body.contains("github.create_pr"));
     assert_eq!(
-        staged_status, 200,
-        "a gateway-authored response must reach the response lifecycle as itself"
+        response_headers.get("content-type").map(String::as_str),
+        Some("application/json")
     );
-    assert!(staged_body.contains("github.create_pr"));
-    assert!(
-        mcp_sse_stream_is_open_for_test(&list_ctx),
-        "the lease must stay open for the final client-visible phase"
-    );
-    assert!(!list_ctx.metadata.contains_key("mcp.sse.delivery"));
-
-    let listed = final_body_and_commit(
-        &plugin,
-        &mut list_ctx,
-        staged_status,
-        &staged_headers,
-        staged_body.as_bytes(),
-    )
-    .await;
-    let (status, body, _) = reject_raw(listed);
-    assert_eq!(
-        status, 202,
-        "a multiplexed response answers 202 on the POST"
-    );
-    assert!(body.is_empty());
     assert!(!mcp_sse_stream_is_open_for_test(&list_ctx));
     assert_eq!(
         list_ctx
             .metadata
             .get("mcp.sse.delivery")
             .map(String::as_str),
-        Some("multiplexed")
-    );
-    assert_eq!(
-        list_ctx
-            .metadata
-            .get("mcp.route_decision")
-            .map(String::as_str),
-        Some("sse_multiplex")
-    );
-
-    // 2) An upstream-ROUTED method under a NUMBER identity, published from the
-    //    response side rather than from dispatch.
-    let mut call_ctx = route_tool_call_with_listener(&plugin, &session_id, 501).await;
-    let upstream = weather_tool_result(501);
-    let response_headers = known_json_response_headers(&upstream);
-    let delivered =
-        final_body_and_commit(&plugin, &mut call_ctx, 200, &response_headers, &upstream).await;
-    let (status, body, _) = reject_raw(delivered);
-    assert_eq!(status, 202);
-    assert!(body.is_empty());
-    assert_eq!(
-        call_ctx
-            .metadata
-            .get("mcp.sse.delivery")
-            .map(String::as_str),
-        Some("multiplexed")
-    );
-    assert!(!mcp_sse_stream_is_open_for_test(&call_ctx));
-
-    // Both identity types arrived on the SAME listener.
-    let seen = sse_drain_until(&mut stream, &["list-1", "\"id\":501"], 8).await;
-    assert!(seen.contains(": mcp-sse"));
-    assert!(
-        seen.contains("github.create_pr"),
-        "synthetic list multiplexed"
-    );
-    assert!(seen.contains("Partly cloudy"), "routed call multiplexed");
-}
-
-/// Stage a gateway-authored aggregate response: the request context (still
-/// holding the open stream lease) plus the exact representation `before_proxy`
-/// produced and handed to the response lifecycle.
-async fn stage_gateway_authored(
-    plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
-    session_id: &str,
-    id: Value,
-    method: &str,
-) -> (ferrum_edge::plugins::RequestContext, PluginResult) {
-    let (mut ctx, mut headers) = mcp_request(session_id, id, method);
-    let dispatched = plugin.before_proxy(&mut ctx, &mut headers).await;
-    (ctx, dispatched)
-}
-
-#[tokio::test]
-async fn aggregate_sse_gateway_authored_error_is_staged_not_published_by_before_proxy() {
-    let plugin = mcp_plugin();
-    let session_id = initialize(&plugin).await;
-    let mut stream = attach_sse_body(&plugin, &session_id).await;
-
-    // A gateway-authored JSON-RPC error is exactly the payload a configured
-    // response-body WAF rule / response schema / AI redaction must be able to
-    // see. `before_proxy` must therefore hand it to the response lifecycle
-    // unchanged rather than publishing it and answering the POST with an empty
-    // 202 those policies would then run over instead.
-    let (mut ctx, dispatched) =
-        stage_gateway_authored(&plugin, &session_id, json!("staged-1"), "does/not/exist").await;
-    let (status, body, response_headers) = reject_raw(dispatched);
-    assert_eq!(status, 200);
-    let parsed: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(parsed["error"]["code"], json!(-32601));
-    assert_eq!(parsed["id"], json!("staged-1"));
-    assert!(
-        mcp_sse_stream_is_open_for_test(&ctx),
-        "the stream lease must remain open for the final lifecycle"
-    );
-    assert!(
-        !ctx.metadata.contains_key("mcp.sse.delivery"),
-        "no delivery outcome may be recorded before the final phase"
-    );
-    // Nothing reached the listener: the greeting is still the only frame.
-    let before = sse_drain_until(&mut stream, &["staged-1"], 1).await;
-    assert!(before.contains(": mcp-sse"));
-    assert!(
-        !before.contains("staged-1"),
-        "before_proxy must not publish a gateway-authored response"
-    );
-
-    // The final body phase reserves the event and turns the POST into the 202,
-    // but nothing is listener-visible until the committed boundary confirms
-    // that later header policy kept that acknowledgement.
-    let delivered = plugin
-        .on_final_response_body(&mut ctx, status, &response_headers, body.as_bytes())
-        .await;
-    let (status, delivered_body, _) = reject_raw(delivered);
-    assert_eq!(status, 202);
-    assert!(delivered_body.is_empty());
-    assert!(mcp_sse_publication_is_pending_for_test(&ctx));
-    assert!(!ctx.metadata.contains_key("mcp.sse.delivery"));
-    plugin
-        .on_response_committed(&mut ctx, status, &HashMap::new(), delivered_body.as_bytes())
-        .await;
-    assert_eq!(
-        ctx.metadata.get("mcp.sse.delivery").map(String::as_str),
-        Some("multiplexed")
-    );
-    assert!(!mcp_sse_publication_is_pending_for_test(&ctx));
-    assert!(!mcp_sse_stream_is_open_for_test(&ctx));
-    let seen = sse_drain_until(&mut stream, &["staged-1"], 4).await;
-    assert!(seen.contains("staged-1"));
-    assert!(seen.contains("-32601"));
-}
-
-#[tokio::test]
-async fn aggregate_sse_late_response_replacement_aborts_reserved_event() {
-    let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
-    config["sessions"] = json!({ "sse_max_streams_per_session": 1 });
-    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
-    let session_id = initialize(&plugin).await;
-    let mut stream = attach_sse_body(&plugin, &session_id).await;
-
-    let (mut ctx, dispatched) =
-        stage_gateway_authored(&plugin, &session_id, json!("late-policy"), "ping").await;
-    let (status, body, headers) = reject_raw(dispatched);
-    let selected = plugin
-        .on_final_response_body(&mut ctx, status, &headers, body.as_bytes())
-        .await;
-    let (selected_status, selected_body, selected_headers) = reject_raw(selected);
-    assert_eq!(selected_status, 202);
-    assert!(selected_body.is_empty());
-    assert!(mcp_sse_publication_is_pending_for_test(&ctx));
-    assert!(!ctx.metadata.contains_key("mcp.sse.delivery"));
-
-    // Model the synthetic lifecycle's deliberately-late response/header policy
-    // replacing the selected acknowledgement. The committed hook observes the
-    // actual replacement, aborts the reservation, and returns the sole stream
-    // slot without ever exposing the pre-policy JSON-RPC body.
-    let blocked = br#"{"error":"blocked by late response policy"}"#;
-    plugin
-        .on_response_committed(&mut ctx, 403, &selected_headers, blocked)
-        .await;
-    assert!(!mcp_sse_publication_is_pending_for_test(&ctx));
-    assert_eq!(
-        ctx.metadata.get("mcp.sse.delivery").map(String::as_str),
         Some("inline")
     );
-
-    let next = ping(&plugin, &session_id, json!("after-late-policy")).await;
-    assert_eq!(
-        reject_raw(next).0,
-        202,
-        "aborted reservation returns capacity"
-    );
-    let seen = sse_drain_until(&mut stream, &["after-late-policy"], 6).await;
-    assert!(seen.contains("after-late-policy"));
-    assert!(!seen.contains("\"id\":\"late-policy\""));
-    assert!(!seen.contains("blocked by late response policy"));
-}
-
-#[tokio::test]
-async fn aggregate_sse_final_body_policy_rejection_answers_inline_and_publishes_nothing() {
-    let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
-    config["sessions"] = json!({ "sse_max_streams_per_session": 1 });
-    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
-    let session_id = initialize(&plugin).await;
-    let mut stream = attach_sse_body(&plugin, &session_id).await;
-
-    let (mut ctx, dispatched) =
-        stage_gateway_authored(&plugin, &session_id, json!("denied-1"), "ping").await;
-    let (staged_status, staged_body, _) = reject_raw(dispatched);
-    assert_eq!(staged_status, 200);
-    assert!(
-        staged_body.contains("denied-1"),
-        "the staged representation is what the response policies inspect"
-    );
-    assert!(mcp_sse_stream_is_open_for_test(&ctx));
-
-    // A response-body security policy (a `waf` response rule, a `body_validator`
-    // response schema) refused the staged payload and installed its own
-    // governed error. That is the client's answer, on the POST, with its HTTP
-    // failure semantics intact — never a 202, and never a published event.
-    let governed = br#"{"error":"blocked by response policy"}"#;
-    let governed_headers = known_json_response_headers(governed);
-    let inline = final_body_and_commit(&plugin, &mut ctx, 403, &governed_headers, governed).await;
-    assert!(
-        matches!(inline, PluginResult::Continue),
-        "the governed non-200 response must remain on the POST"
-    );
-    assert_eq!(
-        ctx.metadata.get("mcp.sse.delivery").map(String::as_str),
-        Some("inline")
-    );
-    assert!(!mcp_sse_stream_is_open_for_test(&ctx));
-
-    // The identity came back exactly once and the original payload was never
-    // published under it.
-    let pinged = ping(&plugin, &session_id, json!("after-refusal")).await;
-    assert_eq!(reject_raw(pinged).0, 202);
-    let seen = sse_drain_until(&mut stream, &["after-refusal"], 6).await;
-    assert!(seen.contains("after-refusal"));
-    assert!(
-        !seen.contains("denied-1"),
-        "a refused gateway-authored payload must never reach the stream"
-    );
-    assert!(!seen.contains("blocked by response policy"));
-}
-
-#[tokio::test]
-async fn aggregate_sse_final_body_redaction_publishes_the_transformed_bytes() {
-    let plugin = mcp_plugin();
-    let session_id = initialize(&plugin).await;
-    let mut stream = attach_sse_body(&plugin, &session_id).await;
-
-    let (mut ctx, dispatched) =
-        stage_gateway_authored(&plugin, &session_id, json!("redact-1"), "does/not/exist").await;
-    let (staged_status, staged_body, staged_headers) = reject_raw(dispatched);
-    assert_eq!(staged_status, 200);
-    assert!(staged_headers.contains_key("content-type"));
-    assert!(staged_body.contains("MCP method not found"));
-
-    // A response transform / AI redaction rewrote the still-valid 200 JSON-RPC
-    // response, keeping the same type-sensitive id. The event must carry the
-    // transformed representation — the bytes the client is actually allowed to
-    // receive — not the pre-policy payload.
-    let redacted = serde_json::to_vec(&json!({
-        "jsonrpc": "2.0",
-        "id": "redact-1",
-        "error": { "code": -32601, "message": "[redacted]" }
-    }))
-    .unwrap();
-    let redacted_headers = known_json_response_headers(&redacted);
-    let delivered =
-        final_body_and_commit(&plugin, &mut ctx, 200, &redacted_headers, &redacted).await;
-    let (status, delivered_body, _) = reject_raw(delivered);
-    assert_eq!(status, 202);
-    assert!(delivered_body.is_empty());
-    assert_eq!(
-        ctx.metadata.get("mcp.sse.delivery").map(String::as_str),
-        Some("multiplexed")
-    );
-
-    let seen = sse_drain_until(&mut stream, &["redact-1"], 4).await;
-    assert!(seen.contains("[redacted]"), "transformed bytes published");
-    assert!(
-        !seen.contains("MCP method not found"),
-        "the pre-policy payload must never be published"
-    );
-}
-
-#[tokio::test]
-async fn aggregate_sse_cancellation_after_staging_suppresses_the_gateway_authored_result() {
-    let plugin = mcp_plugin();
-    let session_id = initialize(&plugin).await;
-    let mut stream = attach_sse_body(&plugin, &session_id).await;
-
-    let (mut ctx, dispatched) =
-        stage_gateway_authored(&plugin, &session_id, json!(900), "ping").await;
-    let (status, body, response_headers) = reject_raw(dispatched);
-    assert_eq!(status, 200);
-    assert!(mcp_sse_stream_is_open_for_test(&ctx));
-
-    // The cancellation arrives on another connection AFTER the gateway authored
-    // its response but BEFORE the final phase publishes it. Keeping the lease
-    // open across the response lifecycle is what makes that window observable.
-    let (ack, cancel_ctx) = cancel_notification(&plugin, &session_id, json!(900)).await;
-    assert_eq!(reject_raw(ack).0, 202);
-    assert_eq!(
-        cancel_ctx
-            .metadata
-            .get("mcp.sse.cancel")
-            .map(String::as_str),
-        Some("cancelled")
-    );
-
-    let suppressed = final_body_and_commit(
+    // The response lifecycle leaves that governed representation alone.
+    let unchanged = final_response_body(
         &plugin,
-        &mut ctx,
+        &mut list_ctx,
         status,
         &response_headers,
         body.as_bytes(),
     )
     .await;
-    let (status, delivered_body, _) = reject_raw(suppressed);
-    assert_eq!(status, 202, "a cancelled request is still acknowledged");
-    assert!(delivered_body.is_empty());
-    assert_eq!(
-        ctx.metadata.get("mcp.sse.delivery").map(String::as_str),
-        Some("suppressed")
-    );
-    assert!(!mcp_sse_stream_is_open_for_test(&ctx));
+    assert!(matches!(unchanged, PluginResult::Continue));
 
-    let pinged = ping(&plugin, &session_id, json!("after-staged-cancel")).await;
-    assert_eq!(reject_raw(pinged).0, 202);
-    let seen = sse_drain_until(&mut stream, &["after-staged-cancel"], 6).await;
-    assert!(seen.contains("after-staged-cancel"));
+    // 2) DEFERRED: an upstream-routed method under a NUMBER identity. Its
+    //    result does not exist at dispatch, so the POST answers with its own
+    //    event stream carrying exactly the governed JSON-RPC bytes.
+    let mut call_ctx = route_tool_call(&plugin, &session_id, 501).await;
+    let upstream = weather_tool_result(501);
+    let response_headers = known_json_response_headers(&upstream);
+    let delivered =
+        final_response_body(&plugin, &mut call_ctx, 200, &response_headers, &upstream).await;
+    let (status, stream_body, stream_headers) = post_stream(delivered);
+    assert_post_attached_stream(status, &stream_body, &stream_headers);
+    // Streaming, not a buffered JSON document: the client must not be told the
+    // stream is cacheable or proxy-buffered.
+    assert_eq!(
+        stream_headers.get("cache-control").map(String::as_str),
+        Some("no-cache")
+    );
+    let message = post_stream_message(&stream_body);
+    assert_eq!(message["id"], json!(501));
+    assert_eq!(
+        message["result"]["structuredContent"]["conditions"],
+        "Partly cloudy"
+    );
+    assert_eq!(
+        call_ctx
+            .metadata
+            .get("mcp.sse.delivery")
+            .map(String::as_str),
+        Some("post_stream")
+    );
+    assert_eq!(
+        call_ctx
+            .metadata
+            .get("mcp.route_decision")
+            .map(String::as_str),
+        Some("sse_post_stream")
+    );
+    assert!(!mcp_sse_stream_is_open_for_test(&call_ctx));
+
+    // Neither answer reached the GET listener: it is still just the greeting.
+    let seen = sse_drain_until(&mut stream, &["Partly cloudy"], 2).await;
+    assert!(seen.contains(": mcp-sse"));
     assert!(
-        !seen.contains("\"id\":900"),
-        "a cancelled gateway-authored result must never be published"
+        !seen.contains("Partly cloudy") && !seen.contains("list-1"),
+        "the GET listener must never carry a POST request's response: {seen:?}"
     );
 }
 
+/// A POST-attached stream publishes a resumption cursor. A freshly attached
+/// listener still starts past it; only an explicit `Last-Event-ID` replays it,
+/// which is the one placement Streamable HTTP permits.
+#[tokio::test]
+async fn aggregate_sse_post_stream_is_resumable_only_by_an_explicit_cursor() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = sse_tool_plugin(&server);
+    let session_id = initialize(&plugin).await;
+    let _ = aggregate_tool_names(&plugin, &session_id, 1).await;
+
+    let mut attached = attach_sse_body(&plugin, &session_id).await;
+
+    let mut cursors = Vec::new();
+    for id in [501_i64, 502] {
+        let mut call_ctx = route_tool_call(&plugin, &session_id, id).await;
+        let upstream = weather_tool_result(id);
+        let response_headers = known_json_response_headers(&upstream);
+        let delivered =
+            final_response_body(&plugin, &mut call_ctx, 200, &response_headers, &upstream).await;
+        let (status, body, headers) = post_stream(delivered);
+        assert_post_attached_stream(status, &body, &headers);
+        cursors.push(post_stream_event_id(&body));
+    }
+
+    // The listener that was attached the whole time never saw either response.
+    let seen = sse_drain_until(&mut attached, &["\"id\":502"], 2).await;
+    assert!(
+        !seen.contains("\"id\":501") && !seen.contains("\"id\":502"),
+        "an attached listener must be advanced past POST-delivered events"
+    );
+    drop(attached);
+
+    // A fresh listener starts at the delivery watermark, so it sees nothing
+    // either: reattaching is not a way to harvest other connections' answers.
+    let mut fresh = attach_sse_body(&plugin, &session_id).await;
+    let seen = sse_drain_until(&mut fresh, &["\"id\":502"], 2).await;
+    assert!(seen.contains(": mcp-sse"));
+    assert!(
+        !seen.contains("\"id\":501") && !seen.contains("\"id\":502"),
+        "a fresh GET listener must not replay POST-delivered responses"
+    );
+    drop(fresh);
+
+    // Resuming at the first cursor replays only what came after it.
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    headers.insert("last-event-id".to_string(), cursors[0].clone());
+    let resumed = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(reject_raw(resumed).0, 200);
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.sse.resume_requested")
+            .map(String::as_str),
+        Some("true")
+    );
+    let mut body = sse_body(&mut ctx);
+    let seen = sse_drain_until(&mut body, &["\"id\":502"], 4).await;
+    assert!(seen.contains("\"id\":502"), "resumption replays: {seen:?}");
+    assert!(
+        !seen.contains("\"id\":501"),
+        "the cursor's own event is not replayed again"
+    );
+}
+
+/// A client that offered only `application/json` is answered with JSON, never
+/// with a representation it said it cannot read (RFC 9110 12.5.1).
+#[tokio::test]
+async fn aggregate_sse_json_only_accept_never_opens_a_post_stream() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = sse_tool_plugin(&server);
+    let session_id = initialize(&plugin).await;
+    let _ = aggregate_tool_names(&plugin, &session_id, 1).await;
+
+    let mut call_ctx =
+        route_tool_call_with_accept(&plugin, &session_id, 510, "application/json").await;
+    assert!(
+        !mcp_sse_stream_is_open_for_test(&call_ctx),
+        "a JSON-only client opens no POST stream"
+    );
+    assert!(!call_ctx.metadata.contains_key("mcp.sse.stream"));
+
+    let upstream = weather_tool_result(510);
+    let response_headers = known_json_response_headers(&upstream);
+    let delivered =
+        final_response_body(&plugin, &mut call_ctx, 200, &response_headers, &upstream).await;
+    assert!(
+        matches!(delivered, PluginResult::Continue),
+        "the upstream JSON response stays exactly as it is"
+    );
+}
+
+/// The event carries the bytes the client is actually allowed to receive: a
+/// response transform or redaction that rewrote the still-valid `200` JSON-RPC
+/// response is what gets framed, not the pre-policy payload.
+#[tokio::test]
+async fn aggregate_sse_post_stream_carries_the_transformed_bytes() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = sse_tool_plugin(&server);
+    let session_id = initialize(&plugin).await;
+    let _ = aggregate_tool_names(&plugin, &session_id, 1).await;
+
+    let mut call_ctx = route_tool_call(&plugin, &session_id, 520).await;
+    let redacted = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 520,
+        "result": { "structuredContent": { "temperature": 22.5, "conditions": "[redacted]" } }
+    }))
+    .unwrap();
+    let redacted_headers = known_json_response_headers(&redacted);
+    let delivered =
+        final_response_body(&plugin, &mut call_ctx, 200, &redacted_headers, &redacted).await;
+    let (status, body, headers) = post_stream(delivered);
+    assert_post_attached_stream(status, &body, &headers);
+    let message = post_stream_message(&body);
+    assert_eq!(
+        message["result"]["structuredContent"]["conditions"],
+        "[redacted]"
+    );
+    assert!(
+        !body.contains("Partly cloudy"),
+        "the pre-policy payload must never be framed"
+    );
+}
+
+/// A non-200 final response keeps its own failure semantics on the POST:
+/// reframing it as a `200` event stream would present a failure as a successful
+/// JSON-RPC answer, and it must not reach the listener either.
 #[tokio::test]
 async fn aggregate_sse_preserves_non_ok_upstream_http_status_inline() {
     let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
-    let plugin = create_plugin(
-        "mcp_gateway",
-        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
-    )
-    .unwrap()
-    .unwrap();
+    let plugin = sse_tool_plugin(&server);
     let session_id = initialize(&plugin).await;
     let _ = aggregate_tool_names(&plugin, &session_id, 1).await;
     let mut stream = attach_sse_body(&plugin, &session_id).await;
 
-    let mut call_ctx = route_tool_call_with_listener(&plugin, &session_id, 550).await;
+    let mut call_ctx = route_tool_call(&plugin, &session_id, 550).await;
     let upstream = weather_tool_result(550);
     let response_headers = known_json_response_headers(&upstream);
     let preserved =
-        final_body_and_commit(&plugin, &mut call_ctx, 503, &response_headers, &upstream).await;
+        final_response_body(&plugin, &mut call_ctx, 503, &response_headers, &upstream).await;
     assert!(
         matches!(preserved, PluginResult::Continue),
-        "the original non-200 response must remain on the POST"
+        "reframing a 5xx as a 200 event stream would erase its failure semantics"
     );
     assert_eq!(
         call_ctx
@@ -10642,32 +10585,19 @@ async fn aggregate_sse_preserves_non_ok_upstream_http_status_inline() {
     );
     assert!(!mcp_sse_stream_is_open_for_test(&call_ctx));
 
-    // The listener stays usable, but it must never receive the upstream error
-    // body that the POST preserved with status 503.
-    let pinged = ping(&plugin, &session_id, json!("after-non-ok")).await;
-    assert_eq!(reject_raw(pinged).0, 202);
-    let seen = sse_drain_until(&mut stream, &["after-non-ok"], 6).await;
-    assert!(seen.contains("after-non-ok"));
-    assert!(
-        !seen.contains("Partly cloudy"),
-        "a non-200 upstream response must not be published as an SSE success"
-    );
+    let seen = sse_drain_until(&mut stream, &["Partly cloudy"], 2).await;
+    assert!(!seen.contains("Partly cloudy"));
 }
 
 #[tokio::test]
 async fn aggregate_sse_cancellation_marks_an_open_routed_request_and_suppresses_its_result() {
     let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
-    let plugin = create_plugin(
-        "mcp_gateway",
-        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
-    )
-    .unwrap()
-    .unwrap();
+    let plugin = sse_tool_plugin(&server);
     let session_id = initialize(&plugin).await;
     let _ = aggregate_tool_names(&plugin, &session_id, 1).await;
     let mut stream = attach_sse_body(&plugin, &session_id).await;
 
-    let mut call_ctx = route_tool_call_with_listener(&plugin, &session_id, 600).await;
+    let mut call_ctx = route_tool_call(&plugin, &session_id, 600).await;
 
     // The cancellation arrives on a DIFFERENT connection while the routed call
     // is still in flight. It can only report `cancelled` because the identity
@@ -10683,14 +10613,19 @@ async fn aggregate_sse_cancellation_marks_an_open_routed_request_and_suppresses_
         "a genuinely open production stream must be cancellable"
     );
 
-    // The eventual result is suppressed: acknowledged, never published.
+    // The eventual result is suppressed: the POST's stream opens and closes
+    // carrying no message, which is what a cancelled request looks like.
     let upstream = weather_tool_result(600);
     let response_headers = known_json_response_headers(&upstream);
     let suppressed =
-        final_body_and_commit(&plugin, &mut call_ctx, 200, &response_headers, &upstream).await;
-    let (status, body, _) = reject_raw(suppressed);
-    assert_eq!(status, 202);
-    assert!(body.is_empty());
+        final_response_body(&plugin, &mut call_ctx, 200, &response_headers, &upstream).await;
+    let (status, body, headers) = post_stream(suppressed);
+    assert_post_attached_stream(status, &body, &headers);
+    assert_eq!(body, ": mcp-sse\n\n");
+    assert!(
+        !body.contains("event: message"),
+        "a cancelled request must not be answered with its result"
+    );
     assert_eq!(
         call_ctx
             .metadata
@@ -10701,31 +10636,24 @@ async fn aggregate_sse_cancellation_marks_an_open_routed_request_and_suppresses_
     assert!(!mcp_sse_stream_is_open_for_test(&call_ctx));
 
     // Capacity came back exactly once, and the cancelled result never reached
-    // the stream: the next response is the first event after the greeting.
-    let pinged = ping(&plugin, &session_id, json!("after-cancel")).await;
-    assert_eq!(reject_raw(pinged).0, 202);
-    let seen = sse_drain_until(&mut stream, &["after-cancel"], 6).await;
-    assert!(seen.contains("after-cancel"));
-    assert!(
-        !seen.contains("Partly cloudy"),
-        "a cancelled request's result must never be published"
-    );
+    // the listener either.
+    let seen = sse_drain_until(&mut stream, &["Partly cloudy"], 2).await;
+    assert!(!seen.contains("Partly cloudy"));
 }
 
 #[tokio::test]
 async fn aggregate_sse_policy_replacement_answers_inline_and_returns_the_identity() {
     let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
     let mut config = aggregate_output_validation_config(&format!("{}/mcp", server.uri()));
-    config["sessions"] = json!({ "sse_max_streams_per_session": 1 });
+    config["sessions"] = json!({ "sse_multiplexing": true, "sse_max_streams_per_session": 1 });
     let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
     let session_id = initialize(&plugin).await;
     let _ = aggregate_tool_names(&plugin, &session_id, 1).await;
-    let mut stream = attach_sse_body(&plugin, &session_id).await;
 
-    let mut call_ctx = route_tool_call_with_listener(&plugin, &session_id, 700).await;
+    let mut call_ctx = route_tool_call(&plugin, &session_id, 700).await;
     // A result that fails outputSchema validation is replaced by a gateway
     // JSON-RPC error. That replacement is the client's answer on the POST and
-    // is never published under the caller's stream identity.
+    // is never framed as this request's event stream.
     let invalid = serde_json::to_vec(&json!({
         "jsonrpc": "2.0",
         "id": 700,
@@ -10734,10 +10662,14 @@ async fn aggregate_sse_policy_replacement_answers_inline_and_returns_the_identit
     .unwrap();
     let response_headers = known_json_response_headers(&invalid);
     let replaced =
-        final_body_and_commit(&plugin, &mut call_ctx, 200, &response_headers, &invalid).await;
-    let (status, body, _) = reject_json(replaced);
+        final_response_body(&plugin, &mut call_ctx, 200, &response_headers, &invalid).await;
+    let (status, body, response_headers) = reject_json(replaced);
     assert_eq!(status, 200);
     assert_eq!(body["error"]["code"], -32012);
+    assert_eq!(
+        response_headers.get("content-type").map(String::as_str),
+        Some("application/json")
+    );
     assert_eq!(
         call_ctx
             .metadata
@@ -10749,27 +10681,20 @@ async fn aggregate_sse_policy_replacement_answers_inline_and_returns_the_identit
 
     // The single stream slot is usable again, which is only true if the
     // replacement released the identity exactly once.
-    let pinged = ping(&plugin, &session_id, json!("after-policy")).await;
-    assert_eq!(reject_raw(pinged).0, 202);
-    let seen = sse_drain_until(&mut stream, &["after-policy"], 6).await;
-    assert!(seen.contains("after-policy"));
-    assert!(
-        !seen.contains("-32012"),
-        "a gateway policy replacement must not be published as an event"
-    );
+    let (pinged, _) = ping_with_context(&plugin, &session_id, json!("after-policy")).await;
+    assert_eq!(reject_json(pinged).0, 200);
 }
 
 #[tokio::test]
 async fn aggregate_sse_dropped_request_releases_the_identity_exactly_once() {
     let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
     let mut config = aggregate_output_validation_config(&format!("{}/mcp", server.uri()));
-    config["sessions"] = json!({ "sse_max_streams_per_session": 1 });
+    config["sessions"] = json!({ "sse_multiplexing": true, "sse_max_streams_per_session": 1 });
     let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
     let session_id = initialize(&plugin).await;
     let _ = aggregate_tool_names(&plugin, &session_id, 1).await;
-    let mut stream = attach_sse_body(&plugin, &session_id).await;
 
-    let mut in_flight = route_tool_call_with_listener(&plugin, &session_id, 800).await;
+    let mut in_flight = route_tool_call(&plugin, &session_id, 800).await;
     // While it holds the only slot, a second request cannot open one and is
     // answered inline instead — proof the routed request really is open.
     let (inline, second) = ping_with_context(&plugin, &session_id, json!("second")).await;
@@ -10785,78 +10710,106 @@ async fn aggregate_sse_dropped_request_releases_the_identity_exactly_once() {
     // rejection, or client disconnect. Dropping the lease is the one release
     // path and it must return the capacity.
     drop_mcp_sse_stream_for_test(&mut in_flight);
-    let reused = ping(&plugin, &session_id, json!("after-drop")).await;
-    assert_eq!(reject_raw(reused).0, 202);
-    let seen = sse_drain_until(&mut stream, &["after-drop"], 6).await;
-    assert!(seen.contains("after-drop"));
+    let (reused, reused_ctx) = ping_with_context(&plugin, &session_id, json!("after-drop")).await;
+    assert_eq!(reject_json(reused).0, 200);
+    assert_eq!(
+        reused_ctx
+            .metadata
+            .get("mcp.sse.stream")
+            .map(String::as_str),
+        Some("open"),
+        "the released slot must be reusable"
+    );
 
     // Exactly once: a late result for the released identity is answered inline
-    // rather than published, and the identity is not reopened.
+    // rather than streamed, and the identity is not reopened.
     let upstream = weather_tool_result(800);
     let response_headers = known_json_response_headers(&upstream);
     let late =
-        final_body_and_commit(&plugin, &mut in_flight, 200, &response_headers, &upstream).await;
+        final_response_body(&plugin, &mut in_flight, 200, &response_headers, &upstream).await;
     assert!(
         matches!(late, PluginResult::Continue),
-        "a released identity must answer inline, never publish late"
+        "a released identity must answer inline, never stream late"
     );
 }
 
 #[tokio::test]
-async fn aggregate_sse_repeated_retention_overflow_cannot_exhaust_stream_capacity() {
+async fn aggregate_sse_completed_identities_cannot_exhaust_stream_capacity() {
     let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
     config["sessions"] = json!({
-        "sse_max_streams_per_session": 2,
+        "sse_multiplexing": true,
+        "sse_max_streams_per_session": 2
+    });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    // Far more sequential requests than `sse_max_streams_per_session`. Each one
+    // opens its identity before dispatch and completes it on its own POST, so
+    // capacity is returned every time and none is refused for cardinality.
+    for index in 0..6 {
+        let id = format!("sequential-{index}");
+        let (result, ctx) = ping_with_context(&plugin, &session_id, json!(id)).await;
+        let (status, body, _) = reject_json(result);
+        assert_eq!(status, 200);
+        assert_eq!(body["id"], json!(id));
+        assert_eq!(
+            ctx.metadata.get("mcp.sse.stream").map(String::as_str),
+            Some("open"),
+            "request {index} must not be refused for cardinality"
+        );
+        assert!(!ctx.metadata.contains_key("mcp.sse.error"));
+    }
+
+    // A completed identity is terminal: reusing that id inside the session is
+    // refused as an identity and answered inline, never joined to a live stream.
+    let (retried, retry) = ping_with_context(&plugin, &session_id, json!("sequential-5")).await;
+    let (status, body, _) = reject_json(retried);
+    assert_eq!(status, 200);
+    assert_eq!(body["id"], json!("sequential-5"));
+    assert_eq!(
+        retry.metadata.get("mcp.sse.error").map(String::as_str),
+        Some("stream_completed")
+    );
+}
+
+/// A replay window too small to keep the delivered event costs resumability,
+/// never delivery: the POST still carries the answer, and a cursor that would
+/// have needed the dropped event fails closed instead of silently resuming.
+#[tokio::test]
+async fn aggregate_sse_tiny_replay_window_still_delivers_but_refuses_a_stale_cursor() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let mut config = aggregate_output_validation_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({
+        "sse_multiplexing": true,
         "sse_max_retained_events": 1,
         "sse_max_replay_events": 0
     });
     let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
     let session_id = initialize(&plugin).await;
-    let mut stream = attach_sse_body(&plugin, &session_id).await;
+    let _ = aggregate_tool_names(&plugin, &session_id, 1).await;
 
-    // The first response takes the only retained slot; nothing consumes it.
-    assert_eq!(
-        reject_raw(ping(&plugin, &session_id, json!("first")).await).0,
-        202
-    );
-
-    // Far more overflowing responses than `sse_max_streams_per_session`. Each
-    // one is refused for RETENTION and answered inline; none may be refused for
-    // cardinality, which would mean the refusal leaked a stream slot.
-    for index in 0..6 {
-        let id = format!("overflow-{index}");
-        let (result, ctx) = ping_with_context(&plugin, &session_id, json!(id)).await;
-        let (status, body, _) = reject_json(result);
-        assert_eq!(status, 200, "an overflowed response is answered inline");
-        assert_eq!(body["id"], json!(id));
-        assert_eq!(
-            ctx.metadata.get("mcp.sse.error").map(String::as_str),
-            Some("retention_overflow"),
-            "overflow {index} must not consume stream capacity"
-        );
-        assert_eq!(
-            ctx.metadata.get("mcp.sse.delivery").map(String::as_str),
-            Some("inline")
-        );
+    let mut cursors = Vec::new();
+    for id in [501_i64, 502] {
+        let mut call_ctx = route_tool_call(&plugin, &session_id, id).await;
+        let upstream = weather_tool_result(id);
+        let response_headers = known_json_response_headers(&upstream);
+        let delivered =
+            final_response_body(&plugin, &mut call_ctx, 200, &response_headers, &upstream).await;
+        let (status, body, headers) = post_stream(delivered);
+        assert_post_attached_stream(status, &body, &headers);
+        assert_eq!(post_stream_message(&body)["id"], json!(id));
+        cursors.push(post_stream_event_id(&body));
     }
 
-    // An inline-completed identity is terminal: retrying it answers inline
-    // again and can never be emitted onto the listener.
-    let (retried, retry) = ping_with_context(&plugin, &session_id, json!("overflow-5")).await;
-    let (status, body, _) = reject_json(retried);
-    assert_eq!(status, 200);
-    assert_eq!(body["id"], json!("overflow-5"));
+    // Nothing was retained, so resuming at the first cursor is `410 Gone`
+    // rather than a stream that silently skips the second response.
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    headers.insert("last-event-id".to_string(), cursors[0].clone());
+    let refused = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(reject_json(refused).0, 410);
     assert_eq!(
-        retry.metadata.get("mcp.sse.error").map(String::as_str),
-        Some("stream_completed")
-    );
-
-    // The listener is still usable and only ever received the first response.
-    let seen = sse_drain_until(&mut stream, &["\"first\""], 4).await;
-    assert!(seen.contains("\"first\""));
-    assert!(
-        !seen.contains("overflow-"),
-        "an inline-answered response must never reach the stream"
+        ctx.metadata.get("mcp.sse.error").map(String::as_str),
+        Some("last_event_id_too_old")
     );
 }
 
@@ -10872,10 +10825,11 @@ async fn aggregate_sse_notifications_and_batches_never_open_a_stream() {
         "method": "tools/list",
         "params": {}
     }));
+    accept_both_representations(&mut note_headers);
     note_headers.insert("mcp-session-id".to_string(), session_id.clone());
     let noted = plugin.before_proxy(&mut note_ctx, &mut note_headers).await;
     let (status, body, _) = reject_raw(noted);
-    assert_eq!(status, 202);
+    assert_eq!(status, 202, "a notification-only POST keeps its 202");
     assert!(body.is_empty());
     assert!(!mcp_sse_stream_is_open_for_test(&note_ctx));
     assert!(!note_ctx.metadata.contains_key("mcp.sse.stream"));
@@ -10886,6 +10840,7 @@ async fn aggregate_sse_notifications_and_batches_never_open_a_stream() {
         { "jsonrpc": "2.0", "id": "b1", "method": "ping", "params": {} },
         { "jsonrpc": "2.0", "id": "b2", "method": "ping", "params": {} }
     ]));
+    accept_both_representations(&mut batch_headers);
     batch_headers.insert("mcp-session-id".to_string(), session_id.clone());
     let batched = plugin
         .before_proxy(&mut batch_ctx, &mut batch_headers)
@@ -10896,24 +10851,19 @@ async fn aggregate_sse_notifications_and_batches_never_open_a_stream() {
     assert_eq!(responses.len(), 2);
     assert!(!mcp_sse_stream_is_open_for_test(&batch_ctx));
 
-    // Nothing above reached the listener: the next event is the first one.
-    let pinged = ping(&plugin, &session_id, json!("only-event")).await;
-    assert_eq!(reject_raw(pinged).0, 202);
-    let seen = sse_drain_until(&mut stream, &["only-event"], 6).await;
-    assert!(seen.contains("only-event"));
-    assert!(!seen.contains("\"b1\""), "no batch member was multiplexed");
-    assert!(!seen.contains("tools"), "no notification was multiplexed");
+    let seen = sse_drain_until(&mut stream, &["\"b1\""], 2).await;
+    assert!(!seen.contains("\"b1\""), "no batch member was streamed");
 }
 
 #[tokio::test]
-async fn aggregate_sse_initialize_is_never_multiplexed_onto_a_prior_session() {
+async fn aggregate_sse_initialize_always_answers_json_on_the_post() {
     let plugin = mcp_plugin();
     let session_id = initialize(&plugin).await;
     let mut stream = attach_sse_body(&plugin, &session_id).await;
 
-    // An initialize carrying an existing session header must still answer
-    // inline: its reply names the NEW session in a header an event stream
-    // cannot convey.
+    // An initialize carrying an existing session header must still answer with
+    // JSON: its reply names the NEW session in a header, and an event stream
+    // cannot convey it.
     let (mut ctx, mut headers) = mcp_ctx(json!({
         "jsonrpc": "2.0",
         "id": "init-2",
@@ -10924,6 +10874,7 @@ async fn aggregate_sse_initialize_is_never_multiplexed_onto_a_prior_session() {
             "clientInfo": { "name": "unit-test", "version": "1" }
         }
     }));
+    accept_both_representations(&mut headers);
     headers.insert("mcp-session-id".to_string(), session_id.clone());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     let (status, body, response_headers) = reject_json(result);
@@ -10932,9 +10883,1434 @@ async fn aggregate_sse_initialize_is_never_multiplexed_onto_a_prior_session() {
     assert!(response_headers.contains_key("mcp-session-id"));
     assert!(!mcp_sse_stream_is_open_for_test(&ctx));
 
-    let pinged = ping(&plugin, &session_id, json!("post-init")).await;
-    assert_eq!(reject_raw(pinged).0, 202);
-    let seen = sse_drain_until(&mut stream, &["post-init"], 6).await;
-    assert!(seen.contains("post-init"));
-    assert!(!seen.contains("init-2"), "initialize must never multiplex");
+    let seen = sse_drain_until(&mut stream, &["init-2"], 2).await;
+    assert!(
+        !seen.contains("init-2"),
+        "initialize must never be streamed"
+    );
+}
+
+#[test]
+fn transparent_catalog_policy_requires_aggregate_mode() {
+    for (section, field, value) in [
+        ("policy", "default_action", json!("deny")),
+        ("policy", "default_action", json!("allow")),
+        ("policy", "tools", json!({})),
+        ("policy", "hide_denied_tools", json!(false)),
+        ("discovery", "on_new_tool", json!("hide_until_configured")),
+        ("discovery", "on_schema_change", json!("allow")),
+        ("discovery", "hide_denied_items", json!(true)),
+        ("discovery", "aggregate_tools", json!(true)),
+        ("discovery", "aggregate_resources", json!(false)),
+        ("discovery", "aggregate_prompts", json!(true)),
+        ("discovery", "namespace_separator", json!(".")),
+        ("discovery", "cache_ttl_seconds", json!(300)),
+    ] {
+        let mut config = transparent_config("http://127.0.0.1:9/mcp");
+        config[section] = json!({});
+        config[section][field] = value;
+        let error = create_plugin("mcp_gateway", &config).err().unwrap();
+        assert!(error.contains(&format!("{section}.{field}")), "{error}");
+        assert!(error.contains("transparent_proxy"), "{error}");
+        config["mode"] = json!("aggregate_router");
+        assert!(create_plugin("mcp_gateway", &config).is_ok());
+    }
+}
+
+#[test]
+fn a_root_endpoint_path_is_refused_at_admission() {
+    // The endpoint reserves its whole subtree, so `/` would reserve the entire
+    // origin and 404 every other handler on the proxy. That is a total outage
+    // on reload, not a routing preference, so it is refused before it can run.
+    for mode in ["aggregate_router", "transparent_proxy"] {
+        let mut config = transparent_config("http://127.0.0.1:9/mcp");
+        config["mode"] = json!(mode);
+        config["endpoint"]["path"] = json!("/");
+        let error = create_plugin("mcp_gateway", &config).err().unwrap();
+        assert!(error.contains("endpoint.path"), "{error}");
+        assert!(error.contains("sub-path"), "{error}");
+        // A sub-path of the same shape is still admitted.
+        config["endpoint"]["path"] = json!("/mcp");
+        assert!(create_plugin("mcp_gateway", &config).is_ok());
+    }
+}
+
+#[tokio::test]
+async fn endpoint_scope_refuses_descendants_in_both_modes() {
+    for mode in ["aggregate_router", "transparent_proxy"] {
+        for endpoint in ["/mcp", "/mcp/"] {
+            let mut config = transparent_config("http://127.0.0.1:9/mcp");
+            config["mode"] = json!(mode);
+            config["endpoint"]["path"] = json!(endpoint);
+            let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+            for path in ["/mcp", "/mcp/", "/mcp//", "/mcp/child"] {
+                if path == endpoint {
+                    continue;
+                }
+                for method in ["POST", "GET", "DELETE", "PUT", "HEAD", "OPTIONS"] {
+                    let (mut ctx, mut headers) = mcp_ctx(json!({
+                        "jsonrpc": "2.0", "id": 1, "method": "ping"
+                    }));
+                    ctx.path = path.to_string();
+                    ctx.method = method.to_string();
+                    let (status, _, _) =
+                        reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+                    assert_eq!(status, 404, "{mode} {endpoint} {method} {path}");
+                    assert!(ctx.route_override_backend_host.is_none());
+                    // A reserved descendant is denied, exactly like the 405.
+                    assert_eq!(
+                        ctx.metadata.get("mcp.route_decision").map(String::as_str),
+                        Some("deny"),
+                        "{mode} {endpoint} {method} {path}"
+                    );
+                }
+            }
+            // A sibling path outside the reserved subtree stays available.
+            let (mut ctx, mut headers) = mcp_ctx(json!({}));
+            ctx.path = "/mcpx".to_string();
+            assert!(matches!(
+                plugin.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ));
+        }
+    }
+}
+
+fn raw_response_id(body: &str) -> String {
+    let fields: std::collections::BTreeMap<String, &serde_json::value::RawValue> =
+        serde_json::from_str(body).unwrap();
+    fields["id"].get().to_string()
+}
+
+#[tokio::test]
+async fn synthetic_singletons_and_batches_echo_exact_numeric_id_tokens() {
+    let plugin = create_plugin("mcp_gateway", &aggregate_config("http://127.0.0.1:9/mcp"))
+        .unwrap()
+        .unwrap();
+    let ids = [
+        "18446744073709551616",
+        "18446744073709551617",
+        "1.00000000000000001",
+        "1.00000000000000002",
+        "1e0",
+        "1.0",
+        "-0",
+        "0",
+        "\"7\"",
+    ];
+    let members: Vec<String> = ids
+        .iter()
+        .map(|id| format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#))
+        .collect();
+    for (id, member) in ids.iter().zip(&members) {
+        let (mut ctx, mut headers) = mcp_ctx_raw(member.as_bytes().to_vec());
+        let (status, body, _) = reject_raw(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(status, 200);
+        assert_eq!(&raw_response_id(&body), id);
+    }
+    let (mut ctx, mut headers) = mcp_ctx_raw(format!("[{}]", members.join(",")).into_bytes());
+    let (_, body, _) = reject_raw(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let responses: Vec<&serde_json::value::RawValue> = serde_json::from_str(&body).unwrap();
+    assert_eq!(responses.len(), ids.len());
+    for (response, id) in responses.iter().zip(ids) {
+        assert_eq!(raw_response_id(response.get()), id);
+    }
+}
+
+#[tokio::test]
+async fn routed_tool_request_and_response_rewrites_preserve_numeric_ids() {
+    let upstream = start_mcp_catalog_server().await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_config(&format!("{}/mcp", upstream.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session = initialize(&plugin).await;
+    let id = "18446744073709551617";
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"github.create_pr","arguments":{{"repo":"payments-api"}}}}}}"#
+    );
+    let (mut ctx, mut headers) = mcp_ctx_raw(body.as_bytes().to_vec());
+    headers.insert("mcp-session-id".to_string(), session);
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let rewritten = plugin
+        .transform_request_body_with_context(&mut ctx, body.as_bytes(), None, &headers)
+        .await
+        .unwrap();
+    assert_eq!(
+        raw_response_id(std::str::from_utf8(&rewritten).unwrap()),
+        id
+    );
+    let response = format!(
+        r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"resource","resource":{{"uri":"file:///project/README.md","text":"ok"}}}}]}}}}"#
+    );
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            response.as_bytes(),
+            Some("application/json"),
+            &known_json_response_headers(response.as_bytes()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        raw_response_id(std::str::from_utf8(&rewritten).unwrap()),
+        id
+    );
+}
+
+#[tokio::test]
+async fn transparent_invalid_batch_preserves_each_reflected_numeric_id() {
+    let plugin = create_plugin("mcp_gateway", &transparent_config("http://127.0.0.1:9/mcp"))
+        .unwrap()
+        .unwrap();
+    let body = br#"[
+        {"jsonrpc":"2.0","id":18446744073709551616,"method":"ping"},
+        {"jsonrpc":"2.0","id":18446744073709551617,"method":"ping"},
+        {}
+    ]"#;
+    let (mut ctx, mut headers) = mcp_ctx_raw(body.to_vec());
+    let (_, body, _) = reject_raw(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let responses: Vec<&serde_json::value::RawValue> = serde_json::from_str(&body).unwrap();
+    assert_eq!(responses.len(), 3);
+    assert_eq!(raw_response_id(responses[0].get()), "18446744073709551616");
+    assert_eq!(raw_response_id(responses[1].get()), "18446744073709551617");
+    assert_eq!(raw_response_id(responses[2].get()), "null");
+    assert!(ctx.route_override_backend_host.is_none());
+}
+
+#[tokio::test]
+async fn mismatched_post_stream_response_is_refused_under_the_request_id() {
+    // The upstream/policy body names a different id than the request that
+    // opened this identity, so it may be neither framed as that request's event
+    // stream nor returned as a successful inline answer. The refusal still has
+    // to name the request, otherwise the client's pending call never resolves.
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = sse_tool_plugin(&server);
+    let session_id = initialize(&plugin).await;
+    let _ = aggregate_tool_names(&plugin, &session_id, 1).await;
+    let mut stream = attach_sse_body(&plugin, &session_id).await;
+
+    let mut ctx = route_tool_call(&plugin, &session_id, 901).await;
+    // The body is valid under the pinned `outputSchema`, so the id is its ONLY
+    // defect. A result that also failed `validate_tool_results` would be
+    // refused with `-32012` by the earlier fail-closed enforcement pass and
+    // never reach the delivery decision this test is about.
+    let mismatch = weather_tool_result(902);
+    let response_headers = known_json_response_headers(&mismatch);
+    let refused = final_response_body(&plugin, &mut ctx, 200, &response_headers, &mismatch).await;
+    let (status, refused_body, refused_headers) = reject_raw(refused);
+    assert_eq!(status, 200);
+    assert_eq!(
+        refused_headers.get("content-type").map(String::as_str),
+        Some("application/json"),
+        "a refusal is a JSON-RPC error on the POST, not a framed event"
+    );
+    let parsed: Value = serde_json::from_str(&refused_body).unwrap();
+    assert_eq!(parsed["error"]["code"], json!(-32603));
+    assert!(parsed.get("result").is_none());
+    assert_eq!(
+        raw_response_id(&refused_body),
+        "901",
+        "the refusal must correlate to the request the client is waiting on"
+    );
+    assert_eq!(
+        ctx.metadata.get("mcp.sse.delivery").map(String::as_str),
+        Some("refused")
+    );
+    assert!(!mcp_sse_stream_is_open_for_test(&ctx));
+
+    // Nothing reached the listener, and the identity's capacity came back.
+    let seen = sse_drain_until(&mut stream, &["\"id\":902"], 2).await;
+    assert!(!seen.contains("\"id\":902"));
+    assert!(!seen.contains("\"id\":901"));
+}
+
+#[tokio::test]
+async fn mismatched_post_stream_refusal_keeps_a_numeric_id_token() {
+    // A numeric identity is its exact admitted wire token, so the refusal
+    // cannot round-trip it through f64 either.
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = sse_tool_plugin(&server);
+    let session_id = initialize(&plugin).await;
+    let _ = aggregate_tool_names(&plugin, &session_id, 1).await;
+
+    let id = "18446744073709551617";
+    let request = format!(
+        r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"github.create_pr","arguments":{{"repo":"payments-api"}}}}}}"#
+    );
+    let (mut ctx, mut headers) = mcp_ctx_raw(request.clone().into_bytes());
+    accept_both_representations(&mut headers);
+    headers.insert("mcp-session-id".to_string(), session_id);
+    let routed = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(routed, PluginResult::Continue));
+    assert!(mcp_sse_stream_is_open_for_test(&ctx));
+    let _ = plugin
+        .transform_request_body_with_context(&mut ctx, request.as_bytes(), None, &headers)
+        .await;
+
+    // Schema-valid, exactly as above: only the id token differs from the one
+    // this request opened its identity under.
+    let mismatched = br#"{"jsonrpc":"2.0","id":18446744073709551616,"result":{"structuredContent":{"temperature":22.5,"conditions":"Partly cloudy"}}}"#;
+    let response_headers = known_json_response_headers(mismatched);
+    let refused = final_response_body(&plugin, &mut ctx, 200, &response_headers, mismatched).await;
+    let (_, refused_body, _) = reject_raw(refused);
+    assert_eq!(raw_response_id(&refused_body), id);
+    let parsed: Value = serde_json::from_str(&refused_body).unwrap();
+    assert_eq!(parsed["error"]["code"], json!(-32603));
+}
+
+#[tokio::test]
+async fn an_oversized_reflected_id_is_refused_without_echoing_it() {
+    // The singleton path has no batch response budget, so a multi-kilobyte id
+    // must not be mirrored back at request size.
+    let plugin = create_plugin("mcp_gateway", &aggregate_config("http://127.0.0.1:9/mcp"))
+        .unwrap()
+        .unwrap();
+    let oversized = "z".repeat(5000);
+    let request = format!(r#"{{"jsonrpc":"2.0","id":"{oversized}","method":"ping"}}"#);
+    let (mut ctx, mut headers) = mcp_ctx_raw(request.into_bytes());
+    let (status, body, _) = reject_raw(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let parsed: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed["error"]["code"], json!(-32600));
+    assert_eq!(parsed["id"], Value::Null);
+    assert!(!body.contains(&oversized), "the id must not be echoed");
+
+    // An id just inside the bound still round-trips exactly.
+    let bounded = "z".repeat(4000);
+    let request = format!(r#"{{"jsonrpc":"2.0","id":"{bounded}","method":"ping"}}"#);
+    let (mut ctx, mut headers) = mcp_ctx_raw(request.into_bytes());
+    let (status, body, _) = reject_raw(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    assert_eq!(raw_response_id(&body), format!("\"{bounded}\""));
+}
+
+/// `initialize` request body used by the session-ownership tests below.
+fn initialize_request_body() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "unit-test", "version": "1" }
+        }
+    })
+}
+
+fn tools_list_body(request_id: i64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "tools/list",
+        "params": {}
+    })
+}
+
+/// One MCP caller: its request context plus that request's header map.
+type McpCaller = (
+    ferrum_edge::plugins::RequestContext,
+    HashMap<String, String>,
+);
+
+/// Caller authenticated as a gateway Consumer with the given id and username.
+fn caller_as_consumer(body: Value, id: &str, username: &str) -> McpCaller {
+    let (mut ctx, headers) = mcp_ctx(body);
+    let mut consumer = create_test_consumer();
+    consumer.id = id.to_string();
+    consumer.username = username.to_string();
+    ctx.identified_consumer = Some(Arc::new(consumer));
+    ctx.authenticated_identity = None;
+    (ctx, headers)
+}
+
+/// Caller carrying an externally authenticated identity with no gateway
+/// Consumer mapping (the `jwks_auth` shape).
+fn caller_as_identity(body: Value, identity: &str) -> McpCaller {
+    let (mut ctx, headers) = mcp_ctx(body);
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = Some(identity.to_string());
+    (ctx, headers)
+}
+
+/// Caller on a proxy with no authentication plugin: no principal at all.
+fn caller_unauthenticated(body: Value) -> McpCaller {
+    let (mut ctx, headers) = mcp_ctx(body);
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = None;
+    (ctx, headers)
+}
+
+/// Drive a synthetic `initialize` for one caller and return the minted session.
+async fn initialize_as(
+    plugin: &std::sync::Arc<dyn ferrum_edge::plugins::Plugin>,
+    caller: McpCaller,
+) -> String {
+    let (mut ctx, mut headers) = caller;
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, response_headers) = reject_json(result);
+    assert_eq!(status, 200);
+    assert_eq!(body["result"]["serverInfo"]["name"], "ferrum-mcp-gateway");
+    response_headers
+        .get("mcp-session-id")
+        .expect("synthetic initialize must return an MCP session")
+        .clone()
+}
+
+/// Replay a request on an existing downstream session as one caller.
+async fn reuse_session_as(
+    plugin: &std::sync::Arc<dyn ferrum_edge::plugins::Plugin>,
+    session_id: &str,
+    caller: McpCaller,
+) -> PluginResult {
+    let (mut ctx, mut headers) = caller;
+    headers.insert("mcp-session-id".to_string(), session_id.to_string());
+    plugin.before_proxy(&mut ctx, &mut headers).await
+}
+
+fn assert_session_refused(result: PluginResult) {
+    let (status, body, _) = reject_raw(result);
+    assert_eq!(status, 404);
+    assert!(
+        body.is_empty(),
+        "refusal must reuse the session error shape"
+    );
+}
+
+fn assert_tools_listed(result: PluginResult) {
+    let (status, body, _) = reject_json(result);
+    assert_eq!(status, 200);
+    assert!(body["result"]["tools"].as_array().is_some());
+}
+
+#[tokio::test]
+async fn aggregate_session_is_bound_to_the_consumer_that_created_it() {
+    let server = start_mcp_catalog_server().await;
+    let config = aggregate_config(&format!("{}/mcp", server.uri()));
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+
+    let owner = caller_as_consumer(initialize_request_body(), "consumer-a", "alice");
+    let session_id = initialize_as(&plugin, owner).await;
+
+    // Another authenticated Consumer holding the same session id is refused
+    // with the ordinary session-not-found shape rather than served the session.
+    let other = caller_as_consumer(tools_list_body(2), "consumer-b", "mallory");
+    assert_session_refused(reuse_session_as(&plugin, &session_id, other).await);
+
+    // The creating Consumer still gets the session.
+    let owner = caller_as_consumer(tools_list_body(3), "consumer-a", "alice");
+    assert_tools_listed(reuse_session_as(&plugin, &session_id, owner).await);
+
+    // An unknown session id keeps producing the same error for that Consumer.
+    let owner = caller_as_consumer(tools_list_body(4), "consumer-a", "alice");
+    assert_session_refused(reuse_session_as(&plugin, "no-such-session", owner).await);
+}
+
+#[tokio::test]
+async fn aggregate_session_is_bound_to_an_external_identity_without_a_consumer() {
+    let server = start_mcp_catalog_server().await;
+    let config = aggregate_config(&format!("{}/mcp", server.uri()));
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+
+    let owner = caller_as_identity(initialize_request_body(), "alice@example.test");
+    let session_id = initialize_as(&plugin, owner).await;
+
+    let other = caller_as_identity(tools_list_body(2), "mallory@example.test");
+    assert_session_refused(reuse_session_as(&plugin, &session_id, other).await);
+
+    // A Consumer-mapped caller is a different principal even when the mapped
+    // username happens to equal the external identity string.
+    let mapped = caller_as_consumer(tools_list_body(3), "consumer-a", "alice@example.test");
+    assert_session_refused(reuse_session_as(&plugin, &session_id, mapped).await);
+
+    let owner = caller_as_identity(tools_list_body(4), "alice@example.test");
+    assert_tools_listed(reuse_session_as(&plugin, &session_id, owner).await);
+}
+
+#[tokio::test]
+async fn aggregate_sessions_are_unchanged_without_an_authentication_plugin() {
+    let server = start_mcp_catalog_server().await;
+    let config = aggregate_config(&format!("{}/mcp", server.uri()));
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+
+    let owner = caller_unauthenticated(initialize_request_body());
+    let session_id = initialize_as(&plugin, owner).await;
+
+    // No principal was available to bind, so reuse is unaffected.
+    let owner = caller_unauthenticated(tools_list_body(2));
+    assert_tools_listed(reuse_session_as(&plugin, &session_id, owner).await);
+
+    // An unknown session id still fails the same way.
+    let owner = caller_unauthenticated(tools_list_body(3));
+    assert_session_refused(reuse_session_as(&plugin, "no-such-session", owner).await);
+
+    // The binding is compared in both directions: a session minted with no
+    // principal is not reusable by an authenticated one.
+    let authenticated = caller_as_consumer(tools_list_body(4), "consumer-a", "alice");
+    assert_session_refused(reuse_session_as(&plugin, &session_id, authenticated).await);
+}
+
+// ---------------------------------------------------------------------------
+// Plugin-audit regressions (#5339–#5349, #5357)
+// ---------------------------------------------------------------------------
+
+/// Issue #5344: media types and structured suffixes are case-insensitive, so an
+/// otherwise identical request must not be accepted or refused on casing alone.
+#[tokio::test]
+async fn request_json_media_types_are_matched_case_insensitively() {
+    let plugin = create_plugin("mcp_gateway", &aggregate_config("http://127.0.0.1:9/mcp"))
+        .unwrap()
+        .unwrap();
+    for content_type in [
+        "application/json",
+        "APPLICATION/JSON",
+        "Application/Json-RPC",
+        "application/vnd.audit+json",
+        "application/vnd.audit+JSON",
+        "APPLICATION/VND.AUDIT+JSON; charset=UTF-8",
+        "  application/vnd.audit+Json  ",
+    ] {
+        let (mut ctx, mut headers) = mcp_ctx(json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "ping",
+            "params": {}
+        }));
+        headers.insert("content-type".to_string(), content_type.to_string());
+        let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(status, 200, "{content_type}");
+        assert_eq!(body["id"], json!(10), "{content_type}");
+        assert!(body["result"].is_object(), "{content_type}");
+    }
+
+    // A genuinely different media type is still refused.
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "ping",
+        "params": {}
+    }));
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    assert_eq!(body["error"]["code"], json!(-32600));
+}
+
+/// Issue #5345: result logging/hashing had no producer anywhere in the plugin,
+/// so the settings are rejected at admission rather than accepted and ignored.
+#[tokio::test]
+async fn result_logging_settings_are_rejected_rather_than_accepted_inert() {
+    for field in ["log_raw_results", "log_result_hash"] {
+        let mut observability = serde_json::Map::new();
+        observability.insert(field.to_string(), json!(true));
+        let mut config = aggregate_config("http://127.0.0.1:9/mcp");
+        config["observability"] = Value::Object(observability);
+        let error = create_plugin("mcp_gateway", &config)
+            .err()
+            .unwrap_or_else(|| panic!("observability.{field} must not be admitted"));
+        assert!(error.contains(field), "{error}");
+    }
+
+    // The implemented argument-side settings stay accepted.
+    let mut config = aggregate_config("http://127.0.0.1:9/mcp");
+    config["observability"] = json!({
+        "emit_metadata": true,
+        "log_argument_hash": true,
+        "log_raw_arguments": false
+    });
+    assert!(create_plugin("mcp_gateway", &config).is_ok());
+}
+
+/// Route one `tools/call` and return the request context so the caller can
+/// inspect the argument observability metadata it produced.
+async fn route_tool_call_arguments(
+    validate_tool_arguments: bool,
+    log_argument_hash: bool,
+    log_raw_arguments: bool,
+    arguments: Value,
+) -> ferrum_edge::plugins::RequestContext {
+    let server = start_mcp_catalog_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["validation"] = json!({ "validate_tool_arguments": validate_tool_arguments });
+    config["observability"] = json!({
+        "emit_metadata": true,
+        "log_argument_hash": log_argument_hash,
+        "log_raw_arguments": log_raw_arguments
+    });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    let _ = aggregate_tool_names(&plugin, &session_id, 900).await;
+
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 901,
+        "method": "tools/call",
+        "params": { "name": "github.create_pr", "arguments": arguments }
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id);
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    ctx
+}
+
+/// Issue #5357: argument observation is its own setting. Turning schema
+/// validation off must not silently turn the requested observation off with it.
+#[tokio::test]
+async fn argument_observation_is_independent_of_argument_validation() {
+    // Validation off, both observations on: the arguments are still observed —
+    // and these arguments would not even have passed the schema.
+    let ctx = route_tool_call_arguments(false, true, true, json!({ "repo": 42 })).await;
+    assert!(
+        ctx.metadata.contains_key("mcp.arguments_hash"),
+        "log_argument_hash must not inherit validate_tool_arguments"
+    );
+    assert_eq!(
+        ctx.metadata.get("mcp.arguments").map(String::as_str),
+        Some(r#"{"repo":42}"#),
+        "log_raw_arguments must not inherit validate_tool_arguments"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.schema_validation")
+            .map(String::as_str),
+        Some("skipped"),
+        "validation was disabled, so the verdict stays at its neutral baseline"
+    );
+
+    // Validation on, both observations off: neither key is emitted, and the
+    // schema verdict still is.
+    let ctx =
+        route_tool_call_arguments(true, false, false, json!({ "repo": "payments-api" })).await;
+    assert!(!ctx.metadata.contains_key("mcp.arguments_hash"));
+    assert!(!ctx.metadata.contains_key("mcp.arguments"));
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.schema_validation")
+            .map(String::as_str),
+        Some("pass")
+    );
+
+    // Everything off: nothing is derived at all.
+    let ctx =
+        route_tool_call_arguments(false, false, false, json!({ "repo": "payments-api" })).await;
+    assert!(!ctx.metadata.contains_key("mcp.arguments_hash"));
+    assert!(!ctx.metadata.contains_key("mcp.arguments"));
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.schema_validation")
+            .map(String::as_str),
+        Some("skipped")
+    );
+
+    // Hash only, with validation on: the raw arguments stay opt-in.
+    let ctx = route_tool_call_arguments(true, true, false, json!({ "repo": "payments-api" })).await;
+    assert!(ctx.metadata.contains_key("mcp.arguments_hash"));
+    assert!(!ctx.metadata.contains_key("mcp.arguments"));
+}
+
+/// Issue #5339: namespacing renames a prompt, it does not strip its descriptor.
+/// A conforming upstream prompt keeps its `title` and its standard `arguments`
+/// array so a client can still discover what `prompts/get` needs.
+#[tokio::test]
+async fn aggregate_prompts_list_preserves_standard_arguments_and_title() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "initialize"})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("mcp-session-id", "upstream-session")
+                .set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": {"protocolVersion": "2025-11-25", "capabilities": {}}
+                })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "prompts/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "prompts",
+            "result": {"prompts": [
+                {
+                    "name": "welcome",
+                    "title": "Welcome prompt",
+                    "description": "Greets a named visitor",
+                    "arguments": [
+                        {
+                            "name": "visitor",
+                            "title": "Visitor",
+                            "description": "Display name",
+                            "required": true
+                        },
+                        { "name": "tone" }
+                    ]
+                },
+                {
+                    // A non-array `arguments` is not a conforming argument list.
+                    "name": "legacy",
+                    "arguments": {"type": "object"},
+                    "argumentsSchema": {"type": "object"}
+                }
+            ]}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "prompts/get"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "get",
+            "result": {"messages": []}
+        })))
+        .mount(&server)
+        .await;
+
+    let config = single_server_family_config(&format!("{}/mcp", server.uri()), false, true, false);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (status, body, _) =
+        aggregate_request_with_metadata(&plugin, &session_id, 930, "prompts/list", json!({})).await;
+    assert_eq!(status, 200);
+    let prompts = body["result"]["prompts"].as_array().unwrap();
+    let welcome = prompts
+        .iter()
+        .find(|prompt| prompt["name"] == json!("github.welcome"))
+        .unwrap_or_else(|| panic!("namespaced prompt missing: {body}"));
+    assert_eq!(welcome["title"], json!("Welcome prompt"));
+    assert_eq!(
+        welcome["description"],
+        json!("[github] Greets a named visitor")
+    );
+    assert_eq!(
+        welcome["arguments"],
+        json!([
+            {
+                "name": "visitor",
+                "title": "Visitor",
+                "description": "Display name",
+                "required": true
+            },
+            { "name": "tone" }
+        ]),
+        "the standard prompt argument array must survive namespacing verbatim"
+    );
+
+    let legacy = prompts
+        .iter()
+        .find(|prompt| prompt["name"] == json!("github.legacy"))
+        .unwrap_or_else(|| panic!("second prompt missing: {body}"));
+    assert!(
+        legacy["arguments"].is_null(),
+        "a non-array arguments value is not republished"
+    );
+    assert_eq!(legacy["argumentsSchema"], json!({"type": "object"}));
+
+    // The namespaced name still routes: argument names are prompt-local and are
+    // never rewritten, so the upstream sees its own prompt name unchanged.
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 931,
+        "method": "prompts/get",
+        "params": { "name": "github.welcome", "arguments": { "visitor": "Pat" } }
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id);
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.upstream_prompt_name")
+            .map(String::as_str),
+        Some("welcome")
+    );
+}
+
+/// Aggregate config on a non-default endpoint, so two instances can be composed.
+fn aggregate_config_on_endpoint(upstream_url: &str, path: &str) -> Value {
+    let mut config = aggregate_output_validation_config(upstream_url);
+    config["endpoint"]["path"] = json!(path);
+    config
+}
+
+/// Issue #5340: response-phase policy belongs to the instance that admitted the
+/// request. A sibling on a disjoint endpoint — even a disabled one — must not
+/// consume its validator claim or apply its own response bounds.
+#[tokio::test]
+async fn sibling_instances_do_not_apply_response_policy_to_another_endpoint() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let upstream = format!("{}/mcp", server.uri());
+
+    // The serving instance: endpoint `/mcp`, result validation on, 4 KiB cap.
+    let serving = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&upstream),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&serving).await;
+
+    let upstream_response = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 941,
+        "result": {
+            "structuredContent": { "temperature": 22.5, "conditions": "Partly cloudy" },
+            "content": [{ "type": "text", "text": "a normal response with room to spare" }]
+        }
+    }))
+    .unwrap();
+    assert!(
+        upstream_response.len() > 100,
+        "the sibling's 100-byte cap must actually be exceeded"
+    );
+    let response_headers = known_json_response_headers(&upstream_response);
+
+    for sibling_enabled in [true, false] {
+        // The unrelated instance: endpoint `/other`, a 100-byte response cap,
+        // and no result validation of its own.
+        let mut sibling_config = aggregate_config_on_endpoint(&upstream, "/other");
+        sibling_config["enabled"] = json!(sibling_enabled);
+        sibling_config["validation"] = json!({
+            "validate_tool_arguments": true,
+            "max_upstream_response_bytes": 100
+        });
+        let sibling = create_plugin("mcp_gateway", &sibling_config)
+            .unwrap()
+            .unwrap();
+
+        let mut ctx = route_validated_tool_call(&serving, &session_id, 940).await;
+        assert!(
+            !sibling.may_enforce_response_body_policy(&ctx),
+            "enabled={sibling_enabled}: a sibling must not claim another endpoint's enforcement"
+        );
+        assert!(
+            !sibling.should_buffer_response_body(&ctx),
+            "enabled={sibling_enabled}: a sibling must not buffer another endpoint's response"
+        );
+        let mut sibling_headers = response_headers.clone();
+        assert!(
+            matches!(
+                sibling
+                    .after_proxy(&mut ctx, 200, &mut sibling_headers)
+                    .await,
+                PluginResult::Continue
+            ),
+            "enabled={sibling_enabled}: a sibling must not refuse another endpoint's response"
+        );
+        assert!(
+            matches!(
+                sibling
+                    .on_final_response_body(&mut ctx, 200, &response_headers, &upstream_response)
+                    .await,
+                PluginResult::Continue
+            ),
+            "enabled={sibling_enabled}: a sibling must not enforce on another endpoint's body"
+        );
+
+        // The serving instance still behaves exactly as it does alone.
+        let mut serving_headers = response_headers.clone();
+        assert!(matches!(
+            serving
+                .after_proxy(&mut ctx, 200, &mut serving_headers)
+                .await,
+            PluginResult::Continue
+        ));
+        assert!(matches!(
+            serving
+                .on_final_response_body(&mut ctx, 200, &response_headers, &upstream_response)
+                .await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            ctx.metadata
+                .get("mcp.result_schema_validation")
+                .map(String::as_str),
+            Some("pass")
+        );
+    }
+}
+
+/// Route one validated `tools/call` under an arbitrary JSON-RPC id token.
+async fn route_validated_tool_call_with_id(
+    plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
+    session_id: &str,
+    warm_id: i64,
+    call_id: Value,
+) -> ferrum_edge::plugins::RequestContext {
+    let _ = aggregate_tool_names(plugin, session_id, warm_id).await;
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": call_id,
+        "method": "tools/call",
+        "params": { "name": "github.create_pr", "arguments": { "repo": "payments-api" } }
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id.to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    ctx
+}
+
+/// Issue #5341: a response-phase refusal must name the pending request. The
+/// upstream failure paths in particular have no readable JSON-RPC id of their
+/// own, so an `id: null` there leaves the caller waiting for its own timeout.
+#[tokio::test]
+async fn response_phase_refusals_name_the_admitted_request_id() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+
+    // An upstream error page: not inspectable JSON, refused at header time.
+    let mut ctx =
+        route_validated_tool_call_with_id(&plugin, &session_id, 950, json!("call-alpha")).await;
+    let mut error_page_headers = HashMap::from([
+        ("content-type".to_string(), "text/html".to_string()),
+        ("content-length".to_string(), "64".to_string()),
+    ]);
+    let (status, body, _) = reject_json(
+        plugin
+            .after_proxy(&mut ctx, 503, &mut error_page_headers)
+            .await,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body["error"]["code"], json!(-32012));
+    assert_eq!(body["id"], json!("call-alpha"));
+
+    // An exact numeric wire token is reflected byte-for-byte, not through f64.
+    let mut ctx = route_validated_tool_call_with_id(&plugin, &session_id, 951, json!(952)).await;
+    let id = "18446744073709551616";
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"github.create_pr","arguments":{{"repo":"payments-api"}}}}}}"#
+    );
+    let (mut ctx_raw, mut headers) = mcp_ctx_raw(body.into_bytes());
+    headers.insert("mcp-session-id".to_string(), session_id.clone());
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx_raw, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let mut event_stream_headers = HashMap::from([
+        ("content-type".to_string(), "text/event-stream".to_string()),
+        ("content-length".to_string(), "64".to_string()),
+    ]);
+    let (_, refused, _) = reject_raw(
+        plugin
+            .after_proxy(&mut ctx_raw, 200, &mut event_stream_headers)
+            .await,
+    );
+    assert_eq!(raw_response_id(&refused), id);
+
+    // Each in-flight request keeps its own identity: the ordinary numeric call
+    // above is refused under its own id, not the huge token's.
+    let mut plain_headers = HashMap::from([
+        ("content-type".to_string(), "text/plain".to_string()),
+        ("content-length".to_string(), "64".to_string()),
+    ]);
+    let (_, refused, _) = reject_json(plugin.after_proxy(&mut ctx, 200, &mut plain_headers).await);
+    assert_eq!(refused["error"]["code"], json!(-32012));
+    assert_eq!(refused["id"], json!(952));
+}
+
+/// Issues #5342 / #5410: the session `GET` listener is an opt-in surface —
+/// answering `405` is equally conforming — and opting in never moves a POST
+/// request's response onto that stream.
+#[tokio::test]
+async fn aggregate_sse_multiplexing_is_off_unless_explicitly_enabled() {
+    // No `sessions` block at all: GET keeps the 405 and POSTs answer inline.
+    let plugin = create_plugin("mcp_gateway", &aggregate_config("http://127.0.0.1:9/mcp"))
+        .unwrap()
+        .unwrap();
+    let (mut ctx, mut headers) = sse_get_ctx(None, Some("text/event-stream"));
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        status, 405,
+        "the aggregate SSE surfaces must be off by default"
+    );
+    assert!(body["error"].as_str().unwrap().contains("disabled"));
+
+    let session_id = initialize(&plugin).await;
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    let (status, _, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 405);
+    assert!(
+        !mcp_aggregate_sse_listener_is_staged_for_test(&ctx),
+        "no listener may be staged while multiplexing is off"
+    );
+
+    // The request's response stays on its own POST, as the transport requires.
+    let (status, body, _) = reject_json(ping(&plugin, &session_id, json!("inline")).await);
+    assert_eq!(status, 200);
+    assert_eq!(body["id"], json!("inline"));
+    assert!(body["result"].is_object());
+
+    // Opting in restores the listener.
+    let opted_in = mcp_plugin();
+    let session_id = initialize(&opted_in).await;
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    let (status, _, response_headers) =
+        reject_raw(opted_in.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    assert_eq!(
+        response_headers.get("content-type").map(String::as_str),
+        Some("text/event-stream")
+    );
+}
+
+/// Issue #5349: the parity metadata must name every phase the plugin is active
+/// on, including the response hooks it declares through the trait itself.
+#[tokio::test]
+async fn mcp_gateway_parity_metadata_names_its_active_response_phases() {
+    let meta = ferrum_edge::plugins::BUILTIN_PLUGIN_PARITY_META
+        .iter()
+        .find(|meta| meta.name == "mcp_gateway")
+        .expect("mcp_gateway parity metadata");
+    for phase in [
+        "before_proxy",
+        "transform_request_body",
+        "transform_response_body",
+        "after_proxy",
+        "on_final_response_body",
+    ] {
+        assert!(
+            meta.active_phases.contains(phase),
+            "parity metadata omits the active {phase} phase: {}",
+            meta.active_phases
+        );
+    }
+
+    // Issue #5410 removed the committed-response hook with the cross-connection
+    // publication it existed to gate: POST-attached delivery has no visibility
+    // boundary to defer past. The declaration and the documented phase list must
+    // agree in BOTH directions, so neither can drift back on its own.
+    let plugin = create_plugin("mcp_gateway", &aggregate_config("http://127.0.0.1:9/mcp"))
+        .unwrap()
+        .unwrap();
+    assert!(!plugin.requires_response_committed_hook());
+    assert!(
+        !meta.active_phases.contains("on_response_committed"),
+        "an undeclared committed hook must not appear in the documented phase list"
+    );
+}
+
+/// The published `McpGatewayConfig` component, compiled as a Draft 2020-12
+/// validator with the rest of `openapi.yaml` available for local `$ref`s.
+fn mcp_gateway_component_validator() -> jsonschema::Validator {
+    let spec: Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/McpGatewayConfig",
+        "components": spec["components"].clone()
+    });
+    jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("McpGatewayConfig schema compiles")
+}
+
+fn schema_fixture_base() -> Value {
+    json!({
+        "mode": "aggregate_router",
+        "endpoint": { "path": "/mcp" },
+        "servers": {
+            "demo": { "upstream_url": "http://127.0.0.1:9/mcp", "namespace": "demo" }
+        }
+    })
+}
+
+fn schema_fixture(overrides: Value) -> Value {
+    let mut config = schema_fixture_base();
+    let object = config.as_object_mut().expect("fixture base is an object");
+    for (key, value) in overrides.as_object().expect("overrides are an object") {
+        object.insert(key.clone(), value.clone());
+    }
+    config
+}
+
+/// Issue #5346: the component is the plugin's published admission contract, so
+/// a differential corpus must agree with the constructor rather than accepting
+/// configs the runtime refuses or refusing defaults the runtime accepts.
+#[tokio::test]
+async fn mcp_gateway_openapi_component_matches_runtime_admission() {
+    let validator = mcp_gateway_component_validator();
+
+    let transparent = json!({
+        "mode": "transparent_proxy",
+        "endpoint": { "path": "/mcp" },
+        "servers": {
+            "demo": { "upstream_url": "http://127.0.0.1:9/mcp", "namespace": "demo" }
+        }
+    });
+    let transparent_with = |overrides: Value| {
+        let mut config = transparent.clone();
+        let object = config
+            .as_object_mut()
+            .expect("transparent base is an object");
+        for (key, value) in overrides.as_object().expect("overrides are an object") {
+            object.insert(key.clone(), value.clone());
+        }
+        config
+    };
+
+    let fixtures: Vec<(&str, Value)> = vec![
+        // Minimal and documented shapes.
+        ("minimal aggregate", schema_fixture_base()),
+        ("minimal transparent", transparent.clone()),
+        (
+            "documented example",
+            json!({
+                "enabled": true,
+                "mode": "aggregate_router",
+                "endpoint": { "path": "/mcp", "protocol_versions": ["2025-11-25"] },
+                "discovery": {
+                    "namespace_separator": ".",
+                    "cache_ttl_seconds": 300,
+                    "on_new_tool": "hide_until_configured",
+                    "on_schema_change": "hide_until_configured"
+                },
+                "sessions": {
+                    "downstream_session_header": "mcp-session-id",
+                    "upstream_session_header": "mcp-session-id",
+                    "initialize_upstreams": "lazy",
+                    "session_ttl_seconds": 3600,
+                    "max_sessions": 16384
+                },
+                "servers": {
+                    "github": {
+                        "upstream_url": "http://github-mcp.example/mcp",
+                        "namespace": "github",
+                        "expose_tools": true
+                    },
+                    "jira": {
+                        "upstream_url": "http://jira-mcp.example/mcp",
+                        "namespace": "jira",
+                        "expose_tools": true
+                    }
+                },
+                "policy": {
+                    "default_action": "deny",
+                    "tools": {
+                        "github.create_pr": { "action": "allow" },
+                        "jira.create_issue": { "action": "allow" }
+                    }
+                },
+                "validation": {
+                    "validate_tool_arguments": true,
+                    "validate_tool_results": false,
+                    "max_batch_items": 32,
+                    "max_batch_bytes": 1048576,
+                    "max_batch_item_bytes": 262144,
+                    "max_batch_response_bytes": 1048576
+                }
+            }),
+        ),
+        // Explicit nulls the constructor treats exactly as omission.
+        ("null enabled", schema_fixture(json!({ "enabled": null }))),
+        (
+            "null discovery",
+            schema_fixture(json!({ "discovery": null })),
+        ),
+        ("null sessions", schema_fixture(json!({ "sessions": null }))),
+        (
+            "null capabilities",
+            schema_fixture(json!({ "capabilities": null })),
+        ),
+        ("null policy", schema_fixture(json!({ "policy": null }))),
+        (
+            "null validation",
+            schema_fixture(json!({ "validation": null })),
+        ),
+        (
+            "null observability",
+            schema_fixture(json!({ "observability": null })),
+        ),
+        (
+            "null protocol_versions",
+            schema_fixture(json!({ "endpoint": { "path": "/mcp", "protocol_versions": null } })),
+        ),
+        (
+            "null max_sessions",
+            schema_fixture(json!({ "sessions": { "max_sessions": null } })),
+        ),
+        (
+            "null cache_ttl_seconds",
+            schema_fixture(json!({ "discovery": { "cache_ttl_seconds": null } })),
+        ),
+        (
+            "null server enabled",
+            schema_fixture(json!({
+                "servers": {
+                    "demo": {
+                        "upstream_url": "http://127.0.0.1:9/mcp",
+                        "namespace": "demo",
+                        "enabled": null
+                    }
+                }
+            })),
+        ),
+        (
+            "null policy.tools",
+            schema_fixture(json!({ "policy": { "tools": null } })),
+        ),
+        // Unknown keys, at every placement the constructor closes.
+        ("unknown root key", schema_fixture(json!({ "bogus": 1 }))),
+        (
+            "unknown endpoint key",
+            schema_fixture(json!({ "endpoint": { "path": "/mcp", "bogus": 1 } })),
+        ),
+        (
+            "unknown discovery key",
+            schema_fixture(json!({ "discovery": { "bogus": 1 } })),
+        ),
+        (
+            "unknown sessions key",
+            schema_fixture(json!({ "sessions": { "bogus": 1 } })),
+        ),
+        (
+            "unknown capabilities key",
+            schema_fixture(json!({ "capabilities": { "bogus": 1 } })),
+        ),
+        (
+            "unknown policy key",
+            schema_fixture(json!({ "policy": { "bogus": 1 } })),
+        ),
+        (
+            "unknown validation key",
+            schema_fixture(json!({ "validation": { "bogus": 1 } })),
+        ),
+        (
+            "unknown observability key",
+            schema_fixture(json!({ "observability": { "bogus": 1 } })),
+        ),
+        (
+            "unknown server key",
+            schema_fixture(json!({
+                "servers": {
+                    "demo": {
+                        "upstream_url": "http://127.0.0.1:9/mcp",
+                        "namespace": "demo",
+                        "bogus": 1
+                    }
+                }
+            })),
+        ),
+        (
+            "unknown tool policy key",
+            schema_fixture(json!({
+                "policy": { "tools": { "demo.thing": { "action": "allow", "bogus": 1 } } }
+            })),
+        ),
+        (
+            "stdio spawn server",
+            schema_fixture(json!({
+                "servers": {
+                    "demo": {
+                        "upstream_url": "http://127.0.0.1:9/mcp",
+                        "namespace": "demo",
+                        "command": "npx"
+                    }
+                }
+            })),
+        ),
+        (
+            "inert result logging",
+            schema_fixture(json!({ "observability": { "log_raw_results": true } })),
+        ),
+        (
+            "inert result hashing",
+            schema_fixture(json!({ "observability": { "log_result_hash": true } })),
+        ),
+        // Expressible scalar constraints.
+        (
+            "root endpoint",
+            schema_fixture(json!({ "endpoint": { "path": "/" } })),
+        ),
+        (
+            "dot-segment endpoint",
+            schema_fixture(json!({ "endpoint": { "path": "/mcp/../admin" } })),
+        ),
+        (
+            "percent-escaped endpoint",
+            schema_fixture(json!({ "endpoint": { "path": "/%2fmcp" } })),
+        ),
+        (
+            "relative endpoint",
+            schema_fixture(json!({ "endpoint": { "path": "mcp" } })),
+        ),
+        (
+            "blank protocol version",
+            schema_fixture(json!({ "endpoint": { "path": "/mcp", "protocol_versions": [" "] } })),
+        ),
+        (
+            "empty protocol versions",
+            schema_fixture(json!({ "endpoint": { "path": "/mcp", "protocol_versions": [] } })),
+        ),
+        (
+            "zero cache ttl",
+            schema_fixture(json!({ "discovery": { "cache_ttl_seconds": 0 } })),
+        ),
+        (
+            "empty namespace separator",
+            schema_fixture(json!({ "discovery": { "namespace_separator": "" } })),
+        ),
+        (
+            "blank namespace",
+            schema_fixture(json!({
+                "servers": {
+                    "demo": { "upstream_url": "http://127.0.0.1:9/mcp", "namespace": " " }
+                }
+            })),
+        ),
+        (
+            "invalid session header",
+            schema_fixture(json!({ "sessions": { "downstream_session_header": "bad header" } })),
+        ),
+        (
+            "non-http upstream",
+            schema_fixture(json!({
+                "servers": { "demo": { "upstream_url": "stdio://x", "namespace": "demo" } }
+            })),
+        ),
+        (
+            "query-bearing upstream",
+            schema_fixture(json!({
+                "servers": {
+                    "demo": { "upstream_url": "http://127.0.0.1:9/mcp?a=1", "namespace": "demo" }
+                }
+            })),
+        ),
+        (
+            "fragment-bearing upstream",
+            schema_fixture(json!({
+                "servers": {
+                    "demo": { "upstream_url": "http://127.0.0.1:9/mcp#f", "namespace": "demo" }
+                }
+            })),
+        ),
+        (
+            "credential-bearing upstream",
+            schema_fixture(json!({
+                "servers": {
+                    "demo": { "upstream_url": "http://u:p@127.0.0.1:9/mcp", "namespace": "demo" }
+                }
+            })),
+        ),
+        ("no servers", schema_fixture(json!({ "servers": {} }))),
+        // Expressible mode constraints.
+        (
+            "transparent result validation",
+            transparent_with(json!({ "validation": { "validate_tool_results": true } })),
+        ),
+        (
+            "transparent result validation disabled",
+            transparent_with(json!({ "validation": { "validate_tool_results": false } })),
+        ),
+        (
+            "transparent discovery field",
+            transparent_with(json!({ "discovery": { "cache_ttl_seconds": 300 } })),
+        ),
+        (
+            "transparent policy field",
+            transparent_with(json!({ "policy": { "default_action": "allow" } })),
+        ),
+        (
+            "advertise logging without passthrough",
+            schema_fixture(json!({ "capabilities": { "advertise_logging": true } })),
+        ),
+        (
+            "advertise tasks without passthrough",
+            schema_fixture(json!({ "capabilities": { "advertise_tasks": true } })),
+        ),
+        (
+            "advertise completions with passthrough",
+            schema_fixture(json!({
+                "capabilities": {
+                    "advertise_completions": true,
+                    "passthrough_unknown_methods": true
+                }
+            })),
+        ),
+    ];
+
+    for (name, config) in fixtures {
+        let schema_admits = validator.is_valid(&config);
+        let runtime_admits = create_plugin("mcp_gateway", &config).is_ok();
+        assert_eq!(
+            schema_admits, runtime_admits,
+            "{name}: schema={schema_admits} runtime={runtime_admits} config={config}"
+        );
+    }
+
+    // Relationships between sibling values are deliberately left to plugin
+    // load: portable JSON Schema cannot compare them. These must therefore pass
+    // the schema and fail the constructor, and the component description says so.
+    let runtime_only: Vec<(&str, Value)> = vec![
+        (
+            "batch item bound above the batch bound",
+            schema_fixture(json!({
+                "validation": { "max_batch_bytes": 1024, "max_batch_item_bytes": 4096 }
+            })),
+        ),
+        (
+            "SSE event bound above the retention budget",
+            schema_fixture(json!({
+                "sessions": { "sse_max_event_bytes": 100, "sse_max_retained_bytes": 50 }
+            })),
+        ),
+        (
+            "no exposed catalog family",
+            schema_fixture(json!({
+                "servers": {
+                    "demo": {
+                        "upstream_url": "http://127.0.0.1:9/mcp",
+                        "namespace": "demo",
+                        "expose_tools": false
+                    }
+                }
+            })),
+        ),
+        (
+            "two enabled transparent servers",
+            transparent_with(json!({
+                "servers": {
+                    "one": { "upstream_url": "http://127.0.0.1:9/mcp", "namespace": "one" },
+                    "two": { "upstream_url": "http://127.0.0.1:10/mcp", "namespace": "two" }
+                }
+            })),
+        ),
+        (
+            "duplicate namespaces",
+            schema_fixture(json!({
+                "servers": {
+                    "one": { "upstream_url": "http://127.0.0.1:9/mcp", "namespace": "same" },
+                    "two": { "upstream_url": "http://127.0.0.1:10/mcp", "namespace": "same" }
+                }
+            })),
+        ),
+    ];
+    for (name, config) in runtime_only {
+        assert!(
+            validator.is_valid(&config),
+            "{name}: portable JSON Schema cannot express this relationship"
+        );
+        assert!(
+            create_plugin("mcp_gateway", &config).is_err(),
+            "{name}: the constructor must still enforce it"
+        );
+    }
 }

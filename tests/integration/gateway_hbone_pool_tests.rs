@@ -14,11 +14,12 @@ use ferrum_edge::proxy::hbone_pool::{
     H2ConnectTunnel, HBONE_DEFAULT_MAX_HEADER_LIST_SIZE, HBONE_TARGET_TAG, HboneConnectionPool,
     HbonePoolError,
 };
-use ferrum_edge::proxy::mesh_mtls_pool::MeshMtlsSender;
+use ferrum_edge::proxy::mesh_mtls_pool::{MeshMtlsConnectionPool, MeshMtlsSender};
 use ferrum_edge::proxy::mesh_trust_registry::{
     MESH_KEEPALIVE_FAILED_MESSAGE, MESH_TRUST_WITHDRAWN_MESSAGE, MeshTransportGate,
 };
 use ferrum_edge::proxy::{GatewayTrustCommit, ProxyState};
+use ferrum_edge::retry::ErrorClass;
 use ferrum_edge::tls::spiffe::build_spiffe_inbound_config;
 use http::{Response, StatusCode};
 use rcgen::{
@@ -1549,4 +1550,201 @@ fn hbone_pool_default_max_header_list_size_is_hyper_parity_not_h2s_16_mib() {
         64 * 1024,
         "attach must be one-shot (OnceLock::set)"
     );
+}
+
+/// Number of simultaneous cold-pool checkouts driven at one hard-down peer.
+const COALESCED_COHORT: usize = 6;
+/// How long the black-hole listener holds an accepted socket before dropping
+/// it. Long enough that every cohort member is provably inside the pool (and
+/// has therefore joined the in-flight creation) before the creator's dial
+/// fails.
+const BLACK_HOLE_HOLD: Duration = Duration::from_millis(750);
+
+/// A listener that ACCEPTS every dial, counts it, holds the socket for `hold`
+/// and then drops it without ever answering the ClientHello, so the client's
+/// TLS handshake fails.
+///
+/// Nothing is ever established, so the accept count IS the physical dial count
+/// for the cohort — the deterministic evidence issue #5046 asks for in place of
+/// a benchmark.
+async fn start_counting_black_hole(hold: Duration) -> (u16, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind black-hole listener");
+    let port = listener.local_addr().expect("black-hole addr").port();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let counter = accepts.clone();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                tokio::time::sleep(hold).await;
+                drop(socket);
+            });
+        }
+    });
+    (port, accepts)
+}
+
+fn gateway_svid_slot_for_test() -> SharedSvidBundle {
+    let td = TrustDomain::new("cluster.local").unwrap();
+    let (root_der, root_pem, root_key_pem) = synthetic_root(&td);
+    let gateway_id = SpiffeId::from_parts(&td, "ns/edge/sa/gateway").unwrap();
+    let (gateway_leaf, gateway_key) = issue_svid(&gateway_id, &root_pem, &root_key_pem);
+    svid_slot(bundle_for(gateway_id, gateway_leaf, gateway_key, root_der))
+}
+
+async fn dial_black_holed_hbone(
+    pool: &HboneConnectionPool,
+    proxy: &Proxy,
+    port: u16,
+) -> HbonePoolError {
+    let dial = pool.get_tunnel_via(
+        proxy,
+        "127.0.0.1",
+        "127.0.0.1",
+        8080,
+        8080,
+        port,
+        None,
+        None,
+        None,
+        None,
+    );
+    match dial.await {
+        Ok(_) => panic!("a black-holed peer can never complete an HBONE dial"),
+        Err(err) => err,
+    }
+}
+
+async fn dial_black_holed_mesh_mtls(
+    pool: &MeshMtlsConnectionPool,
+    proxy: &Proxy,
+    port: u16,
+) -> HbonePoolError {
+    let dial = pool.get_sender(proxy, "127.0.0.1", 8080, 8080, port, None, None, None);
+    match dial.await {
+        Ok(_) => panic!("a black-holed peer can never complete a mesh-mTLS dial"),
+        Err(err) => err,
+    }
+}
+
+/// One physical dial for the whole cohort, and the SAME typed outcome for
+/// every member of it.
+fn assert_shared_dial_failure(outcomes: &[HbonePoolError], accepts: &AtomicUsize) {
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        1,
+        "a simultaneous cohort against one hard-down peer must run ONE physical dial"
+    );
+    assert_eq!(outcomes.len(), COALESCED_COHORT);
+    for outcome in outcomes {
+        assert!(
+            matches!(outcome, HbonePoolError::TlsHandshake { .. }),
+            "every waiter must receive the creator's typed failure"
+        );
+        assert_eq!(outcome.error_class(), ErrorClass::TlsError);
+        assert_eq!(outcome.public_reason(), "TLS handshake failed");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hbone_cohort_pays_for_one_failed_dial_not_one_per_waiter() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let (server_port, accepts) = start_counting_black_hole(BLACK_HOLE_HOLD).await;
+    let pool = Arc::new(HboneConnectionPool::new(
+        PoolConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        gateway_svid_slot_for_test(),
+        4,
+    ));
+    let proxy = Arc::new(proxy_for_test());
+    let ready = Arc::new(tokio::sync::Barrier::new(COALESCED_COHORT));
+
+    let mut tasks = Vec::with_capacity(COALESCED_COHORT);
+    for _ in 0..COALESCED_COHORT {
+        let pool = pool.clone();
+        let proxy = proxy.clone();
+        let ready = ready.clone();
+        let task = tokio::spawn(async move {
+            ready.wait().await;
+            dial_black_holed_hbone(&pool, &proxy, server_port).await
+        });
+        tasks.push(task);
+    }
+
+    let mut outcomes = Vec::with_capacity(COALESCED_COHORT);
+    for task in tasks {
+        outcomes.push(task.await.expect("checkout task should not panic"));
+    }
+
+    assert_shared_dial_failure(&outcomes, &accepts);
+    assert_eq!(
+        pool.pool_size(),
+        0,
+        "a failed creation must never leave a pooled entry behind"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mesh_mtls_cohort_pays_for_one_failed_dial_not_one_per_waiter() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let (server_port, accepts) = start_counting_black_hole(BLACK_HOLE_HOLD).await;
+    let pool = Arc::new(MeshMtlsConnectionPool::new(
+        PoolConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        gateway_svid_slot_for_test(),
+        4,
+    ));
+    let proxy = Arc::new(proxy_for_test());
+    let ready = Arc::new(tokio::sync::Barrier::new(COALESCED_COHORT));
+
+    let mut tasks = Vec::with_capacity(COALESCED_COHORT);
+    for _ in 0..COALESCED_COHORT {
+        let pool = pool.clone();
+        let proxy = proxy.clone();
+        let ready = ready.clone();
+        let task = tokio::spawn(async move {
+            ready.wait().await;
+            dial_black_holed_mesh_mtls(&pool, &proxy, server_port).await
+        });
+        tasks.push(task);
+    }
+
+    let mut outcomes = Vec::with_capacity(COALESCED_COHORT);
+    for task in tasks {
+        outcomes.push(task.await.expect("checkout task should not panic"));
+    }
+
+    assert_shared_dial_failure(&outcomes, &accepts);
+    assert_eq!(
+        pool.pool_size(),
+        0,
+        "a failed creation must never leave a pooled entry behind"
+    );
+}
+
+/// Recovery: the request immediately after a broadcast failure must dial the
+/// peer again. The broadcast releases one cohort; it is not a negative cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_after_a_broadcast_failure_dials_the_peer_again() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let (server_port, accepts) = start_counting_black_hole(Duration::from_millis(50)).await;
+    let pool = HboneConnectionPool::new(
+        PoolConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        gateway_svid_slot_for_test(),
+        4,
+    );
+    let proxy = proxy_for_test();
+
+    for attempt in 1..=3 {
+        let err = dial_black_holed_hbone(&pool, &proxy, server_port).await;
+        assert!(matches!(err, HbonePoolError::TlsHandshake { .. }));
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            attempt,
+            "each independent request must be free to re-dial the peer"
+        );
+    }
 }

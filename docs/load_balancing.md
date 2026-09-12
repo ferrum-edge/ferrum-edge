@@ -559,6 +559,15 @@ upstreams:
 
 ### Passive Health Checks
 
+Full configuration reloads and incremental updates preserve passive ejections
+and accumulated failure history for endpoints still in the live, merged
+static-plus-discovery target set. Passive health and circuit-breaker cleanup
+resolve that set from the same load-balancer snapshot, rather than treating the
+authored static seed as the discovery result. Discovery retirement removes the
+withdrawn endpoints' state; an installed empty target set is authoritative and
+is also pruned. This does not re-admit endpoints that remain ejected or change
+the configured recovery policy.
+
 Passive health checks monitor the HTTP response status codes from actual proxied requests. No additional probe traffic is generated.
 
 ```yaml
@@ -804,6 +813,7 @@ proxies:
       failure_status_codes: [500, 502, 503, 504]
       half_open_max_requests: 1
       trip_on_connection_errors: true
+      half_open_probe_dwell_seconds: 60
 ```
 
 | Field | Type | Default | Description |
@@ -814,12 +824,67 @@ proxies:
 | `failure_status_codes` | array | `[500, 502, 503, 504]` | HTTP status codes from real backend responses that count as failures |
 | `half_open_max_requests` | integer | `1` | Max concurrent requests in half-open state |
 | `trip_on_connection_errors` | boolean | `true` | Whether connection-level errors trip the breaker independently of `failure_status_codes` |
+| `half_open_probe_dwell_seconds` | integer | derived: `max(timeout_seconds * 2, 60)` | Seconds an unsettled half-open probe slot is held before the breaker reclaims it |
 
 **States:**
 
 - **Closed** (normal) — Requests pass through. Responses with status codes in `failure_status_codes` increment the failure counter; connection-level errors also increment it when `trip_on_connection_errors` is enabled. All other responses reset the counter to zero. When the failure counter reaches `failure_threshold`, the circuit opens.
 - **Open** — All requests immediately return `503 Service Unavailable` with `X-Gateway-Error: circuit_breaker_open` without contacting the backend. After `timeout_seconds`, the circuit transitions to Half-Open.
 - **Half-Open** — The circuit allows up to `half_open_max_requests` concurrent probe requests. Successful responses count toward `success_threshold`; when reached, the circuit closes (recovered). Any failure immediately reopens the circuit.
+
+**Probe-slot release:**
+
+A half-open probe holds one of the `half_open_max_requests` slots for the whole
+request. There is no timer out of Half-Open, so every admitted probe must return
+its slot or the breaker stops admitting probes and keeps shedding traffic with
+`503 circuit_breaker_open`. A slot is returned whenever the request reaches a
+terminal outcome, including outcomes that are not backend results:
+
+- **Gateway-side refusals** before any backend dial (plugin rejects, an oversized
+  or timed-out request body, a connection or admission ceiling, a fail-closed
+  mesh-transport refusal) return the slot **neutrally** — no success, no failure.
+  A gateway refusal is not evidence about the backend, so it neither heals nor
+  reopens the circuit.
+- **A client that disconnects mid-probe** — including a WebSocket upgrade
+  abandoned before the backend handshake completes — also returns the slot
+  neutrally. The next probe is admitted normally once the client goes away.
+- **Backend outcomes** (success, failure, connection error) settle the slot and
+  move breaker health as described above.
+
+HTTP/1.1, HTTP/2, WebSocket, gRPC, HTTP/3, the HBONE relay, UDP/DTLS session
+setup, and TCP passthrough and terminating connections own their probe slots
+through the shared `HalfOpenProbeGuard`. Dropping TCP or UDP/DTLS setup during
+DNS resolution or backend connect/handshake, or returning early before a backend
+outcome, releases the slot neutrally. TCP keeps the guard through relay completion
+and rearms it on each retry admission; dropping the connection future also releases
+an unsettled slot. UDP/DTLS still records success when backend setup completes,
+and TCP still records its successful connection outcome at relay completion; the
+guard does not change those boundaries.
+
+**Probe dwell (`half_open_probe_dwell_seconds`):**
+
+Structural slot ownership is the primary guarantee; the dwell is the second
+layer behind it. If some path ever does leak a probe slot, the breaker reclaims
+that slot once no probe has been admitted for the whole dwell, admits the next
+probe, and the outage degrades to a bounded delay instead of lasting for the
+process lifetime. The reclaim is **not** evidence about the backend: it moves no
+failure or success counter, it only returns the slot.
+
+Every reclaim increments `ferrum_circuit_breaker_probe_reclaimed_total` (labelled
+`proxy_id`, `proxy_namespace`, `namespace` — see `docs/prometheus_metrics.md`)
+and logs a warning naming the proxy, the `host:port` target and the dwell, so a
+leak is never silent. Any non-zero value is a bug to report, not a tuning knob to
+raise.
+
+> **The dwell MUST exceed the longest legitimate backend dispatch a probe can
+> take** — at minimum `backend_connect_timeout_ms + backend_read_timeout_ms`, plus
+> any retry budget the probe may spend. Reclaiming a slot while a real probe is
+> still in flight lets a second probe reach the very backend the breaker is
+> protecting, which is exactly what `half_open_max_requests` exists to prevent.
+
+Omitting the field derives `max(timeout_seconds * 2, 60)` seconds. A configured
+value is clamped up to `timeout_seconds` and to at least 1 second, so the dwell
+can never be shorter than the open window the breaker already waits out.
 
 **Failure detection:**
 

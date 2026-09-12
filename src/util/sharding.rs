@@ -11,7 +11,7 @@
 //! Operators can override the auto-sizing via `FERRUM_POOL_SHARD_AMOUNT`
 //! ([`crate::config::EnvConfig::pool_shard_amount`]). `0` keeps the
 //! auto-derived default; any positive value is rounded up to the next power
-//! of two (DashMap's API requires power-of-two shard counts). Values too
+//! of two, with a minimum of two (DashMap requires more than one shard). Values too
 //! large for `next_power_of_two` are saturated to [`MAX_SHARD_AMOUNT`] —
 //! a billion shards is already 6 OOM beyond any sane configuration, and
 //! we'd rather log + clamp than abort the gateway at startup.
@@ -28,7 +28,8 @@ pub const MAX_SHARD_AMOUNT: usize = 1 << 30;
 /// Resolution order:
 /// 1. If `override_value > 0`, round up to the next power of two via
 ///    [`usize::checked_next_power_of_two`]; on overflow, saturate to
-///    [`MAX_SHARD_AMOUNT`].
+///    [`MAX_SHARD_AMOUNT`]. The minimum explicit result is two, including for
+///    an override of one, because DashMap rejects a single shard.
 /// 2. Otherwise, derive from the host CPU topology:
 ///    `next_power_of_two(max(64, num_cpus * 16))`, also saturating.
 ///
@@ -42,12 +43,12 @@ pub fn pool_shard_amount(override_value: usize) -> usize {
         n.checked_next_power_of_two().unwrap_or(MAX_SHARD_AMOUNT)
     }
     if override_value > 0 {
-        return saturating_next_pow2(override_value).min(MAX_SHARD_AMOUNT);
+        return saturating_next_pow2(override_value).clamp(2, MAX_SHARD_AMOUNT);
     }
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    saturating_next_pow2(cores.saturating_mul(16).max(64))
+    saturating_next_pow2(cores.saturating_mul(16).max(64)).min(MAX_SHARD_AMOUNT)
 }
 
 #[cfg(test)]
@@ -71,7 +72,7 @@ mod tests {
     /// unchanged.
     #[test]
     fn override_power_of_two_is_returned_verbatim() {
-        for n in [1usize, 2, 4, 16, 64, 128, 1024] {
+        for n in [2usize, 4, 16, 64, 128, 1024] {
             let s = pool_shard_amount(n);
             assert_eq!(s, n, "override {n} was rewritten to {s}");
         }

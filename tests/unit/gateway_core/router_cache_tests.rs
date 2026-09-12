@@ -219,7 +219,7 @@ fn test_e2e_strip_listen_path_basic() {
     let cache = RouterCache::new(&config, 100);
 
     let rm = cache.find_proxy(None, "/api/v1/users/123").unwrap();
-    let url = build_backend_url(&rm.proxy, "/api/v1/users/123", "", rm.matched_prefix_len);
+    let url = build_backend_url(&rm.proxy, "/api/v1/users/123", "", rm.matched_prefix_len).unwrap();
     assert_eq!(url, "http://backend.example.com:3000/users/123");
 }
 
@@ -231,7 +231,7 @@ fn test_e2e_no_strip_listen_path() {
     let cache = RouterCache::new(&config, 100);
 
     let rm = cache.find_proxy(None, "/api/v1/users/123").unwrap();
-    let url = build_backend_url(&rm.proxy, "/api/v1/users/123", "", rm.matched_prefix_len);
+    let url = build_backend_url(&rm.proxy, "/api/v1/users/123", "", rm.matched_prefix_len).unwrap();
     assert_eq!(url, "http://backend.example.com:3000/api/v1/users/123");
 }
 
@@ -246,7 +246,7 @@ fn test_e2e_with_backend_path() {
     let cache = RouterCache::new(&config, 100);
 
     let rm = cache.find_proxy(None, "/api/v1/users/123").unwrap();
-    let url = build_backend_url(&rm.proxy, "/api/v1/users/123", "", rm.matched_prefix_len);
+    let url = build_backend_url(&rm.proxy, "/api/v1/users/123", "", rm.matched_prefix_len).unwrap();
     assert_eq!(url, "http://backend.example.com:3000/internal/users/123");
 }
 
@@ -261,7 +261,7 @@ fn test_e2e_backend_path_with_nested_listen_path() {
     let cache = RouterCache::new(&config, 100);
 
     let rm = cache.find_proxy(None, "/api/v1/users/123").unwrap();
-    let url = build_backend_url(&rm.proxy, "/api/v1/users/123", "", rm.matched_prefix_len);
+    let url = build_backend_url(&rm.proxy, "/api/v1/users/123", "", rm.matched_prefix_len).unwrap();
     assert_eq!(url, "http://backend.example.com:3000/v2/v1/users/123");
 }
 
@@ -276,7 +276,8 @@ fn test_e2e_query_string_preserved() {
         "/api/search",
         "q=hello&page=1",
         rm.matched_prefix_len,
-    );
+    )
+    .unwrap();
     assert_eq!(url, "http://backend.example.com:3000/search?q=hello&page=1");
 }
 
@@ -287,7 +288,7 @@ fn test_e2e_trailing_slash_on_listen_path() {
     let cache = RouterCache::new(&config, 100);
 
     let rm = cache.find_proxy(None, "/api/v1/").unwrap();
-    let url = build_backend_url(&rm.proxy, "/api/v1/", "", rm.matched_prefix_len);
+    let url = build_backend_url(&rm.proxy, "/api/v1/", "", rm.matched_prefix_len).unwrap();
     assert_eq!(url, "http://backend.example.com:3000/");
 }
 
@@ -307,12 +308,12 @@ fn test_e2e_multiple_proxies_different_backends() {
 
     // Users API
     let rm = cache.find_proxy(None, "/api/users/123").unwrap();
-    let url = build_backend_url(&rm.proxy, "/api/users/123", "", rm.matched_prefix_len);
+    let url = build_backend_url(&rm.proxy, "/api/users/123", "", rm.matched_prefix_len).unwrap();
     assert_eq!(url, "http://users-service.internal:8001/123");
 
     // Products API with backend_path
     let rm = cache.find_proxy(None, "/api/products/456").unwrap();
-    let url = build_backend_url(&rm.proxy, "/api/products/456", "", rm.matched_prefix_len);
+    let url = build_backend_url(&rm.proxy, "/api/products/456", "", rm.matched_prefix_len).unwrap();
     assert_eq!(url, "http://products-service.internal:8002/v2/456");
 }
 
@@ -325,7 +326,7 @@ fn test_e2e_https_backend_scheme() {
     let cache = RouterCache::new(&config, 100);
 
     let rm = cache.find_proxy(None, "/api/data").unwrap();
-    let url = build_backend_url(&rm.proxy, "/api/data", "", rm.matched_prefix_len);
+    let url = build_backend_url(&rm.proxy, "/api/data", "", rm.matched_prefix_len).unwrap();
     assert_eq!(url, "https://backend.example.com:3000/data");
 }
 
@@ -337,7 +338,7 @@ fn test_e2e_websocket_protocol() {
     let cache = RouterCache::new(&config, 100);
 
     let rm = cache.find_proxy(None, "/ws/chat").unwrap();
-    let url = build_backend_url(&rm.proxy, "/ws/chat", "", rm.matched_prefix_len);
+    let url = build_backend_url(&rm.proxy, "/ws/chat", "", rm.matched_prefix_len).unwrap();
     assert_eq!(url, "http://backend.example.com:3000/chat");
 }
 
@@ -349,7 +350,8 @@ fn test_e2e_grpc_protocol() {
     let cache = RouterCache::new(&config, 100);
 
     let rm = cache.find_proxy(None, "/grpc/service.Method").unwrap();
-    let url = build_backend_url(&rm.proxy, "/grpc/service.Method", "", rm.matched_prefix_len);
+    let url =
+        build_backend_url(&rm.proxy, "/grpc/service.Method", "", rm.matched_prefix_len).unwrap();
     assert_eq!(url, "http://backend.example.com:3000/service.Method");
 }
 
@@ -553,7 +555,7 @@ fn test_e2e_exact_listen_path_no_remaining() {
     let cache = RouterCache::new(&config, 100);
 
     let rm = cache.find_proxy(None, "/api/v1").unwrap();
-    let url = build_backend_url(&rm.proxy, "/api/v1", "", rm.matched_prefix_len);
+    let url = build_backend_url(&rm.proxy, "/api/v1", "", rm.matched_prefix_len).unwrap();
     assert_eq!(url, "http://backend.example.com:3000/");
 }
 
@@ -1308,7 +1310,7 @@ fn test_regex_e2e_strip_listen_path() {
     let cache = RouterCache::new(&config, 100);
 
     let rm = cache.find_proxy(None, "/users/42/orders").unwrap();
-    let url = build_backend_url(&rm.proxy, "/users/42/orders", "", rm.matched_prefix_len);
+    let url = build_backend_url(&rm.proxy, "/users/42/orders", "", rm.matched_prefix_len).unwrap();
     // Full-path match: entire path stripped, backend gets "/"
     assert_eq!(url, "http://orders-service:8080/");
 }
@@ -1331,12 +1333,13 @@ fn test_regex_e2e_strip_with_wildcard_suffix() {
         "/users/42/orders/pending",
         "",
         rm.matched_prefix_len,
-    );
+    )
+    .unwrap();
     assert_eq!(url, "http://orders-service:8080/");
 
     // Exact path also matches
     let rm = cache.find_proxy(None, "/users/42/orders").unwrap();
-    let url = build_backend_url(&rm.proxy, "/users/42/orders", "", rm.matched_prefix_len);
+    let url = build_backend_url(&rm.proxy, "/users/42/orders", "", rm.matched_prefix_len).unwrap();
     assert_eq!(url, "http://orders-service:8080/");
 }
 
@@ -1351,7 +1354,7 @@ fn test_regex_e2e_no_strip() {
     let cache = RouterCache::new(&config, 100);
 
     let rm = cache.find_proxy(None, "/users/42/orders").unwrap();
-    let url = build_backend_url(&rm.proxy, "/users/42/orders", "", rm.matched_prefix_len);
+    let url = build_backend_url(&rm.proxy, "/users/42/orders", "", rm.matched_prefix_len).unwrap();
     // No stripping — full path is forwarded
     assert_eq!(url, "http://orders-service:8080/users/42/orders");
 }
@@ -1371,7 +1374,8 @@ fn test_regex_e2e_with_query_string() {
         "/search/products",
         "q=hello&page=1",
         rm.matched_prefix_len,
-    );
+    )
+    .unwrap();
     assert_eq!(url, "http://search-service:8080/?q=hello&page=1");
 }
 
@@ -1387,7 +1391,7 @@ fn test_regex_e2e_with_backend_path() {
     let cache = RouterCache::new(&config, 100);
 
     let rm = cache.find_proxy(None, "/users/42/orders").unwrap();
-    let url = build_backend_url(&rm.proxy, "/users/42/orders", "", rm.matched_prefix_len);
+    let url = build_backend_url(&rm.proxy, "/users/42/orders", "", rm.matched_prefix_len).unwrap();
     // Full-path match stripped, backend_path prepended
     assert_eq!(url, "http://orders-service:8080/internal");
 }
@@ -1516,7 +1520,7 @@ fn test_regex_exact_path_no_remaining() {
     let rm = cache.find_proxy(None, "/status").unwrap();
     assert_eq!(rm.matched_prefix_len, "/status".len());
 
-    let url = build_backend_url(&rm.proxy, "/status", "", rm.matched_prefix_len);
+    let url = build_backend_url(&rm.proxy, "/status", "", rm.matched_prefix_len).unwrap();
     assert_eq!(url, "http://regex-backend:3000/");
 }
 

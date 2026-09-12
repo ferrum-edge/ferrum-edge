@@ -28,10 +28,10 @@ permissions:
   contents: read
 
 concurrency:
-  # `main` pushes are keyed by commit and are never cancelled: a cancelled run
-  # is blocking evidence, so letting a later push cancel an earlier SHA's run
-  # would permanently wedge that SHA's publication instead of validating it.
-  group: ${{ github.event_name == 'pull_request' && format('ambient-host-udp-live-pr-{0}', github.event.pull_request.number) || (github.event_name == 'merge_group' && format('ambient-host-udp-live-merge-group-{0}', github.event.merge_group.head_sha) || (github.event_name == 'push' && format('ambient-host-udp-live-push-{0}', github.sha) || 'ambient-host-udp-live-shared')) }}
+  # `main` pushes coalesce on the ref and are never cancelled: the run in
+  # flight finishes and at most one newer push waits behind it, matching every
+  # other main-only gate so a quiet main converges on one complete SHA.
+  group: ${{ github.event_name == 'pull_request' && format('ambient-host-udp-live-pr-{0}', github.event.pull_request.number) || (github.event_name == 'merge_group' && format('ambient-host-udp-live-merge-group-{0}', github.event.merge_group.head_sha) || (github.event_name == 'push' && format('ambient-host-udp-live-{0}', github.ref) || 'ambient-host-udp-live-shared')) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
 
 jobs:
@@ -213,6 +213,9 @@ jobs:
     if: needs.changes.outputs.relevant == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      CARGO_NET_RETRY: "10"
+      CARGO_HTTP_MULTIPLEXING: "false"
 
     steps:
       - name: Checkout Ferrum Edge
@@ -220,7 +223,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         with:
-          shared-key: "ci-ambient-host-udp-live"
+          shared-key: "ci-netns-capture-live"
 
       - name: Build live test binaries
         id: build_test_bin

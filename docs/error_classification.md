@@ -27,7 +27,7 @@ Every classifier funnels its result into [`crate::retry::ErrorClass`](../src/ret
 | `PortExhaustion` | EADDRNOTAVAIL — all ephemeral ports in use. | `false` (pre-wire) |
 | `ClientDisconnect` | Client gave up before the gateway could complete the response. | `true` (post-wire) |
 | `GracefulRemoteClose` | Peer closed the session cleanly: HTTP/3 `H3_NO_ERROR`/GOAWAY at the response read boundary, or RFC 6455 Close frame on a WebSocket. Excluded from H3 capability downgrades so a backend that closes after every response stays on H3. | `true` (post-wire) |
-| `DispatchPolicyRejected` | Terminal gateway decision before a backend dial, including egress/SNI policy, opaque-TLS SNI admission refusals (issue #4407), admission overflow, and final request-body hook rejection. It is non-retryable and backend-health-neutral. | `true` (gateway-local terminal) |
+| `DispatchPolicyRejected` | Terminal gateway policy decision, including pre-dial egress/SNI policy, opaque-TLS SNI admission refusals (issue #4407), admission overflow, final request-body hook rejection, and response-transformer output above the effective response ceiling (issue #4784). It is non-retryable and backend-health-neutral. | `true` (gateway-local terminal) |
 | `BackendConnectionLimit` | The gateway refused to open a NEW physical backend connection because the destination is already at its DestinationRule `connectionPool.tcp.maxConnections` ceiling (`src/backend_conn_limit.rs`). Emitted by direct H2, gRPC, native H3, HBONE, and Sidecar mesh-mTLS. With `TrustWithdrawn` (the other gateway-side policy refusal) it is one of only two classes that are simultaneously pre-wire (so `retry_on_connect_failure` may rotate to another target with its own admission lane) and backend-health-neutral (`client_side_no_backend_signal`) — a saturated operator-configured ceiling is gateway policy, not evidence about the backend, so it must not trip the circuit breaker, ding passive health, penalize the load balancer, or shrink the adaptive-concurrency permit. The raw-TCP over-cap path records `cb.record_neutral()` for the same reason. The reqwest/HTTP-1.1 and WebSocket lanes instead answer `503` / `DispatchPolicyRejected` because they do not rotate. | `false` (pre-wire) |
 | `TrustWithdrawn` | An accepted gateway trust publication withdrew an authority, so a gateway-to-mesh TLS transport was refused (`src/proxy/mesh_trust_registry.rs`, issue #3859): either the connection was dialed under the outgoing trust generation and refused at registration, or a checked-out HBONE tunnel / mesh-mTLS sender was retired before it could open the next stream. Emitted by the HBONE and Sidecar mesh-mTLS pools and by native gRPC over either. Like `BackendConnectionLimit` it is simultaneously pre-wire (so `retry_on_connect_failure` may re-dial — and the redial succeeds, because the accepted generation is already published) and backend-health-neutral (`client_side_no_backend_signal`) — withdrawing a root is gateway policy, not evidence about the destination workload, so it must not trip the circuit breaker, ding passive health, penalize the load balancer, or shrink the adaptive-concurrency permit. The generic `ConnectionPoolError` would open breakers across every mesh destination live at the instant of a revocation. | `false` (pre-wire) |
 | `RequestError` | Catch-all for unclassified gateway-side rejections and unknown failure modes. | `true` (post-wire) |
@@ -227,8 +227,9 @@ Hyper rejects some HTTP/1.1 wire shapes during header parsing before Ferrum's
 `handle_proxy_request` / `check_protocol_headers()` run. For the three shapes
 the inbound `h1_framing_guard` can name with confidence — conflicting
 `Content-Length` values, HTTP/1.0 + `Transfer-Encoding`, and an invalid UTF-8
-request-target — the guard writes a static `400 Bad Request` directly on the
-connection and closes it. Hyper never sees those requests and does not generate
+request-target — on the connection's first head, before any response bytes,
+the guard writes a static `400 Bad Request` directly on the connection and
+closes it. Hyper never sees those requests and does not generate
 its empty-bodied automatic `400`. The response uses the same JSON envelope
 handler-layer protocol rejects use: `Content-Type: application/json`, a fixed
 `{"error":"..."}` body matching `check_protocol_headers()`, and
@@ -260,15 +261,15 @@ outbound HTTP/1 response on the hot path. Duplicate `Host` and combined
 `Content-Length` + `Transfer-Encoding` still reach the handler and keep their
 existing JSON bodies.
 
-The envelope is armed only before the connection's first response byte. It is
-written straight to the socket from the read path, bypassing Hyper's write
-buffer, and Hyper's HTTP/1 server reads the next request head while an earlier
-response is still being written — so on a keep-alive connection under write
-backpressure a *pipelined* malformed request would otherwise splice the
-envelope into the middle of the previous response. A malformed request
-pipelined behind a response therefore falls back to Hyper's empty-bodied
-`400`, exactly like the unnameable parse failures above. The common case — one
-malformed request on a fresh connection — always gets the JSON envelope.
+The envelope is armed only for the connection's first request head and before
+its first response byte. It is written straight to the socket from the read
+path, bypassing Hyper's write buffer. A later malformed head therefore falls
+back to Hyper's empty-bodied `400`, preserving the earlier response and its
+position in the pipeline before the connection closes. This applies even if
+the earlier request arrived in the same read or is still awaiting a backend
+response: no response bytes need to have been written yet (issue #4754).
+The common case — one malformed request on a fresh connection — still gets
+the JSON envelope.
 
 ## Transaction summary integration
 
@@ -317,7 +318,7 @@ never an error message, never a client- or backend-influenced string.
 | `backend_timeout` | Backend accepted the connection but timed out (504) |
 | `backend_error` | Backend returned 5xx, or a post-wire 5xx without a more specific token |
 | `circuit_breaker_open` | Open-breaker 503; never reached a backend |
-| `overload` | Overload/drain `reject_new_requests` 503 |
+| `overload` | Gateway resource refusal: overload/drain `reject_new_requests` 503, or response-transformer output above the configured response ceiling (502) |
 | `config_stale` | DP stale-config fence 503 |
 | `concurrency_limit` | `adaptive_concurrency` admission 503 |
 
@@ -344,7 +345,7 @@ Do not reuse `backend_error` for a response that never reached a backend.
 | `gateway_buffer_capacity` | `backend_error` |
 | `request_body_too_large` | `backend_error` |
 | `graceful_remote_close` | `backend_error` |
-| `dispatch_policy_rejected` | `backend_error` |
+| `dispatch_policy_rejected` | `overload` for a response-transformer output-ceiling refusal; existing dispatch paths retain their header mapping |
 | `request_error` | `backend_error` |
 | *(no `ErrorClass`; `rejection_phase=circuit_breaker_open`)* | `circuit_breaker_open` |
 | *(no `ErrorClass`; `rejection_phase=overload`)* | `overload` |
@@ -362,6 +363,32 @@ the granular `ErrorClass::as_str` values (19 compiled-in variants) and add
 that optional label on `ferrum_stream_disconnects_total`.
 
 ## Adding a new error path
+
+### Response-transformer output ceiling
+
+An origin response within the route ceiling can become too large only after
+the gateway applies configured JSON body rules. That is a deterministic policy
+refusal: HTTP **502** with the existing `Response body too large` JSON error
+and numeric `limit`, plus the existing
+gateway-owned `overload` header token. It uses `DispatchPolicyRejected`, not
+`GatewayBufferCapacity` or `ResponseBodyTooLarge`. The closed sets remain seven
+header tokens and nineteen error classes. Private request provenance restores
+the header after mutable hooks and stamps the class in the shared transaction-log
+funnel, including native H3 and cross-protocol paths.
+
+Backend-health neutrality here means the healthy origin is not penalized for the
+gateway's configuration; it does not mean the failure is silent or transient.
+The refusal produces one `warn` with `proxy_id`, `plugin=response_transformer`,
+`produced_bytes_at_least`, and `ceiling`. The size includes the first refused
+serializer write and is a lower bound: the gateway neither materializes the
+oversized output nor serializes it a second time to count bytes. No body content
+is logged. Exactly-at-ceiling output passes. Aggregate retained-budget admission
+failure remains 503 / `GatewayBufferCapacity`; an oversized backend body remains
+502 / `ResponseBodyTooLarge` / `backend_error`; request transformation overflow
+remains 413. gRPC-flavored responses retain HTTP 200 / `RESOURCE_EXHAUSTED`, with
+the response-size message and gateway policy log class.
+
+### Implementation checklist
 
 When you add a dispatcher or a new failure mode:
 

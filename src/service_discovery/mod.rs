@@ -669,14 +669,17 @@ impl ServiceDiscoveryManager {
                         );
                         return false;
                     };
-                    Arc::new(kubernetes::KubernetesDiscoverer::new(
-                        client.clone(),
-                        k8s_config.namespace.clone(),
-                        k8s_config.service_name.clone(),
-                        k8s_config.port_name.clone(),
-                        k8s_config.label_selector.clone(),
-                        sd_config.default_weight,
-                    ))
+                    Arc::new(
+                        kubernetes::KubernetesDiscoverer::new(
+                            client.clone(),
+                            k8s_config.namespace.clone(),
+                            k8s_config.service_name.clone(),
+                            k8s_config.port_name.clone(),
+                            k8s_config.label_selector.clone(),
+                            sd_config.default_weight,
+                        )
+                        .with_address_type(k8s_config.address_type),
+                    )
                 } else {
                     warn!(
                         "Service discovery: upstream {} has kubernetes provider but no kubernetes config",
@@ -2562,18 +2565,18 @@ pub fn targets_equal(a: &[UpstreamTarget], b: &[UpstreamTarget]) -> bool {
 }
 
 /// Merge static targets with discovered targets. If a discovered target has the
-/// same host:port as a static target, the static target takes precedence (its
-/// weight and tags are preserved).
+/// same canonical IP/hostname and port as a static target, the static target
+/// takes precedence (its weight and metadata are preserved).
 pub fn merge_targets(
     static_targets: &[UpstreamTarget],
     discovered: &[UpstreamTarget],
 ) -> Vec<UpstreamTarget> {
     let static_keys: std::collections::HashSet<String> =
-        static_targets.iter().map(target_host_port_key).collect();
+        static_targets.iter().map(canonical_discovery_key).collect();
 
     let mut merged = static_targets.to_vec();
     for target in discovered {
-        let key = target_host_port_key(target);
+        let key = canonical_discovery_key(target);
         if !static_keys.contains(&key) {
             merged.push(target.clone());
         }
@@ -2585,6 +2588,9 @@ pub fn merge_targets(
 ///
 /// - Hostnames must pass the same hostname validator as proxy host entries.
 /// - IP literals are accepted only when allowed by `FERRUM_BACKEND_ALLOW_IPS`.
+/// - Consul/Kubernetes targets are canonicalized and deduplicated by dial identity
+///   after validation. Lower weight wins, then policy port/locality/path/sorted
+///   tags break ties. The complete winning record is retained, never combined.
 /// - Ambient cross-cluster HBONE targets may carry an opaque synthetic
 ///   `target.host`; validate their real dial/CONNECT authority tags instead.
 pub fn filter_discovered_targets(
@@ -2593,10 +2599,8 @@ pub fn filter_discovered_targets(
     targets: Vec<UpstreamTarget>,
     backend_allow_ips: crate::config::BackendEgressPolicy,
 ) -> Vec<UpstreamTarget> {
-    targets
-        .into_iter()
-        .filter(
-            |target| match validate_discovered_target_host(target, &backend_allow_ips) {
+    let filtered = targets.into_iter().filter(|target| {
+        match validate_discovered_target_host(target, &backend_allow_ips) {
             Ok(()) => true,
             Err(reason) => {
                 warn!(
@@ -2605,9 +2609,66 @@ pub fn filter_discovered_targets(
                 );
                 false
             }
-            },
-        )
-        .collect()
+        }
+    });
+    // Mesh has distinct Service/subset/identity policies on shared dial addresses;
+    // DNS-SD already resolves duplicate priority tiers in its adapter. Apply the
+    // registry rule here, before publication, without collapsing either contract.
+    if !matches!(provider_name, "consul" | "kubernetes") {
+        return filtered.collect();
+    }
+    let mut admitted = std::collections::BTreeMap::<String, UpstreamTarget>::new();
+    for mut target in filtered {
+        if let Ok(ip) = target.host.parse::<IpAddr>() {
+            target.host = ip.to_canonical().to_string();
+        }
+        let key = target_host_port_key(&target);
+        match admitted.entry(key) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(target);
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                // Never add weights or combine metadata from different records.
+                // Lower weight wins; a complete metadata ordering breaks ties,
+                // independent of catalog order and HashMap iteration order.
+                if registry_target_preference(&target) < registry_target_preference(slot.get()) {
+                    slot.insert(target);
+                }
+            }
+        }
+    }
+    admitted.into_values().collect()
+}
+
+type RegistryTargetPreference<'a> = (
+    u32,
+    Option<u16>,
+    &'a Option<String>,
+    &'a Option<String>,
+    Vec<(&'a str, &'a str)>,
+);
+
+fn registry_target_preference(target: &UpstreamTarget) -> RegistryTargetPreference<'_> {
+    let mut tags: Vec<_> = target
+        .tags
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    tags.sort_unstable();
+    (
+        target.weight,
+        target.service_port_policy_key,
+        &target.locality,
+        &target.path,
+        tags,
+    )
+}
+
+fn canonical_discovery_key(target: &UpstreamTarget) -> String {
+    match target.host.parse::<IpAddr>() {
+        Ok(ip) => format!("{}:{}", ip.to_canonical(), target.port),
+        Err(_) => target_host_port_key(target),
+    }
 }
 
 fn validate_discovered_target_host(

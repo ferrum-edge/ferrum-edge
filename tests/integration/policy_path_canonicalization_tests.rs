@@ -373,7 +373,8 @@ async fn routing_and_backend_forwarding_use_the_same_canonical_path() {
             // The backend request line is built from the same canonical
             // coordinate the router measured `matched_prefix_len` in, so the
             // stripped remainder can never desync from the routing decision.
-            let url = build_backend_url(&matched.proxy, &canonical, "", matched.matched_prefix_len);
+            let url = build_backend_url(&matched.proxy, &canonical, "", matched.matched_prefix_len)
+                .unwrap();
             assert_eq!(
                 url, expected,
                 "spelling {raw:?} (strip={strip_listen_path}) forwarded {url}"
@@ -448,7 +449,7 @@ async fn a_dot_segment_or_backslash_would_desync_policy_from_the_forwarded_reque
         ("/admin/reports/../../public", "/public"),
         ("/admin\\reports", "/admin/reports"),
     ] {
-        let assembled = build_backend_url(&matched.proxy, raw_tail, "", 0);
+        let assembled = build_backend_url(&matched.proxy, raw_tail, "", 0).unwrap();
         let parsed = url::Url::parse(&assembled).expect("backend URL parses");
         assert_eq!(
             parsed.path(),

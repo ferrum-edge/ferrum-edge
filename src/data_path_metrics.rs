@@ -419,6 +419,33 @@ pub fn render_circuit_breakers(output: &mut String, cache: &CircuitBreakerCache,
         }
     }
 
+    // Probe-slot reclaims carry the same label set as the state gauge — no
+    // per-target label — so a leak is attributable to a proxy at fixed
+    // cardinality. The offending `host:port` stays in the warning log.
+    let mut reclaimed_by_proxy: BTreeMap<(String, String), u64> = BTreeMap::new();
+    for (key, reclaimed) in cache.probe_reclaimed_snapshot() {
+        let Some((namespace, proxy_id, _target)) =
+            crate::admin::metrics::parse_namespaced_runtime_key(&key)
+        else {
+            continue;
+        };
+        *reclaimed_by_proxy
+            .entry((namespace.to_string(), proxy_id.to_string()))
+            .or_default() += reclaimed;
+    }
+
+    output.push_str(
+        "# HELP ferrum_circuit_breaker_probe_reclaimed_total Half-open probe slots reclaimed after the dwell because the probe never settled; each one is a leaked probe slot that would otherwise have shed the backend permanently.\n",
+    );
+    output.push_str("# TYPE ferrum_circuit_breaker_probe_reclaimed_total counter\n");
+    for ((namespace, proxy_id), reclaimed) in &reclaimed_by_proxy {
+        output.push_str(&format!(
+            "ferrum_circuit_breaker_probe_reclaimed_total{{proxy_id=\"{}\",proxy_namespace=\"{}\"{ns_label}}} {reclaimed}\n",
+            escape_label_value(proxy_id),
+            escape_label_value(namespace),
+        ));
+    }
+
     output.push_str(
         "# HELP ferrum_circuit_breaker_cache_entries Circuit breakers resident in the shared breaker cache.\n",
     );

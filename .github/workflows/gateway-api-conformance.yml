@@ -39,7 +39,7 @@ concurrency:
   group: ${{ github.event_name == 'pull_request' && format('gateway-api-conformance-pr-{0}', github.event.pull_request.number) || (github.event_name == 'merge_group' && format('gateway-api-conformance-merge-group-{0}', github.event.merge_group.head_sha) || (github.event_name == 'push' && format('gateway-api-conformance-{0}', github.ref) || 'gateway-api-conformance-shared')) }}
   # Cancel a superseded PR/main/merge-group lab on rapid re-push. Scheduled and
   # manual runs share one lane and must run to completion for lab budget.
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'push' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
 
 env:
   FERRUM_IMAGE: ferrum-edge:gateway-api-conformance

@@ -309,9 +309,7 @@
        left alone, and an explicit "-ebpf" tag is PROMOTED (not double-suffixed)
        when tools are required. */ -}}
 {{- if or $ambientUdpLifecycle $nodeWaypointUdpListeners -}}
-{{- if not (hasSuffix "-ebpf-tools" $ambientImageTag) -}}
-{{- $ambientImageTag = printf "%s-ebpf-tools" (trimSuffix "-ebpf" $ambientImageTag) -}}
-{{- end -}}
+{{- $ambientImageTag = include "ferrum-mesh.toolsImageTag" $ambientImageTag -}}
 {{- else if or (eq (lower (toString .Values.ambient.captureMode)) "ebpf") (eq $ambientTopology "node_waypoint") -}}
 {{- /* "-ebpf-tools" already satisfies this tier, so never suffix it again. */ -}}
 {{- if not (or (hasSuffix "-ebpf" $ambientImageTag) (hasSuffix "-ebpf-tools" $ambientImageTag)) -}}

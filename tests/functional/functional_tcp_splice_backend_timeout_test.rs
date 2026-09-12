@@ -416,3 +416,60 @@ async fn functional_splice_io_uring_backend_write_timeout_closes_stuck_reader_ba
 
     setup.teardown();
 }
+
+fn spawn_request_then_push_backend(listener: TcpListener) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                if stream.read_u8().await.ok() != Some(b'S') {
+                    return;
+                }
+                for byte in 0..30u8 {
+                    if stream.write_all(&[byte]).await.is_err() {
+                        return;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+                if stream.read_u8().await.ok() == Some(b'Q') {
+                    let _ = stream.write_all(b"!").await;
+                }
+            });
+        }
+    })
+}
+
+async fn verify_splice_push_after_request(io_uring: &str) {
+    let setup = setup_splice_proxy(
+        "splice-request-then-push",
+        spawn_request_then_push_backend,
+        0,
+        500,
+        30,
+        &[("FERRUM_IO_URING_SPLICE_ENABLED", io_uring)],
+    )
+    .await;
+    let mut stream = connect_stream(setup.proxy_port).await;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        stream.write_all(b"S").await.unwrap();
+        for expected in 0..30u8 {
+            assert_eq!(stream.read_u8().await.unwrap(), expected);
+        }
+        stream.write_all(b"Q").await.unwrap();
+        assert_eq!(stream.read_u8().await.unwrap(), b'!');
+    })
+    .await
+    .expect("backend pushes must survive a drained client write queue");
+    setup.teardown();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_splice_write_timeout_preserves_request_then_push_session() {
+    verify_splice_push_after_request("false").await;
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_io_uring_or_fallback_preserves_request_then_push_session() {
+    verify_splice_push_after_request("auto").await;
+}

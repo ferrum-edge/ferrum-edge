@@ -227,7 +227,7 @@ are accepted and silently weaken the deployment.
 |---|---|
 | `FERRUM_TLS_NO_VERIFY=true` | Disables outbound TLS verification for **all** connections and bypasses backend SAN allow-list enforcement. Any on-path attacker becomes a valid backend. Refused when `FERRUM_MESH_PRODUCTION_MODE=true`. |
 | `FERRUM_DP_GRPC_TLS_NO_VERIFY=true` | Not supported: **rejected at startup**. To reach a CP presenting a self-signed certificate, pin its CA with `FERRUM_DP_GRPC_TLS_CA_CERT_PATH`. |
-| `FERRUM_ADMIN_TLS_NO_VERIFY=true` | Skips Admin API TLS certificate verification. Refused when `FERRUM_MESH_PRODUCTION_MODE=true`. |
+| `FERRUM_ADMIN_TLS_NO_VERIFY=true` | The admin HTTPS listener neither requires nor verifies client certificates, so any TLS client reaches the admin API. Refused when `FERRUM_MESH_PRODUCTION_MODE=true`, and refused together with `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` because a configured client CA demands verification. |
 | `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true` with a non-loopback plaintext admin bind | Downgrades the `database`/`cp` startup refusal to a warning and serves the management plane — and every operator bearer token that reaches it — in cleartext on a network-reachable interface. |
 | `FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES=false` | Removes the cloud-metadata / link-local / multicast / unspecified baseline. With `FERRUM_BACKEND_ALLOW_IPS=both` and no deny list this makes the gateway an unrestricted SSRF bridge; the gateway logs a startup warning to that effect. |
 | `FERRUM_SHUTDOWN_DRAIN_SECONDS=0` | Skips the in-flight connection drain, so a rolling deploy severs live requests instead of finishing them. |

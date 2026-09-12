@@ -45,10 +45,51 @@ paths:
 - Istio and xDS compatibility coverage goes in `tests/conformance/<category>.rs` with `register_feature!`.
 - New `tests/unit/` files must be added to the appropriate `tests/unit/<category>/mod.rs`.
 
+## Shared-Invariant Parity: When Fixing One Path, Name The Siblings
+
+Issue #4792 catalogued thirteen separately-filed defects with one shape: a rule
+was corrected on ONE call site or ONE protocol path, and the siblings that share
+the same rule were left behind. In two cases the correct code's own comment
+described the failure its sibling still had.
+
+- Before landing a fix, ask who else carries the invariant: the other protocol
+  paths (H1/H2, WebSocket, H3, gRPC, HBONE, raw TCP/UDP), the other direction
+  (request vs response), the other providers (`dns_sd` / Consul / Kubernetes),
+  the other CLI subcommands, the other pool families. Name them in the change,
+  even when the answer is "none".
+- Prefer correcting the shared helper over defending at the call site. A local
+  workaround leaves every other caller with the original bug, and later reads as
+  evidence that someone already hit it.
+- When a composed value (a pool key, a metadata blob) gains a field, re-check
+  every consumer that parses it. Match a delimited segment, not a terminal one,
+  so appending a field cannot silently disable a matcher.
+- Encode the answer as a parity test rather than a comment. The pattern is the
+  existing three-way `builtin_parity` registry/factory/metadata set-equality
+  check: a table that enumerates the siblings and fails when a new one is added
+  without the invariant.
+
+Where the invariant cannot be observed at runtime without a live server, assert
+it structurally over `src/` (the technique `dp_config_admission_sites_tests.rs`
+and `allowed_methods_logging_tests.rs` already use), so a new sibling breaks the
+build rather than shipping the gap.
+
+The parity tables live in:
+
+- `tests/unit/gateway_core/shared_invariant_parity_tests.rs` — circuit-breaker
+  HALF_OPEN probe release, discovery-target health pruning, RFC 9113
+  protocol-NACK classification, CLI external-secret resolution, discovery
+  dial-identity dedup, the `pool_shard_amount` minimum, and SVID
+  generation-segment matching across all four pool families.
+- `tests/unit/plugins/waf_body_charset_parity_tests.rs` — wide-charset
+  (UTF-16/UTF-32) body decoding on both the request and response scan paths.
+
+Add a new table to those files when you fix an invariant that more than one path
+shares.
+
 ## Targeted Commands
 
 - Existing inline source test: `cargo test --lib <module>::tests`
-- Public API: `cargo test --test unit_tests <filter>`
+- Public API: `cargo test --test <unit target> <filter>` — four unit targets: `unit_tests` (config, admin, tls, identity, secrets, cli, notifications, util), `unit_plugins_a_tests` (plugin test files a–j), `unit_plugins_b_tests` (plugin test files k–z), `unit_gateway_core_tests` (core runtime)
 - Cross-module behavior: `cargo test --test integration_tests <filter>`
 - Proxy hot path: `cargo build --bin ferrum-edge && cargo test --test functional_tests <filter> -- --ignored`
 - Multi-protocol perf: build once with `cargo build --release`, then `bash tests/performance/multi_protocol/run_protocol_test.sh {http1|http1-tls|http2|http3|ws|grpc|tcp|tcp-tls|udp|udp-dtls|all} [--duration N] [--concurrency N] [--skip-build]`
@@ -96,6 +137,8 @@ paths:
 - **A fixture-owned server (control plane, echo backend) must not bind an ephemeral port already promised to a gateway subprocess.** Bind through a mesh-port-aware helper (`bind_fixture_listener`) that re-rolls, holding rejected listeners so the kernel cannot re-offer them. A `USED_MESH_PORTS`-style set alone only stops one reservation reusing another.
 - **An attempt whose gateway died mid-run is VOID**: retry with fresh ports/dirs/control planes instead of returning the resulting transport error. Never retry an observation from a healthy fixture — authoritative protocol responses and fail-closed security assertions must be made exactly once.
 - `FERRUM_POOL_WARMUP_ENABLED=true` makes the gateway issue `HEAD /` to each backend at startup and shifts backend-hit assertions by one.
+- **Every spawned gateway must be owned by an RAII guard, not a bare `std::process::Child`** (issue #4991). `Child` does nothing on drop, so a panic between spawn and the explicit shutdown call leaves a live gateway holding its ports. Bespoke spawners wrap the child in `crate::common::GatewayChildGuard` at the instant of spawn; `shutdown()` is idempotent and also runs from `Drop`.
+- **Socket fixtures must not assume Linux host behaviour** (issue #4983): a secondary loopback alias (`127.0.0.2`) exists on Linux but not on macOS; a bound-but-unlistened TCP port refuses on Linux and black-holes on Darwin (`ports::REFUSED_TCP_PORT_REFUSES_CONNECT_IMMEDIATELY`); Darwin's default UDP datagram ceiling is 9216 bytes; and `SO_REUSEADDR` lets a specific-address and a wildcard listener share one port on Darwin. Prefer a shape every supported host provides (`::1` for a second listen identity, a second ephemeral port for a second UDP session, a sub-ceiling payload for transport probes); where the prerequisite is genuinely required, probe for it and skip with an explicit message naming it. See `docs/functional_testing.md` -> "Host-Dependent Socket Fixtures".
 - Set `FERRUM_POOL_WARMUP_ENABLED=false` in tests that count backend hits.
 - Keep warmup true when tests require the capability registry to have a `Supported` entry before traffic, such as native H3 or direct H2 routing.
 

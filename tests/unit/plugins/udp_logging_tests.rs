@@ -9,6 +9,7 @@ use chrono::Utc;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::plugins::udp_logging::{UDP_LOGGING_CONFIG_KEYS, UdpLogging};
+use ferrum_edge::plugins::utils::sink_loss::{SinkLossReason, dropped_total};
 use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, PluginHttpClient, validate_plugin_config};
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256, PKCS_RSA_SHA256,
@@ -638,6 +639,87 @@ async fn test_udp_logging_rejects_multiple_unknown_keys_sorted() {
     let aaa = err.find("aaa_extra").expect("aaa_extra");
     let zzz = err.find("zzz_extra").expect("zzz_extra");
     assert!(aaa < zzz, "unknown keys should be sorted: {err}");
+}
+
+#[test]
+fn test_udp_logging_shared_validation_enforces_byte_limits() {
+    let base = json!({"host": "127.0.0.1", "port": 45123});
+    let invalid = [
+        json!({"max_entry_bytes": 0}),
+        json!({"max_entry_bytes": 1023}),
+        json!({"max_entry_bytes": 1048577}),
+        json!({"max_entry_bytes": null}),
+        json!({"max_entry_bytes": "65536"}),
+        json!({"buffer_max_bytes": 2050}),
+        json!({"buffer_max_bytes": null}),
+        json!({"buffer_max_bytes": "16777216"}),
+        json!({"buffer_max_bytes": 268435457}),
+        json!({"max_entry_bytes": 2048, "buffer_max_bytes": 1024}),
+    ];
+    for extra in invalid {
+        let mut config = base.clone();
+        for (key, value) in extra.as_object().expect("override object") {
+            config
+                .as_object_mut()
+                .expect("config object")
+                .insert(key.clone(), value.clone());
+        }
+        let shared = validate_plugin_config("udp_logging", &config)
+            .expect_err("shared validation must reject invalid byte limits");
+        assert!(
+            shared.contains("max_entry_bytes") || shared.contains("buffer_max_bytes"),
+            "shared validation {config} got: {shared}"
+        );
+        let constructed = UdpLogging::new(&config, test_client())
+            .err()
+            .unwrap_or_else(|| panic!("constructor must reject {config}"));
+        assert!(
+            constructed.contains("max_entry_bytes") || constructed.contains("buffer_max_bytes"),
+            "constructor {config} got: {constructed}"
+        );
+    }
+
+    for extra in [
+        json!({}),
+        json!({"max_entry_bytes": 1024, "buffer_max_bytes": 2050}),
+        json!({"max_entry_bytes": 65536, "buffer_max_bytes": 16777216}),
+        json!({"max_entry_bytes": 1048576, "buffer_max_bytes": 268435456}),
+    ] {
+        let mut config = base.clone();
+        for (key, value) in extra.as_object().expect("override object") {
+            config
+                .as_object_mut()
+                .expect("config object")
+                .insert(key.clone(), value.clone());
+        }
+        validate_plugin_config("udp_logging", &config)
+            .unwrap_or_else(|err| panic!("valid byte pair must validate: {config} {err}"));
+        UdpLogging::new(&config, test_client())
+            .unwrap_or_else(|err| panic!("valid byte pair must construct: {config} {err}"));
+    }
+}
+
+#[test]
+fn test_udp_logging_split_retry_counts_each_lost_record_once() {
+    let recovered =
+        ferrum_edge::_test_support::udp_logging_split_retry_lost_record_count_for_test(&[
+            &["reject", "transport"],
+            &["reject", "ok"],
+        ]);
+    assert_eq!(
+        recovered, 1,
+        "local reject plus later transport success must count the lost record once"
+    );
+
+    let exhausted =
+        ferrum_edge::_test_support::udp_logging_split_retry_lost_record_count_for_test(&[
+            &["reject", "transport"],
+            &["reject", "transport"],
+        ]);
+    assert_eq!(
+        exhausted, 2,
+        "local reject plus terminal transport failure must count two lost records"
+    );
 }
 
 #[test]
@@ -1300,45 +1382,209 @@ fn test_udp_logging_dtls_docs_retain_association_when_rebuild_fails() {
 }
 
 #[test]
-fn test_udp_logging_dtls_batch_size_gate_classifies_send_reject_and_split() {
+fn test_udp_logging_batch_size_gate_classifies_send_reject_and_split() {
     let max = 16_384usize;
     assert_eq!(
-        ferrum_edge::_test_support::udp_logging_classify_dtls_batch_size_for_test(
-            false,
-            max + 1,
-            8,
-            max
-        ),
+        ferrum_edge::_test_support::udp_logging_classify_batch_size_for_test(max, 8, max),
         "send_as_is",
-        "plain UDP must not apply the DTLS plaintext ceiling"
+        "in-limit batches send as one datagram"
     );
     assert_eq!(
-        ferrum_edge::_test_support::udp_logging_classify_dtls_batch_size_for_test(
-            true, max, 8, max
-        ),
-        "send_as_is",
-        "in-limit DTLS batches send as one datagram"
-    );
-    assert_eq!(
-        ferrum_edge::_test_support::udp_logging_classify_dtls_batch_size_for_test(
-            true,
-            max + 1,
-            1,
-            max
-        ),
+        ferrum_edge::_test_support::udp_logging_classify_batch_size_for_test(max + 1, 1, max),
         "reject_oversized_single",
         "oversized singles fail closed into retry/final-loss"
     );
     assert_eq!(
-        ferrum_edge::_test_support::udp_logging_classify_dtls_batch_size_for_test(
-            true,
-            max + 1,
-            2,
-            max
-        ),
+        ferrum_edge::_test_support::udp_logging_classify_batch_size_for_test(max + 1, 2, max),
         "split_per_entry",
         "oversized multi-entry batches fan out per entry without async recursion"
     );
+}
+
+/// GHSA-cr65-wcww-rr49: the gate is a property of the transport, not of DTLS.
+/// The plain-UDP ceiling comes from the resolved destination's address family.
+#[test]
+fn test_udp_logging_datagram_limit_is_transport_neutral_not_dtls_only() {
+    let dtls_ceiling = ferrum_edge::dtls::max_plaintext_bytes();
+    assert_eq!(
+        ferrum_edge::_test_support::udp_logging_effective_datagram_limit_for_test(
+            true,
+            Some("127.0.0.1:9514".parse::<SocketAddr>().expect("v4 addr"))
+        ),
+        dtls_ceiling,
+        "DTLS keeps the plaintext ceiling regardless of address family"
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::udp_logging_effective_datagram_limit_for_test(
+            false,
+            Some("127.0.0.1:9514".parse::<SocketAddr>().expect("v4 addr"))
+        ),
+        65_507,
+        "plain UDP over IPv4 is gated at 65,535 minus the IPv4 and UDP headers"
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::udp_logging_effective_datagram_limit_for_test(
+            false,
+            Some("[::1]:9514".parse::<SocketAddr>().expect("v6 addr"))
+        ),
+        65_527,
+        "plain UDP over IPv6 is gated at 65,535 minus the UDP header"
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::udp_logging_effective_datagram_limit_for_test(false, None),
+        65_507,
+        "an unresolved destination must fail closed on the smaller family bound"
+    );
+
+    // The plain-UDP ceiling used to be skipped entirely, so an oversized
+    // record erased every co-batched sibling instead of being split out.
+    assert_eq!(
+        ferrum_edge::_test_support::udp_logging_classify_batch_size_for_test(65_508, 10, 65_507),
+        "split_per_entry",
+        "an over-limit plain-UDP batch must split, not be sent and lost whole"
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::udp_logging_classify_batch_size_for_test(65_508, 1, 65_507),
+        "reject_oversized_single",
+        "an over-limit plain-UDP single must be rejected alone"
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::udp_logging_max_deliverable_entry_bytes_for_test(65_507),
+        65_505,
+        "the documented per-record ceiling is the datagram bound minus JSON array framing"
+    );
+}
+
+/// Receive one datagram, failing the test rather than hanging.
+async fn recv_datagram(listener: &UdpSocket, buffer: &mut [u8], label: &str) -> usize {
+    let budget = Duration::from_secs(10);
+    let Ok(received) = tokio::time::timeout(budget, listener.recv_from(buffer)).await else {
+        panic!("{label}: timed out waiting for a datagram");
+    };
+    let (len, _) = received.expect("receive datagram");
+    len
+}
+
+/// Assert nothing further arrives within a short quiet window.
+async fn expect_no_more_datagrams(listener: &UdpSocket, buffer: &mut [u8], label: &str) {
+    let quiet = Duration::from_millis(500);
+    let extra = tokio::time::timeout(quiet, listener.recv_from(buffer)).await;
+    assert!(extra.is_err(), "{label}");
+}
+
+/// GHSA-cr65-wcww-rr49 reproduction shape with DTLS disabled: nine ordinary
+/// records co-batched with one oversized record. Before the fix no size gate
+/// ran on plain UDP, the whole batch failed with `Message too long`, and all
+/// nine innocent clients' records were destroyed.
+#[tokio::test]
+async fn test_udp_logging_plain_udp_oversized_record_spares_cobatched_siblings() {
+    let listener = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind collector");
+    let addr = listener.local_addr().expect("collector addr");
+
+    // `flush_interval_ms` is set far out so only `batch_size` triggers the
+    // flush and all ten records are co-batched, as in the advisory reproduction.
+    let plugin = UdpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": addr.port(),
+            "batch_size": 10,
+            "flush_interval_ms": 600_000,
+            "max_retries": 0,
+            "buffer_capacity": 64,
+            "max_entry_bytes": 262_144
+        }),
+        test_client(),
+    )
+    .expect("construct");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let drops_before = ferrum_edge::_test_support::udp_logging_local_record_drops_for_test();
+    let sink_loss_before = dropped_total("udp_logging", SinkLossReason::SinkError);
+
+    let ordinary = create_test_transaction_summary();
+    let mut attacker = create_test_transaction_summary();
+    // Admitted by `max_entry_bytes`, far past any UDP datagram maximum.
+    attacker.request_user_agent = Some("x".repeat(200_000));
+
+    for _ in 0..9 {
+        plugin.log(&ordinary).await;
+    }
+    plugin.log(&attacker).await;
+
+    let mut buffer = vec![0u8; 262_144];
+    let mut delivered = 0usize;
+    while delivered < 9 {
+        let len = recv_datagram(&listener, &mut buffer, "co-batched siblings").await;
+        assert!(
+            len <= 65_507,
+            "no assembled datagram may exceed the IPv4 UDP payload maximum (got {len})"
+        );
+        let records: Vec<Value> =
+            serde_json::from_slice(&buffer[..len]).expect("each datagram is a JSON array");
+        delivered += records.len();
+    }
+    assert_eq!(delivered, 9, "exactly the nine ordinary records survive");
+
+    expect_no_more_datagrams(
+        &listener,
+        &mut buffer,
+        "the oversized record must be rejected locally, never put on the wire",
+    )
+    .await;
+    let drops_after = ferrum_edge::_test_support::udp_logging_local_record_drops_for_test();
+    assert!(
+        drops_after > drops_before,
+        "the record rejected alone must be counted as a local drop"
+    );
+    let sink_loss_after = dropped_total("udp_logging", SinkLossReason::SinkError);
+    assert!(
+        sink_loss_after > sink_loss_before,
+        "the rejected record must be published as a per-plugin sink loss"
+    );
+}
+
+/// Control for the gate: a batch that already fits stays one datagram.
+#[tokio::test]
+async fn test_udp_logging_plain_udp_in_limit_batch_is_still_one_datagram() {
+    let listener = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind collector");
+    let addr = listener.local_addr().expect("collector addr");
+
+    let plugin = UdpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": addr.port(),
+            "batch_size": 3,
+            "flush_interval_ms": 600_000,
+            "max_retries": 0,
+            "buffer_capacity": 16
+        }),
+        test_client(),
+    )
+    .expect("construct");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let summary = create_test_transaction_summary();
+    for _ in 0..3 {
+        plugin.log(&summary).await;
+    }
+
+    let mut buffer = vec![0u8; 65_536];
+    let len = recv_datagram(&listener, &mut buffer, "in-limit batch").await;
+    let records: Vec<Value> =
+        serde_json::from_slice(&buffer[..len]).expect("datagram is a JSON array");
+    assert_eq!(records.len(), 3, "an in-limit batch stays one datagram");
+    expect_no_more_datagrams(
+        &listener,
+        &mut buffer,
+        "the gate must not split a batch that already fits",
+    )
+    .await;
 }
 
 #[test]
@@ -1446,12 +1692,31 @@ async fn test_dtls_connection_send_rejects_oversized_plaintext() {
         .expect_err("oversized plaintext must fail");
     assert!(err.to_string().contains("max_plaintext"), "got: {err}");
 
-    // Exact in-limit boundary must complete successfully.
-    let exact = vec![b'y'; max];
+    // An in-limit payload must actually reach the wire. Sized under the
+    // smallest default UDP datagram ceiling among supported hosts — Darwin's
+    // `net.inet.udp.maxdgram` is 9216, where the ~16 KiB record the plaintext
+    // ceiling admits is rejected by the socket with EMSGSIZE (issue #4983).
+    // That is a host property, not a DTLS one, so proving transport and
+    // proving the size gate are two separate assertions.
+    const PORTABLE_IN_LIMIT_BYTES: usize = 8 * 1024;
+    let in_limit = vec![b'z'; PORTABLE_IN_LIMIT_BYTES.min(max)];
     client
-        .send(&exact)
+        .send(&in_limit)
         .await
-        .expect("exact max_plaintext send must succeed");
+        .expect("an in-limit send within every host's datagram ceiling must succeed");
+
+    // The exact ceiling is admitted by the size gate on every host. Where the
+    // host can carry the resulting datagram it also completes; where it cannot,
+    // the failure must come from the socket, never from `max_plaintext`. A
+    // connected-socket send error is per-datagram and retains the association,
+    // so the close assertions below still hold either way.
+    let exact = vec![b'y'; max];
+    if let Err(error) = client.send(&exact).await {
+        assert!(
+            !error.to_string().contains("max_plaintext"),
+            "the exact ceiling must not be rejected by the plaintext size gate: {error}"
+        );
+    }
 
     // Connection close must propagate as a send failure (not hang).
     server_conn.close().await;
@@ -1490,8 +1755,7 @@ fn test_udp_logging_dtls_loss_and_reset_classification() {
         "DTLS send timeout is a transport failure and must reset the sender"
     );
     assert!(
-        ferrum_edge::_test_support::udp_logging_local_dtls_size_rejection_preserves_sender_for_test(
-        ),
+        ferrum_edge::_test_support::udp_logging_local_size_rejection_preserves_sender_for_test(),
         "deterministic local size rejection must preserve the sender"
     );
     assert!(
@@ -1540,6 +1804,10 @@ fn test_udp_logging_openapi_dtls_policy_contract() {
         validator.is_valid(&json!({"host": "2001:db8::10", "port": 9514})),
         "unbracketed IPv6 accepted by parse_socket_host must validate"
     );
+    assert!(
+        validator.is_valid(&json!({"host": " localhost ", "port": 9514})),
+        "OpenAPI must allow host values runtime trims"
+    );
 
     for invalid in [
         json!({"host": "127.0.0.1", "port": 9514, "dtls_no_verify": true}),
@@ -1550,6 +1818,15 @@ fn test_udp_logging_openapi_dtls_policy_contract() {
         json!({"host": "udp://logs.example.com", "port": 9514}),
         json!({"host": "logs.example.com:9514", "port": 9514}),
         json!({"host": "", "port": 9514}),
+        json!({"host": "[localhost]", "port": 9514}),
+        json!({"host": "127.0.0.1", "port": 9514, "dtls": true, "dtls_ca_cert_path": " "}),
+        json!({
+            "host": "127.0.0.1",
+            "port": 9514,
+            "schema": {"static_fields": {"audit": "ok"}},
+            "schema_ref": "audit"
+        }),
+        json!({"host": "127.0.0.1", "port": 9514, "buffer_max_bytes": 2050}),
     ] {
         assert!(
             !validator.is_valid(&invalid),
@@ -1573,6 +1850,11 @@ fn test_udp_logging_docs_dns_and_delivery_contract() {
         "current sender is retained",
         "local UDP socket",
         "FERRUM_DTLS_MAX_PLAINTEXT_BYTES",
+        "transport actually in use, not only under DTLS",
+        "**65,507**",
+        "**65,527**",
+        "bounds the assembled datagram by construction",
+        "reserved for admission-time refusals",
         "split per entry",
         "co-batched siblings",
         "at-least-once",
@@ -1584,6 +1866,11 @@ fn test_udp_logging_docs_dns_and_delivery_contract() {
         "File mode",
         "Database mode",
         "DP mode",
+        "`schema`",
+        "`schema_ref`",
+        "docs/log_schema.md",
+        "268435456",
+        "counted once",
     ] {
         assert!(
             section.contains(needle),

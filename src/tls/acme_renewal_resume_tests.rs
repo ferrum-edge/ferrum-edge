@@ -785,3 +785,100 @@ fn scheduler_config(dns01_hook_command: Option<&str>) -> AcmeRenewalSchedulerCon
         dns_cache: crate::dns::DnsCache::new(crate::dns::DnsConfig::default()),
     }
 }
+
+#[cfg(feature = "acme")]
+#[tokio::test]
+async fn ca_invalid_completion_is_persisted_and_next_scan_plans_new_order() {
+    use crate::tls::acme::client::AcmeClientError;
+    use crate::tls::acme::{RenewalCompletionError, resolve_renewal_completion_result};
+
+    for status in [
+        AcmeOrderStatus::PendingChallenges,
+        AcmeOrderStatus::Ready,
+        AcmeOrderStatus::Processing,
+    ] {
+        let fixture = fixture_with(
+            Some(OrderSpec::with_status(status).build()),
+            Some(issued_certificate(None)),
+            true,
+        );
+        let keeper = successor_keeper(&fixture);
+        let order = fixture.orders.get_order(ORDER_ID).unwrap();
+        let certificate_before =
+            std::fs::read(fixture.dir.path().join("acme-certificates.json")).unwrap();
+        let error = resolve_renewal_completion_result(
+            &fixture.orders,
+            &keeper,
+            &order,
+            Err(RenewalCompletionError::Client(
+                AcmeClientError::TerminalInvalidOrder,
+            )),
+        )
+        .await
+        .unwrap_err();
+        assert_no_challenge_disclosure(&error.to_string());
+        let failed = fixture.orders.get_order(ORDER_ID).unwrap();
+        assert_eq!(failed.status, AcmeOrderStatus::Failed);
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("CA reports that the ACME order is terminally invalid")
+        );
+        assert_eq!(
+            std::fs::read(fixture.dir.path().join("acme-certificates.json")).unwrap(),
+            certificate_before
+        );
+        keeper.finish().await.unwrap();
+        expect_new_order(
+            plan_after_claim(&fixture).await,
+            "CA-invalid completion must not wedge renewal",
+        );
+    }
+}
+
+#[cfg(feature = "acme")]
+#[tokio::test]
+async fn transient_completion_and_lost_claim_leave_the_order_resumable() {
+    use crate::tls::acme::client::AcmeClientError;
+    use crate::tls::acme::{RenewalCompletionError, resolve_renewal_completion_result};
+
+    for lost in [false, true] {
+        let fixture = resumable_http01_fixture();
+        let keeper = successor_keeper(&fixture);
+        let order = fixture.orders.get_order(ORDER_ID).unwrap();
+        let before = fixture.orders.store_version().unwrap();
+        let error = if lost {
+            std::fs::write(
+                fixture.lease_file(),
+                live_takeover_document(&fixture.lease_name()),
+            )
+            .unwrap();
+            AcmeClientError::TerminalInvalidOrder
+        } else {
+            AcmeClientError::Client("invalid: transient network response".to_string())
+        };
+        let outcome = resolve_renewal_completion_result(
+            &fixture.orders,
+            &keeper,
+            &order,
+            Err(RenewalCompletionError::Client(error)),
+        )
+        .await;
+        if lost {
+            assert!(
+                outcome.unwrap().is_none(),
+                "lost lease must abandon the commit"
+            );
+        } else {
+            assert!(outcome.is_err());
+        }
+        assert_eq!(fixture.orders.store_version().unwrap(), before);
+        assert_eq!(
+            fixture.orders.get_order(ORDER_ID).unwrap().status,
+            AcmeOrderStatus::Processing
+        );
+        let _ = keeper.finish().await;
+        if !lost {
+            expect_resume(plan_after_claim(&fixture).await);
+        }
+    }
+}

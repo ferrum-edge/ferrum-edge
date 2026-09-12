@@ -92,8 +92,20 @@ fn h3_plain_bridge_dispatches_mesh_through_shared_pools() {
 #[test]
 fn h3_plain_dispatcher_is_boxed_off_the_cross_protocol_run_stack() {
     let source = include_str!("../../../src/http3/cross_protocol.rs");
+    let entry = source
+        .split("pub(crate) fn run<'a, S>(")
+        .nth(1)
+        .expect("out-of-line cross-protocol entry")
+        .split("async fn run_inner<S>(")
+        .next()
+        .expect("bounded entry factory");
+    assert!(
+        source.contains("#[inline(never)]\npub(crate) fn run<'a, S>(")
+            && entry.contains("Box::pin(run_inner(request))"),
+        "the enclosing bridge future must leave the H3 request frame before mesh dispatch is polled"
+    );
     let run = source
-        .split("pub(crate) async fn run<S>(")
+        .split("async fn run_inner<S>(")
         .nth(1)
         .expect("cross-protocol run dispatcher")
         .split("type BoxedPlainDispatchFuture<'a>")
@@ -152,9 +164,7 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
         "mesh force-buffer must not drain under the client RPC deadline wrapper"
     );
     assert_eq!(
-        mesh_collection
-            .matches("release_cross_protocol_circuit_breaker_probe_on_admission_reject(")
-            .count(),
+        mesh_collection.matches("cb_probe.release_neutral(").count(),
         3,
         "mesh upload collection must release the HALF_OPEN probe on each terminal reject branch"
     );
@@ -167,7 +177,7 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
         .next()
         .expect("bounded mesh collection Ok(None) branch");
     let oversize_release = oversize
-        .find("release_cross_protocol_circuit_breaker_probe_on_admission_reject(")
+        .find("cb_probe.release_neutral()")
         .expect("Ok(None) must release HALF_OPEN probe");
     let oversize_write = oversize
         .find("write_plain_gateway_error(")
@@ -194,7 +204,7 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
         "the mesh force-buffer must bind the captured winner rather than a unit variant"
     );
     let deadline_release = deadline_compact
-        .find("release_cross_protocol_circuit_breaker_probe_on_admission_reject(")
+        .find("cb_probe.release_neutral()")
         .expect("DeadlineExceeded must release HALF_OPEN probe");
     let auth_record = deadline_compact
         .find("record_authorization_termination_once(")
@@ -234,7 +244,7 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
         .next()
         .expect("bounded mesh collection TimedOut/Read branch");
     let timeout_release = timeout
-        .find("release_cross_protocol_circuit_breaker_probe_on_admission_reject(")
+        .find("cb_probe.release_neutral()")
         .expect("TimedOut/Read must release HALF_OPEN probe");
     let timeout_write = timeout
         .find("write_plain_gateway_error(")
@@ -561,7 +571,7 @@ fn translated_h3_grpc_web_threads_preacquired_admission_into_grpc_dispatch() {
 
     let cross_protocol = include_str!("../../../src/http3/cross_protocol.rs");
     let run = cross_protocol
-        .find("pub(crate) async fn run<S>(")
+        .find("async fn run_inner<S>(")
         .expect("cross-protocol run entry point must remain present");
     let grpc_arm = cross_protocol[run..]
         .find("HttpFlavor::Grpc => {")
@@ -1309,7 +1319,8 @@ fn h3_aggregate_sse_writer_streams_under_a_hard_listener_bound() {
             .matches("await_post_deadline_terminal_response_write(")
             .count(),
         2,
-        "pre-commit authorization terminal and listener-lifetime FIN must both use the bounded grace"
+        "exactly two bounded-grace writes: the pre-commit authorization terminal, and the \
+         single post-pump FIN every pump exit settles at"
     );
 
     // Dropping the body is what returns the session's single-listener slot, so
@@ -4815,8 +4826,8 @@ fn committed_native_h3_streaming_responses_reset_unless_a_finish_landed() {
         .expect("the guarded relay must end at its explicit settle");
     let disarms = relay.matches("stream.record_clean_finish();").count();
     assert_eq!(
-        disarms, 2,
-        "only the two FIN-success sites in the guarded relay may disarm the reset"
+        disarms, 3,
+        "only the three FIN-success sites (including a bodyless response) may disarm the reset"
     );
     assert_eq!(
         relay.matches("body_completed = true;").count(),
@@ -4844,14 +4855,10 @@ fn committed_native_h3_streaming_responses_reset_unless_a_finish_landed() {
 /// backstop for a task dropped while parked in `send_data`, and the same
 /// explicit settle after the relay loop.
 ///
-/// The structural invariant that makes the disarm safe in both relays is
-/// stronger than the native relay's: inside the committed region neither has an
-/// inline `finish()` at all. The ONLY client-facing FIN comes from
-/// `finish_h3_response_with_backend_trailers`, whose `Ok(())` is returned
-/// exactly when `h3_stream.finish()` produced `H3AuthorizedWrite::Written` — and
-/// that one match arm is also the relay's only `body_completed = true`. So one
-/// disarm per relay, coinciding with one clean-completion latch, is the whole
-/// set.
+/// Each relay has two authorized FIN-success sites: ordinary completion via
+/// `finish_h3_response_with_backend_trailers` and the bodyless response branch.
+/// Both must pair their successful finish with a clean-completion latch; all
+/// failure, expiry and cancellation exits retain the fail-closed reset.
 #[test]
 fn committed_borrowed_h3_streaming_responses_reset_unless_a_finish_landed() {
     let stream_util = include_str!("../../../src/http3/stream_util.rs");
@@ -4952,8 +4959,8 @@ fn committed_borrowed_h3_streaming_responses_reset_unless_a_finish_landed() {
             .expect("each guarded relay must end at its explicit settle");
         let disarms = guarded.matches("h3_stream.record_clean_finish();").count();
         assert_eq!(
-            disarms, 1,
-            "only the single FIN-success site in a borrowing relay may disarm the reset"
+            disarms, 2,
+            "only the ordinary and bodyless FIN-success sites may disarm the reset"
         );
         assert_eq!(
             guarded.matches("body_completed = true;").count(),

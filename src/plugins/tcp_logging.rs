@@ -202,7 +202,7 @@ impl TcpLogging {
             batch_config: build_batch_config(config, "tcp_logging", batch_defaults)?,
             flush_config,
             writer: Arc::new(Mutex::new(None)),
-            logger: DeferredBatchingLogger::new(),
+            logger: DeferredBatchingLogger::for_plugin("tcp_logging"),
             endpoint_hostname: socket_host.warmup_hostname,
             schema,
             byte_budget: Arc::new(ByteBudget::new_observability(

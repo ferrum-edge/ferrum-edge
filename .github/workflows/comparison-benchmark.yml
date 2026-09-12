@@ -53,6 +53,12 @@ jobs:
     name: Gateway Comparison
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      INPUT_ITERATIONS: ${{ inputs.iterations }}
+      INPUT_DURATION: ${{ inputs.duration }}
+      INPUT_CONNECTIONS: ${{ inputs.connections }}
+      INPUT_THREADS: ${{ inputs.threads }}
+      INPUT_SKIP_GATEWAYS: ${{ inputs.skip_gateways }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -134,10 +140,31 @@ jobs:
           echo ""
           echo "=========================================="
 
-      - name: Run comparison benchmark (${{ inputs.iterations }} iteration(s))
+      - name: Run comparison benchmark
         timeout-minutes: 90
         run: |
-          ITERATIONS=${{ inputs.iterations }}
+          if [[ ! "$INPUT_ITERATIONS" =~ ^[1-3]$ ]]; then
+            echo "::error::iterations must be an integer from 1 through 3"
+            exit 1
+          fi
+          if [[ ! "$INPUT_DURATION" =~ ^[1-9][0-9]*[smh]$ ]]; then
+            echo "::error::duration must be a positive integer followed by s, m, or h"
+            exit 1
+          fi
+          if [[ ! "$INPUT_THREADS" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::threads must be a positive integer"
+            exit 1
+          fi
+          if [[ ! "$INPUT_CONNECTIONS" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::connections must be a positive integer"
+            exit 1
+          fi
+          if [[ ! "$INPUT_SKIP_GATEWAYS" =~ ^$|^(ferrum|kong|tyk|krakend|envoy)(,(ferrum|kong|tyk|krakend|envoy))*$ ]]; then
+            echo "::error::skip_gateways must be a comma-separated list of known gateways"
+            exit 1
+          fi
+
+          ITERATIONS="$INPUT_ITERATIONS"
           echo "Running ${ITERATIONS} iteration(s) of the comparison benchmark suite"
           echo ""
 
@@ -157,10 +184,10 @@ jobs:
 
             # Run the comparison suite
             cd ${{ github.workspace }}
-            WRK_DURATION="${{ inputs.duration }}" \
-            WRK_THREADS="${{ inputs.threads }}" \
-            WRK_CONNECTIONS="${{ inputs.connections }}" \
-            SKIP_GATEWAYS="${{ inputs.skip_gateways }}" \
+            WRK_DURATION="$INPUT_DURATION" \
+            WRK_THREADS="$INPUT_THREADS" \
+            WRK_CONNECTIONS="$INPUT_CONNECTIONS" \
+            SKIP_GATEWAYS="$INPUT_SKIP_GATEWAYS" \
             SKIP_BUILD=$( [ "$run" -gt 1 ] && echo "true" || echo "false" ) \
             bash comparison/run_comparison.sh 2>&1 | tee "/tmp/comparison_output_run${run}.txt"
 
@@ -185,7 +212,11 @@ jobs:
           python3 - <<'PYEOF'
           import json, os, re, math, sys
 
-          ITERATIONS = int("${{ inputs.iterations }}")
+          ITERATIONS = int(os.environ["INPUT_ITERATIONS"])
+          DURATION = os.environ["INPUT_DURATION"]
+          THREADS = os.environ["INPUT_THREADS"]
+          CONNECTIONS = os.environ["INPUT_CONNECTIONS"]
+          SKIP_GATEWAYS = os.environ["INPUT_SKIP_GATEWAYS"]
 
           def parse_wrk_output(file_path):
               """Parse wrk output including the machine-parseable comparison block."""
@@ -325,13 +356,13 @@ jobs:
           lines = []
           lines.append("## Gateway Comparison Benchmark Results\n")
           lines.append(
-              f"**Duration:** ${{ inputs.duration }} | "
-              f"**Threads:** ${{ inputs.threads }} | "
-              f"**Connections:** ${{ inputs.connections }} | "
+              f"**Duration:** {DURATION} | "
+              f"**Threads:** {THREADS} | "
+              f"**Connections:** {CONNECTIONS} | "
               f"**Iterations:** {ITERATIONS}"
           )
-          if "${{ inputs.skip_gateways }}":
-              lines.append(f"**Skipped:** ${{ inputs.skip_gateways }}")
+          if SKIP_GATEWAYS:
+              lines.append(f"**Skipped:** {SKIP_GATEWAYS}")
           lines.append("")
 
           PROTO_LABELS = {"http": "HTTP", "https": "HTTPS (TLS Termination)", "e2e_tls": "E2E TLS"}

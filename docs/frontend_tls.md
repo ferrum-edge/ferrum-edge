@@ -51,7 +51,7 @@ export FERRUM_FRONTEND_TLS_CERT_SOURCE="file:///etc/ferrum/certs/frontend.crt"
 export FERRUM_FRONTEND_TLS_KEY_SOURCE="pkcs11://edge-rsa?pin_env=FERRUM_PKCS11_PIN"
 ```
 
-Use `?module=/path/to/pkcs11.so` or `?module_env=FERRUM_PKCS11_MODULE_PATH` to override the default module path per source, `?slot=` to pin a slot id, `?label=` to override the URI path selector, and `?id_hex=` to refine selection by key id. PKCS#11 support is currently RSA-only and available for frontend/Admin API server TLS keys plus backend mTLS client keys. See [pkcs11_tls.md](pkcs11_tls.md) for HSM deployment notes and the token-backed smoke test.
+Set `FERRUM_PKCS11_MODULE_ALLOWED_PATHS` to a comma-separated list of absolute existing module files or directories before using any URI module override. Unset permits only the operator default `FERRUM_PKCS11_MODULE_PATH` with all module options omitted. Admission and runtime loading enforce canonical paths, including the DP’s own policy for CP-distributed references. Use `?module=/path/to/pkcs11.so` or `?module_env=FERRUM_PKCS11_MODULE_PATH` to override the default module path per source, `?slot=` to pin a slot id, `?label=` to override the URI path selector, and `?id_hex=` to refine selection by key id. PKCS#11 support is currently RSA-only and available for frontend/Admin API server TLS keys plus backend mTLS client keys. See [pkcs11_tls.md](pkcs11_tls.md) for HSM deployment notes and the token-backed smoke test.
 
 ### Handshake Timeout
 
@@ -381,7 +381,7 @@ export FERRUM_ADMIN_TLS_NO_VERIFY="true"
 ### No-Verify Mode (Testing Only)
 
 #### **Purpose**
-The no-verify mode is designed for development, testing, and isolated environments where certificate verification is not practical. Outside production it remains an explicit opt-in that logs a loud warning. Under `FERRUM_MESH_PRODUCTION_MODE=true`, both `FERRUM_TLS_NO_VERIFY` and `FERRUM_ADMIN_TLS_NO_VERIFY` are **refused** by the shared `EnvConfig` validation path used by `ferrum-edge validate` and runtime startup (every mesh topology). FIPS enforce independently refuses them as well.
+The no-verify mode is designed for development, testing, and isolated environments where certificate verification is not practical. `FERRUM_TLS_NO_VERIFY` disables verification of backend server certificates; `FERRUM_ADMIN_TLS_NO_VERIFY` makes the admin HTTPS listener neither require nor verify client certificates, and cannot be combined with `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`. Outside production each remains an explicit opt-in that logs a loud warning. Under `FERRUM_MESH_PRODUCTION_MODE=true`, both `FERRUM_TLS_NO_VERIFY` and `FERRUM_ADMIN_TLS_NO_VERIFY` are **refused** by the shared `EnvConfig` validation path used by `ferrum-edge validate` and runtime startup (every mesh topology). FIPS enforce independently refuses them as well.
 
 #### **Risks**
 - **Security Risk**: Disables ALL certificate verification
@@ -713,6 +713,18 @@ its stale `nextUpdate`, so the
 exported rather than counting further and further negative for material nothing
 staples.
 
+**Every certificate source is enrolled, including the Gateway-API frontend.**
+The operator-configured single-certificate listener and the Gateway-API
+multi-certificate frontend accept a staple through one shared code path that
+validates it against the chain that will serve it, logs the acceptance, fires
+the lead-time warning, and enrols it in the hourly re-check — a certificate
+source cannot admit a staple without also arming its retirement. For the
+SNI-selecting Gateway resolver the retirement republishes the whole name index
+without the staple in a single atomic store, so every name the certificate is
+reachable under — its declared listener hostname, its certificate SAN aliases,
+and the fallback slot — stops offering the expired response on the same
+handshake.
+
 **Refresh is still the operator's job.** Ferrum has **no OCSP responder
 client**: nothing inside the gateway fetches a fresh response, so re-attaching
 one is the operator's own fetch loop plus live reload. Refresh the OCSP source
@@ -918,8 +930,10 @@ verified SubjectPublicKeyInfo from the accepted client-CA bundle (signature
 verified; matching a DN is not enough; identical SPKIs are deduplicated). When
 the signer is not in the accepted bundle, issuer DN and Authority Key
 Identifier cannot prove its key identity: distinct keys can deliberately reuse
-both. Ferrum therefore requires an unambiguous AKI but conservatively includes
-the complete signed CRL in that issuer identity. A reissue from such an
+both. Ferrum therefore conservatively includes the complete signed CRL in that
+issuer identity. A CRL without AKI can be summarized this way, including a CRL
+in the global list whose signer belongs only to a backend trust domain. A
+present malformed or duplicate AKI remains invalid. A reissue from such an
 outside-bundle signer retires established sessions; this availability cost
 prevents colliding issuer metadata from suppressing a new revocation. A CRL
 whose issuer cannot be identified conservatively is refused and the last-good
@@ -1113,7 +1127,7 @@ ACME TLS-ALPN-01 validation still takes precedence over SNI selection, so `acme:
 
 **Rotation and deletion.** Each source carries a content digest (`k8s://<ns>/<secret>#tls.crt?sha256=…`), so a Secret update changes the snapshot and the control plane broadcasts it; the data plane rebuilds the resolver and swaps it atomically for new handshakes. In-flight sessions keep the configuration they negotiated. Deleting a Gateway or listener withdraws exactly its own certificates; when the last Gateway certificate for the namespace goes away, the data plane restores the operator's `FERRUM_FRONTEND_TLS_*` material if any was configured.
 
-**Bounds.** At most 256 Gateway certificates are admitted per configuration snapshot and at most 4096 SNI names are indexed. Certificate admission is listener-atomic: if every `certificateRef` on one listener cannot fit, none of that listener's certificates or routes are materialized. The runtime indexes every explicit listener hostname before adding certificate-derived SAN aliases, so SAN-heavy certificates cannot displace a later listener's declared SNI mapping; only surplus SAN aliases are omitted at the name bound. A stapled OCSP response (`FERRUM_FRONTEND_TLS_OCSP_RESPONSE_SOURCE`) is bound to one certificate, so it is stapled only when the data plane serves exactly one Gateway certificate; with several it is not stapled to any and a warning is logged.
+**Bounds.** At most 256 Gateway certificates are admitted per configuration snapshot and at most 4096 SNI names are indexed. Certificate admission is listener-atomic: if every `certificateRef` on one listener cannot fit, none of that listener's certificates or routes are materialized. The runtime indexes every explicit listener hostname before adding certificate-derived SAN aliases, so SAN-heavy certificates cannot displace a later listener's declared SNI mapping; only surplus SAN aliases are omitted at the name bound. A stapled OCSP response (`FERRUM_FRONTEND_TLS_OCSP_RESPONSE_SOURCE`) is bound to one certificate, so it is stapled only when the data plane serves exactly one Gateway certificate; with several it is not stapled to any and a warning is logged. When it is stapled, it is enrolled in the hourly freshness re-check on the same terms as a single-certificate listener and is retired once it reaches its `nextUpdate` — see [Stapled OCSP Responses](#stapled-ocsp-responses).
 
 ### TLS Inventory Visibility and Metrics
 
@@ -1172,6 +1186,14 @@ continuously. Issue #3816 tracks that gap.
 - **Boundaries are inclusive.** `notBefore` and `notAfter` themselves are inside
   the window, matching RFC 5280 "valid at" semantics. One second past `notAfter`
   is outside it.
+- **A far-future expiry is not an unusable time.** A leaf carrying RFC 5280's
+  "no well-defined expiration" value `99991231235959Z`, or any `notAfter`
+  further out than the host's monotonic clock can represent, is a valid
+  certificate and authenticates. It simply carries no credential deadline of its
+  own, and the finite `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` bounds
+  the admitted stream instead. Where that boundary sits is platform dependent —
+  a nanosecond-based `Instant` saturates centuries before a `timespec`-based one
+  — so this can never be allowed to decide whether a credential is valid.
 - **The connection cache stays, but never caches a time-dependent decision.**
   HTTP/3 memoizes the expensive X.509 parse, path verification, and identity
   extraction once per plugin instance and transport connection. What is cached
@@ -1188,6 +1210,19 @@ continuously. Issue #3816 tracks that gap.
   `notAfter`, the observed time, the subject, the SAN, the serial, the
   fingerprint, and the DER are never echoed to the client and never logged or
   exported as a metric label.
+- **The accepted issuer path bounds the decision too.** A pinned CA and the
+  presented issuing CAs are themselves valid only for a finite time, and the
+  connection cache retains the accepted `allowed_issuers` /
+  `allowed_ca_fingerprints_sha256` decision. The **earliest `notAfter` on the
+  path that actually satisfied the constraint** is therefore composed into the
+  retained window, so an issuer expiring before the leaf ends the authorization
+  at its own expiry. Within one path every certificate must still be valid
+  (earliest wins); across alternatives — several filters, or several verified
+  paths through cross-signed intermediates — the longest-lived matching path
+  wins, since refusing it would shorten an authorization the configuration
+  allows. With both constraint kinds configured, both must pass and the earlier
+  of their two bounds applies. An issuing CA already outside its own validity
+  window contributes no verified path, and the certificate is refused.
 
 A successful `mtls_auth` verification also publishes the leaf's `notAfter` as
 the request's authoritative **credential deadline** on the shared,
@@ -1217,8 +1252,9 @@ conversion back to a userspace rustls session.
 
 Eligibility is therefore decided **before the frontend handshake starts**, while
 the socket is still pristine. A TLS-terminating TCP listener whose plugin chain
-can admit an authenticated stream principal — today that means `mtls_auth` —
-does not take the kTLS handoff at all. Such a connection stays on the ordinary
+can admit an authenticated stream principal — today `mtls_auth` and
+`spiffe_identity`, which admits a certificate-derived SPIFFE principal with the
+leaf's `notAfter` as its deadline — does not take the kTLS handoff at all. Such a connection stays on the ordinary
 buffered rustls path, is relayed normally, and is bounded by the certificate
 deadline exactly as described above. Nothing is refused and no authentication is
 skipped; only the optional fast path is declined.
@@ -1598,10 +1634,19 @@ after that fenced write — but before the final certificate/order publication �
 leaves an authoritative order behind in `pending_challenges`, `ready`, or
 `processing`. Its claim then expires and a successor takes over.
 
+If the CA reports the order itself as terminally `invalid`, the scheduler marks
+that unchanged active order `failed` inside the still-held renewal lease fence.
+The next due scan plans a new order; normal terminal-history pruning applies.
+Timeouts, network errors and other failures without an observed invalid order
+leave the existing order resumable. A lost claim, operator update, deletion or
+newer order prevents the stale failure write. Certificate material is retained
+and no reload is requested on this failure path. Fix the validation problem
+(such as HTTP-01 reachability or DNS-01 publication) so the next order can pass.
+
 The successor **finishes that same order**. It never treats the leftover record
 as a reason to skip the certificate (which would wedge renewal permanently,
 since the record outlives the claim that produced it) and never creates a second
-order with the CA:
+order with the CA while the original remains active:
 
 - **The finalization material is generated first and persisted with the order.**
   The certificate private key and the CSR are produced during *preparation* —

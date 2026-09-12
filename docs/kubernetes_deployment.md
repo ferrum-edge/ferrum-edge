@@ -1389,7 +1389,7 @@ If you use `subPath` mounts for cert files, note that Kubernetes does not propag
 
 ## Database Outage Restart Protection
 
-If you run database or Control Plane mode and want pods to restart cleanly while the database is temporarily unavailable, mount a backup config and set:
+If you run database mode and want pods to restart cleanly while the database is temporarily unavailable, mount a backup config and set:
 
 ```yaml
 env:
@@ -1397,12 +1397,13 @@ env:
     value: /etc/ferrum/backup-config.json
 ```
 
-This lets Ferrum Edge start with a previously exported config while database polling keeps retrying in the background.
+Provision the unmodified JSON returned by an authenticated `GET /backup` request for the intended namespace. Raw `GatewayConfig` JSON is also accepted. Publish the file by atomic replacement and protect it as an unredacted credential backup. The stable regular-file limit is 64 MiB. This lets Ferrum Edge start with the exported runtime configuration while database polling keeps retrying in the background. On healthy database starts, an unusable configured backup produces a warning without blocking startup.
 
 The file is filtered to the pod's `FERRUM_NAMESPACE` before it is validated or served, so a multi-namespace
 (or all-namespace) export is safe to mount here: the pod loads only its own namespace's proxies, consumers,
-credentials, plugin configs, upstreams and trust material, and a `listen_path` or resource name reused in
-another namespace does not reject the file.
+credentials, plugin configs and upstreams, and a `listen_path` or resource name reused in
+another namespace does not reject the file. Administrative API specs and gateway trust bundles are
+ignored; gateway-to-mesh identity remains refused until an authoritative database reload settles trust.
 
 ## Kubernetes Service Discovery
 

@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::Utc;
-use dashmap::DashMap;
 use ferrum_edge::config::types::{
     ActiveHealthCheck, GatewayConfig, HealthCheckConfig, LoadBalancerAlgorithm, LocalityDistribute,
     LocalityFailover, PassiveHealthCheck, SubsetDefinition, SubsetTrafficPolicy, Upstream,
     UpstreamLocalityLbSetting, UpstreamPortOverride, UpstreamTarget,
 };
+use ferrum_edge::health_check::ActiveUnhealthyTargets;
 use ferrum_edge::load_balancer::{HealthContext, LoadBalancerCache, target_key};
 
 fn target(host: &str, locality: Option<&str>) -> UpstreamTarget {
@@ -149,7 +149,7 @@ fn locality_priority_falls_back_to_zone_when_exact_unhealthy() {
     );
     let cache = LoadBalancerCache::new(&config(upstream));
     let snapshot = cache.load();
-    let active_unhealthy = DashMap::new();
+    let active_unhealthy = ActiveUnhealthyTargets::new();
     active_unhealthy.insert(target_key("ferrum|u1", &exact), 1);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
@@ -180,7 +180,7 @@ fn locality_priority_falls_back_to_region_when_zone_unavailable() {
     );
     let cache = LoadBalancerCache::new(&config(upstream));
     let snapshot = cache.load();
-    let active_unhealthy = DashMap::new();
+    let active_unhealthy = ActiveUnhealthyTargets::new();
     active_unhealthy.insert(target_key("ferrum|u1", &exact), 1);
     active_unhealthy.insert(target_key("ferrum|u1", &zone), 1);
     let health = HealthContext {
@@ -216,7 +216,7 @@ fn locality_priority_falls_back_to_any_when_all_preferred_tiers_unhealthy() {
     );
     let cache = LoadBalancerCache::new(&config(upstream));
     let snapshot = cache.load();
-    let active_unhealthy = DashMap::new();
+    let active_unhealthy = ActiveUnhealthyTargets::new();
     active_unhealthy.insert(target_key("ferrum|u1", &exact), 1);
     active_unhealthy.insert(target_key("ferrum|u1", &zone), 1);
     active_unhealthy.insert(target_key("ferrum|u1", &region), 1);
@@ -266,7 +266,7 @@ fn locality_priority_targets_without_locality_treated_as_no_preference() {
 
     // Knock the exact target out — unannotated should now be reachable as
     // the residual fallback (no rank 0/1/2 candidates left).
-    let active_unhealthy = DashMap::new();
+    let active_unhealthy = ActiveUnhealthyTargets::new();
     active_unhealthy.insert(target_key("ferrum|u1", &exact), 1);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
@@ -865,7 +865,7 @@ fn cross_cluster_unhealthy_local_fails_over_to_healthy_gateway() {
     assert!(!up.locality_lb_strict, "test premise: strict stays off");
     let cache = LoadBalancerCache::new(&config(up));
     let snapshot = cache.load();
-    let active_unhealthy = DashMap::new();
+    let active_unhealthy = ActiveUnhealthyTargets::new();
     active_unhealthy.insert(target_key("ferrum|u1", &local), 1);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
@@ -1000,7 +1000,7 @@ fn strict_locality_absent_source_falls_back_to_unhealthy_local_not_remote() {
     );
     let cache = LoadBalancerCache::new(&config(up));
     let snapshot = cache.load();
-    let active_unhealthy = DashMap::new();
+    let active_unhealthy = ActiveUnhealthyTargets::new();
     active_unhealthy.insert(target_key("ferrum|u1", &local), 1);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
@@ -1044,7 +1044,7 @@ fn strict_locality_vec_path_falls_back_to_unhealthy_local_not_remote() {
     let up = strict_upstream(None, targets);
     let cache = LoadBalancerCache::new(&config(up));
     let snapshot = cache.load();
-    let active_unhealthy = DashMap::new();
+    let active_unhealthy = ActiveUnhealthyTargets::new();
     for local in &locals {
         active_unhealthy.insert(target_key("ferrum|u1", local), 1);
     }
@@ -1115,7 +1115,7 @@ fn strict_locality_port_scope_falls_back_to_unhealthy_local_not_remote() {
     up.port_overrides = port_overrides;
     let cache = LoadBalancerCache::new(&config(up));
     let snapshot = cache.load();
-    let active_unhealthy = DashMap::new();
+    let active_unhealthy = ActiveUnhealthyTargets::new();
     active_unhealthy.insert(target_key("ferrum|u1", &local), 1);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
@@ -1214,7 +1214,7 @@ fn strict_locality_subset_scope_falls_back_to_unhealthy_local_not_remote() {
     }]);
     let cache = LoadBalancerCache::new(&config(up));
     let snapshot = cache.load();
-    let active_unhealthy = DashMap::new();
+    let active_unhealthy = ActiveUnhealthyTargets::new();
     active_unhealthy.insert(target_key("ferrum|u1", &local), 1);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
@@ -1864,7 +1864,7 @@ fn locality_distribute_falls_through_when_every_weighted_target_is_unhealthy() {
     );
     let cache = LoadBalancerCache::new(&config(up));
     let snapshot = cache.load();
-    let active_unhealthy = DashMap::new();
+    let active_unhealthy = ActiveUnhealthyTargets::new();
     active_unhealthy.insert(target_key("ferrum|u1", &east), 1);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
@@ -1914,7 +1914,7 @@ fn locality_distribute_vec_fallback_empty_mask_preserves_priority_tier() {
     let up = upstream_with_locality_lb("us-west/us-west-1/a", targets, setting);
     let cache = LoadBalancerCache::new(&config(up));
     let snapshot = cache.load();
-    let active_unhealthy = DashMap::new();
+    let active_unhealthy = ActiveUnhealthyTargets::new();
     active_unhealthy.insert(target_key("ferrum|u1", &east), 1);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
@@ -2013,7 +2013,7 @@ fn locality_failover_overrides_region_fallback_when_all_local_tiers_unhealthy() 
     );
     let cache = LoadBalancerCache::new(&config(up));
     let snapshot = cache.load();
-    let active_unhealthy = DashMap::new();
+    let active_unhealthy = ActiveUnhealthyTargets::new();
     active_unhealthy.insert(target_key("ferrum|u1", &exact), 1);
     active_unhealthy.insert(target_key("ferrum|u1", &zone), 1);
     active_unhealthy.insert(target_key("ferrum|u1", &region), 1);
@@ -2101,7 +2101,7 @@ fn locality_failover_falls_through_when_failover_region_is_also_empty() {
     );
     let cache = LoadBalancerCache::new(&config(up));
     let snapshot = cache.load();
-    let active_unhealthy = DashMap::new();
+    let active_unhealthy = ActiveUnhealthyTargets::new();
     active_unhealthy.insert(target_key("ferrum|u1", &exact), 1);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
@@ -2308,7 +2308,7 @@ fn failover_priority_falls_back_when_higher_tier_unhealthy() {
     );
     let cache = LoadBalancerCache::new(&config(up));
     let snapshot = cache.load();
-    let active_unhealthy = DashMap::new();
+    let active_unhealthy = ActiveUnhealthyTargets::new();
     active_unhealthy.insert(target_key("ferrum|u1", &full), 1);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
@@ -3121,7 +3121,7 @@ fn failover_priority_vec_fallback_path_falls_through_unhealthy_preferred_tier_ab
     );
     let cache = LoadBalancerCache::new(&config(up));
     let snapshot = cache.load();
-    let active_unhealthy = DashMap::new();
+    let active_unhealthy = ActiveUnhealthyTargets::new();
     for target in &full_match {
         active_unhealthy.insert(target_key("ferrum|u1", target), 1);
     }

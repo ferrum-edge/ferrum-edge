@@ -345,3 +345,113 @@ fn a_missing_account_store_reads_empty_but_an_unreadable_one_fails_closed() {
         "a corrupt account store must surface as a read/parse failure, got {error:?}"
     );
 }
+
+#[test]
+fn ca_invalid_order_write_requires_the_live_lease_fence_and_is_visible_to_peers() {
+    use ferrum_edge::tls::lease::{FencedCommit, TlsLeaseStore, acme_renewal_lease_name};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let orders = AcmeOrderStore::open(dir.path()).unwrap();
+    let peer = AcmeOrderStore::open(dir.path()).unwrap();
+    create_order(&orders, "renew-terminal", "edge-cert", "terminal_token");
+    let order = orders.get_order("renew-terminal").unwrap();
+    let leases_a = Arc::new(TlsLeaseStore::open_with_holder(dir.path(), "a".to_string()).unwrap());
+    let leases_b = Arc::new(TlsLeaseStore::open_with_holder(dir.path(), "b".to_string()).unwrap());
+    let name = acme_renewal_lease_name("edge-cert");
+    let first = leases_a
+        .try_acquire(&name, Duration::from_secs(60))
+        .unwrap()
+        .unwrap();
+    let stale_fence = first.fence();
+    first.release().unwrap();
+    let second = leases_b
+        .try_acquire(&name, Duration::from_secs(60))
+        .unwrap()
+        .unwrap();
+    let version = orders.store_version().unwrap();
+    let denied = leases_a
+        .commit_fenced(&name, stale_fence, || {
+            orders.fail_ca_invalid_order_if_current(&order)
+        })
+        .unwrap();
+    assert!(matches!(denied, FencedCommit::NotOwner));
+    assert_eq!(orders.store_version().unwrap(), version);
+    assert_eq!(
+        peer.get_order(&order.id).unwrap().status,
+        AcmeOrderStatus::PendingChallenges
+    );
+    let committed = leases_b
+        .commit_fenced(&name, second.fence(), || {
+            orders.fail_ca_invalid_order_if_current(&order)
+        })
+        .unwrap();
+    assert!(matches!(committed, FencedCommit::Committed(Ok(true))));
+    assert_eq!(
+        peer.get_order(&order.id).unwrap().status,
+        AcmeOrderStatus::Failed
+    );
+    second.release().unwrap();
+}
+
+#[test]
+fn terminal_failure_preserves_replaced_deleted_or_superseded_orders() {
+    for replacement in ["updated", "deleted", "newer", "valid"] {
+        let dir = tempfile::tempdir().unwrap();
+        let orders = AcmeOrderStore::open(dir.path()).unwrap();
+        create_order(&orders, "original", "edge-cert", "original_token");
+        let original = orders.get_order("original").unwrap();
+        match replacement {
+            "deleted" => {
+                orders.delete_order("original").unwrap();
+            }
+            "newer" => {
+                create_order(&orders, "newer", "edge-cert", "newer_token");
+            }
+            _ => {
+                let mut changed = original.clone();
+                changed.status = if replacement == "valid" {
+                    AcmeOrderStatus::Valid
+                } else {
+                    AcmeOrderStatus::Ready
+                };
+                orders.upsert_order(changed, true).unwrap();
+            }
+        }
+        let version = orders.store_version().unwrap();
+        assert!(
+            !orders.fail_ca_invalid_order_if_current(&original).unwrap(),
+            "{replacement}"
+        );
+        assert_eq!(orders.store_version().unwrap(), version, "{replacement}");
+        if replacement == "newer" {
+            assert_eq!(
+                orders
+                    .latest_order_for_certificate("edge-cert")
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                "newer"
+            );
+        }
+    }
+}
+
+#[test]
+fn ca_invalid_order_transition_applies_terminal_history_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let orders = AcmeOrderStore::open_with_limits(dir.path(), 1, None).unwrap();
+    let mut older = pending_order("older", "edge-cert", "older_token");
+    older.status = AcmeOrderStatus::Failed;
+    orders.upsert_order(older, false).unwrap();
+    create_order(&orders, "current", "edge-cert", "current_token");
+    let current = orders.get_order("current").unwrap();
+    assert_eq!(order_ids(&orders).len(), 2);
+    assert!(orders.fail_ca_invalid_order_if_current(&current).unwrap());
+    assert_eq!(order_ids(&orders), vec!["current".to_string()]);
+    assert_eq!(
+        orders.get_order("current").unwrap().status,
+        AcmeOrderStatus::Failed
+    );
+}

@@ -43,7 +43,7 @@ publishes the node-scoped cleanup proof the settled host placement requires.
 cargo build
 cargo build --release
 cargo test --lib
-cargo test --test unit_tests
+cargo test --test unit_tests   # also: unit_plugins_a_tests (a–j), unit_plugins_b_tests (k–z), unit_gateway_core_tests
 cargo test --test integration_tests
 cargo build --bin ferrum-edge && cargo test --test functional_tests -- --ignored
 cargo fmt --all && cargo fmt --all -- --check
@@ -56,7 +56,7 @@ Prerequisite: `protoc`; `build.rs` runs `tonic_build` on `proto/ferrum.proto`.
 
 Test what changed and let CI run the full matrix. For Rust changes, run `cargo fmt --all -- --check`, targeted clippy, and relevant tests. Docs/comment-only changes usually need `git diff --check`. Config/schema/spec/template changes need validation of the changed surface and Rust checks only if Rust changed.
 
-Target by scope: public APIs use `cargo test --test unit_tests <filter>`; cross-module behavior uses `cargo test --test integration_tests <filter>`; proxy hot-path changes use `cargo build --bin ferrum-edge && cargo test --test functional_tests <filter> -- --ignored`. Avoid adding new inline source tests; prefer external unit tests, integration tests, or focused test-only helpers under `tests/`.
+Target by scope: public APIs use `cargo test --test <unit target> <filter>` (the unit suite is four targets: `unit_tests` for config/admin/tls/identity/secrets/cli, `unit_plugins_a_tests` and `unit_plugins_b_tests` for plugin test files starting a–j / k–z, `unit_gateway_core_tests` for core runtime; `cargo test unit::plugins::cors_tests` searches every target); cross-module behavior uses `cargo test --test integration_tests <filter>`; proxy hot-path changes use `cargo build --bin ferrum-edge && cargo test --test functional_tests <filter> -- --ignored`. Avoid adding new inline source tests; prefer external unit tests, integration tests, or focused test-only helpers under `tests/`.
 
 Run the full local suite only for shared infrastructure, cross-module refactors, pre-release work, or when CI is congested. Leave `CARGO_TARGET_DIR` unset across parallel worktrees; inside one workspace, run fmt, clippy, and tests sequentially.
 

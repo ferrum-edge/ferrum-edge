@@ -235,6 +235,25 @@ fn timeout_header(headers: &HashMap<String, String>) -> Option<&str> {
         .map(|(_, value)| value.as_str())
 }
 
+/// True when the client sent `grpc-timeout` but it cannot establish a positive
+/// deadline (malformed wire value, zero timeout, or otherwise invalid).
+fn client_grpc_timeout_is_invalid(headers: &HashMap<String, String>) -> bool {
+    timeout_header(headers).is_some_and(|value| {
+        parse_grpc_timeout(value)
+            .and_then(duration_millis_ceil_saturating)
+            .is_none()
+    })
+}
+
+fn strip_grpc_timeout_header(headers: &mut HashMap<String, String>) {
+    headers.retain(|name, _| !name.eq_ignore_ascii_case("grpc-timeout"));
+}
+
+fn mark_invalid_grpc_timeout_metadata(ctx: &mut RequestContext) {
+    ctx.metadata
+        .insert("grpc_timeout_invalid".to_string(), "true".to_string());
+}
+
 fn initialize_deadline_from_headers(ctx: &mut RequestContext, headers: &HashMap<String, String>) {
     if ctx.grpc_deadline_initialized {
         return;
@@ -379,8 +398,17 @@ impl Plugin for GrpcDeadline {
             }
         }
 
+        let client_timeout_invalid = client_grpc_timeout_is_invalid(headers);
+
         let Some(effective_ms) = ctx.grpc_deadline_budget_ms else {
-            if let Some(value) = timeout_header(headers) {
+            if client_timeout_invalid {
+                mark_invalid_grpc_timeout_metadata(ctx);
+                strip_grpc_timeout_header(headers);
+                debug!(
+                    plugin = "grpc_deadline",
+                    "Stripped invalid grpc-timeout without an enforced fallback"
+                );
+            } else if let Some(value) = timeout_header(headers) {
                 debug!(
                     timeout_val = %value,
                     plugin = "grpc_deadline",
@@ -427,6 +455,9 @@ impl Plugin for GrpcDeadline {
         let timeout_val = format_grpc_timeout(Duration::from_millis(deadline_ms));
         headers.retain(|name, _| !name.eq_ignore_ascii_case("grpc-timeout"));
         headers.insert("grpc-timeout".to_string(), timeout_val);
+        if client_timeout_invalid {
+            mark_invalid_grpc_timeout_metadata(ctx);
+        }
         ctx.metadata.insert(
             "grpc_adjusted_deadline_ms".to_string(),
             deadline_ms.to_string(),

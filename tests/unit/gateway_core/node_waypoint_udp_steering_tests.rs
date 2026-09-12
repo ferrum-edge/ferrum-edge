@@ -2440,13 +2440,12 @@ fn node_waypoint_udp_listeners_select_the_tools_capable_runtime() {
         "enabling NodeWaypoint UDP listeners must select the tools-capable image"
     );
     assert!(
-        chart.contains(
-            "{{- $ambientImageTag = printf \"%s-ebpf-tools\" \
-             (trimSuffix \"-ebpf\" $ambientImageTag) -}}"
-        ),
-        "an explicit -ebpf tag must be promoted, not double-suffixed, when tools \
-         are required"
+        chart.contains("include \"ferrum-mesh.toolsImageTag\" $ambientImageTag"),
+        "Ambient and injector shell consumers must share tools-tag promotion"
     );
+    let helpers = repo_file("charts/ferrum-mesh/templates/_helpers.tpl");
+    assert!(helpers.contains("trimSuffix \"-ebpf\" ."));
+    assert!(helpers.contains("hasSuffix \"-ebpf-tools\" ."));
 
     let node_agent = repo_file("charts/ferrum-mesh/templates/node-agent-daemonset.yaml");
     assert!(

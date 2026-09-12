@@ -5,6 +5,7 @@ use serde_json::Value;
 use url::{Host, Url};
 
 use super::response_body::{BoundedReadError, measure_response_body_bounded};
+use super::sink_loss::{SINK_PLUGINS, SinkLossReason, record_dropped};
 use super::{
     BatchConfig, MAX_BATCH_FLUSH_INTERVAL_MS, MAX_BATCH_RETRIES, MAX_BATCH_RETRY_DELAY_MS,
     MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, RetryPolicy,
@@ -467,6 +468,11 @@ fn has_non_empty_authority(endpoint_url: &str) -> bool {
 
 /// Classify an HTTP batch-delivery response after a bounded body drain.
 ///
+/// `plugin_name` is the closed sink-loss label (for example `"http_logging"`).
+/// Non-retryable 4xx discards increment [`SinkLossReason::BatchDiscard`] for that
+/// plugin so operators see terminal collector rejection in the published loss
+/// metric. Tests that should not publish loss pass an empty string.
+///
 /// Status semantics are unchanged from the historical helper:
 /// - 2xx succeeds (drain is best-effort so a committed ACK is never retried)
 /// - non-408/429 4xx discards without retry
@@ -484,6 +490,7 @@ fn has_non_empty_authority(endpoint_url: &str) -> bool {
 #[allow(dead_code)] // No in-binary caller remains; used by tests/unit/plugins/
 pub async fn handle_http_batch_response(
     plugin_label: &str,
+    plugin_name: &'static str,
     entry_count: usize,
     result: Result<reqwest::Response, reqwest::Error>,
 ) -> Result<(), String> {
@@ -491,7 +498,7 @@ pub async fn handle_http_batch_response(
         Ok(response) => {
             let status = response.status();
             let drain = drain_http_batch_response_body(response).await;
-            classify_http_batch_response(plugin_label, entry_count, status, drain)
+            classify_http_batch_response(plugin_label, plugin_name, entry_count, status, drain)
         }
         Err(error) => Err(format!("{plugin_label} batch failed: {error}")),
     }
@@ -507,6 +514,7 @@ pub async fn handle_http_batch_response(
 /// classification is byte-identical to the unredacted helper.
 pub async fn handle_http_batch_response_redacted(
     plugin_label: &str,
+    plugin_name: &'static str,
     entry_count: usize,
     result: Result<reqwest::Response, String>,
 ) -> Result<(), String> {
@@ -514,7 +522,7 @@ pub async fn handle_http_batch_response_redacted(
         Ok(response) => {
             let status = response.status();
             let drain = drain_http_batch_response_body(response).await;
-            classify_http_batch_response(plugin_label, entry_count, status, drain)
+            classify_http_batch_response(plugin_label, plugin_name, entry_count, status, drain)
         }
         Err(error) => Err(format!("{plugin_label} batch failed: {error}")),
     }
@@ -522,6 +530,7 @@ pub async fn handle_http_batch_response_redacted(
 
 fn classify_http_batch_response(
     plugin_label: &str,
+    plugin_name: &'static str,
     entry_count: usize,
     status: reqwest::StatusCode,
     drain: HttpBatchDrainOutcome,
@@ -546,6 +555,15 @@ fn classify_http_batch_response(
             entry_count,
             drain.diagnostic(),
         );
+        // Returning Ok keeps the no-retry policy. Count the terminal loss here
+        // because BatchingLogger only records BatchDiscard on Err after retries.
+        if SINK_PLUGINS.contains(&plugin_name) {
+            record_dropped(
+                plugin_name,
+                SinkLossReason::BatchDiscard,
+                entry_count as u64,
+            );
+        }
         return Ok(());
     }
 

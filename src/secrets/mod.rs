@@ -34,6 +34,8 @@ pub use registry::{
     resolve_all_env_secrets, resolve_external_reference, resolve_secret,
 };
 
+pub(crate) use registry::resolve_selected_env_secrets;
+
 /// Base `FERRUM_*` variables whose current value was materialized from an
 /// external secret source in this process.
 ///

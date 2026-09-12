@@ -848,6 +848,13 @@ def validate_strict_admin_validation(results_dir: Path) -> None:
         ("127.0.0.1/32", "source 127.0.0.1"),
         "Mapped IPv4 loopback probe-source refusal missing",
     )
+    for component in ("controlPlane", "ca"):
+        require_stderr(
+            results_dir,
+            f"mesh-prod-{component}-mapped-bind.err",
+            ("non-loopback plaintext listener", "allowInsecureHttp"),
+            f"{component} mapped IPv4 loopback bind refusal missing",
+        )
     require_stderr(
         results_dir,
         "mesh-prod-ambient-admin-port0.err",

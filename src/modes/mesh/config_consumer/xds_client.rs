@@ -34,6 +34,7 @@ use crate::xds::translator::{
     FERRUM_ECDS_DESTINATION_RULE_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL, RTDS_TYPE_URL, SDS_TYPE_URL,
     XDS_TYPE_URLS, translate_rtds_layer,
 };
+use crate::xds::{bounded_xds_log_value, xds_type_url_log_label};
 
 const INITIAL_TYPE_URL_ORDER: [&str; 7] = [
     CDS_TYPE_URL,
@@ -1203,7 +1204,7 @@ fn discard_pending_xds_slice_after_nack(
         warn!(
             node_id = %config.node_id,
             namespace = %config.namespace,
-            type_url = %nacked_type_url,
+            type_url = xds_type_url_log_label(nacked_type_url),
             "Discarded debounced xDS slice after NACK to avoid applying mixed-version resources"
         );
     }
@@ -1274,7 +1275,7 @@ async fn handle_ads_response(
         send_ads_request(tx, nack, XDS_OUTBOUND_BOUND).await?;
         warn!(
             node_id = %config.node_id,
-            type_url = %type_url,
+            type_url = xds_type_url_log_label(&type_url),
             "Received unknown xDS type_url; sent NACK"
         );
         return Ok(None);
@@ -1350,10 +1351,10 @@ async fn handle_ads_response(
                 warn!(
                     node_id = %config.node_id,
                     namespace = %config.namespace,
-                    type_url = %type_url,
+                    type_url = xds_type_url_log_label(&type_url),
                     consecutive_nacks = consecutive_after,
                     nack_limit = XDS_CONSECUTIVE_NACK_LIMIT,
-                    error = %e,
+                    error = %bounded_xds_log_value(&e),
                     "First mesh slice blocked: NACKing a required xDS type before initial convergence; \
                      repeated NACKs will trip the circuit breaker and force CP failover/reconnect"
                 );
@@ -1364,8 +1365,8 @@ async fn handle_ads_response(
             } else {
                 warn!(
                     node_id = %config.node_id,
-                    type_url = %type_url,
-                    error = %e,
+                    type_url = xds_type_url_log_label(&type_url),
+                    error = %bounded_xds_log_value(&e),
                     "NACKing invalid xDS ADS response"
                 );
             }
@@ -1591,7 +1592,11 @@ fn reverse_translate(
                 if reserved_dr_name.is_some() {
                     return Err(e);
                 }
-                warn!(resource_name = %resource.name, error = %e, "xDS ECDS resource failed TypedExtensionConfig decode; skipping");
+                warn!(
+                    resource_name = %bounded_xds_log_value(&resource.name),
+                    error = %bounded_xds_log_value(&e),
+                    "xDS ECDS resource failed TypedExtensionConfig decode; skipping"
+                );
                 continue;
             }
         };
@@ -1638,7 +1643,7 @@ fn reverse_translate(
                     ));
                 }
                 warn!(
-                    resource_name = %typed_extension.name,
+                    resource_name = %bounded_xds_log_value(&typed_extension.name),
                     inner_type_url = %inner.type_url,
                     error = %e,
                     "xDS ECDS DR-carrier payload failed JSON decode; DR will be missing from slice"
@@ -1709,14 +1714,14 @@ fn reverse_translate(
     let mut ignored_sds_names = Vec::new();
     for resource in accumulator.resources(SDS_TYPE_URL) {
         match parse_spiffe_bundle_secret_name(&resource.name) {
-            Ok(trust_domain) => trust_domains.push(trust_domain),
+            Ok(trust_domain) => trust_domains.push(bounded_xds_log_value(&trust_domain)),
             Err(e) => {
                 debug!(
-                    resource_name = %resource.name,
-                    error = %e,
+                    resource_name = %bounded_xds_log_value(&resource.name),
+                    error = %bounded_xds_log_value(&e),
                     "Ignoring unsupported xDS SDS secret name"
                 );
-                ignored_sds_names.push(resource.name.clone());
+                ignored_sds_names.push(bounded_xds_log_value(&resource.name));
             }
         }
     }
@@ -1739,7 +1744,7 @@ fn reverse_translate(
             }
             Err(e) => {
                 warn!(
-                    resource_name = %resource.name,
+                    resource_name = %bounded_xds_log_value(&resource.name),
                     error = %e,
                     "xDS RTDS resource failed Runtime decode; skipping"
                 );
@@ -2491,7 +2496,7 @@ fn mesh_slice_carrier_inner<'a>(
         }
         if warn_on_non_reserved_name {
             warn!(
-                resource_name = %resource.name,
+                resource_name = %bounded_xds_log_value(&resource.name),
                 expected_name = %expected_name,
                 inner_type_url = %inner.type_url,
                 "xDS ECDS resource used reserved Ferrum mesh-slice carrier type_url with non-reserved name; skipping"
@@ -6727,5 +6732,27 @@ mod tests {
         assert!(recovered.peer_authentications.is_empty());
         assert!(recovered.trust_bundles.is_none());
         assert!(recovered.workloads.is_empty());
+    }
+
+    #[test]
+    fn oversized_xds_resource_name_is_bounded_in_log_fields() {
+        let hostile_name = "a".repeat(1024 * 1024);
+        let resource = AccumulatedResource {
+            name: hostile_name,
+            // A length-delimited field (name, field 1) that declares 127 bytes
+            // but carries none: prost reliably fails this decode.
+            bytes: vec![0x0a, 0xff],
+        };
+
+        // The ECDS decode path embeds the peer-supplied name in its error, and
+        // the warn site renders both the name and the error through
+        // `bounded_xds_log_value`. A hostile 1 MiB name must therefore never
+        // reach a log line at full length.
+        let err = match decode_ecds_typed_extension(&resource) {
+            Err(e) => e,
+            Ok(_) => panic!("truncated wire bytes must not decode"),
+        };
+        assert!(bounded_xds_log_value(&resource.name).len() <= 1024);
+        assert!(bounded_xds_log_value(&err).len() <= 1024);
     }
 }

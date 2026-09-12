@@ -105,6 +105,8 @@
 //! trusted upstream alias; final arguments are still re-evaluated, and any
 //! unrelated name change fails closed.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -116,7 +118,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::debug;
 use url::Url;
 
 use crate::fips::approved::Sha256;
@@ -278,6 +280,35 @@ const UNINSPECTABLE_REASON_KEY: &str = "ai_tool_governor.uninspectable_reason";
 /// overflow the stream is terminated in `enforce` mode (fail closed) or
 /// released uninspected in `dry_run` (never disrupt traffic).
 const MAX_STREAM_HOLD_BYTES: usize = MAX_PARSE_BYTES;
+/// Maximum distinct values retained in one comma-delimited observation ledger
+/// (`tool_names`, `policy_ids`, `approval_id`, `arguments_hashes`,
+/// `redacted_tools`).
+///
+/// The ledger spans EVERY batch of one request or response stream: per-batch
+/// state resets at each release boundary, but the metadata slot lives until the
+/// stream terminates. Without a ceiling a backend that keeps emitting batches
+/// of distinct tool names grows gateway memory for the life of the stream, and
+/// the documented `0` (unlimited) response-byte policy means no wire-byte
+/// ceiling can serve as this bound. Matches [`MAX_GOVERNABLE_CALLS`] so one
+/// well-formed batch is never truncated.
+const MAX_METADATA_LEDGER_ENTRIES: usize = 64;
+/// Maximum UTF-8 bytes one observation ledger may hold, delimiters included.
+/// Sized so a full [`MAX_GOVERNABLE_CALLS`] batch of SHA-256 hex hashes fits.
+const MAX_METADATA_LEDGER_BYTES: usize = 8192;
+/// Maximum UTF-8 bytes retained from a single observation value. Tool names
+/// arrive from the governed payload and carry no length bound of their own, so
+/// a longer value is stored as its bounded prefix plus
+/// [`METADATA_VALUE_TRUNCATION_MARKER`] rather than whole.
+const MAX_METADATA_VALUE_BYTES: usize = 256;
+/// Appended to a value shortened at [`MAX_METADATA_VALUE_BYTES`] so a consumer
+/// can tell a truncated observation from a genuinely short one. Never a comma:
+/// the ledger delimiter must stay unambiguous.
+const METADATA_VALUE_TRUNCATION_MARKER: &str = "…";
+/// Count of distinct observation values dropped after a ledger reached
+/// [`MAX_METADATA_LEDGER_ENTRIES`] or [`MAX_METADATA_LEDGER_BYTES`]. Written
+/// only when something was actually dropped, so ordinary traffic carries no
+/// extra metadata key.
+const OBSERVATIONS_OMITTED_KEY: &str = "ai_tool_governor.observations_omitted";
 /// Upper bound on cached approval decisions. At capacity, expired entries are
 /// purged; if the cache is still full of live decisions, new decisions are
 /// simply not cached (costing an extra webhook call later, never memory).
@@ -660,10 +691,79 @@ fn set_decision_metadata(m: &mut HashMap<String, String>, label: &str) {
     m.insert("ai_tool_governor.decision".to_string(), label.to_string());
 }
 
+/// Fold `values` into the comma-delimited observation ledger `existing`,
+/// preserving arrival order and bounding the result. Returns the rebuilt ledger
+/// and how many DISTINCT values did not fit.
+///
+/// Deduplication builds one borrowed set per call rather than rescanning the
+/// whole accumulated string once per appended value, so folding successive
+/// batches into one stream ledger costs time linear in the values seen instead
+/// of quadratic in the values already retained. The result is capped at
+/// [`MAX_METADATA_LEDGER_ENTRIES`] entries and [`MAX_METADATA_LEDGER_BYTES`]
+/// bytes, and each value at [`MAX_METADATA_VALUE_BYTES`], so a stream that
+/// keeps emitting distinct tool names can no longer grow this slot without
+/// limit. Truncation is a fixed point: re-folding an already-stored value
+/// reproduces it byte for byte, so the terminal slot merge is idempotent.
+///
+/// Bounding is observational only. Every tool call is still governed, the
+/// sticky highest-severity `decision` and the maximum `risk` are unaffected,
+/// and the omitted count keeps a capped ledger from reading as complete. Two
+/// values that differ only past [`MAX_METADATA_VALUE_BYTES`] therefore collapse
+/// into one retained entry rather than defeating the bound.
+fn bounded_csv_merge<'a>(existing: &'a str, values: &[&'a str]) -> (String, u64) {
+    let mut merged = String::new();
+    let mut seen: std::collections::HashSet<&'a str> = std::collections::HashSet::new();
+    let mut entries = 0usize;
+    let mut omitted = 0u64;
+    let retained = existing.split(',').filter(|value| !value.is_empty());
+    let incoming = values.iter().copied().filter(|value| !value.is_empty());
+    for value in retained.chain(incoming) {
+        let kept = truncate_str(value, MAX_METADATA_VALUE_BYTES);
+        if !seen.insert(kept) {
+            continue;
+        }
+        let marker = if kept.len() < value.len() {
+            METADATA_VALUE_TRUNCATION_MARKER
+        } else {
+            ""
+        };
+        let needs_delimiter = !merged.is_empty();
+        let width = usize::from(needs_delimiter) + kept.len() + marker.len();
+        if entries >= MAX_METADATA_LEDGER_ENTRIES
+            || merged.len().saturating_add(width) > MAX_METADATA_LEDGER_BYTES
+        {
+            omitted = omitted.saturating_add(1);
+            continue;
+        }
+        if needs_delimiter {
+            merged.push(',');
+        }
+        merged.push_str(kept);
+        merged.push_str(marker);
+        entries += 1;
+    }
+    (merged, omitted)
+}
+
+/// Accumulate the count of observations dropped by [`bounded_csv_merge`] under
+/// [`OBSERVATIONS_OMITTED_KEY`], so a capped ledger is never silently short.
+fn record_omitted_observations(m: &mut HashMap<String, String>, omitted: u64) {
+    if omitted == 0 {
+        return;
+    }
+    let total = m
+        .get(OBSERVATIONS_OMITTED_KEY)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_add(omitted);
+    m.insert(OBSERVATIONS_OMITTED_KEY.to_string(), total.to_string());
+}
+
 /// Keep comma-delimited decision metadata aligned with the highest-severity
 /// decision. A higher-severity batch replaces values from a weaker decision,
 /// while an equal-severity batch merges values so multiple inspected surfaces
-/// or plugin instances cannot hide one another's findings.
+/// or plugin instances cannot hide one another's findings. Either way the
+/// stored ledger stays bounded (see [`bounded_csv_merge`]).
 fn set_ranked_csv_metadata(
     m: &mut HashMap<String, String>,
     key: &str,
@@ -674,27 +774,25 @@ fn set_ranked_csv_metadata(
     if batch_rank < previous_rank {
         return;
     }
-    if batch_rank > previous_rank {
-        if values.is_empty() {
-            m.remove(key);
+    if batch_rank == previous_rank && values.is_empty() {
+        return;
+    }
+    let (merged, omitted) = {
+        // A higher-severity batch discards the weaker decision's ledger, so it
+        // starts from an empty accumulator instead of the retained values.
+        let existing = if batch_rank > previous_rank {
+            ""
         } else {
-            m.insert(key.to_string(), values.join(","));
-        }
-        return;
+            m.get(key).map(String::as_str).unwrap_or_default()
+        };
+        bounded_csv_merge(existing, values)
+    };
+    if merged.is_empty() {
+        m.remove(key);
+    } else {
+        m.insert(key.to_string(), merged);
     }
-    if values.is_empty() {
-        return;
-    }
-
-    let existing = m.entry(key.to_string()).or_default();
-    for value in values {
-        if !existing.split(',').any(|existing| existing == *value) {
-            if !existing.is_empty() {
-                existing.push(',');
-            }
-            existing.push_str(value);
-        }
-    }
+    record_omitted_observations(m, omitted);
 }
 
 /// Keep risk aligned with the sticky decision while preserving the maximum
@@ -1198,7 +1296,7 @@ impl GovernorEngine {
                     cd.reason = Some(format!("approval endpoint error: {err}"));
                 }
                 FailOnError::Warn => {
-                    warn!(
+                    warn_sampled!(
                         target: "ai_tool_governor",
                         tool = %call.name,
                         "approval endpoint error, failing open (warn): {err}"
@@ -2000,6 +2098,16 @@ impl AiToolGovernor {
             target
                 .entry(UNINSPECTABLE_REASON_KEY.to_string())
                 .or_insert_with(|| reason.clone());
+        }
+        // The per-stream slot enforces the ledger caps while the stream runs,
+        // and the decision-scoped merge below re-applies them as the slot folds
+        // into `ctx.metadata`. Carry the slot's own tally across so a capped
+        // stream ledger stays visibly incomplete in the transaction summary.
+        if let Some(omitted) = source
+            .get(OBSERVATIONS_OMITTED_KEY)
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            record_omitted_observations(target, omitted);
         }
 
         // An observation-only batch carries no decision and must not fabricate
@@ -4092,6 +4200,35 @@ impl AiToolGovernor {
         self.pending_stream_metadata.len()
     }
 
+    /// Maximum distinct values one `ai_tool_governor.*` observation ledger
+    /// retains across every batch of a request or response stream.
+    pub fn max_metadata_ledger_entries() -> usize {
+        MAX_METADATA_LEDGER_ENTRIES
+    }
+
+    /// Maximum UTF-8 bytes one observation ledger retains, delimiters included.
+    pub fn max_metadata_ledger_bytes() -> usize {
+        MAX_METADATA_LEDGER_BYTES
+    }
+
+    /// Maximum UTF-8 bytes retained from a single observation value, before the
+    /// truncation marker.
+    pub fn max_metadata_value_bytes() -> usize {
+        MAX_METADATA_VALUE_BYTES
+    }
+
+    /// Metadata key naming how many distinct observations a capped ledger
+    /// dropped.
+    pub fn observations_omitted_key() -> &'static str {
+        OBSERVATIONS_OMITTED_KEY
+    }
+
+    /// Marker appended to an observation value shortened at
+    /// [`AiToolGovernor::max_metadata_value_bytes`].
+    pub fn metadata_value_truncation_marker() -> &'static str {
+        METADATA_VALUE_TRUNCATION_MARKER
+    }
+
     /// Production whole-batch approval deadline ceiling (exactly 30s).
     pub fn max_approval_batch_deadline() -> Duration {
         MAX_APPROVAL_BATCH_DEADLINE
@@ -4901,7 +5038,7 @@ impl ToolCallStreamInspector {
         self.record_metadata(&batch);
 
         if batch.enforce_blocks {
-            warn!(
+            warn_sampled!(
                 target: "ai_tool_governor",
                 decision = batch.overall_label,
                 risk = batch.max_risk.as_str(),
@@ -4941,7 +5078,7 @@ impl ToolCallStreamInspector {
     /// bounded by the same hold cap as the SSE path.
     fn hold_entire_body(&mut self) -> ResponseStreamAction {
         if self.carry.len() > MAX_STREAM_HOLD_BYTES {
-            warn!(
+            warn_sampled!(
                 target: "ai_tool_governor",
                 held_bytes = self.carry.len(),
                 mode = self.engine.mode.as_str(),
@@ -4963,7 +5100,7 @@ impl ToolCallStreamInspector {
     /// all retained bytes are forwarded unchanged and later chunks bypass
     /// inspection so observation never disrupts traffic.
     fn handle_hold_overflow(&mut self, mut out: Vec<u8>) -> ResponseStreamAction {
-        warn!(
+        warn_sampled!(
             target: "ai_tool_governor",
             held_bytes = self.held.len(),
             carry_bytes = self.carry.len(),
@@ -5001,7 +5138,7 @@ impl ToolCallStreamInspector {
         if json_dup_keys::slice_ambiguity(strip_json_bom(&body)).is_some() {
             if self.engine.mode == Mode::Enforce {
                 self.record_uninspectable_metadata();
-                warn!(
+                warn_sampled!(
                     target: "ai_tool_governor",
                     "JSON-shaped stream contains duplicate JSON object member names; cutting stream"
                 );
@@ -5017,7 +5154,7 @@ impl ToolCallStreamInspector {
         if extract.ungovernable {
             if self.engine.mode == Mode::Enforce {
                 self.record_uninspectable_metadata();
-                warn!(
+                warn_sampled!(
                     target: "ai_tool_governor",
                     "JSON-shaped stream contains an ungovernable tool call; cutting stream"
                 );
@@ -5039,7 +5176,7 @@ impl ToolCallStreamInspector {
                 && self.engine.mode == Mode::Enforce
             {
                 self.record_uninspectable_metadata();
-                warn!(
+                warn_sampled!(
                     target: "ai_tool_governor",
                     "JSON-shaped stream carries a tool-call shape this plugin cannot read; cutting stream"
                 );
@@ -5068,7 +5205,7 @@ impl ToolCallStreamInspector {
             .await;
         self.record_metadata(&batch);
         if batch.enforce_blocks {
-            warn!(
+            warn_sampled!(
                 target: "ai_tool_governor",
                 decision = batch.overall_label,
                 "JSON-shaped stream tool call blocked; cutting stream: {}",
@@ -5144,7 +5281,7 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                             && self.engine.mode == Mode::Enforce
                         {
                             self.record_uninspectable_metadata();
-                            warn!(
+                            warn_sampled!(
                                 target: "ai_tool_governor",
                                 "SSE frame carries a tool-call shape this plugin cannot read; cutting stream"
                             );
@@ -5196,7 +5333,7 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                     // to preserve arrival order behind a pending batch.
                     if self.engine.mode == Mode::Enforce {
                         self.record_uninspectable_metadata();
-                        warn!(
+                        warn_sampled!(
                             target: "ai_tool_governor",
                             "SSE data payload contains duplicate JSON object member names; cutting stream"
                         );
@@ -5249,7 +5386,7 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                 // unchanged.
                 if self.engine.mode == Mode::Enforce {
                     self.record_uninspectable_metadata();
-                    warn!(
+                    warn_sampled!(
                         target: "ai_tool_governor",
                         held_bytes = self.carry.len(),
                         "opaque stream under governance cannot be inspected; cutting stream"
@@ -5275,7 +5412,7 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                 if std::str::from_utf8(&self.carry).is_err() {
                     if self.engine.mode == Mode::Enforce {
                         self.record_uninspectable_metadata();
-                        warn!(
+                        warn_sampled!(
                             target: "ai_tool_governor",
                             held_bytes = self.carry.len(),
                             "unclassifiable non-UTF-8 stream under governance cannot be inspected; cutting stream"
@@ -5313,7 +5450,7 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                 {
                     self.record_unrecognized_shape_observation();
                     self.record_uninspectable_metadata();
-                    warn!(
+                    warn_sampled!(
                         target: "ai_tool_governor",
                         "trailing SSE frame carries a tool-call shape this plugin cannot read; cutting stream"
                     );
@@ -5330,7 +5467,7 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                 // records the observation and still forwards the trailing bytes.
                 SseEvent::Ambiguous if self.engine.mode == Mode::Enforce => {
                     self.record_uninspectable_metadata();
-                    warn!(
+                    warn_sampled!(
                         target: "ai_tool_governor",
                         "trailing SSE data payload contains duplicate JSON object member names; cutting stream"
                     );
@@ -6967,34 +7104,59 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
         "ai_tool_governor: ",
     )?;
 
-    let action = match obj.get("action").and_then(Value::as_str) {
-        Some("allow") => ToolAction::Allow,
-        Some("deny") => ToolAction::Deny,
-        Some("redact_args") => ToolAction::RedactArgs,
-        Some("require_approval") => ToolAction::RequireApproval,
-        Some("dry_run") => ToolAction::DryRun,
-        Some(other) => {
-            return Err(format!(
-                "ai_tool_governor: tool '{name}' has invalid action {other:?} (expected allow, deny, redact_args, require_approval, or dry_run)"
-            ));
-        }
+    // A present-but-non-string `action` is a wrong TYPE, not an omission
+    // (issue #5395). Reporting it as missing sends an operator hunting for a
+    // key that is right there in the document; name the kind instead, matching
+    // the `risk` / `approval.fail_on_error` diagnostics below.
+    let spelled_action = match obj.get("action") {
         None => {
             return Err(format!(
                 "ai_tool_governor: tool '{name}' is missing required 'action'"
             ));
         }
+        Some(value) => value.as_str().ok_or_else(|| {
+            let kind = json_kind(value);
+            format!(
+                "ai_tool_governor: tool '{name}' 'action' must be a string (expected allow, deny, redact_args, require_approval, or dry_run), got {kind}"
+            )
+        })?,
+    };
+    let action = match spelled_action {
+        "allow" => ToolAction::Allow,
+        "deny" => ToolAction::Deny,
+        "redact_args" => ToolAction::RedactArgs,
+        "require_approval" => ToolAction::RequireApproval,
+        "dry_run" => ToolAction::DryRun,
+        other => {
+            return Err(format!(
+                "ai_tool_governor: tool '{name}' has invalid action {other:?} (expected allow, deny, redact_args, require_approval, or dry_run)"
+            ));
+        }
     };
 
-    let risk = match obj.get("risk").and_then(Value::as_str) {
+    // A present `risk` must be a string before enum matching. A number,
+    // boolean, `null`, array, or object is an operator mistake, not an
+    // omission, and must never fall through to the `low` default.
+    let risk = match obj.get("risk") {
         None => RiskLevel::Low,
-        Some("low") => RiskLevel::Low,
-        Some("medium") => RiskLevel::Medium,
-        Some("high") => RiskLevel::High,
-        Some("critical") => RiskLevel::Critical,
-        Some(other) => {
-            return Err(format!(
-                "ai_tool_governor: tool '{name}' has invalid risk {other:?} (expected low, medium, high, or critical)"
-            ));
+        Some(value) => {
+            let spelled = value.as_str().ok_or_else(|| {
+                let kind = json_kind(value);
+                format!(
+                    "ai_tool_governor: tool '{name}' 'risk' must be a string (expected low, medium, high, or critical), got {kind}"
+                )
+            })?;
+            match spelled {
+                "low" => RiskLevel::Low,
+                "medium" => RiskLevel::Medium,
+                "high" => RiskLevel::High,
+                "critical" => RiskLevel::Critical,
+                other => {
+                    return Err(format!(
+                        "ai_tool_governor: tool '{name}' has invalid risk {other:?} (expected low, medium, high, or critical)"
+                    ));
+                }
+            }
         }
     };
 
@@ -7142,11 +7304,19 @@ fn parse_approval(
         "ai_tool_governor: ",
     )?;
 
-    let endpoint_url = obj
-        .get("endpoint_url")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "ai_tool_governor: 'approval.endpoint_url' is required".to_string())?;
+    // As with `tools.<name>.action`, distinguish an absent key from a present
+    // wrong-typed or empty one (issue #5395): all three used to report the key
+    // as required, which is wrong for the two cases where it is supplied.
+    let Some(endpoint_value) = obj.get("endpoint_url") else {
+        return Err("ai_tool_governor: 'approval.endpoint_url' is required".to_string());
+    };
+    let endpoint_url = endpoint_value.as_str().ok_or_else(|| {
+        let kind = json_kind(endpoint_value);
+        format!("ai_tool_governor: 'approval.endpoint_url' must be a string, got {kind}")
+    })?;
+    if endpoint_url.is_empty() {
+        return Err("ai_tool_governor: 'approval.endpoint_url' must not be empty".to_string());
+    }
 
     let parsed = url::Url::parse(endpoint_url).map_err(|e| {
         format!("ai_tool_governor: 'approval.endpoint_url' is not a valid URL: {e}")
@@ -7198,14 +7368,27 @@ fn parse_approval(
         ));
     }
 
-    let fail_on_error = match obj.get("fail_on_error").and_then(Value::as_str) {
-        None | Some("reject") => FailOnError::Reject,
-        Some("warn") => FailOnError::Warn,
-        Some("allow") => FailOnError::Allow,
-        Some(other) => {
-            return Err(format!(
-                "ai_tool_governor: 'approval.fail_on_error' must be one of 'reject', 'warn', or 'allow', got {other:?}"
-            ));
+    // As with `tools.<name>.risk`, a present non-string value is a mistake and
+    // must not silently resolve to the fail-closed `reject` default.
+    let fail_on_error = match obj.get("fail_on_error") {
+        None => FailOnError::Reject,
+        Some(value) => {
+            let spelled = value.as_str().ok_or_else(|| {
+                let kind = json_kind(value);
+                format!(
+                    "ai_tool_governor: 'approval.fail_on_error' must be a string (expected 'reject', 'warn', or 'allow'), got {kind}"
+                )
+            })?;
+            match spelled {
+                "reject" => FailOnError::Reject,
+                "warn" => FailOnError::Warn,
+                "allow" => FailOnError::Allow,
+                other => {
+                    return Err(format!(
+                        "ai_tool_governor: 'approval.fail_on_error' must be one of 'reject', 'warn', or 'allow', got {other:?}"
+                    ));
+                }
+            }
         }
     };
 
@@ -7339,6 +7522,19 @@ fn parse_observability(config: &Value) -> Result<ObservabilityConfig, String> {
 // ---------------------------------------------------------------------------
 // Small config accessors
 // ---------------------------------------------------------------------------
+
+/// Fixed JSON kind name for admission diagnostics. Only the kind is named — a
+/// rejected configuration value is never echoed into the error text.
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
 
 fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
     match config.get(field) {

@@ -75,9 +75,13 @@ use bytes::Bytes;
 use chrono::Utc;
 use http::header::{HeaderName, HeaderValue};
 use percent_encoding::percent_decode_str;
+use regex::Regex;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use tracing::{debug, info, warn};
+use std::sync::LazyLock;
+use tracing::{debug, info};
+
+use crate::plugins::utils::log_sampling::warn_sampled;
 use url::{Host, Url};
 
 use super::utils::aws_sigv4;
@@ -108,6 +112,38 @@ const ALLOWED_CONFIG_FIELDS: &[&str] = &[
     "on_error",
     "error_status_code",
 ];
+
+/// Recognized string-typed provider fields.
+///
+/// Their JSON type is checked for every supplied field, not only for the
+/// fields the selected provider happens to read. The OpenAPI schema types them
+/// unconditionally, and leaving a wrong type admitted on an inactive provider
+/// turns a later `provider` change into a constructor error on a row that
+/// already validated (issue #5175).
+const PROVIDER_STRING_CONFIG_FIELDS: &[&str] = &[
+    "aws_region",
+    "aws_access_key_id",
+    "aws_secret_access_key",
+    "aws_function_name",
+    "aws_session_token",
+    "aws_qualifier",
+    "aws_endpoint_url",
+    "azure_function_key",
+    "gcp_bearer_token",
+];
+
+/// Operator-facing diagnostics for the AWS credentials a SERVING node must
+/// resolve from config or its own environment. Only
+/// [`CredentialAdmission::Required`] raises them; CP/admin candidate admission
+/// defers availability to the data plane (issue #5179).
+const AWS_REGION_REQUIRED: &str =
+    "'aws_region' is required for aws_lambda (or set AWS_DEFAULT_REGION / AWS_REGION env var)";
+const AWS_ACCESS_KEY_ID_REQUIRED: &str =
+    "'aws_access_key_id' is required for aws_lambda (or set AWS_ACCESS_KEY_ID env var)";
+const AWS_SECRET_ACCESS_KEY_REQUIRED: &str =
+    "'aws_secret_access_key' is required for aws_lambda (or set AWS_SECRET_ACCESS_KEY env var)";
+const AWS_FUNCTION_NAME_REQUIRED: &str =
+    "'aws_function_name' is required for aws_lambda (or set AWS_LAMBDA_FUNCTION_NAME env var)";
 
 const DEFAULT_INSTANCE_ID: &str = "standalone";
 
@@ -187,6 +223,16 @@ struct InvocationFailure {
     /// anticipation of the call must be released rather than retained until TTL.
     /// Defaults to `false` so ambiguous/post-wire outcomes stay fail-closed.
     proven_pre_wire: bool,
+    /// True when the failure describes the function's own OUTPUT
+    /// representation rather than the transport or the provider's error
+    /// signalling. The native gRPC terminate contract forbids falling through
+    /// to the backend on malformed or oversized function output even with
+    /// `on_error: "continue"`, and the raw response-size ceiling fires in
+    /// `invoke` — before `build_native_grpc_terminate_response` can mark its
+    /// own refusals mandatory — so that branch is promoted from this flag
+    /// (`GHSA-4xpr-23qf-v649`). Ordinary transport and provider failures leave
+    /// it `false` and keep the documented `continue` behavior.
+    describes_function_output: bool,
 }
 
 impl InvocationFailure {
@@ -196,6 +242,16 @@ impl InvocationFailure {
             operator_detail: operator_detail.into(),
             must_reject: false,
             proven_pre_wire: false,
+            describes_function_output: false,
+        }
+    }
+
+    /// A failure caused by the function's own response representation rather
+    /// than by the call. See [`Self::describes_function_output`].
+    fn function_output(code: &'static str, operator_detail: impl Into<String>) -> Self {
+        Self {
+            describes_function_output: true,
+            ..Self::new(code, operator_detail)
         }
     }
 
@@ -206,6 +262,7 @@ impl InvocationFailure {
             operator_detail: operator_detail.into(),
             must_reject: false,
             proven_pre_wire: true,
+            describes_function_output: false,
         }
     }
 
@@ -217,6 +274,7 @@ impl InvocationFailure {
             // Governed-input rejections happen in `build_invocation_payload`,
             // before the outbound call, so no external side effect can exist.
             proven_pre_wire: true,
+            describes_function_output: false,
         }
     }
 
@@ -269,6 +327,39 @@ pub(crate) fn security_composition_capabilities(config: &Value) -> Result<(bool,
     Ok((forward_body, mode == InvocationMode::Terminate))
 }
 
+/// Whether this admission must resolve the node-local provider credentials.
+///
+/// CP and admin candidate admission runs on a node that legitimately has no
+/// data-plane AWS/Azure/GCP environment, so requiring those values there would
+/// refuse a row every serving node can construct (issue #5179). This mirrors
+/// the per-mode tolerance model used for every other node-local plugin
+/// dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialAdmission {
+    /// Runtime cache construction on a serving node: every credential the
+    /// selected provider needs must resolve from config or this node's
+    /// environment now.
+    Required,
+    /// CP / admin candidate admission: validate every supplied field, but
+    /// defer node-local credential availability to the serving node.
+    Deferred,
+}
+
+impl CredentialAdmission {
+    /// Resolve one node-local credential.
+    ///
+    /// `Required` turns absence into the operator-facing configuration error;
+    /// `Deferred` reports absence as `Ok(None)`, which stops shape-only
+    /// admission without failing the row.
+    fn require(self, value: Option<String>, missing: &str) -> Result<Option<String>, String> {
+        match (value, self) {
+            (Some(value), _) => Ok(Some(value)),
+            (None, Self::Deferred) => Ok(None),
+            (None, Self::Required) => Err(format!("serverless_function: {missing}")),
+        }
+    }
+}
+
 /// What to do when the function call fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ErrorAction {
@@ -302,8 +393,14 @@ pub struct ServerlessFunction {
     function_hostname: Option<String>,
     metadata_prefix: String,
     aws_config: Option<AwsLambdaConfig>,
-    azure_function_key: Option<String>,
-    gcp_authorization_header: Option<String>,
+    /// Pre-validated `x-functions-key` field value. Parsing at construction
+    /// keeps a credential that cannot form an HTTP header out of the serving
+    /// cache instead of failing `RequestBuilder::build()` on every request
+    /// (issue #5189).
+    azure_function_key: Option<HeaderValue>,
+    /// Pre-validated `Authorization: Bearer …` field value, for the same
+    /// reason as [`Self::azure_function_key`].
+    gcp_authorization_header: Option<HeaderValue>,
     forward_body: bool,
     forward_headers: Vec<String>,
     forward_query_params: bool,
@@ -325,6 +422,53 @@ impl ServerlessFunction {
         http_client: PluginHttpClient,
         instance_id: &str,
     ) -> Result<Self, String> {
+        match Self::admit(
+            config,
+            http_client,
+            instance_id,
+            CredentialAdmission::Required,
+        )? {
+            Some(plugin) => Ok(plugin),
+            // `Required` either resolves every credential the selected
+            // provider needs or returns `Err` above, so the shape-only short
+            // circuit is unreachable from this entry point.
+            None => Err(
+                "serverless_function: credential resolution was skipped during construction"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// Strict shape-only admission for CP / admin candidate configs.
+    ///
+    /// Validates every supplied field — including fields belonging to a
+    /// provider this row does not select — but does not require the AWS /
+    /// Azure / GCP credentials that intentionally resolve only from a data
+    /// plane's environment or external secret backend. Runtime cache
+    /// construction on the serving node still resolves and validates them fail
+    /// closed (issue #5179).
+    pub fn validate_config(config: &Value, http_client: PluginHttpClient) -> Result<(), String> {
+        Self::admit(
+            config,
+            http_client,
+            DEFAULT_INSTANCE_ID,
+            CredentialAdmission::Deferred,
+        )
+        .map(|_| ())
+    }
+
+    /// Shared admission behind both entry points.
+    ///
+    /// Returns `Ok(None)` only under [`CredentialAdmission::Deferred`] when a
+    /// node-local credential the selected provider needs is absent: everything
+    /// supplied has already been validated at that point, and availability is
+    /// the serving node's contract.
+    fn admit(
+        config: &Value,
+        http_client: PluginHttpClient,
+        instance_id: &str,
+        credentials: CredentialAdmission,
+    ) -> Result<Option<Self>, String> {
         let config_object = config
             .as_object()
             .ok_or_else(|| "serverless_function: config must be an object".to_string())?;
@@ -375,6 +519,14 @@ impl ServerlessFunction {
                 );
             }
         };
+
+        // Every recognized provider field the operator SUPPLIED is validated
+        // here, before provider dispatch, so admission does not depend on
+        // which provider happens to read the field (issues #5175, #5181,
+        // #5189). Values a provider resolves from the environment are
+        // revalidated in the provider branch, where the effective value is
+        // known.
+        validate_supplied_provider_fields(config)?;
 
         // Strict mode validation. Silently defaulting an unknown value (e.g.
         // a typo'd "terminat") to `pre_proxy` would mask configuration errors
@@ -445,46 +597,54 @@ impl ServerlessFunction {
         let (function_url, aws_config, azure_function_key, gcp_authorization_header) =
             match &provider {
                 Provider::AwsLambda => {
+                    // Node-local credential resolution. Under
+                    // `CredentialAdmission::Deferred` an absent value is not a
+                    // configuration error — a CP or admin node legitimately has
+                    // no data-plane AWS environment — so admission stops here
+                    // with every supplied field already validated.
                     let region = optional_config_string(config, "aws_region")?
                         .or_else(|| env_non_empty("AWS_DEFAULT_REGION"))
-                        .or_else(|| env_non_empty("AWS_REGION"))
-                        .ok_or_else(|| {
-                            "serverless_function: 'aws_region' is required for aws_lambda \
-                         (or set AWS_DEFAULT_REGION / AWS_REGION env var)"
-                                .to_string()
-                        })?;
+                        .or_else(|| env_non_empty("AWS_REGION"));
+                    let Some(region) = credentials.require(region, AWS_REGION_REQUIRED)? else {
+                        return Ok(None);
+                    };
 
                     let access_key_id = optional_config_string(config, "aws_access_key_id")?
-                        .or_else(|| env_non_empty("AWS_ACCESS_KEY_ID"))
-                        .ok_or_else(|| {
-                            "serverless_function: 'aws_access_key_id' is required for aws_lambda \
-                         (or set AWS_ACCESS_KEY_ID env var)"
-                                .to_string()
-                        })?;
+                        .or_else(|| env_non_empty("AWS_ACCESS_KEY_ID"));
+                    let Some(access_key_id) =
+                        credentials.require(access_key_id, AWS_ACCESS_KEY_ID_REQUIRED)?
+                    else {
+                        return Ok(None);
+                    };
 
-                    let secret_access_key = optional_config_string(
-                        config,
-                        "aws_secret_access_key",
-                    )?
-                    .or_else(|| env_non_empty("AWS_SECRET_ACCESS_KEY"))
-                    .ok_or_else(|| {
-                        "serverless_function: 'aws_secret_access_key' is required for aws_lambda \
-                             (or set AWS_SECRET_ACCESS_KEY env var)"
-                            .to_string()
-                    })?;
+                    let secret_access_key =
+                        optional_config_string(config, "aws_secret_access_key")?
+                            .or_else(|| env_non_empty("AWS_SECRET_ACCESS_KEY"));
+                    let Some(secret_access_key) =
+                        credentials.require(secret_access_key, AWS_SECRET_ACCESS_KEY_REQUIRED)?
+                    else {
+                        return Ok(None);
+                    };
 
                     let function_name = optional_config_string(config, "aws_function_name")?
-                        .or_else(|| env_non_empty("AWS_LAMBDA_FUNCTION_NAME"))
-                        .ok_or_else(|| {
-                            "serverless_function: 'aws_function_name' is required for aws_lambda \
-                         (or set AWS_LAMBDA_FUNCTION_NAME env var)"
-                                .to_string()
-                        })?;
+                        .or_else(|| env_non_empty("AWS_LAMBDA_FUNCTION_NAME"));
+                    let Some(function_name) =
+                        credentials.require(function_name, AWS_FUNCTION_NAME_REQUIRED)?
+                    else {
+                        return Ok(None);
+                    };
+                    // The env fallback is an operator-supplied identifier too,
+                    // so the Invoke URI grammar applies to the effective value
+                    // rather than only to the config literal (issue #5181).
+                    validate_aws_function_name(&function_name)?;
 
                     let session_token = optional_config_string(config, "aws_session_token")?
                         .or_else(|| env_non_empty("AWS_SESSION_TOKEN"));
 
                     let qualifier = optional_config_string(config, "aws_qualifier")?;
+                    if let Some(ref qualifier) = qualifier {
+                        validate_aws_qualifier(qualifier)?;
+                    }
 
                     // Optional override for the AWS Lambda endpoint base URL.
                     // Defaults to the public Lambda endpoint for the region.
@@ -528,7 +688,12 @@ impl ServerlessFunction {
                     let base = endpoint_override
                         .as_deref()
                         .map(|s| s.trim_end_matches('/').to_string())
-                        .unwrap_or_else(|| format!("https://lambda.{region}.amazonaws.com"));
+                        .unwrap_or_else(|| {
+                            format!(
+                                "https://lambda.{region}.{}",
+                                aws_partition_dns_suffix(&region)
+                            )
+                        });
                     let mut url =
                         format!("{base}/2015-03-31/functions/{function_name}/invocations");
                     if let Some(ref q) = qualifier {
@@ -566,6 +731,10 @@ impl ServerlessFunction {
                         );
                     }
 
+                    let key = key
+                        .map(|key| credential_header_value("azure_function_key", &key))
+                        .transpose()?;
+
                     (url, None, key, None)
                 }
                 Provider::GcpCloudFunctions => {
@@ -587,12 +756,9 @@ impl ServerlessFunction {
                         );
                     }
 
-                    let authorization_header = token.map(|token| {
-                        let mut value = String::with_capacity("Bearer ".len() + token.len());
-                        value.push_str("Bearer ");
-                        value.push_str(&token);
-                        value
-                    });
+                    let authorization_header = token
+                        .map(|token| gcp_authorization_header_value(&token))
+                        .transpose()?;
 
                     (url, None, None, authorization_header)
                 }
@@ -611,7 +777,7 @@ impl ServerlessFunction {
 
         let requires_body = forward_body;
 
-        Ok(Self {
+        Ok(Some(Self {
             http_client,
             provider,
             mode,
@@ -631,7 +797,7 @@ impl ServerlessFunction {
             on_error,
             error_status_code,
             requires_body,
-        })
+        }))
     }
 
     /// Build the JSON payload sent to the serverless function.
@@ -800,13 +966,15 @@ impl ServerlessFunction {
                 }
             }
             Provider::AzureFunctions => {
+                // Pre-validated at construction, so this conversion cannot
+                // fail and stall every request at `build()` (issue #5189).
                 if let Some(ref key) = self.azure_function_key {
-                    req_builder = req_builder.header("x-functions-key", key.as_str());
+                    req_builder = req_builder.header("x-functions-key", key.clone());
                 }
             }
             Provider::GcpCloudFunctions => {
                 if let Some(ref auth_header) = self.gcp_authorization_header {
-                    req_builder = req_builder.header("authorization", auth_header.as_str());
+                    req_builder = req_builder.header("authorization", auth_header.clone());
                 }
             }
         }
@@ -857,7 +1025,10 @@ impl ServerlessFunction {
         let body = read_response_body_bounded(response, self.max_response_body_bytes)
             .await
             .map_err(|error| match error {
-                BoundedReadError::LimitExceeded { .. } => InvocationFailure::new(
+                // The function's OUTPUT representation, not the call: a
+                // native gRPC terminate contract must reject rather than fall
+                // through on it (`GHSA-4xpr-23qf-v649`).
+                BoundedReadError::LimitExceeded { .. } => InvocationFailure::function_output(
                     "response_body_too_large",
                     "function response exceeded max_response_body_bytes",
                 ),
@@ -892,7 +1063,7 @@ impl ServerlessFunction {
     }
 
     fn failure_result(&self, ctx: &mut RequestContext, failure: InvocationFailure) -> PluginResult {
-        warn!(
+        warn_sampled!(
             error_class = failure.code,
             destination = %self.function_display_url,
             detail = %failure.operator_detail,
@@ -983,6 +1154,154 @@ fn parse_forward_headers(config: &Value) -> Result<Vec<String>, String> {
     Ok(parsed)
 }
 
+/// Anchored AWS Lambda `Invoke` `FunctionName` grammar.
+///
+/// Copied from the AWS Lambda API reference URI-parameter pattern, which
+/// covers a bare name, a name with a version/alias suffix, a partial ARN, and
+/// a full ARN. Compiled once from a literal; a malformed literal is a build
+/// defect this `expect` surfaces at first use rather than a runtime input
+/// path, matching the shared resource-ID regexes in `src/config/types.rs`.
+static AWS_FUNCTION_NAME_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\A(arn:(aws[a-zA-Z-]*)?:lambda:)?([a-z]{2}(-gov)?(-iso([a-z])?)?-[a-z]+-[0-9]:)?([0-9]{12}:)?(function:)?[a-zA-Z0-9_.-]+(:(\$LATEST|[a-zA-Z0-9_-]+))?\z",
+    )
+    .expect("AWS Lambda function-name pattern is a valid regex")
+});
+
+/// Anchored AWS Lambda `Invoke` `Qualifier` grammar (a version number, an
+/// alias name, or `$LATEST`). The empty alternative the AWS pattern allows is
+/// unreachable here: an empty config string is treated as absent.
+static AWS_QUALIFIER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\A[a-zA-Z0-9$_-]+\z").expect("AWS Lambda qualifier pattern is a valid regex")
+});
+
+/// Longest `FunctionName` the Lambda Invoke API accepts.
+const MAX_AWS_FUNCTION_NAME_CHARS: usize = 170;
+/// Longest `Qualifier` the Lambda Invoke API accepts.
+const MAX_AWS_QUALIFIER_CHARS: usize = 128;
+
+/// Validate every recognized provider field the operator actually supplied,
+/// independently of which provider this row selects.
+///
+/// Provider-specific parsing used to run only inside the selected branch, so a
+/// wrong JSON type on another provider's field was silently admitted even
+/// though the OpenAPI schema types every one of them unconditionally, and a
+/// later `provider` change turned an already-persisted row into a constructor
+/// error (issue #5175). The same argument applies to the values themselves: an
+/// identifier the Lambda Invoke API rejects (issue #5181) or a credential that
+/// cannot form an HTTP header (issue #5189) is a deterministic operator error
+/// whichever provider is active.
+fn validate_supplied_provider_fields(config: &Value) -> Result<(), String> {
+    for field in PROVIDER_STRING_CONFIG_FIELDS {
+        if let Some(value) = config.get(*field)
+            && !value.is_string()
+        {
+            return Err(format!("serverless_function: '{field}' must be a string"));
+        }
+    }
+    if let Some(endpoint) = optional_config_string(config, "aws_endpoint_url")? {
+        validate_aws_endpoint_url(&endpoint)?;
+    }
+    if let Some(function_name) = optional_config_string(config, "aws_function_name")? {
+        validate_aws_function_name(&function_name)?;
+    }
+    if let Some(qualifier) = optional_config_string(config, "aws_qualifier")? {
+        validate_aws_qualifier(&qualifier)?;
+    }
+    if let Some(key) = optional_config_string(config, "azure_function_key")? {
+        credential_header_value("azure_function_key", &key)?;
+    }
+    if let Some(token) = optional_config_string(config, "gcp_bearer_token")? {
+        gcp_authorization_header_value(&token)?;
+    }
+    Ok(())
+}
+
+/// Reject a Lambda function name/ARN the Invoke API cannot address.
+///
+/// The value is interpolated into the invocation URL, so a deterministic
+/// syntax error (a space, an empty segment, a stray `/`) is an operator
+/// mistake that belongs at admission rather than at every invocation. This
+/// does not check that the function EXISTS or that the credentials may call
+/// it. The diagnostic is fixed and never echoes the configured value.
+fn validate_aws_function_name(function_name: &str) -> Result<(), String> {
+    if function_name.chars().count() > MAX_AWS_FUNCTION_NAME_CHARS {
+        return Err(format!(
+            "serverless_function: 'aws_function_name' must be at most \
+             {MAX_AWS_FUNCTION_NAME_CHARS} characters"
+        ));
+    }
+    if !AWS_FUNCTION_NAME_REGEX.is_match(function_name) {
+        return Err(
+            "serverless_function: 'aws_function_name' is not a valid Lambda function name, \
+             partial ARN, or full ARN"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Reject a Lambda version/alias qualifier the Invoke API cannot address.
+fn validate_aws_qualifier(qualifier: &str) -> Result<(), String> {
+    if qualifier.chars().count() > MAX_AWS_QUALIFIER_CHARS {
+        return Err(format!(
+            "serverless_function: 'aws_qualifier' must be at most \
+             {MAX_AWS_QUALIFIER_CHARS} characters"
+        ));
+    }
+    if !AWS_QUALIFIER_REGEX.is_match(qualifier) {
+        return Err(
+            "serverless_function: 'aws_qualifier' is not a valid Lambda version or alias \
+             qualifier"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Parse a provider credential into the exact `HeaderValue` the invocation
+/// sends.
+///
+/// Without this, a credential carrying a newline or another byte no HTTP
+/// header value may contain reaches the serving cache and fails inside
+/// `RequestBuilder::build()` on every request instead of failing admission
+/// (issue #5189). The diagnostic names the field and never reflects the
+/// credential, and the parsed value is marked sensitive so it is redacted
+/// anywhere a header map is rendered.
+fn credential_header_value(field: &str, value: &str) -> Result<HeaderValue, String> {
+    let mut header = HeaderValue::from_str(value)
+        .map_err(|_| format!("serverless_function: '{field}' is not a valid HTTP header value"))?;
+    header.set_sensitive(true);
+    Ok(header)
+}
+
+/// The `Authorization` field value a GCP invocation sends. Validated as the
+/// ASSEMBLED `Bearer <token>` string, which is what reqwest converts.
+fn gcp_authorization_header_value(token: &str) -> Result<HeaderValue, String> {
+    let mut value = String::with_capacity("Bearer ".len() + token.len());
+    value.push_str("Bearer ");
+    value.push_str(token);
+    credential_header_value("gcp_bearer_token", &value)
+}
+
+/// DNS suffix of the AWS partition a region belongs to.
+///
+/// The regional Lambda endpoint is `lambda.<region>.<suffix>`. Only the China
+/// partition uses a suffix other than `amazonaws.com`: Beijing (`cn-north-1`)
+/// and Ningxia (`cn-northwest-1`) publish `lambda.<region>.amazonaws.com.cn`,
+/// so deriving the commercial suffix there targets a hostname that is not the
+/// service (issue #5180). GovCloud (`us-gov-*`) regions are ordinary
+/// `amazonaws.com` hosts and need no special case. The air-gapped ISO
+/// partitions (`us-iso-*`, `us-isob-*`, `eu-isoe-*`, `us-isof-*`) are NOT
+/// derived — those deployments must set `aws_endpoint_url` explicitly.
+fn aws_partition_dns_suffix(region: &str) -> &'static str {
+    if region.starts_with("cn-") {
+        "amazonaws.com.cn"
+    } else {
+        "amazonaws.com"
+    }
+}
+
 /// Validate a function URL (Azure/GCP `function_url`).
 fn validate_function_url(url: &str) -> Result<(), String> {
     validate_http_url_field(url, "function_url")
@@ -992,6 +1311,21 @@ fn validate_function_url(url: &str) -> Result<(), String> {
 /// Lambda `aws_endpoint_url` override. Surfaces the field name in the error
 /// so operators see exactly which config key was rejected.
 fn validate_http_url_field(url: &str, field: &str) -> Result<(), String> {
+    // Reject raw ASCII whitespace and control bytes BEFORE parsing. The URL
+    // parser strips tab/CR/LF anywhere and percent-encodes a literal space, so
+    // a value containing them is admitted under one spelling and sent under
+    // another, and the published OpenAPI grammar rejects it outright. Failing
+    // here keeps the configured string, the parsed destination used for
+    // credential-leak screening, and the schema on one contract (issue #5178).
+    if url
+        .bytes()
+        .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+    {
+        return Err(format!(
+            "serverless_function: {field} must not contain ASCII whitespace or control characters"
+        ));
+    }
+
     let parsed = Url::parse(url).map_err(|_| format!("serverless_function: invalid {field}"))?;
 
     match parsed.scheme() {
@@ -2829,7 +3163,7 @@ impl Plugin for ServerlessFunction {
         // is owned by the grpc_web plugin, and RejectBinary normalization cannot
         // synthesize a correct browser-facing response from the unary contract.
         if self.mode == InvocationMode::Terminate && is_grpc_web_terminate_request(headers, ctx) {
-            warn!(
+            warn_sampled!(
                 "serverless_function: terminate mode does not support gRPC-Web requests — \
                  use native application/grpc or HTTP terminate"
             );
@@ -2874,7 +3208,20 @@ impl Plugin for ServerlessFunction {
                 }
                 return self.pre_invocation_failure_result(ctx, failure);
             }
-            Err(failure) => return self.failure_result(ctx, failure),
+            Err(mut failure) => {
+                // The native gRPC terminate contract forbids falling through
+                // to the backend on malformed or oversized function output,
+                // including under `on_error: "continue"`. The raw
+                // response-size ceiling fires inside `invoke`, before
+                // `build_native_grpc_terminate_response` can mark its own
+                // refusals mandatory, so promote that class here
+                // (`GHSA-4xpr-23qf-v649`). Ordinary transport and provider
+                // failures keep the documented `continue` behavior.
+                if native_grpc_terminate && failure.describes_function_output {
+                    failure.must_reject = true;
+                }
+                return self.failure_result(ctx, failure);
+            }
         };
         ctx.metadata
             .insert(self.metadata_key("status"), status.to_string());

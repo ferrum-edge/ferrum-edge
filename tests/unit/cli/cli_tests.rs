@@ -59,8 +59,7 @@ fn without_env_vars<F: FnOnce()>(vars: &[&str], f: F) {
 
 #[test]
 fn test_parse_no_args() {
-    let cli = Cli::try_parse_from(["ferrum-edge"]).unwrap();
-    assert!(cli.command.is_none());
+    assert!(Cli::try_parse_from(["ferrum-edge"]).is_err());
 }
 
 #[test]
@@ -429,7 +428,7 @@ fn test_parse_health_live_with_port_and_host() {
         Some(Command::Health(args)) => {
             assert!(args.live);
             assert_eq!(args.port, Some(9001));
-            assert_eq!(args.host, "127.0.0.1");
+            assert_eq!(args.host.as_deref(), Some("127.0.0.1"));
         }
         _ => panic!("Expected Health command"),
     }
@@ -1286,7 +1285,7 @@ where
     let args = HealthArgs {
         settings: None,
         port: Some(port),
-        host: "127.0.0.1".to_string(),
+        host: Some("127.0.0.1".to_string()),
         tls: false,
         tls_no_verify: false,
         live,
@@ -1359,7 +1358,7 @@ fn run_health_against_tls_response(response: &[u8]) -> Result<(), String> {
     let result = execute_health(&HealthArgs {
         settings: None,
         port: Some(port),
-        host: "127.0.0.1".to_string(),
+        host: Some("127.0.0.1".to_string()),
         tls: true,
         tls_no_verify: true,
         live: false,

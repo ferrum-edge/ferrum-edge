@@ -6,7 +6,7 @@
 //! downstream logging plugins. Prometheus receives the same usage through a
 //! private typed snapshot rather than trusting public metadata provenance.
 //!
-//! Supports OpenAI, Anthropic, Google Gemini, Cohere, Mistral, and AWS Bedrock
+//! Supports OpenAI, Anthropic, Google Gemini, Cohere, Mistral, AWS Bedrock, and TGI
 //! response formats. Auto-detection inspects the JSON structure to determine
 //! the provider when `provider` is set to `"auto"` (the default).
 //!
@@ -15,8 +15,8 @@
 //! SSE stream to extract its final usage event defeats live token delivery, so it
 //! is opt-in. By default a streamed request (client `Accept: text/event-stream` or a
 //! `stream: true` request another AI plugin flagged) is never buffered, on every
-//! backend dispatch path. For streaming responses, the plugin parses each `data:`
-//! line as JSON and merges provider cumulative/partial usage snapshots without
+//! backend dispatch path. Opted-in buffered streams join each event's `data:`
+//! fields as JSON and merge provider cumulative/partial usage snapshots without
 //! summing repeated cumulative values. OpenAI Chat Completions and
 //! `response.completed`, Anthropic start/delta, Gemini/Vertex usage metadata,
 //! and Cohere terminal usage shapes are recognized.
@@ -193,11 +193,14 @@ impl AiTokenMetrics {
 
     /// Parse an SSE (text/event-stream) response body to extract token usage.
     ///
-    /// SSE responses consist of `data: {...}\n\n` lines. Supported providers
-    /// report cumulative or partial snapshots, so each newer present field
-    /// replaces that field while omitted fields retain the earlier value.
+    /// LF, CRLF, and CR delimit lines; a blank line dispatches the joined data
+    /// fields of one event. Only one event is retained at a time, bounded by the
+    /// decoded body's inspection limit. Supported providers report cumulative
+    /// or partial snapshots, so each newer present field replaces that field
+    /// while omitted fields retain the earlier value.
     fn extract_from_sse(&self, body: &[u8]) -> Option<AiTokenUsage> {
         let body_str = std::str::from_utf8(body).ok()?;
+        let body_str = body_str.strip_prefix('\u{feff}').unwrap_or(body_str);
 
         let mut model: Option<String> = None;
         let mut final_usage: Option<AiTokenUsage> = None;
@@ -208,21 +211,37 @@ impl AiTokenMetrics {
             parse_ai_provider(&self.provider)
         };
 
-        for line in body_str.lines() {
-            let data = if let Some(stripped) = line.strip_prefix("data: ") {
-                stripped.trim()
-            } else if let Some(stripped) = line.strip_prefix("data:") {
-                stripped.trim()
-            } else {
+        let mut event_data = String::new();
+        let mut skip_lf = false;
+        for raw_line in body_str.split_inclusive(['\r', '\n']) {
+            // CRLF is one line ending, not an intervening blank line.
+            if skip_lf && raw_line == "\n" {
+                skip_lf = false;
                 continue;
-            };
-
-            // Skip the [DONE] sentinel
-            if data == "[DONE]" {
+            }
+            skip_lf = raw_line.ends_with('\r');
+            let line = raw_line.trim_end_matches(['\r', '\n']);
+            if !line.is_empty() {
+                let data = match line.split_once(':') {
+                    Some(("data", value)) => value.strip_prefix(' ').unwrap_or(value),
+                    None if line == "data" => "",
+                    _ => continue,
+                };
+                event_data.push_str(data);
+                event_data.push('\n');
                 continue;
             }
 
-            let json: Value = match serde_json::from_str(data) {
+            // Empty data, [DONE], and malformed events carry no usage. Clear
+            // the event before continuing so unrelated events never combine.
+            let data = event_data.trim();
+            if data.is_empty() || data == "[DONE]" {
+                event_data.clear();
+                continue;
+            }
+            let parsed = serde_json::from_str::<Value>(data);
+            event_data.clear();
+            let json = match parsed {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -467,22 +486,27 @@ impl Plugin for AiTokenMetrics {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        // The pre-header buffering decision drives EVERY backend dispatch path —
-        // including the retry and HTTP/3-backend paths that never
-        // consult the header-time `should_buffer_response_body_for_content_type`
-        // refinement below. Gate it on the request shape so those paths preserve
-        // streaming too, mirroring `ai_response_guard`:
-        //
-        //   * A client asking for a stream (`Accept: text/event-stream`) or a
-        //     request another plugin flagged as `stream: true`
-        //     (`ai_request_streaming`) keeps streaming unless the operator opted
-        //     into `buffer_streaming_responses`. Otherwise the SSE response would
-        //     be collected until `max_response_body_size_bytes` (502) instead of
-        //     streaming tokens to the client — the exact regression #1726 fixes.
+        // Request hints avoid buffering before headers. When no hint exists,
+        // the response-header and retry-release hooks also recognize origin SSE.
         if !self.buffer_streaming_responses && self.request_prefers_streaming(ctx) {
             return false;
         }
         true
+    }
+
+    fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
+        !self.buffer_streaming_responses && self.should_buffer_response_body(ctx)
+    }
+
+    fn should_release_response_body_under_retries(
+        &self,
+        ctx: &RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.may_release_response_body_under_retries(ctx)
+            && header_value(response_headers, "content-type")
+                .is_some_and(is_event_stream_content_type)
     }
 
     fn should_buffer_response_body_for_content_type(

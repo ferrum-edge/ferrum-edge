@@ -169,7 +169,8 @@ fn install_default_egress_slice(runtime: &MeshRuntimeState) {
         ..MeshSlice::default()
     };
     runtime.install_slice(slice.clone());
-    runtime.record_applied_slice(&slice);
+    let token = runtime.begin_revision_apply(&slice);
+    runtime.record_applied_slice_with_token(&slice, token);
 }
 
 fn admin_state(jwt: JwtManager) -> AdminState {

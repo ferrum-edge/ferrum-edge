@@ -26,6 +26,20 @@ fn make_consumer(username: &str) -> Consumer {
 }
 
 fn make_ctx(proxy_id: &str, ip: &str, consumer: Option<&str>) -> StreamConnectionContext {
+    make_ctx_in_namespace(
+        proxy_id,
+        &ferrum_edge::config::types::default_namespace(),
+        ip,
+        consumer,
+    )
+}
+
+fn make_ctx_in_namespace(
+    proxy_id: &str,
+    proxy_namespace: &str,
+    ip: &str,
+    consumer: Option<&str>,
+) -> StreamConnectionContext {
     let mut ctx = StreamConnectionContext::new(
         ip.to_string(),
         ip.to_string(),
@@ -35,6 +49,7 @@ fn make_ctx(proxy_id: &str, ip: &str, consumer: Option<&str>) -> StreamConnectio
         BackendScheme::Tcp,
         Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
     );
+    ctx.proxy_namespace = proxy_namespace.to_string();
     ctx.identified_consumer = consumer.map(|c| Arc::new(make_consumer(c)));
     ctx
 }
@@ -96,6 +111,45 @@ fn test_tcp_connection_throttle_protocol_and_priority() {
     assert!(!plugin.requires_request_body_buffering());
     assert!(!plugin.requires_response_body_buffering());
     assert_eq!(plugin.tracked_keys_count(), Some(0));
+}
+
+/// A global-scope throttle shares one plugin instance across every namespace.
+/// Keys must include `proxy_namespace` so the same bare `proxy_id` in two
+/// tenants keeps independent budgets (Refs GHSA-rp87-rhqp-g9h8).
+#[tokio::test]
+async fn test_tcp_connection_throttle_isolates_budget_by_proxy_namespace() {
+    let plugin = make_plugin(&json!({"max_connections_per_key": 1})).unwrap();
+
+    let mut tenant_a = make_ctx_in_namespace("shared-proxy", "tenant-a", "10.0.0.1", None);
+    assert!(matches!(
+        plugin.on_stream_connect(&mut tenant_a).await,
+        PluginResult::Continue
+    ));
+
+    let mut tenant_b = make_ctx_in_namespace("shared-proxy", "tenant-b", "10.0.0.1", None);
+    assert!(matches!(
+        plugin.on_stream_connect(&mut tenant_b).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(plugin.tracked_keys_count(), Some(2));
+
+    let mut tenant_a_second = make_ctx_in_namespace("shared-proxy", "tenant-a", "10.0.0.1", None);
+    assert!(matches!(
+        plugin.on_stream_connect(&mut tenant_a_second).await,
+        PluginResult::Reject {
+            status_code: 429,
+            ..
+        }
+    ));
+
+    let mut tenant_b_second = make_ctx_in_namespace("shared-proxy", "tenant-b", "10.0.0.1", None);
+    assert!(matches!(
+        plugin.on_stream_connect(&mut tenant_b_second).await,
+        PluginResult::Reject {
+            status_code: 429,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]

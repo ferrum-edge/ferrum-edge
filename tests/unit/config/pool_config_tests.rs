@@ -475,7 +475,9 @@ fn test_append_reqwest_client_behavior_pool_key_adaptive_precedence() {
     adaptive.pool_http2_initial_stream_window_size = Some(65_535);
 
     let mut buf = String::new();
-    global.append_reqwest_client_behavior_pool_key(&adaptive, &mut buf);
+    global
+        .for_proxy(&adaptive)
+        .append_reqwest_client_behavior_pool_key(&mut buf);
     assert_eq!(buf, "|rcfg=i90;ka60;h2=1;h2i30;h2t45;aw1;mf1048576");
     assert!(
         !buf.contains(";sw"),
@@ -488,7 +490,9 @@ fn test_append_reqwest_client_behavior_pool_key_adaptive_precedence() {
     fixed.pool_http2_initial_connection_window_size = Some(131_072);
 
     buf.clear();
-    global.append_reqwest_client_behavior_pool_key(&fixed, &mut buf);
+    global
+        .for_proxy(&fixed)
+        .append_reqwest_client_behavior_pool_key(&mut buf);
     assert_eq!(
         buf,
         "|rcfg=i90;ka60;h2=1;h2i30;h2t45;aw0;sw65535;cw131072;mf1048576"
@@ -504,8 +508,92 @@ fn test_append_reqwest_client_behavior_pool_key_keepalive_disabled() {
     proxy.pool_enable_http2 = Some(false);
 
     let mut buf = String::new();
-    global.append_reqwest_client_behavior_pool_key(&proxy, &mut buf);
+    global
+        .for_proxy(&proxy)
+        .append_reqwest_client_behavior_pool_key(&mut buf);
     assert_eq!(buf, "|rcfg=i90;ka0;h2=0");
+}
+
+fn resolved_reqwest_key(config: &PoolConfig) -> String {
+    let mut key = String::new();
+    config.append_reqwest_client_behavior_pool_key(&mut key);
+    key
+}
+
+#[test]
+fn reqwest_key_uses_resolved_fixed_windows_for_implicit_and_explicit_adaptive_off() {
+    for global_adaptive in [false, true] {
+        let global = PoolConfig {
+            http2_adaptive_window: global_adaptive,
+            ..Default::default()
+        };
+        for (stream, connection) in [
+            (Some(65_535), None),
+            (Some(1_048_576), None),
+            (None, Some(65_535)),
+            (Some(0), Some(u32::MAX)),
+        ] {
+            let mut implicit = create_test_proxy();
+            implicit.pool_http2_initial_stream_window_size = stream;
+            implicit.pool_http2_initial_connection_window_size = connection;
+            let resolved = global.for_proxy(&implicit);
+            assert!(!resolved.http2_adaptive_window);
+            let key = resolved_reqwest_key(&resolved);
+            assert!(key.contains(";aw0;sw"), "{key}");
+
+            let mut explicit = implicit.clone();
+            explicit.pool_http2_adaptive_window = Some(false);
+            explicit.pool_http2_initial_stream_window_size =
+                Some(resolved.http2_initial_stream_window_size);
+            explicit.pool_http2_initial_connection_window_size =
+                Some(resolved.http2_initial_connection_window_size);
+            assert_eq!(resolved, global.for_proxy(&explicit));
+            assert_eq!(key, resolved_reqwest_key(&global.for_proxy(&explicit)));
+        }
+    }
+}
+
+#[test]
+fn resolved_reqwest_key_partitions_every_consumed_pool_setting() {
+    let baseline = PoolConfig {
+        http2_adaptive_window: false,
+        ..Default::default()
+    };
+    let baseline_key = resolved_reqwest_key(&baseline);
+    macro_rules! partitions {
+        ($field:ident, $value:expr) => {
+            let changed = PoolConfig {
+                $field: $value,
+                ..baseline.clone()
+            };
+            assert_ne!(
+                baseline_key,
+                resolved_reqwest_key(&changed),
+                stringify!($field)
+            );
+        };
+    }
+    partitions!(idle_timeout_seconds, 30);
+    partitions!(enable_http_keep_alive, false);
+    partitions!(enable_http2, false);
+    partitions!(tcp_keepalive_seconds, 15);
+    partitions!(http2_keep_alive_interval_seconds, 20);
+    partitions!(http2_keep_alive_timeout_seconds, 25);
+    partitions!(http2_initial_stream_window_size, 65_535);
+    partitions!(http2_initial_connection_window_size, 65_535);
+    partitions!(http2_adaptive_window, true);
+    partitions!(http2_max_frame_size, 16_384);
+
+    // These fields do not vary reqwest client behavior across proxies. The
+    // production encoder exhaustively destructures PoolConfig so adding a new
+    // field requires explicitly classifying it instead of silently omitting it.
+    let unrelated = PoolConfig {
+        max_idle_per_host: 32,
+        http2_connections_per_host: baseline.http2_connections_per_host + 1,
+        http2_max_concurrent_streams: None,
+        ..baseline.clone()
+    };
+    assert_eq!(baseline_key, resolved_reqwest_key(&unrelated));
 }
 
 #[test]

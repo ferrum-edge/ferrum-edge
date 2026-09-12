@@ -776,6 +776,7 @@ async fn test_kubernetes_discover_parses_endpointslice() {
     let endpoint_slice_response = serde_json::json!({
         "items": [
             {
+                "addressType": "IPv4",
                 "ports": [
                     {"name": "http", "port": 8080, "protocol": "TCP"},
                     {"name": "grpc", "port": 9090, "protocol": "TCP"}
@@ -1581,6 +1582,7 @@ async fn test_kubernetes_discover_port_boundary_table() {
         let mock_server = MockServer::start().await;
         let response = serde_json::json!({
             "items": [{
+                "addressType": "IPv4",
                 "ports": [{"name": "http", "port": raw_port, "protocol": "TCP"}],
                 "endpoints": [{
                     "addresses": ["10.244.0.5"],
@@ -1630,6 +1632,7 @@ async fn test_kubernetes_discover_mixed_valid_invalid_ports_in_snapshot() {
     let response = serde_json::json!({
         "items": [
             {
+                "addressType": "IPv4",
                 "ports": [{"name": "http", "port": 65537, "protocol": "TCP"}],
                 "endpoints": [{
                     "addresses": ["10.244.0.1"],
@@ -1637,6 +1640,7 @@ async fn test_kubernetes_discover_mixed_valid_invalid_ports_in_snapshot() {
                 }]
             },
             {
+                "addressType": "IPv4",
                 "ports": [{"name": "http", "port": 8080, "protocol": "TCP"}],
                 "endpoints": [{
                     "addresses": ["10.244.0.2"],
@@ -1644,6 +1648,7 @@ async fn test_kubernetes_discover_mixed_valid_invalid_ports_in_snapshot() {
                 }]
             },
             {
+                "addressType": "IPv4",
                 "ports": [{"name": "http", "port": 0, "protocol": "TCP"}],
                 "endpoints": [{
                     "addresses": ["10.244.0.3"],
@@ -1651,6 +1656,7 @@ async fn test_kubernetes_discover_mixed_valid_invalid_ports_in_snapshot() {
                 }]
             },
             {
+                "addressType": "IPv4",
                 "ports": [{"name": "http", "port": 65535, "protocol": "TCP"}],
                 "endpoints": [{
                     "addresses": ["10.244.0.4"],
@@ -1704,6 +1710,7 @@ async fn test_kubernetes_discover_no_port_name_uses_first_port() {
 
     let response = serde_json::json!({
         "items": [{
+            "addressType": "IPv4",
             "ports": [
                 {"name": "grpc", "port": 9090, "protocol": "TCP"},
                 {"name": "http", "port": 8080, "protocol": "TCP"}
@@ -1746,6 +1753,7 @@ async fn test_kubernetes_discover_port_name_not_found() {
 
     let response = serde_json::json!({
         "items": [{
+            "addressType": "IPv4",
             "ports": [
                 {"name": "grpc", "port": 9090, "protocol": "TCP"}
             ],
@@ -1815,6 +1823,7 @@ async fn test_kubernetes_discover_missing_conditions_defaults_ready() {
 
     let response = serde_json::json!({
         "items": [{
+            "addressType": "IPv4",
             "ports": [{"name": "http", "port": 8080, "protocol": "TCP"}],
             "endpoints": [{
                 "addresses": ["10.244.0.5"]
@@ -1855,6 +1864,7 @@ async fn test_kubernetes_discover_rejects_terminating_and_non_serving_endpoints(
 
     let response = serde_json::json!({
         "items": [{
+            "addressType": "IPv4",
             "ports": [{"name": "http", "port": 8080, "protocol": "TCP"}],
             "endpoints": [
                 {
@@ -1924,6 +1934,7 @@ async fn test_kubernetes_discover_multiple_endpointslice_items() {
     let response = serde_json::json!({
         "items": [
             {
+                "addressType": "IPv4",
                 "ports": [{"name": "http", "port": 8080}],
                 "endpoints": [{
                     "addresses": ["10.0.0.1", "10.0.0.2"],
@@ -1931,6 +1942,7 @@ async fn test_kubernetes_discover_multiple_endpointslice_items() {
                 }]
             },
             {
+                "addressType": "IPv4",
                 "ports": [{"name": "http", "port": 8081}],
                 "endpoints": [{
                     "addresses": ["10.0.1.1"],
@@ -2002,6 +2014,7 @@ async fn test_kubernetes_discover_uses_default_weight() {
 
     let response = serde_json::json!({
         "items": [{
+            "addressType": "IPv4",
             "ports": [{"port": 8080}],
             "endpoints": [{
                 "addresses": ["10.244.0.5"],
@@ -2037,6 +2050,7 @@ async fn test_kubernetes_discover_uses_default_weight() {
 fn k8s_endpointslice_fixture() -> serde_json::Value {
     serde_json::json!({
         "items": [{
+            "addressType": "IPv4",
             "ports": [{"port": 8080}],
             "endpoints": [{
                 "addresses": ["10.244.0.5"],
@@ -3918,10 +3932,18 @@ impl ConsulPipelineHarness {
         &mut self,
         snapshot: ferrum_edge::service_discovery::DiscoverySnapshot,
     ) -> ferrum_edge::_test_support::DiscoveryApplyControlForTest {
+        self.apply_snapshot_from("consul", snapshot).await
+    }
+
+    async fn apply_snapshot_from(
+        &mut self,
+        provider: &str,
+        snapshot: ferrum_edge::service_discovery::DiscoverySnapshot,
+    ) -> ferrum_edge::_test_support::DiscoveryApplyControlForTest {
         ferrum_edge::_test_support::apply_service_discovery_snapshot_for_test(
             "ferrum",
             &self.upstream_id,
-            "consul",
+            provider,
             snapshot,
             &mut self.state,
             &self.lb_cache,
@@ -5824,6 +5846,7 @@ async fn kubernetes_normal_endpointslicelist_still_parses() {
         "apiVersion": "discovery.k8s.io/v1",
         "kind": "EndpointSliceList",
         "items": [{
+            "addressType": "IPv4",
             "ports": [{"name": "http", "port": 8080}],
             "endpoints": [{
                 "addresses": ["10.244.0.9"],
@@ -5951,6 +5974,7 @@ async fn production_discovery_loop_retains_targets_and_cursor_on_oversized_or_ma
     Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "items": [{
+                "addressType": "IPv4",
                 "ports": [{"port": 8080}],
                 "endpoints": [{
                     "addresses": ["10.244.1.1"],
@@ -6524,5 +6548,351 @@ fn reserved_srv_tag_namespace_is_stripped_from_copied_labels() {
         tags.get("srv.priority").map(String::as_str),
         Some("0"),
         "only the reserved ferrum.srv.* namespace is stripped"
+    );
+}
+
+// Registry identity regressions run through production admission/publication.
+
+#[tokio::test]
+async fn consul_duplicate_registrations_publish_one_share_and_stable_snapshot() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        true,
+        None,
+        1,
+    );
+    let mut harness = ConsulPipelineHarness::new("dedup-consul", Vec::new());
+    let mut records = vec![
+        serde_json::json!({"Service": {
+            "ID": "a", "Address": "2001:db8::1", "Port": 8080,
+            "Weights": {"Passing": 2}, "Tags": ["stable"]
+        }}),
+        serde_json::json!({"Service": {
+            "ID": "b", "Address": "2001:0db8:0:0:0:0:0:1", "Port": 8080,
+            "Weights": {"Passing": 8}, "Tags": ["canary"]
+        }}),
+        serde_json::json!({"Service": {
+            "ID": "c", "Address": "2001:db8::1", "Port": 8080,
+            "Weights": {"Passing": 2}, "Tags": ["stable"]
+        }}),
+        serde_json::json!({"Service": {
+            "ID": "peer", "Address": "2001:db8::2", "Port": 8080,
+            "Weights": {"Passing": 4}
+        }}),
+    ];
+    let mut installed = None;
+    for index in [10, 11] {
+        server.reset().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(&records)
+                    .insert_header("X-Consul-Index", index.to_string()),
+            )
+            .mount(&server)
+            .await;
+        harness.discover_and_apply(&discoverer).await.unwrap();
+        assert_eq!(cursor_index(&discoverer), index);
+        let upstream = harness
+            .lb_cache
+            .get_upstream("ferrum", "dedup-consul")
+            .unwrap();
+        assert_eq!(upstream.targets.len(), 2);
+        assert_eq!(upstream.targets[0].host, "2001:db8::1");
+        assert_eq!(upstream.targets[0].weight, 2);
+        assert_eq!(upstream.targets[0].tags["consul_tag_0"], "stable");
+        assert_eq!(upstream.targets[1].weight, 4);
+        if let Some(previous) = &installed {
+            assert!(
+                Arc::ptr_eq(previous, &upstream),
+                "reordering must not republish"
+            );
+        }
+        installed = Some(upstream);
+        let mut first = 0;
+        for _ in 0..60 {
+            let selected = harness
+                .lb_cache
+                .select_target("ferrum", "dedup-consul", "request", None)
+                .unwrap();
+            first += usize::from(selected.target.host == "2001:db8::1");
+        }
+        assert_eq!(first, 30, "three registrations still get one RR share");
+        records.reverse();
+    }
+
+    // The retained registry weights also drive the real weighted scheduler.
+    let targets = installed.unwrap().targets.clone();
+    let mut weighted = make_upstream("weighted", targets, None);
+    weighted.algorithm = LoadBalancerAlgorithm::WeightedRoundRobin;
+    let cache = LoadBalancerCache::new(&make_config_with_upstreams(vec![weighted]));
+    let mut first = 0;
+    for _ in 0..60 {
+        let selected = cache
+            .select_target("ferrum", "weighted", "request", None)
+            .unwrap();
+        first += usize::from(selected.target.host == "2001:db8::1");
+    }
+    assert_eq!(first, 20, "the retained weights are 2:4, never summed");
+}
+
+#[test]
+fn registry_identity_preserves_ports_metadata_static_precedence_and_mesh_siblings() {
+    use ferrum_edge::service_discovery::{filter_discovered_targets, merge_targets};
+
+    let mut winner = make_target("2001:db8::1", 8080);
+    winner.weight = 3;
+    winner.service_port_policy_key = Some(80);
+    winner.locality = Some("region/zone".to_string());
+    winner.path = Some("/api".to_string());
+    winner.tags.insert("subset".to_string(), "blue".to_string());
+    let mut duplicate = winner.clone();
+    duplicate.host = "2001:0db8:0:0:0:0:0:1".to_string();
+    duplicate
+        .tags
+        .insert("subset".to_string(), "green".to_string());
+    let different_port = make_target("2001:db8::1", 9090);
+    let records = vec![duplicate.clone(), winner.clone(), different_port.clone()];
+    for mut input in [records.clone(), records.into_iter().rev().collect()] {
+        // Invalid spelling cannot be repaired into an admitted address.
+        input.push(make_target("[2001:db8::1]", 8080));
+        input.push(make_target("2001:db8::1%eth0", 8080));
+        input.push(make_target("UPPER.example", 8080));
+        let admitted = filter_discovered_targets(
+            "identity",
+            "consul",
+            input,
+            ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        );
+        assert_eq!(admitted, vec![winner.clone(), different_port.clone()]);
+        let mut static_target = duplicate.clone();
+        static_target.weight = 7;
+        assert_eq!(
+            merge_targets(&[static_target.clone()], &admitted),
+            vec![static_target, different_port.clone()]
+        );
+    }
+    let mesh = vec![winner, duplicate];
+    assert_eq!(
+        filter_discovered_targets(
+            "identity",
+            "mesh",
+            mesh.clone(),
+            ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        ),
+        mesh,
+        "mesh policy identities on a shared dial address must remain distinct"
+    );
+    let public_only = ferrum_edge::config::BackendEgressPolicy::from_allow_ips(
+        ferrum_edge::config::BackendAllowIps::Public,
+    );
+    assert!(
+        filter_discovered_targets(
+            "identity",
+            "consul",
+            vec![
+                make_target("127.0.0.1", 8080),
+                make_target("::ffff:127.0.0.1", 8080),
+            ],
+            public_only,
+        )
+        .is_empty()
+    );
+}
+
+fn registry_slice(family: serde_json::Value, addresses: &[&str], port: u16) -> serde_json::Value {
+    serde_json::json!({
+        "addressType": family,
+        "ports": [{"name": "http", "port": port}],
+        "endpoints": [{
+            "addresses": addresses,
+            "conditions": {"ready": true},
+            "targetRef": {"kind": "Pod", "namespace": "default", "name": "api", "uid": "pod-a"}
+        }]
+    })
+}
+
+#[tokio::test]
+async fn kubernetes_family_selection_and_duplicate_slices_publish_and_reload() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let discoverer = with_mock_sa_token(
+        KubernetesDiscoverer::new(
+            reqwest::Client::new(),
+            "default".to_string(),
+            "api".to_string(),
+            Some("http".to_string()),
+            None,
+            3,
+        )
+        .with_api_url(server.uri()),
+    );
+    let v4 = registry_slice(serde_json::json!("IPv4"), &["10.0.0.1"], 8080);
+    let v6 = registry_slice(serde_json::json!("IPv6"), &["2001:db8::1"], 8080);
+    let mut harness = ConsulPipelineHarness::new("kube-family", Vec::new());
+    let mut other_namespace =
+        make_upstream("kube-family", vec![make_target("10.9.0.1", 8080)], None);
+    other_namespace.namespace = "other".to_string();
+    harness.lb_cache.rebuild(&make_config_with_upstreams(vec![
+        make_upstream("kube-family", Vec::new(), None),
+        other_namespace,
+    ]));
+    for items in [
+        vec![v6.clone(), v4.clone(), v4.clone()],
+        vec![v4.clone(), v6.clone()],
+    ] {
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/discovery.k8s.io/v1/namespaces/default/endpointslices",
+            ))
+            .and(query_param(
+                "labelSelector",
+                "kubernetes.io/service-name=api",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"items": items})),
+            )
+            .mount(&server)
+            .await;
+        harness
+            .apply_snapshot_from("kubernetes", discoverer.discover().await.unwrap())
+            .await;
+        assert_eq!(harness.lb_hosts(), vec!["10.0.0.1"]);
+        let selected = harness
+            .lb_cache
+            .select_target("ferrum", "kube-family", "request", None)
+            .unwrap();
+        assert_eq!(selected.target.host, "10.0.0.1");
+        assert_eq!(selected.target.port, 8080);
+        assert_eq!(selected.target.weight, 3);
+    }
+    let old = harness
+        .lb_cache
+        .get_upstream("ferrum", "kube-family")
+        .unwrap();
+    // Simulate the replacement task after an explicit family config reload.
+    let discoverer = discoverer.with_address_type(Some(KubernetesAddressType::Ipv6));
+    harness.state = ferrum_edge::_test_support::DiscoveryLoopStateForTest::new();
+    harness
+        .apply_snapshot_from("kubernetes", discoverer.discover().await.unwrap())
+        .await;
+    assert_eq!(harness.lb_hosts(), vec!["2001:db8::1"]);
+    assert_eq!(
+        old.targets[0].host, "10.0.0.1",
+        "old snapshot remains immutable"
+    );
+    let peer = harness
+        .lb_cache
+        .get_upstream("other", "kube-family")
+        .unwrap();
+    assert_eq!(peer.targets[0].host, "10.9.0.1");
+}
+
+#[tokio::test]
+async fn kubernetes_address_type_validation_and_ipv6_only_default() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let items = vec![
+        registry_slice(
+            serde_json::json!("IPv6"),
+            &["2001:db8::2", "2001:0db8::2"],
+            8080,
+        ),
+        registry_slice(serde_json::json!("IPv6"), &["2001:db8::2"], 9090),
+        registry_slice(serde_json::json!("IPv4"), &["2001:db8::3"], 8080),
+        registry_slice(
+            serde_json::json!("IPv6"),
+            &["10.0.0.1", "::ffff:10.0.0.1"],
+            8080,
+        ),
+        registry_slice(
+            serde_json::json!("IPv4"),
+            &["backend.example", "[::1]", "127.1"],
+            8080,
+        ),
+        registry_slice(serde_json::json!("FQDN"), &["backend.example"], 8080),
+        registry_slice(serde_json::Value::Null, &["10.0.0.1"], 8080),
+        serde_json::json!({"ports": [{"port": 8080}], "endpoints": [{"addresses": ["10.0.0.1"]}]}),
+    ];
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"items": items})))
+        .mount(&server)
+        .await;
+    let discoverer = with_mock_sa_token(
+        KubernetesDiscoverer::new(
+            reqwest::Client::new(),
+            "default".to_string(),
+            "api".to_string(),
+            None,
+            None,
+            1,
+        )
+        .with_api_url(server.uri()),
+    );
+    let mut harness = ConsulPipelineHarness::new("v6-only", Vec::new());
+    harness
+        .apply_snapshot_from("kubernetes", discoverer.discover().await.unwrap())
+        .await;
+    let upstream = harness.lb_cache.get_upstream("ferrum", "v6-only").unwrap();
+    assert_eq!(upstream.targets.len(), 2);
+    assert_eq!(upstream.targets[0], make_target("2001:db8::2", 8080));
+    assert_eq!(upstream.targets[1], make_target("2001:db8::2", 9090));
+    let selected = harness
+        .lb_cache
+        .select_target("ferrum", "v6-only", "request", None)
+        .unwrap();
+    assert_eq!(selected.target.host, "2001:db8::2");
+    assert!(
+        discoverer
+            .with_address_type(Some(KubernetesAddressType::Ipv4))
+            .discover()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn kubernetes_address_type_config_roundtrip_and_validation() {
+    for family in ["IPv4", "IPv6"] {
+        let config: ServiceDiscoveryConfig = serde_json::from_value(serde_json::json!({
+            "provider": "kubernetes",
+            "kubernetes": {"service_name": "api", "address_type": family}
+        }))
+        .unwrap();
+        let serialized = serde_json::to_value(&config).unwrap();
+        assert_eq!(serialized["kubernetes"]["address_type"], family);
+        assert_eq!(
+            serde_json::from_value::<ServiceDiscoveryConfig>(serialized).unwrap(),
+            config
+        );
+    }
+    assert!(
+        serde_json::from_value::<KubernetesConfig>(serde_json::json!({
+            "service_name": "api", "address_type": "FQDN"
+        }))
+        .is_err()
+    );
+    let automatic: KubernetesConfig =
+        serde_json::from_value(serde_json::json!({"service_name": "api"})).unwrap();
+    assert_eq!(automatic.address_type, None);
+    assert!(
+        serde_json::to_value(automatic)
+            .unwrap()
+            .get("address_type")
+            .is_none()
     );
 }

@@ -566,6 +566,37 @@ fn latency_histogram_distribution_shape_separates_bimodal_tail() {
 }
 
 #[test]
+fn latency_histogram_clamps_raced_count_to_finite_buckets() {
+    use std::sync::atomic::Ordering;
+
+    let state = BpfMetricsState::new();
+    // Model a scrape that loaded count before a concurrent observation but
+    // loaded the observation's exclusive bucket afterward.
+    state.srtt_count.store(1, Ordering::Relaxed);
+    state.srtt_bucket_exclusive[0].store(2, Ordering::Relaxed);
+
+    let text = render_with(state);
+    assert_eq!(
+        metric_value(
+            &text,
+            "ferrum_mesh_bpf_srtt_microseconds_bucket{le=\"100\"}"
+        ),
+        2
+    );
+    assert_eq!(
+        metric_value(
+            &text,
+            "ferrum_mesh_bpf_srtt_microseconds_bucket{le=\"+Inf\"}"
+        ),
+        2
+    );
+    assert_eq!(
+        metric_value(&text, "ferrum_mesh_bpf_srtt_microseconds_count"),
+        2
+    );
+}
+
+#[test]
 fn latency_histogram_extreme_values_are_deterministic() {
     let state = BpfMetricsState::new();
 

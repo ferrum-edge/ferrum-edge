@@ -135,6 +135,10 @@ fn reconnecting_alone_does_not_clear_a_raised_stale_state() {
     assert!(snapshot.stale, "recovery requires an APPLIED snapshot");
     assert!(snapshot.new_traffic_blocked);
     assert!(snapshot.cp_connected);
+    assert_eq!(
+        snapshot.cp_disconnected_seconds, 601,
+        "transport connect without apply must not clear the outage stamp"
+    );
     assert_eq!(snapshot.reason, FreshnessReason::SnapshotStale.as_str());
 }
 
@@ -693,6 +697,58 @@ fn plain_transport_error_still_latches_after_an_admission_refusal() {
     assert!(snapshot.new_traffic_blocked);
     // The refusal counter is unaffected by the later transport failure.
     assert_eq!(snapshot.cp_admission_refused_total, 1);
+}
+
+/// `cp_disconnected_seconds` measures time without usable applied configuration,
+/// not bare transport connectivity (issue #4757).
+#[test]
+fn cp_disconnected_seconds_tracks_usable_config_not_transport_connect() {
+    let epoch = epoch();
+    let freshness = DpConfigFreshness::new_at(epoch, MAX_STALE, StaleAction::FailClosed);
+
+    // Startup without any applied snapshot: outage runs from process start.
+    assert_eq!(
+        freshness.evaluate_at(at(epoch, 30)).cp_disconnected_seconds,
+        30
+    );
+
+    // Transport connects but never delivers usable config — stamp keeps growing.
+    freshness.record_cp_connected_at(at(epoch, 60));
+    let connected_without_apply = freshness.evaluate_at(at(epoch, 90));
+    assert!(connected_without_apply.cp_connected);
+    assert_eq!(
+        connected_without_apply.cp_disconnected_seconds, 90,
+        "transport connect without apply must not reset the outage stamp"
+    );
+
+    // Drop and reconnect again: still no apply, still monotonic.
+    freshness.record_cp_authority_lost_at(at(epoch, 100));
+    freshness.record_cp_connected_at(at(epoch, 120));
+    let after_reconnect = freshness.evaluate_at(at(epoch, 150));
+    assert_eq!(
+        after_reconnect.cp_disconnected_seconds, 150,
+        "reconnect-backoff cycles must not saw-tooth the outage diagnostic"
+    );
+
+    // A normal reconnect that delivers usable configuration clears the stamp.
+    freshness.record_snapshot_applied_at(at(epoch, 160));
+    assert_eq!(
+        freshness
+            .evaluate_at(at(epoch, 200))
+            .cp_disconnected_seconds,
+        0,
+        "an applied snapshot ends the configuration outage"
+    );
+
+    // A subsequent disconnect restarts the stamp.
+    freshness.record_cp_authority_lost_at(at(epoch, 250));
+    assert_eq!(
+        freshness
+            .evaluate_at(at(epoch, 300))
+            .cp_disconnected_seconds,
+        50,
+        "a later authority loss must restart the outage clock"
+    );
 }
 
 /// A DP that never connected is already `Lost`, so an admission refusal on a

@@ -887,17 +887,32 @@ impl JwksKeyStore {
             .decode(e)
             .map_err(|e| format!("invalid base64url in 'e': {}", e))?;
 
-        // Approved RSA strength, when FIPS mode is enforced. A JWKS is fetched
-        // from an operator-configured issuer, so a weak signing key admitted
-        // here would make that issuer's compromise Ferrum's authentication
-        // failure. Only public components are inspected, and diagnostics
-        // report strength/form without reproducing key bytes.
+        // Approved RSA strength. A JWKS is fetched from an operator-configured
+        // issuer, so a weak signing key admitted here would make that issuer's
+        // compromise Ferrum's authentication failure. Only public components
+        // are inspected, and diagnostics report strength/form without
+        // reproducing key bytes.
+        crate::fips::keys::check_jwk_rsa_modulus_enforced(&n_bytes)?;
         crate::fips::keys::check_jwk_rsa_public_key(&n_bytes, &e_bytes)?;
 
+        // RFC 7517 §4.4: `alg` identifies the algorithm intended for use with
+        // the key. Defaulting every unrecognized value to RS256 admitted keys
+        // the issuer published for a different purpose entirely — RSA-OAEP /
+        // RSA1_5 encryption keys, and PSS keys — as PKCS#1 v1.5
+        // signature-verification keys, which is cross-algorithm use of the
+        // issuer's key material. Only an absent `alg` falls back to RS256; any
+        // present value must name a supported RSA signature algorithm, and it
+        // then binds verification to exactly that algorithm because
+        // `build_validation` seeds `Validation::new` from it.
         let algorithm = match jwk.alg.as_deref() {
+            None | Some("RS256") => Algorithm::RS256,
             Some("RS384") => Algorithm::RS384,
             Some("RS512") => Algorithm::RS512,
-            _ => Algorithm::RS256, // Default RSA algorithm
+            Some(other) => {
+                return Err(format!(
+                    "JWK alg '{other}' is not a supported RSA signature algorithm"
+                ));
+            }
         };
 
         let decoding_key = DecodingKey::from_rsa_raw_components(&n_bytes, &e_bytes);
@@ -927,12 +942,21 @@ impl JwksKeyStore {
             Some(other) => return Err(format!("unsupported EC curve: {}", other)),
         };
 
-        // Override algorithm from the `alg` field if present
-        let algorithm = match jwk.alg.as_deref() {
-            Some("ES384") => Algorithm::ES384,
-            Some("ES256") => Algorithm::ES256,
-            _ => algorithm,
-        };
+        // RFC 7517 §4.4: a present `alg` must name a supported EC signature
+        // algorithm AND agree with the curve. Previously a contradicting or
+        // non-signature `alg` (`ECDH-ES`, `ES512` on a P-256 key) was silently
+        // ignored in favour of the curve-derived algorithm, so a key published
+        // for key agreement was admitted for signature verification.
+        match jwk.alg.as_deref() {
+            None => {}
+            Some("ES256") if algorithm == Algorithm::ES256 => {}
+            Some("ES384") if algorithm == Algorithm::ES384 => {}
+            Some(other) => {
+                return Err(format!(
+                    "JWK alg '{other}' is not a supported EC signature algorithm for this curve"
+                ));
+            }
+        }
 
         // from_ec_components takes base64url-encoded strings directly
         let decoding_key = DecodingKey::from_ec_components(x, y)

@@ -142,6 +142,12 @@ A resolved value that cannot be placed in the process environment is reported ra
 
 Smart path discovery yields to a suffixed source. When `FERRUM_CONF_PATH_FILE` (or the `_VAULT`/`_AWS`/`_AZURE`/`_GCP` equivalent) is set, `validate` and `run` do **not** auto-discover `./ferrum.conf`, `./config/ferrum.conf`, or `/etc/ferrum/ferrum.conf`, and the same holds for `FERRUM_FILE_CONFIG_PATH_FILE` and the `./resources.yaml` family. A discovered default is the lowest-precedence source there is, so treating it as a competing one would fail the command with a multiple-sources error in any working directory that merely happened to contain a settings or resources file. An **explicit** `-s/--settings` or `-c/--spec` path is different — that is a genuine two-sources-for-one-key mistake and is still reported as a conflict.
 
+Resource discovery runs after external secret resolution and settings loading.
+A `FERRUM_FILE_CONFIG_PATH` in the selected `ferrum.conf` suppresses resource
+discovery. `--spec` overrides the direct environment and settings file; a
+configured external source retains the documented conflict check for an explicit
+CLI path. A bare `ferrum-edge` invocation prints usage and exits nonzero; use `run`.
+
 File-mode inference is likewise the *lowest*-precedence mode source, and it runs after secrets are resolved so that every source above it is visible first. `run` and `validate` fall back to `FERRUM_MODE=file` only when a spec path is configured **and** no mode was set by any higher-precedence source — matching the documented `CLI > env > conf file > smart defaults > hardcoded` order. Both commands check `-m/--mode` first (via `apply_run_overrides` / `apply_validate_overrides`), then `FERRUM_MODE` in the environment, then a `FERRUM_MODE_FILE`/`_VAULT`/`_AWS`/`_AZURE`/`_GCP` source, then `FERRUM_MODE` in `ferrum.conf`. A spec path that is itself supplied by a suffixed source still infers file mode, because it has been materialized into `FERRUM_FILE_CONFIG_PATH` by then. Externalizing the mode and the spec path together is therefore supported: neither shadows the other, and the inference never manufactures a second competing source for `FERRUM_MODE`.
 
 The report withholds externally sourced values, not just the ones that appear in errors. `validate` prints its findings with plain stdout writes, which are not log records and are not an error return, so each value-bearing field is filtered where it is printed. A field whose variable was resolved from an external source is withheld by name — `FERRUM_MODE_FILE` containing `database` prints `Mode: <redacted: value from external secret source>`, not `Mode: Database` — while the surrounding validation result, including `Validation passed.` and the spec-document counts, is unaffected. `run` withholds the same value on its own startup log line for the same reason: `Operating mode:` re-renders the resolved value as the `Database` enum variant, a form the log-record redactor deliberately does not derive, so that line is withheld by variable name too.
@@ -154,6 +160,7 @@ The report withholds externally sourced values, not just the ones that appear in
    - Unique `listen_path` enforcement
    - Stream proxy port conflict detection against gateway reserved ports
    - Plugin config validation (each plugin is instantiated to verify its config)
+   - Shared runtime admission, including plugin security composition (such as duplicate effective `correlation_id` headers) and `tcp_connection_throttle` attachment compatibility
    - TLS certificate path existence checks
    - Upstream reference validation
 3. **Startup security** (env-level TLS/CIDR/metrics surfaces shared with `run`) — side-effect-free loaders that `serve()` also uses, so `validate` cannot report success for configs that refuse to start. Mode-scoped:
@@ -268,29 +275,38 @@ ferrum-edge health [OPTIONS]
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--settings <PATH>` | `-s` | Operational settings file for inferred ports (same path discovery as `run`) |
+| `--settings <PATH>` | `-s` | Operational settings file for inferred host and ports (same path discovery as `run`) |
 | `--port <PORT>` | `-p` | Admin API port (defaults to `FERRUM_ADMIN_HTTP_PORT` / 9000, or `FERRUM_ADMIN_HTTPS_PORT` / 9443 when TLS is used) |
-| `--host <HOST>` | | Admin API host (default: `127.0.0.1`) |
+| `--host <HOST>` | | Admin API host (default: effective `FERRUM_ADMIN_BIND_ADDRESS`) |
 | `--tls` | | Connect via HTTPS instead of HTTP |
 | `--tls-no-verify` | | Skip TLS certificate verification (for self-signed certs / testing) |
 | `--live` | | Probe liveness (`GET /live`) instead of readiness (`GET /health`) |
 
 ### Auto-Detection
 
-Health resolves admin ports from environment variables, then the selected
-`ferrum.conf`, then 9000/9443 defaults. Use `--settings` for the same custom
-settings path passed to `run`, or `FERRUM_CONF_PATH`; otherwise normal settings
-path discovery applies. An invalid settings file or port fails the probe.
-An explicit `--port` bypasses settings inference and uses plaintext unless
-`--tls` is also given. The one-shot probe does not run startup secret-source
-materialization; pass resolved paths/ports when startup uses external sources.
+Health resolves the admin host and ports from environment variables (including
+external secret suffixes), then the selected `ferrum.conf`, then defaults. Use
+`--settings` for the same custom settings path passed to `run`, or
+`FERRUM_CONF_PATH` (which also supports external suffixes); otherwise normal
+settings discovery applies. Invalid endpoint settings fail the probe.
+
+`--host` overrides the host; `--port` overrides the port and selects plaintext
+unless `--tls` is given. Supplying both bypasses settings inference entirely.
+With only `--port`, host inference still applies. IPv4 wildcard `0.0.0.0` probes
+`127.0.0.1`; IPv6 wildcard `::` probes `::1`. Specific addresses are preserved.
+
+The probe fetches only the settings path and endpoint fields it needs, through
+the same provider/conflict checks as startup. It does not fetch unrelated
+secrets, load server TLS private keys, or mutate the environment. Server TLS
+verification remains enabled unless `--tls-no-verify` is explicitly supplied.
+An explicitly selected port `0` fails as disabled.
 
 When `FERRUM_ADMIN_HTTP_PORT=0` in either environment or settings (plaintext admin disabled), the health command automatically switches to TLS mode and uses port 9443 (or the value of `FERRUM_ADMIN_HTTPS_PORT`). No `--tls` flag is needed in this case.
 
 ### Examples
 
 ```bash
-# Default — connect to http://127.0.0.1:9000/health
+# Default — infer the gateway admin endpoint (127.0.0.1:9000 when unset)
 ferrum-edge health
 
 # Custom port

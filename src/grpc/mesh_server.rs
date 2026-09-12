@@ -27,10 +27,14 @@ use super::auth::{
 use super::cp_server::{CpGrpcServer, CpScope, DEFAULT_CP_DP_JWT_ISSUER};
 use super::cp_trust::{CpDpVerifier, CpDpVerifierStore, CpGrpcConnectInfo};
 use super::mesh_registry::{MeshNodeInfo, MeshNodeRegistry};
-use super::mesh_slice_drift::{MeshSliceDriftAdmitError, MeshSliceDriftRegistry, validate_version};
+use super::mesh_slice_drift::{
+    MeshSliceDriftAdmitError, MeshSliceDriftRegistry, MeshSliceReportRejection,
+    MeshSliceReportStatus, validate_version,
+};
 use super::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
 use super::proto::{
-    MeshConfigUpdate, MeshSliceStatusReport, MeshSliceStatusResponse, MeshSubscribeRequest,
+    MeshConfigUpdate, MeshSliceRejectReason, MeshSliceStatusPhase, MeshSliceStatusReport,
+    MeshSliceStatusResponse, MeshSubscribeRequest,
 };
 use crate::FERRUM_VERSION;
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot;
@@ -1048,23 +1052,55 @@ impl MeshConfigSync for MeshGrpcServer {
         };
 
         let report = request.into_inner();
-        let error_message = if report.error_message.is_empty() {
-            None
-        } else {
-            Some(report.error_message.as_str())
-        };
+        // Issue #4812: the DP reports the lifecycle stage and a closed refusal
+        // enum. Anything the control plane does not recognise is refused rather
+        // than recorded, so an unknown wire value can never land on the admin
+        // surface as an unlabelled or misattributed verdict.
+        let status = mesh_slice_report_status(report.phase, report.reject_reason)
+            .map_err(mesh_slice_drift_status)?;
         self.drift
             .record_status(
                 &identity.subject,
                 &report.session_token,
                 &report.version,
-                error_message,
+                status,
                 Utc::now(),
             )
             .map_err(mesh_slice_drift_status)?;
 
         Ok(Response::new(MeshSliceStatusResponse {}))
     }
+}
+
+/// Map a `ReportMeshSliceStatus` phase + refusal category onto the registry's
+/// verdict (issue #4812), failing closed on any unrecognised wire value.
+fn mesh_slice_report_status(
+    phase: i32,
+    reject_reason: i32,
+) -> Result<MeshSliceReportStatus, MeshSliceDriftAdmitError> {
+    let phase = MeshSliceStatusPhase::try_from(phase)
+        .map_err(|_| MeshSliceDriftAdmitError::UnknownStatusPhase)?;
+    let reason = MeshSliceRejectReason::try_from(reject_reason)
+        .map_err(|_| MeshSliceDriftAdmitError::UnknownRejectReason)?;
+    let rejection = match reason {
+        MeshSliceRejectReason::Unspecified => {
+            return Ok(match phase {
+                MeshSliceStatusPhase::Accepted => MeshSliceReportStatus::Accepted,
+                MeshSliceStatusPhase::Applied => MeshSliceReportStatus::Applied,
+            });
+        }
+        MeshSliceRejectReason::InstallRefused => MeshSliceReportRejection::InstallRefused,
+        MeshSliceRejectReason::RuntimeConfigBuild => MeshSliceReportRejection::RuntimeConfigBuild,
+        MeshSliceRejectReason::RuntimeProxyRefused => MeshSliceReportRejection::RuntimeProxyRefused,
+        MeshSliceRejectReason::RuntimeTrustUnusable => {
+            MeshSliceReportRejection::RuntimeTrustUnusable
+        }
+        MeshSliceRejectReason::RuntimeTlsReload => MeshSliceReportRejection::RuntimeTlsReload,
+        MeshSliceRejectReason::RuntimeDtlsCandidate => {
+            MeshSliceReportRejection::RuntimeDtlsCandidate
+        }
+    };
+    Ok(MeshSliceReportStatus::Rejected(rejection))
 }
 
 /// Record a delivered slice on the drift registry without ever failing the
@@ -1101,7 +1137,9 @@ fn mesh_slice_drift_status(error: MeshSliceDriftAdmitError) -> Status {
         | MeshSliceDriftAdmitError::VersionHasControlCharacter
         | MeshSliceDriftAdmitError::EmptyNodeId
         | MeshSliceDriftAdmitError::NodeIdTooLong
-        | MeshSliceDriftAdmitError::EmptyNamespace => Status::invalid_argument(format!(
+        | MeshSliceDriftAdmitError::EmptyNamespace
+        | MeshSliceDriftAdmitError::UnknownStatusPhase
+        | MeshSliceDriftAdmitError::UnknownRejectReason => Status::invalid_argument(format!(
             "{} (field={})",
             error.as_status_message(),
             error.field_name()

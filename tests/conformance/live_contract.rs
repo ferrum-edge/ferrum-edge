@@ -876,8 +876,21 @@ fn live_contract_sidecar_native_subscribe_fixture_is_mtls_jwt() {
     );
 }
 
-fn native_evid_assignment_line(trimmed_line: &str) -> bool {
-    trimmed_line.starts_with("NATIVE_EVID_") && trimmed_line.contains('=')
+fn native_evid_assignment_line(trimmed_line: &str, reason: &str) -> bool {
+    let Some((name, value)) = trimmed_line.split_once('=') else {
+        return false;
+    };
+    let allowed_name = match reason {
+        "peer sent no certificates" => "NATIVE_EVID_CP_NO_CERT",
+        "Invalid token: authentication failed" => "NATIVE_EVID_CP_JWT_AUTH_FAILED",
+        _ => return false,
+    };
+
+    name == allowed_name
+        && value.len() >= 2
+        && value.starts_with('\'')
+        && value.ends_with('\'')
+        && !value[1..value.len() - 1].contains('\'')
 }
 
 /// CP rejection reason literals are allowed only on closed-set `NATIVE_EVID_*`
@@ -886,7 +899,7 @@ fn native_evid_assignment_line(trimmed_line: &str) -> bool {
 fn run_sh_has_generic_cp_reason_literal(run_sh: &str, reason: &str) -> bool {
     run_sh.lines().any(|line| {
         let trimmed = line.trim_start();
-        !native_evid_assignment_line(trimmed) && line.contains(reason)
+        !native_evid_assignment_line(trimmed, reason) && line.contains(reason)
     })
 }
 
@@ -1447,6 +1460,22 @@ classify_native_probe() {
             .any(|error| error.contains("generic CP-log matching")),
         "contract must reject CP reason literals even when grep uses a renamed variable, \
          got {renamed_violations:?}"
+    );
+
+    let prefixed_renamed_cp_grep = renamed_cp_grep.replace(
+        "peer_reason='peer sent no certificates'",
+        "NATIVE_EVID_PEER_REASON='peer sent no certificates'",
+    );
+    let prefixed_renamed_cp_grep =
+        prefixed_renamed_cp_grep.replace("$peer_reason", "$NATIVE_EVID_PEER_REASON");
+    let prefixed_renamed_violations =
+        native_probe_classifier_contract_violations(&prefixed_renamed_cp_grep, HELPER, MANIFESTS);
+    assert!(
+        prefixed_renamed_violations
+            .iter()
+            .any(|error| error.contains("generic CP-log matching")),
+        "contract must reject CP reason literals hidden behind arbitrary NATIVE_EVID_ names, \
+         got {prefixed_renamed_violations:?}"
     );
 
     let no_slice_guard = r#"

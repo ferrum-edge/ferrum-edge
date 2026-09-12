@@ -225,6 +225,7 @@ impl DbHarness {
         );
 
         let mut cmd = Command::new(gateway_binary_path());
+        cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", &db_url)
@@ -480,6 +481,7 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
         let proxy_port_seed = ephemeral_port().await;
         let identity = mint_stream_listener_db_identity();
         let mut cmd = Command::new(gateway_binary_path());
+        cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", &db_url)
@@ -549,6 +551,7 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
     #[allow(clippy::zombie_processes)]
     let mut child = {
         let mut cmd = Command::new(gateway_binary_path());
+        cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", &db_url)
@@ -681,6 +684,7 @@ plugin_configs: []
 
         let identity = crate::common::SpawnedGatewayIdentity::mint("stream-listener-file");
         let mut cmd = Command::new(gateway_binary_path());
+        cmd.arg("run");
         cmd.env("FERRUM_MODE", "file")
             .env("FERRUM_FILE_CONFIG_PATH", config_path.to_str().unwrap())
             .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())

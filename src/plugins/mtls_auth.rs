@@ -22,7 +22,10 @@ use x509_parser::prelude::*;
 
 use crate::consumer_index::ConsumerIndex;
 
-use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
+use super::utils::auth_flow::{
+    self, AuthMechanism, CredentialDeadline, ExtractedCredential, VerifyOutcome,
+};
+use super::utils::cert_validity::CertValidityWindow;
 use super::{PluginResult, RequestContext, StreamConnectionContext};
 
 /// Supported certificate fields for consumer identity matching.
@@ -53,55 +56,6 @@ static NEXT_MTLS_AUTH_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 /// certificate identity material (issue #3816).
 const ALLOWED_ISSUER_MISMATCH: &str = "Certificate issuer does not match any allowed issuer";
 
-/// Certificate-invariant temporal window retained beside a cached identity.
-///
-/// Only the two canonical Unix timestamps are kept. No DER, DN, SAN, serial, or
-/// fingerprint reaches this type, and neither value is ever logged, exported as
-/// a metric label, or echoed to a client.
-#[derive(Debug, Clone, Copy)]
-struct CertValidityWindow {
-    not_before_unix: i64,
-    not_after_unix: i64,
-}
-
-impl CertValidityWindow {
-    /// Parse the leaf's validity interval, failing closed on anything that
-    /// cannot be represented as a coherent window.
-    ///
-    /// `x509_parser` returns `i64` seconds, so an out-of-range or malformed
-    /// ASN.1 time surfaces as a nonsensical value rather than a panic. An
-    /// inverted interval (`not_after < not_before`) is rejected outright: such
-    /// a certificate can never be valid, and admitting it would make the
-    /// per-request check depend on which bound is compared first.
-    fn from_certificate(cert: &X509Certificate<'_>) -> Option<Self> {
-        let validity = cert.validity();
-        Self::from_unix_bounds(
-            validity.not_before.timestamp(),
-            validity.not_after.timestamp(),
-        )
-    }
-
-    /// Construct a window from canonical Unix seconds, failing closed on an
-    /// inverted interval. Shared by certificate parsing and the explicit-
-    /// instant test seam so both sides use the same bounds check.
-    fn from_unix_bounds(not_before_unix: i64, not_after_unix: i64) -> Option<Self> {
-        if not_after_unix < not_before_unix {
-            return None;
-        }
-        Some(Self {
-            not_before_unix,
-            not_after_unix,
-        })
-    }
-
-    /// Whether `now_unix` lies inside the closed interval. Both boundaries are
-    /// inclusive, matching RFC 5280's "valid at" semantics and
-    /// `x509_parser`'s own `Validity::is_valid_at`.
-    fn contains(&self, now_unix: i64) -> bool {
-        now_unix >= self.not_before_unix && now_unix <= self.not_after_unix
-    }
-}
-
 /// Production inclusive validity predicate at an explicit Unix instant
 /// (issue #4359). `None` is the fail-closed inverted-interval case used by
 /// `CertValidityWindow::from_certificate`. Reached through `_test_support`;
@@ -127,13 +81,21 @@ pub(crate) fn cert_validity_unix_bounds_from_der(der: &[u8]) -> Option<(i64, i64
 
 #[derive(Debug)]
 enum CertificateEvaluation {
-    /// Certificate-invariant result: the extracted identity plus the leaf's
+    /// Certificate-invariant result: the extracted identity plus the
     /// authoritative validity window, and — once the first successful
     /// evaluation converts `notAfter` — the monotonic expiry that every later
     /// cache hit must return unchanged (issue #3816). Deliberately does NOT
     /// record "was valid when evaluated": the Unix window is re-checked on
     /// every request, but the monotonic Instant is captured once so a
     /// wall-clock rollback cannot recreate a later deadline.
+    ///
+    /// The window is the leaf's, tightened by the earliest `notAfter` of the
+    /// issuer path that satisfied the configured `allowed_issuers` /
+    /// `allowed_ca_fingerprints_sha256` constraint (GHSA-jw5x-439c-78v3), so a
+    /// CA that ends before the leaf also ends the cached decision. It is
+    /// certificate-invariant in the same way the leaf window is: which path was
+    /// accepted and when each certificate on it expires do not change over the
+    /// life of a connection.
     Identity {
         identity: String,
         validity: CertValidityWindow,
@@ -390,6 +352,178 @@ fn is_valid_ca_issuer(cert: &X509Certificate<'_>) -> bool {
             .is_some_and(|usage| usage.value.key_cert_sign())
 }
 
+/// Cryptographically verified issuance graph over the client-presented chain.
+///
+/// Node `0` is the leaf; the remaining nodes are the presented chain
+/// certificates that parsed. An edge `child -> parent` exists when `parent` is a
+/// currently valid CA whose subject matches the child's issuer AND actually
+/// signed the child. Signature verification is the expensive step, so every
+/// candidate edge is verified exactly once here and every query below reuses the
+/// result — the same `O(n^2)` verification budget the previous per-constraint
+/// walks each spent on their own.
+struct PresentedChain<'a> {
+    /// Parsed certificates. Index `0` is the leaf.
+    certs: Vec<X509Certificate<'a>>,
+    /// DER bytes, parallel to [`Self::certs`].
+    ders: Vec<&'a [u8]>,
+    /// `parents[i]` holds the node indexes that verifiably issued node `i`.
+    parents: Vec<Vec<usize>>,
+}
+
+impl<'a> PresentedChain<'a> {
+    /// Build the graph, or `None` when the leaf does not parse or is outside its
+    /// own validity interval — the same two refusals the previous walks made
+    /// before looking at any issuer.
+    fn build(leaf_der: &'a [u8], chain: &'a [Vec<u8>]) -> Option<Self> {
+        let (_, leaf) = X509Certificate::from_der(leaf_der).ok()?;
+        if !leaf.validity().is_valid() {
+            return None;
+        }
+
+        let mut certs = Vec::with_capacity(chain.len() + 1);
+        let mut ders = Vec::with_capacity(chain.len() + 1);
+        certs.push(leaf);
+        ders.push(leaf_der);
+        for der in chain {
+            if let Ok((_, cert)) = X509Certificate::from_der(der.as_slice()) {
+                certs.push(cert);
+                ders.push(der.as_slice());
+            }
+        }
+
+        // The leaf is never a candidate issuer, so index 0 is excluded.
+        let issuer_eligible: Vec<bool> = certs
+            .iter()
+            .enumerate()
+            .map(|(idx, cert)| idx > 0 && is_valid_ca_issuer(cert))
+            .collect();
+
+        let mut parents: Vec<Vec<usize>> = vec![Vec::new(); certs.len()];
+        for child in 0..certs.len() {
+            let mut child_parents = Vec::new();
+            for (parent, cert) in certs.iter().enumerate() {
+                if parent == child || !issuer_eligible[parent] {
+                    continue;
+                }
+                if cert.subject() != certs[child].issuer() {
+                    continue;
+                }
+                if certs[child]
+                    .verify_signature(Some(cert.public_key()))
+                    .is_ok()
+                {
+                    child_parents.push(parent);
+                }
+            }
+            parents[child] = child_parents;
+        }
+
+        Some(Self {
+            certs,
+            ders,
+            parents,
+        })
+    }
+
+    /// Widest-path bound for every node: the MAXIMUM over all verified paths
+    /// from the leaf of the EARLIEST issuer `notAfter` on that path. `None` for
+    /// a node the leaf cannot reach.
+    ///
+    /// Max-of-min is the composition the policy actually states: within one
+    /// accepted path every certificate must still be valid (earliest wins), but
+    /// alternative valid paths are alternatives (latest wins) — refusing to
+    /// consider the better one would shorten an authorization the operator's
+    /// configuration allows. The leaf's own bound is deliberately `i64::MAX`
+    /// here; the caller composes the leaf `notAfter` unconditionally.
+    fn issuer_path_bounds(&self) -> Vec<Option<i64>> {
+        let mut bounds: Vec<Option<i64>> = vec![None; self.certs.len()];
+        bounds[0] = Some(i64::MAX);
+        // Relaxation to a fixpoint. Every sweep that changes anything raises at
+        // least one node's bound to a value drawn from the finite set of node
+        // `notAfter`s, so the fixpoint is reached in at most `certs.len()`
+        // sweeps even for a cyclic presented chain.
+        for _ in 0..self.certs.len() {
+            let mut changed = false;
+            for (child, child_parents) in self.parents.iter().enumerate() {
+                let Some(child_bound) = bounds[child] else {
+                    continue;
+                };
+                for &parent in child_parents {
+                    let parent_not_after = self.certs[parent].validity().not_after.timestamp();
+                    let candidate = child_bound.min(parent_not_after);
+                    if bounds[parent].is_none_or(|existing| existing < candidate) {
+                        bounds[parent] = Some(candidate);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        bounds
+    }
+
+    /// Effective `notAfter` of the best verified path from the leaf to
+    /// `pinned_ca`, or `None` when no such path exists (the filter does not
+    /// match). `Some`/`None` here is exactly the reachability predicate the
+    /// previous per-filter flood computed; the bound is what is new.
+    fn bound_to_pinned_ca(&self, bounds: &[Option<i64>], pinned_ca_der: &[u8]) -> Option<i64> {
+        let (_, pinned_ca) = X509Certificate::from_der(pinned_ca_der).ok()?;
+        if !is_valid_ca_issuer(&pinned_ca) {
+            return None;
+        }
+        let pinned_not_after = pinned_ca.validity().not_after.timestamp();
+        let mut best: Option<i64> = None;
+        for (idx, bound) in bounds.iter().enumerate() {
+            let Some(bound) = *bound else {
+                continue;
+            };
+            if self.certs[idx].issuer() != pinned_ca.subject() {
+                continue;
+            }
+            if self.certs[idx]
+                .verify_signature(Some(pinned_ca.public_key()))
+                .is_err()
+            {
+                continue;
+            }
+            let candidate = bound.min(pinned_not_after);
+            if best.is_none_or(|existing| existing < candidate) {
+                best = Some(candidate);
+            }
+        }
+        best
+    }
+
+    /// Effective `notAfter` of the best verified path from the leaf to any
+    /// presented certificate whose SHA-256 fingerprint is allowed, or `None`
+    /// when no verified issuer matches. The leaf is never a fingerprint
+    /// candidate.
+    fn bound_to_allowed_fingerprint(
+        &self,
+        bounds: &[Option<i64>],
+        allowed: &HashSet<[u8; 32]>,
+    ) -> Option<i64> {
+        let mut best: Option<i64> = None;
+        for (idx, der) in self.ders.iter().enumerate().skip(1) {
+            let Some(bound) = bounds[idx] else {
+                continue;
+            };
+            let digest = Sha256::digest(*der);
+            let mut fingerprint = [0u8; 32];
+            fingerprint.copy_from_slice(&digest);
+            if !allowed.contains(&fingerprint) {
+                continue;
+            }
+            if best.is_none_or(|existing| existing < bound) {
+                best = Some(bound);
+            }
+        }
+        best
+    }
+}
+
 /// mTLS authentication plugin.
 ///
 /// Authenticates consumers by matching a configurable field from the client's
@@ -478,160 +612,72 @@ impl MtlsAuth {
         !self.allowed_issuers.is_empty() || !self.allowed_ca_fingerprints_sha256.is_empty()
     }
 
-    /// Verify the certificate's issuer against configured constraints.
+    /// Verify the certificate's issuer against configured constraints, and
+    /// return the effective `notAfter` of the accepted constraint path.
     ///
-    /// Returns Ok(()) if no constraints are configured or all pass.
-    /// Returns Err(reason) if a constraint fails.
+    /// `Ok(None)` means no constraint is configured, so nothing beyond the leaf
+    /// bounds the decision. `Ok(Some(unix))` is the temporal bound of the path
+    /// that actually satisfied the policy: the configured pin and the presented
+    /// issuing CAs are themselves only valid for a finite time, so an issuer
+    /// that expires before the leaf must end the authorization there rather than
+    /// let a memoized "the constraint passed" outlive it
+    /// (GHSA-jw5x-439c-78v3). When both constraint kinds are configured both
+    /// must pass, and the composed bound is the earlier of the two accepted
+    /// paths.
     fn verify_issuer_constraints(
         &self,
-        _peer_cert: &X509Certificate<'_>,
         peer_cert_der: &[u8],
         chain_der: Option<&[Vec<u8>]>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<i64>, String> {
+        let chain = chain_der.unwrap_or(&[]);
+        // One parse and one signature-verification budget for both constraints.
+        // An unusable or already-expired leaf reaches neither, exactly as the
+        // two separate walks refused it before.
+        let presented = PresentedChain::build(peer_cert_der, chain);
+        let bounds = presented
+            .as_ref()
+            .map(PresentedChain::issuer_path_bounds)
+            .unwrap_or_default();
+        let mut path_bound: Option<i64> = None;
+
         // Each filter's DN attributes were bound to the pinned certificate's
         // subject at construction. Runtime authorization therefore depends on a
         // cryptographically verified path to that pinned CA, which may be the
         // immediate issuer, an intermediate, or a root. DN labels alone are not
-        // unique CA identities.
+        // unique CA identities. Filters are alternatives, so the longest-lived
+        // matching path wins.
         if !self.allowed_issuers.is_empty() {
-            let chain = chain_der.unwrap_or(&[]);
-            let matched = self.allowed_issuers.iter().any(|filter| {
-                self.chain_reaches_pinned_ca(peer_cert_der, chain, filter.ca_cert_der.as_slice())
-            });
-            if !matched {
-                return Err(ALLOWED_ISSUER_MISMATCH.to_string());
+            let mut matched: Option<i64> = None;
+            if let Some(graph) = presented.as_ref() {
+                for filter in &self.allowed_issuers {
+                    let pinned = filter.ca_cert_der.as_slice();
+                    matched = matched.max(graph.bound_to_pinned_ca(&bounds, pinned));
+                }
             }
+            let Some(bound) = matched else {
+                return Err(ALLOWED_ISSUER_MISMATCH.to_string());
+            };
+            path_bound = Some(bound);
         }
 
-        // Check allowed_ca_fingerprints_sha256 against the chain certs
+        // Check allowed_ca_fingerprints_sha256 against the chain certs.
         if !self.allowed_ca_fingerprints_sha256.is_empty() {
-            let chain = chain_der.unwrap_or(&[]);
-            let matched = self
-                .validated_issuer_chain(peer_cert_der, chain)
-                .into_iter()
-                .any(|cert_der| {
-                    let digest = Sha256::digest(cert_der);
-                    let mut fingerprint = [0u8; 32];
-                    fingerprint.copy_from_slice(&digest);
-                    self.allowed_ca_fingerprints_sha256.contains(&fingerprint)
-                });
-            if !matched {
+            let allowed = &self.allowed_ca_fingerprints_sha256;
+            let matched = presented
+                .as_ref()
+                .and_then(|graph| graph.bound_to_allowed_fingerprint(&bounds, allowed));
+            let Some(bound) = matched else {
                 return Err(
                     "No certificate in the chain matches any allowed CA fingerprint".to_string(),
                 );
-            }
-        }
-
-        Ok(())
-    }
-
-    fn chain_reaches_pinned_ca<'a>(
-        &self,
-        leaf_der: &'a [u8],
-        chain: &'a [Vec<u8>],
-        pinned_ca_der: &[u8],
-    ) -> bool {
-        let Ok((_, leaf)) = X509Certificate::from_der(leaf_der) else {
-            return false;
-        };
-        let Ok((_, pinned_ca)) = X509Certificate::from_der(pinned_ca_der) else {
-            return false;
-        };
-        if !leaf.validity().is_valid() {
-            return false;
-        }
-
-        // 0 = unseen, 1 = reachable and pending, 2 = processed. Reusing one
-        // state vector as the work queue keeps path search iterative and
-        // bounded to O(n^2), including alternate and cyclic presented chains.
-        let mut states = vec![0u8; chain.len()];
-        let mut current = leaf;
-        loop {
-            if is_valid_ca_issuer(&pinned_ca)
-                && current.issuer() == pinned_ca.subject()
-                && current
-                    .verify_signature(Some(pinned_ca.public_key()))
-                    .is_ok()
-            {
-                return true;
-            }
-
-            for (idx, cert_der) in chain.iter().enumerate() {
-                if states[idx] != 0 {
-                    continue;
-                }
-                let Ok((_, candidate)) = X509Certificate::from_der(cert_der) else {
-                    continue;
-                };
-                if is_valid_ca_issuer(&candidate)
-                    && candidate.subject() == current.issuer()
-                    && current
-                        .verify_signature(Some(candidate.public_key()))
-                        .is_ok()
-                {
-                    states[idx] = 1;
-                }
-            }
-
-            let Some(next_idx) = states.iter().position(|state| *state == 1) else {
-                return false;
             };
-            states[next_idx] = 2;
-            let Ok((_, parsed)) = X509Certificate::from_der(&chain[next_idx]) else {
-                continue;
+            path_bound = match path_bound {
+                Some(existing) => Some(existing.min(bound)),
+                None => Some(bound),
             };
-            current = parsed;
-        }
-    }
-
-    fn validated_issuer_chain<'a>(
-        &self,
-        leaf_der: &'a [u8],
-        chain: &'a [Vec<u8>],
-    ) -> Vec<&'a [u8]> {
-        let mut verified_chain = Vec::new();
-        let Ok((_, mut current)) = X509Certificate::from_der(leaf_der) else {
-            return verified_chain;
-        };
-        if !current.validity().is_valid() {
-            return verified_chain;
         }
 
-        let mut used = vec![false; chain.len()];
-        loop {
-            let mut next_idx = None;
-            for (idx, cert_der) in chain.iter().enumerate() {
-                if used[idx] {
-                    continue;
-                }
-                let Ok((_, candidate)) = X509Certificate::from_der(cert_der) else {
-                    continue;
-                };
-                if !is_valid_ca_issuer(&candidate) || candidate.subject() != current.issuer() {
-                    continue;
-                }
-                if current
-                    .verify_signature(Some(candidate.public_key()))
-                    .is_ok()
-                {
-                    next_idx = Some(idx);
-                    break;
-                }
-            }
-
-            let Some(idx) = next_idx else {
-                break;
-            };
-            used[idx] = true;
-            verified_chain.push(chain[idx].as_slice());
-            if let Ok((_, parsed)) = X509Certificate::from_der(&chain[idx]) {
-                current = parsed;
-            } else {
-                break;
-            }
-        }
-
-        verified_chain
+        Ok(path_bound)
     }
 
     /// Extract the configured field value from a parsed X.509 certificate.
@@ -745,19 +791,36 @@ impl MtlsAuth {
         //
         // A malformed or inverted interval is not representable as a window and
         // fails closed here, before any identity is extracted.
-        let Some(validity) = CertValidityWindow::from_certificate(&parsed_cert) else {
+        let Some(leaf_validity) = CertValidityWindow::from_certificate(&parsed_cert) else {
             debug!("mtls_auth: certificate validity interval is not usable");
             return CertificateEvaluation::InvalidCertificate;
         };
 
-        if self.has_issuer_constraints()
-            && let Err(reason) = self.verify_issuer_constraints(&parsed_cert, cert_der, chain_der)
-        {
-            debug!("mtls_auth: allowed issuer constraint failed");
-            return CertificateEvaluation::Forbidden(
-                serde_json::json!({ "error": reason }).to_string(),
-            );
-        }
+        // The accepted constraint path's own expiry composes INTO the retained
+        // window (GHSA-jw5x-439c-78v3). Issuer validity is time-dependent, so a
+        // pinned or presented CA that ends before the leaf must end the cached
+        // decision — and the stream-admission deadline derived from it — there.
+        let constraint_bound = if self.has_issuer_constraints() {
+            match self.verify_issuer_constraints(cert_der, chain_der) {
+                Ok(bound) => bound,
+                Err(reason) => {
+                    debug!("mtls_auth: allowed issuer constraint failed");
+                    return CertificateEvaluation::Forbidden(
+                        serde_json::json!({ "error": reason }).to_string(),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+
+        // A constraint path that already ended before the leaf became valid
+        // leaves no usable window and fails closed, exactly like an inverted
+        // certificate interval.
+        let Some(validity) = leaf_validity.tightened_to(constraint_bound) else {
+            debug!("mtls_auth: certificate validity interval is not usable");
+            return CertificateEvaluation::InvalidCertificate;
+        };
 
         let identity = match self.extract_cert_identity(&parsed_cert, cert_der) {
             Ok(id) => id,
@@ -826,22 +889,33 @@ impl MtlsAuth {
                     r#"{"error":"Client certificate is not currently valid"}"#.into(),
                 );
             }
-            deadline
+            Some(deadline)
         } else {
-            // First successful evaluation: convert `notAfter` once. An
-            // unrepresentable conversion fails closed and does not populate the
-            // slot, so a later request retries rather than caching a bogus Instant.
-            let Some(converted) =
-                auth_flow::try_credential_deadline_from_unix_seconds(validity.not_after_unix, 0)
-            else {
-                debug!(
-                    "mtls_auth: certificate expiry is not representable as a monotonic deadline"
-                );
-                return VerifyOutcome::Invalid(r#"{"error":"Invalid client certificate"}"#.into());
-            };
-            match monotonic_expiry.set(converted) {
-                Ok(()) => converted,
-                Err(_) => monotonic_expiry.get().copied().unwrap_or(converted),
+            // First successful evaluation: convert `notAfter` once. An unusable
+            // interval fails closed and does not populate the slot, so a later
+            // request retries rather than caching a bogus Instant.
+            let converted =
+                auth_flow::try_credential_deadline_from_unix_seconds(validity.not_after_unix, 0);
+            match converted {
+                CredentialDeadline::Bounded(deadline) => match monotonic_expiry.set(deadline) {
+                    Ok(()) => Some(deadline),
+                    Err(_) => Some(monotonic_expiry.get().copied().unwrap_or(deadline)),
+                },
+                // A valid leaf whose `notAfter` outruns the representable
+                // monotonic range is not an invalid certificate (issue #5396):
+                // admit it with no credential bound and let the finite
+                // authenticated-stream maximum bound the session. The slot stays
+                // empty so a later request can still capture a real deadline.
+                CredentialDeadline::Unbounded => {
+                    debug!("mtls_auth: certificate expiry is beyond the monotonic deadline range");
+                    None
+                }
+                CredentialDeadline::Invalid => {
+                    debug!("mtls_auth: certificate expiry cannot bound a live credential");
+                    return VerifyOutcome::Invalid(
+                        r#"{"error":"Invalid client certificate"}"#.into(),
+                    );
+                }
             }
         };
 
@@ -854,8 +928,9 @@ impl MtlsAuth {
             // The authoritative certificate bound published on the shared
             // protocol-neutral contract. Cache hits return the Instant captured
             // above, never a newly derived later value.
-            Some(consumer) => VerifyOutcome::consumer(consumer)
-                .with_credential_deadline(Some(credential_deadline)),
+            Some(consumer) => {
+                VerifyOutcome::consumer(consumer).with_credential_deadline(credential_deadline)
+            }
             None => VerifyOutcome::ConsumerNotFound(
                 r#"{"error":"No consumer found for client certificate"}"#.into(),
             ),

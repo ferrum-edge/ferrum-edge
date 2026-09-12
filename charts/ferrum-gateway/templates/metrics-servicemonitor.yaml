@@ -31,8 +31,7 @@ metadata:
   name: {{ include "ferrum-gateway.suffixedName" (dict "base" (include "ferrum-gateway.fullname" .) "suffix" "-metrics") }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "ferrum-gateway.labels" . | nindent 4 }}
-    app.kubernetes.io/component: gateway-metrics
+    {{- include "ferrum-gateway.labels" (dict "root" . "component" "gateway-metrics") | nindent 4 }}
     {{- with $sm.labels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

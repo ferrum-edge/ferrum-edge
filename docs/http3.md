@@ -12,6 +12,7 @@ Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxi
 - [Cross-protocol bridge](#cross-protocol-bridge)
   - [Mesh transport dispatch for the H3→gRPC bridge](#mesh-transport-dispatch-for-the-h3grpc-bridge)
 - [Buffering policy](#buffering-policy)
+- [Responses without content](#responses-without-content)
 - [Coalescing and frame cadence](#coalescing-and-frame-cadence)
 - [gRPC trailers over H3](#grpc-trailers-over-h3)
 - [Backend trailers and response header policy](#backend-trailers-and-response-header-policy)
@@ -463,6 +464,24 @@ The relay consumes the request-scoped absolute gRPC deadline across pool acquisi
 
 **Response body — streamed with coalescing when policy permits.** See below. Retry/body-plugin cases retain their existing bounded buffered response behavior.
 
+## Responses without content
+
+Native H3 responses to HEAD and responses with body-forbidden statuses (including
+204, 205, and 304) cancel the backend stream's receive direction at the response
+headers using `H3_REQUEST_CANCELLED`. They finish downstream without DATA or
+backend trailers. Cancellation is stream-scoped: the pooled QUIC connection and
+other request streams remain usable. The gateway does not drain forbidden DATA,
+so a backend that keeps sending cannot prolong the request by refreshing an idle
+read deadline, even when the response byte ceiling or read timeout is disabled.
+
+This applies to streaming and buffered native H3 responses. The decision uses
+the dispatched request method and original backend status before response hooks;
+the buffered writer also enforces the final status after hooks. Header policy
+still runs, and HEAD retains a valid representation `Content-Length` even when
+that length exceeds the response body ceiling. Existing status-specific header
+sanitization remains in effect. Ordinary response bodies retain their size,
+read-timeout, inspection, and trailer-policy handling.
+
 ## Coalescing and frame cadence
 
 Both the native H3 path and the cross-protocol bridge use the same response-side coalescing window:
@@ -876,8 +895,7 @@ This means every WebSocket plugin works on H3 sessions unchanged:
   incomplete-message frame/duration bounds
   (`FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES` /
   `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS`), installed on both framers
-  by the shared relay. H3 client frames are unmasked per RFC 9220 §5; the
-  bridge validates that rule before bytes reach the framer, so fragment
+  by the shared relay. The bridge relays client bytes verbatim, so fragment
   accounting sees exactly the same frame sequence on H1, H2, and H3
 - `on_ws_disconnect` (end-of-session bookkeeping with success-only frame/byte
   counts, direction, and `io_side` attribution)
@@ -889,24 +907,36 @@ This means every WebSocket plugin works on H3 sessions unchanged:
 - Sticky-session cookies on the 200 response (same as H1/H2)
 - All logging plugins (the `TransactionSummary` emitted at upgrade time carries `http_method = "CONNECT"`, mirroring the H2 Extended CONNECT path)
 
-### Frame masking — RFC 9220 §5 vs RFC 6455
+### Frame masking — RFC 6455 §5.1 applies unchanged on HTTP/3
 
-RFC 6455 / RFC 8441 require client-to-server WebSocket frames to be
-masked. RFC 9220 §5 REVERSES this: WebSocket frames over HTTP/3 MUST
-be unmasked because QUIC already provides packet-level authentication.
-The gateway's H3 path:
+There is no HTTP/3 masking exemption. RFC 9220 §3 adopts RFC 8441's
+Extended CONNECT mechanism, and RFC 8441 §5 then says the peers
+"proceed with the WebSocket Protocol [RFC6455] using the ... stream
+from the CONNECT transaction as if it were the TCP connection".
+Neither document mentions masking, so RFC 6455 §5.1 governs on every
+frontend: client-to-server frames MUST be masked, server-to-client
+frames MUST NOT be, and a server MUST close the connection on an
+unmasked client frame. RFC 9220 §5 is IANA Considerations.
+
+The gateway's H3 path is therefore identical to H1 and H2:
 
 - **Emits unmasked frames to the client** — `tokio_tungstenite`'s
-  `Role::Server` doesn't mask outgoing frames, so this is correct
-  on default settings.
-- **Accepts unmasked frames from the client** —
-  `accept_unmasked_frames = true` is set on the H3 path's
-  WebSocketConfig (it's `false` on the H1/H2 path).
-- **Rejects masked client frames** — the H3 receive pump pre-validates
-  WebSocket frame headers before bytes reach tungstenite's permissive
-  `accept_unmasked_frames` mode. A non-compliant H3 client that sends a
-  masked frame receives a WebSocket close frame with code `1002`
-  (protocol error), and the frame is not bridged to the backend.
+  `Role::Server` doesn't mask outgoing frames, which is what RFC 6455
+  requires of a server.
+- **Accepts and unmasks masked client frames** — the pump tasks relay
+  QUIC DATA bytes verbatim without inspecting frame headers, and the
+  shared `run_websocket_proxy` framer unmasks the payload before the
+  frame plugins run. Frames are re-encoded for the backend under the
+  backend transport's own role, so backend-facing masking is unchanged.
+- **Rejects unmasked client frames** — `accept_unmasked_frames = false`
+  on every frontend, so an unmasked client frame is a tungstenite
+  protocol error and the client is closed with code `1002` by the same
+  shared close mapping H1/H2 use.
+
+Before issue #5011 this was inverted: the H3 bridge attributed an
+unmasked-frame mandate to "RFC 9220 §5" and closed masked client frames
+with `1002`, so no standards-compliant client could exchange data over an
+H3 WebSocket route.
 
 ### Tunnel mode
 
@@ -915,10 +945,6 @@ apply to H3 sessions. The H3 frontend has no raw TCP underneath QUIC to
 splice; bytes always pass through the pump tasks. Operators who set
 tunnel mode for H1/H2 throughput automatically get frame-parsing
 semantics on H3 — frame-level plugins continue to work regardless.
-The generic `run_websocket_proxy` carries a `debug_assert!` enforcing
-this invariant (`websocket_tunnel_mode` and `accept_unmasked_client_frames`
-are mutually exclusive) so a future refactor that wires a non-TCP
-transport into the raw-copy fast path fails loudly in debug builds.
 
 ### Circuit breaker, load balancer, graceful drain
 
@@ -1021,9 +1047,11 @@ End-to-end functional coverage lives in
 `tests/functional/functional_websocket_test.rs`. The tree ships a small
 h3-quinn-based RFC 9220 client because common off-the-shelf clients
 (curl 8.x, h2load, tungstenite) still focus on WebSocket over HTTP/1.1
-/ HTTP/2. The functional shard covers H3 text/binary frame relay,
-masked-frame permissiveness, subprotocol forwarding and the no-subprotocol
-case, backend retry target rotation, failed backend upgrade responses,
+/ HTTP/2. That client masks its frames per RFC 6455 §5.1, like every
+real WebSocket client. The functional shard covers H3 text/binary frame
+relay with a masking client, the `1002` refusal of an unmasked client
+frame, subprotocol forwarding and the no-subprotocol case, backend
+retry target rotation, failed backend upgrade responses,
 per-IP request-slot release after the 200 CONNECT response, and
 `FERRUM_HTTP3_WEBSOCKET_ENABLED=false` rejecting Extended CONNECT while
 plain H3 requests continue to route.
@@ -1568,7 +1596,15 @@ for the upstream retirement plan.
 
 ## Flow-control window tuning
 
-The default QUIC flow-control windows are conservative because the H3 listener serves untrusted clients: 256 KiB per stream, 2 MiB receive budget per connection, and 2 MiB send budget per connection. The connection-level receive window is the aggregate governor, so active per-stream receive windows cannot exceed the connection receive budget in total. Memory budget per QUIC connection scales with `FERRUM_HTTP3_RECEIVE_WINDOW + FERRUM_HTTP3_SEND_WINDOW`; raise these values only after benchmarking a workload that benefits from larger windows. Explicit env values continue to override these defaults. Note: the H3 *backend* pool (gateway-to-upstream) uses larger windows internally (8 MiB stream / 32 MiB connection / 8 MiB send) — these are not exposed as env vars. Larger windows do **not** replace the declared-frame-length bound: pooled backend connections still install `max_buffered_frame_len` from `FERRUM_MAX_HEADER_SIZE_BYTES`, because an H3 backend is a hostile network boundary.
+The QUIC flow-control windows are split by **trust plane**, because the frontend listener and the backend pools face different peers.
+
+The *frontend* defaults are conservative because the H3 listener serves untrusted clients: 256 KiB per stream, 2 MiB receive budget per connection, and 2 MiB send budget per connection (`FERRUM_HTTP3_STREAM_RECEIVE_WINDOW`, `FERRUM_HTTP3_RECEIVE_WINDOW`, `FERRUM_HTTP3_SEND_WINDOW`). The connection-level receive window is the aggregate governor, so active per-stream receive windows cannot exceed the connection receive budget in total. Memory budget per QUIC connection scales with `FERRUM_HTTP3_RECEIVE_WINDOW + FERRUM_HTTP3_SEND_WINDOW`; raise these values only after benchmarking a workload that benefits from larger windows.
+
+The *backend* pool (gateway-to-upstream) has its own triple — 8 MiB stream / 32 MiB connection / 8 MiB send — tunable with `FERRUM_HTTP3_BACKEND_STREAM_RECEIVE_WINDOW`, `FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW`, and `FERRUM_HTTP3_BACKEND_SEND_WINDOW`. Keeping the planes separate is the point: a single shared triple meant restoring backend throughput also re-opened the untrusted-client amplification exposure that the hardened frontend defaults closed (issue #4755). Every backend QUIC connection — the pooled direct-backend dial, the explicit-target/retry dial, and the standalone `Http3Client` — is built from one shared `build_backend_transport_config`, so no backend path can silently fall back to quinn's own defaults.
+
+Both triples are validated at startup with the same bounds: `0` is refused (a zero credit budget stalls the connection in that direction) and the four receive windows must fit in a QUIC variable-length integer (`[1, 2^62-1]`).
+
+Larger windows do **not** replace the declared-frame-length bound: pooled backend connections still install `max_buffered_frame_len` from `FERRUM_MAX_HEADER_SIZE_BYTES`, because an H3 backend is a hostile network boundary.
 
 The frontend HTTP/2 listener applies the same conservative-by-default philosophy via `FERRUM_FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE` (256 KiB), `FERRUM_FRONTEND_H2_INITIAL_CONNECTION_WINDOW_SIZE` (2 MiB), and `FERRUM_FRONTEND_H2_MAX_FRAME_SIZE` (16 KiB). These are independent of the backend pool `FERRUM_POOL_HTTP2_*` env vars. For benchmarking or trusted-network deployments, raise the frontend H2 values to match the backend pool defaults (8 MiB stream / 32 MiB connection / 1 MiB frame).
 
@@ -1577,11 +1613,14 @@ The frontend HTTP/2 listener applies the same conservative-by-default philosophy
 | Variable | Default | Purpose |
 |---|---|---|
 | `FERRUM_ENABLE_HTTP3` | `false` | Enable the QUIC listener |
-| `FERRUM_HTTP3_IDLE_TIMEOUT` | `30` | QUIC idle timeout (seconds). `0` disables the idle timer (RFC 9000 §10.1). When `FERRUM_HTTP3_CONNECT_UDP_ENABLED=true` the **frontend** listener raises this to at least `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS` (never lowers it, and never raises `0`); the raise is logged. H3 backend pools keep the configured value. See [the tunnel/connection idle note](#the-tunnel-idle-timeout-and-the-quic-connection-idle-timeout). |
+| `FERRUM_HTTP3_IDLE_TIMEOUT` | `30` | QUIC idle timeout (seconds). `0` disables the idle timer (RFC 9000 §10.1). When `FERRUM_HTTP3_CONNECT_UDP_ENABLED=true` the **frontend** listener raises this to at least `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS` (never lowers it, and never raises `0`); the raise is logged. H3 backend pools install this configured value on their own QUIC transport, and `0` leaves their idle timer disabled too. See [the tunnel/connection idle note](#the-tunnel-idle-timeout-and-the-quic-connection-idle-timeout). |
 | `FERRUM_HTTP3_MAX_STREAMS` | `1000` | Max concurrent streams per QUIC connection |
-| `FERRUM_HTTP3_STREAM_RECEIVE_WINDOW` | `262,144` | Per-stream QUIC flow-control window (256 KiB — frontend default; raise for high-throughput workloads) |
-| `FERRUM_HTTP3_RECEIVE_WINDOW` | `2,097,152` | Connection-level QUIC flow-control window (2 MiB — frontend default; raise for high-throughput workloads) |
-| `FERRUM_HTTP3_SEND_WINDOW` | `2,097,152` | Connection-level send window (2 MiB — frontend default) |
+| `FERRUM_HTTP3_STREAM_RECEIVE_WINDOW` | `262,144` | **Frontend** per-stream QUIC flow-control window (256 KiB; raise for high-throughput workloads). Must be in `[1, 2^62-1]`. |
+| `FERRUM_HTTP3_RECEIVE_WINDOW` | `2,097,152` | **Frontend** connection-level QUIC flow-control window (2 MiB; raise for high-throughput workloads). Must be in `[1, 2^62-1]`. |
+| `FERRUM_HTTP3_SEND_WINDOW` | `2,097,152` | **Frontend** connection-level send window (2 MiB). Must be greater than 0. |
+| `FERRUM_HTTP3_BACKEND_STREAM_RECEIVE_WINDOW` | `8,388,608` | **Backend** pool per-stream QUIC flow-control window (8 MiB). Independent of the frontend knob — see [Flow-control window tuning](#flow-control-window-tuning). Must be in `[1, 2^62-1]`. |
+| `FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW` | `33,554,432` | **Backend** pool connection-level QUIC flow-control window (32 MiB), the aggregate governor for every multiplexed stream on one backend connection. Must be in `[1, 2^62-1]`. |
+| `FERRUM_HTTP3_BACKEND_SEND_WINDOW` | `8,388,608` | **Backend** pool connection-level send window (8 MiB). Must be greater than 0. |
 | `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` | `4` | H3 backend pool connections per target |
 | `FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS` | `120` | H3 backend connection idle eviction |
 | `FERRUM_HTTP3_COALESCE_MIN_BYTES` | `32,768` | Response coalesce flush target. Clamped to `[H3_COALESCE_MIN_FLOOR=1 KiB, H3_COALESCE_MAX_CAP=1 MiB]`. |

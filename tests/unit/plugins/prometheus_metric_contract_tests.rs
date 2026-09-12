@@ -43,6 +43,7 @@ const API_CHARGEBACK_FAMILIES: &[&str] = &[
     "ferrum_api_chargeback_registry_max_entries",
     "ferrum_api_chargeback_registry_max_retained_bytes",
     "ferrum_api_chargeback_registry_retained_bytes",
+    "ferrum_api_chargeback_uncollected_retained_entries",
     "ferrum_api_charges_total",
     "ferrum_api_stream_connection_charges_total",
     "ferrum_api_stream_connections_total",
@@ -772,6 +773,7 @@ fn representative_exposition() -> String {
     let mut output = registry.render_uncached();
     output.push_str(&ferrum_edge::plugins::utils::jwks_cache::render_prometheus());
     output.push_str(&ferrum_edge::observability_delivery::render_prometheus());
+    output.push_str(&ferrum_edge::plugins::utils::sink_loss::render_prometheus());
     output.push_str(&ferrum_edge::notifications::render_delivery_prometheus());
 
     let bpf =

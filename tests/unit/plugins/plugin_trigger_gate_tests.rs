@@ -132,6 +132,7 @@ async fn run_request(
 }
 
 fn published(config: &GatewayConfig, proxy_id: &str) -> Vec<Arc<dyn Plugin>> {
+    super::plugin_utils::ensure_basic_auth_test_secret();
     let cache = PluginCache::new(config).expect("plugin cache builds");
     cache.get_plugins(NS, proxy_id).as_ref().clone()
 }
@@ -1905,6 +1906,17 @@ async fn a_non_identity_trigger_removes_an_auth_plugin_from_the_effective_reques
     );
     let plugins = published(&cfg, "api");
     let consumer_index = ConsumerIndex::new(&[]);
+
+    assert!(plugins.iter().all(|plugin| plugin.has_execution_trigger()));
+    let mut unconditional = cfg.clone();
+    unconditional.plugin_configs[0].trigger = None;
+    // A priority-only wrapper must not be diagnosed as trigger-gated.
+    unconditional.plugin_configs[0].priority_override = Some(1050);
+    assert!(
+        published(&unconditional, "api")
+            .iter()
+            .all(|plugin| !plugin.has_execution_trigger())
+    );
 
     let mut public = request("GET", "/api/public");
     for plugin in &plugins {

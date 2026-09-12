@@ -41,6 +41,9 @@
 //! - [`ScriptedH2Backend::step_errors`] — non-empty if any script step
 //!   failed. Tests SHOULD call `assert_no_step_errors()` to surface silent
 //!   fixture failures.
+//! - [`ScriptedH2Backend::accept_log`] — bounded, non-payload accept ledger
+//!   (index, peer socket, milliseconds since the fixture started) used to
+//!   attribute an unexpected connection (issue #4720)
 
 use bytes::Bytes;
 use h2::server::Builder as H2Builder;
@@ -50,12 +53,13 @@ use http::{HeaderMap, Request, Response, StatusCode};
 use rustls::ServerConfig;
 use rustls_pemfile::{certs, private_key};
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
@@ -390,6 +394,8 @@ impl ScriptedH2BackendBuilder {
             streams: Mutex::new(Vec::new()),
             step_errors: Mutex::new(Vec::new()),
             connection_aborts: StdMutex::new(Vec::new()),
+            accept_log: StdMutex::new(Vec::new()),
+            started: Instant::now(),
             test_signal: test_signal_rx,
         });
         let state_task = state.clone();
@@ -410,6 +416,11 @@ impl ScriptedH2BackendBuilder {
                         let Ok((tcp, peer_addr)) = accept_result else { continue; };
                         let connection_index =
                             state_task.accepted.fetch_add(1, Ordering::SeqCst) as usize;
+                        // Issue #4720: record the accept before a single
+                        // protocol byte is read, so a connection that never
+                        // completes a handshake is still attributable.
+                        let accept_record =
+                            state_task.record_accept(connection_index, port, peer_addr);
                         let script = connection_scripts
                             .get(connection_index)
                             .or_else(|| connection_scripts.last())
@@ -434,17 +445,20 @@ impl ScriptedH2BackendBuilder {
                                         )
                                         .await
                                     }
-                                    Err(e) => Err(format!("TLS handshake failed: {e}")),
+                                    Err(e) => Err(format!("{TLS_HANDSHAKE_FAILED_PREFIX} {e}")),
                                 }
                             } else {
                                 run_h2_connection(tcp, settings, script, repeat_script, conn_state)
                                     .await
                             };
                             if let Err(mut msg) = result {
-                                if msg.contains("preface_kind=") {
-                                    msg.push_str(&format!(
-                                        "; backend_port={port} peer={peer_addr} connection_index={connection_index}"
-                                    ));
+                                // Attach connection identity to every handshake
+                                // failure the fixture is going to surface, and
+                                // to none it treats as benign: a benign
+                                // disconnect must keep the exact text the
+                                // closed allowlist recognizes (issue #4720).
+                                if wants_connection_identity(&msg) {
+                                    msg.push_str(&format!("; {accept_record}"));
                                 }
                                 err_sink.step_errors.lock().await.push(msg);
                             }
@@ -569,6 +583,18 @@ impl ScriptedH2Backend {
         self.state.step_errors.lock().await.clone()
     }
 
+    /// Bounded, non-payload ledger of accepted connections (issue #4720).
+    ///
+    /// Each entry carries the accept index, the peer socket the kernel
+    /// reported and the milliseconds since this fixture started listening. No
+    /// request, header or payload byte is retained. Use it to attribute a
+    /// connection this fixture did not expect: the peer port names the sending
+    /// socket, and the relative timestamp places it against a test running
+    /// concurrently in the same binary.
+    pub fn accept_log(&self) -> Vec<AcceptRecord> {
+        self.state.accept_log_snapshot()
+    }
+
     /// Panic if any script step returned an error other than a known-benign
     /// client/probe disconnect (see [`is_benign_script_step_error`]), including
     /// a peer that vanished during the pre-script H2 settings handshake.
@@ -579,10 +605,20 @@ impl ScriptedH2Backend {
             .filter(|error| !is_benign_script_step_error(error))
             .collect();
         if !unexpected.is_empty() {
+            // Issue #4720: print the whole bounded accept ledger, not only the
+            // failing connection. An unexpected connection is only explicable
+            // next to the ones the test did expect.
+            let accepts: Vec<String> = self
+                .accept_log()
+                .iter()
+                .map(|record| record.to_string())
+                .collect();
             panic!(
-                "{} script step error(s): {:?}",
+                "{} script step error(s): {:?}; accepted={} accept_log={:?}",
                 unexpected.len(),
-                unexpected
+                unexpected,
+                self.accepted_connections(),
+                accepts
             );
         }
     }
@@ -609,6 +645,35 @@ impl Drop for ScriptedH2Backend {
     }
 }
 
+/// One accepted TCP connection, recorded before any protocol byte is read.
+///
+/// Non-payload by construction: an index, the peer socket the kernel reported,
+/// and the milliseconds since the fixture started listening. Issue #4720 needs
+/// exactly this to attribute an unexpected connection to a sender, and nothing
+/// more — no bytes, no headers, no request identity.
+#[derive(Clone, Copy, Debug)]
+pub struct AcceptRecord {
+    pub index: usize,
+    pub backend_port: u16,
+    pub peer: SocketAddr,
+    pub since_start_ms: u128,
+}
+
+impl std::fmt::Display for AcceptRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "#{} backend_port={} peer={} t=+{}ms",
+            self.index, self.backend_port, self.peer, self.since_start_ms
+        )
+    }
+}
+
+/// Upper bound on retained accept records. A fixture that accepts more than
+/// this has a different problem than the one this ledger diagnoses, and an
+/// unbounded ledger would grow with a soak test.
+const ACCEPT_LOG_CAPACITY: usize = 64;
+
 struct H2State {
     accepted: AtomicU32,
     handshakes: AtomicU32,
@@ -626,10 +691,39 @@ struct H2State {
     streams: Mutex<Vec<ReceivedStream>>,
     step_errors: Mutex<Vec<String>>,
     connection_aborts: StdMutex<Vec<AbortHandle>>,
+    /// Bounded, non-payload ledger of accepted connections (issue #4720).
+    accept_log: StdMutex<Vec<AcceptRecord>>,
+    /// Fixture start, so every accept carries a relative timestamp that can be
+    /// lined up against a concurrently running test in the same binary.
+    started: Instant,
     test_signal: watch::Receiver<bool>,
 }
 
 impl H2State {
+    fn record_accept(&self, index: usize, backend_port: u16, peer: SocketAddr) -> AcceptRecord {
+        let record = AcceptRecord {
+            index,
+            backend_port,
+            peer,
+            since_start_ms: self.started.elapsed().as_millis(),
+        };
+        let mut guard = match self.accept_log.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard.len() < ACCEPT_LOG_CAPACITY {
+            guard.push(record);
+        }
+        record
+    }
+
+    fn accept_log_snapshot(&self) -> Vec<AcceptRecord> {
+        match self.accept_log.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
     fn track_connection(&self, abort: AbortHandle) {
         if let Ok(mut guard) = self.connection_aborts.lock() {
             guard.retain(|h| !h.is_finished());
@@ -777,19 +871,29 @@ where
         .handshake::<_, Bytes>(observed_io)
         .await
         .map_err(|e| {
-            if e.reason() == Some(Reason::PROTOCOL_ERROR) {
-                let prefix = observation
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                format!(
-                    "h2 handshake failed: {e}; preface_kind={} observed_bytes={}",
-                    prefix.kind(),
-                    prefix.len
-                )
-            } else {
-                // Keep existing exact disconnect classifications unchanged.
-                format!("h2 handshake failed: {e}")
+            let base = format!("{H2_HANDSHAKE_FAILED_PREFIX} {e}");
+            // Keep existing exact disconnect classifications unchanged: a
+            // benign client/probe disconnect is matched against its exact
+            // text, so appending anything would turn ordinary scheduling
+            // noise into a test failure.
+            //
+            // Everything else is classified (issue #4720). This deliberately
+            // covers more than `PROTOCOL_ERROR`: an unexpected connection that
+            // opens and closes before writing a preface reports
+            // `connection closed before reading preface`, which is exactly the
+            // class the mirror-fixture investigation still has to attribute,
+            // and it carried no preface category at all before.
+            if is_benign_script_step_error(&base) {
+                return base;
             }
+            let prefix = observation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            format!(
+                "{base}; preface_kind={} observed_bytes={}",
+                prefix.kind(),
+                prefix.len
+            )
         })?;
     state.handshakes.fetch_add(1, Ordering::SeqCst);
 
@@ -1283,6 +1387,7 @@ fn build_server_config_with_alpn(
 /// Prefix for failures in [`run_h2_connection`] before the script starts — the
 /// H2 settings exchange on an accepted TCP/TLS stream.
 const H2_HANDSHAKE_FAILED_PREFIX: &str = "h2 handshake failed:";
+const TLS_HANDSHAKE_FAILED_PREFIX: &str = "TLS handshake failed:";
 
 /// Substrings for client-disconnect errors scripted TLS/H2 backends may record
 /// when a peer vanishes mid-handshake or without a clean shutdown. Closed
@@ -1342,6 +1447,20 @@ pub(crate) fn is_benign_script_step_error(error: &str) -> bool {
         || BENIGN_SCRIPT_STEP_ERROR_SUBSTRINGS
             .iter()
             .any(|needle| error.contains(needle))
+}
+
+/// Returns true when `error` is a handshake failure the fixture is going to
+/// surface, so the accepted connection's identity belongs on it (issue #4720).
+///
+/// A benign client/probe disconnect is deliberately excluded. Those are
+/// recognized by their exact std-IO text, so appending an identity suffix would
+/// reclassify ordinary scheduling noise as a fixture failure. A script-step
+/// error is excluded too: it is raised after the handshake completed, when the
+/// connection under test is already the one the script accepted.
+fn wants_connection_identity(error: &str) -> bool {
+    (error.starts_with(H2_HANDSHAKE_FAILED_PREFIX)
+        || error.starts_with(TLS_HANDSHAKE_FAILED_PREFIX))
+        && !is_benign_script_step_error(error)
 }
 
 #[cfg(test)]
@@ -1593,5 +1712,91 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(backend.received_stream_count(), 1);
+    }
+
+    /// Issue #4720: an accept record carries an index, a peer socket and a
+    /// relative timestamp, and nothing that could be a payload byte.
+    #[test]
+    fn accept_record_reports_identity_without_payload() {
+        let record = AcceptRecord {
+            index: 3,
+            backend_port: 8080,
+            peer: "127.0.0.1:54321".parse().expect("peer"),
+            since_start_ms: 1_234,
+        };
+        assert_eq!(
+            record.to_string(),
+            "#3 backend_port=8080 peer=127.0.0.1:54321 t=+1234ms"
+        );
+    }
+
+    /// Issue #4720: identity is attached to the handshake failures a test will
+    /// see, and withheld from the benign disconnects whose exact text the
+    /// closed allowlist matches.
+    #[test]
+    fn connection_identity_is_attached_only_to_surfaced_handshake_failures() {
+        // The originally reported class: a mismatched HTTP/2 preface.
+        assert!(wants_connection_identity(
+            "h2 handshake failed: connection error detected: unspecific protocol error detected"
+        ));
+        // The other half of the same investigation: a connection that opened
+        // and closed before writing a preface. It used to carry no category.
+        assert!(wants_connection_identity(
+            "h2 handshake failed: connection closed before reading preface"
+        ));
+        assert!(wants_connection_identity(
+            "TLS handshake failed: invalid peer certificate"
+        ));
+        // Benign client/probe disconnects keep their exact text.
+        assert!(!wants_connection_identity(
+            "h2 handshake failed: Broken pipe"
+        ));
+        assert!(!wants_connection_identity(
+            "h2 handshake failed: Broken pipe (os error 32)"
+        ));
+        assert!(!wants_connection_identity(
+            "TLS handshake failed: tls handshake eof"
+        ));
+        // A post-handshake script failure is not a handshake failure.
+        assert!(!wants_connection_identity(
+            "send_data: connection error detected: unspecific protocol error detected"
+        ));
+    }
+
+    /// Issue #4720: every accept is recorded before a protocol byte is read,
+    /// and the ledger is bounded so a soak test cannot grow it without limit.
+    #[tokio::test]
+    async fn accept_ledger_records_connections_and_stays_bounded() {
+        let reservation = reserve_port().await.expect("port");
+        let port = reservation.port;
+        let backend = ScriptedH2Backend::builder_plain(reservation.into_listener())
+            .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+            .spawn()
+            .expect("spawn");
+
+        // A connection that never writes an HTTP/2 preface is exactly the
+        // shape under investigation, and must still be attributable.
+        let socket = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp connect");
+        let local = socket.local_addr().expect("local addr");
+        for _ in 0..40 {
+            if backend.accepted_connections() >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        drop(socket);
+
+        let log = backend.accept_log();
+        assert!(!log.is_empty(), "the accept must be recorded");
+        assert!(
+            log.len() <= ACCEPT_LOG_CAPACITY,
+            "the ledger must stay bounded; len={}",
+            log.len()
+        );
+        let first = log[0];
+        assert_eq!(first.index, 0);
+        assert_eq!(first.peer.port(), local.port());
     }
 }

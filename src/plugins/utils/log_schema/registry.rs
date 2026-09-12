@@ -397,6 +397,7 @@ mod tests {
             metadata: MetadataPolicy::Nested,
             timestamp_format: TimestampFormat::Rfc3339,
             capability_scoped: false,
+            flatten_reserved: Default::default(),
         })
     }
 

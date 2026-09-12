@@ -249,6 +249,7 @@ async fn test_all_plugins_available() {
 
 #[tokio::test]
 async fn test_plugin_creation_all_plugins() {
+    super::plugin_utils::ensure_basic_auth_test_secret();
     for plugin_name in available_plugins() {
         // Some plugins now require specific config fields
         let config = match plugin_name {
@@ -374,6 +375,7 @@ async fn test_plugin_creation_all_plugins() {
                 }
             }),
             "a2a_gateway" => json!({
+                "discovery": {"rewrite_agent_card_urls": false},
                 "mode": "transparent_proxy",
                 "endpoint": {
                     "path": "/a2a",
@@ -397,7 +399,8 @@ async fn test_plugin_creation_all_plugins() {
             }),
             "ldap_auth" => json!({
                 "ldap_url": "ldaps://ldap.example.com:636",
-                "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+                "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+                "canonical_identity_attribute": "uid"
             }),
             "cors" => json!({"allowed_origins": ["*"]}),
             "response_caching" => json!({"ttl_seconds": 60}),
@@ -526,6 +529,7 @@ async fn test_plugin_error_handling() {
 
 #[tokio::test]
 async fn test_plugin_configuration_validation() {
+    super::plugin_utils::ensure_basic_auth_test_secret();
     // Test that plugins handle missing config gracefully
     let empty_config = json!({});
 
@@ -586,7 +590,7 @@ async fn test_plugin_complex_configurations() {
                 "rules": [
                     {"operation": "add", "target": "header", "key": "X-Request-ID", "value": "{{request_id}}"},
                     {"operation": "add", "target": "header", "key": "X-Timestamp", "value": "{{timestamp}}"},
-                    {"operation": "add", "target": "header", "key": "X-Forwarded-For", "value": "{{client_ip}}"},
+                    {"operation": "add", "target": "header", "key": "X-Client-Label", "value": "test-client"},
                     {"operation": "remove", "target": "header", "key": "X-Internal"},
                     {"operation": "remove", "target": "header", "key": "X-Debug"}
                 ]

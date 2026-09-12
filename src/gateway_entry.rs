@@ -682,6 +682,34 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
             "raised soft FD limit to hard cap"
         );
     }
+    // Classify the resulting soft cap for the FD load-shedding tier (issue
+    // #4787). An unlimited hard cap used to make `fd_max` `i64::MAX` and the
+    // tier permanently inert with no diagnostic; now it is either measured
+    // against the platform ceiling or explicitly disabled, and said out loud
+    // here as well as on `/overload`.
+    match overload::classify_fd_limit(fd_raise.soft_after) {
+        overload::FdLimitVerdict::ClampedToPlatformCeiling(ceiling) => {
+            info!(
+                soft_after = fd_raise.soft_after,
+                hard = fd_raise.hard,
+                platform_ceiling = ceiling,
+                "FD hard cap is unlimited; FD pressure shedding will measure against the \
+                 platform ceiling instead"
+            );
+        }
+        overload::FdLimitVerdict::NotEnforceable if fd_raise.soft_after > 0 => {
+            warn!(
+                soft_after = fd_raise.soft_after,
+                hard = fd_raise.hard,
+                "FD hard cap is unlimited and this platform publishes no enforceable ceiling; \
+                 FD-based load shedding is DISABLED (/overload reports \
+                 pressure.file_descriptors.enforced=false). Set a finite LimitNOFILE= / \
+                 --ulimit nofile= to re-enable it; connection- and request-based shedding are \
+                 unaffected"
+            );
+        }
+        _ => {}
+    }
     if fd_raise.soft_after > 0 && fd_raise.soft_after < overload::FD_HARD_LIMIT_PRODUCTION_FLOOR {
         warn!(
             soft_before = fd_raise.soft_before,
@@ -890,6 +918,11 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         );
         rt_builder.max_blocking_threads(blocking);
     }
+    // Size the io_uring splice relay cap from the same pool the relays draw
+    // their blocking threads from (issue #4786). Seeded before the runtime is
+    // built so the first relay already observes the derived value; only
+    // `EnvConfig` knows how much of the pool the relay path may claim.
+    proxy::tcp_proxy::initialize_io_uring_splice_limit(env_config.blocking_threads);
     let rt = match rt_builder.build() {
         Ok(rt) => rt,
         Err(e) => {
@@ -930,9 +963,44 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
         let shutdown_tx_signal = shutdown_tx.clone();
 
-        // Graceful shutdown handler
+        // Signal observer (issue #4829). Deliberately keeps listening after
+        // the first signal: a second SIGTERM/SIGINT is an operator or
+        // orchestrator saying "stop now", and swallowing it silently left
+        // SIGKILL — which skips every cleanup phase — as the only escalation.
+        // Splitting the observer from the drain sequencer below matters: the
+        // pre-drain sleep must not be what stops the repeat from being seen.
+        let (first_signal_tx, first_signal_rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
-            let ctrl_c = tokio::signal::ctrl_c();
+            let mut first_signal_tx = Some(first_signal_tx);
+            let mut observed: u32 = 0;
+            let mut on_signal = move |name: &'static str, count: u32| {
+                match overload::classify_shutdown_signal(count) {
+                    overload::ShutdownSignalAction::InitiateDrain => {
+                        info!("{} received, initiating graceful shutdown...", name);
+                        if let Some(tx) = first_signal_tx.take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                    overload::ShutdownSignalAction::Escalate => {
+                        overload::escalate_shutdown();
+                        warn!(
+                            signal = name,
+                            "{} received again during shutdown — skipping the remaining drain \
+                             and exiting as soon as the fixed cleanup phases finish",
+                            name
+                        );
+                    }
+                    overload::ShutdownSignalAction::AlreadyEscalated => {
+                        warn!(
+                            signal = name,
+                            "{} received again; shutdown is already escalated and the fixed \
+                             cleanup phases are running — send SIGKILL to stop immediately \
+                             without them",
+                            name
+                        );
+                    }
+                }
+            };
 
             #[cfg(unix)]
             {
@@ -944,22 +1012,46 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
                         return;
                     }
                 };
-                tokio::select! {
-                    _ = ctrl_c => {
-                        info!("SIGINT received, initiating graceful shutdown...");
+                // SIGINT gets its own stream rather than `tokio::signal::ctrl_c()`
+                // so repeats are observable; `ctrl_c()` is a one-shot future.
+                let mut sigint = match signal(SignalKind::interrupt()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("Failed to register SIGINT handler: {}", e);
+                        return;
                     }
-                    _ = sigterm.recv() => {
-                        info!("SIGTERM received, initiating graceful shutdown...");
-                    }
+                };
+                loop {
+                    let name = tokio::select! {
+                        _ = sigint.recv() => "SIGINT",
+                        _ = sigterm.recv() => "SIGTERM",
+                    };
+                    observed = observed.saturating_add(1);
+                    on_signal(name, observed);
                 }
             }
 
             #[cfg(not(unix))]
             {
-                ctrl_c.await.ok();
-                info!("Ctrl+C received, initiating graceful shutdown...");
+                loop {
+                    if tokio::signal::ctrl_c().await.is_err() {
+                        error!("Failed to await Ctrl+C notification");
+                        return;
+                    }
+                    observed = observed.saturating_add(1);
+                    on_signal("Ctrl+C", observed);
+                }
             }
+        });
 
+        // Drain sequencer: publishes readiness, holds the optional pre-drain
+        // window, then fires the shutdown broadcast.
+        tokio::spawn(async move {
+            if first_signal_rx.await.is_err() {
+                // The observer task exited without ever seeing a signal
+                // (handler registration failed); it already logged why.
+                return;
+            }
             // Publish the draining verdict BEFORE the shutdown channel closes
             // the accept loops. `/health` and `/status` report `ready:false`
             // (503) from here on while `/live` stays 200, so an orchestrator
@@ -972,7 +1064,14 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
                     predrain_seconds = shutdown_predrain.as_secs(),
                     "Pre-drain: reporting not-ready while listeners keep accepting"
                 );
-                tokio::time::sleep(shutdown_predrain).await;
+                // A repeated signal cuts the window short: an operator asking
+                // twice does not want to keep accepting new connections.
+                tokio::select! {
+                    _ = tokio::time::sleep(shutdown_predrain) => {}
+                    _ = overload::shutdown_escalation_token().cancelled() => {
+                        warn!("Pre-drain window cut short by a repeated shutdown signal");
+                    }
+                }
             }
             let _ = shutdown_tx_signal.send(true);
         });

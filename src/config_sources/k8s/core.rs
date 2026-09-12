@@ -993,26 +993,37 @@ fn endpoint_backend_port(
     service_port: u16,
     slice: &CoreEndpointSlice,
 ) -> Option<u16> {
-    match service_port_spec.and_then(|port| port.target_port.as_ref()) {
-        Some(ServiceTargetPort::Number(port)) if *port != 0 => Some(*port),
-        Some(ServiceTargetPort::Name(name)) => slice
+    // EndpointSlice port names correspond to Service port names, not named
+    // targetPorts (which name container ports). The slice already resolved
+    // the container number and is authoritative for direct endpoint dials.
+    let endpoint_port = if let Some(name) = service_port_spec.and_then(|port| port.name.as_deref())
+    {
+        slice
             .ports
             .iter()
-            .find(|port| port.name.as_deref() == Some(name.as_str()))
-            .and_then(|port| port.port),
-        Some(ServiceTargetPort::Number(_)) => None,
-        None => {
-            if let Some(name) = service_port_spec.and_then(|port| port.name.as_deref())
-                && let Some(port) = slice
-                    .ports
-                    .iter()
-                    .find(|port| port.name.as_deref() == Some(name))
-                    .and_then(|port| port.port)
-            {
-                return Some(port);
-            }
-            Some(service_port)
+            .find(|port| port.name.as_deref() == Some(name))
+            .and_then(|port| port.port)
+    } else {
+        match slice.ports.as_slice() {
+            [only] if only.name.is_none() => only.port,
+            _ => None,
         }
+    };
+    match service_port_spec.and_then(|port| port.target_port.as_ref()) {
+        // Kubernetes also defaults targetPort to the Service port; neither
+        // that default nor an explicit number overrides a matching slice.
+        Some(ServiceTargetPort::Number(port)) if *port != 0 => endpoint_port.or(Some(*port)),
+        Some(ServiceTargetPort::Name(name)) => endpoint_port.or_else(|| {
+            // Preserve the existing fallback for manually managed slices
+            // whose port uses the target name rather than the Service name.
+            slice
+                .ports
+                .iter()
+                .find(|port| port.name.as_deref() == Some(name.as_str()))
+                .and_then(|port| port.port)
+        }),
+        Some(ServiceTargetPort::Number(_)) => None,
+        None => endpoint_port.or(Some(service_port)),
     }
 }
 

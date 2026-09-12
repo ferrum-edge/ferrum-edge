@@ -91,6 +91,107 @@ fn test_dns_cache() -> DnsCache {
 }
 
 #[tokio::test]
+async fn reqwest_rotation_timer_retires_old_generation_and_keeps_current_and_static_entries() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let files = generate_gateway_svid();
+    let static_files = generate_gateway_svid();
+    let env_config = EnvConfig {
+        gateway_svid_cert_path: Some(files.cert_path.clone()),
+        gateway_svid_key_path: Some(files.key_path.clone()),
+        gateway_svid_trust_bundle_path: Some(files.trust_bundle_path.clone()),
+        mesh_svid_rotation_drain_seconds: 1,
+        ..Default::default()
+    };
+    let (state, handles) = ProxyState::new(
+        GatewayConfig::default(),
+        test_dns_cache(),
+        env_config,
+        None,
+        None,
+    )
+    .expect("proxy state");
+
+    // Establish a consumed baseline before inserting entries. Otherwise the
+    // watch task's first poll could adopt the outgoing revision as its baseline.
+    state.backend_svid_rotation_tx.send_replace(7);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while state.backend_svid_generation.load(Ordering::Acquire) != 7 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("rotation consumer must observe the baseline");
+
+    let mut proxy: Proxy = serde_json::from_value(json!({
+        "id": "svid-pool-drain",
+        "listen_path": "/",
+        "backend_scheme": "https",
+        "backend_host": "localhost",
+        "backend_port": 8443,
+        "pool_idle_timeout_seconds": 3600
+    }))
+    .expect("proxy fixture");
+    proxy.normalize_fields();
+    proxy.resolved_tls.client_cert_path = Some(files.cert_path.clone());
+    proxy.resolved_tls.client_key_path = Some(files.key_path.clone());
+    let old_key = state.connection_pool.pool_key_for_warmup(&proxy);
+    assert!(old_key.contains("|svidg=7|rcfg=i3600;"), "{old_key}");
+    drop(state.connection_pool.get_client(&proxy).await.unwrap());
+
+    let mut static_proxy = proxy.clone();
+    static_proxy.resolved_tls.client_cert_path = Some(static_files.cert_path.clone());
+    static_proxy.resolved_tls.client_key_path = Some(static_files.key_path.clone());
+    let static_key = state.connection_pool.pool_key_for_warmup(&static_proxy);
+    assert!(static_key.contains("|svidg=static|rcfg="));
+    drop(
+        state
+            .connection_pool
+            .get_client(&static_proxy)
+            .await
+            .unwrap(),
+    );
+    let before = state.connection_pool.get_stats().entries_per_host;
+    assert_eq!(before.len(), 2);
+    assert!(before.contains_key(&old_key) && before.contains_key(&static_key));
+
+    // Exercise the production rotation consumer and its configured one-second
+    // delayed drain; do not call force_drain_svid_generation from the test.
+    state.backend_svid_rotation_tx.send_replace(8);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while state.backend_svid_generation.load(Ordering::Acquire) != 8 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("rotation consumer must advance the generation");
+    let current_key = state.connection_pool.pool_key_for_warmup(&proxy);
+    assert!(current_key.contains("|svidg=8|rcfg="));
+    drop(state.connection_pool.get_client(&proxy).await.unwrap());
+
+    // Ten seconds permits hosted-runner scheduling delay but is far below the
+    // 3,600-second idle timeout, so idle pruning cannot satisfy this assertion.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let entries = state.connection_pool.get_stats().entries_per_host;
+            assert!(entries.contains_key(&current_key));
+            assert!(entries.contains_key(&static_key));
+            if !entries.contains_key(&old_key) {
+                assert_eq!(entries.len(), 2);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("retired reqwest entry must leave within the rotation drain window");
+    for handle in handles {
+        handle.abort();
+    }
+}
+
+#[tokio::test]
 async fn proxy_state_loads_gateway_svid_bundle_from_env_config() {
     let files = generate_gateway_svid();
     let env_config = EnvConfig {

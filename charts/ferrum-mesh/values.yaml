@@ -311,6 +311,10 @@ injector:
     secretName: ferrum-mesh-injector-tls
     certPath: /etc/ferrum/injector/tls/tls.crt
     keyPath: /etc/ferrum/injector/tls/tls.key
+  # Set FERRUM_MESH_CAPTURE_MODE=iptables here to inject pod capture rules.
+  # The chart then promotes the injected sidecar/init image to -ebpf-tools.
+  # An explicit FERRUM_INJECTOR_SIDECAR_IMAGE must already have a tools tag
+  # (optionally tag@digest); it is preserved once, never silently rewritten.
   env:
     FERRUM_MODE: injector
   # Injector mode has no admin /live|/health surface. Defaults use a TCP probe

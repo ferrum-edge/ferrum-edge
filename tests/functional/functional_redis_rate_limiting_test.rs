@@ -4067,3 +4067,22 @@ async fn test_shared_replay_authority_live_redis_admits_exactly_one_winner() {
     delete_redis_keys_by_prefix(&prefix).await;
     println!("test_shared_replay_authority_live_redis_admits_exactly_one_winner PASSED");
 }
+
+/// Real independent gateway processes must agree on dispatch provenance.
+#[tokio::test]
+#[ignore]
+async fn test_request_deduplication_redis_dispatch_failures_preserve_execution_provenance() {
+    if !redis_is_available().await {
+        assert!(
+            std::env::var_os("FERRUM_REDIS_REQUIRED").is_none(),
+            "Redis required for dispatch provenance gate"
+        );
+        return;
+    }
+    let prefix = format!("ferrum:test:dedup-dispatch:{}", Uuid::new_v4().simple());
+    crate::scaffolding::dedup_dispatch::assert_dispatch_provenance(Some(json!({
+        "sync_mode": "redis", "redis_url": REDIS_URL, "redis_key_prefix": prefix
+    })))
+    .await;
+    delete_redis_keys_by_prefix(&prefix).await;
+}

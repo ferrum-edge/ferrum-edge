@@ -325,7 +325,6 @@ jobs:
           # the pinned live trusted tip, so a Cross surface that only the newer
           # verifier recognizes is still enforced against this pull request.
           python3 -I "$trusted_verifier" \
-            --self-test \
             --config "$proposed_cross" \
             --cargo-config "$proposed_cargo" \
             --cargo-tool-config "$proposed_cargo_tool" \

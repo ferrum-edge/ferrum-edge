@@ -1073,7 +1073,7 @@ const MESH_MODE_TEST_SOURCE: &str = include_str!(concat!(
 const CHILD_BOUND_READINESS_FIXTURES: &[&str] = &[
     "drive_dr_live_visibility",
     "drive_egress_a_to_b",
-    "drive_grpc_egress_a_to_b",
+    "drive_grpc_egress_a_to_b_at_path",
     "drive_websocket_egress_a_to_b",
     "drive_cross_cluster_egress",
     "drive_ambient_cross_cluster_egress",
@@ -1089,7 +1089,7 @@ const CHILD_BOUND_READINESS_FIXTURES: &[&str] = &[
 const DEAD_GATEWAY_VOIDING_DRIVERS: &[&str] = &[
     "drive_dr_live_visibility",
     "drive_egress_a_to_b",
-    "drive_grpc_egress_a_to_b",
+    "drive_grpc_egress_a_to_b_at_path",
     "drive_websocket_egress_a_to_b",
     "drive_cross_cluster_egress",
     "drive_ambient_cross_cluster_egress",
@@ -1456,13 +1456,19 @@ async fn functional_mesh_mode_starts_after_native_mesh_subscribe() {
                 config_protocol: "native",
                 topology: "sidecar",
                 waypoint_name: None,
-                env_overrides: Vec::new(),
+                env_overrides: vec![("FERRUM_POOL_SHARD_AMOUNT", "1".to_string())],
             },
         );
 
         let subscribe = wait_for_mesh_subscribe(&mut request_rx, STARTUP_TIMEOUT).await;
-        let inbound_listening = wait_for_tcp_port(inbound_port, STARTUP_TIMEOUT).await;
-        let outbound_listening = wait_for_tcp_port(outbound_port, Duration::from_secs(5)).await;
+        let inbound_listening =
+            wait_for_gateway_listener(&mut child, inbound_port, STARTUP_TIMEOUT)
+                .await
+                .is_ready();
+        let outbound_listening =
+            wait_for_gateway_listener(&mut child, outbound_port, Duration::from_secs(5))
+                .await
+                .is_ready();
 
         kill_child(&mut child);
         let subscribe_count = cp.subscribe_count.load(Ordering::Relaxed);
@@ -4709,6 +4715,8 @@ async fn functional_mesh_sidecar_egress_rejects_untrusted_client_gateway() {
 #[derive(Debug, Default)]
 struct GrpcEgressResponse {
     status: u16,
+    initial_headers_end_stream: bool,
+    data_frames: usize,
     headers: HashMap<String, String>,
     body: Vec<u8>,
     trailers: HashMap<String, String>,
@@ -5131,9 +5139,12 @@ async fn grpc_mesh_retry_request(
     )
     .await
     .map_err(|_| "mesh retry client connect timed out")??;
+    let framing = Arc::new(crate::scaffolding::clients::grpc::InboundResponseFraming::default());
+    let observed =
+        crate::scaffolding::clients::grpc::FrameObservingIo::new(stream, Arc::clone(&framing));
     let (mut sender, connection) = tokio::time::timeout(
         Duration::from_secs(5),
-        http2::handshake(TokioExecutor::new(), TokioIo::new(stream)),
+        http2::handshake(TokioExecutor::new(), TokioIo::new(observed)),
     )
     .await
     .map_err(|_| "mesh retry client HTTP/2 handshake timed out")??;
@@ -5187,6 +5198,7 @@ async fn grpc_mesh_retry_request(
                 .map(|value| (name.as_str().to_string(), value.to_string()))
         })
         .collect();
+    let mut data_frames = 0;
     let mut response_body = Vec::new();
     let mut response_trailers = HashMap::new();
     let mut incoming = response.into_body();
@@ -5198,6 +5210,7 @@ async fn grpc_mesh_retry_request(
             Err(_) => return Err("mesh retry response body timed out".into()),
         };
         if frame.is_data() {
+            data_frames += 1;
             if let Ok(data) = frame.into_data() {
                 response_body.extend_from_slice(&data);
             }
@@ -5215,6 +5228,8 @@ async fn grpc_mesh_retry_request(
     let _ = connection_task.await;
     Ok(GrpcEgressResponse {
         status,
+        initial_headers_end_stream: framing.initial_headers_end_stream(),
+        data_frames,
         headers,
         body: response_body,
         trailers: response_trailers,
@@ -5467,6 +5482,23 @@ async fn start_grpc_trailers_echo_backend_on(addr: SocketAddr) -> u16 {
                         .map(|c| c.to_bytes())
                         .unwrap_or_default();
 
+                    if path == "/echo.Mesh/TrailersOnly" {
+                        let body = http_body_util::Empty::<Bytes>::new()
+                            .map_err(|never| -> std::io::Error { match never {} })
+                            .boxed();
+                        return Ok::<_, hyper::Error>(
+                            hyper::Response::builder()
+                                .status(200)
+                                .header("content-type", "application/grpc")
+                                .header("grpc-status", "7")
+                                .header("grpc-message", "denied")
+                                .header("grpc-status-details-bin", "CAc=")
+                                .header("x-mesh-trailers-only", "backend")
+                                .body(body)
+                                .expect("build terminal gRPC response"),
+                        );
+                    }
+
                     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(2);
                     let _ = tx.send(Ok(Frame::data(body_bytes))).await;
                     let mut trailers = hyper::HeaderMap::new();
@@ -5482,7 +5514,7 @@ async fn start_grpc_trailers_echo_backend_on(addr: SocketAddr) -> u16 {
                         .status(200)
                         .header("content-type", "application/grpc")
                         .header("x-echo-path", &path)
-                        .body(StreamBody::new(ReceiverStream::new(rx)))
+                        .body(BodyExt::boxed(StreamBody::new(ReceiverStream::new(rx))))
                         .expect("build gRPC trailers echo response");
                     Ok::<_, hyper::Error>(response)
                 });
@@ -5529,7 +5561,10 @@ async fn grpc_egress_request_to(
         .await
         .map_err(|_| "connect timed out")??;
     let _ = stream.set_nodelay(true);
-    let io = TokioIo::new(stream);
+    let framing = Arc::new(crate::scaffolding::clients::grpc::InboundResponseFraming::default());
+    let observed =
+        crate::scaffolding::clients::grpc::FrameObservingIo::new(stream, Arc::clone(&framing));
+    let io = TokioIo::new(observed);
     let (mut sender, conn) = http2::handshake(TokioExecutor::new(), io).await?;
     let conn_task = tokio::spawn(async move {
         let _ = conn.await;
@@ -5553,6 +5588,7 @@ async fn grpc_egress_request_to(
         }
     }
 
+    let mut data_frames = 0;
     let mut body_bytes = Vec::new();
     let mut trailers = HashMap::new();
     let mut body = response.into_body();
@@ -5564,6 +5600,7 @@ async fn grpc_egress_request_to(
             Err(_) => return Err("gRPC response body timed out".into()),
         };
         if frame.is_data() {
+            data_frames += 1;
             if let Ok(data) = frame.into_data() {
                 body_bytes.extend_from_slice(&data);
             }
@@ -5581,6 +5618,8 @@ async fn grpc_egress_request_to(
 
     Ok(GrpcEgressResponse {
         status,
+        initial_headers_end_stream: framing.initial_headers_end_stream(),
+        data_frames,
         headers,
         body: body_bytes,
         trailers,
@@ -5596,6 +5635,15 @@ async fn grpc_egress_request_to(
 async fn drive_grpc_egress_a_to_b(
     topology: &str,
     client_trusted: bool,
+    converged: fn(&GrpcEgressResponse) -> bool,
+) -> Result<(GrpcEgressResponse, String), String> {
+    drive_grpc_egress_a_to_b_at_path(topology, client_trusted, "/echo.Mesh/Call", converged).await
+}
+
+async fn drive_grpc_egress_a_to_b_at_path(
+    topology: &str,
+    client_trusted: bool,
+    path: &str,
     converged: fn(&GrpcEgressResponse) -> bool,
 ) -> Result<(GrpcEgressResponse, String), String> {
     ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
@@ -5754,7 +5802,7 @@ async fn drive_grpc_egress_a_to_b(
             let observed = grpc_egress_request(
                 a_outbound_port,
                 "svc-b.ferrum.svc.cluster.local",
-                "/echo.Mesh/Call",
+                path,
                 &framed,
             )
             .await
@@ -5934,6 +5982,44 @@ async fn functional_mesh_ambient_egress_grpc_routes_a_to_b_over_hbone_with_trail
             .any(|w| w == b"ferrum-mesh-grpc-payload"),
         "the echoed gRPC payload must ride the relayed DATA frames: {resp:?}\n{logs}"
     );
+}
+
+/// Both secured egress transports must preserve the backend's initial HEADERS
+/// END_STREAM, not merely forward grpc-status as non-terminal metadata.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_grpc_trailers_only_preserves_wire_end_stream() {
+    for topology in ["sidecar", "ambient"] {
+        let (resp, logs) = drive_grpc_egress_a_to_b_at_path(
+            topology,
+            true,
+            "/echo.Mesh/TrailersOnly",
+            // Stop on the first backend-authored response, even if malformed.
+            // A successful framing assertion must never be a convergence filter.
+            |resp| resp.headers.get("x-mesh-trailers-only").map(String::as_str) == Some("backend"),
+        )
+        .await
+        .expect("secured trailers-only drive");
+        assert_eq!(resp.status, 200, "{topology}: {resp:?}\n{logs}");
+        assert!(
+            resp.initial_headers_end_stream,
+            "{topology}: {resp:?}\n{logs}"
+        );
+        assert_eq!(resp.data_frames, 0, "{topology}: {resp:?}\n{logs}");
+        assert!(resp.body.is_empty(), "{topology}: {resp:?}\n{logs}");
+        assert!(resp.trailers.is_empty(), "{topology}: {resp:?}\n{logs}");
+        for (name, expected) in [
+            ("grpc-status", "7"),
+            ("grpc-message", "denied"),
+            ("grpc-status-details-bin", "CAc="),
+        ] {
+            assert_eq!(
+                resp.headers.get(name).map(String::as_str),
+                Some(expected),
+                "{topology}: {resp:?}\n{logs}"
+            );
+        }
+    }
 }
 
 /// gRPC fail-closed negative (Ambient, issue #3728): an UNTRUSTED gateway A —
@@ -20535,6 +20621,9 @@ async fn functional_h3_plain_mixed_retry_skips_unix_and_uses_mesh_mtls() {
     let observed = peer.wait_for_http(Duration::from_secs(10)).await;
     assert_eq!(observed.method, "POST");
     assert!(observed.presented_client_spiffe(H3_MESH_GATEWAY_SPIFFE));
+    assert_eq!(observed.authority, H3_MESH_SERVICE_AUTHORITY);
+    assert_eq!(observed.path, H3_MESH_PLAIN_BACKEND_PATH);
+    assert_eq!(observed.body, payload);
     assert!(
         !socket_path.exists(),
         "H3 must never create/dial the Unix socket"
@@ -20677,6 +20766,11 @@ async fn functional_h3_plain_mesh_transport_follows_reload_and_withdrawal() {
     assert_eq!(first.status.as_u16(), 200);
     let observed_a = peer_a.wait_for_http(Duration::from_secs(10)).await;
     assert_eq!(observed_a.method, "POST");
+    assert!(observed_a.presented_client_spiffe(H3_MESH_GATEWAY_SPIFFE));
+    assert_eq!(observed_a.authority, H3_MESH_SERVICE_AUTHORITY);
+    assert_eq!(observed_a.path, H3_MESH_PLAIN_BACKEND_PATH);
+    assert_eq!(observed_a.body, b"h3-plain-reload");
+    assert_eq!(first.body_bytes.as_ref(), b"h3-plain-reload");
 
     let peer_b_tags = h3_mesh_mtls_tags(peer_b.port, H3_MESH_PEER_B_SPIFFE);
     h3_mesh_plain_reload(&gateway, config_for(&peer_b_tags, 1), &peer_b_tags).await;
@@ -20684,6 +20778,11 @@ async fn functional_h3_plain_mesh_transport_follows_reload_and_withdrawal() {
     assert_eq!(retargeted.status.as_u16(), 200);
     let observed_b = peer_b.wait_for_http(Duration::from_secs(10)).await;
     assert_eq!(observed_b.method, "POST");
+    assert!(observed_b.presented_client_spiffe(H3_MESH_GATEWAY_SPIFFE));
+    assert_eq!(observed_b.authority, H3_MESH_SERVICE_AUTHORITY);
+    assert_eq!(observed_b.path, H3_MESH_PLAIN_BACKEND_PATH);
+    assert_eq!(observed_b.body, b"h3-plain-reload");
+    assert_eq!(retargeted.body_bytes.as_ref(), b"h3-plain-reload");
 
     let peer_b_accepts = peer_b.accept_count();
     h3_mesh_plain_reload(&gateway, config_for(&[], 2), &[]).await;
@@ -20764,4 +20863,183 @@ async fn functional_h3_websocket_dispatches_over_same_cluster_ambient_hbone() {
     );
 
     gateway.shutdown().await;
+}
+
+/// Exercise materialized aliases and numeric authority ports over real sidecar
+/// mTLS, with both positive and negative host matchers and a destination-port
+/// control. Every successful request must reach the labeled workload backend.
+async fn drive_inbound_authority_policy_matrix() -> Result<(), String> {
+    use ferrum_edge::modes::mesh::config::RequestMatch;
+
+    ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
+    let server_spiffe = "spiffe://cluster.local/ns/ferrum/sa/echo";
+    let client_spiffe = "spiffe://cluster.local/ns/default/sa/client";
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_id = format!("functional-mesh-authority-policy-{attempt}");
+        let temp = TempDir::new().map_err(|e| format!("temp dir: {e}"))?;
+        let peers = generate_mesh_peer_svids(temp.path(), server_spiffe, client_spiffe);
+        let backend_port = start_labeled_echo_backend("authority-workload-ok").await;
+        let mut slice =
+            inbound_authz_slice(&node_id, server_spiffe, client_spiffe, backend_port, true);
+        let canonical = format!("echo:{backend_port}");
+        let padded = format!("echo:0{backend_port}");
+        let mut rules = Vec::new();
+        for (path, hosts, not_hosts, ports) in [
+            ("/hosts", vec![canonical.clone()], vec![], vec![]),
+            ("/padded", vec![padded.clone()], vec![], vec![]),
+            ("/negative", vec![], vec![canonical.clone()], vec![]),
+            ("/wildcard", vec!["echo:*".to_string()], vec![], vec![]),
+            (
+                "/aliases",
+                vec!["echo.ferrum.svc.cluster.local".to_string()],
+                vec![],
+                vec![],
+            ),
+            ("/ports", vec![], vec![], vec![backend_port]),
+        ] {
+            rules.push(MeshRule {
+                action: PolicyAction::Deny,
+                to: vec![RequestMatch {
+                    paths: vec![path.to_string()],
+                    hosts,
+                    not_hosts,
+                    ports,
+                    ..RequestMatch::default()
+                }],
+                ..MeshRule::default()
+            });
+        }
+        slice.mesh_policies.push(MeshPolicy {
+            name: "authority-policy".to_string(),
+            namespace: "ferrum".to_string(),
+            scope: PolicyScope::MeshWide,
+            rules,
+        });
+        let cp = start_static_mesh_cp(slice).await;
+        let ports = reserve_mesh_ports().await;
+        let inbound_port = ports.inbound;
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp.addr,
+                ports,
+                node_id: &node_id,
+                config_protocol: "native",
+                topology: "sidecar",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", server_spiffe.to_string()),
+                    (
+                        "FERRUM_GATEWAY_SVID_CERT_PATH",
+                        peers.server_cert_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_KEY_PATH",
+                        peers.server_key_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        peers.trust_bundle_path.clone(),
+                    ),
+                ],
+            },
+        );
+        let readiness = wait_for_gateway_listener(&mut child, inbound_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
+            last_failure = readiness.describe("authority policy sidecar", inbound_port);
+            kill_child(&mut child);
+            cp.shutdown().await;
+            continue;
+        }
+        let mut cases = Vec::new();
+        for authority in [
+            canonical.clone(),
+            padded,
+            format!("echo:00{backend_port}"),
+            format!("ECHO:{backend_port}"),
+            format!("echo.:{backend_port}"),
+        ] {
+            for (path, expected) in [
+                ("/public", 200),
+                ("/hosts", 403),
+                ("/padded", 403),
+                ("/negative", 200),
+                ("/wildcard", 403),
+            ] {
+                cases.push((authority.clone(), path, expected));
+            }
+        }
+        for alias in [
+            "echo",
+            "echo.ferrum",
+            "echo.ferrum.svc",
+            "echo.ferrum.svc.cluster.local",
+        ] {
+            cases.push((alias.to_string(), "/public", 200));
+            cases.push((alias.to_string(), "/ports", 403));
+            let expected = if alias.ends_with("cluster.local") {
+                403
+            } else {
+                200
+            };
+            cases.push((alias.to_string(), "/aliases", expected));
+        }
+        cases.push((
+            "echo.ferrum.svc.cluster.local".to_string(),
+            "/negative",
+            403,
+        ));
+        for authority in [
+            format!("echo:+{backend_port}"),
+            "echo:99999".to_string(),
+            "echo:abc".to_string(),
+        ] {
+            cases.push((authority, "/public", 400));
+        }
+        let mut observations = Vec::new();
+        for (authority, path, expected) in cases {
+            let result = mesh_inbound_http_get(
+                inbound_port,
+                &peers.ca_pem,
+                server_spiffe,
+                Some((&peers.client_cert_pem, &peers.client_key_pem)),
+                &authority,
+                path,
+            )
+            .await;
+            observations.push((authority, path, expected, result));
+        }
+        if let Some(exited) =
+            exited_gateway_diagnostic(&mut [("authority policy sidecar", &mut child)])
+        {
+            last_failure = format!("attempt {attempt}: {exited}");
+            kill_child(&mut child);
+            cp.shutdown().await;
+            continue;
+        }
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        cp.shutdown().await;
+        for (authority, path, expected, result) in observations {
+            let (status, body) =
+                result.map_err(|e| format!("{authority} {path}: {e}\n{output}"))?;
+            assert_eq!(status, expected, "{authority} {path}: {body}\n{output}");
+            assert_eq!(
+                body.contains("authority-workload-ok"),
+                expected == 200,
+                "{authority} {path}"
+            );
+        }
+        return Ok(());
+    }
+    Err(format!("authority policy fixture failed: {last_failure}"))
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_authority_policy_ports_and_literal_aliases() {
+    drive_inbound_authority_policy_matrix().await.unwrap();
 }

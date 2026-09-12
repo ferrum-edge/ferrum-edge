@@ -34,6 +34,9 @@ jobs:
     name: Resolve and propose current base image digests
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      # One inventory for resolution and staging, including the live image layer.
+      DOCKERFILES: "Dockerfile Dockerfile.release Dockerfile.test Dockerfile.ebpf-tools-layer Dockerfile.iproute2-layer"
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -42,8 +45,6 @@ jobs:
 
       - name: Resolve current digests
         id: resolve
-        env:
-          DOCKERFILES: "Dockerfile Dockerfile.release Dockerfile.test Dockerfile.ebpf-tools-layer"
         run: |
           set -euo pipefail
           changed=""
@@ -117,7 +118,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B "${BRANCH}"
-          git add Dockerfile Dockerfile.release Dockerfile.test Dockerfile.ebpf-tools-layer
+          git add -- ${DOCKERFILES}
           git commit -m "deps: refresh container base image digests"
           git push --force origin "${BRANCH}"
           if [ -n "$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[].number')" ]; then

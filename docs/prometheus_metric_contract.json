@@ -94,6 +94,16 @@
     "emission": "when_plugin_enabled"
   },
   {
+    "name": "chargeback_sink_queue_outstanding",
+    "type": "gauge",
+    "help": "Current accepted generations' queued, batched, and exporting rows.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
     "name": "chargeback_sink_queue_retained_bytes",
     "type": "gauge",
     "help": "Chargeback sink retained export and spool-delivery bytes under the configured buffer_max_bytes budget.",
@@ -788,6 +798,30 @@
     "emission": "when_series_present"
   },
   {
+    "name": "ferrum_ai_rate_limit_local_accounting_tokens_total",
+    "type": "counter",
+    "help": "AI tokens charged locally after centralized reconciliation failed.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "ai",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_ai_rate_limit_unaccounted_tokens_total",
+    "type": "counter",
+    "help": "AI tokens not charged because local reconciliation capacity was exhausted.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "ai",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_ai_tokens_total",
     "type": "counter",
     "help": "Total tokens reported by AI providers.",
@@ -931,6 +965,16 @@
     "emission": "when_plugin_enabled"
   },
   {
+    "name": "ferrum_api_chargeback_uncollected_retained_entries",
+    "type": "gauge",
+    "help": "Billing rows the last eviction pass kept past stale_entry_ttl_seconds because no completed /charges export has collected their current counters.",
+    "labels": [],
+    "subsystem": "api_chargeback",
+    "export_surface": "/charges",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
     "name": "ferrum_api_charges_total",
     "type": "counter",
     "help": "Total per-call charges accumulated per consumer.",
@@ -1040,6 +1084,20 @@
     "export_surface": "/metrics",
     "bundled": "documented_only",
     "emission": "conditional"
+  },
+  {
+    "name": "ferrum_circuit_breaker_probe_reclaimed_total",
+    "type": "counter",
+    "help": "Half-open probe slots reclaimed after the dwell because the probe never settled; each one is a leaked probe slot that would otherwise have shed the backend permanently.",
+    "labels": [
+      "proxy_id",
+      "proxy_namespace",
+      "namespace"
+    ],
+    "subsystem": "circuit_breaker",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_series_present"
   },
   {
     "name": "ferrum_circuit_breakers",
@@ -2375,7 +2433,7 @@
   {
     "name": "ferrum_kafka_logging_retained_bytes",
     "type": "gauge",
-    "help": "Ferrum userspace retained payload+key bytes awaiting librdkafka admission.",
+    "help": "Ferrum-charged retained payload+key bytes, held from admission through librdkafka's own copy of the record until terminal delivery, terminal failure, purge, or immediate rejection.",
     "labels": [
       "generation"
     ],
@@ -2825,9 +2883,7 @@
     "name": "ferrum_mesh_dns_upstream_id_exhaustions_total",
     "type": "counter",
     "help": "Mesh DNS upstream transaction ID exhaustion events.",
-    "labels": [
-      "namespace"
-    ],
+    "labels": [],
     "subsystem": "mesh",
     "export_surface": "/metrics",
     "bundled": "documented_only",
@@ -4262,6 +4318,31 @@
     "export_surface": "/metrics",
     "bundled": "alert_and_dashboard",
     "emission": "conditional"
+  },
+  {
+    "name": "ferrum_plugin_log_sink_records_accepted_total",
+    "type": "counter",
+    "help": "Observability records admitted to a per-plugin logging sink's bounded queue. Process-cumulative; not reset by a plugin-cache reload.",
+    "labels": [
+      "plugin"
+    ],
+    "subsystem": "logging_sinks",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_plugin_log_sink_records_dropped_total",
+    "type": "counter",
+    "help": "Observability records discarded by a per-plugin logging sink, by bounded reason. Process-cumulative; not reset by a plugin-cache reload.",
+    "labels": [
+      "plugin",
+      "reason"
+    ],
+    "subsystem": "logging_sinks",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
   },
   {
     "name": "ferrum_proxy_passive_unhealthy_targets",

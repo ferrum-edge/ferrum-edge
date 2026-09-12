@@ -21,7 +21,7 @@ Dynamic families (AI token counters, mesh BPF prefix overrides, request_mirror l
 
 Scrape rendering stays allocation-light: the inventory is a documentation/CI contract only and is **not** scanned on the `/metrics` hot path.
 
-Ferrum accepts exactly one enabled, process-global `prometheus_metrics` plugin. Mesh mode auto-injects `workload_metrics` only to supply identity labels and Telemetry policy; mesh RED/lifecycle registry updates and gRPC message scanners activate only after the Prometheus plugin's request/stream hook observes the transaction. Without that exporter, the mesh metric families remain silent. The raw TCP lifecycle families cover stream-plugin paths; Ambient destination HBONE CONNECT relays use the HTTP request/response families and `ferrum_mesh_hbone_relay_failures_total` instead.
+Ferrum accepts exactly one enabled, process-global `prometheus_metrics` plugin. Mesh mode auto-injects `workload_metrics` only to supply identity labels and Telemetry policy; mesh RED/lifecycle registry updates and gRPC message scanners activate only after the Prometheus plugin's `on_request_received` / `on_stream_connect` hooks observe the transaction (counters complete later in `log` / `on_stream_disconnect`). Without that exporter, the mesh metric families remain silent. The raw TCP lifecycle families cover stream-plugin paths; Ambient destination HBONE CONNECT relays use the HTTP request/response families and `ferrum_mesh_hbone_relay_failures_total` instead.
 
 ## Operator runbooks for newly documented families
 
@@ -224,6 +224,7 @@ Everything except `ferrum_backend_retry_attempts_total` and `ferrum_frontend_tls
 | `ferrum_circuit_breakers` | gauge | `proxy_id`, `proxy_namespace`, `state`, `namespace` | Breakers resident for the proxy, counted per state (`closed`, `open`, `half_open`). Per-target breakers are aggregated into this count deliberately — see cardinality below. |
 | `ferrum_circuit_breaker_cache_entries` / `ferrum_circuit_breaker_cache_max_entries` | gauge | `namespace` | Shared breaker-cache occupancy against its admission ceiling. At the ceiling, new proxy/target breakers stop being admitted. |
 | `ferrum_circuit_breaker_cache_admission_refused_total` | counter | `namespace` | Requests that could not be given a cached breaker because the cache was at its ceiling. Each one ran on a transient breaker whose failures never accumulate, so circuit breaking is silently degraded for that key. A rising value means raise `FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES`. |
+| `ferrum_circuit_breaker_probe_reclaimed_total` | counter | `proxy_id`, `proxy_namespace`, `namespace` | Half-open probe slots reclaimed after `half_open_probe_dwell_seconds` because the probe never settled. Any non-zero value is a leaked probe slot the dwell downgraded from a permanent shed to a bounded delay — a bug to report, not a knob to tune. The offending `host:port` is named in the accompanying warning log, deliberately not in a label. |
 
 **Suggested alert:** `ferrum_upstream_unhealthy_targets / ferrum_upstream_targets > 0.5` for 5m (an upstream is more than half ejected), and `max by (proxy_id) (ferrum_circuit_breakers{state="open"}) > 0` for 5m. To identify *which* target, read authenticated `GET /admin/metrics` — `health_check.unhealthy_targets[]` and `circuit_breakers[]` carry the `host:port` that the metric surface deliberately omits.
 
@@ -266,6 +267,62 @@ on every status. Mapping: [error_classification.md](error_classification.md#http
 `ferrum_stream_disconnects_total{error_class}` uses the same 19
 `ErrorClass::as_str` values as stream logs and omits the label when unset.
 
+### Per-plugin logging-sink record loss
+
+`ferrum_plugin_log_sink_records_dropped_total{plugin,reason}` and
+`ferrum_plugin_log_sink_records_accepted_total{plugin}` publish the record
+accounting of the per-plugin observability sinks (`http_logging`,
+`tcp_logging`, `udp_logging`, `ws_logging`, `statsd_logging`, `loki_logging`,
+`kafka_logging`, `ai_transcript_audit`, `api_chargeback_sink`). Before these
+families existed the sinks logged their discards but published nothing, so a
+truncated audit trail was invisible on `/metrics`.
+
+These are **not** the same as `ferrum_log_sink_*{sink}`, which covers only the
+process-global stdout/stderr writers, and not the same as
+`ferrum_observability_*`, which counts the shared retained-byte ceiling and
+batch-materialization layer for the process as a whole.
+
+Both label values come from fixed compile-time sets and never carry an
+endpoint, topic, namespace, policy id, or record content:
+
+| `plugin` | one of the nine sinks above, or `other` for a sink identity outside the closed set |
+| --- | --- |
+| `reason` | `batch_discard`, `byte_budget`, `queue_full`, `record_too_large`, `shutdown`, `sink_error` |
+
+- `byte_budget` — a per-instance `buffer_max_bytes` budget or the process-wide
+  `FERRUM_LOG_DELIVERY_MAX_RETAINED_BYTES` ceiling refused the admission.
+- `record_too_large` — the serialized record exceeded `max_entry_bytes` or its
+  own retained-byte reservation.
+- `queue_full` — the bounded in-memory queue was full and no overflow handoff
+  took ownership.
+- `batch_discard` — a whole batch was discarded after its retry budget was
+  exhausted, or a non-retryable HTTP 4xx permanently rejected it, with no
+  durable fallback. Counts records, not batches. `ai_transcript_audit` counts a
+  permanently rejected batch at its classification point rather than letting
+  the shared retry loop see the discard as a delivery.
+- `shutdown` — the flush worker was closed, or had not started yet.
+- `sink_error` — a per-record delivery or serialization failure that retrying
+  could not fix.
+
+Counters are process-cumulative and are **not** reset by a plugin-cache
+reload: a configuration change is not evidence that lost records came back.
+Every plugin/reason series is emitted on every scrape, including zero-valued
+ones, so `rate(ferrum_plugin_log_sink_records_dropped_total[5m]) > 0` is a
+usable alert expression without waiting for a series to appear. No alert rule
+is bundled — the acceptable loss rate is deployment-specific.
+
+`byte_budget`, `record_too_large`, `queue_full`, and `shutdown` are
+admission-time refusals, so `accepted` plus those four accounts for every
+record the sinks were offered — the property that makes the loss counter
+trustworthy. `batch_discard` is a post-admission loss of records that were
+already counted as accepted, and `sink_error` covers a per-record delivery or
+serialization failure that may occur on either side of admission; neither is
+part of that identity.
+
+Both totals, plus the non-zero per-plugin reason breakdown, are also projected
+onto the authenticated `/status` payload under `log_sink_record_loss`, so a
+loss is visible without a metrics backend.
+
 ## Complete family inventory
 
 Sorted by family name. Optional namespace labels are listed when the emitter supports them.
@@ -281,6 +338,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `chargeback_sink_queue_full_drops_total` | counter | — | `api_chargeback_sink` | `documented_only` | `when_plugin_enabled` | Chargeback sink events dropped because the bounded in-memory queue was full and no durable overflow path accepted ownership. Shutdown/unavailable admission is not counted here. |
 | `chargeback_sink_queue_high_water_diversions_total` | counter | — | `api_chargeback_sink` | `documented_only` | `when_plugin_enabled` | Chargeback sink events whose high-water durable spool-delivery handoff was accepted. Spool delivery saturation/closure is counted by spool loss metrics, not this counter. |
 | `chargeback_sink_queue_high_water_hits_total` | counter | — | `api_chargeback_sink` | `documented_only` | `when_plugin_enabled` | Chargeback sink enqueue attempts observed at or above the queue high-water mark (telemetry only). |
+| `chargeback_sink_queue_outstanding` | gauge | — | `api_chargeback_sink` | `documented_only` | `when_plugin_enabled` | Current accepted generations' queued, batched, and exporting rows. |
 | `chargeback_sink_queue_retained_bytes` | gauge | — | `api_chargeback_sink` | `documented_only` | `when_plugin_enabled` | Chargeback sink retained export and spool-delivery bytes under the configured buffer_max_bytes budget. |
 | `chargeback_sink_snapshot_cardinality_rejections_total` | counter | — | `api_chargeback_sink` | `documented_only` | `when_plugin_enabled` | Snapshot charges that could not be accumulated or overflow-spooled under hard budgets. |
 | `chargeback_sink_snapshot_emits_total` | counter | — | `api_chargeback_sink` | `documented_only` | `when_plugin_enabled` | Chargeback sink snapshot delta events emitted. |
@@ -342,6 +400,8 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_ai_federation_circuits_open` | gauge | `namespace` | `ai` | `documented_only` | `always` | Current ai_federation provider circuits in open or half-open recovery state. |
 | `ferrum_ai_federation_circuits_opened_total` | counter | `namespace` | `ai` | `documented_only` | `always` | ai_federation provider circuit closed-to-open transitions. |
 | `ferrum_ai_prompt_tokens_total` | counter | `proxy_id`, `provider`, `namespace` | `ai` | `documented_only` | `when_series_present` | Prompt tokens reported by AI providers. |
+| `ferrum_ai_rate_limit_local_accounting_tokens_total` | counter | `namespace` | `ai` | `documented_only` | `always` | AI tokens charged locally after centralized reconciliation failed. |
+| `ferrum_ai_rate_limit_unaccounted_tokens_total` | counter | `namespace` | `ai` | `documented_only` | `always` | AI tokens not charged because local reconciliation capacity was exhausted. |
 | `ferrum_ai_tokens_total` | counter | `proxy_id`, `provider`, `namespace` | `ai` | `documented_only` | `when_series_present` | Total tokens reported by AI providers. |
 | `ferrum_api_bandwidth_charges_total` | counter | `consumer`, `proxy_id`, `proxy_name`, `direction`, `currency`, `protocol_family`, `namespace` | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Total bandwidth charges per consumer, split by direction. |
 | `ferrum_api_bytes_received_total` | counter | `consumer`, `proxy_id`, `proxy_name`, `currency`, `protocol_family`, `namespace` | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Total bytes the gateway received backend->client and forwarded to this consumer. |
@@ -353,6 +413,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_api_chargeback_registry_max_entries` | gauge | — | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Configured ceiling on retained billing rows (complete registry entry keys). |
 | `ferrum_api_chargeback_registry_max_retained_bytes` | gauge | — | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Configured ceiling on retained registry bytes. |
 | `ferrum_api_chargeback_registry_retained_bytes` | gauge | — | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Estimated bytes retained by the shared registry. |
+| `ferrum_api_chargeback_uncollected_retained_entries` | gauge | — | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Billing rows the last eviction pass kept past stale_entry_ttl_seconds because no completed /charges export has collected their current counters. |
 | `ferrum_api_charges_total` | counter | `consumer`, `proxy_id`, `proxy_name`, `status_code`, `currency`, `namespace` | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Total per-call charges accumulated per consumer. |
 | `ferrum_api_stream_connection_charges_total` | counter | `consumer`, `proxy_id`, `proxy_name`, `currency`, `namespace` | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Total per-connection charges for stream sessions. |
 | `ferrum_api_stream_connections_total` | counter | `consumer`, `proxy_id`, `proxy_name`, `currency`, `namespace` | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Total stream sessions (TCP/UDP/DTLS) per consumer. |
@@ -361,6 +422,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_circuit_breaker_cache_admission_refused_total` | counter | `namespace` | `circuit_breaker` | `documented_only` | `conditional` | Requests refused a cached breaker because the shared breaker cache was at its admission ceiling; each one ran on a transient breaker whose failures never accumulate. |
 | `ferrum_circuit_breaker_cache_entries` | gauge | `namespace` | `circuit_breaker` | `documented_only` | `conditional` | Circuit breakers resident in the shared breaker cache. |
 | `ferrum_circuit_breaker_cache_max_entries` | gauge | `namespace` | `circuit_breaker` | `documented_only` | `conditional` | Admission ceiling for the shared breaker cache; new keys are refused at this count. |
+| `ferrum_circuit_breaker_probe_reclaimed_total` | counter | `proxy_id`, `proxy_namespace`, `namespace` | `circuit_breaker` | `documented_only` | `when_series_present` | Half-open probe slots reclaimed after the dwell because the probe never settled; each one is a leaked probe slot that would otherwise have shed the backend permanently. |
 | `ferrum_circuit_breakers` | gauge | `proxy_id`, `proxy_namespace`, `state`, `namespace` | `circuit_breaker` | `alert_and_dashboard` | `when_series_present` | Upstream circuit breakers resident for this proxy, counted by breaker state. |
 | `ferrum_client_disconnects_total` | counter | `proxy_id`, `namespace` | `prometheus_metrics` | `dashboard` | `conditional` | Requests where the client disconnected before receiving the full response. |
 | `ferrum_compression_codec_admitted_total` | counter | `namespace` | `compression` | `documented_only` | `always` | Compression codec jobs admitted to the bounded spawn_blocking pool. |
@@ -473,7 +535,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_kafka_logging_healthy` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Whether the Kafka logging generation recovered from its latest failure. |
 | `ferrum_kafka_logging_in_flight` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Records waiting in librdkafka for terminal delivery. |
 | `ferrum_kafka_logging_records_total` | counter | `generation`, `outcome` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Kafka logging record outcomes. |
-| `ferrum_kafka_logging_retained_bytes` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Ferrum userspace retained payload+key bytes awaiting librdkafka admission. |
+| `ferrum_kafka_logging_retained_bytes` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Ferrum-charged retained payload+key bytes, held from admission through librdkafka's own copy of the record until terminal delivery, terminal failure, purge, or immediate rejection. |
 | `ferrum_log_sink_accepted_records_total` | counter | `sink` | `logging` | `documented_only` | `when_process_initialized` | Records accepted by the bounded process log sink. |
 | `ferrum_log_sink_dropped_records_total` | counter | `sink`, `reason` | `logging` | `documented_only` | `when_process_initialized` | Log records dropped by bounded admission. |
 | `ferrum_log_sink_healthy` | gauge | `sink` | `logging` | `documented_only` | `when_process_initialized` | Whether the process log sink has recovered from its latest I/O or drain failure. |
@@ -508,7 +570,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_mesh_config_revision_rejections_total` | counter | `reason`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Mesh slices quarantined by the config-revision freshness gate before replacing live state, by reason. |
 | `ferrum_mesh_config_stream_attempts_total` | counter | `protocol`, `outcome`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Completed mesh configuration-stream attempts by consumer protocol (native/xds/stock_xds) and closed-set outcome. A remote clean EOF is an endpoint failure, not a success. Local retirements (shutdown, tls_reload, credential_rotated, credential_source_invalid, credential_deadline, primary_retry) never rotate the endpoint or grow backoff. transport_failure is a dial failure while established_transport_failure is an already-open stream going dark; heartbeat_silence_timeout is the native application-silence bound, not an HTTP/2 keepalive timeout. admission_refused is a CP stream-admission capacity/tenancy refusal (RESOURCE_EXHAUSTED): the control plane is alive and answering, so it is deliberately not a transport failure. |
 | `ferrum_mesh_config_update_rejections_total` | counter | `consumer`, `reason`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | MeshSubscribe responses refused before apply, by consumer and reason. |
-| `ferrum_mesh_dns_upstream_id_exhaustions_total` | counter | `namespace` | `mesh` | `documented_only` | `always` | Mesh DNS upstream transaction ID exhaustion events. |
+| `ferrum_mesh_dns_upstream_id_exhaustions_total` | counter | — | `mesh` | `documented_only` | `always` | Mesh DNS upstream transaction ID exhaustion events. |
 | `ferrum_mesh_ext_authz_check_failures_total` | counter | `disposition`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Failed CUSTOM external authorization checks by how the failure was resolved. |
 | `ferrum_mesh_ext_authz_checks_total` | counter | `outcome`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Istio AuthorizationPolicy CUSTOM external authorization check outcomes. |
 | `ferrum_mesh_federation_bundle_age_seconds` | gauge | `trust_domain`, `gateway_namespace` | `mesh_federation` | `alert_and_dashboard` | `conditional` | Age of the cached federated trust bundle, in seconds. |
@@ -614,6 +676,8 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_overload_resource_current` | gauge | `resource`, `namespace` | `overload` | `documented_only` | `conditional` | Most recent overload-monitor sample of a tracked resource. |
 | `ferrum_overload_resource_limit` | gauge | `resource`, `namespace` | `overload` | `documented_only` | `conditional` | Ceiling the overload monitor compares each tracked resource against. |
 | `ferrum_overload_shedding_active` | gauge | `action`, `namespace` | `overload` | `alert_and_dashboard` | `conditional` | Whether a progressive load-shedding action is currently engaged (1) or not (0). |
+| `ferrum_plugin_log_sink_records_accepted_total` | counter | `plugin` | `logging_sinks` | `documented_only` | `always` | Observability records admitted to a per-plugin logging sink's bounded queue. Process-cumulative; not reset by a plugin-cache reload. |
+| `ferrum_plugin_log_sink_records_dropped_total` | counter | `plugin`, `reason` | `logging_sinks` | `documented_only` | `always` | Observability records discarded by a per-plugin logging sink, by bounded reason. Process-cumulative; not reset by a plugin-cache reload. |
 | `ferrum_proxy_passive_unhealthy_targets` | gauge | `proxy_id`, `proxy_namespace`, `namespace` | `upstream_health` | `documented_only` | `when_series_present` | Targets this proxy has ejected from traffic-based passive health checking. |
 | `ferrum_rate_limit_exceeded_total` | counter | `namespace` | `prometheus_metrics` | `dashboard` | `always` | Total rate limit rejections. |
 | `ferrum_request_duration_ms` | histogram | `proxy_id`, `le`, `namespace` | `prometheus_metrics` | `dashboard` | `always` | Request duration in milliseconds. |

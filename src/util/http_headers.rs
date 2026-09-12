@@ -2,6 +2,15 @@
 
 use std::collections::HashMap;
 
+/// Parse an explicit HTTP authority port using the RFC digit grammar.
+/// Return its numeric value so routing and policy use one decimal spelling.
+pub(crate) fn parse_authority_port(port: &str) -> Option<u16> {
+    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    port.parse().ok()
+}
+
 pub(crate) fn cache_control_has_directive(value: &str, directive: &str) -> bool {
     let mut segment_start = 0;
     let mut in_quote = false;

@@ -917,6 +917,21 @@ impl HmacAuth {
         // `{error_prefix}unknown configuration key(s): …` verbatim.
         reject_unknown_keys(config_obj, "config", &root_config_keys(), "hmac_auth: ")?;
 
+        // The shared Redis helper ASCII-lowercases `sync_mode` before matching,
+        // which would admit spellings the published enum does not list. Screen
+        // the exact wire form here first (same pattern as `graphql`) so the
+        // schema and the constructor accept exactly the same set.
+        match config_obj.get("sync_mode") {
+            None => {}
+            Some(Value::String(mode)) if matches!(mode.as_str(), "local" | "redis") => {}
+            Some(Value::String(mode)) => {
+                return Err(format!(
+                    "hmac_auth: 'sync_mode' must be exactly 'local' or 'redis', got: {mode:?}"
+                ));
+            }
+            Some(_) => return Err("hmac_auth: 'sync_mode' must be a string".to_string()),
+        }
+
         let clock_skew_seconds = parse_u64_field(
             config_obj.get("clock_skew_seconds"),
             "clock_skew_seconds",
@@ -945,7 +960,9 @@ impl HmacAuth {
                 let value = value
                     .as_str()
                     .ok_or_else(|| "hmac_auth: 'signing_profile' must be a string".to_string())?;
-                match value.trim() {
+                // Exact, untrimmed: the diagnostic below promises "exactly",
+                // and the published enum lists only the canonical spellings.
+                match value {
                     HMAC_SIGNING_VERSION_V2 => HmacSigningProfile::V2,
                     HMAC_SIGNING_VERSION_V1 => HmacSigningProfile::V1Unsafe,
                     _ => {
@@ -1000,6 +1017,20 @@ impl HmacAuth {
                 let value = value
                     .as_str()
                     .ok_or_else(|| "hmac_auth: 'replay_scope' must be a string".to_string())?;
+                // `ReplayScope::parse` trims and ASCII-lowercases, which would
+                // admit spellings the published enum does not list. Screen the
+                // exact wire form first (same pattern as `sync_mode` above) so
+                // the schema and the constructor accept exactly the same set;
+                // the shared parser still owns the value mapping.
+                if !matches!(value, "process" | "shared") {
+                    return Err(
+                        "hmac_auth: 'replay_scope' must be exactly 'process' or 'shared' — use \
+                         'shared' together with sync_mode: 'redis' for any deployment running \
+                         more than one gateway replica, or 'process' to declare a single-process \
+                         deployment whose replay protection is not cross-replica"
+                            .to_string(),
+                    );
+                }
                 Some(ReplayScope::parse("hmac_auth", "replay_scope", value)?)
             }
         };

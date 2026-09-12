@@ -27,7 +27,9 @@ use std::task::Waker;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http_body::Body as _;
+use http_body::Frame;
 
+use ferrum_edge::_test_support::proxy_body_streaming_for_test;
 use ferrum_edge::plugins::prometheus_metrics::{ClientDisconnectKey, MetricsRegistry};
 use ferrum_edge::plugins::{
     Plugin, RequestContext, ResponseStreamAction, ResponseStreamInspector, TransactionSummary,
@@ -35,6 +37,7 @@ use ferrum_edge::plugins::{
     spawn_bounded_terminal_summary_log,
 };
 use ferrum_edge::proxy::ProxyBody;
+use ferrum_edge::proxy::body::ProxyBodyError;
 use ferrum_edge::proxy::deferred_log::{BodyOutcome, DeferredTransactionLogger};
 use ferrum_edge::retry::ErrorClass;
 
@@ -200,12 +203,43 @@ fn make_summary_with_status(status: u16) -> TransactionSummary {
     }
 }
 
+/// The fixture request context every direct-dispatch case here builds.
+///
+/// Building one also opens observability delivery for this process, because
+/// each of those cases hands terminal work to the process-global delivery
+/// lifecycle without ever starting a serving cycle. Another test in this binary
+/// may already have run an in-process gateway through `modes::file::serve`, and
+/// that fixture's shutdown drains and permanently CLOSES the delivery
+/// generation it was serving on. A closed generation admits nothing: the
+/// dispatch is dropped and a fixture waiting on the resulting notification waits
+/// forever (issue #4987).
+///
+/// This is `begin_serving_cycle`, not a reset: an open generation is reused
+/// untouched, and a fresh one is installed only when the current one is already
+/// draining or closed — exactly the start -> drain -> start transition an
+/// in-process embedder performs, and never a generation another serving cycle
+/// still owns.
 fn make_ctx() -> RequestContext {
+    ferrum_edge::observability_delivery::begin_serving_cycle();
     RequestContext::new(
         "10.0.0.1".to_string(),
         "GET".to_string(),
         "/things/42".to_string(),
     )
+}
+
+/// Longest a fixture here waits for a signal produced by detached delivery work.
+const FIXTURE_SIGNAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Await a fixture notification under a bound.
+///
+/// A dropped dispatch produces no signal at all, and an unbounded `notified()`
+/// would then park the whole test binary instead of failing one test. Bounding
+/// the wait turns that into an assertion naming what never arrived.
+async fn notified_within(notify: &tokio::sync::Notify, what: &str) {
+    tokio::time::timeout(FIXTURE_SIGNAL_TIMEOUT, notify.notified())
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
 }
 
 /// Wait until the spawned `log_with_mirror` task has run and pushed a summary
@@ -239,6 +273,33 @@ async fn wait_for_events(
     events.lock().unwrap().clone()
 }
 
+/// The dropped-dispatch shape from issue #4987, stated as an assertion.
+///
+/// Terminal dispatch here is admitted through the process-global observability
+/// delivery lifecycle, and an in-process gateway fixture elsewhere in this
+/// binary permanently closes that lifecycle when it shuts down. Nothing in
+/// libtest lets a fixture control which of those runs first, so this pins the
+/// property the whole module depends on instead: after the fixture context is
+/// built, a terminal summary handed to detached delivery actually reaches the
+/// log sinks. Without the reopen in `make_ctx` this fails with a delivered
+/// count of zero once a serving fixture has run in the same process.
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_terminal_dispatch_reaches_log_sinks() {
+    let (capturing, captured) = CapturingPlugin::new();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(capturing)];
+    let ctx = make_ctx();
+
+    spawn_bounded_terminal_summary_log(&plugins, make_summary_with_status(200), &ctx);
+
+    let delivered = wait_for_captures(&captured, 1).await;
+    assert_eq!(
+        delivered.len(),
+        1,
+        "detached terminal delivery must be admitted for a fixture that opened it"
+    );
+    assert_eq!(delivered[0].response_status_code, 200);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn buffered_logging_without_deadline_awaits_plugins_sequentially() {
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -264,7 +325,7 @@ async fn buffered_logging_without_deadline_awaits_plugins_sequentially() {
     let log_task = tokio::spawn(async move {
         log_with_mirror_before_buffered_response(&plugins, summary, &ctx).await;
     });
-    started.notified().await;
+    notified_within(&started, "the first buffered log hook to start").await;
 
     assert!(
         !log_task.is_finished(),
@@ -302,7 +363,7 @@ async fn deadline_buffered_logging_does_not_await_a_blocked_sink() {
     .await
     .expect("deadline-bearing response must not await the blocked log sink");
 
-    started.notified().await;
+    notified_within(&started, "the detached deadline log hook to start").await;
     assert_eq!(events.lock().unwrap().as_slice(), ["deadline-log-started"]);
     release.notify_one();
     assert_eq!(
@@ -355,7 +416,7 @@ async fn the_authenticated_buffered_terminal_summary_is_delivered_once_and_never
 
     // Configured plugin order is preserved inside the detached task: the second
     // sink does not run until the blocked one finishes.
-    started.notified().await;
+    notified_within(&started, "the detached terminal summary hook to start").await;
     assert_eq!(events.lock().unwrap().as_slice(), ["blocked-sink"]);
     assert!(captured.lock().unwrap().is_empty());
 
@@ -389,7 +450,7 @@ async fn streamed_terminal_logging_is_spawned_after_body_completion() {
     );
 
     logger.fire(BodyOutcome::success(64));
-    started.notified().await;
+    notified_within(&started, "the streamed terminal log hook to start").await;
     assert_eq!(events.lock().unwrap().as_slice(), ["stream-log-started"]);
 
     release.notify_one();
@@ -1224,4 +1285,139 @@ async fn completed_body_does_not_reach_prometheus_counter() {
         !output.contains("ferrum_client_disconnects_total"),
         "an untouched disconnect family must stay out of the exposition: {output}"
     );
+}
+
+/// A streaming adapter with the shape every real relay adapter has once the
+/// backend has finished: it yields its last buffered DATA frame and reports
+/// `is_end_stream()` immediately, without waiting to be polled again. Hyper is
+/// then allowed to drop the body without one redundant `Ready(None)` poll.
+struct EndStreamAfterFinalFrame {
+    data: Option<Bytes>,
+}
+
+impl http_body::Body for EndStreamAfterFinalFrame {
+    type Data = Bytes;
+    type Error = ProxyBodyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.data.take() {
+            Some(data) => Poll::Ready(Some(Ok(Frame::data(data)))),
+            None => Poll::Ready(None),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.data.is_none()
+    }
+}
+
+/// The genuine mid-stream abandonment: a frame was delivered, more is coming,
+/// and the wrapper has NOT terminated.
+struct StillStreamingAfterFrame {
+    data: Option<Bytes>,
+}
+
+impl http_body::Body for StillStreamingAfterFrame {
+    type Data = Bytes;
+    type Error = ProxyBodyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.data.take() {
+            Some(data) => Poll::Ready(Some(Ok(Frame::data(data)))),
+            None => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        false
+    }
+}
+
+/// Poll exactly once and return the DATA byte count of the frame produced.
+fn poll_one_data_frame(body: &mut ProxyBody) -> usize {
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    match Pin::new(body).poll_frame(&mut cx) {
+        Poll::Ready(Some(Ok(frame))) => frame.data_ref().map_or(0, Bytes::len),
+        Poll::Ready(Some(Err(e))) => panic!("unexpected body error: {e}"),
+        Poll::Ready(None) => panic!("expected a data frame, saw end of stream"),
+        Poll::Pending => panic!("expected a data frame, saw Pending"),
+    }
+}
+
+/// Issue #5072: a finite stream that was fully delivered must be classified as
+/// a completion, not a client disconnect.
+///
+/// The trigger is not framing but `is_end_stream()`: a length-delimited backend
+/// body (a `Content-Length` `text/event-stream` response on H1 or H2) leaves the
+/// relay adapter reporting end-of-stream as soon as it hands over its final DATA
+/// frame, so hyper stops polling and drops the body one poll early. Classifying
+/// that as a disconnect made `request_deduplication` hold its in-flight lease
+/// until `inflight_ttl_seconds` — a same-key retry got 409 for a response the
+/// client received in full — and trained the adaptive limiter on a disconnect
+/// that never happened.
+#[tokio::test(flavor = "multi_thread")]
+async fn drop_after_a_proven_end_of_stream_is_a_completion() {
+    let (plugin, captured) = CapturingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let summary = make_summary_with_status(200);
+    let logger = DeferredTransactionLogger::new(summary, plugins, make_ctx());
+
+    let payload = Bytes::from_static(b"data: first\n\ndata: last\n\n");
+    let expected_len = payload.len();
+    let inner = Box::pin(EndStreamAfterFinalFrame {
+        data: Some(payload),
+    });
+    let mut body = proxy_body_streaming_for_test(inner).with_logger(logger);
+
+    // Exactly one poll: hyper sees the terminal DATA frame, observes
+    // `is_end_stream()`, and never polls for `Ready(None)`.
+    assert_eq!(poll_one_data_frame(&mut body), expected_len);
+    drop(body);
+
+    let captures = wait_for_captures(&captured, 1).await;
+    assert_eq!(captures.len(), 1);
+    let got = &captures[0];
+    assert!(
+        got.body_completed,
+        "a proven end-of-stream is a completion, not a disconnect"
+    );
+    assert!(!got.client_disconnected);
+    assert_eq!(got.body_error_class, None);
+    assert_eq!(got.bytes_received, expected_len as u64);
+}
+
+/// The other direction of the same gate: only a `true` end-of-stream is
+/// trusted, so a body abandoned while it still had frames to produce stays a
+/// client disconnect and deduplication still retains its lease.
+#[tokio::test(flavor = "multi_thread")]
+async fn drop_while_still_streaming_is_still_a_client_disconnect() {
+    let (plugin, captured) = CapturingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let summary = make_summary_with_status(200);
+    let logger = DeferredTransactionLogger::new(summary, plugins, make_ctx());
+
+    let payload = Bytes::from_static(b"data: first\n\n");
+    let expected_len = payload.len();
+    let inner = Box::pin(StillStreamingAfterFrame {
+        data: Some(payload),
+    });
+    let mut body = proxy_body_streaming_for_test(inner).with_logger(logger);
+
+    assert_eq!(poll_one_data_frame(&mut body), expected_len);
+    drop(body);
+
+    let captures = wait_for_captures(&captured, 1).await;
+    assert_eq!(captures.len(), 1);
+    let got = &captures[0];
+    assert!(!got.body_completed);
+    assert!(got.client_disconnected);
+    assert_eq!(got.body_error_class, Some(ErrorClass::ClientDisconnect));
+    assert_eq!(got.bytes_received, expected_len as u64);
 }

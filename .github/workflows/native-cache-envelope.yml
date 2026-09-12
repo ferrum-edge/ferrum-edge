@@ -1,0 +1,163 @@
+name: Native Cache Envelope Proof
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/native-cache-envelope.yml
+      - .github/scripts/native_cache_envelope.py
+      - .github/native-cache-envelope/Dockerfile
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/native-cache-envelope.yml
+      - .github/scripts/native_cache_envelope.py
+      - .github/native-cache-envelope/Dockerfile
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    name: Native cache envelope contracts and inert image round trip
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - run: python .github/scripts/native_cache_envelope.py self-test
+      - run: python .github/scripts/native_cache_envelope.py prepare
+      - name: Build and copy the inert data image without starting it
+        run: |
+          set -euo pipefail
+          docker build --tag ferrum-native-envelope:proof \
+            --file .github/native-cache-envelope/Dockerfile \
+            "$RUNNER_TEMP/ferrum-native-envelope/context"
+          docker create --name ferrum-native-envelope-proof ferrum-native-envelope:proof
+          docker cp ferrum-native-envelope-proof:/envelope.tar \
+            "$RUNNER_TEMP/ferrum-native-envelope/delivery/envelope.tar"
+      - run: python .github/scripts/native_cache_envelope.py verify
+      - name: Remove the owned inert container
+        if: always()
+        run: docker rm --force ferrum-native-envelope-proof
+
+  publish:
+    name: Publish only the synthetic envelope from trusted main
+    needs: contracts
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      github.repository == 'ferrum-edge/ferrum-edge'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - run: python .github/scripts/native_cache_envelope.py prepare
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - name: Publish the bounded public fixture
+        id: publish
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: ${{ runner.temp }}/ferrum-native-envelope/context
+          file: .github/native-cache-envelope/Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          tags: ghcr.io/ferrum-edge/ferrum-edge-buildcache:native-envelope-v1-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          labels: io.ferrum.native-envelope.run=${{ github.run_id }}-${{ github.run_attempt }}
+
+  anonymous-reader:
+    name: Anonymous digest-pinned envelope reader on a fresh runner
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - run: python .github/scripts/native_cache_envelope.py prepare
+      - name: Pull the exact published digest without registry credentials
+        env:
+          CACHE_DIGEST: ${{ needs.publish.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$CACHE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          export DOCKER_CONFIG
+          DOCKER_CONFIG="$(mktemp -d "$RUNNER_TEMP/native-envelope-anonymous.XXXXXX")"
+          docker pull "ghcr.io/ferrum-edge/ferrum-edge-buildcache@$CACHE_DIGEST"
+          docker create --name ferrum-native-envelope-reader \
+            "ghcr.io/ferrum-edge/ferrum-edge-buildcache@$CACHE_DIGEST"
+          docker cp ferrum-native-envelope-reader:/envelope.tar \
+            "$RUNNER_TEMP/ferrum-native-envelope/delivery/envelope.tar"
+          printf '%s\n' "$CACHE_DIGEST" > "$RUNNER_TEMP/ferrum-native-envelope/digest.txt"
+      - run: python .github/scripts/native_cache_envelope.py verify
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: native-envelope-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ferrum-native-envelope/proof.json
+            ${{ runner.temp }}/ferrum-native-envelope/digest.txt
+          if-no-files-found: error
+          retention-days: 7
+      - name: Remove the owned inert container
+        if: always()
+        run: docker rm --force ferrum-native-envelope-reader
+
+  cleanup:
+    name: Delete only this invocation's synthetic registry version
+    needs: [publish, anonymous-reader]
+    if: always() && needs.publish.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      packages: write
+    steps:
+      - name: Match exact digest and sole owned tag before deletion
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CACHE_DIGEST: ${{ needs.publish.outputs.digest }}
+          CACHE_TAG: native-envelope-v1-proof-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          [[ "$CACHE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$CACHE_TAG" =~ ^native-envelope-v1-proof-[0-9]+-[0-9]+$ ]]
+          gh api --paginate --slurp \
+            '/orgs/ferrum-edge/packages/container/ferrum-edge-buildcache/versions?per_page=100' \
+            > "$RUNNER_TEMP/native-envelope-versions.json"
+          version_id="$(jq -er --arg digest "$CACHE_DIGEST" --arg tag "$CACHE_TAG" \
+            '[.[][] | select(.name == $digest and .metadata.container.tags == [$tag])] |
+             if length == 1 then .[0].id else error("expected one exclusively owned version") end' \
+            "$RUNNER_TEMP/native-envelope-versions.json")"
+          [[ "$version_id" =~ ^[1-9][0-9]*$ ]]
+          gh api \
+            "/orgs/ferrum-edge/packages/container/ferrum-edge-buildcache/versions/$version_id" \
+            | jq -e --arg digest "$CACHE_DIGEST" --arg tag "$CACHE_TAG" \
+              '.name == $digest and .metadata.container.tags == [$tag]' > /dev/null
+          gh api --method DELETE \
+            "/orgs/ferrum-edge/packages/container/ferrum-edge-buildcache/versions/$version_id"
+          printf 'Deleted owned synthetic version %s (%s)\n' "$version_id" "$CACHE_DIGEST"

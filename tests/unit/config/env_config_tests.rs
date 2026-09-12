@@ -32,6 +32,24 @@ fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
     }
 }
 
+/// A Workload API socket path whose every directory component the production
+/// socket contract admits on this host.
+///
+/// The tests that use it are about *attestor* diagnostics, and `validate`
+/// checks the socket contract first. A hard-coded `/tmp/...` is a symlinked
+/// ancestor on macOS, so the socket check refuses it and the attestor assertion
+/// fails on the wrong error — poisoning `ENV_LOCK` for every other test in this
+/// binary (issue #4984). The real directory behind the platform temporary
+/// directory is resolved instead. The socket file itself is never created:
+/// the contract requires the parent to exist, not the socket.
+fn admitted_workload_api_socket_path() -> String {
+    std::fs::canonicalize(std::env::temp_dir())
+        .expect("the platform temporary directory resolves to a real directory")
+        .join("fe-env-attestor.sock")
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Helper to remove an env var (must be called inside with_env_vars or while holding ENV_LOCK).
 fn remove_var(key: &str) {
     // SAFETY: Called within with_env_vars which holds ENV_LOCK.
@@ -482,6 +500,10 @@ fn test_env_config_dp_mode_missing_grpc_url() {
         &[
             ("FERRUM_MODE", "dp"),
             (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
+            (
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
                 "secret-padding-for-32-char-min!!",
             ),
@@ -502,6 +524,10 @@ fn test_env_config_dp_config_max_stale_defaults_to_one_hour_fail_closed() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
             ("FERRUM_DP_CP_GRPC_URLS", "http://127.0.0.1:50051"),
             (
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
@@ -530,6 +556,10 @@ fn test_env_config_dp_config_max_stale_zero_is_the_unbounded_opt_in() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
             ("FERRUM_DP_CP_GRPC_URLS", "http://127.0.0.1:50051"),
             (
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
@@ -558,6 +588,10 @@ fn test_env_config_dp_config_stale_action_rejects_case_and_dash_variants() {
         with_env_vars(
             &[
                 ("FERRUM_MODE", "dp"),
+                (
+                    "FERRUM_ADMIN_JWT_SECRET",
+                    "dp-admin-secret-padding-at-least-32-bytes",
+                ),
                 ("FERRUM_DP_CP_GRPC_URLS", "http://127.0.0.1:50051"),
                 (
                     "FERRUM_CP_DP_GRPC_JWT_SECRET",
@@ -579,6 +613,10 @@ fn test_env_config_dp_config_stale_action_rejects_unknown_values() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
             ("FERRUM_DP_CP_GRPC_URLS", "http://127.0.0.1:50051"),
             (
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
@@ -598,6 +636,10 @@ fn test_env_config_dp_mode_missing_jwt_secret() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
             ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
         ],
         || {
@@ -1259,6 +1301,7 @@ fn test_env_config_mesh_workload_api_rejects_file_svid_override() {
 
 #[test]
 fn test_env_config_mesh_workload_api_rejects_malformed_unix_identity_rule() {
+    let socket_path = admitted_workload_api_socket_path();
     with_env_vars(
         &[
             ("FERRUM_MODE", "mesh"),
@@ -1275,10 +1318,7 @@ fn test_env_config_mesh_workload_api_rejects_malformed_unix_identity_rule() {
             ("FERRUM_MESH_CA_BOOTSTRAP_DEV", "true"),
             ("FERRUM_MESH_WORKLOAD_API_ENABLED", "true"),
             ("FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY", "true"),
-            (
-                "FERRUM_MESH_WORKLOAD_API_SOCKET_PATH",
-                "/tmp/ferrum-env-config-attestor-validation.sock",
-            ),
+            ("FERRUM_MESH_WORKLOAD_API_SOCKET_PATH", socket_path.as_str()),
             (
                 "FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES",
                 "uid:not-a-number=spiffe://cluster.local/ns/default/sa/app",
@@ -1297,6 +1337,7 @@ fn test_env_config_mesh_workload_api_rejects_malformed_unix_identity_rule() {
 
 #[test]
 fn test_env_config_mesh_workload_api_requires_available_attestor() {
+    let socket_path = admitted_workload_api_socket_path();
     with_env_vars(
         &[
             ("FERRUM_MODE", "mesh"),
@@ -1313,10 +1354,7 @@ fn test_env_config_mesh_workload_api_requires_available_attestor() {
             ("FERRUM_MESH_CA_BOOTSTRAP_DEV", "true"),
             ("FERRUM_MESH_WORKLOAD_API_ENABLED", "true"),
             ("FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY", "true"),
-            (
-                "FERRUM_MESH_WORKLOAD_API_SOCKET_PATH",
-                "/tmp/ferrum-env-config-attestor-validation.sock",
-            ),
+            ("FERRUM_MESH_WORKLOAD_API_SOCKET_PATH", socket_path.as_str()),
         ],
         || {
             remove_var("FERRUM_MESH_PRODUCTION_MODE");
@@ -1512,6 +1550,30 @@ fn test_env_config_mesh_production_refuses_tls_no_verify() {
             "only the engaged bypass must be named: {err}"
         );
     });
+}
+
+#[test]
+fn test_env_config_refuses_admin_tls_no_verify_with_client_ca_bundle() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_ADMIN_TLS_NO_VERIFY", "true"),
+            (
+                "FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH",
+                "/etc/ferrum/admin-client-ca.pem",
+            ),
+        ],
+        || {
+            let err = EnvConfig::from_env()
+                .expect_err("admin TLS no-verify paired with a client CA bundle must be refused");
+            assert!(err.contains("FERRUM_ADMIN_TLS_NO_VERIFY"), "got: {err}");
+            assert!(
+                err.contains("FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH"),
+                "got: {err}"
+            );
+        },
+    );
 }
 
 #[test]
@@ -1844,6 +1906,9 @@ fn test_env_config_http3_defaults() {
             remove_var("FERRUM_HTTP3_STREAM_RECEIVE_WINDOW");
             remove_var("FERRUM_HTTP3_RECEIVE_WINDOW");
             remove_var("FERRUM_HTTP3_SEND_WINDOW");
+            remove_var("FERRUM_HTTP3_BACKEND_STREAM_RECEIVE_WINDOW");
+            remove_var("FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW");
+            remove_var("FERRUM_HTTP3_BACKEND_SEND_WINDOW");
             remove_var("FERRUM_FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE");
             remove_var("FERRUM_FRONTEND_H2_INITIAL_CONNECTION_WINDOW_SIZE");
             remove_var("FERRUM_FRONTEND_H2_MAX_FRAME_SIZE");
@@ -1856,6 +1921,10 @@ fn test_env_config_http3_defaults() {
             assert_eq!(config.http3_stream_receive_window, 262_144);
             assert_eq!(config.http3_receive_window, 2_097_152);
             assert_eq!(config.http3_send_window, 2_097_152);
+            // Backend H3 defaults (throughput-tuned, trusted upstream plane)
+            assert_eq!(config.http3_backend_stream_receive_window, 8_388_608);
+            assert_eq!(config.http3_backend_receive_window, 33_554_432);
+            assert_eq!(config.http3_backend_send_window, 8_388_608);
             assert_eq!(config.http3_connections_per_backend, 4);
             assert_eq!(config.http3_pool_idle_timeout_seconds, 120);
             assert_eq!(config.http3_request_body_channel_capacity, 32);
@@ -2275,6 +2344,135 @@ fn test_http3_flush_interval_ceiling() {
     );
 }
 
+/// Backend H3 flow-control windows parse from their own variables and do not
+/// disturb the hardened frontend triple (issue #4755).
+#[test]
+fn test_http3_backend_windows_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_BACKEND_STREAM_RECEIVE_WINDOW", "16777216"),
+            ("FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW", "67108864"),
+            ("FERRUM_HTTP3_BACKEND_SEND_WINDOW", "16777216"),
+        ],
+        || {
+            remove_var("FERRUM_HTTP3_STREAM_RECEIVE_WINDOW");
+            remove_var("FERRUM_HTTP3_RECEIVE_WINDOW");
+            remove_var("FERRUM_HTTP3_SEND_WINDOW");
+
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_backend_stream_receive_window, 16_777_216);
+            assert_eq!(config.http3_backend_receive_window, 67_108_864);
+            assert_eq!(config.http3_backend_send_window, 16_777_216);
+            // Frontend triple untouched.
+            assert_eq!(config.http3_stream_receive_window, 262_144);
+            assert_eq!(config.http3_receive_window, 2_097_152);
+            assert_eq!(config.http3_send_window, 2_097_152);
+        },
+    );
+}
+
+/// Raising the frontend windows must not move the backend plane either.
+#[test]
+fn test_http3_frontend_windows_do_not_move_the_backend_plane() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_STREAM_RECEIVE_WINDOW", "1048576"),
+            ("FERRUM_HTTP3_RECEIVE_WINDOW", "4194304"),
+            ("FERRUM_HTTP3_SEND_WINDOW", "4194304"),
+        ],
+        || {
+            remove_var("FERRUM_HTTP3_BACKEND_STREAM_RECEIVE_WINDOW");
+            remove_var("FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW");
+            remove_var("FERRUM_HTTP3_BACKEND_SEND_WINDOW");
+
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_stream_receive_window, 1_048_576);
+            assert_eq!(config.http3_receive_window, 4_194_304);
+            assert_eq!(config.http3_send_window, 4_194_304);
+            assert_eq!(config.http3_backend_stream_receive_window, 8_388_608);
+            assert_eq!(config.http3_backend_receive_window, 33_554_432);
+            assert_eq!(config.http3_backend_send_window, 8_388_608);
+        },
+    );
+}
+
+/// A zero QUIC flow-control window grants no credit at all, so it is refused
+/// on BOTH trust planes rather than silently installed.
+#[test]
+fn test_http3_zero_flow_control_window_rejected() {
+    for key in [
+        "FERRUM_HTTP3_STREAM_RECEIVE_WINDOW",
+        "FERRUM_HTTP3_RECEIVE_WINDOW",
+        "FERRUM_HTTP3_SEND_WINDOW",
+        "FERRUM_HTTP3_BACKEND_STREAM_RECEIVE_WINDOW",
+        "FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW",
+        "FERRUM_HTTP3_BACKEND_SEND_WINDOW",
+    ] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                (key, "0"),
+            ],
+            || {
+                let err = EnvConfig::from_env()
+                    .err()
+                    .unwrap_or_else(|| panic!("{key}=0 must be refused"));
+                assert!(err.contains(key), "refusal must name {key}: {err}");
+            },
+        );
+    }
+}
+
+/// A receive window above the QUIC variable-length integer range used to be
+/// swallowed at connection-setup time and replaced by the compiled default.
+#[test]
+fn test_http3_receive_window_above_varint_range_rejected() {
+    for key in [
+        "FERRUM_HTTP3_STREAM_RECEIVE_WINDOW",
+        "FERRUM_HTTP3_RECEIVE_WINDOW",
+        "FERRUM_HTTP3_BACKEND_STREAM_RECEIVE_WINDOW",
+        "FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW",
+    ] {
+        // QUIC_VARINT_MAX_U64 + 1.
+        let over = (1u64 << 62).to_string();
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                (key, over.as_str()),
+            ],
+            || {
+                let err = EnvConfig::from_env()
+                    .err()
+                    .unwrap_or_else(|| panic!("{key} above the varint range must be refused"));
+                assert!(err.contains(key), "refusal must name {key}: {err}");
+            },
+        );
+    }
+}
+
+/// The varint bound itself is admitted — the refusal is strictly above it.
+#[test]
+fn test_http3_receive_window_at_varint_max_accepted() {
+    let at_max = ((1u64 << 62) - 1).to_string();
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW", at_max.as_str()),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_backend_receive_window, (1u64 << 62) - 1);
+        },
+    );
+}
+
 #[test]
 fn test_http3_initial_mtu_default() {
     with_env_vars(
@@ -2645,6 +2843,10 @@ fn test_env_config_dp_mode_valid() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
             ("FERRUM_DP_CP_GRPC_URLS", "http://control-plane:50051"),
             // Non-loopback http:// CP URL requires the explicit plaintext opt-in.
             ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
@@ -6252,6 +6454,10 @@ fn test_resolved_dp_cp_grpc_urls_single_entry() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
             ("FERRUM_DP_CP_GRPC_URLS", "http://cp1:50051"),
             (
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
@@ -6273,6 +6479,10 @@ fn test_resolved_dp_cp_grpc_urls_multi_urls_only() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
             (
                 "FERRUM_DP_CP_GRPC_URLS",
                 "https://cp1:50051,https://cp2:50051,https://cp3:50051",
@@ -6303,6 +6513,10 @@ fn test_resolved_dp_cp_grpc_urls_trims_whitespace() {
         &[
             ("FERRUM_MODE", "dp"),
             (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
+            (
                 "FERRUM_DP_CP_GRPC_URLS",
                 " https://cp1:50051 , https://cp2:50051 ",
             ),
@@ -6327,6 +6541,10 @@ fn test_resolved_dp_cp_grpc_urls_filters_empty() {
         &[
             ("FERRUM_MODE", "dp"),
             (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
+            (
                 "FERRUM_DP_CP_GRPC_URLS",
                 "https://cp1:50051,,https://cp2:50051,",
             ),
@@ -6350,6 +6568,10 @@ fn test_dp_mode_validation_accepts_urls() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
             ("FERRUM_DP_CP_GRPC_URLS", "https://cp1:50051"),
             (
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
@@ -6368,6 +6590,10 @@ fn test_dp_mode_validation_rejects_no_url() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
             (
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
                 "secret-padding-for-32-char-min!!",
@@ -6391,6 +6617,10 @@ fn test_dp_cp_failover_primary_retry_secs_default() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
             ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
             (
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
@@ -6411,6 +6641,10 @@ fn test_dp_cp_failover_primary_retry_secs_custom() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
             ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
             (
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
@@ -7006,6 +7240,34 @@ fn test_pool_shard_amount_zero_kept_as_auto_sentinel() {
 }
 
 #[test]
+fn pool_shard_env_admission_matches_runtime_normalization_boundaries() {
+    use ferrum_edge::util::sharding::{MAX_SHARD_AMOUNT, pool_shard_amount};
+
+    let mut values = vec![0usize, 1, 2, 3, usize::MAX];
+    for exponent in 1..=30 {
+        let power = 1usize << exponent;
+        values.extend([power - 1, power, power + 1]);
+    }
+    for value in values {
+        let text = value.to_string();
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_POOL_SHARD_AMOUNT", &text),
+            ],
+            || {
+                let config = EnvConfig::from_env().unwrap();
+                assert_eq!(config.pool_shard_amount, value);
+                let normalized = pool_shard_amount(config.pool_shard_amount);
+                assert!(normalized.is_power_of_two());
+                assert!((2..=MAX_SHARD_AMOUNT).contains(&normalized));
+            },
+        );
+    }
+}
+
+#[test]
 fn test_k8s_istio_root_namespace_defaults_to_istio_system() {
     with_env_vars(
         &[
@@ -7526,9 +7788,10 @@ fn shutdown_predrain_default_is_zero_in_every_mode() {
 
 /// `main.rs` must resolve the window through the mode gate above rather than
 /// re-deriving it, so the chart contract and the runtime cannot drift apart
-/// again. The signal handler must also publish the draining verdict BEFORE it
+/// again. The drain sequencer must also publish the draining verdict BEFORE it
 /// sleeps: the whole point of the window is that readiness already reports
-/// `ready:false` while the accept loops stay open.
+/// `ready:false` while the accept loops stay open. The window itself races the
+/// shutdown-escalation token so a second signal ends it early.
 #[test]
 fn main_resolves_predrain_through_the_shared_mode_gate() {
     const MAIN_SOURCE: &str = include_str!("../../../src/gateway_entry.rs");
@@ -7547,9 +7810,15 @@ fn main_resolves_predrain_through_the_shared_mode_gate() {
     let announce_at = MAIN_SOURCE
         .find("overload::announce_shutdown_drain();")
         .expect("the signal handler must publish the draining verdict");
+    // The wait is a `select!` arm rather than a bare `.await`: a repeated
+    // shutdown signal must be able to cut the window short (issue #4829), so
+    // match the timer expression itself and assert the race separately below.
     let sleep_at = MAIN_SOURCE
-        .find("tokio::time::sleep(shutdown_predrain).await;")
+        .find("tokio::time::sleep(shutdown_predrain)")
         .expect("the signal handler must hold the accept loops open for the window");
+    let escalation_at = MAIN_SOURCE
+        .find("overload::shutdown_escalation_token().cancelled()")
+        .expect("a repeated shutdown signal must be able to cut the pre-drain window short");
     let broadcast_at = MAIN_SOURCE
         .find("let _ = shutdown_tx_signal.send(true);")
         .expect("the signal handler must close the accept loops afterwards");
@@ -7558,4 +7827,96 @@ fn main_resolves_predrain_through_the_shared_mode_gate() {
         "readiness must flip to not-ready, then the window elapses, and only then do the accept \
          loops close"
     );
+    assert!(
+        sleep_at < escalation_at && escalation_at < broadcast_at,
+        "the pre-drain wait must race the escalation token inside the window, not outlive it"
+    );
+}
+
+// ── Graceful-shutdown drain bounds (issue #4829) ──────────────────────
+
+#[test]
+fn test_env_config_shutdown_drain_seconds_accepts_zero_default_and_maximum() {
+    for (value, expected) in [("0", 0u64), ("30", 30), ("86400", 86_400)] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_SHUTDOWN_DRAIN_SECONDS", value),
+            ],
+            || {
+                assert_eq!(
+                    EnvConfig::from_env().unwrap().shutdown_drain_seconds,
+                    expected
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn test_env_config_shutdown_drain_seconds_rejects_values_above_the_maximum() {
+    for value in ["86401", "31536000"] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_SHUTDOWN_DRAIN_SECONDS", value),
+            ],
+            || {
+                let error = EnvConfig::from_env().unwrap_err();
+                assert!(
+                    error.contains("FERRUM_SHUTDOWN_DRAIN_SECONDS"),
+                    "unexpected error for {value}: {error}"
+                );
+                assert!(
+                    error.contains("86400"),
+                    "error should name the documented maximum: {error}"
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn test_env_config_shutdown_predrain_seconds_accepts_zero_and_maximum() {
+    for (value, expected) in [("0", 0u64), ("3600", 3_600)] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_SHUTDOWN_PREDRAIN_SECONDS", value),
+            ],
+            || {
+                assert_eq!(
+                    EnvConfig::from_env().unwrap().shutdown_predrain_seconds,
+                    expected
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn test_env_config_shutdown_predrain_seconds_rejects_values_above_the_maximum() {
+    for value in ["3601", "86400"] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_SHUTDOWN_PREDRAIN_SECONDS", value),
+            ],
+            || {
+                let error = EnvConfig::from_env().unwrap_err();
+                assert!(
+                    error.contains("FERRUM_SHUTDOWN_PREDRAIN_SECONDS"),
+                    "unexpected error for {value}: {error}"
+                );
+                assert!(
+                    error.contains("3600"),
+                    "error should name the documented maximum: {error}"
+                );
+            },
+        );
+    }
 }

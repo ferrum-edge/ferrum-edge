@@ -605,7 +605,7 @@ pub struct MeshRevisionGate {
 /// with, so the commit that finalizes the `applied` slot binds the SAME pair the
 /// gate admitted rather than whatever the caller recomputes later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MeshRevisionApplyToken {
+pub struct MeshRevisionApplyToken {
     epoch: u64,
     content: [u8; 32],
 }
@@ -673,9 +673,10 @@ impl MeshRevisionGate {
     ///
     /// `content` must be the identity of the content this apply will install.
     /// The token is minted only when BOTH the revision and the identity still
-    /// match the accepted slot, so a candidate whose content diverges from the
-    /// one that was admitted at this revision can never reach a commit.
-    pub(crate) fn begin_apply(
+    /// match the accepted or applied slot. The latter permits overlay refreshes
+    /// of the serving generation while a newer received candidate is pending.
+    /// Divergent content cannot gain permission through either slot.
+    pub fn begin_apply(
         &self,
         candidate: Option<&MeshConfigRevision>,
         content: MeshRevisionContentIdentity,
@@ -683,14 +684,39 @@ impl MeshRevisionGate {
         let candidate = candidate.filter(|revision| revision.is_well_formed());
         let content = content.digest()?;
         let state = self.lock_state();
-        if state.accepted.as_ref() != candidate {
+        // Overlay refreshes may re-apply the serving generation while a newer
+        // received candidate is pending or has failed runtime validation.
+        let accepted =
+            state.accepted.as_ref() == candidate && state.accepted_content == Some(content);
+        let applied = state.applied.as_ref() == candidate && state.applied_content == Some(content);
+        if !accepted && !applied {
             return None;
         }
-        if state.accepted_content != Some(content) {
-            return None;
-        }
-        let epoch = state.accepted_epoch?;
+        let epoch = if accepted {
+            state.accepted_epoch?
+        } else {
+            state.reset_epoch
+        };
         Some(MeshRevisionApplyToken { epoch, content })
+    }
+
+    /// Refuse a commit that did not carry permission from apply begin. Keep
+    /// both watermarks intact: a runtime refusal must still roll back to the
+    /// last committed serving generation, never to an empty bootstrap slot.
+    pub(crate) fn reject_missing_apply_token(&self, revision: Option<&MeshConfigRevision>) {
+        let state = self.lock_state();
+        let accepted_revision = state.accepted.as_ref().map(sanitized_revision);
+        let applied_revision = state.applied.as_ref().map(sanitized_revision);
+        drop(state);
+        tracing::error!(
+            candidate_revision = ?revision.map(sanitized_revision),
+            ?accepted_revision,
+            ?applied_revision,
+            "Mesh revision commit has no apply token; retaining the last committed baseline"
+        );
+        crate::plugins::mesh::prometheus_helpers::increment_mesh_config_revision_rejection(
+            "missing_apply_token",
+        );
     }
 
     /// Commit the watermark for a slice the proxy runtime ACCEPTED.
@@ -707,7 +733,7 @@ impl MeshRevisionGate {
     /// `content` must be the same identity the token was minted for; a mismatch
     /// means the caller is committing content other than the one the gate
     /// admitted, which is refused rather than bound to the applied slot.
-    pub(crate) fn commit_applied(
+    pub fn commit_applied(
         &self,
         revision: Option<&MeshConfigRevision>,
         content: MeshRevisionContentIdentity,

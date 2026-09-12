@@ -542,6 +542,125 @@ async fn test_client_level_pool_settings_share_and_isolate() {
     );
 }
 
+/// Issue #4769: twelve proxies have six effective reqwest configurations.
+/// Exercise real client insertion in both orders, so implicit window settings
+/// cannot inherit whichever incompatible client happened to be created first.
+#[tokio::test]
+async fn test_resolved_window_matrix_creates_one_pool_per_effective_configuration() {
+    let cases = [
+        ("default", None, None, None, None, 0),
+        ("implicit-small-stream", None, Some(65_535), None, None, 1),
+        (
+            "explicit-small-stream",
+            Some(false),
+            Some(65_535),
+            None,
+            None,
+            1,
+        ),
+        (
+            "implicit-large-stream",
+            None,
+            Some(1_048_576),
+            None,
+            None,
+            2,
+        ),
+        (
+            "explicit-large-stream",
+            Some(false),
+            Some(1_048_576),
+            None,
+            None,
+            2,
+        ),
+        (
+            "implicit-small-connection",
+            None,
+            None,
+            Some(65_535),
+            None,
+            3,
+        ),
+        (
+            "explicit-small-connection",
+            Some(false),
+            None,
+            Some(65_535),
+            None,
+            3,
+        ),
+        (
+            "adaptive-stream-ignored",
+            Some(true),
+            Some(65_535),
+            None,
+            None,
+            0,
+        ),
+        (
+            "adaptive-connection-ignored",
+            Some(true),
+            None,
+            Some(65_535),
+            None,
+            0,
+        ),
+        ("both-fixed", None, Some(65_535), Some(65_535), None, 4),
+        ("h1", None, None, None, Some(false), 5),
+        (
+            "h1-windows-ignored",
+            Some(false),
+            Some(65_535),
+            Some(65_535),
+            Some(false),
+            5,
+        ),
+    ];
+    for reverse in [false, true] {
+        let pool = ConnectionPool::new(
+            PoolConfig::default(),
+            create_test_env_config(),
+            create_test_dns_cache(),
+            None,
+            std::sync::Arc::new(Vec::new()),
+        );
+        let mut observed = Vec::new();
+        let mut expected_groups = std::collections::HashSet::new();
+        for position in 0..cases.len() {
+            let index = if reverse {
+                cases.len() - 1 - position
+            } else {
+                position
+            };
+            let (name, adaptive, stream, connection, h2, group) = cases[index];
+            let mut proxy = create_test_proxy();
+            proxy.id = name.to_string();
+            proxy.pool_http2_adaptive_window = adaptive;
+            proxy.pool_http2_initial_stream_window_size = stream;
+            proxy.pool_http2_initial_connection_window_size = connection;
+            proxy.pool_enable_http2 = h2;
+            let key = pool.pool_key_for_warmup(&proxy);
+            for (prior_group, prior_key) in &observed {
+                assert_eq!(group == *prior_group, key == *prior_key, "{name}");
+            }
+            drop(
+                pool.get_client(&proxy)
+                    .await
+                    .expect("construct reqwest client"),
+            );
+            expected_groups.insert(group);
+            observed.push((group, key));
+            let stats = pool.get_stats();
+            assert_eq!(stats.total_pools, expected_groups.len(), "{name}");
+            for (_, expected_key) in &observed {
+                assert!(stats.entries_per_host.contains_key(expected_key), "{name}");
+            }
+        }
+        assert_eq!(pool.get_stats().total_pools, 6);
+    }
+}
+
 /// Adaptive window overrides fixed initial windows in reqwest/hyper, so two
 /// proxies with `aw=1` and different fixed windows still share one client.
 #[tokio::test]

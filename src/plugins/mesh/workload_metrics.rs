@@ -387,16 +387,52 @@ impl WorkloadMetrics {
     where
         F: FnMut(&str) -> Result<String, std::env::VarError>,
     {
-        // Unknown root keys fail closed. A non-object config keeps its existing
-        // behavior (every read below yields `None`, producing a default
-        // instance) — closing that shape is a separate change.
-        if let Some(object) = config.as_object() {
-            crate::util::unknown_keys::reject_unknown_keys(
-                object,
-                "config",
-                WORKLOAD_METRICS_CONFIG_KEYS,
-                "workload_metrics: ",
-            )?;
+        let object = config
+            .as_object()
+            .ok_or_else(|| "workload_metrics: config must be an object".to_string())?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "config",
+            WORKLOAD_METRICS_CONFIG_KEYS,
+            "workload_metrics: ",
+        )?;
+        for key in [
+            "node_id",
+            "topology",
+            "namespace",
+            "workload_spiffe_id",
+            "service_name",
+            "deployment_environment",
+        ] {
+            if config.get(key).is_some_and(|value| !value.is_string()) {
+                return Err(format!("workload_metrics: {key} must be a string"));
+            }
+        }
+        for key in [
+            "span_reporting_disabled",
+            "disable_span_reporting",
+            "disableSpanReporting",
+        ] {
+            if config.get(key).is_some_and(|value| !value.is_boolean()) {
+                return Err(format!("workload_metrics: {key} must be a boolean"));
+            }
+        }
+        for key in [
+            "batch_size",
+            "flush_interval_ms",
+            "buffer_capacity",
+            "buffer_max_bytes",
+            "max_retries",
+            "retry_delay_ms",
+        ] {
+            if config
+                .get(key)
+                .is_some_and(|value| value.as_u64().is_none())
+            {
+                return Err(format!(
+                    "workload_metrics: {key} must be a non-negative integer"
+                ));
+            }
         }
 
         let workload_spiffe_id = config
@@ -406,18 +442,7 @@ impl WorkloadMetrics {
             .map(SpiffeId::new)
             .transpose()
             .map_err(|e| format!("workload_metrics: invalid workload_spiffe_id: {e}"))?;
-        let labels = config
-            .get("labels")
-            .and_then(Value::as_object)
-            .map(|labels| {
-                labels
-                    .iter()
-                    .filter_map(|(key, value)| {
-                        value.as_str().map(|value| (key.clone(), value.to_string()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let labels = string_map_config(config, "labels")?;
         let baggage_trust = BaggageTrustPolicy::from_config(config).map_err(|e| {
             if e.starts_with("workload_metrics:") {
                 e
@@ -441,46 +466,9 @@ impl WorkloadMetrics {
             }
             None => None,
         };
-        let custom_tags: HashMap<String, String> = config
-            .get("custom_tags")
-            .and_then(Value::as_object)
-            .map(|tags| {
-                tags.iter()
-                    .filter_map(|(key, value)| {
-                        value.as_str().map(|value| (key.clone(), value.to_string()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let custom_header_tags: HashMap<String, String> = config
-            .get("custom_header_tags")
-            .and_then(Value::as_object)
-            .map(|tags| {
-                tags.iter()
-                    .filter_map(|(key, value)| {
-                        value.as_str().map(|value| (key.clone(), value.to_string()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let custom_env_tags: HashMap<String, String> = match config.get("custom_env_tags") {
-            None => HashMap::new(),
-            Some(Value::Object(tags)) => {
-                let mut parsed = HashMap::with_capacity(tags.len());
-                for (key, value) in tags {
-                    let Some(env_var) = value.as_str() else {
-                        return Err(format!(
-                            "workload_metrics: custom_env_tags.{key} must be a string"
-                        ));
-                    };
-                    parsed.insert(key.clone(), env_var.to_string());
-                }
-                parsed
-            }
-            Some(_) => {
-                return Err("workload_metrics: custom_env_tags must be an object".to_string());
-            }
-        };
+        let custom_tags = string_map_config(config, "custom_tags")?;
+        let custom_header_tags = string_map_config(config, "custom_header_tags")?;
+        let custom_env_tags = string_map_config(config, "custom_env_tags")?;
         let ValidatedCustomTags {
             mut custom_tags,
             custom_header_tags,
@@ -722,6 +710,12 @@ impl WorkloadMetrics {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> bool {
+        // Metrics-only instances compose labels and custom tags without owning
+        // trace context. Clearing a sibling's trace IDs here would suppress all
+        // of its span exporters because this instance cannot rebuild the IDs.
+        if !self.trace_context_enabled() {
+            return false;
+        }
         // `on_request_received` imports inbound context early so authorization
         // rejects remain observable. For accepted requests, request_transformer
         // runs before this hook and its final header policy is authoritative.
@@ -894,7 +888,21 @@ impl WorkloadMetrics {
             }
         }
         if let Some(marker) = self.custom_trace_attributes_marker.as_ref() {
-            metadata.insert(CUSTOM_TRACE_ATTRIBUTES_METADATA.to_string(), marker.clone());
+            let composed = metadata
+                .entry(CUSTOM_TRACE_ATTRIBUTES_METADATA.to_string())
+                .or_default();
+            if composed != marker {
+                // Cache admission bounds the union across the effective chain.
+                // Repeated early/final hooks must not duplicate names.
+                for name in marker.split(',') {
+                    if !composed.split(',').any(|existing| existing == name) {
+                        if !composed.is_empty() {
+                            composed.push(',');
+                        }
+                        composed.push_str(name);
+                    }
+                }
+            }
         }
         if let Some(marker) = self.disabled_metrics_marker.as_ref() {
             metadata.insert(MESH_METRICS_DISABLED_METADATA.to_string(), marker.clone());
@@ -1044,16 +1052,10 @@ impl WorkloadMetrics {
         }
     }
 
-    async fn log_with_precomputed_mesh_key(
-        &self,
-        summary: &TransactionSummary,
-        mesh_key: Option<&crate::plugins::mesh::prometheus_helpers::MeshRequestKey>,
-    ) {
+    async fn log_span(&self, summary: &TransactionSummary) {
         if summary.mirror {
             return;
         }
-        // Service graph aggregates all mesh RED data; trace export below honors sampling.
-        crate::plugins::mesh::service_graph::record_transaction_with_mesh_key(summary, mesh_key);
         if !self.should_export_metadata(&summary.metadata) {
             return;
         }
@@ -1091,14 +1093,25 @@ impl WorkloadMetrics {
 /// per-instance construction — never the sum of every intermediate instance.
 /// Diagnostics name the proxy only and never echo plan bytes, expressions,
 /// request data, or secrets.
+/// The custom trace attribute union is also capped at 32 names, including
+/// conditional instances, so composing ownership cannot truncate exports.
 pub(crate) fn validate_effective_metric_tag_override_plan_budget(
     plugins: &[Arc<dyn Plugin>],
     proxy_id: &str,
 ) -> Result<(), String> {
     let mut effective_plan_lengths = [0usize; MeshMetricFamily::ALL.len()];
+    let mut custom_tag_names = BTreeSet::new();
     for plugin in plugins {
         if plugin.name() != "workload_metrics" {
             continue;
+        }
+        if let Some(marker) = plugin.workload_custom_trace_attributes() {
+            custom_tag_names.extend(marker.split(','));
+            if custom_tag_names.len() > MAX_CUSTOM_TAGS {
+                return Err(format!(
+                    "proxy_id={proxy_id}: workload_metrics effective custom tags exceed {MAX_CUSTOM_TAGS} distinct names"
+                ));
+            }
         }
         let conditional = plugin.metric_tag_override_plans_are_conditional();
         for (family, plan) in plugin.metric_tag_override_plans() {
@@ -1130,6 +1143,14 @@ pub(crate) fn validate_effective_metric_tag_override_plan_budget(
 impl Plugin for WorkloadMetrics {
     fn name(&self) -> &str {
         "workload_metrics"
+    }
+
+    fn records_mesh_service_graph(&self, _summary: &TransactionSummary) -> bool {
+        true
+    }
+
+    fn workload_custom_trace_attributes(&self) -> Option<&str> {
+        self.custom_trace_attributes_marker.as_deref()
     }
 
     fn metric_tag_override_plans(&self) -> &[(MeshMetricFamily, String)] {
@@ -1414,17 +1435,7 @@ impl Plugin for WorkloadMetrics {
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        let mesh_key = crate::plugins::mesh::prometheus_helpers::mesh_request_key(summary);
-        self.log_with_precomputed_mesh_key(summary, mesh_key.as_ref())
-            .await;
-    }
-
-    async fn log_with_mesh_key(
-        &self,
-        summary: &TransactionSummary,
-        mesh_key: Option<&crate::plugins::mesh::prometheus_helpers::MeshRequestKey>,
-    ) {
-        self.log_with_precomputed_mesh_key(summary, mesh_key).await;
+        self.log_span(summary).await;
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -1441,6 +1452,24 @@ fn string_config(config: &Value, key: &str) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn string_map_config(config: &Value, key: &str) -> Result<HashMap<String, String>, String> {
+    let Some(value) = config.get(key) else {
+        return Ok(HashMap::new());
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("workload_metrics: {key} must be an object"))?;
+    object
+        .iter()
+        .map(|(name, value)| {
+            value
+                .as_str()
+                .map(|value| (name.clone(), value.to_string()))
+                .ok_or_else(|| format!("workload_metrics: {key} values must be strings"))
+        })
+        .collect()
 }
 
 fn parse_direction_emit(config: &Value) -> Result<DirectionEmit, String> {

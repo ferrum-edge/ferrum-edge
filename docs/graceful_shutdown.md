@@ -25,6 +25,27 @@ Serving modes (database, file, cp, dp, mesh) run these phases **sequentially**, 
 
 `FERRUM_SHUTDOWN_DRAIN_SECONDS=0` still disables the drain **wait**; the close hint and the request-admission rejection in step 5 are unconditional, and the pre-drain window in step 2 is independent of it.
 
+## Repeated signals
+
+A second `SIGTERM`/`SIGINT` is an escalation, not a duplicate. The gateway keeps listening for signals for its whole lifetime, so:
+
+- **First signal** — the ordinary sequence above.
+- **Second signal** — logged at `warn`, and the process **skips whatever remains of the pre-drain window and the drain wait** (steps 2 and 5-7). Everything after that runs unchanged: the transport pool tail, background-task cleanup, audit flush, observability delivery, and plugin finalizers. The escalation means "stop waiting for peers", not "abandon cleanup".
+- **Third and later** — logged at `warn` with a reminder that `SIGKILL` is the only stronger step, and that it skips the cleanup phases entirely.
+
+This is the behavior operators expect from pressing Ctrl-C twice, and it gives an orchestrator an escalation path short of `SIGKILL`. In-flight requests are force-closed at the point of escalation exactly as they are on a drain timeout.
+
+## Bounds on the drain knobs
+
+Both knobs are refused at the configuration boundary — at startup and by the non-serving `ferrum-edge validate` command — rather than clamped, so a typo surfaces before an incident rather than during one:
+
+| Variable | Minimum | Maximum |
+|---|---|---|
+| `FERRUM_SHUTDOWN_DRAIN_SECONDS` | `0` (skip the wait) | `86400` (24h) |
+| `FERRUM_SHUTDOWN_PREDRAIN_SECONDS` | `0` (no window) | `3600` (1h) |
+
+The pre-drain ceiling is the tighter of the two because that window keeps every listener **accepting new connections** while readiness already reports not-ready; it exists to bridge a load balancer's endpoint-withdrawal latency, which is at most a few health-check intervals.
+
 ## Configuration
 
 ```bash

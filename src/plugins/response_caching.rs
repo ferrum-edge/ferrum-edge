@@ -890,7 +890,24 @@ fn duration_from_monotonic_nanos_str(value: &str) -> Option<Duration> {
         .map(duration_from_nanos_u128)
 }
 
+/// Parse the upstream `Age` field into the age the response already carried
+/// when it arrived.
+///
+/// `Age` is a singleton `delta-seconds` field, but an origin that emits it on
+/// more than one field line is comma-folded into a single value before any
+/// plugin sees it (`crate::proxy` joins repeated response fields with
+/// `", "`). A digits-only parser refuses that combined value, and the caller
+/// then substitutes a zero age — silently rejuvenating a response that was
+/// already stale on arrival and making it a reusable cache entry. RFC 9110
+/// §5.5 directs a recipient that receives a singleton field as a list to use
+/// its first member, so the first member is what this parses. A first member
+/// that is not a plain `delta-seconds` is still an unusable `Age`, exactly as
+/// a single malformed value is.
 fn parse_age_header(value: &str) -> Option<Duration> {
+    let value = match value.split_once(',') {
+        Some((first_member, _)) => first_member,
+        None => value,
+    };
     let value = value.trim();
     if value.is_empty() || !value.as_bytes().iter().all(|byte| byte.is_ascii_digit()) {
         return None;
@@ -1600,6 +1617,33 @@ impl ResponseCaching {
         {
             return self.stage_final_header_decision(ctx, FinalHeaderDecision::Inert);
         }
+        // Gateway transport-failure guard. A backend that refused the connection
+        // before the request reached the wire, or vanished mid-exchange, leaves
+        // proxy core to mint the 502/504 the client receives. That response is
+        // this gateway's own error report, not a representation the origin
+        // selected, so an operator who lists 502/504 in `cacheable_status_codes`
+        // to retain genuine origin error pages must not thereby pin a local
+        // transport error over a resource whose origin has already recovered.
+        // Typed dispatch provenance decides it — not the status, and not a
+        // forgeable metadata or header marker — so an authoritative origin 502
+        // is still stored under that configuration. Mirrors
+        // `request_deduplication`'s transport-provenance gate.
+        //
+        // `NotDispatched` deliberately does not refuse: direct hook contexts
+        // never dispatch a backend, and a synthetic short-circuit is already
+        // refused above. Not an uncacheable-*resource* signal either, so the
+        // predictor is left alone.
+        if matches!(
+            ctx.backend_dispatch_state(),
+            super::BackendDispatchState::PreWireFailure
+                | super::BackendDispatchState::AmbiguousFailure
+        ) {
+            debug!(
+                "response_caching: backend dispatch failed in transport, taking no header-phase \
+                 effect for a gateway-generated error response"
+            );
+            return self.stage_final_header_decision(ctx, FinalHeaderDecision::Inert);
+        }
         // If a runtime-overlay publication landed mid-request the bytes belong to
         // neither policy, so this representation can neither be stored nor be
         // trusted to describe what it supersedes. Not an uncacheable-resource
@@ -2078,6 +2122,44 @@ impl ResponseCaching {
         Some(vary_headers)
     }
 
+    /// Publish this cache's downstream `Vary` contract on the response that
+    /// produced a miss.
+    ///
+    /// The mandatory `Authorization` / `Proxy-Authorization` / `Cookie`
+    /// dimensions and every configured `vary_by_headers` name exist precisely
+    /// because a downstream shared cache cannot observe Ferrum's private caller
+    /// partition. Mirroring them onto the retained entry alone published them
+    /// only from the second request onwards: the FIRST, publicly cacheable
+    /// response — the one a downstream cache actually stores — went out with
+    /// whatever `Vary` the origin sent, so that cache could reuse an anonymous
+    /// representation for a credential- or session-bearing request. The same
+    /// selection is therefore established here, before the miss is emitted, and
+    /// the later hit carries an identical list.
+    ///
+    /// `Vary: *` is left exactly as the origin sent it: it is a stronger
+    /// downstream refusal than any name list, and this cache already refuses to
+    /// store such a response.
+    fn publish_downstream_vary_contract(
+        &self,
+        ctx: &RequestContext,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        // No staged base key means this instance never ran a lookup for this
+        // request, so it establishes no partition to publish.
+        let Some(base_key) = ctx.metadata.get(&self.meta_base_key) else {
+            return;
+        };
+        let Some(mut vary_headers) = self.merged_vary_headers(response_headers) else {
+            return;
+        };
+        // The same three-way union the store path builds: configured names plus
+        // origin `Vary` (above), the dimensions already published for this base
+        // key, then the mandatory credential/session names.
+        self.merge_existing_vary_headers(base_key, &mut vary_headers);
+        self.merge_mandatory_sensitive_vary_headers(&mut vary_headers);
+        response_headers.insert("vary".to_string(), vary_headers.join(", "));
+    }
+
     fn is_fresh_conditional_hit(
         &self,
         request_headers: &HashMap<String, String>,
@@ -2447,16 +2529,27 @@ impl ResponseCaching {
         let mut guard = self.accounting_guard();
         let maintenance = &mut *guard;
 
+        // The descendant boundary is the mutated path plus exactly one
+        // separator. A path that already ends in `/` — including the root `/`
+        // — IS that boundary, so appending another slash would range over a
+        // `//` prefix no indexed descendant can occupy and leave every child
+        // of a slash-terminated parent stale after a successful mutation.
+        let path_is_own_boundary = encoded.ends_with('/');
         let descendant_prefix: Arc<str> = {
             let mut prefix = String::with_capacity(encoded.len() + 1);
             prefix.push_str(encoded.as_ref());
-            prefix.push('/');
+            if !path_is_own_boundary {
+                prefix.push('/');
+            }
             prefix.into()
         };
 
         let mut doomed: Vec<String> = Vec::new();
         if let Some(paths) = maintenance.path_index.get(scope) {
-            if let Some(keys) = paths.get(encoded.as_ref()) {
+            // When the path is its own boundary the ordered range below already
+            // covers the exact entry; looking it up again would queue every one
+            // of its keys twice and overstate the removal count.
+            if !path_is_own_boundary && let Some(keys) = paths.get(encoded.as_ref()) {
                 doomed.extend(keys.iter().cloned());
             }
             for (indexed_path, keys) in paths.range(Arc::clone(&descendant_prefix)..) {
@@ -2838,6 +2931,14 @@ fn parse_single_entity_tag(value: &str) -> Option<&str> {
     (position == value.len()).then_some(opaque)
 }
 
+/// How many empty members an HTTP list field may carry before the whole value
+/// is refused.
+///
+/// RFC 9110 §5.6.1.2 requires a recipient to parse and ignore a *reasonable*
+/// number of empty list elements; the bound is what keeps "reasonable" from
+/// becoming unbounded work for a header that is nothing but separators.
+const MAX_EMPTY_LIST_MEMBERS: usize = 16;
+
 fn if_none_match_matches(if_none_match: &str, etag: Option<&str>) -> bool {
     let bytes = if_none_match.as_bytes();
     let mut position = 0;
@@ -2855,8 +2956,27 @@ fn if_none_match_matches(if_none_match: &str, etag: Option<&str>) -> bool {
         return false;
     };
     let mut matched = false;
+    let mut empty_members = 0usize;
     loop {
         skip_etag_ows(bytes, &mut position);
+        // An empty list member carries no entity-tag. A leading, trailing, or
+        // interior one is a sender defect the recipient must tolerate
+        // (RFC 9110 §5.6.1.2) — treating it as a malformed tag would refuse a
+        // list that does name the stored representation and replay the whole
+        // 200 instead of the 304 the validator asked for.
+        if bytes.get(position) == Some(&b',') {
+            position += 1;
+            empty_members += 1;
+            if empty_members > MAX_EMPTY_LIST_MEMBERS {
+                return false;
+            }
+            continue;
+        }
+        if position == bytes.len() {
+            // The value ended on separators. A list of nothing but empty
+            // members delivered no entity-tag, so `matched` is still false.
+            return matched;
+        }
         let Some(candidate_opaque) = parse_entity_tag(if_none_match, &mut position) else {
             return false;
         };
@@ -2869,10 +2989,6 @@ fn if_none_match_matches(if_none_match: &str, etag: Option<&str>) -> bool {
             return false;
         }
         position += 1;
-        skip_etag_ows(bytes, &mut position);
-        if position == bytes.len() {
-            return false;
-        }
     }
 }
 
@@ -3382,7 +3498,14 @@ impl Plugin for ResponseCaching {
             // state and overwrite that instance's client-visible header.
             return PluginResult::Continue;
         };
+        let is_miss = status == "MISS";
         self.add_cache_status_header(response_headers, status);
+        if is_miss {
+            // Every other status either replays an entry that already carries
+            // the list (HIT / REVALIDATED) or established no partition at all
+            // (BYPASS / PREDICTED-BYPASS).
+            self.publish_downstream_vary_contract(ctx, response_headers);
+        }
         PluginResult::Continue
     }
 

@@ -821,6 +821,43 @@ async fn cumulative_multi_datagram_replies_share_one_request_budget() {
 }
 
 #[tokio::test]
+async fn exhausted_exchange_does_not_fund_the_next_requests_reply() {
+    let backend = BurstBackend::start(vec![b'x'; 800], 1).await;
+    let service = BurstBackend::service();
+    let snapshot = LabSnapshot {
+        services: vec![(service.clone(), backend.port)],
+        routes: vec![RouteSpec {
+            gateway: "edge",
+            section: "dns",
+            route: "dns",
+            backend_refs: json!([{"name": service.as_str(), "port": backend.port}]),
+        }],
+        extra_objects: Vec::new(),
+    };
+    let mut overrides = HashMap::new();
+    overrides.insert(BurstBackend::dns_name(), "127.0.0.1".to_string());
+    let lab = start_translated_udp_lab(&snapshot, overrides).await;
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+
+    client
+        .send_to(&[b'r'; 100], lab.gateway_addr(0))
+        .await
+        .expect("send first request");
+    let replies = recv_n(&client, 1, REPLY_TIMEOUT).await;
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].len(), 800);
+
+    // Reuse the session after consuming the entire first request's credit.
+    // The next 800-byte reply exceeds this request's 792-byte allowance.
+    client
+        .send_to(&[b'r'; 99], lab.gateway_addr(0))
+        .await
+        .expect("send second request");
+    assert!(recv_n(&client, 1, NO_REPLY_WINDOW).await.is_empty());
+    lab.shutdown().await;
+}
+
+#[tokio::test]
 async fn route_policy_tightens_then_delete_restores_default() {
     let backend = BurstBackend::start(vec![b'z'; 200], 1).await;
     let service = BurstBackend::service();

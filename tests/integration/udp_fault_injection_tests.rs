@@ -503,8 +503,18 @@ async fn udp_delay_for_client_a_does_not_block_client_b() {
     .await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), gateway.listen_port);
 
+    // Sessions are keyed by the full client `SocketAddr`, so two ephemeral ports
+    // on one loopback address are already two isolated peers. The sibling
+    // functional fixture used `127.0.0.2` here, which needs a secondary
+    // loopback alias macOS does not configure (issue #4983); the port alone
+    // carries the peer identity this test asserts on.
     let client_a = UdpSocket::bind("127.0.0.1:0").await.expect("client A bind");
-    let client_b = UdpSocket::bind("127.0.0.2:0").await.expect("client B bind");
+    let client_b = UdpSocket::bind("127.0.0.1:0").await.expect("client B bind");
+    assert_ne!(
+        client_a.local_addr().expect("client A addr"),
+        client_b.local_addr().expect("client B addr"),
+        "client A and client B must be distinct UDP sessions"
+    );
 
     client_a
         .send_to(b"slow-a", gateway_addr)

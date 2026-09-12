@@ -167,6 +167,7 @@ fn start_gateway(
     let binary_path = gateway_binary_path();
 
     let mut cmd = std::process::Command::new(binary_path);
+    cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())

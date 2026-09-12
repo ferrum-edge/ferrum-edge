@@ -15,15 +15,15 @@ use crate::config_sources::k8s::udp_amplification_policy::lookup_route_posture;
 use crate::config_sources::k8s::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiBackendTlsPolicyStatus, GatewayApiListenerKey,
     GatewayApiListenerParentKind, GatewayApiMaterializedRouteParent, GatewayApiRouteAttachment,
-    GatewayApiRouteConflict, GatewayApiRouteConflictKey, GatewayClassAuthority, K8sObject,
-    K8sResourceKey, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
-    UNSUPPORTED_SHAPE_MARKER, backend_lb_policy_conflict_losers, backend_lb_policy_status,
-    gateway_api_route_conflict_keys_with_acc, gateway_api_section_name_is_valid,
-    gateway_api_status_conflict_context, merge_backend_lb_policy_status,
-    namespace_selector_matches, parse_gateway_listener_allowed_route_namespaces,
-    parse_reference_grant_permissions, secret_object_is_valid_tls_certificate,
-    translate_k8s_objects_collecting_skips, validate_gateway_listener_allowed_routes,
-    validate_listenerset_listener_entry,
+    GatewayApiRouteConflict, GatewayApiRouteConflictKey, GatewayClassAuthority,
+    INCOMPATIBLE_FILTERS_MARKER, K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslation,
+    K8sTranslationOptions, UNSUPPORTED_SHAPE_MARKER, backend_lb_policy_conflict_losers,
+    backend_lb_policy_status, gateway_api_route_conflict_keys_with_acc,
+    gateway_api_section_name_is_valid, gateway_api_status_conflict_context,
+    merge_backend_lb_policy_status, namespace_selector_matches,
+    parse_gateway_listener_allowed_route_namespaces, parse_reference_grant_permissions,
+    secret_object_is_valid_tls_certificate, translate_k8s_objects_collecting_skips,
+    validate_gateway_listener_allowed_routes, validate_listenerset_listener_entry,
 };
 use crate::k8s_controller::convert::k8s_time_to_rfc3339;
 use crate::k8s_controller::metrics::{
@@ -614,6 +614,8 @@ struct GatewayApiStatusIndexes<'a> {
     listenersets_by_ns_name: HashMap<(&'a str, &'a str), &'a K8sObject>,
     /// ListenerSets whose parentRef selects a Ferrum-managed Gateway.
     listenersets_on_managed_gateways: HashSet<(&'a str, &'a str)>,
+    /// ListenerSets rejected by their parent Gateway's allowedListeners policy.
+    listenersets_not_allowed: HashSet<(&'a str, &'a str)>,
     secrets_by_ns_name: HashMap<(&'a str, &'a str), &'a K8sObject>,
     services_by_ns_name: HashMap<(&'a str, &'a str), &'a K8sObject>,
     service_imports_by_ns_name: HashMap<(&'a str, &'a str), &'a K8sObject>,
@@ -644,6 +646,7 @@ impl<'a> GatewayApiStatusIndexes<'a> {
         objects: &'a [K8sObject],
         route_conflicts: &'a [GatewayApiRouteConflict],
         materialized_route_parents: &HashSet<GatewayApiMaterializedRouteParent>,
+        translation: &'a crate::config_sources::k8s::K8sTranslation,
     ) -> Self {
         let mut gateway_classes_by_name = HashMap::new();
         let mut gateways_by_ns_name = HashMap::new();
@@ -754,6 +757,15 @@ impl<'a> GatewayApiStatusIndexes<'a> {
         }
 
         let mut listenersets_on_managed_gateways = HashSet::new();
+        let mut listenersets_not_allowed = HashSet::new();
+        for status in &translation.listenerset_statuses {
+            if !status.accepted && status.accepted_reason == "NotAllowed" {
+                listenersets_not_allowed.insert((
+                    status.resource.namespace.as_str(),
+                    status.resource.name.as_str(),
+                ));
+            }
+        }
         for ((namespace, name), listenerset) in &listenersets_by_ns_name {
             if let Some(parent_ref) = listenerset.spec.get("parentRef") {
                 let group = parent_ref
@@ -821,6 +833,7 @@ impl<'a> GatewayApiStatusIndexes<'a> {
             managed_gateways,
             listenersets_by_ns_name,
             listenersets_on_managed_gateways,
+            listenersets_not_allowed,
             secrets_by_ns_name,
             services_by_ns_name,
             service_imports_by_ns_name,
@@ -959,6 +972,7 @@ pub fn plan_gateway_api_status_updates_budgeted(
         objects,
         route_conflicts,
         &reuse.translation.materialized_route_parents,
+        &reuse.translation,
     );
 
     let mut eligible: Vec<&K8sObject> = objects
@@ -2749,11 +2763,13 @@ fn route_status(
                         "ResolvedRefs",
                         format!("Ferrum rejected this route attachment: {error}"),
                     )
-                } else if error_is_unsupported_shape(error) {
+                } else if error_is_unsupported_shape(error) || error_is_incompatible_filters(error)
+                {
                     // An object that is valid under the pinned Gateway API CRD
                     // but names a shape Ferrum does not implement is
-                    // `Accepted=False` / `UnsupportedValue` — the upstream
-                    // constant for exactly this — not the generic `Invalid`,
+                    // `Accepted=False` / `UnsupportedValue`, or the more
+                    // specific `IncompatibleFilters` for known filter actions,
+                    // rather than the generic `Invalid`,
                     // which would report a well-formed object as malformed.
                     // Reference resolution is independent of the unsupported
                     // field, so it is still reported on its own terms.
@@ -2765,7 +2781,11 @@ fn route_status(
                         false,
                         resolved_refs,
                         false,
-                        "UnsupportedValue",
+                        if error_is_incompatible_filters(error) {
+                            "IncompatibleFilters"
+                        } else {
+                            "UnsupportedValue"
+                        },
                         resolved_refs_reason,
                         format!("Ferrum does not implement this route shape: {error}"),
                     )
@@ -3765,6 +3785,11 @@ fn route_parent_ref_not_allowed_by_listener(
     parent_ref: &Value,
     indexes: &GatewayApiStatusIndexes<'_>,
 ) -> bool {
+    if parent_ref_listenerset_target(route, parent_ref)
+        .is_some_and(|target| indexes.listenersets_not_allowed.contains(&target))
+    {
+        return true;
+    }
     let Some(parent) = route_parent_object(route, parent_ref, indexes) else {
         return false;
     };
@@ -4071,6 +4096,11 @@ fn error_is_parent_ref_no_matching(error: &K8sTranslateError) -> bool {
         }
         K8sTranslateError::Unsupported(_) => false,
     }
+}
+
+fn error_is_incompatible_filters(error: &K8sTranslateError) -> bool {
+    matches!(error, K8sTranslateError::InvalidResource { message, .. }
+        if message.starts_with(INCOMPATIBLE_FILTERS_MARKER))
 }
 
 /// True when the translator rejected an object that is **valid** under the

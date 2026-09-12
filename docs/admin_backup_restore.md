@@ -161,20 +161,28 @@ must be protected as secrets. The export audit record carries a
 `gateway_trust_bundles` **count** only — never certificate bytes, PEM, subjects,
 or revisions.
 
-> **Not the same file as `FERRUM_DB_CONFIG_BACKUP_PATH`.** The database-outage
-> startup backup is a raw `GatewayConfig` document. It may describe any number of
-> namespaces — an all-namespace export is a valid thing to put there — because
-> the startup loader projects it onto the gateway's own `FERRUM_NAMESPACE` before
-> validating or serving it. It carries no trust section
-> at all, because `gateway_trust_bundles` is deliberately not serialized into
-> `GatewayConfig` (it must never ride the ConfigSync `config_json` wire). A
-> process that boots from that file therefore treats its namespace trust state
-> as **unknown** and refuses gateway-to-mesh identity until an authoritative
-> database full reload settles it, rather than falling back to source-loaded
-> SVID trust and possibly re-enabling a root the committed generation had
-> withdrawn. `GET /gateway-trust/status` reports `authority_unresolved: true`
-> for the duration. Use `GET /backup` / `POST /restore` — not the startup backup
-> file — to move trust state between deployments.
+`GET /backup` output can be provisioned unchanged as
+`FERRUM_DB_CONFIG_BACKUP_PATH` for **database-mode** outage bootstrap. Raw
+`GatewayConfig` JSON remains accepted. The loader requires a supported config
+`version`, ignores only the known administrative envelope fields
+(`ferrum_version`, `exported_at`, `source`, `counts`, `gateway_trust_bundles`,
+`api_specs`), and rejects unknown runtime fields. It reads a stable regular file
+of at most 64 MiB; provision updates by atomic replacement, with permissions
+appropriate for unredacted credentials.
+
+Before admission, resources are filtered to the gateway's `FERRUM_NAMESPACE`.
+Consumer admission follows the database full-load policy; malformed consumer
+fields or ambiguous resource IDs/credentials reject the candidate. Only a fully
+admitted candidate can become the startup generation. A healthy database start
+also checks the configured backup and warns if it is unusable, while continuing
+to serve the authoritative database configuration.
+
+Bootstrap **does not restore API specs or gateway trust**. Those administrative
+sections are ignored even when present. Namespace trust remains **unknown** and
+gateway-to-mesh identity is refused until an authoritative database full reload
+settles it. `GET /gateway-trust/status` reports `authority_unresolved: true`
+for that duration. Use `POST /restore` to move administrative resources between
+databases; mounting an export as a startup backup does not write to the database.
 
 ### Safety Guard
 

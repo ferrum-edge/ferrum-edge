@@ -156,7 +156,8 @@ fn test_build_backend_url_strip() {
         "/api/v1/users/123",
         "",
         proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
-    );
+    )
+    .unwrap();
     assert_eq!(url, "http://backend.example.com:3000/users/123");
 }
 
@@ -169,7 +170,8 @@ fn test_build_backend_url_no_strip() {
         "/api/v1/users/123",
         "",
         proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
-    );
+    )
+    .unwrap();
     assert_eq!(url, "http://backend.example.com:3000/api/v1/users/123");
 }
 
@@ -182,7 +184,8 @@ fn test_build_backend_url_with_backend_path() {
         "/api/v1/users",
         "",
         proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
-    );
+    )
+    .unwrap();
     assert_eq!(url, "http://backend.example.com:3000/internal/users");
 }
 
@@ -195,7 +198,8 @@ fn test_build_backend_url_with_relative_backend_path() {
         "/api/v1/users",
         "",
         proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
-    );
+    )
+    .unwrap();
     assert_eq!(url, "http://backend.example.com:3000/internal/users");
 }
 
@@ -207,7 +211,8 @@ fn test_build_backend_url_with_query() {
         "/api/v1/search",
         "q=hello&page=1",
         proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
-    );
+    )
+    .unwrap();
     assert_eq!(url, "http://backend.example.com:3000/search?q=hello&page=1");
 }
 
@@ -223,7 +228,8 @@ fn test_build_backend_url_target_path_overrides_backend_path() {
         9090,
         proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
         Some("/v2"),
-    );
+    )
+    .unwrap();
     assert_eq!(url, "http://target.example.com:9090/v2/users");
 }
 
@@ -252,6 +258,13 @@ fn request_phase_deadline_rejects_preserve_grpc_web_framing() {
     assert!(helper.contains("error_response_for_content_type("));
     assert!(helper.contains("finalize_grpc_web_error_response_headers("));
     assert!(helper.contains("build_grpc_web_error_response_from_parts("));
+    assert_eq!(
+        helper
+            .matches(".remove(FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY)")
+            .count(),
+        2,
+        "gRPC-Web deferred committed-hook exits must clear internal synthetic bookkeeping"
+    );
 }
 
 #[test]
@@ -266,7 +279,8 @@ fn test_build_backend_url_target_path_none_uses_backend_path() {
         9090,
         proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
         None,
-    );
+    )
+    .unwrap();
     assert_eq!(url, "http://target.example.com:9090/v1/users");
 }
 
@@ -281,7 +295,8 @@ fn test_build_backend_url_target_path_with_no_backend_path() {
         9090,
         proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
         Some("/service"),
-    );
+    )
+    .unwrap();
     assert_eq!(url, "http://target.example.com:9090/service/users");
 }
 
@@ -297,7 +312,8 @@ fn test_build_backend_url_target_path_without_slashes_inserts_separator() {
         9090,
         proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
         Some("service"),
-    );
+    )
+    .unwrap();
     assert_eq!(url, "http://target.example.com:9090/service/users");
 }
 
@@ -312,7 +328,8 @@ fn test_build_backend_url_target_path_with_query() {
         9090,
         proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
         Some("/svc"),
-    );
+    )
+    .unwrap();
     assert_eq!(url, "http://target.example.com:9090/svc/search?q=hello");
 }
 
@@ -321,7 +338,8 @@ fn test_backend_effective_grpc_path_uses_prefix_strip() {
     let mut proxy = test_proxy();
     proxy.listen_path = Some("/prefix".into());
     let path =
-        build_backend_effective_path(&proxy, "/prefix/pkg.Service/Denied", "/prefix".len(), None);
+        build_backend_effective_path(&proxy, "/prefix/pkg.Service/Denied", "/prefix".len(), None)
+            .unwrap();
     assert_eq!(path, "/pkg.Service/Denied");
 }
 
@@ -331,7 +349,7 @@ fn test_backend_effective_grpc_path_uses_exact_route_backend_path() {
     proxy.listen_path = Some("=/public.Service/Allowed".into());
     proxy.backend_path = Some("/admin.Service/Delete".into());
     let incoming = "/public.Service/Allowed";
-    let path = build_backend_effective_path(&proxy, incoming, incoming.len(), None);
+    let path = build_backend_effective_path(&proxy, incoming, incoming.len(), None).unwrap();
     assert_eq!(path, "/admin.Service/Delete");
 }
 
@@ -341,7 +359,7 @@ fn test_backend_effective_grpc_path_uses_regex_match_length() {
     proxy.listen_path = Some("~^/public\\.Service/Allowed$".into());
     proxy.backend_path = Some("/admin.Service/Delete".into());
     let incoming = "/public.Service/Allowed";
-    let path = build_backend_effective_path(&proxy, incoming, incoming.len(), None);
+    let path = build_backend_effective_path(&proxy, incoming, incoming.len(), None).unwrap();
     assert_eq!(path, "/admin.Service/Delete");
 }
 
@@ -355,7 +373,8 @@ fn test_backend_effective_grpc_path_uses_selected_target_path() {
         incoming,
         incoming.len(),
         Some("/selected.Service/Method"),
-    );
+    )
+    .unwrap();
     assert_eq!(path, "/selected.Service/Method");
 }
 
@@ -365,7 +384,7 @@ fn test_backend_effective_path_matches_backend_url_path_assembly() {
     proxy.backend_path = Some("/backend.Service".into());
     let incoming = "/api/v1/Method";
     let strip_len = "/api/v1".len();
-    let path = build_backend_effective_path(&proxy, incoming, strip_len, None);
+    let path = build_backend_effective_path(&proxy, incoming, strip_len, None).unwrap();
     let url = build_backend_url_with_target(
         &proxy,
         incoming,
@@ -374,7 +393,8 @@ fn test_backend_effective_path_matches_backend_url_path_assembly() {
         9090,
         strip_len,
         None,
-    );
+    )
+    .unwrap();
     assert_eq!(path, "/backend.Service/Method");
     assert_eq!(url, format!("http://target.example.com:9090{path}"));
 }
@@ -600,13 +620,13 @@ fn test_deferred_destination_override_is_rebound_before_dispatch() {
         .find("let destination_rebound = !Arc::ptr_eq(&previous_proxy, &proxy);")
         .expect("the rebind must detect a committed destination by proxy identity");
     let rebase = after_deferred
-        .find("path = rebase_route_override_path(&mut ctx, path);")
+        .find("path = rebase_route_override_path(&mut ctx, path, &mut strip_len);")
         .expect("deferred destination overrides must rebase the dispatch path");
     let reselect = after_deferred
         .find("upstream_target = backend_dispatch::concretize_wildcard_target_for_request(")
         .expect("deferred destination overrides must replace the pinned target");
     let backend_url = after_deferred
-        .find("let backend_url = build_backend_url_with_target(")
+        .find("let backend_url = match build_backend_url_with_target(")
         .expect("generic backend URL construction must remain present");
 
     assert!(rebind < moved && moved < rebase && rebase < reselect && reselect < backend_url);
@@ -2126,7 +2146,7 @@ fn upload_deadline_exits_use_finalized_rejection_cleanup_and_logging() {
         .split("async fn finalize_upload_deadline_rejection(")
         .nth(1)
         .expect("shared upload-deadline rejection finalizer")
-        .split("fn release_circuit_breaker_probe_on_admission_reject")
+        .split("fn normalized_authorization_expired(")
         .next()
         .expect("bounded upload-deadline finalizer");
     assert!(helper.contains("build_finalized_upload_deadline_response("));
@@ -2185,8 +2205,7 @@ fn upload_deadline_exits_use_finalized_rejection_cleanup_and_logging() {
         .collect();
     assert_eq!(grpc_collect_deadline_branches.len(), 2);
     for branch in grpc_collect_deadline_branches {
-        assert!(branch.contains("grpc_probe_guard.disarm()"));
-        assert!(branch.contains("release_circuit_breaker_probe_on_admission_reject("));
+        assert!(branch.contains("cb_probe.release_neutral()"));
         assert!(branch.contains("preacquired_backend_admission.take_if_acquired()"));
     }
 }
@@ -5345,4 +5364,91 @@ fn unix_websocket_dispatch_keeps_trusted_uri_separate_from_policy_host() {
         src[host_insert..host_insert + 160].contains("from_str(host)"),
         "the Host header must be the policy value, not the socket path"
     );
+}
+
+#[test]
+fn invalid_backend_path_coordinates_refuse_all_builders_and_retries() {
+    use ferrum_edge::_test_support::websocket_backend_path_for_test;
+    use ferrum_edge::proxy::InvalidBackendPath;
+
+    let mut proxy = test_proxy();
+    proxy.backend_path = Some("/sensitive".into());
+    let path = "/route/€";
+    for offset in [8, 9, path.len() + 1, usize::MAX] {
+        assert_eq!(
+            build_backend_url(&proxy, path, "", offset),
+            Err(InvalidBackendPath)
+        );
+        assert_eq!(
+            build_backend_effective_path(&proxy, path, offset, Some("/other")),
+            Err(InvalidBackendPath)
+        );
+        assert_eq!(
+            websocket_backend_path_for_test(&proxy, path, offset),
+            Err(InvalidBackendPath)
+        );
+        assert!(!retry_target_preserves_backend_path(
+            true,
+            &proxy,
+            path,
+            offset,
+            &retry_target("one", None),
+            &retry_target("two", None),
+        ));
+    }
+    assert_eq!(
+        build_backend_effective_path(&proxy, path, 7, None).unwrap(),
+        "/sensitive/€"
+    );
+    proxy.strip_listen_path = false;
+    assert_eq!(
+        build_backend_effective_path(&proxy, path, usize::MAX, None).unwrap(),
+        "/sensitive/route/€"
+    );
+}
+
+#[test]
+fn route_rebase_invalidates_offsets_but_preserves_base_path_semantics() {
+    use ferrum_edge::_test_support::rebase_backend_path_for_test;
+    use ferrum_edge::plugins::RequestContext;
+    use std::sync::Arc;
+
+    let mut unchanged =
+        RequestContext::new("127.0.0.1".into(), "GET".into(), "/entry/users".into());
+    let mut original_offset = "/entry".len();
+    let (path, cloned_offset) =
+        rebase_backend_path_for_test(&mut unchanged, "/entry/users".into(), &mut original_offset);
+    assert_eq!(path, "/entry/users");
+    assert_eq!(original_offset, "/entry".len());
+    assert_eq!(cloned_offset, original_offset);
+
+    for (rewrite, absolute, expected) in [
+        ("/é/€", false, "/base/é/€"),
+        ("/entry/users", false, "/base/entry/users"),
+        ("/provider/chat", true, "/provider/chat"),
+    ] {
+        let mut proxy = test_proxy();
+        proxy.listen_path = Some("/entry".into());
+        proxy.backend_path = Some("/base".into());
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/entry/users".into());
+        ctx.route_override_path = Some(rewrite.into());
+        ctx.route_override_path_is_absolute = absolute;
+        let proxy = ctx.apply_route_overrides(Arc::new(proxy));
+        let mut strip_len = "/entry".len();
+        let (path, cloned_offset) =
+            rebase_backend_path_for_test(&mut ctx, "/entry/users".into(), &mut strip_len);
+        assert_eq!(strip_len, 0);
+        assert_eq!(cloned_offset, 0);
+        assert_eq!(ctx.route_override_path.as_deref(), Some(rewrite));
+        assert_eq!(
+            build_backend_effective_path(&proxy, &path, strip_len, None).unwrap(),
+            expected
+        );
+        if !absolute {
+            assert_eq!(
+                build_backend_effective_path(&proxy, &path, strip_len, Some("/target")).unwrap(),
+                format!("/target{rewrite}")
+            );
+        }
+    }
 }

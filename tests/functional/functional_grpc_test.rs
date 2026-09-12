@@ -262,6 +262,7 @@ fn start_gateway_with_extra_env(
         .port();
     let observability_token = format!("ferrum-edge-grpc-probe-{}", uuid::Uuid::new_v4().simple());
     let mut cmd = std::process::Command::new(gateway_binary_path());
+    cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())

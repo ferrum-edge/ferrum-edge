@@ -115,6 +115,7 @@ mod mesh_k8s_pod_discovery_tests_host_udp_capture;
 mod mesh_l4_weighted_routing_tests;
 mod mesh_l7_routing_tests;
 mod mesh_local_reload_observability_tests;
+mod mesh_mtls_pool_width_tests;
 mod mesh_multicluster_discovery_tests;
 mod mesh_node_waypoint_dtls_owner_tests;
 mod mesh_node_waypoint_stream_scope_tests;

@@ -118,27 +118,30 @@ pub enum InventoryScope {
     /// dropped; JWKS/OCSP material is fetched so an unreadable source is
     /// reported as such. Used by the authenticated operator inventory endpoint.
     Full,
-    /// Load only public certificate-family material (certificate, CA bundle,
-    /// CRL). Private-key, JWKS, and OCSP sources are never materialized; their
-    /// state comes from the owning validated config/reload state. Used by the
-    /// cached snapshot that backs certificate metrics.
+    /// Load only public certificate and revocation material (certificate, CA
+    /// bundle, CRL, and OCSP). Private-key and JWKS sources are never
+    /// materialized; their state comes from the owning validated config/reload
+    /// state. Used by the cached snapshot that backs certificate metrics.
     PublicMetadata,
 }
 
 impl InventoryScope {
     /// Whether this scope may load `kind` from its configured source.
     ///
-    /// Only certificate-family material yields public metadata the inventory
-    /// actually renders (subject/issuer/SANs/validity/fingerprint/CRL counts),
-    /// so the metrics scope loads nothing else — in particular never a private
-    /// key, which would let a scraper drive key materialization outside the TLS
-    /// reload lifecycle.
+    /// Only certificate and revocation material yields public metadata the
+    /// inventory actually renders (subject/issuer/SANs/validity/fingerprint,
+    /// CRL counts, and revocation deadlines), so the metrics scope loads
+    /// nothing else — in particular never a private key, which would let a
+    /// scraper drive key materialization outside the TLS reload lifecycle.
     fn may_load(self, kind: MaterialKind) -> bool {
         match self {
             Self::Full => true,
             Self::PublicMetadata => matches!(
                 kind,
-                MaterialKind::Cert | MaterialKind::CaBundle | MaterialKind::Crl
+                MaterialKind::Cert
+                    | MaterialKind::CaBundle
+                    | MaterialKind::Crl
+                    | MaterialKind::Ocsp
             ),
         }
     }
@@ -175,10 +178,10 @@ impl TlsInventory {
         Self::collect_with_scope(env_config, gateway_config, InventoryScope::Full)
     }
 
-    /// Metrics-safe inventory. Loads only public certificate-family material
-    /// and never materializes private-key bytes. Blocking; runs on the bounded
-    /// background refresh in [`crate::tls::inventory_cache`], never on a
-    /// request path.
+    /// Metrics-safe inventory. Loads only public certificate and revocation
+    /// material and never materializes private-key bytes. Blocking; runs on the
+    /// bounded background refresh in [`crate::tls::inventory_cache`], never on
+    /// a request path.
     pub fn collect_public_metadata(
         env_config: Option<&EnvConfig>,
         gateway_config: Option<&GatewayConfig>,

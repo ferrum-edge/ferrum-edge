@@ -861,6 +861,7 @@ mod tests {
         headers.insert("grpc-status", "14".parse().unwrap());
         let response = MatrixResponse::Grpc(GrpcResponse {
             http_status: 200,
+            initial_headers_end_stream: true,
             headers,
             messages: Vec::new(),
             raw_body_frames: Vec::new(),
@@ -882,6 +883,7 @@ mod tests {
         // only when Trailers-Only metadata is already present.
         let response = MatrixResponse::Grpc(GrpcResponse {
             http_status: 200,
+            initial_headers_end_stream: false,
             headers: http::HeaderMap::new(),
             messages: Vec::new(),
             raw_body_frames: Vec::new(),

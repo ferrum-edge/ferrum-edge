@@ -188,11 +188,25 @@ When the cache reaches the max entry count, new circuit breaker entries for prev
 
 ### AI Semantic Cache
 
+**Replay contract:** Entries retain finalized application JSON, decoded from
+transport encoding. Ordinary application body rewrites run once; current response
+inspection, mandatory redaction, live header rules, and negotiated compression
+still apply on hits. Provider-managed Responses conversations and Gemini retained
+contexts bypass replay. Other unmodeled root context and Cohere SYSTEM history
+remain exact scope dimensions; see the [plugin contract](plugins.md#ai_semantic_cache).
+
 **What it stores:** Cached LLM responses keyed by family-correct prompt text (exact keys preserve LLM-significant case and whitespace; structural canonicalization remains for JSON key order and numeric sampling params). Lookup runs at priority 4057 in the final-request-body hook, so the prompt bytes and the backend-visible header/query/destination partition are the fully transformed ones the provider would receive, not the pre-transform request. When `semantic_similarity_enabled` is true, local cache entries can also carry prompt embeddings and are indexed in a local HNSW vector snapshot for semantic lookup after exact misses.
 
 **Default limit:** 10,000 entries. In semantic mode, HNSW snapshot memory and periodic full-index rebuild CPU also scale with this count and are charged against `max_total_size_bytes`.
 
 **Config fields:** `ttl_seconds`, `max_entries`, `max_entry_size_bytes`, `max_total_size_bytes`, `include_model_in_key`, `include_params_in_key`, `scope_by_consumer`, `anonymous_caller_scope`, and the optional semantic/Redis settings documented in [Plugins](plugins.md#ai_semantic_cache).
+
+Retention counts, sizes, and timeouts must be positive. Entry size must not exceed
+the total budget; their hard ceilings are 16 MiB and 1 GiB respectively. Embedding
+dimensions are capped at 16,384 and candidate count at 1,024. Redis mode requires
+an endpoint and an integrity key of at least 32 UTF-8 bytes. Semantic mode requires
+an admitted HTTP(S) embedding endpoint; authentication header values are validated
+at construction without disclosing credentials.
 
 **Cleanup mechanism:** TTL-based expiration (`ttl_seconds` config field). Expired-entry sweep and max-entries eviction (oldest-first) run off the request hot path in throttled, non-overlapping lifecycle-owned workers (at most once every 30 seconds), so no single request pays the full-map scan or oldest-entry selection. The optional semantic vector snapshot is rebuilt by the same lifecycle owner after local semantic entries are inserted or evicted, at most once every 30 seconds after the first indexed semantic entry. Generation drop/reload cooperatively cancels these workers; blocking-pool work already scheduled may finish before releasing its bounded reservation. `max_total_size_bytes` is a hard retained-byte budget covering response bodies, headers, scope keys, embeddings, published HNSW generations, and in-flight rebuild workspace via lock-free leases, enforced synchronously on the store path (independent of the background eviction); failed/superseded/cancelled rebuilds release candidate reservations promptly. Concurrent stores that cannot reserve are skipped; same-key replacement drops the displaced entry's lease so overwritten bytes release immediately. Redis is treated as an untrusted trust boundary: every hit is byte-bounded before allocation, schema-versioned, authenticated with a seal timestamp, and re-validated against the same TTL/status/content-type/size/JSON/header admission contract as a local store, with stale, invalid, or cross-version entries quarantined rather than served. Failed quarantine deletes are rate-limited and counted without logging key/payload material, and a bounded per-instance local suppressor (fingerprint + 30s TTL, constant-work capacity eviction) prevents immediate re-download/parse/delete amplification of the same poisoned remote value while still reconsidering repaired replacements within that bound. Quarantine fingerprints are computed only for inadmissible Redis values, not on every valid hit.
 
@@ -222,7 +236,7 @@ When the cache reaches the max entry count, new circuit breaker entries for prev
 
 **Default limit:** 10,000 entries. Caching is disabled by default.
 
-**Config field:** `cache_ttl_seconds` (default `0`, disabled; maximum `86,400` seconds / 24 hours) and `max_cache_entries` (default `10,000`).
+**Config field:** `cache_ttl_seconds` (default `0`, disabled; maximum `86,400` seconds / 24 hours) and `max_cache_entries` (default `10,000`; maximum `1,000,000`).
 
 **Cleanup mechanism:** TTL-based expiration is checked on lookup. Admission uses atomic entry accounting to preserve the hard cap during concurrent authentication. At capacity, one existing entry is replaced for each new admission; the request path never performs a full-cache scan.
 
@@ -264,7 +278,7 @@ When the cache reaches the max entry count, new circuit breaker entries for prev
 
 **Config fields:** `max_entries`, `max_retained_bytes` (process-global — every enabled instance must use the same values), and `render_cache_ttl_seconds` (default `5`).
 
-**Cleanup mechanism:** Background eviction task runs periodically and removes entries that have not been updated within the configured staleness window. The rendered Prometheus/JSON output is cached with a configurable TTL (`render_cache_ttl_seconds`, default 5s). Registry saturation is exported via `ferrum_api_chargeback_registry_entries`, `ferrum_api_chargeback_registry_max_entries`, `ferrum_api_chargeback_registry_retained_bytes`, `ferrum_api_chargeback_registry_max_retained_bytes`, `ferrum_api_chargeback_identity_overflow_total`, and `ferrum_api_chargeback_dropped_charges_total`.
+**Cleanup mechanism:** A background eviction task runs periodically and removes entries that have not been updated within the configured staleness window **and** whose current counters a completed `GET /charges` export has already collected. Idle age alone never deletes uncollected billing state; rows held past the TTL awaiting collection are reported by `ferrum_api_chargeback_uncollected_retained_entries` and by the JSON `registry.uncollected_retained_entries` field, and remain bounded by `max_entries` / `max_retained_bytes` (see [plugins.md](plugins.md#api_chargeback) → collection contract). The rendered Prometheus/JSON output is cached with a configurable TTL (`render_cache_ttl_seconds`, default 5s); `cache_invalidation_min_age_ms` is evaluated per format against that document's own timestamp. Registry saturation is exported via `ferrum_api_chargeback_registry_entries`, `ferrum_api_chargeback_registry_max_entries`, `ferrum_api_chargeback_registry_retained_bytes`, `ferrum_api_chargeback_registry_max_retained_bytes`, `ferrum_api_chargeback_identity_overflow_total`, `ferrum_api_chargeback_dropped_charges_total`, and `ferrum_api_chargeback_uncollected_retained_entries`.
 
 ### Prometheus Metrics
 
@@ -309,7 +323,7 @@ When the cache reaches the max entry count, new circuit breaker entries for prev
 | `soap_ws_security` | *(fixed, not configurable)* | `93601`s | Nonce claim retention — `max created_max_age_seconds + 2 x max created_clock_skew_seconds + 1`, the widest window the schema admits, so a later reload cannot outlive a claim |
 | `soap_ws_security` | `nonce.max_encoded_length` | `512` | Maximum encoded `wsse:Nonce` length |
 | `soap_ws_security` | `nonce.max_total_cache_bytes` | `67108864` | Maximum retained nonce-key UTF-8 payload bytes (one count per shared key allocation) |
-| `ldap_auth` | `max_cache_entries` | `10000` | Maximum cached LDAP bind results |
+| `ldap_auth` | `max_cache_entries` | `10000` | Maximum cached LDAP bind results (1–1,000,000) |
 | `ldap_auth` | `cache_ttl_seconds` | `0` | LDAP cache entry TTL (`0` = disabled; maximum `86400`) |
 | `oauth2_introspection` | `providers[].max_cache_entries` | `10000` | Per-provider hard entry ceiling, split 75/25 between active and negative results |
 | `oauth2_introspection` | `providers[].max_cache_entry_bytes` | `16384` | Maximum normalized active authorization-result bytes retained per token |

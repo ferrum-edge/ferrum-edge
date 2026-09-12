@@ -37,6 +37,7 @@
 //!     -- --ignored --nocapture
 //! ```
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::scaffolding::backends::{
@@ -201,7 +202,9 @@ async fn h2c_grpc_request(
         .ok_or_else(|| format!("bad target {target}"))?;
     let port: u16 = port_str.parse()?;
     let tcp = TcpStream::connect((host, port)).await?;
-    let (mut send_req, connection) = h2_client::handshake(tcp).await?;
+    let framing = Arc::new(crate::scaffolding::clients::grpc::InboundResponseFraming::default());
+    let io = crate::scaffolding::clients::grpc::FrameObservingIo::new(tcp, Arc::clone(&framing));
+    let (mut send_req, connection) = h2_client::handshake(io).await?;
     let conn_task = tokio::spawn(connection);
 
     let mut req_builder = Request::builder()
@@ -252,6 +255,7 @@ async fn h2c_grpc_request(
     Ok(GrpcResponse {
         http_status,
         headers,
+        initial_headers_end_stream: framing.initial_headers_end_stream(),
         messages,
         raw_body_frames: raw_frames,
         trailers,
@@ -776,6 +780,20 @@ async fn request_mirror_grpc_h2c_missing_and_client_supplied_te() {
             stream.headers
         );
     }
+    // Issue #4720: this fixture once recorded an extra `h2 handshake failed`
+    // from a connection nothing in the test explains. The bounded, non-payload
+    // accept ledger is what attributes the next occurrence: every accepted
+    // connection carries an index, the peer socket the kernel reported and a
+    // millisecond offset from fixture start, so a failing
+    // `assert_no_step_errors` names the sending socket instead of only the
+    // protocol error. Assert the ledger is actually populated here so the
+    // diagnostic cannot silently regress to an empty list.
+    let accepts = mirror.accept_log();
+    assert!(
+        !accepts.is_empty(),
+        "the mirror fixture must record every accepted connection; accepted={}",
+        mirror.accepted_connections()
+    );
     mirror.assert_no_step_errors().await;
 }
 

@@ -1,5 +1,8 @@
 //! Functional coverage for serverless_function terminate mode on native gRPC.
 
+use crate::scaffolding::certs::TestCa;
+use crate::scaffolding::clients::{Http3Client, Http3GrpcStream};
+use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::reserve_port;
 use bytes::Bytes;
 use ferrum_edge::admin::jwt_auth::{JwtConfig, JwtManager};
@@ -280,6 +283,300 @@ async fn spawn_grpc_terminate_function() -> (u16, Arc<AtomicUsize>, JoinHandle<(
                                 .status(StatusCode::OK)
                                 .header("content-type", "application/json")
                                 .body(Full::new(Bytes::from(body)))
+                                .expect("function response"),
+                        )
+                    }
+                });
+                let _ = Http1ServerBuilder::new()
+                    .serve_connection(io, service)
+                    .await;
+            });
+        }
+    });
+    (port, hits, task)
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/3 (issue #5174)
+//
+// The native HTTP/3 finalized-request-egress rejection used the contextless
+// writer, which passes `FramedGrpcUnaryProvenance::NONE` and forgets the
+// client's gRPC-Web flavor. A valid unary terminate contract therefore reached
+// an H3 client as an empty trailers-only success, and the unsupported-gRPC-Web
+// refusal reached a browser as native gRPC framing.
+// ---------------------------------------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_serverless_terminate_frames_native_grpc_unary_over_http3() {
+    let (backend_port, backend_hits, backend_task) = spawn_counting_grpc_backend().await;
+    let contract = json!({
+        "grpc_status": 0,
+        "grpc_message": "ok",
+        "message_base64": "CAE=",
+        "trailers": { "x-function": "terminate" }
+    });
+    let (function_port, function_hits, function_task) = spawn_terminate_function(contract).await;
+    let (_gateway, https_port, _scratch) =
+        spawn_h3_serverless_gateway(h3_terminate_config(backend_port, function_port)).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://127.0.0.1:{https_port}/test.Service/Unary");
+    let mut stream = open_h3_grpc_stream_with_retry(&client, &url, "application/grpc").await;
+    stream.send_message(b"").await.expect("send unary request");
+    stream.finish().await.expect("half-close request");
+
+    let (status, headers) = stream.recv_response().await.expect("H3 response headers");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("content-type").and_then(|v| v.to_str().ok()),
+        Some("application/grpc")
+    );
+    let (body, trailers) = stream
+        .recv_body_and_trailers()
+        .await
+        .expect("H3 response body and trailers");
+    assert_eq!(
+        body.as_ref(),
+        b"\x00\x00\x00\x00\x02\x08\x01",
+        "the authored unary frame must survive the H3 boundary"
+    );
+    assert_eq!(
+        trailers.get("grpc-status").and_then(|v| v.to_str().ok()),
+        Some("0")
+    );
+    assert_eq!(
+        trailers.get("grpc-message").and_then(|v| v.to_str().ok()),
+        Some("ok")
+    );
+    assert_eq!(
+        trailers.get("x-function").and_then(|v| v.to_str().ok()),
+        Some("terminate")
+    );
+    assert_eq!(function_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        backend_hits.load(Ordering::SeqCst),
+        0,
+        "terminate must not reach the gRPC backend"
+    );
+
+    backend_task.abort();
+    function_task.abort();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_serverless_terminate_status_only_stays_trailers_only_over_http3() {
+    let (backend_port, backend_hits, backend_task) = spawn_counting_grpc_backend().await;
+    let contract = json!({
+        "grpc_status": 5,
+        "grpc_message": "not found",
+        "trailers": { "x-function": "terminate" }
+    });
+    let (function_port, function_hits, function_task) = spawn_terminate_function(contract).await;
+    let (_gateway, https_port, _scratch) =
+        spawn_h3_serverless_gateway(h3_terminate_config(backend_port, function_port)).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://127.0.0.1:{https_port}/test.Service/Unary");
+    let mut stream = open_h3_grpc_stream_with_retry(&client, &url, "application/grpc").await;
+    stream.send_message(b"").await.expect("send unary request");
+    stream.finish().await.expect("half-close request");
+
+    let (status, headers) = stream.recv_response().await.expect("H3 response headers");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("grpc-status").and_then(|v| v.to_str().ok()),
+        Some("5"),
+        "the status-only contract keeps grpc-status in the initial HEADERS block"
+    );
+    let (body, _trailers) = stream
+        .recv_body_and_trailers()
+        .await
+        .expect("H3 response body");
+    assert!(body.is_empty(), "the status-only contract authors no DATA");
+    assert_eq!(function_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backend_hits.load(Ordering::SeqCst), 0);
+
+    backend_task.abort();
+    function_task.abort();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_serverless_terminate_grpc_web_refusal_keeps_browser_framing_over_http3() {
+    let (backend_port, backend_hits, backend_task) = spawn_counting_grpc_backend().await;
+    let contract = json!({
+        "grpc_status": 0,
+        "message_base64": "CAE="
+    });
+    let (function_port, function_hits, function_task) = spawn_terminate_function(contract).await;
+    let (_gateway, https_port, _scratch) =
+        spawn_h3_serverless_gateway(h3_terminate_config(backend_port, function_port)).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://127.0.0.1:{https_port}/test.Service/Unary");
+    let mut stream =
+        open_h3_grpc_stream_with_retry(&client, &url, "application/grpc-web+proto").await;
+    stream
+        .send_raw_data(Bytes::from_static(b"\x00\x00\x00\x00\x00"))
+        .await
+        .expect("send gRPC-Web request");
+    stream.finish().await.expect("half-close request");
+
+    let (_status, headers) = stream.recv_response().await.expect("H3 response headers");
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        content_type.starts_with("application/grpc-web"),
+        "an unsupported gRPC-Web terminate refusal must keep browser framing, got {content_type}"
+    );
+    assert_eq!(
+        function_hits.load(Ordering::SeqCst),
+        0,
+        "the refusal is decided before invocation"
+    );
+    assert_eq!(backend_hits.load(Ordering::SeqCst), 0);
+
+    backend_task.abort();
+    function_task.abort();
+}
+
+fn h3_terminate_config(backend_port: u16, function_port: u16) -> serde_json::Value {
+    json!({
+        "version": "1",
+        "proxies": [{
+            "id": "serverless-grpc-terminate-h3",
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": false,
+            "plugins": [
+                {"plugin_config_id": "serverless-grpc-terminate-h3"}
+            ]
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [
+            {
+                "id": "serverless-grpc-terminate-h3",
+                "plugin_name": "serverless_function",
+                "scope": "proxy",
+                "proxy_id": "serverless-grpc-terminate-h3",
+                "enabled": true,
+                "config": {
+                    "provider": "gcp_cloud_functions",
+                    "mode": "terminate",
+                    "function_url": format!("http://127.0.0.1:{function_port}/invoke"),
+                    "timeout_ms": 5000,
+                    "on_error": "reject"
+                }
+            }
+        ]
+    })
+}
+
+async fn spawn_h3_serverless_gateway(
+    config: serde_json::Value,
+) -> (GatewayHarness, u16, tempfile::TempDir) {
+    let yaml = serde_yaml::to_string(&config).expect("serialize H3 serverless config");
+    let mut last_error = String::new();
+    for _ in 0..5 {
+        let reservation = reserve_port().await.expect("reserve H3 listener port");
+        let https_port = reservation.port;
+        drop(reservation);
+
+        let scratch = tempfile::tempdir().expect("gateway scratch dir");
+        let ca = TestCa::new("h3-serverless-gateway").expect("gateway CA");
+        let (cert, key) = ca.valid().expect("gateway leaf");
+        let cert_path = scratch.path().join("gateway.cert.pem");
+        let key_path = scratch.path().join("gateway.key.pem");
+        std::fs::write(&cert_path, cert).expect("write gateway cert");
+        std::fs::write(&key_path, key).expect("write gateway key");
+
+        match GatewayHarness::builder()
+            .file_config(yaml.clone())
+            .log_level("warn")
+            .capture_output()
+            .max_attempts(1)
+            .env("FERRUM_ENABLE_HTTP3", "true")
+            .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+            .env(
+                "FERRUM_FRONTEND_TLS_CERT_PATH",
+                cert_path.to_string_lossy().into_owned(),
+            )
+            .env(
+                "FERRUM_FRONTEND_TLS_KEY_PATH",
+                key_path.to_string_lossy().into_owned(),
+            )
+            .env("FERRUM_TLS_NO_VERIFY", "true")
+            .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+            .spawn()
+            .await
+        {
+            Ok(harness) => return (harness, https_port, scratch),
+            Err(error) => last_error = error.to_string(),
+        }
+    }
+    panic!("failed to spawn H3 serverless gateway after retries: {last_error}");
+}
+
+async fn open_h3_grpc_stream_with_retry(
+    client: &Http3Client,
+    url: &str,
+    content_type: &str,
+) -> Http3GrpcStream {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let attempt = if content_type == "application/grpc" {
+            client.open_grpc_stream(url).await
+        } else {
+            client.open_grpc_web_stream(url, content_type).await
+        };
+        match attempt {
+            Ok(stream) => return stream,
+            Err(error) if std::time::Instant::now() < deadline => {
+                let _ = error;
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            Err(error) => panic!("H3 gRPC stream never opened: {error}"),
+        }
+    }
+}
+
+async fn spawn_terminate_function(
+    response: serde_json::Value,
+) -> (u16, Arc<AtomicUsize>, JoinHandle<()>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind function");
+    let port = listener.local_addr().expect("function addr").port();
+    let hits_clone = Arc::clone(&hits);
+    let body = Arc::new(response.to_string());
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let hits = Arc::clone(&hits_clone);
+            let body = Arc::clone(&body);
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let service = service_fn(move |_req: Request<Incoming>| {
+                    let hits = Arc::clone(&hits);
+                    let body = Arc::clone(&body);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, Infallible>(
+                            http::Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "application/json")
+                                .body(Full::new(Bytes::from(body.as_str().to_owned())))
                                 .expect("function response"),
                         )
                     }

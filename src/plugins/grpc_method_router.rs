@@ -6,12 +6,14 @@
 //! - Populates `grpc_service`, `grpc_method`, and `grpc_full_method` metadata
 //!   from that finalized method for downstream response phases
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, ENFORCEMENT_UNAVAILABLE_MESSAGE,
@@ -693,7 +695,7 @@ impl Plugin for GrpcMethodRouter {
                             headers: grpc_content_type_header(),
                         };
                     }
-                    warn!(
+                    warn_sampled!(
                         method = %full_method,
                         plugin = "grpc_method_router",
                         "gRPC method rate limit exceeded"

@@ -1782,6 +1782,37 @@ fn waf_with_monitor_only_response_rule() -> Arc<dyn Plugin> {
     )
 }
 
+/// A response posture whose ONLY blocking disposition is the strict size cap:
+/// globally enforcing, one monitor-only response-body rule, and
+/// `on_body_too_large: block`. The request side has claimed this shape since
+/// #4006; the response side did not, so the cap was applied to the ENCODED
+/// origin bytes and a compressed body slipped under a cap its plaintext
+/// exceeds (`GHSA-v8p4-f3c9-g3w4`).
+fn waf_size_only_enforcing_response_body(mode: &str) -> Arc<dyn Plugin> {
+    Arc::new(
+        Waf::new(&json!({
+            "mode": mode,
+            "include_default_rules": false,
+            "scan_budget_ms": 0,
+            "response_inspection": true,
+            "response_body_inspection": true,
+            "on_body_too_large": "block",
+            "max_scan_bytes": 64,
+            "custom_rules": [{
+                "id": "CUSTOM-RESP-BODY-SIZE-ONLY",
+                "name": "observed response payload",
+                "category": "custom",
+                "severity": "high",
+                "target": "response_body",
+                "match_kind": "contains",
+                "pattern": BLOCKED_TOKEN,
+                "action": "monitor"
+            }]
+        }))
+        .expect("size-only enforcing waf response-body config"),
+    )
+}
+
 async fn publish_origin_encoded_response(
     plugins: &[Arc<dyn Plugin>],
 ) -> (bool, u16, HashMap<String, String>, Vec<u8>) {
@@ -1842,6 +1873,38 @@ async fn a_monitor_only_response_rule_does_not_refuse_an_undecodable_response() 
     );
     assert_eq!(status, 200);
     assert_eq!(body, b"opaque-octets".to_vec());
+}
+
+#[tokio::test]
+async fn a_size_only_enforcing_response_policy_refuses_an_undecodable_response() {
+    // Nothing in this configuration can refuse a response except the strict
+    // size cap, so the cap is the protection mechanism: an origin coding the
+    // gateway cannot decode must not be measured as-is.
+    let (replaced, status, _, body) =
+        publish_origin_encoded_response(&[waf_size_only_enforcing_response_body("enforce")]).await;
+
+    assert!(
+        replaced,
+        "a size-only enforcing response posture must claim the decoded representation"
+    );
+    assert_ne!(status, 200);
+    assert_ne!(body, b"opaque-octets".to_vec());
+}
+
+#[tokio::test]
+async fn a_monitor_mode_size_only_response_policy_does_not_refuse() {
+    // `on_body_too_large: block` only rejects while globally enforcing, so the
+    // new claim stays exactly as narrow as the request-side one.
+    let (replaced, status, headers, body) =
+        publish_origin_encoded_response(&[waf_size_only_enforcing_response_body("monitor")]).await;
+
+    assert!(!replaced);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"opaque-octets".to_vec());
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some(UNDECODABLE_ORIGIN_CODING)
+    );
 }
 
 /// `ai_response_guard` in `warn` passes every finding through, exactly as its

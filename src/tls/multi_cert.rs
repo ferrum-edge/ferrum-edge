@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -27,6 +28,7 @@ use x509_parser::extensions::{GeneralName, ParsedExtension};
 use x509_parser::prelude::*;
 
 use crate::tls::TlsPolicy;
+use crate::tls::ocsp_recheck::{AcceptedStaple, StapleRetiringResolver, StapleTarget};
 use crate::tls::source::{CertSource, MaterialKind, SourceScheme, load_material_blocking};
 
 /// Upper bound on SNI names indexed across the whole snapshot.
@@ -59,10 +61,7 @@ pub struct GatewayCertificateInput {
 }
 
 /// SNI → certificate index built once per config snapshot.
-///
-/// `Debug` deliberately reports only counts: a `CertifiedKey` holds a live
-/// signing key, and a resolver is reachable from broad runtime state dumps.
-pub struct SniCertResolver {
+struct SniIndex {
     /// Listener hostnames are authoritative routing/ownership claims. Keep
     /// them separate from certificate-derived aliases so an unrelated
     /// certificate SAN can never become a signature-compatible fallback for a
@@ -78,22 +77,40 @@ pub struct SniCertResolver {
     fallback: Vec<Arc<CertifiedKey>>,
 }
 
+/// The SNI-selecting resolver a Gateway listener serves.
+///
+/// The index is held in an [`ArcSwap`] rather than inline so a stapled OCSP
+/// response can be retired in place once it reaches its `nextUpdate` (issue
+/// #4773): the published `Arc<ServerConfig>` is not replaceable without
+/// `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`, and the HTTP/3 listener rebuilds
+/// its TLS 1.3-only config around this same resolver, so one atomic store is
+/// what reaches HTTP/1.1, HTTP/2, HTTP/3 and TCP+TLS together. The handshake
+/// path pays one `ArcSwap::load()` and nothing else — no lock, no allocation,
+/// no per-request work.
+///
+/// `Debug` deliberately reports only counts: a `CertifiedKey` holds a live
+/// signing key, and a resolver is reachable from broad runtime state dumps.
+pub struct SniCertResolver {
+    index: ArcSwap<SniIndex>,
+}
+
 impl std::fmt::Debug for SniCertResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let index = self.index.load();
         f.debug_struct("SniCertResolver")
             .field(
                 "exact_names",
-                &(self.declared_exact.len() + self.san_exact.len()),
+                &(index.declared_exact.len() + index.san_exact.len()),
             )
             .field(
                 "wildcard_names",
-                &(self.declared_wildcard.len() + self.san_wildcard.len()),
+                &(index.declared_wildcard.len() + index.san_wildcard.len()),
             )
             .finish_non_exhaustive()
     }
 }
 
-impl SniCertResolver {
+impl SniIndex {
     /// The certificate candidates a server name selects, or `None` to use the
     /// fallback listener's candidates.
     ///
@@ -126,10 +143,11 @@ impl ResolvesServerCert for SniCertResolver {
         // ClientHello without SNI (or with an unknown one) is answered with the
         // fallback rather than a handshake failure — the same credential a
         // single-certificate listener would have presented.
+        let index = self.index.load();
         let signature_schemes = client_hello.signature_schemes();
         if let Some(candidates) = client_hello
             .server_name()
-            .and_then(|server_name| self.candidates(server_name))
+            .and_then(|server_name| index.candidates(server_name))
         {
             // A claimed exact/wildcard name is authoritative. If none of its
             // certificates supports the client's signature schemes, fail the
@@ -137,8 +155,82 @@ impl ResolvesServerCert for SniCertResolver {
             // fallback certificate.
             return select_compatible_certified_key(candidates, signature_schemes);
         }
-        select_compatible_certified_key(&self.fallback, signature_schemes)
+        select_compatible_certified_key(&index.fallback, signature_schemes)
     }
+}
+
+impl StapleRetiringResolver for SniCertResolver {
+    /// Publish a stapleless generation of the whole index.
+    ///
+    /// A staple is attached only when the snapshot serves exactly one
+    /// certificate, but that one `Arc<CertifiedKey>` is reachable from several
+    /// index entries (its listener hostname, each of its SANs, and the
+    /// fallback). Rebuilding through one identity map keeps those entries
+    /// pointing at the *same* replacement, so the candidate-set identity the
+    /// index was built with survives the retirement.
+    fn drop_stapled_ocsp_response(&self) -> bool {
+        let current = self.index.load_full();
+        let mut replacements: HashMap<usize, Arc<CertifiedKey>> = HashMap::new();
+        for certified_key in current
+            .declared_exact
+            .values()
+            .chain(current.declared_wildcard.values())
+            .chain(current.san_exact.values())
+            .chain(current.san_wildcard.values())
+            .flatten()
+            .chain(current.fallback.iter())
+        {
+            if certified_key.ocsp.is_none() {
+                continue;
+            }
+            replacements
+                .entry(Arc::as_ptr(certified_key) as usize)
+                .or_insert_with(|| {
+                    let mut without_staple = (**certified_key).clone();
+                    without_staple.ocsp = None;
+                    Arc::new(without_staple)
+                });
+        }
+        if replacements.is_empty() {
+            return false;
+        }
+        self.index.store(Arc::new(SniIndex {
+            declared_exact: retire_index(&current.declared_exact, &replacements),
+            declared_wildcard: retire_index(&current.declared_wildcard, &replacements),
+            san_exact: retire_index(&current.san_exact, &replacements),
+            san_wildcard: retire_index(&current.san_wildcard, &replacements),
+            fallback: retire_candidates(&current.fallback, &replacements),
+        }));
+        true
+    }
+}
+
+/// One index map with every stapled credential swapped for its replacement.
+fn retire_index(
+    names: &HashMap<String, Vec<Arc<CertifiedKey>>>,
+    replacements: &HashMap<usize, Arc<CertifiedKey>>,
+) -> HashMap<String, Vec<Arc<CertifiedKey>>> {
+    names
+        .iter()
+        .map(|(name, candidates)| (name.clone(), retire_candidates(candidates, replacements)))
+        .collect()
+}
+
+/// One candidate list with every stapled credential swapped for its
+/// replacement, preserving order and the identity relationship between entries.
+fn retire_candidates(
+    candidates: &[Arc<CertifiedKey>],
+    replacements: &HashMap<usize, Arc<CertifiedKey>>,
+) -> Vec<Arc<CertifiedKey>> {
+    candidates
+        .iter()
+        .map(|candidate| {
+            replacements
+                .get(&(Arc::as_ptr(candidate) as usize))
+                .cloned()
+                .unwrap_or_else(|| candidate.clone())
+        })
+        .collect()
 }
 
 /// First certificate whose signing key can satisfy the ClientHello. One
@@ -169,6 +261,7 @@ pub fn load_gateway_multi_cert_tls_config(
     ocsp_response_source: Option<&str>,
     tls_policy: &TlsPolicy,
     cert_expiry_warning_days: u64,
+    revocation_expiry_warning_days: u64,
     crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<Arc<rustls::ServerConfig>, anyhow::Error> {
     load_gateway_multi_cert_tls_config_with_handshake_scope(
@@ -177,6 +270,7 @@ pub fn load_gateway_multi_cert_tls_config(
         ocsp_response_source,
         tls_policy,
         cert_expiry_warning_days,
+        revocation_expiry_warning_days,
         crls,
         None,
     )
@@ -200,6 +294,7 @@ pub(crate) fn load_gateway_multi_cert_tls_config_with_handshake_scope(
     ocsp_response_source: Option<&str>,
     tls_policy: &TlsPolicy,
     cert_expiry_warning_days: u64,
+    revocation_expiry_warning_days: u64,
     crls: &[CertificateRevocationListDer<'static>],
     handshake_scope: Option<crate::tls::ClientTrustScope>,
 ) -> Result<Arc<rustls::ServerConfig>, anyhow::Error> {
@@ -220,12 +315,10 @@ pub(crate) fn load_gateway_multi_cert_tls_config_with_handshake_scope(
     // certificate breaks handshakes with clients that check staple validity,
     // and guessing which certificate it belongs to is not something the
     // operator asked for.
-    let ocsp_response = match (ocsp_response_source, certificates.len()) {
+    let staple_source = match (ocsp_response_source, certificates.len()) {
         (Some(source), 1) => {
-            let material = load_material_blocking(
-                &CertSource::parse(source, MaterialKind::Ocsp),
-                MaterialKind::Ocsp,
-            )?;
+            let cert_source = CertSource::parse(source, MaterialKind::Ocsp);
+            let material = load_material_blocking(&cert_source, MaterialKind::Ocsp)?;
             let bytes = material.bytes.expose_secret().to_vec();
             // Bounded structural admission here; the certificate-bound half
             // runs in `load_certified_key` against the chain that will serve
@@ -243,7 +336,11 @@ pub(crate) fn load_gateway_multi_cert_tls_config_with_handshake_scope(
                 "Admitted the structure of a stapled OCSP response; certificate binding is \
                  checked against the served leaf and issuer before it is attached"
             );
-            bytes
+            Some(StapleSource {
+                bytes,
+                configured_source_id: cert_source.source_id(),
+                display_source_id: material.display_source_id,
+            })
         }
         (Some(_), _) => {
             warn!(
@@ -252,21 +349,38 @@ pub(crate) fn load_gateway_multi_cert_tls_config_with_handshake_scope(
                  certificates; the response is bound to one certificate and is not stapled to any \
                  of them"
             );
-            Vec::new()
+            None
         }
-        (None, _) => Vec::new(),
+        (None, _) => None,
     };
 
     let mut cert_display = String::new();
     let mut key_display = String::new();
     let mut loaded = Vec::with_capacity(certificates.len());
+    let mut accepted_staple: Option<AcceptedStaple> = None;
 
     for input in certificates {
-        let (certified_key, leaf, cert_source_id, key_source_id) =
-            load_certified_key(input, &ocsp_response, tls_policy, cert_expiry_warning_days)?;
+        let LoadedCertificate {
+            certified_key,
+            leaf,
+            cert_source_id,
+            key_source_id,
+            accepted_staple: staple,
+        } = load_certified_key(
+            input,
+            staple_source.as_ref(),
+            tls_policy,
+            cert_expiry_warning_days,
+            revocation_expiry_warning_days,
+        )?;
         if cert_display.is_empty() {
             cert_display = cert_source_id;
             key_display = key_source_id;
+        }
+        // A staple is attached only to a single-certificate snapshot, so at
+        // most one certificate accepts one.
+        if staple.is_some() {
+            accepted_staple = staple;
         }
 
         loaded.push((input, certified_key, leaf));
@@ -373,17 +487,27 @@ pub(crate) fn load_gateway_multi_cert_tls_config_with_handshake_scope(
     );
 
     let sni_resolver = Arc::new(SniCertResolver {
-        declared_exact,
-        declared_wildcard,
-        san_exact,
-        san_wildcard,
-        fallback,
+        index: ArcSwap::new(Arc::new(SniIndex {
+            declared_exact,
+            declared_wildcard,
+            san_exact,
+            san_wildcard,
+            fallback,
+        })),
     });
     // ACME TLS-ALPN-01 validation still wins over SNI selection, exactly as it
     // does on a single-certificate listener.
     let resolver = Arc::new(crate::tls::acme::AcmeTlsAlpnResolver::with_resolver(
         sni_resolver,
     ));
+    // Issue #4773: hand the exact resolver this snapshot installs to the
+    // periodic re-check, which retires the staple once it reaches
+    // `nextUpdate`. Without this the Gateway frontend validated a staple,
+    // recorded its deadline, and then served it forever — the single
+    // certificate path has been enrolled since issue #4505 item 4.
+    if let Some(accepted_staple) = accepted_staple {
+        accepted_staple.enroll(&resolver);
+    }
     let client_ca_source =
         client_ca_bundle_path.map(|source| CertSource::parse(source, MaterialKind::CaBundle));
 
@@ -462,13 +586,36 @@ fn validate_explicit_listener_claims(
     Ok(())
 }
 
+/// The configured stapled OCSP response, loaded and structurally admitted, with
+/// the identities [`crate::tls::ocsp_recheck`] needs to track and retire it.
+struct StapleSource {
+    bytes: Vec<u8>,
+    /// The operator's configured source string — the TLS inventory's
+    /// `source.identifier`, so a retirement reaches the right entry.
+    configured_source_id: String,
+    /// The already-redacted display id, the only form ever logged.
+    display_source_id: String,
+}
+
+/// One loaded Gateway certificate, plus the staple acceptance it produced.
+struct LoadedCertificate {
+    certified_key: Arc<CertifiedKey>,
+    leaf: CertificateDer<'static>,
+    cert_source_id: String,
+    key_source_id: String,
+    /// `Some` only for the single certificate a staple was attached to; it must
+    /// be enrolled with the resolver that ends up serving it.
+    accepted_staple: Option<AcceptedStaple>,
+}
+
 /// Load and pair one certificate, returning it plus its parsed leaf DER.
 fn load_certified_key(
     input: &GatewayCertificateInput,
-    ocsp_response: &[u8],
+    staple_source: Option<&StapleSource>,
     tls_policy: &TlsPolicy,
     cert_expiry_warning_days: u64,
-) -> Result<(Arc<CertifiedKey>, CertificateDer<'static>, String, String), anyhow::Error> {
+    revocation_expiry_warning_days: u64,
+) -> Result<LoadedCertificate, anyhow::Error> {
     let cert_source = CertSource::parse(input.cert_source.as_str(), MaterialKind::Cert);
     let key_source = CertSource::parse(input.key_source.as_str(), MaterialKind::Key);
     if matches!(&key_source, CertSource::Uri(uri) if uri.scheme == SourceScheme::Pkcs11) {
@@ -503,27 +650,24 @@ fn load_certified_key(
     )?;
 
     // Issue #4300: bind the staple to this exact leaf/issuer before it can be
-    // served. `ocsp_response` is only non-empty when the data plane serves a
+    // served. `staple_source` is only `Some` when the data plane serves a
     // single certificate, so the response and the chain below are the pair the
-    // client will actually see.
-    if !ocsp_response.is_empty() {
-        let acceptance = crate::tls::ocsp::validate_stapled_response(ocsp_response, &cert_chain)
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "Gateway certificate {} was configured with a stapled OCSP response that was \
-                     rejected: {error}",
-                    input.identity
-                )
-            })?;
-        info!(
-            gateway_certificate = %input.identity,
-            ocsp_der_bytes = acceptance.der_len,
-            ocsp_this_update = acceptance.this_update,
-            ocsp_next_update = acceptance.next_update,
-            ocsp_delegated_responder = acceptance.delegated_responder,
-            "Validated and stapled OCSP response for Gateway certificate"
-        );
-    }
+    // client will actually see. Acceptance goes through the shared
+    // `crate::tls::ocsp_recheck` helper, which is also the only way a staple
+    // becomes trackable — that is what keeps a certificate source from being
+    // added without enrolment (issue #4773, refs #4792).
+    let accepted_staple = staple_source
+        .map(|staple| {
+            crate::tls::ocsp_recheck::accept_stapled_response(
+                &staple.bytes,
+                &cert_chain,
+                StapleTarget::GatewayCertificate(input.identity.as_str()),
+                staple.configured_source_id.clone(),
+                staple.display_source_id.clone(),
+                revocation_expiry_warning_days,
+            )
+        })
+        .transpose()?;
 
     let mut certified_key =
         CertifiedKey::from_der(cert_chain, key, tls_policy.crypto_provider.as_ref()).map_err(
@@ -534,16 +678,17 @@ fn load_certified_key(
                 )
             },
         )?;
-    if !ocsp_response.is_empty() {
-        certified_key.ocsp = Some(ocsp_response.to_vec());
+    if let Some(staple) = staple_source {
+        certified_key.ocsp = Some(staple.bytes.clone());
     }
 
-    Ok((
-        Arc::new(certified_key),
+    Ok(LoadedCertificate {
+        certified_key: Arc::new(certified_key),
         leaf,
-        cert_material.display_source_id,
-        key_material.display_source_id,
-    ))
+        cert_source_id: cert_material.display_source_id,
+        key_source_id: key_material.display_source_id,
+        accepted_staple,
+    })
 }
 
 /// Add one normalized name without allowing derived aliases to grow the index
@@ -732,7 +877,7 @@ mod tests {
     fn declared_listener_names_cannot_fall_through_to_unrelated_san_candidates() {
         let declared = test_certified_key(&rcgen::PKCS_ECDSA_P256_SHA256, "claimed.example.com");
         let san_alias = test_certified_key(&rcgen::PKCS_ED25519, "alias.example.com");
-        let resolver = SniCertResolver {
+        let index = SniIndex {
             declared_exact: HashMap::from([(
                 "claimed.example.com".to_string(),
                 vec![declared.clone()],
@@ -747,19 +892,19 @@ mod tests {
             fallback: vec![san_alias.clone()],
         };
 
-        let exact_claim = resolver
+        let exact_claim = index
             .candidates("claimed.example.com")
             .expect("declared exact candidates");
         assert_eq!(exact_claim.len(), 1);
         assert!(Arc::ptr_eq(&exact_claim[0], &declared));
 
-        let wildcard_claim = resolver
+        let wildcard_claim = index
             .candidates("api.example.net")
             .expect("declared wildcard candidates");
         assert_eq!(wildcard_claim.len(), 1);
         assert!(Arc::ptr_eq(&wildcard_claim[0], &declared));
 
-        let unclaimed_alias = resolver
+        let unclaimed_alias = index
             .candidates("unclaimed.example.org")
             .expect("unclaimed SAN alias candidates");
         assert_eq!(unclaimed_alias.len(), 1);

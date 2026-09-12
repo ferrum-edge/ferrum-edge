@@ -59,6 +59,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::common::workload_api_socket_paths::workload_api_socket_path;
+
 use async_trait::async_trait;
 use ferrum_edge::identity::attestation::{AttestError, Attestor, PeerInfo, WorkloadIdentity};
 use ferrum_edge::identity::ca::{CertificateAuthority, bootstrap, internal};
@@ -148,16 +150,15 @@ fn internal_ca() -> Arc<internal::InternalCa> {
     )
 }
 
-/// A unique socket path under the system temp dir.
+/// A unique socket path this test binary owns.
 ///
-/// Deliberately short: `sockaddr_un.sun_path` is ~104 bytes, and a long per-test
-/// path is the classic reason a UDS test fails with a bare `EINVAL`.
+/// Not the raw system temp directory: the production ancestor policy refuses a
+/// symlinked directory component, and the ordinary macOS `TMPDIR` lives under
+/// `/var`, which is a symlink. The shared helper resolves a canonical parent
+/// that also leaves room for the private staging directory inside
+/// `sockaddr_un.sun_path` (issue #4984).
 fn socket_path(label: &str) -> PathBuf {
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock is after the epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!("fe-wa-{label}-{}.sock", unique % 1_000_000_000))
+    workload_api_socket_path(label)
 }
 
 /// Limits built from the shipped defaults, so a test only states the bound it is

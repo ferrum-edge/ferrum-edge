@@ -45,11 +45,57 @@ fn trust_domain_rejects_invalid_char() {
 }
 
 #[test]
-fn trust_domain_rejects_leading_dot() {
-    assert!(matches!(
-        TrustDomain::new(".example.com"),
-        Err(TrustDomainError::BadBoundary(_))
-    ));
+fn trust_domain_accepts_boundary_punctuation() {
+    // SPIFFE-ID §2.1 defines the trust-domain grammar as a character set only:
+    // `[a-z0-9.-_]`, with no positional rule. Ferrum used to refuse a leading
+    // or trailing `.`, `-`, or `_` and rejected conformant peers with 403
+    // (issue #5052). Every one of these is a legal trust domain.
+    for raw in [
+        "_audit.example",
+        ".example.com",
+        "example.com.",
+        "-example.com",
+        "example.com-",
+        "example.com_",
+        "_",
+        "-",
+        ".",
+        "a..b",
+    ] {
+        let td = TrustDomain::new(raw).expect("SPIFFE-conformant trust domain");
+        assert_eq!(td.as_str(), raw);
+    }
+}
+
+#[test]
+fn trust_domain_still_rejects_non_grammar_punctuation() {
+    // Loosening the boundary rule must not admit userinfo, a port, percent
+    // encoding, or an IPv6 literal — the character set already excludes them
+    // and continues to.
+    for (raw, ch) in [
+        ("user@example.com", '@'),
+        ("example.com:8443", ':'),
+        ("ex%2fample.com", '%'),
+        ("[::1]", '['),
+        ("example com", ' '),
+    ] {
+        match TrustDomain::new(raw) {
+            Err(TrustDomainError::InvalidChar(_, actual)) => assert_eq!(actual, ch),
+            other => panic!("trust domain '{raw}' must be refused for '{ch}', got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn trust_domain_accepts_the_full_spec_length() {
+    // §2.3 puts the maximum trust-domain name length at 255 bytes. 241..=255
+    // used to be refused by a local 240-byte cap.
+    for len in [241usize, 254, MAX_TRUST_DOMAIN_LEN] {
+        let raw = "a".repeat(len);
+        let td = TrustDomain::new(raw.clone()).expect("spec-length trust domain");
+        assert_eq!(td.as_str().len(), len);
+    }
+    assert_eq!(MAX_TRUST_DOMAIN_LEN, 255);
 }
 
 #[test]
@@ -373,6 +419,32 @@ fn spiffe_id_rejects_too_long() {
         SpiffeId::new(raw),
         Err(SpiffeIdError::TooLong(_, _, _))
     ));
+}
+
+#[test]
+fn spiffe_id_accepts_spec_legal_boundary_and_length_trust_domains() {
+    // The parser delegates trust-domain admission, so the same conformant
+    // identifiers must survive a full `spiffe://` parse (issue #5052).
+    let id = SpiffeId::new("spiffe://_audit.example/ns/test/sa/client").expect("boundary domain");
+    assert_eq!(id.trust_domain().as_str(), "_audit.example");
+    assert_eq!(id.kubernetes_identity(), Some(("test", "client")));
+
+    let long_domain = "a".repeat(MAX_TRUST_DOMAIN_LEN);
+    let id = SpiffeId::new(format!("spiffe://{long_domain}/workload")).expect("255-byte domain");
+    assert_eq!(id.trust_domain().as_str(), long_domain);
+    assert_eq!(id.path(), "workload");
+
+    // One byte over the trust-domain bound is still refused, and the whole-URI
+    // bound is unchanged and enforced separately.
+    let over_limit = "a".repeat(MAX_TRUST_DOMAIN_LEN + 1);
+    assert!(matches!(
+        SpiffeId::new(format!("spiffe://{over_limit}/workload")),
+        Err(SpiffeIdError::InvalidTrustDomain(
+            _,
+            TrustDomainError::TooLong(_, _)
+        ))
+    ));
+    assert!(MAX_SPIFFE_ID_LEN > MAX_TRUST_DOMAIN_LEN + "spiffe://".len());
 }
 
 #[test]

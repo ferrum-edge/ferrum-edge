@@ -556,7 +556,13 @@ async fn test_tcp_logging_rejects_invalid_tls_server_names_at_admission() {
 #[tokio::test]
 async fn test_tcp_logging_accepts_valid_dns_and_ip_tls_server_names() {
     ensure_crypto_provider();
-    for tls_server_name in ["logs.example.com", "localhost", "127.0.0.1"] {
+    for tls_server_name in [
+        "logs.example.com",
+        "localhost",
+        "127.0.0.1",
+        "localhost.",
+        "log_sink.local",
+    ] {
         let result = TcpLogging::new(
             &json!({
                 "host": "127.0.0.1",

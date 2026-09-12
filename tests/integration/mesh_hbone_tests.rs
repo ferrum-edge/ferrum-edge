@@ -2260,6 +2260,7 @@ fn inbound_hbone_dns_screen_denial_releases_half_open_probe_without_tripping() {
         failure_status_codes: vec![500, 502, 503],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
     cb.record_failure(503, true, false);
@@ -2306,7 +2307,7 @@ fn inbound_hbone_dns_screen_denial_settles_half_open_via_production_helper() {
     let collapsed: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
         collapsed.contains(
-            "settle_hbone_backend_connect_circuit_breaker_outcome( &cb, err.status, cb_is_half_open_probe, );"
+            "settle_hbone_backend_connect_circuit_breaker_outcome( &cb, err.status, cb_probe.take_slot(), );"
         ),
         "connect_backend error arm must settle the same selected-target breaker"
     );

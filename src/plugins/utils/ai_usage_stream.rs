@@ -163,20 +163,46 @@ impl UsageAccumulator {
         self.observed = true;
     }
 
-    /// Apply one SSE `data:` payload (already stripped of the field name).
+    /// Apply one dispatched SSE event's assembled `data` payload.
+    ///
+    /// Per the WHATWG event-stream grammar an event may carry several `data`
+    /// fields, whose values are joined with `\n` and dispatched as ONE payload.
+    /// The assembled document is therefore what is parsed first: parsing each
+    /// field on its own discarded a legal usage document split across two of
+    /// them, so the authoritative provider counts were lost and the budget
+    /// followed the pre-request heuristic estimate instead
+    /// (`GHSA-pqjf-4jcj-34rp`).
+    ///
+    /// A provider that omits the blank line between two complete documents
+    /// leaves them joined here, which is not itself valid JSON. That case falls
+    /// back to parsing each line on its own so a non-conformant stream keeps
+    /// exactly the accounting it had before event assembly existed.
     ///
     /// `[DONE]` and non-JSON payloads are ignored — a malformed frame in the
     /// middle of an otherwise valid stream must not discard counters already
     /// observed, and must never be charged as zero.
     pub fn apply_sse_data(&mut self, data: &str, configured: Option<AiProvider>) {
-        let data = data.trim();
-        if data.is_empty() || data == "[DONE]" {
+        if self.apply_sse_json(data, configured) || !data.contains('\n') {
             return;
         }
+        for line in data.lines() {
+            self.apply_sse_json(line, configured);
+        }
+    }
+
+    /// Parse one candidate JSON payload. Returns `true` when the payload was
+    /// recognized (a parsed document, the `[DONE]` sentinel, or empty), so the
+    /// caller knows whether the per-line fallback above is worth attempting.
+    fn apply_sse_json(&mut self, data: &str, configured: Option<AiProvider>) -> bool {
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            return true;
+        }
         let Ok(json) = serde_json::from_str::<Value>(data) else {
-            return;
+            return false;
         };
         self.apply_event_json(&json, configured);
+        true
     }
 
     /// Apply one parsed provider event or terminal document.
@@ -187,6 +213,32 @@ impl UsageAccumulator {
     /// and an explicitly configured `provider` must not suppress the
     /// authoritative terminal signal of the format the backend actually sent.
     pub fn apply_event_json(&mut self, json: &Value, configured: Option<AiProvider>) {
+        // OpenAI Responses streaming (`response.*` events). The authoritative
+        // counters ride the TERMINAL `response.completed` event and live under
+        // `response.usage`, not root `usage`, so without this arm a completed
+        // Responses stream reported no usage at all and the budget kept the
+        // pre-request estimate (`GHSA-pqjf-4jcj-34rp`). Every other
+        // `response.*` event — `response.created`, `response.in_progress`,
+        // `response.incomplete`, `response.failed`, the per-item deltas — is a
+        // progress snapshot, never a usage authority, so the whole family
+        // returns here rather than falling through to the generic arms below.
+        // Mirrors the sibling `ai_token_metrics` terminal-event handling, and
+        // matches no supported provider's own event names (Anthropic uses
+        // `message_*`/`content_block_*`, Cohere v2 `message-*`).
+        if let Some(kind) = json.get("type").and_then(Value::as_str)
+            && kind.starts_with("response.")
+        {
+            if kind == "response.completed"
+                && let Some(response) = json.get("response")
+            {
+                let provider = detect_sse_provider(response)
+                    .or(configured)
+                    .unwrap_or(AiProvider::OpenAi);
+                self.record(&extract_response_usage(response, provider));
+            }
+            return;
+        }
+
         // Root `usage` object: OpenAI / Mistral chunks with
         // `stream_options.include_usage`, Cohere v2 buffered, Bedrock Converse.
         // An explicitly empty or null `usage` (sent on every non-terminal
@@ -265,6 +317,54 @@ impl UsageAccumulator {
     }
 }
 
+/// Bounded assembly buffer for one SSE event's `data` fields.
+///
+/// Retention is capped by [`MAX_SSE_EVENT_BYTES`] across the WHOLE event, not
+/// just per line: without that, a provider could split unbounded bytes over
+/// many short, individually-legal `data` fields and grow this buffer without
+/// limit. An event that exceeds the cap is abandoned and the parser resumes at
+/// the next dispatch, exactly as an oversized single line already does — a
+/// usage event is never 64 KiB, so no real charge is lost.
+#[derive(Debug, Default)]
+struct SseEventBuffer {
+    data: String,
+    /// A `data` field was seen for this event. An explicitly empty one still
+    /// counts, so `data:\ndata:{...}` keeps its leading newline.
+    has_data: bool,
+    /// The cap was exceeded; drop the remainder of this event.
+    overflowed: bool,
+}
+
+impl SseEventBuffer {
+    fn push_data(&mut self, value: &str) {
+        if self.overflowed {
+            return;
+        }
+        let separator = usize::from(self.has_data);
+        if self.data.len() + separator + value.len() > MAX_SSE_EVENT_BYTES {
+            self.overflowed = true;
+            self.data = String::new();
+            self.has_data = true;
+            return;
+        }
+        if self.has_data {
+            self.data.push('\n');
+        }
+        self.data.push_str(value);
+        self.has_data = true;
+    }
+
+    /// Reset and return the dispatched payload, or `None` when this event
+    /// carried no usable `data` (no field at all, or an abandoned oversized
+    /// one).
+    fn take(&mut self) -> Option<String> {
+        let overflowed = std::mem::take(&mut self.overflowed);
+        let has_data = std::mem::take(&mut self.has_data);
+        let data = std::mem::take(&mut self.data);
+        (has_data && !overflowed).then_some(data)
+    }
+}
+
 /// Wire framing an [`UsageStreamExtractor`] should decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageStreamFormat {
@@ -286,6 +386,8 @@ pub struct UsageStreamExtractor {
     usage: UsageAccumulator,
     /// Partial SSE line, or partial AWS event-stream message.
     carry: Vec<u8>,
+    /// Assembled `data` field values for the SSE event currently being built.
+    event: SseEventBuffer,
     /// Remaining bytes of an oversized unit to discard without buffering.
     skip_remaining: u64,
     /// The current SSE line exceeded the cap: discard through the next newline.
@@ -304,6 +406,7 @@ impl UsageStreamExtractor {
             configured_provider,
             usage: UsageAccumulator::default(),
             carry: Vec::new(),
+            event: SseEventBuffer::default(),
             skip_remaining: 0,
             resyncing: false,
             pending_message_len: 0,
@@ -319,7 +422,7 @@ impl UsageStreamExtractor {
     /// bounded-retention guarantee.
     #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn retained_bytes(&self) -> usize {
-        self.carry.len()
+        self.carry.len() + self.event.data.len()
     }
 
     /// Feed the next chunk of decoded response body bytes.
@@ -340,9 +443,15 @@ impl UsageStreamExtractor {
     /// AWS event-stream message is discarded: a truncated binary frame carries
     /// no trustworthy counters.
     pub fn finish(&mut self) {
-        if self.format == UsageStreamFormat::Sse && !self.resyncing && !self.carry.is_empty() {
-            let line = std::mem::take(&mut self.carry);
-            self.apply_sse_line(&line);
+        if self.format == UsageStreamFormat::Sse {
+            if !self.resyncing && !self.carry.is_empty() {
+                let line = std::mem::take(&mut self.carry);
+                self.apply_sse_line(&line);
+            }
+            // A provider that omits the terminating blank line after its final
+            // usage event must still be charged, so the event assembled so far
+            // is dispatched here rather than discarded.
+            self.dispatch_sse_event();
         }
         self.carry = Vec::new();
         self.pending_message_len = 0;
@@ -394,16 +503,51 @@ impl UsageStreamExtractor {
         self.carry.extend_from_slice(rest);
     }
 
+    /// Feed one complete SSE line into event assembly.
+    ///
+    /// Implements the WHATWG "parsing an event stream" line rules that matter
+    /// to usage accounting: a blank line DISPATCHES the event, a line starting
+    /// with `:` is a comment, and a `data` field's value (with one optional
+    /// leading space removed) is appended to the event's payload, joined with
+    /// `\n`. Only complete events are handed to the accumulator, so a usage
+    /// document a provider legally split across two `data` fields is no longer
+    /// discarded (`GHSA-pqjf-4jcj-34rp`).
     fn apply_sse_line(&mut self, line: &[u8]) {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         let Ok(line) = std::str::from_utf8(line) else {
             return;
         };
-        // SSE field names are case-sensitive per the HTML Living Standard.
-        let Some(data) = line.strip_prefix("data:") else {
+        // A UTF-8 BOM is permitted at the very start of an event stream and is
+        // not part of the first field name.
+        let line = line.strip_prefix('\u{feff}').unwrap_or(line);
+        if line.is_empty() {
+            self.dispatch_sse_event();
+            return;
+        }
+        if line.starts_with(':') {
+            return;
+        }
+        // SSE field names are case-sensitive per the HTML Living Standard. A
+        // line with no colon at all is a field with an empty value.
+        let (field, value) = match line.find(':') {
+            Some(index) => {
+                let value = &line[index + 1..];
+                (&line[..index], value.strip_prefix(' ').unwrap_or(value))
+            }
+            None => (line, ""),
+        };
+        if field != "data" {
+            return;
+        }
+        self.event.push_data(value);
+    }
+
+    /// Hand the assembled event payload to the accumulator and reset.
+    fn dispatch_sse_event(&mut self) {
+        let Some(data) = self.event.take() else {
             return;
         };
-        self.usage.apply_sse_data(data, self.configured_provider);
+        self.usage.apply_sse_data(&data, self.configured_provider);
     }
 
     fn push_event_stream(&mut self, chunk: &[u8]) {

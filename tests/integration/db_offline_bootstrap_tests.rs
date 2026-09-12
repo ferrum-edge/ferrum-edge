@@ -142,8 +142,18 @@ async fn normal_reconnect_does_not_rerun_migrations() {
     let db_path = temp_dir.path().join("primary.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
 
+    // Successful SQLite startup has no fast-failure latency contract. Use
+    // normal connect/acquire budgets to allow for runner contention before
+    // this test reaches the reconnect assertions.
+    let defaults = DbPoolConfig::default();
+    let pool_config = DbPoolConfig {
+        connect_timeout_seconds: defaults.connect_timeout_seconds,
+        acquire_timeout_seconds: defaults.acquire_timeout_seconds,
+        ..fast_fail_pool_config()
+    };
+
     // Eager connect — migrations run exactly once here.
-    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, fast_fail_pool_config())
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, pool_config)
         .await
         .expect("initial connect");
 

@@ -23,6 +23,14 @@
 //! 5. If all entries are trusted (or XFF is absent/empty), fall back to the
 //!    TCP socket address.
 //!
+//! Every `X-Forwarded-For` field-line is read as **raw bytes**, in wire order,
+//! and the field-lines together form one chain. A field-line is never accepted
+//! or discarded whole: each element is evaluated on its own, and an element
+//! that is not a valid address is an invalid hop rather than a reason to drop
+//! the elements beside it. A text accessor that skips a field-line it cannot
+//! represent must not be used here — the remote peer chooses those bytes, so
+//! such a view is peer-controlled (advisory GHSA-73ff-frj6-cpmp).
+//!
 //! # Configured single-hop real-IP header
 //!
 //! When `FERRUM_REAL_IP_HEADER` names an authoritative header (`X-Real-IP`,
@@ -259,20 +267,32 @@ pub fn resolve_client_ip(
     resolve_client_ip_parsed(socket_ip, &socket_addr, xff_header, trusted_proxies)
 }
 
-/// Like `resolve_client_ip` but accepts a pre-parsed `IpAddr` so callers on
-/// the hot path avoid parsing the socket IP string twice. The returned text is
-/// canonicalized before it becomes the request client identity.
-pub fn resolve_client_ip_parsed(
+/// Resolve the real client IP from every `X-Forwarded-For` field-line, as raw
+/// bytes.
+///
+/// This is the form every ingress path uses. The field-lines are one chain in
+/// wire order, exactly as if the hops had written a single comma-separated
+/// line, and a line is examined element by element rather than being accepted
+/// or discarded whole. Proxies commonly append the address they vouch for to
+/// the line they received (nginx `$proxy_add_x_forwarded_for`, Envoy's default
+/// `use_remote_address`, most cloud load balancers), so preserving the line is
+/// what preserves the trust boundary (advisory GHSA-73ff-frj6-cpmp).
+///
+/// The `socket_addr` is pre-parsed so hot-path callers do not parse the socket
+/// IP string twice. The returned text is canonicalized before it becomes the
+/// request client identity.
+pub fn resolve_client_ip_field_lines<'a>(
     socket_ip: &str,
     socket_addr: &IpAddr,
-    xff_header: Option<&str>,
+    xff_field_lines: impl IntoIterator<Item = &'a [u8]>,
     trusted_proxies: &TrustedProxies,
 ) -> String {
-    // No XFF header — use socket IP
-    let xff = match xff_header {
-        Some(h) if !h.trim().is_empty() => h,
-        _ => return canonical_ip_string(*socket_addr),
-    };
+    let mut field_lines = xff_field_lines.into_iter().peekable();
+
+    // No XFF field-line at all — use socket IP.
+    if field_lines.peek().is_none() {
+        return canonical_ip_string(*socket_addr);
+    }
 
     // If the direct connection is NOT from a trusted proxy, the XFF header
     // could be entirely attacker-controlled — ignore it.
@@ -284,38 +304,77 @@ pub fn resolve_client_ip_parsed(
         return canonical_ip_string(*socket_addr);
     }
 
-    // Walk XFF entries right-to-left without collecting into a Vec.
-    // rsplit(',') yields entries from right to left directly.
-    for entry in xff.rsplit(',') {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
-        }
-        match entry.parse::<IpAddr>() {
-            Ok(ip) => {
-                if !trusted_proxies.contains(&ip) {
-                    // First untrusted IP = real client
-                    return canonical_ip_string(ip);
-                }
-                // This is a trusted proxy, keep walking left
+    // The right-to-left walk is decided entirely by the LAST element that is
+    // neither empty nor a trusted proxy, so one allocation-free forward pass
+    // computes it — the same shape `trusted_forwarded_request_scheme` uses for
+    // its boundary index, and the only shape available over field-lines that
+    // cannot be iterated backwards. A valid untrusted address there is the real
+    // client; an unparseable one fails closed to the socket address because
+    // everything further left is more attacker-controlled. A malformed element
+    // only clears a boundary seen to its left, and a later untrusted address
+    // re-establishes one.
+    let mut client = None;
+    let mut malformed_boundary = false;
+    for field_line in field_lines {
+        for entry in field_line.split(|byte| *byte == b',') {
+            let entry = trim_header_ows(entry);
+            if entry.is_empty() {
+                continue;
             }
-            Err(_) => {
-                // Unparseable entry after the trusted suffix — stop the walk.
-                // Entries to the left are MORE attacker-controlled; continuing
-                // would let a spoofed IP feed ACLs, rate limits, and logs.
-                // Fail closed: fall through to the socket address below.
-                debug!(
-                    entry = entry,
-                    "Malformed X-Forwarded-For entry after trusted suffix; \
-                     falling back to socket address"
-                );
-                break;
+            match std::str::from_utf8(entry)
+                .ok()
+                .and_then(|entry| entry.parse::<IpAddr>().ok())
+            {
+                Some(ip) if trusted_proxies.contains(&ip) => {}
+                Some(ip) => {
+                    client = Some(ip);
+                    malformed_boundary = false;
+                }
+                None => {
+                    client = None;
+                    malformed_boundary = true;
+                }
             }
         }
     }
 
-    // All XFF entries were trusted proxies — fall back to socket IP
-    canonical_ip_string(*socket_addr)
+    match client {
+        // First untrusted IP walking right-to-left = real client.
+        Some(ip) => canonical_ip_string(ip),
+        None => {
+            if malformed_boundary {
+                // The offending element is deliberately NOT logged: it is
+                // untrusted remote bytes that may carry CR/LF or obs-text.
+                debug!(
+                    socket_ip = socket_ip,
+                    "Malformed X-Forwarded-For entry after trusted suffix; \
+                     falling back to socket address"
+                );
+            }
+            // All entries trusted, or the boundary was unparseable.
+            canonical_ip_string(*socket_addr)
+        }
+    }
+}
+
+/// Like `resolve_client_ip` but accepts a pre-parsed `IpAddr` and one already
+/// text-decoded `X-Forwarded-For` chain.
+///
+/// Production ingress uses [`resolve_client_ip_field_lines`] instead, because a
+/// `&str` cannot represent a field-line the client made unrepresentable.
+#[allow(dead_code)] // Used by external test crates via public API
+pub fn resolve_client_ip_parsed(
+    socket_ip: &str,
+    socket_addr: &IpAddr,
+    xff_header: Option<&str>,
+    trusted_proxies: &TrustedProxies,
+) -> String {
+    resolve_client_ip_field_lines(
+        socket_ip,
+        socket_addr,
+        xff_header.map(str::as_bytes),
+        trusted_proxies,
+    )
 }
 
 /// Outcome of evaluating every field-line of the configured real-IP header.
@@ -423,11 +482,17 @@ fn parse_single_real_ip_value(value: &str) -> Option<IpAddr> {
 /// considered: an accepted value wins, and a rejected one returns `None` so
 /// callers keep the socket IP rather than falling through to XFF. Only a wholly
 /// absent header falls back to the XFF walk.
-pub fn resolve_forwarded_client_ip<'a>(
+///
+/// `xff_field_lines` yields every `X-Forwarded-For` field-line as raw bytes.
+/// Both iterators must come from a byte-preserving accessor
+/// (`RequestContext::header_field_lines`); a text accessor that skips
+/// unrepresentable field-lines silently erases the trust boundary this walk
+/// depends on.
+pub fn resolve_forwarded_client_ip<'a, 'b>(
     socket_ip: &str,
     socket_addr: &IpAddr,
     real_ip_field_lines: impl IntoIterator<Item = &'a [u8]>,
-    xff_header: Option<&str>,
+    xff_field_lines: impl IntoIterator<Item = &'b [u8]>,
     trusted_proxies: &TrustedProxies,
 ) -> Option<String> {
     if trusted_proxies.is_empty() {
@@ -445,7 +510,8 @@ pub fn resolve_forwarded_client_ip<'a>(
         RealIpHeaderOutcome::Absent => {}
     }
 
-    let resolved = resolve_client_ip_parsed(socket_ip, socket_addr, xff_header, trusted_proxies);
+    let resolved =
+        resolve_client_ip_field_lines(socket_ip, socket_addr, xff_field_lines, trusted_proxies);
     if resolved == socket_ip {
         None
     } else {

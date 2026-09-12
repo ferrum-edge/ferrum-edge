@@ -9,6 +9,7 @@ Ferrum Edge provides configurable retry logic for failed backend requests. Retri
 - [Configuration](#configuration)
 - [Retry Behavior](#retry-behavior)
   - [Connection Failures](#connection-failures)
+  - [Native gRPC Protocol NACKs](#native-grpc-protocol-nacks)
   - [HTTP Status Code Failures](#http-status-code-failures)
   - [Method Filtering](#method-filtering)
 - [Backoff Strategies](#backoff-strategies)
@@ -35,7 +36,7 @@ Retry logic applies to the following proxy protocols:
 | HTTP/1.1 | Yes | Full retry support with body replay |
 | HTTP/2 | Yes | Full retry support with body replay |
 | HTTP/3 (QUIC) | Yes | Full retry support with body replay |
-| gRPC / gRPCs | Yes | Connection failure retries with body replay and upstream target rotation |
+| gRPC / gRPCs | Yes | Connection failure and protocol-NACK retries with body replay and upstream target rotation |
 | WebSocket / WSS | Yes | Connection failure retries on initial backend connection with upstream target rotation |
 | TCP / TCP+TLS | Yes (connect-phase only) | Target rotation on connection-setup failures when `retry_on_connect_failure` is enabled and `upstream_id` is set; no mid-stream byte replay. See [Load Balancing — Retry Logic](load_balancing.md#retry-logic). |
 | UDP / DTLS | No | Datagram-based protocol, no connect-phase retry or target rotation |
@@ -105,6 +106,24 @@ Note that `is_canceled` is a statement about hyper's own wire boundary, not abou
 Independently of the Ferrum retry policy above, reqwest replays a request **once per protocol NACK** (up to two replays) when the backend proves it did not process it: a remote `GOAWAY` with `NO_ERROR` (RFC 9113 §6.8) or a remote `RST_STREAM` with `REFUSED_STREAM` (RFC 9113 §8.7). Reqwest can only do this for a body it holds in full.
 
 A live `backend_write_timeout_ms` (default `30000`) makes Ferrum hand reqwest a *streaming* carrier for buffered uploads, which would silently disable that replay. Ferrum therefore reproduces it at its own dispatch layer — same two shapes, same budget of two replays, a fresh upload pump per attempt, and one absolute response-header bound across all attempts. This is typed (`h2::Reason`), never substring-matched: a mis-detected NACK would replay a non-idempotent request the backend may already have processed. It requires no `retry` configuration and is independent of `retryable_methods`, exactly as reqwest's own behavior was.
+
+### Native gRPC Protocol NACKs
+
+With a `retry` block, buffered native gRPC requests replay a remote
+`GOAWAY(NO_ERROR)` that excludes their stream (`last_stream_id` below the request's
+stream ID), or a remote `RST_STREAM(REFUSED_STREAM)`. RFC 9113 guarantees that the
+backend application did not process these requests, even if DATA reached the
+transport. The typed `ProtocolNack` kind maps to the pre-wire
+`connection_pool_error` class, so `retry_on_connect_failure` permits replay of
+gRPC POSTs without adding POST to `retryable_methods`.
+
+These retries consume the proxy's `max_retries` budget and configured backoff,
+retain the original RPC deadline, and may rotate upstream targets. The direct
+gRPC pool discards the rejected sender before reacquisition. Unlike reqwest's
+independent protocol replay, no gRPC replay occurs without effective retries or
+when `retry_on_connect_failure` is false. Unreplayable streaming uploads, failures
+after response headers, and other resets such as `INTERNAL_ERROR` after request
+DATA was accepted do not qualify for this pre-wire exception.
 
 ### HTTP Status Code Failures
 
@@ -336,4 +355,6 @@ This is equivalent to the minimal configuration since `retryable_status_codes` d
 
 ### TCP passthrough connection retries
 
-TCP passthrough honors `retry_on_connect_failure` and `max_retries` for DNS, circuit-breaker admission, per-target connection-cap admission, and plain TCP connect failures. Each retry uses the existing healthy-target selection and mesh enforcement, preserves the original stream authorization deadline, and updates connection accounting for the selected target. ClientHello peeking and stream-connect plugins run once; outbound PROXY framing and encrypted client bytes are forwarded only after connection setup succeeds. No retry occurs after outbound framing or relay begins.
+Both terminating TCP/TCP+TLS and passthrough retries resolve connect timeouts from the currently selected DestinationRule policy port on every dial. The target that successfully connects supplies the relay's TCP idle timeout, including an explicit zero (disabled). A port without overrides falls back to proxy/global defaults, never to the initial target's overrides. Policy ports remain distinct from workload dial ports.
+
+TCP passthrough honors `retry_on_connect_failure` and `max_retries` for DNS, circuit-breaker admission, per-target connection-cap admission, and plain TCP connect failures. Each retry uses the existing healthy-target selection and mesh enforcement, preserves the original stream authorization deadline, and resolves the selected target's per-port connect timeout and connection accounting. The successful target's per-port TCP idle timeout governs the relay. ClientHello peeking and stream-connect plugins run once; outbound PROXY framing and encrypted client bytes are forwarded only after connection setup succeeds. No retry occurs after outbound framing or relay begins.

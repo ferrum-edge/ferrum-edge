@@ -166,6 +166,7 @@ fn start_gateway_with_dns(
     let binary_path = gateway_binary_path();
 
     let mut command = std::process::Command::new(binary_path);
+    command.arg("run");
     command
         .env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
@@ -750,6 +751,7 @@ plugin_configs:
     config:
       ldap_url: "ldap://127.0.0.1:{ldap_port}"
       bind_dn_template: "uid={{username}},ou=users,dc=example,dc=com"
+      canonical_identity_attribute: "uid"
 "#;
 
     let (mut gateway_process, echo_handle, proxy_port, _admin_port, _temp_dir) =
@@ -824,6 +826,7 @@ plugin_configs:
     config:
       ldap_url: "ldap://127.0.0.1:{ldap_port}"
       bind_dn_template: "uid={{username}},ou=users,dc=example,dc=com"
+      canonical_identity_attribute: "uid"
 "#;
 
     let (mut gateway_process, echo_handle, proxy_port, _admin_port, _temp_dir) =
@@ -893,6 +896,7 @@ plugin_configs:
     config:
       ldap_url: "ldap://directory.test:{ldap_port}"
       bind_dn_template: "uid={{username}},ou=users,dc=example,dc=com"
+      canonical_identity_attribute: "uid"
       allow_plaintext: true
       connect_timeout_seconds: 1
 "#;

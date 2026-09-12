@@ -217,6 +217,7 @@ fn builtin_parity_meta_matches_registry_set() {
 
 #[tokio::test]
 async fn complete_order_table_matches_parity_meta_and_runtime_priority() {
+    super::plugin_utils::ensure_basic_auth_test_secret();
     let rows = parse_complete_order_table(EXECUTION_ORDER_DOC);
     assert_unique_names("complete-order table", rows.iter().map(|r| r.name.clone()));
 
@@ -258,10 +259,34 @@ async fn complete_order_table_matches_parity_meta_and_runtime_priority() {
             row.name
         );
 
-        let config = minimal_plugin_config(&row.name);
+        let mut config = minimal_plugin_config(&row.name);
+        if row.name == "proxy_alerts" {
+            // This capability is conditional on the selected alert-rule family.
+            config["rules"] = serde_json::json!([{
+                "name": "disconnects",
+                "type": "stream_disconnect_cause",
+                "causes": ["backend_error"],
+                "threshold_count": 1,
+                "channels": ["ops"]
+            }]);
+        }
         let plugin = create_plugin(&row.name, &config)
             .unwrap_or_else(|e| panic!("create_plugin({}) failed: {e}", row.name))
             .unwrap_or_else(|| panic!("create_plugin({}) returned None", row.name));
+        if plugin.requires_ws_disconnect_hooks() {
+            for (source, phases) in [
+                ("parity metadata", meta.active_phases),
+                ("execution-order documentation", row.active_phases.as_str()),
+            ] {
+                assert!(
+                    phases
+                        .split(',')
+                        .any(|phase| phase.trim() == "on_ws_disconnect"),
+                    "{} requires WebSocket disconnect hooks but {source} omits on_ws_disconnect",
+                    row.name
+                );
+            }
+        }
         assert_eq!(
             plugin.priority(),
             meta.priority,
@@ -281,6 +306,7 @@ async fn complete_order_table_matches_parity_meta_and_runtime_priority() {
 
 #[tokio::test]
 async fn protocol_matrix_matches_parity_meta_and_runtime_protocols() {
+    super::plugin_utils::ensure_basic_auth_test_secret();
     let rows = parse_protocol_matrix(EXECUTION_ORDER_DOC);
     assert_unique_names("protocol matrix", rows.iter().map(|r| r.name.clone()));
 

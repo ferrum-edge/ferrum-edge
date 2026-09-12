@@ -473,3 +473,51 @@ fn pattern_admission_holds_regex_listen_paths_to_the_escape_rules_only() {
         Some("invalid_escape")
     );
 }
+
+#[tokio::test]
+async fn shared_before_proxy_boundary_validates_absolute_provider_paths() {
+    use ferrum_edge::_test_support::run_before_proxy_hooks_for_test;
+    use ferrum_edge::plugins::{PluginResult, RequestContext};
+    use std::collections::HashMap;
+
+    for (path, expected) in [
+        ("/provider/../admin", None),
+        ("/provider/%2e%2e/admin", None),
+        ("/provider%2fadmin", None),
+        ("/provider%252fadmin", None),
+        ("/provider/%00", None),
+        ("/provider/%61pi", Some("/provider/api")),
+        ("/provider/api", Some("/provider/api")),
+    ] {
+        for absolute in [false, true] {
+            let mut ctx = RequestContext::new(
+                "127.0.0.1".to_string(),
+                "POST".to_string(),
+                "/public".to_string(),
+            );
+            ctx.route_override_path = Some(path.to_string());
+            ctx.route_override_path_is_absolute = absolute;
+            ctx.set_matched_path_strip_len(7);
+            let result = run_before_proxy_hooks_for_test(&[], &mut ctx, &mut HashMap::new()).await;
+            if let Some(expected) = expected {
+                assert!(matches!(result, PluginResult::Continue));
+                assert_eq!(ctx.route_override_path.as_deref(), Some(expected));
+            } else {
+                assert!(matches!(
+                    result,
+                    PluginResult::Reject {
+                        status_code: 400,
+                        ..
+                    }
+                ));
+            }
+            assert_eq!(ctx.path, "/public");
+            assert_eq!(
+                ctx.matched_path_strip_len(),
+                7,
+                "rebase owns the offset reset"
+            );
+            assert_eq!(ctx.route_override_path_is_absolute, absolute);
+        }
+    }
+}

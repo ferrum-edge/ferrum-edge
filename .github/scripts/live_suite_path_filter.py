@@ -9,57 +9,21 @@ import sys
 from pathlib import Path
 
 
-MESH_FEDERATION_DOCUMENTATION_PATHS = frozenset(
-    {
-        "docs/configuration.md",
-        "docs/mesh.md",
-        "docs/mesh_multicluster_federation_runbook.md",
-        "docs/spire_deployment.md",
-    }
-)
+# Documentation no longer schedules any live suite on a pull request: every
+# suite runs on each push to `main`, so a docs-only diff must not pay for a
+# Kind cluster. The per-suite sets stay declared (empty) because the
+# required-CI verifier proves the PR planner's documentation trigger set is a
+# superset of theirs.
+MESH_FEDERATION_DOCUMENTATION_PATHS: frozenset[str] = frozenset()
 
-MESH_E2E_SIDECAR_DOCUMENTATION_PATHS = frozenset(
-    {
-        "docs/configuration.md",
-        "docs/cp_dp_mode.md",
-        "docs/mesh.md",
-        "docs/spire_deployment.md",
-    }
-)
+MESH_E2E_SIDECAR_DOCUMENTATION_PATHS: frozenset[str] = frozenset()
 
-AMBIENT_HOST_UDP_DOCUMENTATION_PATHS = frozenset(
-    {
-        "docs/ci_cd.md",
-        "docs/configuration.md",
-        "docs/mesh.md",
-        "docs/node_agent.md",
-        "docs/tcp_udp_proxy.md",
-    }
-)
+AMBIENT_HOST_UDP_DOCUMENTATION_PATHS: frozenset[str] = frozenset()
 
-CNI_LIFECYCLE_DOCUMENTATION_PATHS = frozenset(
-    {
-        "docs/node_agent.md",
-        "docs/node_agent_security.md",
-    }
-)
+CNI_LIFECYCLE_DOCUMENTATION_PATHS: frozenset[str] = frozenset()
 
-# Istio Status CAS live has no documentation trigger set: its retired
-# workflow-level `paths:` list named only the writer, metrics, fixture, and
-# workflow/action surfaces. Keep that cost envelope.
 ISTIO_STATUS_CAS_DOCUMENTATION_PATHS: frozenset[str] = frozenset()
 
-# verify_required_ci.py requires the PR planner's protected documentation set
-# to cover this union, so new live-suite documentation triggers cannot silently
-# receive lightweight CI.
-#
-# The NodeWaypoint eBPF live suite is deliberately absent: its relevance is
-# decided by the `node-waypoint-ebpf-live` suite of `ci_runtime_plan.py`, the
-# trusted-base planner that already runs inside
-# `node-waypoint-ebpf-live.yml`'s `production-dockerfile-plan` job. Adding a
-# second classifier for the same live job would mean two gates that can each
-# bypass the other. `verify_required_ci.py` folds that planner's documentation
-# patterns into the same full-CI union.
 LIVE_SUITE_DOCUMENTATION_PATHS = (
     MESH_FEDERATION_DOCUMENTATION_PATHS
     | MESH_E2E_SIDECAR_DOCUMENTATION_PATHS
@@ -73,6 +37,14 @@ def exact_path_patterns(paths: frozenset[str]) -> list[str]:
     return [rf"^{re.escape(path)}$" for path in sorted(paths)]
 
 
+# Pull-request relevance for the dedicated Kind live suites. Each list names
+# the surfaces that suite EXISTS to exercise: its own harness, workflow, and
+# tooling, plus the Kubernetes-facing runtime modules it drives. Broad shared
+# trees (proxy, plugins, TLS, config, the Cargo build graph) are deliberately
+# absent: they are covered by the unit/integration/functional shards on the
+# same pull request, and every live suite runs on every push to `main`, so a
+# regression there turns `main` red for that commit instead of costing every
+# unrelated PR a Kind cluster. Unknown paths do NOT force a run.
 SUITE_PATTERNS: dict[str, list[str]] = {
     "gateway-api": [
         r"^\.github/workflows/(ci|gateway-api-conformance)\.yml$",
@@ -84,83 +56,35 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^scripts/gateway_api_tcproute_conformance\.sh$",
         r"^scripts/gateway_api_tlsroute_conformance\.sh$",
         r"^scripts/gateway_api_gatewayclass_authority_conformance\.sh$",
-        r"^Cargo\.(toml|lock)$",
-        r"^build\.rs$",
-        r"^rust-toolchain\.toml$",
-        r"^\.cargo/",
-        r"^vendor/",
         r"^Dockerfile(\..*)?$",
         r"^\.dockerignore$",
         r"^charts/ferrum-mesh/",
-        r"^proto/",
-        r"^src/config/",
         r"^src/config_sources/(mod\.rs|k8s/)",
         r"^src/k8s_controller/",
-        r"^src/modes/(control_plane|data_plane)\.rs$",
         r"^src/modes/mesh/",
-        r"^src/grpc/",
-        r"^src/router_cache\.rs$",
-        r"^src/load_balancer\.rs$",
-        r"^src/plugins/",
-        r"^src/proxy/",
-        r"^src/tls/",
+        *exact_path_patterns(MESH_FEDERATION_DOCUMENTATION_PATHS),
     ],
     "mesh-federation": [
         r"^\.github/workflows/(ci|multicluster-federation-live|multicluster-poller-partition-live)\.yml$",
-        # `validate_live_assertions.py` is the emitted-artifact release gate in
-        # the workflow's `gate` job, so editing it changes what a live run must
-        # prove about the artifact it published.
         r"^\.github/scripts/(live_suite_path_filter|validate_live_assertions)\.py$",
         r"^\.github/actions/package-ferrum-runtime-image/",
         r"^\.github/actions/setup-kubernetes-tools/",
         r"^tests/k8s/multicluster-federation/",
         r"^tests/k8s/multicluster-poller-partition/",
         r"^tests/k8s/lib/(live_assertions|spire)\.sh$",
-        # The GA-contract half of this suite is the enforced, non-deferred
-        # `multicluster-federation` rows of ga_contract.yaml, pinned by the
-        # hosted conformance suite (live_contract.rs,
-        # mesh_multicluster_federation.rs, wired through mod.rs /
-        # conformance_tests.rs). Editing any of them changes what the live
-        # fixture is required to prove, so the live datapath must re-run.
         r"^tests/conformance/(ga_contract\.yaml|contract\.rs|live_contract\.rs|mesh_multicluster_federation\.rs|mod\.rs)$",
         r"^tests/conformance_tests\.rs$",
-        r"^Cargo\.(toml|lock)$",
-        r"^build\.rs$",
-        r"^rust-toolchain\.toml$",
-        r"^\.cargo/",
-        r"^vendor/",
         r"^Dockerfile(\..*)?$",
         r"^\.dockerignore$",
-        r"^proto/",
-        r"^ferrum\.conf$",
-        r"^src/config/",
-        # The poller-partition fixture sharing this suite filter runs a real
-        # CP with Kubernetes discovery enabled. Changes to any leg of that
-        # CP watch/translate pipeline must therefore re-run the live gate.
-        r"^src/modes/control_plane\.rs$",
         r"^src/k8s_controller/",
         r"^src/config_sources/k8s/",
         r"^src/modes/mesh/",
-        r"^src/grpc/",
+        r"^src/grpc/mesh_",
         r"^src/identity/",
-        r"^src/tls/",
-        r"^src/secrets/",
-        r"^src/service_discovery/",
+        r"^src/service_discovery/(kubernetes|mesh)\.rs$",
         r"^src/plugins/mesh/",
-        r"^src/capture/",
-        r"^src/proxy/",
         *exact_path_patterns(MESH_FEDERATION_DOCUMENTATION_PATHS),
     ],
-    # Single-cluster Sidecar mesh live e2e (STRICT mTLS / authz / RequestAuth
-    # JWT / DR connectTimeout / CP-delivered native MeshSubscribe config) +
-    # the GA-contract live-assertion validator. Deliberately mirrors
-    # mesh-federation minus its multicluster-only surfaces, plus the JWT
-    # plugin the fixture's RequestAuth probes exercise, the conformance
-    # contract/validator files its workflow's validator step consumes, and
-    # the CP + native-subscribe surfaces backing the required
-    # sidecar.config.native_subscribe_delivered assertion (the DP-side native
-    # client, src/modes/mesh/config_consumer/native_client.rs, is already
-    # covered by src/modes/mesh/).
     "mesh-e2e-sidecar": [
         r"^\.github/workflows/(ci|mesh-e2e-sidecar-live)\.yml$",
         r"^\.github/scripts/live_suite_path_filter\.py$",
@@ -169,130 +93,42 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^tests/k8s/mesh_e2e_sidecar/",
         r"^tests/k8s/lib/(live_assertions|spire)\.sh$",
         r"^tests/k8s/lib/native_probe_classify\.py$",
-        # mod.rs wires `mod live_contract;` into the conformance tree and
-        # tests/conformance_tests.rs is the harness that declares
-        # `mod conformance;` — unwiring either would let the GA artifact gate
-        # vanish (the workflow's exact-path guard only runs when this filter
-        # marks the PR relevant).
         r"^tests/conformance/(ga_contract\.yaml|contract\.rs|live_contract\.rs|mod\.rs)$",
         r"^tests/conformance_tests\.rs$",
-        r"^Cargo\.(toml|lock)$",
-        r"^build\.rs$",
-        r"^rust-toolchain\.toml$",
-        r"^\.cargo/",
-        r"^vendor/",
         r"^Dockerfile(\..*)?$",
         r"^\.dockerignore$",
-        r"^proto/",
-        r"^ferrum\.conf$",
-        r"^src/config/",
         r"^src/modes/mesh/",
-        # CP runtime for the fixture's ferrum-cp Deployment (FERRUM_MODE=cp):
-        # binds FERRUM_CP_GRPC_LISTEN_ADDR, wires MeshGrpcServer, starts the
-        # K8s controller, and broadcasts reconciled mesh snapshots to
-        # subscribers. Kept to the one mode file — dp mode (data_plane.rs) is
-        # the gateway ConfigSync consumer, which the mesh DP never uses.
-        r"^src/modes/control_plane\.rs$",
-        # CP/DP gRPC TLS watchers used by the native MeshSubscribe mTLS
-        # rotation assertion (projected Secret generation swap).
-        r"^src/modes/grpc_tls_reload\.rs$",
-        r"^src/modes/tls_source_util\.rs$",
-        # CP-side MeshSubscribe surface only: mesh_server.rs serves the
-        # MeshConfigSync.MeshSubscribe stream (namespace-scoped snapshot
-        # build + content_eq dedupe), mesh_registry.rs tracks the subscribed
-        # nodes the reconcile broadcasts converge through, auth.rs is the
-        # DP<->CP JWT verification the fixture's mTLS+JWT stream still
-        # relies on, and cp_server.rs owns the shared CP scope/namespace
-        # filtering helpers mesh_server.rs calls when serving native slices;
-        # dp_client.rs owns shared DP gRPC JWT/TLS/version helpers imported by
-        # the native MeshSubscribe client. mod.rs (pure module wiring,
-        # compile-gated on every PR) stays out.
-        r"^src/grpc/(mesh_server|mesh_registry|auth|cp_server|dp_client)\.rs$",
-        # The watch->reconcile->broadcast pipeline that is the ONLY source of
-        # the mesh model the CP serves over MeshSubscribe (there is no DB or
-        # admin write path for the mesh block).
+        r"^src/modes/injector\.rs$",
+        r"^src/grpc/mesh_",
         r"^src/k8s_controller/",
-        # K8s mesh-model translation the CP leg depends on: core.rs turns the
-        # cluster's real Services/Pods/EndpointSlices into MeshService and
-        # Workload entries; k8s/mod.rs holds the shared accumulator and
-        # translation entry points core.rs plugs into. istio.rs/
-        # gateway_api.rs/mesh_config.rs stay out — the fixture disables those
-        # watches (FERRUM_K8S_WATCH_ISTIO_CRDS/GATEWAY_API_CRDS/MESH_CONFIG
-        # = false), so their translations cannot affect this suite — and so
-        # does src/config_sources/mod.rs (pure module wiring).
-        r"^src/config_sources/k8s/(mod|core)\.rs$",
-        # Serves authenticated GET /mesh/config-drift — the
-        # native_subscribe_delivered check requires the route, JWT extraction
-        # and role parsing, plus the response builder, to attribute the applied
-        # slice to source_protocol=native from the ferrum-cp URL.
-        r"^src/admin/(mod|mesh_config_drift|jwt_auth|audit)\.rs$",
+        r"^src/config_sources/k8s/",
+        r"^src/admin/mesh_config_drift\.rs$",
         r"^src/identity/",
-        r"^src/tls/",
-        r"^src/secrets/",
-        r"^src/service_discovery/",
         r"^src/plugins/mesh/",
-        r"^src/plugins/jwks_auth\.rs$",
-        # The shared JWT-validation core jwks_auth delegates to — the suite's
-        # RequestAuthentication assertions gate real bearer extraction +
-        # signature/issuer/exp validation, so regressions in these helpers
-        # must re-run it. Kept to the JWKS/JWT-specific modules
-        # (src/plugins/utils/ is otherwise a broad grab-bag of unrelated
-        # plugin helpers, and broad shared surfaces like src/plugins/mod.rs
-        # stay out by design — they are gated on every PR by the in-process
-        # unit/integration/functional mesh suites).
-        r"^src/plugins/utils/(jwt_verifier|jwks_store|jwks_cache|token_extract)\.rs$",
-        # Owns BackendConnectionGuard — the exact behavior the DR
-        # maxConnections WebSocket live assertion validates (held session
-        # occupies the slot, concurrent upgrade 503s, slot frees on close).
-        r"^src/backend_conn_limit\.rs$",
-        r"^src/capture/",
-        r"^src/proxy/",
         *exact_path_patterns(MESH_E2E_SIDECAR_DOCUMENTATION_PATHS),
     ],
-    # Ambient host-network UDP live-kernel gate (#3705): production
-    # ProxyHostUdpBackend TPROXY capture, attribution, replies, and cleanup.
     "ambient-host-udp": [
         r"^\.github/workflows/(ci|ambient-host-udp-live|release)\.yml$",
-        # The trusted release-trust surfaces decide whether the tag the chart
-        # selects is owned, gated, signed, and attested at all.
         r"^\.github/scripts/(live_suite_path_filter|pr_ci_plan|verify_cross_build_policy|verify_release_image_attestations)\.py$",
         r"^\.github/scripts/stage_iproute2_runtime\.sh$",
         r"^\.github/actions/setup-rust-ci/",
-        # The chart auto-selects a published runtime variant for the Ambient UDP
-        # lifecycle, so the image the chart names is part of this gate's subject:
-        # a Dockerfile or release-publication edit can make the selected tag stop
-        # shipping the shell/iptables tools the production backend executes.
         r"^Dockerfile$",
         r"^tests/k8s/ambient_host_udp_live/",
         r"^tests/unit/gateway_core/(ambient_host_udp_live_contract_tests|mesh_host_udp_capture_plan_tests)\.rs$",
         r"^tests/integration/mesh_k8s_pod_discovery/host_udp_capture_tests\.rs$",
         r"^tests/functional/functional_mesh_mode_test\.rs$",
-        r"^Cargo\.(toml|lock)$",
-        r"^build\.rs$",
-        r"^rust-toolchain\.toml$",
-        r"^\.cargo/",
-        r"^vendor/",
-        r"^proto/",
         r"^charts/ferrum-mesh/",
         r"^src/capture/",
         r"^src/modes/mesh/",
-        r"^src/proxy/(host_udp_capture|host_udp_capture_live_tests|mesh_udp_capture|netns_capture|netns_udp_capture|udp_batch|udp_placement_cleanup|udp_placement_migration|mod)\.rs$",
-        # The production entry points for the Ambient UDP lifecycle: the
-        # `ambient-udp-preflight` subcommand definition and dispatch, and the
-        # node-agent that publishes the node identity every placement proof is
-        # bound to. A defect in any of them bypasses the proof this gate
-        # exercises live.
+        r"^src/proxy/(host_udp_capture|host_udp_capture_live_tests|mesh_udp_capture|netns_capture|netns_udp_capture|udp_placement_cleanup|udp_placement_migration)\.rs$",
+        # The `ambient-udp-preflight` subcommand definition and dispatch are
+        # production entry points of this lifecycle, so the CLI/binary entry
+        # files stay sensitive even though they sit outside `src/proxy/`.
         r"^src/(cli|main|gateway_entry)\.rs$",
         r"^src/modes/node_agent\.rs$",
-        r"^src/socket_opts\.rs$",
         r"^src/ebpf/veth\.rs$",
         *exact_path_patterns(AMBIENT_HOST_UDP_DOCUMENTATION_PATHS),
     ],
-    # Istio status CAS competing-writer live proof. Kept to the retired
-    # workflow-level `paths:` list plus the trusted classifier script and the
-    # local composite actions the live job executes: the retired list named
-    # `setup-rust-ci` but not the `setup-sccache` / `setup-fast-linker` actions
-    # it runs, which decide how the live test binary is compiled and linked.
     "istio-status-cas": [
         r"^\.github/workflows/istio-status-cas-live\.yml$",
         r"^\.github/scripts/live_suite_path_filter\.py$",
@@ -306,11 +142,6 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^tests/fixtures/k8s/istio_authorizationpolicy_status_crd\.yaml$",
         *exact_path_patterns(ISTIO_STATUS_CAS_DOCUMENTATION_PATHS),
     ],
-    # CNI install lifecycle live recovery. Chart matches stay exact-path, not
-    # the whole Helm tree, so unrelated chart edits keep the previous cost. The
-    # retired `paths:` list named neither `setup-rust-ci` nor the
-    # `setup-sccache` / `setup-fast-linker` actions it runs, even though they
-    # build the `ferrum-edge` and `ferrum-cni` binaries this suite installs.
     "cni-lifecycle": [
         r"^\.github/workflows/cni-lifecycle-live\.yml$",
         r"^\.github/scripts/live_suite_path_filter\.py$",
@@ -319,9 +150,6 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^\.github/actions/setup-fast-linker/",
         r"^\.github/actions/setup-rust-ci/",
         r"^\.github/actions/setup-sccache/",
-        r"^Cargo\.(toml|lock)$",
-        r"^build\.rs$",
-        r"^proto/",
         r"^src/bin/ferrum-cni\.rs$",
         r"^src/cni/",
         r"^charts/ferrum-mesh/templates/cni-uninstall-hook\.yaml$",
@@ -330,11 +158,9 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^charts/ferrum-mesh/templates/node-agent-rbac\.yaml$",
         r"^charts/ferrum-mesh/values\.yaml$",
         r"^tests/k8s/cni_lifecycle_live/",
-        r"^PRODUCTION_READINESS\.md$",
         *exact_path_patterns(CNI_LIFECYCLE_DOCUMENTATION_PATHS),
     ],
 }
-
 
 COMPILED = {
     suite: [re.compile(pattern) for pattern in patterns]
@@ -1466,69 +1292,80 @@ def local_action_dependency_self_test() -> list[str]:
 
 def self_test() -> int:
     cases = [
-        ("gateway-api", ["src/tls/frontend.rs"], True),
         ("gateway-api", [".github/scripts/live_suite_path_filter.py"], True),
         ("gateway-api", [".github/actions/setup-kubernetes-tools/action.yml"], True),
         ("gateway-api", ["scripts/gateway_api_conformance_lab_setup.sh"], True),
         ("gateway-api", ["scripts/gateway_api_tcproute_conformance.sh"], True),
         ("gateway-api", ["scripts/gateway_api_tlsroute_conformance.sh"], True),
         ("gateway-api", ["scripts/gateway_api_gatewayclass_authority_conformance.sh"], True),
-        ("gateway-api", ["src/config/model.rs"], True),
+        ("gateway-api", ["src/k8s_controller/reconciler.rs"], True),
+        ("gateway-api", ["src/config_sources/k8s/core.rs"], True),
+        ("gateway-api", ["charts/ferrum-mesh/values.yaml"], True),
         ("gateway-api", ["Dockerfile.release"], True),
+        # Shared runtime trees and the build graph stay on main.
+        ("gateway-api", ["src/tls/frontend.rs"], False),
+        ("gateway-api", ["src/config/model.rs"], False),
+        ("gateway-api", ["src/proxy/mod.rs"], False),
+        ("gateway-api", ["src/plugins/cors.rs"], False),
+        ("gateway-api", ["Cargo.lock"], False),
         ("gateway-api", ["docs/mesh.md"], False),
         ("mesh-federation", ["tests/k8s/lib/spire.sh"], True),
         ("mesh-federation", ["tests/k8s/multicluster-poller-partition/run.sh"], True),
         ("mesh-federation", [".github/scripts/live_suite_path_filter.py"], True),
         ("mesh-federation", [".github/actions/setup-kubernetes-tools/action.yml"], True),
         ("mesh-federation", ["src/service_discovery/kubernetes.rs"], True),
-        ("mesh-federation", ["src/modes/control_plane.rs"], True),
+        ("mesh-federation", ["src/service_discovery/mesh.rs"], True),
         ("mesh-federation", ["src/k8s_controller/reconciler.rs"], True),
         ("mesh-federation", ["src/config_sources/k8s/core.rs"], True),
+        ("mesh-federation", ["src/modes/mesh/policy.rs"], True),
+        ("mesh-federation", ["src/identity/spiffe.rs"], True),
+        ("mesh-federation", ["src/grpc/mesh_server.rs"], True),
+        ("mesh-federation", ["src/modes/control_plane.rs"], False),
+        ("mesh-federation", ["src/service_discovery/consul.rs"], False),
+        ("mesh-federation", ["src/proxy/hbone_proxy.rs"], False),
+        ("mesh-federation", ["src/tls/mod.rs"], False),
         ("mesh-federation", ["charts/ferrum-mesh/values.yaml"], False),
-        ("mesh-federation", ["docs/spire_deployment.md"], True),
+        ("mesh-federation", ["docs/spire_deployment.md"], False),
+        ("mesh-federation", ["Cargo.toml"], False),
         ("mesh-e2e-sidecar", ["tests/k8s/mesh_e2e_sidecar/run.sh"], True),
         ("mesh-e2e-sidecar", ["tests/k8s/lib/native_probe_classify.py"], True),
         ("mesh-e2e-sidecar", [".github/actions/setup-kubernetes-tools/action.yml"], True),
-        ("mesh-e2e-sidecar", ["src/plugins/jwks_auth.rs"], True),
-        ("mesh-e2e-sidecar", ["src/plugins/utils/jwt_verifier.rs"], True),
-        ("mesh-e2e-sidecar", ["src/plugins/utils/jwks_store.rs"], True),
-        ("mesh-e2e-sidecar", ["src/plugins/utils/token_extract.rs"], True),
-        ("mesh-e2e-sidecar", ["src/backend_conn_limit.rs"], True),
         ("mesh-e2e-sidecar", ["tests/conformance/ga_contract.yaml"], True),
         ("mesh-e2e-sidecar", ["tests/conformance/mod.rs"], True),
         ("mesh-e2e-sidecar", ["tests/conformance_tests.rs"], True),
-        ("mesh-e2e-sidecar", ["src/modes/control_plane.rs"], True),
-        ("mesh-e2e-sidecar", ["src/modes/grpc_tls_reload.rs"], True),
-        ("mesh-e2e-sidecar", ["src/modes/tls_source_util.rs"], True),
-        ("mesh-e2e-sidecar", ["docs/cp_dp_mode.md"], True),
+        ("mesh-e2e-sidecar", ["src/modes/mesh/mod.rs"], True),
+        ("mesh-e2e-sidecar", ["src/modes/injector.rs"], True),
         ("mesh-e2e-sidecar", ["src/grpc/mesh_server.rs"], True),
         ("mesh-e2e-sidecar", ["src/grpc/mesh_registry.rs"], True),
-        ("mesh-e2e-sidecar", ["src/grpc/auth.rs"], True),
-        ("mesh-e2e-sidecar", ["src/grpc/cp_server.rs"], True),
-        ("mesh-e2e-sidecar", ["src/grpc/dp_client.rs"], True),
         ("mesh-e2e-sidecar", ["src/k8s_controller/reconciler.rs"], True),
         ("mesh-e2e-sidecar", ["src/config_sources/k8s/core.rs"], True),
         ("mesh-e2e-sidecar", ["src/config_sources/k8s/mod.rs"], True),
-        ("mesh-e2e-sidecar", ["src/config_sources/mod.rs"], False),
         ("mesh-e2e-sidecar", ["src/admin/mesh_config_drift.rs"], True),
-        ("mesh-e2e-sidecar", ["src/admin/mod.rs"], True),
-        ("mesh-e2e-sidecar", ["src/admin/jwt_auth.rs"], True),
-        ("mesh-e2e-sidecar", ["src/admin/audit.rs"], True),
+        ("mesh-e2e-sidecar", ["src/identity/ca.rs"], True),
+        ("mesh-e2e-sidecar", ["src/plugins/mesh/authz.rs"], True),
+        ("mesh-e2e-sidecar", ["src/plugins/jwks_auth.rs"], False),
+        ("mesh-e2e-sidecar", ["src/plugins/utils/jwt_verifier.rs"], False),
+        ("mesh-e2e-sidecar", ["src/backend_conn_limit.rs"], False),
+        ("mesh-e2e-sidecar", ["src/modes/control_plane.rs"], False),
+        ("mesh-e2e-sidecar", ["src/grpc/auth.rs"], False),
+        ("mesh-e2e-sidecar", ["src/admin/mod.rs"], False),
+        ("mesh-e2e-sidecar", ["src/config_sources/mod.rs"], False),
+        ("mesh-e2e-sidecar", ["src/tls/mod.rs"], False),
+        ("mesh-e2e-sidecar", ["docs/cp_dp_mode.md"], False),
         ("mesh-e2e-sidecar", ["tests/k8s/multicluster-federation/run.sh"], False),
         ("mesh-e2e-sidecar", ["src/grpc/mod.rs"], False),
         ("mesh-e2e-sidecar", ["src/modes/data_plane.rs"], False),
-        ("mesh-e2e-sidecar", ["src/config_sources/k8s/istio.rs"], False),
         ("mesh-e2e-sidecar", ["src/admin/backup.rs"], False),
         ("mesh-e2e-sidecar", ["src/plugins/utils/ai_providers.rs"], False),
         ("mesh-e2e-sidecar", ["charts/ferrum-mesh/values.yaml"], False),
+        ("mesh-e2e-sidecar", ["Cargo.lock"], False),
         ("ambient-host-udp", ["src/proxy/host_udp_capture.rs"], True),
         ("ambient-host-udp", ["src/proxy/host_udp_capture_live_tests.rs"], True),
         ("ambient-host-udp", ["tests/k8s/ambient_host_udp_live/run.sh"], True),
         ("ambient-host-udp", [".github/workflows/ambient-host-udp-live.yml"], True),
         ("ambient-host-udp", [".github/scripts/live_suite_path_filter.py"], True),
+        ("ambient-host-udp", [".github/scripts/verify_cross_build_policy.py"], True),
         ("ambient-host-udp", ["charts/ferrum-mesh/values.yaml"], True),
-        ("ambient-host-udp", ["docs/tcp_udp_proxy.md"], True),
-        ("ambient-host-udp", ["docs/ci_cd.md"], True),
         ("ambient-host-udp", ["Dockerfile"], True),
         ("ambient-host-udp", [".github/workflows/release.yml"], True),
         ("ambient-host-udp", [".github/scripts/stage_iproute2_runtime.sh"], True),
@@ -1544,10 +1381,16 @@ def self_test() -> int:
         ),
         ("ambient-host-udp", ["src/proxy/udp_placement_migration.rs"], True),
         ("ambient-host-udp", ["src/proxy/udp_placement_cleanup.rs"], True),
+        ("ambient-host-udp", ["src/modes/node_agent.rs"], True),
+        ("ambient-host-udp", ["src/capture/mod.rs"], True),
         ("ambient-host-udp", ["src/cli.rs"], True),
         ("ambient-host-udp", ["src/main.rs"], True),
         ("ambient-host-udp", ["src/gateway_entry.rs"], True),
-        ("ambient-host-udp", ["src/modes/node_agent.rs"], True),
+        ("ambient-host-udp", ["src/socket_opts.rs"], False),
+        ("ambient-host-udp", ["src/proxy/mod.rs"], False),
+        ("ambient-host-udp", ["docs/tcp_udp_proxy.md"], False),
+        ("ambient-host-udp", ["docs/ci_cd.md"], False),
+        ("ambient-host-udp", ["Cargo.lock"], False),
         ("ambient-host-udp", ["src/modes/data_plane.rs"], False),
         ("ambient-host-udp", ["tests/k8s/mesh_e2e_sidecar/run.sh"], False),
         ("istio-status-cas", ["src/k8s_controller/istio_status.rs"], True),
@@ -1589,8 +1432,6 @@ def self_test() -> int:
             True,
         ),
         ("cni-lifecycle", ["charts/ferrum-mesh/values.yaml"], True),
-        ("cni-lifecycle", ["docs/node_agent_security.md"], True),
-        ("cni-lifecycle", ["PRODUCTION_READINESS.md"], True),
         ("cni-lifecycle", [".github/actions/setup-rust-ci/action.yml"], True),
         ("cni-lifecycle", [".github/actions/setup-sccache/action.yml"], True),
         ("cni-lifecycle", [".github/actions/setup-fast-linker/action.yml"], True),
@@ -1606,6 +1447,9 @@ def self_test() -> int:
             ["charts/ferrum-mesh/templates/sidecar-injector.yaml"],
             False,
         ),
+        ("cni-lifecycle", ["docs/node_agent_security.md"], False),
+        ("cni-lifecycle", ["PRODUCTION_READINESS.md"], False),
+        ("cni-lifecycle", ["Cargo.lock"], False),
         ("cni-lifecycle", ["docs/ci_cd.md"], False),
         ("cni-lifecycle", ["src/modes/data_plane.rs"], False),
     ]

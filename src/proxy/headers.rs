@@ -103,6 +103,16 @@ define_header_name_set! {
     ]
 }
 
+/// Returns `true` for the gateway-owned consumer assertion namespace.
+///
+/// Consumer plugins may attach additional attributes beneath this prefix, so
+/// backend boundaries must reject the whole namespace rather than only the two
+/// built-in identity fields.
+#[inline]
+pub(crate) fn is_consumer_assertion_header(name: &str) -> bool {
+    name.starts_with("x-consumer-")
+}
+
 define_header_name_set! {
     // Public inventory is consumed by library tests, not the binary target.
     #[allow(dead_code)]
@@ -567,6 +577,11 @@ fn strip_reserved_gateway_assertion_headers(headers: &mut http::HeaderMap) {
 /// gRPC metadata (including `-bin` metadata) instead of collapsing it into one
 /// comma-folded field. A plugin mutation no longer matches and therefore still
 /// replaces the raw values below.
+///
+/// Field lines are compared as UTF-8, matching
+/// [`crate::plugins::RequestContext::materialize_headers`]. Comparing with
+/// `to_str()` would report every obs-text field line as changed and collapse an
+/// untouched repeated sequence into one folded value.
 fn raw_header_values_match_materialized(
     headers: &http::HeaderMap,
     name: &http::HeaderName,
@@ -576,7 +591,7 @@ fn raw_header_values_match_materialized(
     let Some(first) = values.next() else {
         return false;
     };
-    let Ok(first) = first.to_str() else {
+    let Ok(first) = std::str::from_utf8(first.as_bytes()) else {
         return false;
     };
     let Some(mut remaining) = expected.strip_prefix(first) else {
@@ -584,7 +599,7 @@ fn raw_header_values_match_materialized(
     };
     let separator = crate::plugins::repeated_request_header_separator(name.as_str());
     for value in values {
-        let Ok(value) = value.to_str() else {
+        let Ok(value) = std::str::from_utf8(value.as_bytes()) else {
             return false;
         };
         let Some(after_separator) = remaining.strip_prefix(separator) else {
@@ -651,12 +666,13 @@ pub fn merge_proxy_headers_and_strip_for_grpc(
 /// [`crate::plugins::RequestContext::headers`] view; a prebuilt or filtered map
 /// needs its own merge helper (see `merge_proxy_headers_for_prebuilt_h3_grpc`).
 ///
-/// One consequence: `materialize_headers` omits non-UTF-8 header values, so a
-/// field line carrying legal HTTP obs-text that is not valid UTF-8 is absent
-/// from `proxy_headers` and is therefore dropped here. For native gRPC this is
-/// inert (metadata must be ASCII, or base64 via `-bin`), but any future caller
-/// on a path that must forward arbitrary bytes byte-exact has to exempt those
-/// entries from the removal pass rather than reuse this helper as-is.
+/// One consequence: `materialize_headers` omits header values that are not
+/// valid UTF-8, so a field line carrying legal HTTP obs-text that is not valid
+/// UTF-8 is absent from `proxy_headers` and is therefore dropped here. Valid
+/// UTF-8 obs-text IS materialized byte-exact and survives. For native gRPC this
+/// is inert (metadata must be ASCII, or base64 via `-bin`), but any future
+/// caller on a path that must forward arbitrary bytes byte-exact has to exempt
+/// those entries from the removal pass rather than reuse this helper as-is.
 pub fn merge_proxy_headers_preserving_repeated(
     headers: &mut http::HeaderMap,
     proxy_headers: &std::collections::HashMap<String, String>,

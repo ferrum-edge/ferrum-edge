@@ -640,6 +640,85 @@ fn test_idle_timeout_arms_publish_policy_close_before_teardown() {
     }
 }
 
+/// The relay-failure Close maps `ErrorClass` to the RFC 6455 wire code the
+/// surviving peer must observe (issue #4770): 1002 for a protocol violation,
+/// 1011 for a transport failure, and 1001 while the gateway is draining. The
+/// reason stays a bounded, non-secret literal.
+#[test]
+fn test_relay_failure_close_frame_maps_error_class_and_drain() {
+    let protocol = ferrum_edge::_test_support::ws_relay_failure_close_frame_for_test(
+        ferrum_edge::retry::ErrorClass::ProtocolError,
+        false,
+    );
+    assert_eq!(protocol.code, CloseCode::Protocol);
+    assert_eq!(protocol.reason.as_str(), "protocol error");
+    assert!(protocol.reason.len() <= 123);
+
+    let transport = ferrum_edge::_test_support::ws_relay_failure_close_frame_for_test(
+        ferrum_edge::retry::ErrorClass::ConnectionReset,
+        false,
+    );
+    assert_eq!(transport.code, CloseCode::Error);
+    assert_eq!(transport.reason.as_str(), "relay error");
+    assert!(transport.reason.len() <= 123);
+
+    // Draining wins even for a protocol violation: an operator-driven shutdown
+    // observes 1001 (going away), not a client-facing 1002/1011.
+    let draining = ferrum_edge::_test_support::ws_relay_failure_close_frame_for_test(
+        ferrum_edge::retry::ErrorClass::ProtocolError,
+        true,
+    );
+    assert_eq!(draining.code, CloseCode::Away);
+    assert_eq!(draining.reason.as_str(), "gateway draining");
+    assert!(draining.reason.len() <= 123);
+}
+
+/// The generic transport/protocol read-error arms are the last unconverted
+/// members of the policy-close family. Each must publish a defined Close (via
+/// `publish_ws_policy_close`) before `break`, mapping the classified error to
+/// 1002/1011/1001 and honoring an in-progress drain. Mirrors
+/// `test_idle_timeout_arms_publish_policy_close_before_teardown`.
+#[test]
+fn test_generic_relay_error_arms_publish_policy_close_before_break() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+
+    for (marker, end_marker) in [
+        (
+            "Error receiving from client",
+            "Client -> backend forwarding completed",
+        ),
+        (
+            "Error receiving from backend",
+            "Backend -> client forwarding completed",
+        ),
+    ] {
+        let branch = source
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("missing generic error arm: {marker}"))
+            .1;
+        let branch = branch
+            .split_once(end_marker)
+            .unwrap_or_else(|| panic!("missing relay branch end: {end_marker}"))
+            .0;
+        assert!(
+            branch.contains("publish_ws_policy_close"),
+            "{marker} must publish the policy Close before breaking"
+        );
+        assert!(
+            branch.contains("ws_relay_failure_close_frame"),
+            "{marker} must map the classified error to a defined Close code"
+        );
+        assert!(
+            branch.contains("ws_websocket_is_draining"),
+            "{marker} must honor an in-progress drain (1001)"
+        );
+        assert!(
+            branch.contains("send_bounded_ws_close"),
+            "{marker} must attempt a bounded polite Close write to the surviving peer"
+        );
+    }
+}
+
 /// Models hyper's upgraded HTTP/2 writer (`H2Upgraded`): `start_send` hands the
 /// frame to a bounded, capacity-1 channel that a *separate* task drains, and
 /// `poll_flush` only reports readiness once that task has run. A relay half is

@@ -965,6 +965,41 @@ async fn admin_https_registers_a_client_certificate_authenticated_connection() {
     let _ = tokio::time::timeout(Duration::from_secs(5), listener).await;
 }
 
+/// With a client-CA bundle configured (and without `FERRUM_ADMIN_TLS_NO_VERIFY`),
+/// anonymous TLS clients must be refused at handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_https_with_client_ca_refuses_anonymous_tls_client() {
+    let _registry = isolated_client_trust_registry().await;
+    let pki = admin_mtls_pki();
+
+    let slot: ferrum_edge::tls::SharedFrontendTls =
+        Arc::new(ArcSwap::new(Arc::new(Some(admin_mtls_server_config(&pki)))));
+    let (addr, shutdown_tx, listener) = start_admin_https_listener(slot, 10).await;
+
+    // TLS 1.3 lets the client finish its side of the handshake before the
+    // server's `certificate_required` alert arrives, so a refused anonymous
+    // client surfaces either at connect or on its first request — never as a
+    // served response.
+    let outcome = match establish_admin_connection(
+        addr,
+        admin_client_config(&pki, false, &[b"http/1.1"]),
+        false,
+    )
+    .await
+    {
+        Err(_) => AdminAttempt::TransportFailed,
+        Ok((mut transport, _driver)) => transport.live_probe().await,
+    };
+    assert_eq!(
+        outcome,
+        AdminAttempt::TransportFailed,
+        "anonymous TLS client must be refused when admin client CA is configured"
+    );
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), listener).await;
+}
+
 /// An admin HTTPS connection that presents NO client certificate holds no trust
 /// decision a CRL or client-CA withdrawal could revoke, so it must be neither
 /// tracked nor retired — a pure pass-through case.

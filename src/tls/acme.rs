@@ -44,6 +44,7 @@ use x509_parser::extensions::{GeneralName, ParsedExtension};
 use x509_parser::prelude::*;
 
 use crate::config::types::validate_resource_id;
+use crate::tls::ocsp_recheck::StapleRetiringResolver;
 use crate::tls::shared_store::{
     SharedStoreError, SharedStoreFile, TlsPersistentStoreKind, TlsStoreAdmissionReason,
     TlsStoreIoDirection, VersionedStoreFile, record_store_admission_rejected, record_store_pruned,
@@ -845,7 +846,8 @@ fn acme_store_path(dir: impl Into<PathBuf>, file_name: &str) -> Result<PathBuf, 
             "store directory must not be empty".to_string(),
         ));
     }
-    std::fs::create_dir_all(&dir).map_err(|error| AcmeError::Write(error.to_string()))?;
+    crate::tls::store_dir::create_private_store_dir(&dir)
+        .map_err(|error| AcmeError::Write(error.to_string()))?;
     Ok(dir.join(file_name))
 }
 
@@ -965,6 +967,55 @@ impl AcmeOrderStore {
             document.orders.insert(record.id.clone(), record.clone());
             let pruned = prune_terminal_order_history(document, terminal_history);
             Ok((record, pruned))
+        })?;
+        record_store_pruned(outcome.1 as u64);
+        Ok(outcome.0)
+    }
+
+    /// Persist authoritative CA-invalid evidence only for the same active
+    /// snapshot. Callers must also hold the certificate's renewal lease fence.
+    /// Never recreate a deleted order, overwrite an operator update, or make an
+    /// older failed order hide a newer order from the renewal planner.
+    pub fn fail_ca_invalid_order_if_current(
+        &self,
+        expected: &AcmeOrderRecord,
+    ) -> Result<bool, AcmeError> {
+        validate_acme_id(&expected.id)?;
+        let expected = expected.clone();
+        let terminal_history = self.terminal_history;
+        let outcome = self.file.mutate_if::<_, AcmeError>(move |document| {
+            let Some(current) = document.orders.get(&expected.id) else {
+                return Ok((false, (false, 0)));
+            };
+            let latest = document
+                .orders
+                .values()
+                .filter(|order| order.certificate_id == expected.certificate_id)
+                .max_by_key(|order| order.updated_at);
+            if current.created_at != expected.created_at
+                || current.updated_at != expected.updated_at
+                || current.order_url != expected.order_url
+                || current.certificate_id != expected.certificate_id
+                || current.status != expected.status
+                || !matches!(
+                    current.status,
+                    AcmeOrderStatus::PendingChallenges
+                        | AcmeOrderStatus::Ready
+                        | AcmeOrderStatus::Processing
+                )
+                || latest.is_none_or(|order| order.id != expected.id)
+            {
+                return Ok((false, (false, 0)));
+            }
+            let Some(current) = document.orders.get_mut(&expected.id) else {
+                return Ok((false, (false, 0)));
+            };
+            current.status = AcmeOrderStatus::Failed;
+            current.error =
+                Some("CA reports that the ACME order is terminally invalid".to_string());
+            current.updated_at = Utc::now();
+            let pruned = prune_terminal_order_history(document, terminal_history);
+            Ok((true, (true, pruned)))
         })?;
         record_store_pruned(outcome.1 as u64);
         Ok(outcome.0)
@@ -2137,7 +2188,12 @@ enum AcmeResolverFallback {
     /// path, replacing the `Arc` clone this arm did before; nothing on the
     /// per-request hot path observes it.
     Single(arc_swap::ArcSwap<rustls::sign::CertifiedKey>),
-    Resolver(Arc<dyn rustls::server::ResolvesServerCert>),
+    /// An inner resolver that selects among several credentials. Typed as
+    /// [`StapleRetiringResolver`] rather than a bare `ResolvesServerCert` so
+    /// this arm can give up a staple too: a fallback that could not would be a
+    /// certificate source exempt from `crate::tls::ocsp_recheck`, which is the
+    /// gap issue #4773 reported for the Gateway multi-certificate frontend.
+    Resolver(Arc<dyn StapleRetiringResolver>),
 }
 
 impl AcmeResolverFallback {
@@ -2184,8 +2240,14 @@ impl AcmeTlsAlpnResolver {
     /// so no handshake pays for the retirement and none can observe a torn
     /// credential.
     pub fn drop_stapled_ocsp_response(&self) -> bool {
-        let AcmeResolverFallback::Single(slot) = &self.fallback else {
-            return false;
+        let slot = match &self.fallback {
+            AcmeResolverFallback::Single(slot) => slot,
+            // The Gateway multi-certificate index publishes its own stapleless
+            // generation; the retirement is the inner resolver's to make
+            // because it owns every credential it selects among.
+            AcmeResolverFallback::Resolver(resolver) => {
+                return resolver.drop_stapled_ocsp_response();
+            }
         };
         let current = slot.load_full();
         if current.ocsp.is_none() {
@@ -2199,7 +2261,7 @@ impl AcmeTlsAlpnResolver {
 
     /// Wrap an inner resolver (Gateway multi-certificate SNI selection) so
     /// ACME TLS-ALPN-01 validation still takes precedence over it.
-    pub fn with_resolver(fallback: Arc<dyn rustls::server::ResolvesServerCert>) -> Self {
+    pub fn with_resolver(fallback: Arc<dyn StapleRetiringResolver>) -> Self {
         Self {
             fallback: AcmeResolverFallback::Resolver(fallback),
             cache: Mutex::new(BTreeMap::new()),
@@ -3399,7 +3461,11 @@ async fn finish_renewal_order(
             }
         }
     }
-    let completed = completion_result?;
+    let Some(completed) =
+        resolve_renewal_completion_result(order_store, keeper, &order, completion_result).await?
+    else {
+        return Ok(abandon_renewal(&certificate.id));
+    };
     validate_completed_certificate_pair(&completed.cert_pem, &completed.key_pem)?;
     let issued = AcmeCertificateRecord::new_issued(AcmeIssuedCertificateInput {
         id: certificate.id.clone(),
@@ -3523,12 +3589,55 @@ async fn prepare_renewal_order(
     })
 }
 
+/// Keep CA state typed until the scheduler has persisted a terminal outcome.
+#[cfg(feature = "acme")]
+#[derive(Debug, Error)]
+pub(crate) enum RenewalCompletionError {
+    #[error(transparent)]
+    Preparation(#[from] AcmeError),
+    #[error(transparent)]
+    Client(#[from] client::AcmeClientError),
+}
+
+/// Transient completion failures leave the active order resumable. Only an
+/// observed CA-invalid order may become Failed, and only inside the live claim.
+#[cfg(feature = "acme")]
+pub(crate) async fn resolve_renewal_completion_result(
+    order_store: &Arc<AcmeOrderStore>,
+    keeper: &crate::tls::lease::RenewalLeaseKeeper,
+    order: &AcmeOrderRecord,
+    result: Result<client::CompletedAcmeHttp01Order, RenewalCompletionError>,
+) -> Result<Option<client::CompletedAcmeHttp01Order>, AcmeError> {
+    let error = match result {
+        Ok(completed) => return Ok(Some(completed)),
+        Err(RenewalCompletionError::Preparation(error)) => return Err(error),
+        Err(RenewalCompletionError::Client(error)) => error,
+    };
+    if matches!(error, client::AcmeClientError::TerminalInvalidOrder) {
+        let orders = Arc::clone(order_store);
+        let expected = order.clone();
+        let persisted = match keeper
+            .commit_fenced(move || orders.fail_ca_invalid_order_if_current(&expected))
+            .await
+        {
+            Ok(result) => result?,
+            Err(_) => return Ok(None),
+        };
+        tracing::warn!(
+            order_id = %order.id,
+            failed_order_persisted = persisted,
+            "CA-invalid renewal ended; only an unchanged active order may be marked failed"
+        );
+    }
+    Err(AcmeError::Write(error.to_string()))
+}
+
 #[cfg(feature = "acme")]
 async fn complete_prepared_renewal_order(
     order: &AcmeOrderRecord,
     challenge_type: AcmeRenewalChallengeType,
     config: &AcmeRenewalSchedulerConfig,
-) -> Result<client::CompletedAcmeHttp01Order, AcmeError> {
+) -> Result<client::CompletedAcmeHttp01Order, RenewalCompletionError> {
     let account_credentials_json = order
         .account_credentials_json
         .clone()
@@ -3564,7 +3673,7 @@ async fn complete_prepared_renewal_order(
         }
         AcmeRenewalChallengeType::Dns01 => client::complete_dns01_order(complete_config).await,
     }
-    .map_err(|error| AcmeError::Write(error.to_string()))
+    .map_err(RenewalCompletionError::Client)
 }
 
 #[cfg(feature = "acme")]
@@ -3804,6 +3913,9 @@ pub mod client {
         /// material, so it must not describe what it found.
         #[error("ACME order finalization material is missing or unusable")]
         UnusableFinalizationMaterial,
+        /// Authoritative remote order state, never inferred from error text.
+        #[error("ACME order is terminally invalid and cannot be completed")]
+        TerminalInvalidOrder,
         #[error("ACME client error: {0}")]
         Client(String),
     }
@@ -4389,11 +4501,22 @@ pub mod client {
             OrderStatus::Processing => &[PollCertificate],
             OrderStatus::Valid => &[RetrieveCertificate],
             OrderStatus::Invalid => {
-                return Err(AcmeClientError::Client(
-                    "ACME order is invalid and cannot be completed".to_string(),
-                ));
+                return Err(AcmeClientError::TerminalInvalidOrder);
             }
         })
+    }
+
+    /// Polling may return a generic API error even after updating the order to
+    /// Invalid. Read the authoritative state after the call, without parsing
+    /// an error message or treating a network timeout as a terminal order.
+    fn completion_call_result<T>(
+        result: Result<T, instant_acme::Error>,
+        status: OrderStatus,
+    ) -> Result<T, AcmeClientError> {
+        if status == OrderStatus::Invalid {
+            return Err(AcmeClientError::TerminalInvalidOrder);
+        }
+        result.map_err(|error| AcmeClientError::Client(error.to_string()))
     }
 
     /// Whether a pending order should notify a challenge as ready.
@@ -4516,10 +4639,8 @@ pub mod client {
                             }
                         }
                     }
-                    let order_status = order
-                        .poll_ready(&retry_policy)
-                        .await
-                        .map_err(|error| AcmeClientError::Client(error.to_string()))?;
+                    let ready = order.poll_ready(&retry_policy).await;
+                    let order_status = completion_call_result(ready, order.state().status)?;
                     if order_status != OrderStatus::Ready {
                         return Err(AcmeClientError::Client(format!(
                             "ACME order reached {order_status:?} before finalization"
@@ -4527,30 +4648,23 @@ pub mod client {
                     }
                 }
                 AcmeCompletionAction::FinalizeWithPersistedCsr => {
-                    order
-                        .finalize_csr(&csr_der)
-                        .await
-                        .map_err(|error| AcmeClientError::Client(error.to_string()))?;
+                    let finalized = order.finalize_csr(&csr_der).await;
+                    completion_call_result(finalized, order.state().status)?;
                 }
                 AcmeCompletionAction::PollCertificate => {
-                    cert_pem = Some(
-                        order
-                            .poll_certificate(&retry_policy)
-                            .await
-                            .map_err(|error| AcmeClientError::Client(error.to_string()))?,
-                    );
+                    let certificate = order.poll_certificate(&retry_policy).await;
+                    cert_pem = Some(completion_call_result(certificate, order.state().status)?);
                 }
                 AcmeCompletionAction::RetrieveCertificate => {
+                    let certificate = order.certificate().await;
                     cert_pem = Some(
-                        order
-                            .certificate()
-                            .await
-                            .map_err(|error| AcmeClientError::Client(error.to_string()))?
-                            .ok_or_else(|| {
+                        completion_call_result(certificate, order.state().status)?.ok_or_else(
+                            || {
                                 AcmeClientError::Client(
                                     "ACME order is valid but returned no certificate".to_string(),
                                 )
-                            })?,
+                            },
+                        )?,
                     );
                 }
             }
@@ -5261,7 +5375,31 @@ pub mod client {
 
             let error = completion_actions(OrderStatus::Invalid)
                 .expect_err("an invalid order must fail closed");
-            assert!(matches!(error, AcmeClientError::Client(_)));
+            assert!(matches!(error, AcmeClientError::TerminalInvalidOrder));
+        }
+
+        #[test]
+        fn completion_failures_use_observed_order_state_not_error_text() {
+            for status in [
+                OrderStatus::Pending,
+                OrderStatus::Ready,
+                OrderStatus::Processing,
+                OrderStatus::Valid,
+            ] {
+                let error = completion_call_result::<()>(
+                    Err(instant_acme::Error::Str(
+                        "invalid: simulated transient response",
+                    )),
+                    status,
+                )
+                .unwrap_err();
+                assert!(matches!(error, AcmeClientError::Client(_)));
+            }
+            for result in [Ok(()), Err(instant_acme::Error::Str("CA problem detail"))] {
+                let error = completion_call_result(result, OrderStatus::Invalid).unwrap_err();
+                assert!(matches!(error, AcmeClientError::TerminalInvalidOrder));
+                assert!(!error.to_string().contains("CA problem detail"));
+            }
         }
 
         /// Challenge notification is remote-status-aware: only `Pending` is

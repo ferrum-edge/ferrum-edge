@@ -134,8 +134,9 @@ cost of more false positives. Loud rules retuned to `paranoia_min: 2` or `3`
 Attackers hide payloads behind encodings a raw-byte scan never sees. Before
 matching request and response bodies, the WAF also scans **decoded variants**:
 
-- UTF-16LE / UTF-16BE and UTF-32LE / UTF-32BE request bodies admitted by the
-  body content-type gates, using an explicit `charset` or a byte-order mark
+- UTF-16LE / UTF-16BE and UTF-32LE / UTF-32BE request and response bodies
+  admitted by the direction's body content-type gates, using an explicit
+  `charset`, a byte-order mark, or an undeclared wide-text prefix signature
   (bare `utf-16` / `utf-32` without a BOM tries both endiannesses)
 - JSON / JavaScript unicode escapes — `\uXXXX`, `\u{...}`, `\xXX`
 - HTML entities — `&lt;`, `&#60;`, `&#x3c;`
@@ -147,7 +148,7 @@ So a `<script>` written as `<script>`, `&lt;script&gt;`, or
 escape decoders are content-type-agnostic (an attacker controls the declared
 `Content-Type`) and bounded to a small number of variants.
 
-UTF-16 / UTF-32 transcoding does **not** decide whether a request body is
+UTF-16 / UTF-32 transcoding does **not** decide whether a body is
 scanned. The existing `body_content_types`, `inspect_multipart`, and
 `inspect_binary_body` gates run first and remain authoritative; an excluded
 body is not admitted merely because it declares a UTF-16 or UTF-32 charset or
@@ -167,9 +168,28 @@ reading is used. `00 00 FE FF` is not a UTF-16 BOM prefix and is
 unambiguous. Bare `charset=utf-16` / `charset=utf-32` with no
 BOM does not invent an endianness (IANA leaves both unspecified without a
 BOM). Both little-endian and big-endian decodes are scanned by the
-request-body rules, and the existing raw/lossy view is still scanned. Bare
+direction's body rules, and the existing raw/lossy view is still scanned. Bare
 `utf-16` / `utf-32` stays endianness-unspecified rather than defaulting to
 little-endian as WHATWG does, which is the more conservative choice.
+
+Without a charset or BOM, inference requires a four-byte prefix containing
+one non-NUL ASCII UTF-32 unit or two non-NUL ASCII UTF-16 units in the
+corresponding NUL positions. Interior NULs alone do not select a decoder.
+The prefix selects a width; both endians and the raw/lossy text are scanned
+within the existing two-wide-view cap. Ordinary UTF-8 and binary data without
+that prefix gain no transcoded view. An explicit charset retains its existing
+resolution policy.
+
+Raw/lossy text and its bounded transformations are always retained, including
+when a declaration resolves one wide view. Requests and responses share the
+same raw-byte, wide-text, layered decoding,
+encoding-special, Luhn, and CIDR pipeline, including packs with only encoding
+specials. Response decoding uses the final response Content-Type before
+transport compression. Rule conditions, false-positive filters, per-rule modes,
+body size limits, and scan budgets still apply. HTTP responses that omit a body
+(HEAD and bodyless statuses) remain outside body inspection; response inspection
+must still be enabled. Request JSON-path rules retain their scalar-local
+normalization policy.
 
 Wide decoding is **lossy**. A malformed code unit — a length that is not a
 multiple of the code-unit size, an unpaired surrogate, or a UTF-32 unit in
@@ -371,7 +391,11 @@ paranoia, change severity/score, or set a per-rule `action`. Per-rule
 `fp_filters` are unanchored regular expressions evaluated against the **complete
 inspected target value** after the rule matcher finds a hit — for example the
 full query value, header value, or `body_json_path` scalar string — not merely
-the substring that satisfied `contains`/`regex`/…:
+the substring that satisfied `contains`/`regex`/…. A body carrying non-UTF-8
+bytes is filtered too: the filter (and `global_exemptions.fp_capture_filters`)
+sees the same lossy text view the wide-charset path uses, with invalid bytes
+replaced by `U+FFFD`, so binary and legacy-encoded content is suppressed on the
+same terms as text:
 
 ```json
 {
@@ -504,6 +528,14 @@ H2, and H3 behave identically, and the request decision is made on the finalized
 backend-visible body — a request transformer that grows a body past the cap is
 still governed.
 
+**The cap is measured against plaintext, in both directions.** A globally
+enforcing `on_body_too_large: block` is itself a blocking disposition, so a
+request or response whose ORIGIN declared a `Content-Encoding` is decoded by the
+shared representation gate before the cap is applied — even when every
+applicable body rule is monitor-only. Otherwise a compressed body would slip
+under a cap its plaintext exceeds. `mode: monitor` never claims: an undecodable
+origin coding there costs an observation, not the response.
+
 Prefer sizing over rejecting where you can: setting `max_scan_bytes` at or above
 the effective request/response ceiling (including any route-scoped ceiling)
 means no admitted body is ever oversize, and `fail_closed` never fires.
@@ -615,10 +647,12 @@ and later instances are not invoked for it.
 **Observability.** A closed WebSocket session has no per-message
 transaction-summary surface, so message findings are emitted as
 fixed-cardinality `waf`-target log events instead of `waf.*` transaction
-metadata: one event for every block (always, since the close is the only other
+metadata: a diagnostic for every block (always, since the close is the only other
 signal), plus one per matched rule and one per non-blocking
 oversize/uninspectable/scan-timeout signal when `log_to_stdout` is enabled. No
-message bytes are logged. Monitor-mode WebSocket findings are non-blocking and
+message bytes are logged. Warnings are sampled once per source site per 10 seconds
+across all sessions, with suppressed-event counts; every diagnostic is available
+at debug level. Monitor-mode WebSocket findings are non-blocking and
 there is no per-message transaction metadata surface, so enable
 `log_to_stdout` when staging WebSocket policy in `mode: monitor`; otherwise
 those findings intentionally produce no operator-visible signal.
@@ -731,8 +765,21 @@ Limitations and behavior to know:
   session is established: there is no session summary to attach to, and emitting a
   per-datagram summary for a spoofable, sessionless datagram would be a log-flood
   amplifier, so those blocks surface only on the opt-in `log_to_stdout` channel.
+- **`inspect_tcp` governs a TCP-only surface.** It selects the opening-bytes
+  capture that only a TCP frontend performs. A UDP or DTLS session runs the same
+  connection-admission hook, but carries no TCP first bytes and is never judged
+  by this switch — its datagrams are governed entirely by `inspect_udp`. So the
+  documented defaults (`inspect_tcp: true`, `inspect_udp: true`) are usable on a
+  UDP route as-is: clean datagrams reach the backend, and a configured signature
+  match still drops.
 - By default only client→backend traffic is inspected; set `inspect_response`
-  to also scan backend→client datagrams.
+  to also scan backend→client datagrams. It is a **direction switch inside UDP
+  inspection**, not an independent surface: it is read after `inspect_udp` has
+  admitted the datagram hook, so `inspect_response: true` inspects nothing while
+  `inspect_udp` is false. Under `mode: enforce`, a stream policy whose only
+  claimed enforcement is a response-only direction with both `inspect_tcp` and
+  `inspect_udp` off is rejected at construction rather than silently doing
+  nothing.
 
 ## Observability
 
@@ -767,8 +814,10 @@ so enforce-mode impact stays directly countable before you switch modes — in
 particular the server-first `first_bytes_unavailable` false-positive risk noted
 above, whose would-blocks carry no `waf.rule_hits` to infer from.
 
-`log_to_stdout` additionally emits a dedicated structured `warn!`
-(`target: "waf"`) per matched rule, independent of any logging plugin. Each
+`log_to_stdout` additionally emits dedicated structured diagnostics
+(`target: "waf"`), independent of any logging plugin. Per-rule details are
+available at debug level; warnings sample one event per source site per 10 seconds
+and report `suppressed_events` (shared across rules and instances). Each
 event carries `action` as that rule's **effective direct outcome** after applying
 the global mode (`blocked`, `monitored`, or `disabled`) and `rule_action` as the
 configured rule action (`enforce`, `monitor`, or `disabled`). Aggregate anomaly
@@ -811,7 +860,7 @@ fire, then switch to `enforce`.
 | `reject_content_type` | string | `application/json` | blocked-response content type |
 | `reject_body` | string | `{"error":"Forbidden"}` | blocked-response body |
 | `log_to_metadata` | bool | `true` | write `waf.*` metadata |
-| `log_to_stdout` | bool | `false` | structured per-hit warning |
+| `log_to_stdout` | bool | `false` | structured hit diagnostics: sampled warnings and per-hit debug detail |
 | `stream` | object | _(off)_ | raw TCP/UDP inspection (see [Stream inspection](#stream-tcpudp-inspection)) |
 
 ### `stream` block
@@ -819,7 +868,7 @@ fire, then switch to `enforce`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `tcp_require_tls` | bool | `false` | reject TCP whose opening bytes aren't a TLS ClientHello (raw-wire proxies only) |
-| `inspect_tcp` | bool | `true` | run signatures over TCP opening bytes |
+| `inspect_tcp` | bool | `true` | run signatures over TCP opening bytes; TCP frontends only |
 | `inspect_udp` | bool | `true` | run signatures over UDP/DTLS datagrams |
-| `inspect_response` | bool | `false` | also scan backend→client datagrams |
+| `inspect_response` | bool | `false` | also scan backend→client datagrams; a direction switch inside UDP inspection, so it does nothing unless `inspect_udp` is on |
 | `signatures` | object[] | `[]` | byte-pattern rules: `id`, `pattern`, `severity?`, `action?` |

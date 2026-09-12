@@ -31,6 +31,7 @@ from coverage_plan import (
     VALID_MODES,
     parse_planned_shards,
     select_plan,
+    select_scoped_plan,
     self_test as planner_self_test,
     verify_downloaded_artifacts,
 )
@@ -769,16 +770,20 @@ jobs:
     if not recollect_failures:
         failures.append("plugin re-collection mutation was not caught")
 
-    admin = select_plan("pull_request", ["src/admin/mod.rs"])
-    config = select_plan("pull_request", ["src/config/env_config.rs"])
-    identity = select_plan("pull_request", ["src/identity/mod.rs"])
-    proxy = select_plan("pull_request", ["src/proxy/mod.rs"])
-    mesh = select_plan("pull_request", ["src/modes/mesh/config.rs"])
-    protocol = select_plan("pull_request", ["src/http3/server.rs"])
-    plugin = select_plan("pull_request", ["src/plugins/cors.rs"])
-    unknown = select_plan("pull_request", ["src/cli.rs"])
-    merge_group = select_plan("merge_group", ["src/admin/mod.rs"])
+    admin = select_scoped_plan("pull_request", ["src/admin/mod.rs"])
+    config = select_scoped_plan("pull_request", ["src/config/env_config.rs"])
+    identity = select_scoped_plan("pull_request", ["src/identity/mod.rs"])
+    proxy = select_scoped_plan("pull_request", ["src/proxy/mod.rs"])
+    mesh = select_scoped_plan("pull_request", ["src/modes/mesh/config.rs"])
+    protocol = select_scoped_plan("pull_request", ["src/http3/server.rs"])
+    plugin = select_scoped_plan("pull_request", ["src/plugins/cors.rs"])
+    unknown = select_scoped_plan("pull_request", ["src/cli.rs"])
+    merge_group = select_scoped_plan("merge_group", ["src/admin/mod.rs"])
     main_event = select_plan("push", ["src/admin/mod.rs"])
+    pr_policy = select_plan("pull_request", ["src/admin/mod.rs"])
+    controller_policy = select_plan("pull_request", [".github/workflows/coverage.yml"])
+    require(pr_policy.mode == "skip" and not pr_policy.shards, "pull requests skip instrumented coverage", failures)
+    require(controller_policy.mode == "full", "coverage controller edits run the full matrix on the PR", failures)
     require(admin.mode == "shards" and ADMIN_API_SHARD in admin.shards, "admin positive", failures)
     require(config.mode == "full" and set(config.shards) == set(CANONICAL_SHARD_ORDER), "config positive vs full shared matrix", failures)
     require(identity.mode == "full" and set(identity.shards) == set(CANONICAL_SHARD_ORDER), "identity positive vs full shared matrix", failures)

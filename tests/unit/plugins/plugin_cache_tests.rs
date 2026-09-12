@@ -29,6 +29,12 @@ use ferrum_edge::proxy::deferred_log::BodyOutcome;
 use ferrum_edge::{PluginCache, PluginCapabilities};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+
+// Shared fixtures live in plugin_utils so every unit target (including the
+// core `unit_tests` binary) can build them without compiling this suite.
+pub(crate) use super::plugin_utils::{
+    make_plugin_config, make_plugin_config_with_json, make_proxy, minimal_plugin_config,
+};
 use std::sync::Arc;
 
 /// Test shim for the finalized-request-egress phase (GHSA-4vr5-4wm3-x5xv).
@@ -172,275 +178,6 @@ impl Plugin for StalledDeadlineResponseTransformer {
     }
 }
 
-/// Returns the minimal valid config for a given plugin name so that `create_plugin` succeeds.
-pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
-    match plugin_name {
-        "access_control" => json!({"allowed_consumers": ["testuser"]}),
-        "tcp_connection_throttle" => json!({"max_connections_per_key": 10}),
-        "ip_restriction" => json!({"allow": ["0.0.0.0/0"]}),
-        "geo_restriction" => json!({
-            "db_path": "/nonexistent/GeoIP2-Country.mmdb",
-            "allow_countries": ["US"]
-        }),
-        "rate_limiting" => json!({
-            "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]
-        }),
-        "request_transformer" => {
-            json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]})
-        }
-        "response_transformer" => {
-            json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]})
-        }
-        "request_size_limiting" => json!({"max_bytes": 1048576}),
-        "waf" => json!({ "mode": "monitor" }),
-        "response_size_limiting" => json!({"max_bytes": 1048576}),
-        "ws_message_size_limiting" => json!({"max_frame_bytes": 65536}),
-        "ws_rate_limiting" => json!({"frames_per_second": 100}),
-        "body_validator" => json!({"required_fields": ["name"]}),
-        "graphql" => json!({"max_depth": 100}),
-        "grpc_method_router" => json!({"allow_methods": ["test.Svc/Method"]}),
-        "grpc_deadline" => json!({"max_deadline_ms": 30000}),
-        "ai_rate_limiter" => json!({"token_limit": 100000}),
-        "cors" => json!({"allowed_origins": ["*"]}),
-        "response_caching" => json!({"ttl_seconds": 60}),
-        "http_logging" => json!({"endpoint_url": "http://localhost:9200/logs"}),
-        "tcp_logging" => json!({"host": "localhost", "port": 5140}),
-        "ws_logging" => json!({"endpoint_url": "ws://localhost:9300/logs"}),
-        "otel_tracing" => json!({"endpoint": "http://localhost:4318/v1/traces"}),
-        // `hmac_auth` defaults to the single-use `ferrum-hmac-v2` profile, which
-        // requires an explicit replay-scope declaration.
-        "hmac_auth" => json!({"replay_scope": "process"}),
-        "jwks_auth" => {
-            json!({"providers": [{"jwks_uri": "http://127.0.0.1:9/.well-known/jwks.json"}]})
-        }
-        "oauth2_introspection" => json!({
-            "providers": [{
-                "introspection_endpoint": "http://127.0.0.1:9/introspect",
-                "client_auth": {"method": "none"}
-            }]
-        }),
-        "oidc_relying_party" => json!({
-            "providers": [{
-                "issuer": "https://issuer.example.com",
-                "authorization_endpoint": "https://issuer.example.com/authorize",
-                "token_endpoint": "https://issuer.example.com/token",
-                "jwks_uri": "https://issuer.example.com/jwks",
-                "client_id": "ferrum-gateway",
-                "client_auth": {"method": "client_secret_basic", "client_secret": "secret"},
-                "scopes": ["openid", "profile"],
-                "redirect_uri": "https://app.example.com/oauth/callback",
-                "callback_path": "/oauth/callback",
-                "logout_path": "/oauth/logout"
-            }],
-            "session": {
-                "store": "cookie",
-                "encryption_secret": "01234567890123456789012345678901"
-            },
-            "behavior": {"trusted_redirect_hosts": ["app.example.com"]}
-        }),
-        "udp_rate_limiting" => json!({"datagrams_per_second": 1000}),
-        "serverless_function" => {
-            json!({"provider": "azure_functions", "function_url": "https://example.com/func"})
-        }
-        "request_mirror" => json!({"mirror_host": "mirror.local"}),
-        "load_testing" => json!({
-            "key": "test-load-key-0123456789abcdef!!",
-            "concurrent_clients": 1,
-            "duration_seconds": 1,
-            "gateway_port": 8000
-        }),
-        "fault_injection" => json!({
-            "abort": {"status_code": 503, "percentage": 100.0},
-            "runtime_overlay_scope": "checkout"
-        }),
-        "udp_logging" => json!({"host": "127.0.0.1", "port": 9514}),
-        "statsd_logging" => json!({"host": "127.0.0.1", "port": 8125}),
-        "loki_logging" => json!({"endpoint_url": "http://localhost:3100/loki/api/v1/push"}),
-        "kafka_logging" => json!({"broker_list": "localhost:9092", "topic": "test-logs"}),
-        "request_deduplication" => json!({}),
-        "response_mock" => json!({"rules": [{"path": "/test", "body": "mock"}]}),
-        "openapi_validator" => json!({
-            "operations": [{
-                "method": "GET",
-                "path_template": "/health",
-                "path_regex": "^/health$",
-                "responses": {
-                    "200": {
-                        "content": {
-                            "application/json": {
-                                "type": "object"
-                            }
-                        }
-                    }
-                }
-            }]
-        }),
-        "ai_federation" => {
-            json!({"providers": [{"name": "test", "provider_type": "openai", "api_key": "sk-test"}]})
-        }
-        "ai_stream_router" => json!({
-            "providers": [{
-                "name": "test",
-                "provider_type": "openai",
-                "endpoint": "https://api.openai.com/v1/chat/completions",
-                "api_key": "sk-test",
-                "model_patterns": ["gpt-*"]
-            }]
-        }),
-        "mcp_gateway" => json!({
-            "mode": "transparent_proxy",
-            "endpoint": {"path": "/mcp"},
-            "servers": {
-                "tools": {
-                    "upstream_url": "http://mcp-gateway.example/mcp",
-                    "namespace": "tools"
-                }
-            }
-        }),
-        "a2a_gateway" => json!({
-            "mode": "transparent_proxy",
-            "endpoint": {
-                "path": "/a2a",
-                "agent_card_path": "/.well-known/agent-card.json",
-                "grpc_services": ["a2a.v1.A2AService"]
-            }
-        }),
-        "ai_semantic_firewall" => json!({
-            "provider": {
-                "type": "openai_compatible_embeddings",
-                "endpoint": "http://127.0.0.1:9/v1/embeddings",
-                "request_timeout_ms": 100
-            }
-        }),
-        "ai_tool_governor" => json!({
-            "tools": { "github.create_pr": { "action": "allow" } }
-        }),
-        "ai_transcript_audit" => json!({
-            "sink": {"endpoint_url": "https://localhost:9200/audit"}
-        }),
-        "ldap_auth" => json!({
-            "ldap_url": "ldaps://ldap.example.com:636",
-            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
-        }),
-        "spec_expose" => json!({"spec_url": "https://example.com/openapi.yaml"}),
-        "api_chargeback" => {
-            json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0.00001}]})
-        }
-        "api_chargeback_sink" => json!({
-            "clickhouse": {
-                "url": "http://127.0.0.1:8123",
-                "database": "default",
-                "table": "ferrum_charge_events"
-            },
-            "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.00001}],
-            "spool": {"enabled": false}
-        }),
-        "ai_response_guard" => json!({"pii_patterns": ["ssn"], "action": "reject"}),
-        "ai_request_guard" => json!({"max_messages": 100}),
-        "transaction_log_schema" => {
-            json!({"schemas": {"default": {"summary_type": "both"}}})
-        }
-        "mesh_route_dispatch" => json!({
-            "rules": [{
-                "match": {"methods": ["GET"]},
-                "destination": {"upstream_id": "canary"}
-            }]
-        }),
-        "mesh_outbound_registry" => {
-            json!({"registry": ["reviews.default.svc.cluster.local"]})
-        }
-        "opa" => json!({
-            "opa_host": "http://127.0.0.1:8181",
-            "policy_path": "ferrum/authz/allow"
-        }),
-        "proxy_alerts" => json!({
-            "channels": {
-                "ops": { "type": "slack", "webhook_url": "https://hooks.slack.com/x" }
-            },
-            "rules": [{
-                "name": "r", "type": "error_rate",
-                "status_codes": [500], "threshold_percent": 5.0,
-                "channels": ["ops"]
-            }]
-        }),
-        _ => json!({}),
-    }
-}
-
-pub(crate) fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
-    Proxy {
-        id: id.to_string(),
-        namespace: ferrum_edge::config::types::default_namespace(),
-        name: Some(format!("Proxy {}", id)),
-        hosts: vec![],
-        listen_path: Some(listen_path.to_string()),
-        backend_scheme: Some(BackendScheme::Http),
-        dispatch_kind: DispatchKind::from(BackendScheme::Http),
-        backend_host: "localhost".to_string(),
-        backend_port: 3000,
-        backend_path: None,
-        strip_listen_path: true,
-        preserve_host_header: false,
-        backend_connect_timeout_ms: 5000,
-        backend_read_timeout_ms: 30000,
-        backend_write_timeout_ms: 30000,
-        backend_tls_client_cert_path: None,
-        backend_tls_client_key_path: None,
-        backend_tls_verify_server_cert: true,
-        backend_tls_server_ca_cert_path: None,
-        resolved_tls: Default::default(),
-        dispatch_port_overrides: None,
-        dispatch_port_override_fallback: None,
-        dns_override: None,
-        dns_cache_ttl_seconds: None,
-        auth_mode: AuthMode::Single,
-        plugins: plugin_ids
-            .into_iter()
-            .map(|id| PluginAssociation {
-                plugin_config_id: id.to_string(),
-            })
-            .collect(),
-
-        pool_idle_timeout_seconds: None,
-        pool_enable_http_keep_alive: None,
-        pool_enable_http2: None,
-        pool_tcp_keepalive_seconds: None,
-        pool_http2_keep_alive_interval_seconds: None,
-        pool_http2_keep_alive_timeout_seconds: None,
-        pool_http2_initial_stream_window_size: None,
-        pool_http2_initial_connection_window_size: None,
-        pool_http2_adaptive_window: None,
-        pool_http2_max_frame_size: None,
-        pool_http2_max_concurrent_streams: None,
-        pool_http3_connections_per_backend: None,
-        h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
-        pool_http1_max_pending_requests: None,
-        upstream_id: None,
-        upstream_subset: None,
-        api_spec_id: None,
-        circuit_breaker: None,
-        retry: None,
-        response_body_mode: Default::default(),
-        listen_port: None,
-        frontend_tls: false,
-        passthrough: false,
-        udp_idle_timeout_seconds: 60,
-        tcp_idle_timeout_seconds: Some(300),
-        websocket_idle_timeout_seconds: None,
-        allowed_methods: None,
-        allowed_ws_origins: vec![],
-        udp_max_response_amplification_factor: None,
-        stream_proxy_protocol: None,
-        backend_proxy_protocol: None,
-        stream_match: None,
-        compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-        pending_limit_scope: None,
-    }
-}
-
 fn make_tcp_proxy(id: &str, plugin_ids: Vec<&str>) -> Proxy {
     let mut proxy = make_proxy(id, "/", plugin_ids);
     proxy.listen_path = None;
@@ -485,31 +222,6 @@ async fn run_tcp_connect_chain(
         }
     }
     true
-}
-
-pub(crate) fn make_plugin_config(
-    id: &str,
-    plugin_name: &str,
-    scope: PluginScope,
-    proxy_id: Option<&str>,
-    enabled: bool,
-) -> PluginConfig {
-    // Some plugins now require non-empty config to be created successfully.
-    let config = minimal_plugin_config(plugin_name);
-    PluginConfig {
-        id: id.to_string(),
-        namespace: ferrum_edge::config::types::default_namespace(),
-        plugin_name: plugin_name.to_string(),
-        config,
-        scope,
-        proxy_id: proxy_id.map(|s| s.to_string()),
-        enabled,
-        priority_override: None,
-        trigger: None,
-        api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    }
 }
 
 fn make_config(proxies: Vec<Proxy>, plugin_configs: Vec<PluginConfig>) -> GatewayConfig {
@@ -1645,6 +1357,7 @@ fn test_global_plugins_returned_for_all_proxies() {
 }
 
 #[test]
+#[serial_test::serial(prometheus_global_registry)]
 fn test_prometheus_metrics_requires_global_and_unique_registry_owner() {
     let scoped = make_config(
         vec![make_proxy("p1", "/api", vec!["prometheus"])],
@@ -1855,6 +1568,8 @@ fn test_workload_metrics_effective_plan_budget_measures_same_family_as_replaceme
             ),
         ],
     );
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+        .expect("valid multi-instance metric plan must pass admission");
     let cache = PluginCache::new(&config)
         .expect("same-family later replacement must be measured as replacement, not addition");
     assert_eq!(
@@ -1910,6 +1625,10 @@ fn test_workload_metrics_effective_plan_budget_retains_earlier_plan_when_trigger
         )],
         vec![earlier, conditional_replacement, other_family],
     );
+    let admission =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+            .expect_err("a skipped replacement must preserve the earlier plan at admission");
+    assert!(admission.contains("exceed 16384 encoded bytes across surviving families"));
     let error = PluginCache::new(&config)
         .err()
         .expect("a skipped replacement can leave the larger earlier plan effective");
@@ -1940,6 +1659,8 @@ fn test_workload_metrics_effective_plan_budget_admits_within_budget_chain() {
             ),
         ],
     );
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+        .expect("valid multi-instance metric plan must pass admission");
     let cache = PluginCache::new(&config)
         .expect("within-budget multi-instance different-family chain must remain valid");
     assert_eq!(
@@ -2083,6 +1804,7 @@ fn test_api_chargeback_allows_one_instance_per_proxy_with_mixed_currency() {
 }
 
 #[test]
+#[serial_test::serial(prometheus_global_registry)]
 fn test_single_prometheus_metrics_instance_is_shared_once_across_protocols() {
     let config = make_config(
         vec![
@@ -4342,8 +4064,10 @@ fn candidate_security_validation_constructs_custom_capabilities_without_builtin_
             && effective_chain.contains("plugin.is_auth_plugin()"),
         "effective-chain validation must derive authentication participation from constructed capabilities"
     );
-    assert!(candidate.contains("validate_plugin_security_composition(&merged)"));
-    assert!(candidate.contains("validate_plugin_security_composition(plugins)"));
+    assert!(candidate.contains("prepare_plugin_chain("));
+    let assembly_start = source.find("fn prepare_plugin_chain(").unwrap();
+    let assembly = &source[assembly_start..start];
+    assert!(assembly.contains("validate_plugin_security_composition(plugins)"));
 }
 
 fn enforces_finalized_request_policy_override_returns_true(source: &str, fn_offset: usize) -> bool {
@@ -7913,29 +7637,6 @@ fn transaction_log_schema_delta_reload_updates_registry_without_runtime_entries(
                 .get_plugins_for_protocol("ferrum", "p1", protocol)
                 .is_empty()
         );
-    }
-}
-
-pub(crate) fn make_plugin_config_with_json(
-    id: &str,
-    plugin_name: &str,
-    config: serde_json::Value,
-    scope: PluginScope,
-    proxy_id: Option<&str>,
-) -> PluginConfig {
-    PluginConfig {
-        id: id.to_string(),
-        namespace: ferrum_edge::config::types::default_namespace(),
-        plugin_name: plugin_name.to_string(),
-        config,
-        scope,
-        proxy_id: proxy_id.map(|s| s.to_string()),
-        enabled: true,
-        priority_override: None,
-        trigger: None,
-        api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
     }
 }
 
@@ -13440,4 +13141,196 @@ fn disabled_size_limiting_instance_publishes_no_ceiling() {
     let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
 
     assert_eq!(view.enforced_request_body_limit(), None);
+}
+
+#[test]
+#[serial_test::serial(prometheus_global_registry)]
+fn candidate_and_runtime_reject_every_runtime_composition_rule() {
+    let scoped = |id, name| make_plugin_config(id, name, PluginScope::Proxy, Some("p1"), true);
+    let pair = |name| vec![scoped("a", name), scoped("b", name)];
+    let interleaved = |name: &str| {
+        let config = if name == "cors" {
+            json!({"allowed_origins": ["*"]})
+        } else {
+            json!({"rules": [{"match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "target"}}], "reject_unmatched": true})
+        };
+        let mut a =
+            make_plugin_config_with_json("a", name, config.clone(), PluginScope::Proxy, Some("p1"));
+        let mut b = make_plugin_config_with_json("b", name, config, PluginScope::Proxy, Some("p1"));
+        a.priority_override = Some(100);
+        b.priority_override = Some(200);
+        let mut middle = scoped("middle", "ip_restriction");
+        middle.priority_override = Some(150);
+        vec![a, middle, b]
+    };
+    let budget = vec![
+        make_plugin_config_with_json(
+            "a",
+            "workload_metrics",
+            workload_metrics_family_set_overrides("REQUEST_COUNT", 62),
+            PluginScope::Proxy,
+            Some("p1"),
+        ),
+        make_plugin_config_with_json(
+            "b",
+            "workload_metrics",
+            workload_metrics_family_set_overrides("REQUEST_DURATION", 62),
+            PluginScope::Proxy,
+            Some("p1"),
+        ),
+    ];
+    let cases = [
+        (
+            "exclusive load testing",
+            pair("load_testing"),
+            "at most one effective instance",
+        ),
+        (
+            "exclusive chargeback",
+            pair("api_chargeback"),
+            "at most one effective instance",
+        ),
+        (
+            "CORS contiguity",
+            interleaved("cors"),
+            "cors instances must remain contiguous",
+        ),
+        (
+            "mesh contiguity",
+            interleaved("mesh_route_dispatch"),
+            "mesh_route_dispatch instances must remain contiguous",
+        ),
+        (
+            "metric budget",
+            budget,
+            "exceed 16384 encoded bytes across surviving families",
+        ),
+        (
+            "prometheus owner",
+            vec![scoped("a", "prometheus_metrics")],
+            "must have scope 'global'",
+        ),
+        (
+            "BPF owner",
+            vec![scoped("a", "__mesh_bpf_metrics")],
+            "must have scope 'global'",
+        ),
+    ];
+    for (case, configs, diagnostic) in cases {
+        let ids = configs.iter().map(|pc| pc.id.as_str()).collect();
+        let config = make_config(vec![make_proxy("p1", "/api", ids)], configs);
+        let admission =
+            validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+                .expect_err(case);
+        assert!(admission.contains(diagnostic), "{case}: {admission}");
+        let full = PluginCache::new(&config).err().expect(case);
+        assert!(full.contains(diagnostic), "{case}: {full}");
+
+        let baseline = make_config(vec![make_proxy("p1", "/api", vec![])], vec![]);
+        let cache = PluginCache::new(&baseline).unwrap();
+        let before = cache.get_plugins("ferrum", "p1");
+        let changed = HashSet::from([NamespacedResourceId::new("ferrum", "p1")]);
+        let incremental = cache
+            .apply_delta(&config, &changed, &[], true)
+            .expect_err(case);
+        assert!(incremental.contains(diagnostic), "{case}: {incremental}");
+        assert!(
+            Arc::ptr_eq(&before, &cache.get_plugins("ferrum", "p1")),
+            "{case}: rejected incremental candidate replaced the published chain"
+        );
+    }
+}
+
+#[test]
+fn candidate_ordering_matches_runtime_for_ties_scopes_and_stream_only_interlopers() {
+    // Equal priorities follow config order for proxy instances, not association
+    // order. Put the interloper last in associations to expose that difference.
+    for middle_name in ["ip_restriction", "udp_rate_limiting"] {
+        let mut first = cors_config("a", &["GET"], &["X-Test"], Some(100), None);
+        let mut last = cors_config("b", &["GET"], &["X-Test"], Some(100), None);
+        let mut middle = make_plugin_config_with_priority(
+            "middle",
+            middle_name,
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+            Some(100),
+            None,
+        );
+        for scope in [
+            PluginScope::Proxy,
+            PluginScope::ProxyGroup,
+            PluginScope::Global,
+        ] {
+            for pc in [&mut first, &mut middle, &mut last] {
+                pc.scope = scope.clone();
+                pc.proxy_id = (scope == PluginScope::Proxy).then(|| "p1".to_string());
+            }
+            let associations = if scope == PluginScope::ProxyGroup {
+                vec!["a", "middle", "b"]
+            } else {
+                vec!["a", "b", "middle"]
+            };
+            let config = make_config(
+                vec![make_proxy("p1", "/api", associations)],
+                vec![first.clone(), middle.clone(), last.clone()],
+            );
+            let admission =
+                validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None);
+            let runtime = PluginCache::new(&config);
+            assert_eq!(
+                admission.is_ok(),
+                middle_name == "udp_rate_limiting",
+                "{middle_name}/{scope:?}: {admission:?}"
+            );
+            assert_eq!(
+                runtime.is_ok(),
+                admission.is_ok(),
+                "{middle_name}/{scope:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn candidate_topology_does_not_open_node_local_geo_database() {
+    let mut geo = make_plugin_config_with_priority(
+        "geo",
+        "geo_restriction",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+        Some(150),
+        None,
+    );
+    for triggered in [false, true] {
+        geo.trigger = triggered.then(|| {
+            serde_json::from_value(json!({
+                "when": {"match": {"method": ["GET"]}}
+            }))
+            .unwrap()
+        });
+        let config = make_config(
+            vec![make_proxy("p1", "/api", vec!["geo"])],
+            vec![geo.clone()],
+        );
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+            .expect("CP admission must not open the deliberately absent MMDB");
+        let config = make_config(
+            vec![make_proxy("p1", "/api", vec!["a", "geo", "b"])],
+            vec![
+                cors_config("a", &["GET"], &["X-Test"], Some(100), None),
+                geo.clone(),
+                cors_config("b", &["GET"], &["X-Test"], Some(200), None),
+            ],
+        );
+        let error =
+            validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+                .expect_err("the pure geo view must still participate in ordering");
+        assert!(
+            error.contains("cors instances must remain contiguous"),
+            "{error}"
+        );
+    }
 }

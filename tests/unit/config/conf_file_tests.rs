@@ -268,10 +268,10 @@ fn test_parse_comments_and_empty_lines() {
 
 #[test]
 fn test_parse_quoted_values() {
-    let input = "KEY1 = \"hello world\"\nKEY2 = 'single quoted'\n";
+    let input = "FERRUM_LOG_LEVEL = \"hello world\"\nFERRUM_NAMESPACE = 'single quoted'\n";
     let conf = ConfFile::parse(input).unwrap();
-    assert_eq!(conf.get("KEY1"), Some("hello world"));
-    assert_eq!(conf.get("KEY2"), Some("single quoted"));
+    assert_eq!(conf.get("FERRUM_LOG_LEVEL"), Some("hello world"));
+    assert_eq!(conf.get("FERRUM_NAMESPACE"), Some("single quoted"));
 }
 
 #[test]
@@ -295,9 +295,9 @@ fn test_parse_quoted_values_preserve_literal_content() {
             format!("héllo {other_quote}world{other_quote}"),
             r"C:\path\with\backslashes\".to_string(),
         ] {
-            let input = format!("KEY = {quote}{literal}{quote} # trailing comment");
+            let input = format!("FERRUM_MODE = {quote}{literal}{quote} # trailing comment");
             let conf = ConfFile::parse(&input).unwrap();
-            assert_eq!(conf.get("KEY"), Some(literal.as_str()));
+            assert_eq!(conf.get("FERRUM_MODE"), Some(literal.as_str()));
         }
     }
 }
@@ -311,7 +311,7 @@ fn test_parse_unclosed_quotes_name_key_and_line_without_value() {
         "'secret # suffix",
         "\"secret'",
     ] {
-        let input = format!("# comment\n\nFERRUM_ADMIN_JWT_SECRET = {value}\nKEY = next");
+        let input = format!("# comment\n\nFERRUM_ADMIN_JWT_SECRET = {value}\nFERRUM_MODE = next");
         let err = ConfFile::parse(&input).unwrap_err();
         assert_eq!(
             err,
@@ -324,12 +324,12 @@ fn test_parse_unclosed_quotes_name_key_and_line_without_value() {
 fn test_parse_rejects_text_after_closing_quote() {
     for quote in ['"', '\''] {
         for trailing in ["unexpected", " unexpected # comment", " 'second value'"] {
-            let input = format!("\nKEY = {quote}secret{quote}{trailing}");
+            let input = format!("\nFERRUM_MODE = {quote}secret{quote}{trailing}");
             let err = ConfFile::parse(&input).unwrap_err();
             assert_eq!(
                 err,
                 "Invalid conf file syntax at line 2: \
-                 unexpected text after closing quote for key 'KEY'"
+                 unexpected text after closing quote for key 'FERRUM_MODE'"
             );
         }
     }
@@ -337,22 +337,22 @@ fn test_parse_rejects_text_after_closing_quote() {
 
 #[test]
 fn test_parse_no_spaces() {
-    let conf = ConfFile::parse("KEY=value").unwrap();
-    assert_eq!(conf.get("KEY"), Some("value"));
+    let conf = ConfFile::parse("FERRUM_MODE=value").unwrap();
+    assert_eq!(conf.get("FERRUM_MODE"), Some("value"));
 }
 
 #[test]
 fn test_parse_inline_comments() {
-    let conf = ConfFile::parse("KEY = value # this is a comment").unwrap();
-    assert_eq!(conf.get("KEY"), Some("value"));
-    let conf = ConfFile::parse("KEY = value#literal\t#literal # comment").unwrap();
-    assert_eq!(conf.get("KEY"), Some("value#literal\t#literal"));
+    let conf = ConfFile::parse("FERRUM_MODE = value # this is a comment").unwrap();
+    assert_eq!(conf.get("FERRUM_MODE"), Some("value"));
+    let conf = ConfFile::parse("FERRUM_MODE = value#literal\t#literal # comment").unwrap();
+    assert_eq!(conf.get("FERRUM_MODE"), Some("value#literal\t#literal"));
 }
 
 #[test]
 fn test_parse_empty_value() {
-    let conf = ConfFile::parse("KEY =").unwrap();
-    assert_eq!(conf.get("KEY"), Some(""));
+    let conf = ConfFile::parse("FERRUM_MODE =").unwrap();
+    assert_eq!(conf.get("FERRUM_MODE"), Some(""));
 }
 
 #[test]
@@ -419,12 +419,10 @@ fn conf_file_exact_limit_loads_and_limit_plus_one_refuses() {
 
     let dir = tempfile::tempdir().unwrap();
     let exact = dir.path().join("exact.conf");
-    // Fill with valid KEY=VALUE lines under the ceiling.
+    // Fill with valid setting assignments under the ceiling.
     let mut body = String::new();
-    let mut n = 0u32;
     while (body.len() as u64) + 32 < MAX_FERRUM_CONF_BYTES {
-        body.push_str(&format!("FERRUM_CUSTOM_{n} = v\n"));
-        n += 1;
+        body.push_str("FERRUM_LOG_LEVEL = info\n");
     }
     let pad = (MAX_FERRUM_CONF_BYTES as usize).saturating_sub(body.len());
     if pad > 1 {
@@ -547,4 +545,108 @@ fn conf_file_fifo_is_rejected_promptly() {
         err.contains("not a regular file") || err.contains("Failed to read"),
         "got: {err}"
     );
+}
+
+#[test]
+fn conf_file_recognizes_inventory_and_rejects_unknown_keys_without_values() {
+    use ferrum_edge::config::public_env_inventory::PUBLIC_FERRUM_ENV_SETTINGS;
+
+    for key in PUBLIC_FERRUM_ENV_SETTINGS {
+        let conf = ConfFile::parse(&format!("{key} = fixture\n")).unwrap();
+        assert_eq!(conf.get(key), Some("fixture"));
+    }
+    for key in ["FERRUM_UNKNOWN_SETTING", "UNRELATED_SETTING"] {
+        let error = ConfFile::parse(&format!("# settings\n{key}=private-fixture-value"))
+            .expect_err("unknown key must fail");
+        assert!(error.contains(key));
+        assert!(error.contains("line 2"));
+        assert!(!error.contains("private-fixture-value"));
+    }
+    for suffix in ferrum_edge::secrets::EXTERNAL_SECRET_SUFFIXES {
+        let key = format!("FERRUM_ADMIN_HTTP_PORT{suffix}");
+        let error = ConfFile::parse(&format!("{key}=private-fixture-reference"))
+            .expect_err("suffix belongs in the environment");
+        assert!(error.contains(&key));
+        assert!(error.contains("environment-only"));
+        assert!(!error.contains("private-fixture-reference"));
+    }
+    for key in [
+        "FERRUM_DNS_RESOLVER_HOSTS_FILE",
+        "FERRUM_DP_CP_GRPC_TOKEN_FILE",
+        "FERRUM_MESH_STOCK_XDS_TOKEN_FILE",
+        "FERRUM_TRANSCRIPT_SINK_SECRET_CUSTOM_42",
+    ] {
+        assert!(ConfFile::parse(&format!("{key}=fixture")).is_ok(), "{key}");
+    }
+}
+
+#[test]
+fn gateway_listener_bindings_respect_address_scope_and_disabled_ports() {
+    use ferrum_edge::config::OperatingMode;
+
+    for (proxy, admin, collision) in [
+        ("0.0.0.0", "127.0.0.1", true),
+        ("127.0.0.1", "127.0.0.1", true),
+        ("127.0.0.1", "127.0.0.2", false),
+        ("::", "127.0.0.1", true),
+        ("::", "::1", true),
+        ("::1", "127.0.0.1", false),
+        ("::ffff:127.0.0.1", "127.0.0.1", true),
+    ] {
+        let config = EnvConfig {
+            mode: OperatingMode::File,
+            proxy_bind_address: proxy.into(),
+            admin_bind_address: admin.into(),
+            proxy_http_port: 9100,
+            admin_http_port: 9100,
+            ..EnvConfig::default()
+        };
+        let result = config.validate_gateway_listener_bindings();
+        assert_eq!(result.is_err(), collision, "{proxy} / {admin}: {result:?}");
+        if let Err(error) = result {
+            assert!(error.contains("FERRUM_PROXY_HTTP_PORT"));
+            assert!(error.contains("FERRUM_ADMIN_HTTP_PORT"));
+        }
+        let disabled = EnvConfig {
+            proxy_http_port: 0,
+            admin_http_port: 0,
+            ..config
+        };
+        assert!(disabled.validate_gateway_listener_bindings().is_ok());
+    }
+}
+
+#[test]
+fn gateway_listener_bindings_include_tls_and_only_active_modes() {
+    use ferrum_edge::config::OperatingMode;
+
+    let mut config = EnvConfig {
+        mode: OperatingMode::File,
+        proxy_http_port: 0,
+        proxy_https_port: 9200,
+        admin_http_port: 9200,
+        ..EnvConfig::default()
+    };
+    assert!(config.validate_gateway_listener_bindings().is_ok());
+    config.frontend_tls_cert_path = Some("fixture-cert".into());
+    config.frontend_tls_key_path = Some("fixture-key".into());
+    let error = config.validate_gateway_listener_bindings().unwrap_err();
+    assert!(error.contains("FERRUM_PROXY_HTTPS_PORT"));
+    assert!(error.contains("FERRUM_ADMIN_HTTP_PORT"));
+    config.admin_http_port = 0;
+    config.admin_https_port = 9200;
+    config.admin_tls_cert_path = Some("fixture-cert".into());
+    config.admin_tls_key_path = Some("fixture-key".into());
+    let error = config.validate_gateway_listener_bindings().unwrap_err();
+    assert!(error.contains("FERRUM_ADMIN_HTTPS_PORT"));
+    config.mode = OperatingMode::ControlPlane;
+    assert!(config.validate_gateway_listener_bindings().is_ok());
+    config.cp_grpc_listen_addr = Some("0.0.0.0:9200".into());
+    let error = config.validate_gateway_listener_bindings().unwrap_err();
+    assert!(error.contains("FERRUM_CP_GRPC_LISTEN_ADDR"));
+    assert!(error.contains("FERRUM_ADMIN_HTTPS_PORT"));
+    config.cp_grpc_listen_addr = Some("127.0.0.2:9200".into());
+    assert!(config.validate_gateway_listener_bindings().is_ok());
+    config.cp_grpc_listen_addr = Some("0.0.0.0:0".into());
+    assert!(config.validate_gateway_listener_bindings().is_ok());
 }

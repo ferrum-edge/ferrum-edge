@@ -62,12 +62,13 @@
 //! duplicate windows 1 and 2 at the cost of dropping recoverable transient
 //! failures; it cannot close window 3.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tracing::warn;
 
 use crate::plugins::utils::http_client::PluginHttpClient;
 
@@ -196,7 +197,7 @@ pub fn dispatch_one(
             generation
                 .metrics()
                 .record_backpressure_dropped(channel_type);
-            warn!(
+            warn_sampled!(
                 source = log_source,
                 channel = %channel.name(),
                 channel_type,
@@ -234,7 +235,7 @@ pub fn dispatch_one(
     });
 
     if !spawned {
-        warn!(
+        warn_sampled!(
             source = log_source,
             channel = %channel.name(),
             channel_type,
@@ -300,7 +301,7 @@ pub(crate) async fn run_with_retries(
             DeliveryAttempt::Failed { class, message } => {
                 let retryable = class == FailureClass::Transient && attempt < max_attempts;
                 if retryable {
-                    warn!(
+                    warn_sampled!(
                         source = log_source,
                         channel = %channel.name(),
                         channel_type = channel.kind(),
@@ -321,7 +322,7 @@ pub(crate) async fn run_with_retries(
                     }
                     continue;
                 }
-                warn!(
+                warn_sampled!(
                     source = log_source,
                     channel = %channel.name(),
                     channel_type = channel.kind(),

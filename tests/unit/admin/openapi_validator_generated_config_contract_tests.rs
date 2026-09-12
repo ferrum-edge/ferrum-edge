@@ -5,6 +5,7 @@
 //! may be objects (Draft 7 / OAS 3.0) or boolean schemas (Draft 2020-12 / OAS 3.1).
 
 use ferrum_edge::admin::api_specs::{SpecFormat, extract};
+use ferrum_edge::plugins::openapi_validator::OpenapiValidator;
 use serde_json::{Value, json};
 
 fn openapi_validator_config_validator() -> jsonschema::Validator {
@@ -25,6 +26,223 @@ fn assert_valid_against_admin_schema(config: &Value, label: &str) {
     if let Err(error) = validator.validate(config) {
         panic!("{label} must validate against OpenapiValidatorConfig: {error}; config={config}");
     }
+}
+
+fn admission_contract_config() -> Value {
+    json!({
+        "schema_draft": "draft2020-12",
+        "operations": [{
+            "method": "POST", "path_template": "/contract", "path_regex": "/contract",
+            "request_body": {"content": {"application/json": {"type": "object"}}}
+        }]
+    })
+}
+
+fn assert_admission(validator: &jsonschema::Validator, config: &Value, accepted: bool) {
+    assert_eq!(validator.is_valid(config), accepted, "schema: {config}");
+    assert_eq!(
+        OpenapiValidator::new(config).is_ok(),
+        accepted,
+        "runtime: {config}"
+    );
+}
+
+#[test]
+fn published_openapi_validator_fields_match_constructor_bounds_and_syntax() {
+    let validator = openapi_validator_config_validator();
+    for (patch, accepted) in [
+        (json!({"max_body_bytes": 1}), true),
+        (json!({"max_body_bytes": u64::MAX}), true),
+        (json!({"max_body_bytes": 0}), false),
+        (json!({"max_body_bytes": -1}), false),
+        (json!({"error_truncate_chars": 0}), true),
+        (json!({"error_truncate_chars": u64::MAX}), true),
+        (json!({"error_truncate_chars": -1}), false),
+        (
+            json!({"error_response": {"content_type": "application/problem+json; charset=\"utf-8\""}}),
+            true,
+        ),
+        (
+            json!({"error_response": {"content_type": "application/problem+json;bad"}}),
+            false,
+        ),
+        (
+            json!({"error_response": {"content_type": "application/*"}}),
+            false,
+        ),
+        (
+            json!({"error_response": {"content_type": "application/{json}"}}),
+            false,
+        ),
+        (
+            json!({"error_response": {"content_type": " application/json"}}),
+            false,
+        ),
+        (
+            json!({"error_response": {"content_type": "application/json\n"}}),
+            false,
+        ),
+        (
+            json!({"error_response": {"request_status_code": 399}}),
+            false,
+        ),
+        (
+            json!({"error_response": {"response_status_code": 600}}),
+            false,
+        ),
+        (json!({"bypass": {"paths": [""]}}), false),
+        (json!({"bypass": {"methods": [""]}}), false),
+        (json!({"bypass": {"consumers": [""]}}), false),
+    ] {
+        let mut config = admission_contract_config();
+        config
+            .as_object_mut()
+            .unwrap()
+            .extend(patch.as_object().unwrap().clone());
+        assert_admission(&validator, &config, accepted);
+    }
+    for field in ["max_body_bytes", "error_truncate_chars"] {
+        let mut config = admission_contract_config();
+        config[field] = serde_json::from_str("18446744073709551616").unwrap();
+        assert!(!validator.is_valid(&config));
+        assert!(OpenapiValidator::new(&config).is_err());
+    }
+    for field in ["method", "path_template", "path_regex", "operation_label"] {
+        let mut config = admission_contract_config();
+        config["operations"][0][field] = json!("");
+        assert!(!validator.is_valid(&config), "empty {field}");
+        assert!(OpenapiValidator::new(&config).is_err(), "empty {field}");
+    }
+}
+
+#[test]
+fn published_media_selectors_match_constructor_normalization() {
+    let validator = openapi_validator_config_validator();
+    for (media, accepted) in [
+        (" application/json ", true),
+        ("\u{2003}Application/JSON\u{2003};ignored", true),
+        ("application/x{sample}", true),
+        ("application/*", true),
+        ("*/*", true),
+        ("*/json", false),
+        ("application/json\n", false),
+        ("application/json;\u{0085}", false),
+    ] {
+        let mut config = admission_contract_config();
+        config["request_content_types"] = json!([media]);
+        config["response_content_types"] = json!([media]);
+        config["operations"][0]["request_body"]["content"] = json!({(media): true});
+        config["operations"][0]["responses"] = json!({"200": {(media): true}});
+        assert_admission(&validator, &config, accepted);
+    }
+}
+
+#[test]
+fn published_encoding_conditions_match_constructor_admission() {
+    let validator = openapi_validator_config_validator();
+    for inline in [false, true] {
+        for (media, encoding, accepted) in [
+            (
+                "application/x-www-form-urlencoded",
+                json!({"style": "spaceDelimited"}),
+                true,
+            ),
+            (
+                "application/x-www-form-urlencoded",
+                json!({"style": "spaceDelimited", "explode": true}),
+                false,
+            ),
+            (
+                "multipart/form-data",
+                json!({"style": "pipeDelimited", "explode": true}),
+                false,
+            ),
+            ("multipart/form-data", json!({"style": "deepObject"}), false),
+            (
+                "multipart/form-data",
+                json!({"style": "deepObject", "explode": true}),
+                true,
+            ),
+            (
+                "application/x-www-form-urlencoded",
+                json!({"headers": {}}),
+                false,
+            ),
+            (
+                "application/x-www-form-urlencoded",
+                json!({"contentType": "text/plain"}),
+                false,
+            ),
+            ("multipart/form-data", json!({"contentType": "   "}), false),
+            (
+                "multipart/form-data",
+                json!({"contentType": " text/plain "}),
+                true,
+            ),
+            ("application/json", json!({}), false),
+        ] {
+            let schema = json!({
+                "type": "object",
+                "properties": {"data": {"type": "object", "additionalProperties": false}}
+            });
+            let mut config = admission_contract_config();
+            let encoding = json!({"data": encoding});
+            config["operations"][0]["request_body"] = if inline {
+                json!({"content_type": media, "schema": schema, "encoding": encoding})
+            } else {
+                json!({"content": {(media): {"schema": schema, "encoding": encoding}}})
+            };
+            assert_admission(&validator, &config, accepted);
+        }
+    }
+}
+
+#[test]
+fn response_content_metadata_uses_the_published_response_shape() {
+    let validator = openapi_validator_config_validator();
+    for (response, accepted) in [
+        (
+            json!({"description": "ok", "content": {"application/json": true}}),
+            true,
+        ),
+        (json!({"description": "ok", "application/json": true}), true),
+        (
+            json!({"content": {"application/json": true, "description": "ok"}}),
+            false,
+        ),
+        (
+            json!({"application/json": {"schema": true, "encoding": {}}}),
+            false,
+        ),
+    ] {
+        let mut config = admission_contract_config();
+        config["operations"][0]["responses"] = json!({"200": response});
+        assert_admission(&validator, &config, accepted);
+    }
+}
+
+#[test]
+fn schema_dependent_admission_rules_remain_constructor_checks() {
+    let validator = openapi_validator_config_validator();
+    let mut duplicates = admission_contract_config();
+    duplicates["request_content_types"] = json!(["application/json", " Application/JSON "]);
+    assert!(validator.is_valid(&duplicates));
+    assert!(OpenapiValidator::new(&duplicates).is_err());
+
+    let mut unknown_property = admission_contract_config();
+    unknown_property["operations"][0]["request_body"] = json!({"content": {
+        "multipart/form-data": {
+            "schema": {"type": "object", "properties": {"data": {"type": "string"}}},
+            "encoding": {"other": {}}
+        }
+    }});
+    assert!(validator.is_valid(&unknown_property));
+    assert!(OpenapiValidator::new(&unknown_property).is_err());
+
+    unknown_property["operations"][0]["request_body"]["content"]["multipart/form-data"]["encoding"] =
+        json!({"data": {"style": "deepObject", "explode": true}});
+    assert!(validator.is_valid(&unknown_property));
+    assert!(OpenapiValidator::new(&unknown_property).is_err());
 }
 
 fn extract_validator_config(spec: &str) -> Value {

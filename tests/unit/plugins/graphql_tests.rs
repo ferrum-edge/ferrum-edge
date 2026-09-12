@@ -353,6 +353,62 @@ async fn test_alias_exceeds_limit() {
     assert_reject(result, Some(400));
 }
 
+#[tokio::test]
+async fn test_alias_count_counts_ignored_tokens_before_colon() {
+    let config = json!({ "max_aliases": 2 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let plain = "{ a1: f a2: f a3: f }";
+    let comma = "{ a1,: f a2,: f a3,: f }";
+    let comment = "{ a1# ign\n: f a2# ign\n: f a3# ign\n: f }";
+
+    for query in [plain, comma, comment] {
+        let mut ctx = create_graphql_context(query, None);
+        let mut headers = make_graphql_headers();
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 400);
+                assert!(
+                    body.contains("Query uses 3 aliases, maximum allowed is 2"),
+                    "expected alias-budget rejection for {query:?}, got {body}"
+                );
+            }
+            other => panic!("Expected Reject(400) for {query:?}, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_two_aliases_pass_with_ignored_tokens_before_colon() {
+    let config = json!({ "max_aliases": 2 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let plain = "{ a1: f a2: f }";
+    let comma = "{ a1,: f a2,: f }";
+    let comment = "{ a1# ign\n: f a2# ign\n: f }";
+
+    for query in [plain, comma, comment] {
+        let mut ctx = create_graphql_context(query, None);
+        let mut headers = make_graphql_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_continue(result);
+    }
+}
+
+#[tokio::test]
+async fn test_alias_count_unaffected_by_commas_in_argument_lists() {
+    let config = json!({ "max_aliases": 2 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "{ user(id: 1, status: active) { name } }";
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
 // ── Introspection control ──
 
 #[tokio::test]
@@ -1618,6 +1674,432 @@ async fn multiple_instances_track_their_own_envelope_decisions() {
     );
     assert_reject(
         strict
+            .on_final_request_body_with_context(&mut ctx, &headers, transformed.as_bytes())
+            .await,
+        Some(400),
+    );
+}
+
+// ── Complete `Ignored` grammar: UnicodeBOM (GHSA-wr84-jm45-wrwp) ──
+
+/// A `UnicodeBOM` between the operation keyword and the operation name is an
+/// ignored token, so the operation is still NAMED and its configured
+/// named-operation budget is consulted. Treating the BOM as an unknown byte
+/// parsed the document as anonymous and let the budget be bypassed entirely.
+#[tokio::test]
+async fn bom_before_the_operation_name_keeps_the_named_operation_budget() {
+    let config = json!({
+        "operation_rate_limits": {
+            "GetUser": { "max_requests": 1, "window_seconds": 60 }
+        }
+    });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+    let query = "query\u{feff}GetUser { user { name } }";
+
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let operation_name = ctx.metadata.get("graphql_operation_name").cloned();
+    assert_eq!(
+        operation_name.as_deref(),
+        Some("GetUser"),
+        "a BOM is an ignored token, so the operation keeps its name"
+    );
+
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(429));
+}
+
+/// Every ignored-token class is equivalent between an operation keyword and its
+/// name: whitespace, line terminators, commas, comments, and the BOM.
+#[tokio::test]
+async fn every_ignored_token_class_keeps_the_operation_name() {
+    let config = json!({ "max_complexity": 100 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    for separator in [
+        " ",
+        "\n",
+        ",",
+        "# ignored\n",
+        "\u{feff}",
+        "\u{feff} ,# ignored\n\u{feff}",
+    ] {
+        let query = format!("query{separator}GetUser {{ user {{ name }} }}");
+        let mut ctx = create_graphql_context(&query, None);
+        let mut headers = make_graphql_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        let operation_name = ctx.metadata.get("graphql_operation_name").cloned();
+        assert_eq!(
+            operation_name.as_deref(),
+            Some("GetUser"),
+            "separator {separator:?} must leave the operation named"
+        );
+        assert_eq!(ctx.metadata.get("graphql_complexity").unwrap(), "2");
+    }
+}
+
+/// A BOM must not hide the `mutation` keyword from the whole-document fallback
+/// scan either, which would downgrade the operation type and charge the wrong
+/// per-type budget. The unbalanced document is what forces the fallback: the
+/// structured parser finds no complete operation definition in it.
+#[tokio::test]
+async fn bom_before_a_leading_mutation_keyword_keeps_the_operation_type() {
+    let config = json!({
+        "type_rate_limits": {
+            "mutation": { "max_requests": 1, "window_seconds": 60 }
+        }
+    });
+
+    for query in [
+        "\u{feff}mutation { createUser { id } }",
+        "\u{feff}mutation { createUser { id }",
+    ] {
+        // A fresh instance per spelling so each starts with an unspent budget.
+        let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+        let mut ctx = create_graphql_context(query, None);
+        let mut headers = make_graphql_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(
+            ctx.metadata.get("graphql_operation_type").unwrap(),
+            "mutation",
+            "a leading BOM must not downgrade {query:?} to a query operation"
+        );
+
+        let mut ctx = create_graphql_context(query, None);
+        let mut headers = make_graphql_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_reject(result, Some(429));
+    }
+}
+
+/// The BOM is ignored wherever the other ignored tokens are: before an alias
+/// colon and before a fragment name. A fragment whose name the parser loses is
+/// never expanded, which hides everything it selects from the analyzer.
+#[tokio::test]
+async fn bom_is_ignored_before_alias_colons_and_fragment_names() {
+    let alias_plugin = create_plugin("graphql", &json!({ "max_aliases": 1 }))
+        .unwrap()
+        .unwrap();
+    let mut ctx = create_graphql_context("{ a1\u{feff}: f a2\u{feff}: f }", None);
+    let mut headers = make_graphql_headers();
+    assert_reject(
+        alias_plugin.before_proxy(&mut ctx, &mut headers).await,
+        Some(400),
+    );
+
+    let introspect = create_plugin("graphql", &json!({ "introspection_allowed": false }))
+        .unwrap()
+        .unwrap();
+    let query = "query { ...F } fragment\u{feff}F on Query { __schema { types { name } } }";
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    let result = introspect.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(403));
+}
+
+// ── Directive punctuator and directive name are distinct tokens (#5130) ──
+
+/// `@` and the directive name are separate lexical tokens, so any ignored token
+/// may sit between them. Inferring directive context from the immediately
+/// preceding byte counted the directive name as a selected field and rejected
+/// legitimate traffic with a complexity one higher than the adjacent spelling.
+#[tokio::test]
+async fn ignored_tokens_after_the_directive_punctuator_do_not_add_complexity() {
+    let config = json!({ "max_complexity": 100 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    for separator in ["", " ", "\n", ",", "# ignored\n", "\u{feff}", " ,\n"] {
+        let query = format!("{{ ok @{separator}skip(if: false) }}");
+        let mut ctx = create_graphql_context(&query, None);
+        let mut headers = make_graphql_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(
+            ctx.metadata.get("graphql_complexity").unwrap(),
+            "1",
+            "separator {separator:?} after `@` must not turn the directive into a field"
+        );
+    }
+}
+
+/// The same rule in the whole-document fallback scanner. An unbalanced document
+/// is what reaches it: the structured parser models no complete operation there
+/// and hands the document to the legacy scan.
+#[tokio::test]
+async fn fallback_scanner_does_not_count_spaced_directives_as_fields() {
+    let config = json!({ "max_complexity": 100 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    for separator in ["", " ", ",", "\u{feff}"] {
+        let query = format!("{{ ok @{separator}skip(if: false)");
+        let mut ctx = create_graphql_context(&query, None);
+        let mut headers = make_graphql_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(
+            ctx.metadata.get("graphql_complexity").unwrap(),
+            "1",
+            "fallback separator {separator:?} must not turn the directive into a field"
+        );
+    }
+}
+
+/// A one-field query with a directive must be admitted under `max_complexity: 1`
+/// however its directive is spelled — the reported reproduction.
+#[tokio::test]
+async fn spaced_directive_is_admitted_under_a_one_field_complexity_budget() {
+    let config = json!({ "max_complexity": 1 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    for query in ["{ ok @skip(if: false) }", "{ ok @ skip(if: false) }"] {
+        let mut ctx = create_graphql_context(query, None);
+        let mut headers = make_graphql_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    }
+}
+
+/// Directive arguments must still be skipped, and a genuine field after a
+/// directive must still be counted.
+#[tokio::test]
+async fn directives_still_skip_arguments_and_following_fields_still_count() {
+    let config = json!({ "max_complexity": 100 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "{ ok @ include(if: $show, other: nested) second }";
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(ctx.metadata.get("graphql_complexity").unwrap(), "2");
+}
+
+// ── One token per rate bucket per request (#5131) ──
+
+/// A body transform that changes the envelope without changing the operation
+/// (adding an unrelated `extensions` member) must cost ONE token, not two.
+/// Charging the final phase again refused the very first request under
+/// `max_requests: 1`, with the backend never contacted.
+#[tokio::test]
+async fn harmless_body_transform_charges_the_type_budget_once() {
+    let config = json!({
+        "type_rate_limits": {
+            "query": { "max_requests": 1, "window_seconds": 60 }
+        }
+    });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let mut ctx = create_graphql_context("{ ok }", None);
+    let mut headers = make_graphql_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let transformed = r#"{"query":"{ ok }","extensions":{"audit":"enabled"}}"#;
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, transformed.as_bytes())
+            .await,
+    );
+}
+
+/// The same for a named-operation budget: the operation name is unchanged, so
+/// the transformed envelope reuses the token the early phase already spent.
+#[tokio::test]
+async fn harmless_body_transform_charges_the_named_budget_once() {
+    let config = json!({
+        "operation_rate_limits": {
+            "GetUser": { "max_requests": 1, "window_seconds": 60 }
+        }
+    });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "query GetUser { user { name } }";
+    let mut ctx = create_graphql_context(query, Some("GetUser"));
+    let mut headers = make_graphql_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let transformed = json!({
+        "query": query,
+        "operationName": "GetUser",
+        "extensions": { "audit": "enabled" }
+    });
+    let transformed = transformed.to_string();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, transformed.as_bytes())
+            .await,
+    );
+}
+
+/// Re-serializing the same envelope (different bytes, same operation) is the
+/// other shape of the same hazard.
+#[tokio::test]
+async fn reserialized_envelope_does_not_spend_a_second_token() {
+    let config = json!({
+        "type_rate_limits": {
+            "query": { "max_requests": 1, "window_seconds": 60 }
+        }
+    });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let mut ctx = create_graphql_context("{ ok }", None);
+    let mut headers = make_graphql_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let reserialized = "{\n  \"query\": \"{ ok }\"\n}";
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, reserialized.as_bytes())
+            .await,
+    );
+}
+
+/// Charging once is not the same as not charging: a second request over the
+/// same budget must still be refused.
+#[tokio::test]
+async fn the_single_charge_still_exhausts_the_budget_for_the_next_request() {
+    let config = json!({
+        "type_rate_limits": {
+            "query": { "max_requests": 1, "window_seconds": 60 }
+        }
+    });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let transformed = r#"{"query":"{ ok }","extensions":{"audit":"enabled"}}"#;
+
+    let mut ctx = create_graphql_context("{ ok }", None);
+    let mut headers = make_graphql_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, transformed.as_bytes())
+            .await,
+    );
+
+    let mut ctx = create_graphql_context("{ ok }", None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(429));
+}
+
+/// A transform that actually selects a DIFFERENT operation type reaches a
+/// bucket this request never claimed, so the dispatched operation is still
+/// charged and still enforced.
+#[tokio::test]
+async fn a_transform_to_another_operation_type_is_charged_and_enforced() {
+    let config = json!({
+        "type_rate_limits": {
+            "mutation": { "max_requests": 1, "window_seconds": 60 }
+        }
+    });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+    let transformed = r#"{"query":"mutation { createUser { id } }"}"#;
+
+    // First request: the query passes freely, the transformed mutation spends
+    // the mutation budget's only token.
+    let mut ctx = create_graphql_context("{ ok }", None);
+    let mut headers = make_graphql_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, transformed.as_bytes())
+            .await,
+    );
+
+    // Second request: the same transform now finds the mutation budget spent.
+    let mut ctx = create_graphql_context("{ ok }", None);
+    let mut headers = make_graphql_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, transformed.as_bytes())
+            .await,
+        Some(429),
+    );
+}
+
+/// The same for a renamed operation: the early phase charged `GetUser`, and the
+/// dispatched `GetOrder` is charged against its own budget.
+#[tokio::test]
+async fn a_transform_to_another_operation_name_is_charged_and_enforced() {
+    let config = json!({
+        "operation_rate_limits": {
+            "GetOrder": { "max_requests": 1, "window_seconds": 60 }
+        }
+    });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+    let transformed = r#"{"query":"query GetOrder { order { id } }","operationName":"GetOrder"}"#;
+
+    let mut ctx = create_graphql_context("query GetUser { user { name } }", Some("GetUser"));
+    let mut headers = make_graphql_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, transformed.as_bytes())
+            .await,
+    );
+
+    let mut ctx = create_graphql_context("query GetUser { user { name } }", Some("GetUser"));
+    let mut headers = make_graphql_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, transformed.as_bytes())
+            .await,
+        Some(429),
+    );
+}
+
+/// Two configured instances build identical bucket key strings over separate
+/// budgets, so the claim is per instance: neither may consume the other's, and
+/// neither may charge itself twice.
+#[tokio::test]
+async fn the_once_per_request_claim_is_scoped_to_one_instance() {
+    let config = json!({
+        "type_rate_limits": {
+            "query": { "max_requests": 1, "window_seconds": 60 }
+        }
+    });
+    let first = create_plugin("graphql", &config).unwrap().unwrap();
+    let second = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let mut ctx = create_graphql_context("{ ok }", None);
+    let mut headers = make_graphql_headers();
+    assert_continue(first.before_proxy(&mut ctx, &mut headers).await);
+    assert_continue(second.before_proxy(&mut ctx, &mut headers).await);
+
+    let transformed = r#"{"query":"{ ok }","extensions":{"audit":"enabled"}}"#;
+    assert_continue(
+        first
+            .on_final_request_body_with_context(&mut ctx, &headers, transformed.as_bytes())
+            .await,
+    );
+    assert_continue(
+        second
+            .on_final_request_body_with_context(&mut ctx, &headers, transformed.as_bytes())
+            .await,
+    );
+}
+
+/// Structural policy is unaffected by the accounting claim: a transformed
+/// envelope is still fully re-parsed and re-decided even when its rate bucket
+/// was already charged.
+#[tokio::test]
+async fn structural_policy_still_runs_over_an_already_charged_bucket() {
+    let config = json!({
+        "max_depth": 2,
+        "type_rate_limits": {
+            "query": { "max_requests": 10, "window_seconds": 60 }
+        }
+    });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let mut ctx = create_graphql_context("{ a }", None);
+    let mut headers = make_graphql_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let transformed = r#"{"query":"{ a { b { c { d } } } }"}"#;
+    assert_reject(
+        plugin
             .on_final_request_body_with_context(&mut ctx, &headers, transformed.as_bytes())
             .await,
         Some(400),

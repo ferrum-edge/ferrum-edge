@@ -6691,7 +6691,7 @@ pub(crate) fn service_entry_port_protocol_is_udp(protocol: Option<&str>) -> bool
 
 /// Parse an Istio `ServiceEntry` `spec.resolution` string, defaulting to `NONE`
 /// exactly as Istio does. Shared by the ServiceEntry translator and by
-/// [`service_entry_spec_has_unresolvable_wildcard_host`] so the raw-spec
+/// [`service_entry_spec_has_unresolvable_stream_wildcard_host`] so the raw-spec
 /// predicate can never classify a resolution differently from the translation
 /// that feeds materialization.
 fn service_entry_resolution(spec: &Value) -> Resolution {
@@ -6702,23 +6702,52 @@ fn service_entry_resolution(spec: &Value) -> Resolution {
     }
 }
 
-/// Whether any `spec.hosts[]` element of a raw Istio `ServiceEntry` spec is a
-/// wildcard host the egress materializer cannot turn into a dialable upstream.
+/// Whether an Istio `ServiceEntry` `spec.ports[].protocol` string names a
+/// stream-family egress port (`tcp`, `mongo`, `redis`, `mysql`, `postgres`).
 ///
-/// A thin raw-spec wrapper over the SHARED
-/// [`egress_host_is_unresolvable_wildcard`] predicate the HTTP-family,
-/// stream-family, and datagram egress branches all apply, reading `resolution`
-/// through [`service_entry_resolution`] (defaulting to `NONE`) and the endpoint
-/// count from `spec.endpoints`. Used by `istio_status::service_entry_status` so
-/// the CRD `deferred_fields` report can never claim a host is materialized that
-/// the materializer skips — the same lock-step contract
-/// [`service_entry_port_protocol_is_udp`] provides for the UDP lane.
+/// Routes the raw token through the SAME [`app_protocol`] classifier the
+/// translator uses and mirrors the EgressGateway materializer's stream/HTTP
+/// split (`egress_is_stream_protocol` in `src/modes/mesh/mod.rs`) minus the
+/// UDP lane, which [`service_entry_port_protocol_is_udp`] reports separately.
+/// `tls` is HTTP-family there, so it is HTTP-family here.
+pub(crate) fn service_entry_port_protocol_is_stream_family(protocol: Option<&str>) -> bool {
+    matches!(
+        app_protocol(protocol),
+        AppProtocol::Tcp
+            | AppProtocol::Mongo
+            | AppProtocol::Redis
+            | AppProtocol::Mysql
+            | AppProtocol::Postgres
+    )
+}
+
+/// Whether a raw Istio `ServiceEntry` spec carries a wildcard `spec.hosts[]`
+/// element that its stream-family egress ports cannot materialize.
 ///
-/// Note the datagram branch is deliberately stricter (it refuses every wildcard,
-/// including the `STATIC`-with-endpoints case this predicate admits), so this
-/// wrapper under-reports for a UDP-only wildcard entry rather than over-reporting
-/// a host as deferred that the HTTP/stream branches do materialize.
-pub(crate) fn service_entry_spec_has_unresolvable_wildcard_host(spec: &Value) -> bool {
+/// HTTP-family egress concretizes a wildcard target from the request authority
+/// at dispatch, so a wildcard host is inert only on stream-family ports: the
+/// stream materializer applies the SHARED [`egress_host_is_unresolvable_wildcard`]
+/// predicate and skips the host. This wrapper reads `resolution` through
+/// [`service_entry_resolution`] (defaulting to `NONE`) and the endpoint count
+/// from `spec.endpoints`, and reports `true` only when at least one port is
+/// stream-family, so `istio_status::service_entry_status` can never claim a
+/// stream host is materialized that the materializer skips — the same
+/// lock-step contract [`service_entry_port_protocol_is_udp`] provides for the
+/// UDP lane.
+pub(crate) fn service_entry_spec_has_unresolvable_stream_wildcard_host(spec: &Value) -> bool {
+    let has_stream_port = spec
+        .get("ports")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|port| {
+            service_entry_port_protocol_is_stream_family(
+                port.get("protocol").and_then(Value::as_str),
+            )
+        });
+    if !has_stream_port {
+        return false;
+    }
     let resolution = service_entry_resolution(spec);
     let endpoint_count = spec
         .get("endpoints")

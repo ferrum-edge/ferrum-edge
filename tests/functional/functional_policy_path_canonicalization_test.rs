@@ -21,6 +21,7 @@ use ferrum_edge::tls::acme::{
 use http::{HeaderMap, Method, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
+use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -28,6 +29,9 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
+use tokio_tungstenite::tungstenite::handshake::server::{
+    Request as WsRequest, Response as WsResponse,
+};
 
 // ============================================================================
 // Request-target recording backend
@@ -69,6 +73,12 @@ impl RecordingBackend {
                             Ok(0) | Err(_) => return,
                             Ok(read) => buffer.extend_from_slice(&chunk[..read]),
                         }
+                    }
+                    // Capability refresh probes h2c even when pool warmup is
+                    // disabled. Its connection preface is not an HTTP/1
+                    // request and must not become a recorded "*" target.
+                    if buffer.starts_with(b"PRI * HTTP/2.0\r\n\r\n") {
+                        return;
                     }
                     let text = String::from_utf8_lossy(&buffer).into_owned();
                     let target = text
@@ -164,6 +174,13 @@ async fn spawn_gateway(
     backend_port: u16,
     acme_store_dir: Option<&std::path::Path>,
 ) -> (TestGateway, u16) {
+    spawn_path_gateway(&build_config(backend_port), acme_store_dir).await
+}
+
+async fn spawn_path_gateway(
+    config: &str,
+    acme_store_dir: Option<&std::path::Path>,
+) -> (TestGateway, u16) {
     const MAX_ATTEMPTS: usize = 5;
     let mut last_error = String::new();
 
@@ -189,7 +206,7 @@ async fn spawn_gateway(
         drop(reservation);
 
         let mut builder = TestGateway::builder()
-            .mode_file(build_config(backend_port))
+            .mode_file(config.to_string())
             .log_level("warn")
             .max_attempts(1)
             .env("FERRUM_ENABLE_HTTP3", "true")
@@ -969,4 +986,527 @@ async fn functional_acme_http01_shares_the_canonical_policy_path() {
     }
 
     gateway.shutdown();
+}
+
+// Path-coordinate regressions use real transport clients and record the
+// upstream request target, so a successful but misrouted request still fails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoordinateFlavor {
+    Http,
+    Grpc,
+    GrpcWeb,
+    WebSocket,
+}
+
+async fn coordinate_backend(flavor: CoordinateFlavor) -> RecordingBackend {
+    if flavor == CoordinateFlavor::Http {
+        return RecordingBackend::start().await;
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let targets = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&targets);
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let recorded = Arc::clone(&recorded);
+            tokio::spawn(async move {
+                if flavor == CoordinateFlavor::WebSocket {
+                    // Tungstenite requires its unboxed ErrorResponse at this callback boundary.
+                    #[allow(clippy::result_large_err)]
+                    let callback = move |req: &WsRequest, response: WsResponse| {
+                        recorded.lock().unwrap().push(req.uri().path().to_string());
+                        Ok(response)
+                    };
+                    if let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(stream, callback).await
+                    {
+                        use futures_util::StreamExt;
+                        while ws.next().await.is_some() {}
+                    }
+                } else {
+                    let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+                        let recorded = Arc::clone(&recorded);
+                        async move {
+                            let path = req.uri().path().to_string();
+                            recorded.lock().unwrap().push(path.clone());
+                            let _ = req.into_body().collect().await;
+                            if path == "/base/failure" {
+                                return Err(std::io::Error::other("intentional backend reset"));
+                            }
+                            Ok::<_, std::io::Error>(
+                                hyper::Response::builder()
+                                    .header("content-type", "application/grpc")
+                                    .header("grpc-status", "0")
+                                    .body(Full::new(Bytes::new()))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                }
+            });
+        }
+    });
+    RecordingBackend {
+        port,
+        targets,
+        handle,
+    }
+}
+
+fn coordinate_config(port: u16, flavor: CoordinateFlavor) -> String {
+    use serde_json::json;
+    let mut proxies = Vec::new();
+    let mut plugins = Vec::new();
+    for (id, listen, rewrite) in [
+        ("guard", "~^/guard/.*", None),
+        ("rewrite", "/entry", Some("/é")),
+        ("suffix", "/prefix", Some("/users")),
+        ("stable", "/stable", None),
+        ("failure", "~^/failure/.*", None),
+    ] {
+        let mut attachments = Vec::new();
+        if id == "guard" || id == "failure" {
+            let plugin_id = format!("coordinate-auth-{id}");
+            attachments.push(json!({"plugin_config_id": plugin_id}));
+            plugins.push(json!({
+                "id": plugin_id, "plugin_name": "key_auth",
+                "scope": "proxy", "proxy_id": id, "enabled": true,
+                "config": {"key_location": "header:X-Api-Key"}
+            }));
+        }
+        if let Some(rewrite) = rewrite {
+            let plugin_id = format!("coordinate-{id}");
+            attachments.push(json!({"plugin_config_id": plugin_id}));
+            plugins.push(json!({
+                "id": plugin_id, "plugin_name": "mesh_route_dispatch",
+                "scope": "proxy", "proxy_id": id, "enabled": true,
+                "config": {"rules": [{
+                    "match": {"uri": {"prefix": listen}},
+                    "destination": {"backend_host": "127.0.0.1", "backend_port": port},
+                    "rewrite": {"uri": rewrite, "match_prefix": listen}
+                }]}
+            }));
+        }
+        if flavor == CoordinateFlavor::GrpcWeb {
+            let plugin_id = format!("coordinate-web-{id}");
+            attachments.push(json!({"plugin_config_id": plugin_id}));
+            plugins.push(json!({
+                "id": plugin_id, "plugin_name": "grpc_web",
+                "scope": "proxy", "proxy_id": id, "enabled": true, "config": {}
+            }));
+        }
+        proxies.push(json!({
+            "id": id, "listen_path": listen, "backend_scheme": "http",
+            "backend_host": "127.0.0.1", "backend_port": port,
+            "backend_path": if id == "failure" { "/base/failure" } else { "/base/check" },
+            "strip_listen_path": true,
+            "pool_enable_http2": false, "plugins": attachments
+        }));
+    }
+    json!({
+        "version": "1", "proxies": proxies, "plugin_configs": plugins,
+        "upstreams": [], "consumers": [{
+            "id": "coordinate-user", "username": "coordinate-user",
+            "credentials": {"keyauth": [{"key": "coordinate-test-key"}]}
+        }]
+    })
+    .to_string()
+}
+
+async fn coordinate_send(
+    protocol: u8,
+    port: u16,
+    target: &str,
+    flavor: CoordinateFlavor,
+    authenticated: bool,
+) -> RpcResponse {
+    let websocket = flavor == CoordinateFlavor::WebSocket;
+    let content_type = match flavor {
+        CoordinateFlavor::Grpc => Some("application/grpc"),
+        CoordinateFlavor::GrpcWeb => Some("application/grpc-web+proto"),
+        _ => None,
+    };
+    // A zero-length protobuf message still has a five-byte gRPC envelope.
+    // An empty upload is rejected by grpc_web before backend dispatch.
+    let request_body = if content_type.is_some() {
+        Bytes::from_static(b"\x00\x00\x00\x00\x00")
+    } else {
+        Bytes::new()
+    };
+    let method = if websocket && protocol != 1 {
+        Method::CONNECT
+    } else if content_type.is_some() {
+        Method::POST
+    } else {
+        Method::GET
+    };
+    let scheme = if protocol == 3 { "https" } else { "http" };
+    let url = format!("{scheme}://127.0.0.1:{port}{target}");
+    if protocol == 3 {
+        let client = Http3Client::insecure().unwrap();
+        if websocket {
+            let mut options = crate::scaffolding::clients::WebSocketOptions::default();
+            if authenticated {
+                options
+                    .headers
+                    .push(("x-api-key".into(), "coordinate-test-key".into()));
+            }
+            let response = client.websocket(&url, options).await.unwrap();
+            return RpcResponse {
+                status: response.status,
+                headers: response.headers.clone(),
+                body: Bytes::new(),
+            };
+        }
+        let mut options = GetOptions::default().method(method).body(request_body);
+        if let Some(content_type) = content_type {
+            options = options.header("content-type", content_type);
+        }
+        if authenticated {
+            options = options.header("x-api-key", "coordinate-test-key");
+        }
+        let response = client.get_with_options(&url, options).await.unwrap();
+        assert!(response.body_error.is_none(), "incomplete H3 response");
+        let mut headers = response.headers;
+        if let Some(trailers) = response.trailers {
+            headers.extend(trailers);
+        }
+        return RpcResponse {
+            status: response.status,
+            headers,
+            body: response.body_bytes,
+        };
+    }
+    let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(if protocol == 1 { target } else { &url })
+        .header("host", format!("127.0.0.1:{port}"));
+    if let Some(content_type) = content_type {
+        builder = builder.header("content-type", content_type);
+    }
+    if authenticated {
+        builder = builder.header("x-api-key", "coordinate-test-key");
+    }
+    if websocket {
+        builder = builder.header("sec-websocket-version", "13");
+        if protocol == 1 {
+            builder = builder
+                .header("connection", "Upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
+        }
+    }
+    let mut request = builder.body(Full::new(request_body)).unwrap();
+    if websocket && protocol == 2 {
+        request
+            .extensions_mut()
+            .insert(hyper::ext::Protocol::from_static("websocket"));
+    }
+    let (response, task) = if protocol == 1 {
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        let task = tokio::spawn(async move {
+            let _ = conn.with_upgrades().await;
+        });
+        (sender.send_request(request).await.unwrap(), task)
+    } else {
+        let (mut sender, conn) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+                .await
+                .unwrap();
+        let task = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        (sender.send_request(request).await.unwrap(), task)
+    };
+    let (parts, body) = response.into_parts();
+    let mut headers = parts.headers;
+    let body = if websocket {
+        Bytes::new()
+    } else {
+        let collected = body.collect().await.unwrap();
+        if let Some(trailers) = collected.trailers() {
+            headers.extend(trailers.clone());
+        }
+        collected.to_bytes()
+    };
+    task.abort();
+    RpcResponse {
+        status: parts.status,
+        headers,
+        body,
+    }
+}
+
+async fn coordinate_matrix(flavor: CoordinateFlavor) {
+    let backend = coordinate_backend(flavor).await;
+    let config = coordinate_config(backend.port, flavor);
+    let (mut gateway, https_port) = spawn_path_gateway(&config, None).await;
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(15))
+        .await
+        .unwrap();
+    for protocol in 1..=3 {
+        if flavor == CoordinateFlavor::Grpc && protocol == 1 {
+            continue;
+        }
+        let port = if protocol == 3 {
+            https_port
+        } else {
+            gateway.proxy_port
+        };
+        for (target, authenticated, expected) in [
+            ("/guard/plain", false, None),
+            ("/guard/aaa€", false, None),
+            ("/guard/plain", true, Some("/base/check")),
+            ("/guard/aaa€", true, Some("/base/check")),
+            ("/entry/€", false, Some("/base/check/é/€")),
+            ("/entry/users", false, Some("/base/check/é/users")),
+            ("/prefix/users", false, Some("/base/check/users/users")),
+            ("/stable/users", false, Some("/base/check/users")),
+        ] {
+            assert_eq!(backend.take_targets(), Vec::<String>::new());
+            let response = tokio::time::timeout(
+                Duration::from_secs(15),
+                coordinate_send(protocol, port, target, flavor, authenticated),
+            )
+            .await
+            .expect("coordinate exchange timed out");
+            let label = format!("{flavor:?} H{protocol} {target} auth={authenticated}");
+            let rpc = matches!(flavor, CoordinateFlavor::Grpc | CoordinateFlavor::GrpcWeb);
+            let status = if expected.is_none() && !rpc {
+                401
+            } else if expected.is_some() && flavor == CoordinateFlavor::WebSocket && protocol == 1 {
+                101
+            } else {
+                200
+            };
+            assert_eq!(response.status.as_u16(), status, "{label}");
+            if expected.is_none() && flavor == CoordinateFlavor::Http {
+                let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+                assert!(
+                    body["error"].is_string(),
+                    "{label}: authentication refusal body"
+                );
+            }
+            if flavor == CoordinateFlavor::Grpc {
+                let expected_status = if expected.is_some() { "0" } else { "16" };
+                assert_eq!(response.headers["grpc-status"], expected_status, "{label}");
+            } else if flavor == CoordinateFlavor::GrpcWeb {
+                let expected_status = if expected.is_some() {
+                    "grpc-status: 0"
+                } else {
+                    "grpc-status: 16"
+                };
+                assert!(
+                    String::from_utf8_lossy(&response.body).contains(expected_status),
+                    "{label}: headers={:?}, body={:?}",
+                    response.headers,
+                    response.body
+                );
+            }
+            let expected: Vec<String> = expected
+                .into_iter()
+                .map(|path| {
+                    if flavor == CoordinateFlavor::Http {
+                        path.replace('é', "%C3%A9").replace('€', "%E2%82%AC")
+                    } else {
+                        path.to_string()
+                    }
+                })
+                .collect();
+            assert_eq!(
+                backend.take_targets(),
+                expected,
+                "{label}: actual upstream path"
+            );
+        }
+    }
+    if flavor == CoordinateFlavor::Grpc {
+        // Exercise the separate native-gRPC backend-error summary and then
+        // prove the gateway can still serve another authenticated request.
+        let response = tokio::time::timeout(
+            Duration::from_secs(15),
+            coordinate_send(2, gateway.proxy_port, "/failure/aaa€", flavor, true),
+        )
+        .await
+        .expect("backend-error response timed out");
+        assert_eq!(response.status, StatusCode::OK);
+        assert_ne!(response.headers["grpc-status"], "0");
+        assert_eq!(backend.take_targets(), vec!["/base/failure".to_string()]);
+        let response = coordinate_send(2, gateway.proxy_port, "/guard/plain", flavor, true).await;
+        assert_eq!(response.headers["grpc-status"], "0");
+        assert_eq!(backend.take_targets(), vec!["/base/check".to_string()]);
+    }
+    gateway.shutdown();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_path_coordinates_http() {
+    coordinate_matrix(CoordinateFlavor::Http).await;
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_path_coordinates_grpc() {
+    coordinate_matrix(CoordinateFlavor::Grpc).await;
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_path_coordinates_grpc_web() {
+    coordinate_matrix(CoordinateFlavor::GrpcWeb).await;
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_path_coordinates_websocket() {
+    coordinate_matrix(CoordinateFlavor::WebSocket).await;
+}
+
+async fn rewritten_path_matrix(flavor: CoordinateFlavor) {
+    use serde_json::json;
+
+    let backend = coordinate_backend(flavor).await;
+    let config_text = coordinate_config(backend.port, flavor);
+    let mut config: serde_json::Value =
+        serde_json::from_str(&config_text).expect("coordinate fixture config");
+    // Reuse the existing authentication and protocol setup, with one root
+    // route so raw prefix tails reach mesh_route_dispatch unchanged.
+    let mut proxy = config["proxies"][0].clone();
+    proxy["listen_path"] = json!("/");
+    proxy["backend_path"] = json!("/base");
+    let attachments = proxy["plugins"].as_array_mut().unwrap();
+    attachments.push(json!({"plugin_config_id": "composed-rewrite"}));
+    config["proxies"] = json!([proxy]);
+    let plugins = config["plugin_configs"].as_array_mut().unwrap();
+    plugins.retain(|plugin| plugin["proxy_id"] == "guard");
+    plugins.push(json!({
+        "id": "composed-rewrite", "plugin_name": "mesh_route_dispatch",
+        "scope": "proxy", "proxy_id": "guard", "enabled": true,
+        "config": {"rules": [
+            {
+                "match": {"uri": {"prefix": "/api"}},
+                "destination": {"backend_host": "127.0.0.1", "backend_port": backend.port},
+                "rewrite": {"uri": "/v2", "match_prefix": "/api"}
+            },
+            {
+                "match": {"uri": {"prefix": "/slash"}},
+                "destination": {"backend_host": "127.0.0.1", "backend_port": backend.port},
+                "rewrite": {"uri": "/v2/", "match_prefix": "/slash"}
+            }
+        ]}
+    }));
+    let (mut gateway, https_port) = spawn_path_gateway(&config.to_string(), None).await;
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(15))
+        .await
+        .unwrap();
+    for protocol in 1..=3 {
+        if flavor == CoordinateFlavor::Grpc && protocol == 1 {
+            continue;
+        }
+        let port = if protocol == 3 {
+            https_port
+        } else {
+            gateway.proxy_port
+        };
+        for (target, authenticated, status, expected_path) in [
+            ("/api/users", false, 401, None),
+            ("/api../admin", false, 401, None),
+            ("/api../admin", true, 400, None),
+            ("/api..", true, 400, None),
+            ("/api./users", true, 400, None),
+            ("/slash../admin", true, 400, None),
+            ("/api/%2e%2e/admin", true, 400, None),
+            ("/api%2fusers", true, 400, None),
+            ("/api/users", true, 200, Some("/base/v2/users")),
+            ("/slash/users", true, 200, Some("/base/v2/users")),
+            (
+                "/api..hidden/users",
+                true,
+                200,
+                Some("/base/v2/..hidden/users"),
+            ),
+            ("/other/users", true, 200, Some("/base/other/users")),
+        ] {
+            assert!(backend.take_targets().is_empty());
+            let response = tokio::time::timeout(
+                Duration::from_secs(15),
+                coordinate_send(protocol, port, target, flavor, authenticated),
+            )
+            .await
+            .expect("rewritten path exchange timed out");
+            let label = format!("{flavor:?} H{protocol} {target} auth={authenticated}");
+            let rpc = matches!(flavor, CoordinateFlavor::Grpc | CoordinateFlavor::GrpcWeb);
+            let expected_status = if rpc {
+                200
+            } else if status == 200 && flavor == CoordinateFlavor::WebSocket && protocol == 1 {
+                101
+            } else {
+                status
+            };
+            assert_eq!(response.status.as_u16(), expected_status, "{label}");
+            let grpc_status = match status {
+                200 => "0",
+                401 => "16",
+                _ => "3",
+            };
+            if flavor == CoordinateFlavor::Grpc {
+                assert_eq!(response.headers["grpc-status"], grpc_status, "{label}");
+            } else if flavor == CoordinateFlavor::GrpcWeb {
+                assert!(
+                    String::from_utf8_lossy(&response.body)
+                        .contains(&format!("grpc-status: {grpc_status}")),
+                    "{label}: {:?}",
+                    response.body
+                );
+            } else if flavor == CoordinateFlavor::Http && status == 400 {
+                let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+                assert!(body["error"].is_string(), "{label}: fixed error envelope");
+                assert!(!String::from_utf8_lossy(&response.body).contains(target));
+            }
+            assert_eq!(
+                backend.take_targets(),
+                expected_path
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+                "{label}: actual upstream path"
+            );
+        }
+    }
+    gateway.shutdown();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_rewritten_path_http() {
+    rewritten_path_matrix(CoordinateFlavor::Http).await;
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_rewritten_path_grpc() {
+    rewritten_path_matrix(CoordinateFlavor::Grpc).await;
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_rewritten_path_grpc_web() {
+    rewritten_path_matrix(CoordinateFlavor::GrpcWeb).await;
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_rewritten_path_websocket() {
+    rewritten_path_matrix(CoordinateFlavor::WebSocket).await;
 }

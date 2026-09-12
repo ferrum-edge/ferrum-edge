@@ -1887,6 +1887,7 @@ fn stage_frontend_tls_snapshot(
                         .as_deref(),
                     tls_policy,
                     proxy_state.env_config.tls_cert_expiry_warning_days,
+                    proxy_state.env_config.tls_crl_expiry_warning_days,
                     proxy_state.crls.as_ref().as_slice(),
                     handshake_scope,
                 )
@@ -2255,7 +2256,10 @@ async fn connect_and_subscribe_with_startup_ready_inner(
         ConfigSyncClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
             req.metadata_mut().insert("authorization", token.clone());
             Ok(req)
-        });
+        })
+        .max_decoding_message_size(
+            crate::modes::mesh::config_consumer::common::MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE,
+        );
 
     info!(
         "Connected to CP, subscribing for config updates (DP v{})",

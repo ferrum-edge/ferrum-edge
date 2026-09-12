@@ -529,7 +529,8 @@ fn assert_subset_preparation(config: &GatewayConfig, expected: ExpectedSubsetPre
             target.port,
             strip_len,
             target.path.as_deref(),
-        );
+        )
+        .unwrap();
         assert_eq!(
             backend_url,
             format!(

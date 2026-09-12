@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use serial_test::serial;
 
 use crate::common::containers::{
-    RedpandaContainer, fail_in_ci_else_skip, start_redpanda_container,
+    RedpandaContainer, fail_in_ci_else_skip, start_redpanda_container, start_redpanda_tls_container,
 };
 
 async fn redpanda(test: &str) -> Option<RedpandaContainer> {
@@ -125,6 +125,190 @@ where
             return snap;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Exercise the compiled TLS/SCRAM implementation, including metadata-selected
+/// brokers. Missing native TLS support or fixture setup is a failure, never a skip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn kafka_logging_tls_and_scram_deliver_and_reject_invalid_trust() {
+    let fixture = start_redpanda_tls_container()
+        .await
+        .expect("TLS broker is required");
+    for (protocol, bootstrap) in [
+        ("ssl", &fixture.ssl_bootstrap),
+        ("sasl_ssl", &fixture.sasl_ssl_bootstrap),
+    ] {
+        let topic = format!("ferrum-{protocol}");
+        fixture
+            .broker
+            .create_topic(&topic, &[])
+            .await
+            .expect("create TLS topic");
+        let mut config = json!({
+            "security_protocol": protocol,
+            "ssl_ca_location": fixture.ca_path,
+            "ssl_no_verify": false
+        });
+        if protocol == "sasl_ssl" {
+            config["sasl_mechanism"] = json!("SCRAM-SHA-256");
+            config["sasl_username"] = json!("ferrum-test");
+            config["sasl_password"] = json!("fixture-password");
+        }
+        let marker = format!("/kafka-verified-{protocol}");
+        let producer = plugin(bootstrap, &topic, config.clone());
+        producer.log(&summary(&marker, "203.0.113.60")).await;
+        let delivered = wait_snapshot(&producer, Duration::from_secs(20), |snap| {
+            snap.delivered_total + snap.delivery_failed_total >= 1
+        })
+        .await;
+        assert_eq!(
+            delivered.delivered_total, 1,
+            "{protocol} must receive a broker ack"
+        );
+        assert_eq!(delivered.delivery_failed_total, 0);
+        assert_eq!(delivered.queue_rejected_total, 0);
+        let (key, payload) = fixture
+            .broker
+            .consume_one(&topic, Duration::from_secs(10))
+            .await
+            .expect("consume TLS record")
+            .expect("TLS record must be retained");
+        assert_eq!(key.as_deref(), Some("203.0.113.60"));
+        assert!(payload.contains(&marker));
+        producer.finalize().await;
+        assert_eq!(producer.snapshot().flush_failures_total, 0);
+
+        // A valid but unrelated CA must prevent delivery on both transports.
+        config["ssl_ca_location"] = json!(fixture.wrong_ca_path);
+        config["message_timeout_ms"] = json!(3_000);
+        let untrusted = plugin(bootstrap, &topic, config.clone());
+        untrusted
+            .log(&summary("/must-not-deliver", "203.0.113.61"))
+            .await;
+        let failed = wait_snapshot(&untrusted, Duration::from_secs(10), |snap| {
+            snap.delivered_total + snap.delivery_failed_total >= 1
+        })
+        .await;
+        assert_eq!(
+            failed.delivered_total, 0,
+            "{protocol} must verify the broker certificate"
+        );
+        assert_eq!(failed.delivery_failed_total, 1);
+        untrusted.finalize().await;
+
+        if protocol == "sasl_ssl" {
+            config["ssl_ca_location"] = json!(fixture.ca_path);
+            config["sasl_password"] = json!("wrong-fixture-password");
+            let unauthenticated = plugin(bootstrap, &topic, config);
+            unauthenticated
+                .log(&summary("/must-not-authenticate", "203.0.113.62"))
+                .await;
+            let failed = wait_snapshot(&unauthenticated, Duration::from_secs(10), |snap| {
+                snap.delivered_total + snap.delivery_failed_total >= 1
+            })
+            .await;
+            assert_eq!(
+                failed.delivered_total, 0,
+                "SCRAM must authenticate the client"
+            );
+            assert_eq!(failed.delivery_failed_total, 1);
+            unauthenticated.finalize().await;
+        }
+    }
+}
+
+/// Verify admission and HTTP -> Kafka delivery using the actual Cargo-built
+/// gateway executable, not just the plugin linked into this test process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn kafka_logging_tls_gateway_artifact_acceptance() {
+    use crate::common::echo_servers::spawn_http_echo;
+    use crate::common::gateway_harness::TestGateway;
+
+    let fixture = start_redpanda_tls_container()
+        .await
+        .expect("TLS broker is required");
+    let echo = spawn_http_echo().await.expect("HTTP backend");
+    let files = tempfile::tempdir().expect("artifact configs");
+    for (protocol, bootstrap) in [
+        ("ssl", &fixture.ssl_bootstrap),
+        ("sasl_ssl", &fixture.sasl_ssl_bootstrap),
+    ] {
+        let topic = format!("artifact-{protocol}");
+        fixture
+            .broker
+            .create_topic(&topic, &[])
+            .await
+            .expect("artifact topic");
+        let mut plugin_config = json!({
+            "broker_list": bootstrap, "topic": topic,
+            "security_protocol": protocol, "acks": "all",
+            "ssl_ca_location": fixture.ca_path, "message_timeout_ms": 10_000
+        });
+        if protocol == "sasl_ssl" {
+            plugin_config["sasl_mechanism"] = json!("SCRAM-SHA-256");
+            plugin_config["sasl_username"] = json!("ferrum-test");
+            plugin_config["sasl_password"] = json!("fixture-password");
+        }
+        let config = json!({
+            "version": "1", "consumers": [],
+            "proxies": [{"id": "kafka-proxy", "listen_path": "/audit",
+                "backend_scheme": "http", "backend_host": "127.0.0.1",
+                "backend_port": echo.port}],
+            "plugin_configs": [{"id": "kafka-audit", "plugin_name": "kafka_logging",
+                "scope": "global", "enabled": true, "config": plugin_config}]
+        });
+        let config_path = files.path().join(format!("{protocol}.json"));
+        std::fs::write(&config_path, config.to_string()).expect("write artifact config");
+        let output = tokio::time::timeout(
+            Duration::from_secs(20),
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_ferrum-edge"))
+                .args(["validate", "--mode", "file", "--spec"])
+                .arg(&config_path)
+                .env("FERRUM_BACKEND_ALLOW_IPS", "both")
+                .env("FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES", "false")
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("offline validation deadline")
+        .expect("run validate");
+        assert!(
+            output.status.success(),
+            "{protocol} artifact validation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let mut gateway = TestGateway::builder()
+            .mode_file(config.to_string())
+            .skip_auto_build()
+            .env("FERRUM_BACKEND_ALLOW_IPS", "both")
+            .env("FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES", "false")
+            .spawn()
+            .await
+            .expect("start TLS logging artifact");
+        gateway
+            .wait_for_proxy_port(Duration::from_secs(10))
+            .await
+            .expect("proxy ready");
+        let marker = format!("/audit/artifact-{protocol}");
+        let response = crate::common::containers::fixture_http_client()
+            .get(gateway.proxy_url(&marker))
+            .send()
+            .await
+            .expect("proxy request");
+        assert!(response.status().is_success());
+        let _ = response.bytes().await.expect("finish HTTP body");
+        let (_, payload) = fixture
+            .broker
+            .consume_one(&topic, Duration::from_secs(20))
+            .await
+            .expect("consume artifact record")
+            .expect("artifact must deliver over TLS");
+        assert!(payload.contains(&marker));
+        gateway.shutdown();
     }
 }
 

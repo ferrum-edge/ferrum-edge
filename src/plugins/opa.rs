@@ -6,6 +6,8 @@
 //! sensitive client headers and query credentials before forwarding request
 //! context to OPA.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -15,7 +17,7 @@ use http::header::{CONTENT_TYPE, HeaderName, HeaderValue};
 use serde::Serialize;
 use serde::ser::SerializeMap;
 use serde_json::{Map, Value};
-use tracing::{info, warn};
+use tracing::info;
 use url::{Host, Url};
 
 use crate::retry::classify_reqwest_error;
@@ -104,6 +106,13 @@ impl Serialize for OpaInputPayload<'_> {
 pub struct Opa {
     http_client: PluginHttpClient,
     decision_url: String,
+    /// Structural `scheme://host[:port]/redacted` rendering of `decision_url`,
+    /// precomputed once so the shared client's slow-call and egress-denial
+    /// diagnostics never print the configured base path. `opa_host` rejects
+    /// userinfo, query, and fragment, but it does accept a base PATH, and a
+    /// deployment may put a reusable credential there
+    /// (GHSA-4ghp-v85j-5hvq).
+    redacted_decision_url: String,
     decision_hostname: String,
     custom_headers: Vec<(HeaderName, HeaderValue)>,
     timeout: Duration,
@@ -129,6 +138,24 @@ pub struct Opa {
     query_ambiguity_policy: QueryAmbiguityPolicy,
     redact_headers: HashSet<String>,
     redact_query_keys: HashSet<String>,
+}
+
+/// Outcome of the network half of one decision call: everything decided while
+/// the shared HTTP client is still measuring external I/O.
+///
+/// JSON parsing and policy evaluation deliberately happen after the measured
+/// span closes, so CPU time is never attributed to network I/O.
+enum OpaDecisionFetch {
+    /// The complete decision document, within the configured byte ceiling.
+    Body(bytes::Bytes),
+    /// `Content-Length` already exceeded the configured ceiling.
+    DeclaredTooLarge,
+    /// The streamed body crossed the ceiling before it finished.
+    StreamedTooLarge,
+    /// The body read failed mid-stream; carries only the error CLASS.
+    ReadFailed(String),
+    /// OPA answered with a non-2xx status.
+    NonSuccess(u16),
 }
 
 /// What to do when the request query cannot be reduced to one decoded view
@@ -171,7 +198,8 @@ impl Opa {
             .ok_or_else(|| "opa: config must be a JSON object".to_string())?;
         reject_unknown_keys(object)?;
 
-        let (decision_url, decision_hostname) = parse_decision_endpoint(object)?;
+        let (decision_url, redacted_decision_url, decision_hostname) =
+            parse_decision_endpoint(object)?;
         if decision_url.starts_with("https://") {
             info!(
                 plugin = "opa",
@@ -210,6 +238,7 @@ impl Opa {
         Ok(Self {
             http_client,
             decision_url,
+            redacted_decision_url,
             decision_hostname,
             custom_headers,
             timeout: Duration::from_millis(timeout_ms),
@@ -476,7 +505,7 @@ impl Opa {
     }
 
     fn on_error(&self, reason: &'static str, detail: String) -> PluginResult {
-        warn!(
+        warn_sampled!(
             plugin = "opa",
             reason = reason,
             detail = %detail,
@@ -535,7 +564,7 @@ impl Plugin for Opa {
             // The reason is a fixed-cardinality token; query bytes are
             // attacker-controlled and may carry credentials, so they are never
             // logged here.
-            warn!(
+            warn_sampled!(
                 plugin = "opa",
                 reason = "ambiguous_query",
                 ambiguity = ambiguity.reason(),
@@ -565,51 +594,66 @@ impl Plugin for Opa {
             request = request.header(name.clone(), value.clone());
         }
 
-        match self
+        // The decision is not made until the complete response document has
+        // arrived, so the body wait is part of the external I/O this plugin
+        // performs. Measuring it inside the shared call keeps
+        // `latency_plugin_external_io_ms` and the slow-call threshold on the
+        // same boundary the decision actually waits for; a policy service that
+        // flushes headers immediately and its decision 180 ms later is
+        // otherwise invisible in both (issue #5059). Only the read runs inside
+        // the closure — JSON parsing and evaluation stay outside so CPU time is
+        // never reported as network time.
+        let max_response_bytes = self.max_response_bytes;
+        let fetched = self
             .http_client
-            .execute_tracked(request, "opa", &ctx.plugin_http_call_ns)
-            .await
-        {
-            Ok(response) if response.status().is_success() => {
-                if response
-                    .content_length()
-                    .is_some_and(|length| length > self.max_response_bytes as u64)
-                {
-                    return self.on_error(
-                        "opa_response_too_large",
-                        format!(
-                            "declared response length exceeds {} bytes",
-                            self.max_response_bytes
-                        ),
-                    );
-                }
+            .execute_redacted_tracked_through_body(
+                request,
+                "opa",
+                &self.redacted_decision_url,
+                &ctx.plugin_http_call_ns,
+                move |response| async move {
+                    if !response.status().is_success() {
+                        return OpaDecisionFetch::NonSuccess(response.status().as_u16());
+                    }
+                    if response
+                        .content_length()
+                        .is_some_and(|length| length > max_response_bytes as u64)
+                    {
+                        return OpaDecisionFetch::DeclaredTooLarge;
+                    }
+                    match read_response_body_bounded(response, max_response_bytes).await {
+                        Ok(bytes) => OpaDecisionFetch::Body(bytes),
+                        Err(BoundedReadError::LimitExceeded { .. }) => {
+                            OpaDecisionFetch::StreamedTooLarge
+                        }
+                        Err(BoundedReadError::Stream(error)) => {
+                            OpaDecisionFetch::ReadFailed(classify_reqwest_error(&error).to_string())
+                        }
+                    }
+                },
+            )
+            .await;
 
-                match read_response_body_bounded(response, self.max_response_bytes).await {
-                    Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
-                        Ok(body) => self.evaluate(&body),
-                        Err(error) => self.on_error("opa_response_parse_failed", error.to_string()),
-                    },
-                    Err(BoundedReadError::LimitExceeded { .. }) => self.on_error(
-                        "opa_response_too_large",
-                        format!(
-                            "response exceeded configured {} byte limit",
-                            self.max_response_bytes
-                        ),
-                    ),
-                    Err(BoundedReadError::Stream(error)) => self.on_error(
-                        "opa_response_read_failed",
-                        classify_reqwest_error(&error).to_string(),
-                    ),
-                }
+        match fetched {
+            Ok(OpaDecisionFetch::Body(bytes)) => match serde_json::from_slice::<Value>(&bytes) {
+                Ok(body) => self.evaluate(&body),
+                Err(error) => self.on_error("opa_response_parse_failed", error.to_string()),
+            },
+            Ok(OpaDecisionFetch::DeclaredTooLarge) => self.on_error(
+                "opa_response_too_large",
+                format!("declared response length exceeds {max_response_bytes} bytes"),
+            ),
+            Ok(OpaDecisionFetch::StreamedTooLarge) => self.on_error(
+                "opa_response_too_large",
+                format!("response exceeded configured {max_response_bytes} byte limit"),
+            ),
+            Ok(OpaDecisionFetch::ReadFailed(error_class)) => {
+                self.on_error("opa_response_read_failed", error_class)
             }
-            Ok(response) => self.on_error(
-                "opa_non_success_status",
-                response.status().as_u16().to_string(),
-            ),
-            Err(error) => self.on_error(
-                "opa_call_failed",
-                classify_reqwest_error(&error).to_string(),
-            ),
+            Ok(OpaDecisionFetch::NonSuccess(status)) => {
+                self.on_error("opa_non_success_status", status.to_string())
+            }
+            Err(error) => self.on_error("opa_call_failed", error),
         }
     }
 
@@ -646,7 +690,11 @@ impl Plugin for Opa {
     }
 }
 
-fn parse_decision_endpoint(object: &Map<String, Value>) -> Result<(String, String), String> {
+/// Parse `opa_host` + `policy_path` into the wire decision URL, its
+/// diagnostic-safe rendering, and the hostname used for DNS warmup.
+fn parse_decision_endpoint(
+    object: &Map<String, Value>,
+) -> Result<(String, String, String), String> {
     let opa_host = required_string(object, "opa_host")?;
     let parsed =
         Url::parse(opa_host).map_err(|error| format!("opa: invalid 'opa_host': {error}"))?;
@@ -688,10 +736,14 @@ fn parse_decision_endpoint(object: &Map<String, Value>) -> Result<(String, Strin
         OPA_DATA_PREFIX,
         policy_path
     );
-    Url::parse(&decision_url)
+    let parsed_decision_url = Url::parse(&decision_url)
         .map_err(|error| format!("opa: invalid decision URL from opa_host/policy_path: {error}"))?;
 
-    Ok((decision_url, hostname))
+    Ok((
+        decision_url,
+        crate::plugins::utils::redacted_endpoint_url(&parsed_decision_url),
+        hostname,
+    ))
 }
 
 fn validate_policy_path(policy_path: &str) -> Result<(), String> {

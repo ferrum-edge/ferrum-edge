@@ -58,7 +58,7 @@ The Dockerfile uses a **multi-stage build** for optimal size:
 |---|---|---|---|---|
 | `runtime` (default) | `:<tag>` | distroless | no (also no `ip`) | ordinary gateway |
 | `runtime-ebpf` | `:<tag>-ebpf` | distroless | no (`ip` only) | node-agent eBPF capture, TCP-only NodeWaypoint |
-| `runtime-ebpf-tools` | `:<tag>-ebpf-tools` | Debian 13 slim | **yes** | Ambient UDP capture lifecycle, NodeWaypoint UDP/DTLS Service-path steering, `FERRUM_NODE_AGENT_FALLBACK_MODE=iptables` |
+| `runtime-ebpf-tools` | `:<tag>-ebpf-tools` | Debian 13 slim | **yes** | Ambient UDP capture lifecycle, NodeWaypoint UDP/DTLS Service-path steering, injector iptables capture, `FERRUM_NODE_AGENT_FALLBACK_MODE=iptables` |
 
 **Image Features**:
 - **Distroless**: The ordinary target omits `ip`; the source-build `runtime-ebpf` target adds only `ip` and non-base resolved shared objects. Both contain no shell, package manager, `iptables`, or `ip6tables`. PR CI builds both targets, runs their expected entrypoints, and inspects normalized exported filesystems for forbidden runtime tools

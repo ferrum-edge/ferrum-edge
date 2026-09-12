@@ -5,7 +5,7 @@ use ferrum_edge::config::db_loader::IncrementalResult;
 use ferrum_edge::config::types::{
     CircuitBreakerConfig, GatewayConfig, LoadBalancerAlgorithm, UpstreamTarget,
 };
-use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
+use ferrum_edge::proxy::{ConfigApplyOutcome, HalfOpenProbeGuard, ProxyState};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +17,7 @@ fn default_config() -> CircuitBreakerConfig {
         failure_status_codes: vec![500, 502, 503],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     }
 }
 
@@ -73,6 +74,7 @@ fn test_half_open_recovery() {
         failure_status_codes: vec![500],
         half_open_max_requests: 2,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
 
@@ -100,6 +102,7 @@ fn test_half_open_probe_failure_reopens() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
 
@@ -124,6 +127,7 @@ fn wall_clock_jumps_do_not_change_breaker_recovery_cycles() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
 
@@ -164,6 +168,7 @@ fn saturated_monotonic_tick_keeps_unrepresentable_breaker_wait_closed() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
 
@@ -181,6 +186,7 @@ fn open_state_half_open_straggler_does_not_refresh_recovery_timeout() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
 
@@ -208,6 +214,7 @@ fn test_half_open_non_failure_status_releases_probe_slot() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
 
@@ -264,6 +271,7 @@ fn grpc_gateway_side_error_releases_half_open_probe_without_reopening() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
     cb.record_failure(500, false, false);
@@ -325,6 +333,7 @@ fn test_half_open_client_disconnect_neutral_releases_probe_slot() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
 
@@ -372,6 +381,7 @@ fn record_success_without_probe_admission_still_advances_half_open() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
     cb.record_failure(500, false, false);
@@ -412,6 +422,7 @@ fn test_half_open_max_requests_enforced() {
         failure_status_codes: vec![500],
         half_open_max_requests: 2,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
 
@@ -439,6 +450,7 @@ fn test_half_open_slot_freed_on_success() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
 
@@ -465,6 +477,7 @@ fn test_half_open_concurrent_slots() {
         failure_status_codes: vec![500],
         half_open_max_requests: 5,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = Arc::new(CircuitBreaker::new(config));
 
@@ -498,6 +511,7 @@ fn test_concurrent_failure_recording() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = Arc::new(CircuitBreaker::new(config));
 
@@ -571,6 +585,7 @@ fn test_per_target_independent_breakers() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
 
     let tk_a = target_key("10.0.0.1", 8080);
@@ -609,6 +624,7 @@ fn test_per_target_does_not_share_with_direct_backend() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
 
     // Trip breaker for proxy-1 with no target (direct backend)
@@ -692,6 +708,7 @@ fn test_tcp_direct_backend_circuit_breaker_opens() {
         failure_status_codes: vec![502],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
 
     // Simulate two backend connect failures (no upstream → None target key).
@@ -725,6 +742,7 @@ fn test_tcp_upstream_backend_circuit_breaker_per_target() {
         failure_status_codes: vec![502],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
 
     let tk = target_key("backend.internal", 4000);
@@ -755,6 +773,7 @@ fn test_tcp_successful_connection_records_success() {
         failure_status_codes: vec![502],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
 
     // Trip the breaker open.
@@ -784,6 +803,7 @@ fn test_udp_session_failure_records_failure() {
         failure_status_codes: vec![502],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
 
     // Simulate two UDP socket connect failures.
@@ -811,6 +831,7 @@ fn test_udp_successful_session_records_success() {
         failure_status_codes: vec![502],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
 
     let cb = cache.get_or_create("ferrum", "udp-proxy-2", None, &config);
@@ -835,6 +856,7 @@ fn test_stream_proxy_rejects_when_circuit_open() {
         failure_status_codes: vec![502],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
 
     // Trip the breaker with a single failure.
@@ -862,6 +884,7 @@ fn test_connection_errors_trip_breaker_by_default() {
         failure_status_codes: vec![500], // Note: 502 is NOT in the list
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
 
@@ -882,6 +905,7 @@ fn test_connection_errors_ignored_when_disabled() {
         failure_status_codes: vec![500, 502],
         half_open_max_requests: 1,
         trip_on_connection_errors: false,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
 
@@ -907,6 +931,7 @@ fn test_status_code_failures_work_independently_of_connection_flag() {
         failure_status_codes: vec![500, 503],
         half_open_max_requests: 1,
         trip_on_connection_errors: false,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
 
@@ -925,6 +950,7 @@ fn test_connection_error_reopens_half_open() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
 
@@ -955,6 +981,7 @@ fn test_connection_error_probe_failure_releases_slot_for_next_cycle() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
 
@@ -993,6 +1020,7 @@ fn test_connection_error_ignored_in_half_open_when_disabled() {
         failure_status_codes: vec![500],
         half_open_max_requests: 2,
         trip_on_connection_errors: false,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
 
@@ -1024,6 +1052,7 @@ fn test_connection_error_ignored_in_half_open_releases_probe_slot() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: false,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
 
@@ -1053,6 +1082,7 @@ fn test_connection_errors_disabled_do_not_reset_failure_count() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: false,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
 
@@ -1243,6 +1273,7 @@ fn test_timeout_zero_transitions_immediately_to_half_open() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
 
@@ -1263,6 +1294,7 @@ fn test_timeout_does_not_transition_before_elapsed() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
 
@@ -1328,6 +1360,7 @@ fn test_concurrent_failure_and_success_recording() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = Arc::new(CircuitBreaker::new(config));
 
@@ -1397,6 +1430,7 @@ fn test_concurrent_half_open_probe_failures() {
             failure_status_codes: vec![500],
             half_open_max_requests: 4,
             trip_on_connection_errors: true,
+            half_open_probe_dwell_seconds: None,
         };
         let cb = Arc::new(CircuitBreaker::new(config));
 
@@ -1485,6 +1519,7 @@ fn test_concurrent_half_open_mixed_success_and_failure() {
             failure_status_codes: vec![500],
             half_open_max_requests: 4,
             trip_on_connection_errors: true,
+            half_open_probe_dwell_seconds: None,
         };
         let cb = Arc::new(CircuitBreaker::new(config));
 
@@ -1792,6 +1827,7 @@ fn test_can_execute_returns_half_open_probe_flag() {
         failure_status_codes: vec![500],
         half_open_max_requests: 2,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
 
@@ -1824,6 +1860,7 @@ fn test_closed_request_completing_in_open_does_not_decrement_counter() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
 
@@ -1877,6 +1914,7 @@ fn test_cache_can_execute_returns_probe_flag() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
 
     // CLOSED: not a probe
@@ -1919,6 +1957,7 @@ fn test_half_open_bound_and_no_wedge_under_admit_reopen_race_stress() {
         failure_status_codes: vec![500],
         half_open_max_requests: MAX,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = Arc::new(CircuitBreaker::new(config));
     cb.record_failure(500, false, false); // trip OPEN
@@ -2013,6 +2052,7 @@ fn half_open_probe_failure_after_recovery_counts_toward_threshold_not_reopen() {
         failure_status_codes: vec![500],
         half_open_max_requests: 2, // admit two probes so one can straggle
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
     for _ in 0..3 {
@@ -2083,6 +2123,7 @@ fn open_epoch_is_visible_to_a_probe_admitted_immediately_after_open() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
     assert_eq!(cb.open_epoch(), 0, "fresh breaker starts at generation 0");
@@ -2176,6 +2217,7 @@ fn open_generation_is_preserved_across_non_open_transitions() {
         failure_status_codes: vec![500],
         half_open_max_requests: 2,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cb = CircuitBreaker::new(config);
     assert_eq!(cb.open_epoch(), 0);
@@ -2224,6 +2266,7 @@ fn can_execute_with_admission_epoch_returns_the_admitted_generation() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     };
     let cache = CircuitBreakerCache::new();
     let proxy_id = "epoch-proxy";
@@ -2584,5 +2627,557 @@ fn ceiling_refusals_are_counted_and_a_scoped_prune_restores_admission() {
             .state_name(),
         "open",
         "a cached breaker accumulates failures and opens"
+    );
+}
+
+// ===========================================================================
+// HALF_OPEN probe-slot ownership (GHSA-4cq4-3f3f-mq76)
+//
+// A request admitted as the breaker's single HALF_OPEN probe used to signal
+// ownership of that slot with a bare `bool` threaded through every explicit
+// `record_*` call site. None of those sites run when the client disconnects
+// mid-probe — the transport drops the whole service future — so the packed
+// state stayed `(HALF_OPEN, count = 1)`. There is no timer out of HALF_OPEN, so
+// from that moment the gateway shed every later request to the backend.
+//
+// `HalfOpenProbeGuard` owns the slot instead, and these pin its four settle
+// paths: an explicit outcome, a gateway-side NEUTRAL refusal, a rotated retry
+// target, and `Drop`.
+// ===========================================================================
+
+fn probe_slot_breaker_config() -> CircuitBreakerConfig {
+    CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        // Zero recovery delay: `can_execute` admits the HALF_OPEN probe on the
+        // very next call, with no sleep and no wall-clock dependency.
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
+    }
+}
+
+/// An OPEN breaker with exactly one HALF_OPEN probe admitted, plus the guard
+/// that owns that probe's slot.
+fn breaker_with_admitted_probe() -> (Arc<CircuitBreaker>, HalfOpenProbeGuard) {
+    let cb = Arc::new(CircuitBreaker::new(probe_slot_breaker_config()));
+    cb.record_failure(500, false, false);
+    assert_eq!(cb.state_name(), "open");
+    let is_half_open_probe = cb.can_execute().expect("timeout 0 admits a probe");
+    assert!(
+        is_half_open_probe,
+        "the admission must claim the probe slot"
+    );
+    assert_eq!(cb.half_open_in_flight(), 1);
+    assert!(
+        cb.can_execute().is_err(),
+        "the single probe slot must be occupied"
+    );
+    let guard = HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe);
+    (cb, guard)
+}
+
+#[test]
+fn dropping_the_probe_guard_releases_the_slot_without_moving_breaker_health() {
+    let (cb, guard) = breaker_with_admitted_probe();
+
+    // The reported defect: the client disconnects mid-probe and the dispatch
+    // future is dropped without any `record_*` running.
+    drop(guard);
+
+    assert_eq!(
+        cb.half_open_in_flight(),
+        0,
+        "a dropped probe must return its slot"
+    );
+    assert_eq!(
+        cb.state_name(),
+        "half_open",
+        "a client disconnect is neither a backend success nor a backend failure"
+    );
+    assert!(
+        cb.can_execute().is_ok(),
+        "the next probe must be admitted instead of the breaker wedging OPEN forever"
+    );
+}
+
+#[test]
+fn dropping_the_udp_cache_probe_guard_releases_the_admitted_breaker_slot() {
+    let cache = CircuitBreakerCache::new();
+    let config = probe_slot_breaker_config();
+    let target = target_key("udp-backend.internal", 5353);
+
+    // Both UDP frontend paths admit through the cache, using a proxy-wide
+    // breaker for a direct backend and a target-scoped breaker for an upstream.
+    for target in [None, Some(target.as_str())] {
+        let cb = cache.get_or_create("default", "udp-proxy", target, &config);
+        cb.record_failure(502, true, false);
+        assert_eq!(cb.state_name(), "open");
+        let (admitted_cb, is_half_open_probe) = cache
+            .can_execute("default", "udp-proxy", target, &config)
+            .expect("timeout 0 admits the UDP setup probe");
+        assert!(Arc::ptr_eq(&cb, &admitted_cb));
+        assert!(is_half_open_probe);
+        let cb_probe = HalfOpenProbeGuard::for_admitted_probe(&admitted_cb, is_half_open_probe);
+        assert_eq!(cb.half_open_in_flight(), 1);
+        assert!(
+            cache
+                .can_execute("default", "udp-proxy", target, &config)
+                .is_err()
+        );
+
+        // DNS/connect cancellation or an early setup error records no outcome.
+        drop(cb_probe);
+        assert_eq!(cb.half_open_in_flight(), 0);
+        assert_eq!(cb.state_name(), "half_open");
+
+        let (next_cb, is_half_open_probe) = cache
+            .can_execute("default", "udp-proxy", target, &config)
+            .expect("dropping UDP setup must allow the next probe");
+        assert!(Arc::ptr_eq(&cb, &next_cb));
+        assert!(is_half_open_probe);
+        let next_probe = HalfOpenProbeGuard::for_admitted_probe(&next_cb, is_half_open_probe);
+        next_cb.record_success(next_probe.take_slot());
+        assert_eq!(cb.half_open_in_flight(), 0);
+        assert_eq!(cb.state_name(), "closed");
+    }
+}
+
+#[test]
+fn dropping_the_tcp_cache_probe_future_releases_the_admitted_breaker_slot() {
+    let config = probe_slot_breaker_config();
+    let target = target_key("tcp-backend.internal", 5432);
+    let retry_target = target_key("tcp-retry.internal", 5432);
+
+    // Both TCP paths keep the guard in their connection future, for direct
+    // backends and upstream targets, including a re-admitted retry attempt.
+    for target in [None, Some(target.as_str())] {
+        for retry in [false, true] {
+            let cache = CircuitBreakerCache::new();
+            let cb = cache.get_or_create("default", "tcp-proxy", target, &config);
+            cb.record_failure(502, true, false);
+            let final_target = if retry {
+                target.map(|_| retry_target.as_str())
+            } else {
+                target
+            };
+            let final_cb = cache.get_or_create("default", "tcp-proxy", final_target, &config);
+            let mut connection = Box::pin(async {
+                let (admitted_cb, is_half_open_probe) = cache
+                    .can_execute("default", "tcp-proxy", target, &config)
+                    .expect("timeout 0 admits the TCP setup probe");
+                assert!(Arc::ptr_eq(&cb, &admitted_cb));
+                assert!(is_half_open_probe);
+                let mut cb_probe =
+                    HalfOpenProbeGuard::for_admitted_probe(&admitted_cb, is_half_open_probe);
+                if retry {
+                    admitted_cb.record_failure(502, true, cb_probe.take_slot());
+                    assert_eq!(admitted_cb.half_open_in_flight(), 0);
+                    assert!(!cb_probe.holds_slot());
+                    if !Arc::ptr_eq(&admitted_cb, &final_cb) {
+                        final_cb.record_failure(502, true, false);
+                    }
+                    let (retry_cb, is_half_open_probe) = cache
+                        .can_execute("default", "tcp-proxy", final_target, &config)
+                        .expect("the rotated TCP target admits a probe");
+                    assert!(Arc::ptr_eq(&final_cb, &retry_cb));
+                    assert!(is_half_open_probe);
+                    cb_probe.rearm(&retry_cb, is_half_open_probe);
+                }
+                // Park during setup or relay, then cancel without an outcome.
+                std::future::pending::<()>().await;
+                drop(cb_probe);
+            });
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(std::future::Future::poll(connection.as_mut(), &mut context).is_pending());
+            assert_eq!(final_cb.half_open_in_flight(), 1);
+            assert!(
+                cache
+                    .can_execute("default", "tcp-proxy", final_target, &config)
+                    .is_err()
+            );
+
+            drop(connection);
+            assert_eq!(cb.half_open_in_flight(), 0);
+            assert_eq!(final_cb.half_open_in_flight(), 0);
+            assert_eq!(final_cb.state_name(), "half_open");
+            if !Arc::ptr_eq(&cb, &final_cb) {
+                assert_eq!(cb.state_name(), "open");
+            }
+            let (next_cb, is_half_open_probe) = cache
+                .can_execute("default", "tcp-proxy", final_target, &config)
+                .expect("dropping TCP setup must allow the next probe");
+            assert!(Arc::ptr_eq(&final_cb, &next_cb));
+            assert!(is_half_open_probe);
+            let next_probe = HalfOpenProbeGuard::for_admitted_probe(&next_cb, is_half_open_probe);
+            next_cb.record_success(next_probe.take_slot());
+            assert_eq!(final_cb.half_open_in_flight(), 0);
+            assert_eq!(final_cb.state_name(), "closed");
+        }
+    }
+}
+
+#[test]
+fn taking_the_probe_slot_disarms_the_guard_so_drop_cannot_release_it_twice() {
+    let (cb, guard) = breaker_with_admitted_probe();
+
+    assert!(guard.holds_slot());
+    assert!(guard.take_slot(), "the first take owns the slot");
+    assert!(!guard.holds_slot());
+    assert!(
+        !guard.take_slot(),
+        "a second take must not claim the same slot"
+    );
+
+    // The explicit outcome the taker recorded.
+    cb.record_success(true);
+    assert_eq!(cb.half_open_in_flight(), 0);
+    assert_eq!(cb.state_name(), "closed", "success_threshold 1 closes");
+
+    // Re-open and admit a fresh probe on a DIFFERENT logical request. Dropping
+    // the already-taken guard must not decrement this unrelated probe's slot.
+    cb.record_failure(500, false, false);
+    assert!(cb.can_execute().expect("second cycle admits a probe"));
+    assert_eq!(cb.half_open_in_flight(), 1);
+    drop(guard);
+    assert_eq!(
+        cb.half_open_in_flight(),
+        1,
+        "a disarmed guard must never release another probe's slot"
+    );
+}
+
+#[test]
+fn releasing_neutrally_returns_the_slot_exactly_once() {
+    let (cb, guard) = breaker_with_admitted_probe();
+
+    guard.release_neutral();
+    assert_eq!(cb.half_open_in_flight(), 0);
+    assert_eq!(cb.state_name(), "half_open");
+
+    // A second admission for a different request, then a redundant release and
+    // the drop: neither may touch the new probe's slot.
+    assert!(cb.can_execute().expect("next probe admitted"));
+    assert_eq!(cb.half_open_in_flight(), 1);
+    guard.release_neutral();
+    drop(guard);
+    assert_eq!(
+        cb.half_open_in_flight(),
+        1,
+        "release_neutral and Drop must both be no-ops once the slot is settled"
+    );
+}
+
+#[test]
+fn a_guard_for_a_closed_state_request_owns_nothing() {
+    let cb = Arc::new(CircuitBreaker::new(probe_slot_breaker_config()));
+    let is_half_open_probe = cb.can_execute().expect("closed admits");
+    assert!(!is_half_open_probe);
+
+    let guard = HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe);
+    assert!(!guard.holds_slot());
+    assert!(!guard.take_slot());
+    guard.release_neutral();
+    drop(guard);
+
+    // Trip and admit a real probe; the CLOSED-state guard above must not have
+    // left anything behind that could free it.
+    cb.record_failure(500, false, false);
+    assert!(cb.can_execute().expect("probe admitted"));
+    assert_eq!(cb.half_open_in_flight(), 1);
+}
+
+#[test]
+fn rearming_adopts_the_rotated_targets_slot_and_settles_the_previous_one() {
+    let (first, mut guard) = breaker_with_admitted_probe();
+    let (second, second_guard) = breaker_with_admitted_probe();
+    // The rotated target's slot is owned by the retry's own re-admission; this
+    // fixture guard for it must not also hold it.
+    second_guard.take_slot();
+
+    // A retry rotates onto `second` while `first`'s slot is still held. Rearm
+    // settles the abandoned slot NEUTRALLY rather than leaking it.
+    guard.rearm(&second, true);
+    assert_eq!(
+        first.half_open_in_flight(),
+        0,
+        "rotating away must return the previous target's slot"
+    );
+    assert_eq!(
+        first.state_name(),
+        "half_open",
+        "the rotation itself is health-neutral for the previous target"
+    );
+    assert!(guard.holds_slot());
+
+    drop(guard);
+    assert_eq!(
+        second.half_open_in_flight(),
+        0,
+        "the rearmed guard must release the rotated target's slot"
+    );
+    assert_eq!(second.state_name(), "half_open");
+}
+
+#[test]
+fn rearming_onto_a_closed_state_retry_leaves_the_guard_empty() {
+    let (first, mut guard) = breaker_with_admitted_probe();
+    let healthy = Arc::new(CircuitBreaker::new(probe_slot_breaker_config()));
+
+    guard.rearm(&healthy, false);
+    assert_eq!(first.half_open_in_flight(), 0);
+    assert!(!guard.holds_slot());
+
+    drop(guard);
+    assert_eq!(
+        healthy.half_open_in_flight(),
+        0,
+        "a CLOSED-state re-admission owns no probe slot to release"
+    );
+    assert_eq!(healthy.state_name(), "closed");
+}
+
+// ===========================================================================
+// HALF_OPEN probe dwell (issue #4980, defence in depth behind
+// GHSA-4cq4-3f3f-mq76)
+//
+// `HalfOpenProbeGuard` makes every dispatch path settle its probe slot
+// structurally. The dwell is the layer behind it: if some future path still
+// leaks a slot, the breaker reclaims it once no probe has been admitted for a
+// whole dwell, so a permanent `503 circuit_breaker_open` outage degrades to a
+// bounded delay and `ferrum_circuit_breaker_probe_reclaimed_total` makes the
+// leak visible.
+//
+// Every test drives the breaker through the deterministic-clock constructors,
+// so the dwell is exercised against the same process-local monotonic origin the
+// production path reads — there is no second clock.
+// ===========================================================================
+
+fn dwell_config(timeout_seconds: u64, dwell_seconds: Option<u64>) -> CircuitBreakerConfig {
+    CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 2,
+        timeout_seconds,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: dwell_seconds,
+    }
+}
+
+/// A breaker holding one HALF_OPEN probe that is never settled — the leak the
+/// dwell exists to survive.
+///
+/// The breaker trips at tick 0 and admits its only probe at tick 1_000
+/// (`timeout_seconds: 1`), so the dwell is armed from tick 1_000.
+fn breaker_with_leaked_probe(dwell_seconds: u64) -> CircuitBreaker {
+    let cb = CircuitBreaker::new(dwell_config(1, Some(dwell_seconds)));
+    cb.record_failure_at_for_test(500, false, false, 0, 0);
+    assert_eq!(cb.state_name(), "open");
+    assert_eq!(
+        cb.can_execute_at_for_test(1_000).ok(),
+        Some(true),
+        "the recovery timeout must admit the probe that then leaks"
+    );
+    assert_eq!(cb.half_open_in_flight(), 1);
+    assert!(
+        cb.can_execute_at_for_test(1_000).is_err(),
+        "the single probe slot is occupied"
+    );
+    cb
+}
+
+#[test]
+fn an_unsettled_probe_is_not_reclaimed_before_the_dwell_elapses() {
+    let cb = breaker_with_leaked_probe(10);
+
+    // One millisecond short of the dwell: the probe may still be a legitimate
+    // slow backend dispatch, and reclaiming it would put a second probe on a
+    // backend the breaker is protecting.
+    assert!(
+        cb.can_execute_at_for_test(1_000 + 9_999).is_err(),
+        "the slot must stay held until the whole dwell has elapsed"
+    );
+    assert_eq!(cb.half_open_in_flight(), 1);
+    assert_eq!(cb.probe_reclaimed_total(), 0);
+    assert_eq!(cb.state_name(), "half_open");
+}
+
+#[test]
+fn a_probe_admitted_inside_the_dwell_rearms_it_for_every_slot() {
+    // Two slots, so one probe can leak while the other keeps cycling. The dwell
+    // is armed off the NEWEST admission: while probes are still being admitted
+    // the breaker is not wedged, and no live probe may be reclaimed.
+    let config = CircuitBreakerConfig {
+        half_open_max_requests: 2,
+        ..dwell_config(1, Some(10))
+    };
+    let cb = CircuitBreaker::new(config);
+    cb.record_failure_at_for_test(500, false, false, 0, 0);
+    assert_eq!(cb.can_execute_at_for_test(1_000).ok(), Some(true));
+    // A second probe is admitted well inside the first probe's dwell.
+    assert_eq!(cb.can_execute_at_for_test(9_000).ok(), Some(true));
+    assert_eq!(cb.half_open_in_flight(), 2);
+
+    // The first probe is now 10s old, but the newest admission is only 2s old.
+    assert!(cb.can_execute_at_for_test(11_000).is_err());
+    assert_eq!(cb.probe_reclaimed_total(), 0);
+    assert_eq!(cb.half_open_in_flight(), 2);
+
+    // A full dwell after the newest admission, one slot is reclaimed.
+    assert_eq!(cb.can_execute_at_for_test(19_000).ok(), Some(true));
+    assert_eq!(cb.probe_reclaimed_total(), 1);
+}
+
+#[test]
+fn reclaiming_a_stalled_probe_admits_the_next_one_without_moving_breaker_health() {
+    let cb = breaker_with_leaked_probe(10);
+    let failures_before = cb.failure_count();
+    let successes_before = cb.success_count();
+
+    assert_eq!(
+        cb.can_execute_at_for_test(1_000 + 10_000).ok(),
+        Some(true),
+        "the dwell must reclaim the leaked slot and admit a fresh probe"
+    );
+
+    assert_eq!(cb.probe_reclaimed_total(), 1);
+    assert_eq!(
+        cb.half_open_in_flight(),
+        1,
+        "one slot reclaimed, one slot handed to the new probe"
+    );
+    assert_eq!(
+        cb.state_name(),
+        "half_open",
+        "a reclaim is not evidence about the backend, so it must not change state"
+    );
+    assert_eq!(
+        cb.failure_count(),
+        failures_before,
+        "a reclaim must not count as a backend failure"
+    );
+    assert_eq!(
+        cb.success_count(),
+        successes_before,
+        "a reclaim must not count as a backend success"
+    );
+}
+
+#[test]
+fn a_stale_settle_after_a_reclaim_is_a_no_op_and_cannot_over_admit() {
+    let cb = breaker_with_leaked_probe(10);
+    assert_eq!(cb.can_execute_at_for_test(11_000).ok(), Some(true));
+    // The fresh probe now holds the only slot.
+    assert_eq!(cb.half_open_in_flight(), 1);
+
+    // The leaked probe finally settles, long after its slot was reclaimed.
+    // Slots are anonymous, so letting this decrement a second time would make
+    // the in-flight count under-state the probes actually running.
+    cb.record_neutral(true);
+    assert_eq!(
+        cb.half_open_in_flight(),
+        1,
+        "the reclaim already returned that slot; the stale settle must not decrement again"
+    );
+    assert!(
+        cb.can_execute_at_for_test(11_001).is_err(),
+        "a double decrement would over-admit alongside the live probe"
+    );
+    assert_eq!(
+        cb.probe_reclaimed_total(),
+        1,
+        "a stale settle is not itself a reclaim"
+    );
+
+    // The live probe's own settle returns the slot exactly once.
+    cb.record_neutral(true);
+    assert_eq!(cb.half_open_in_flight(), 0);
+    assert_eq!(cb.can_execute_at_for_test(11_002).ok(), Some(true));
+}
+
+#[test]
+fn the_reclaim_counter_advances_once_per_dwell_not_once_per_rejection() {
+    let cb = breaker_with_leaked_probe(10);
+
+    assert_eq!(cb.can_execute_at_for_test(11_000).ok(), Some(true));
+    assert_eq!(cb.probe_reclaimed_total(), 1);
+
+    // Every rejection inside the next dwell leaves the counter alone.
+    assert!(cb.can_execute_at_for_test(11_001).is_err());
+    assert!(cb.can_execute_at_for_test(20_999).is_err());
+    assert_eq!(cb.probe_reclaimed_total(), 1);
+
+    // The replacement probe leaked too: one more dwell, exactly one more
+    // reclaim.
+    assert_eq!(cb.can_execute_at_for_test(21_000).ok(), Some(true));
+    assert_eq!(cb.probe_reclaimed_total(), 2);
+}
+
+#[test]
+fn a_reopen_clears_the_reclaim_debt_so_the_next_cycle_accounts_from_zero() {
+    let cb = breaker_with_leaked_probe(10);
+    assert_eq!(cb.can_execute_at_for_test(11_000).ok(), Some(true));
+    assert_eq!(cb.probe_reclaimed_total(), 1);
+
+    // The fresh probe fails: the reopen zeroes the in-flight count and forgets
+    // every slot, so the outstanding reclaim debt is settled with it.
+    cb.record_failure_at_for_test(500, false, true, 11_000, 0);
+    assert_eq!(cb.state_name(), "open");
+    assert_eq!(cb.half_open_in_flight(), 0);
+
+    // The next cycle admits its probe and settles it normally — the release
+    // must decrement, not be swallowed as debt from the previous cycle.
+    assert_eq!(cb.can_execute_at_for_test(12_000).ok(), Some(true));
+    assert_eq!(cb.half_open_in_flight(), 1);
+    cb.record_neutral(true);
+    assert_eq!(cb.half_open_in_flight(), 0);
+}
+
+#[test]
+fn the_probe_dwell_defaults_to_twice_the_open_timeout_with_a_one_minute_floor() {
+    // Twice the open timeout once that exceeds the floor.
+    let long_timeout = CircuitBreaker::new(dwell_config(45, None));
+    assert_eq!(long_timeout.half_open_probe_dwell_ms(), 90_000);
+
+    // A short recovery timeout must not produce a dwell shorter than the
+    // longest legitimate backend dispatch, so the derived value has a floor.
+    let short_timeout = CircuitBreaker::new(dwell_config(5, None));
+    assert_eq!(short_timeout.half_open_probe_dwell_ms(), 60_000);
+    let at_the_floor = CircuitBreaker::new(dwell_config(30, None));
+    assert_eq!(at_the_floor.half_open_probe_dwell_ms(), 60_000);
+}
+
+#[test]
+fn a_configured_probe_dwell_is_clamped_to_the_open_timeout_and_to_one_second() {
+    // Honoured above both clamps.
+    let honoured = CircuitBreaker::new(dwell_config(30, Some(600)));
+    assert_eq!(honoured.half_open_probe_dwell_ms(), 600_000);
+
+    // Below the open timeout, the breaker would reclaim probes faster than it
+    // admits them, so the dwell is clamped up.
+    let below_timeout = CircuitBreaker::new(dwell_config(30, Some(5)));
+    assert_eq!(below_timeout.half_open_probe_dwell_ms(), 30_000);
+
+    // Zero would reclaim every probe on the next admission attempt.
+    let zero = CircuitBreaker::new(dwell_config(0, Some(0)));
+    assert_eq!(zero.half_open_probe_dwell_ms(), 1_000);
+}
+
+#[test]
+fn an_omitted_probe_dwell_leaves_existing_configs_parsing_unchanged() {
+    let stored = r#"{"failure_threshold":5,"success_threshold":3,"timeout_seconds":30,"failure_status_codes":[500,502,503,504],"half_open_max_requests":1,"trip_on_connection_errors":true}"#;
+    let parsed: CircuitBreakerConfig = serde_json::from_str(stored).expect("legacy config parses");
+    assert_eq!(parsed.half_open_probe_dwell_seconds, None);
+    assert_eq!(parsed, CircuitBreakerConfig::default());
+
+    // Omitted stays omitted on the way back out, so stored configs do not gain
+    // a field they never set.
+    let round_tripped = serde_json::to_string(&parsed).expect("config serializes");
+    assert!(
+        !round_tripped.contains("half_open_probe_dwell_seconds"),
+        "{round_tripped}"
     );
 }

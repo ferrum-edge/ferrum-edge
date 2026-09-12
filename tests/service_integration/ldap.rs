@@ -254,6 +254,7 @@ async fn ldap_direct_bind_validates_credentials() {
     let plugin = ldap_plugin(json!({
         "ldap_url": ldap.url.clone(),
         "bind_dn_template": "uid={username},ou=people,dc=example,dc=org",
+        "canonical_identity_attribute": "uid",
     }));
 
     // Correct password → authenticated (Continue, no rejection).
@@ -333,6 +334,7 @@ async fn ldap_group_membership_is_enforced() {
     let plugin = ldap_plugin(json!({
         "ldap_url": ldap.url.clone(),
         "bind_dn_template": "uid={username},ou=people,dc=example,dc=org",
+        "canonical_identity_attribute": "uid",
         "service_account_dn": LDAP_ADMIN_DN,
         "service_account_password": LDAP_ADMIN_PASSWORD,
         "group_base_dn": "ou=groups,dc=example,dc=org",

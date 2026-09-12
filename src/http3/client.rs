@@ -354,6 +354,10 @@ pub(crate) async fn drain_h3_response_body(
 ) -> Result<(bytes::Bytes, Option<http::HeaderMap>), H3BodyDrainError> {
     use crate::proxy::response_buffer_budget;
 
+    if cancel_bodyless_h3_response(stream, method, status) {
+        return Ok((bytes::Bytes::new(), None));
+    }
+
     // This helper only ever RETAINS the body, so the documented streaming
     // `0 = unlimited` cannot apply here: it is folded to the fail-closed
     // fallback ceiling, and retained bytes are additionally charged against the
@@ -490,6 +494,24 @@ pub(crate) async fn drain_h3_response_body(
         return Err(H3BodyDrainError::BufferBudgetExhausted);
     };
     Ok((body, trailers))
+}
+
+/// A response that ends at its headers has no DATA or trailers to drain.
+/// Cancel only this QUIC receive direction; the pooled connection and sibling
+/// streams remain usable. In particular, do not spend an unbounded amount of
+/// time discarding a progressing peer's forbidden DATA when size/read limits
+/// are disabled (or when an idle deadline keeps being refreshed).
+pub(crate) fn cancel_bodyless_h3_response(
+    stream: &mut H3RequestStream,
+    method: &str,
+    status: u16,
+) -> bool {
+    let omits_body =
+        crate::plugins::utils::synthetic_response::synthetic_response_omits_body(method, status);
+    if omits_body {
+        stream.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+    }
+    omits_body
 }
 
 /// Read backend response trailers, bounded by `backend_read_timeout_ms`.
@@ -2227,17 +2249,11 @@ impl Http3ConnectionPool {
         let default_cfg = super::config::Http3ServerConfig::default();
         let cfg = h3_config.unwrap_or(&default_cfg);
 
-        let mut transport_config = quinn::TransportConfig::default();
-        transport_config.initial_mtu(cfg.initial_mtu);
-        transport_config.stream_receive_window(crate::http3::config::quic_varint_or_default(
-            cfg.stream_receive_window,
-            crate::http3::config::H3_STREAM_RECEIVE_WINDOW_DEFAULT,
-        ));
-        transport_config.receive_window(crate::http3::config::quic_varint_or_default(
-            cfg.receive_window,
-            crate::http3::config::H3_RECEIVE_WINDOW_DEFAULT,
-        ));
-        transport_config.send_window(cfg.send_window);
+        // Backend-plane QUIC transport tuning (issues #4755 and #4756): the
+        // documented backend flow-control windows and the configured
+        // `FERRUM_HTTP3_IDLE_TIMEOUT`, never the hardened frontend listener's
+        // untrusted-client budgets and never quinn's 30 s idle default.
+        let transport_config = crate::http3::config::build_backend_transport_config(cfg)?;
 
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
         client_config.transport_config(Arc::new(transport_config));
@@ -2392,17 +2408,11 @@ impl Http3ConnectionPool {
         let default_cfg = super::config::Http3ServerConfig::default();
         let cfg = h3_config.unwrap_or(&default_cfg);
 
-        let mut transport_config = quinn::TransportConfig::default();
-        transport_config.initial_mtu(cfg.initial_mtu);
-        transport_config.stream_receive_window(crate::http3::config::quic_varint_or_default(
-            cfg.stream_receive_window,
-            crate::http3::config::H3_STREAM_RECEIVE_WINDOW_DEFAULT,
-        ));
-        transport_config.receive_window(crate::http3::config::quic_varint_or_default(
-            cfg.receive_window,
-            crate::http3::config::H3_RECEIVE_WINDOW_DEFAULT,
-        ));
-        transport_config.send_window(cfg.send_window);
+        // Backend-plane QUIC transport tuning (issues #4755 and #4756): the
+        // documented backend flow-control windows and the configured
+        // `FERRUM_HTTP3_IDLE_TIMEOUT`, never the hardened frontend listener's
+        // untrusted-client budgets and never quinn's 30 s idle default.
+        let transport_config = crate::http3::config::build_backend_transport_config(cfg)?;
 
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
         client_config.transport_config(Arc::new(transport_config));
@@ -4093,18 +4103,11 @@ impl Http3Client {
         let default_cfg = super::config::Http3ServerConfig::default();
         let cfg = h3_config.unwrap_or(&default_cfg);
 
-        // Apply QUIC transport tuning for the client side
-        let mut transport_config = quinn::TransportConfig::default();
-        transport_config.initial_mtu(cfg.initial_mtu);
-        transport_config.stream_receive_window(crate::http3::config::quic_varint_or_default(
-            cfg.stream_receive_window,
-            crate::http3::config::H3_STREAM_RECEIVE_WINDOW_DEFAULT,
-        ));
-        transport_config.receive_window(crate::http3::config::quic_varint_or_default(
-            cfg.receive_window,
-            crate::http3::config::H3_RECEIVE_WINDOW_DEFAULT,
-        ));
-        transport_config.send_window(cfg.send_window);
+        // Backend-plane QUIC transport tuning (issues #4755 and #4756): the
+        // documented backend flow-control windows and the configured
+        // `FERRUM_HTTP3_IDLE_TIMEOUT`, never the hardened frontend listener's
+        // untrusted-client budgets and never quinn's 30 s idle default.
+        let transport_config = crate::http3::config::build_backend_transport_config(cfg)?;
 
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
         client_config.transport_config(Arc::new(transport_config));

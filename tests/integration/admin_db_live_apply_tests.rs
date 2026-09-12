@@ -895,6 +895,41 @@ async fn apply_status_is_unverifiable_for_a_foreign_topology_epoch() {
 }
 
 #[tokio::test]
+async fn apply_status_does_not_wait_on_an_unissued_future_cursor() {
+    let h = deferred_harness(Duration::ZERO, false).await;
+
+    let (status, headers, _body) = admin_request(
+        reqwest::Method::POST,
+        &h.base,
+        "/proxies",
+        &h.token,
+        Some(&proxy_payload("/issued-cursor-bound")),
+    )
+    .await;
+    assert_eq!(status, 201);
+    let (epoch, _sequence) = cursor_from_headers(&headers);
+
+    let (status, _headers, body) = tokio::time::timeout(
+        Duration::from_millis(500),
+        admin_request(
+            reqwest::Method::GET,
+            &h.base,
+            &format!(
+                "/config/apply-status?epoch={epoch}&sequence={}&wait_ms=30000",
+                u64::MAX
+            ),
+            &h.token,
+            None,
+        ),
+    )
+    .await
+    .expect("an unissued future cursor must not register a blocking waiter");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["state"], "unverifiable", "{body}");
+    let _ = h.shutdown_tx.send(true);
+}
+
+#[tokio::test]
 async fn deferred_without_poll_loop_stays_plain_success_and_status_is_absent() {
     let (store, _tmp) = sqlite_store().await;
     let proxy_state = proxy_state();

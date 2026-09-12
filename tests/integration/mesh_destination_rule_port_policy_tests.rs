@@ -487,7 +487,7 @@ fn partial_subset_and_port_outlier_overlays_share_field_level_precedence() {
     };
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let mut prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
     let subset_passive = prepared.upstreams[0]
         .resolved_subset_tls
         .get("v1")
@@ -508,6 +508,32 @@ fn partial_subset_and_port_outlier_overlays_share_field_level_precedence() {
     assert_eq!(port_passive.unhealthy_window_seconds, 15);
     assert_eq!(port_passive.healthy_after_seconds, 45);
     assert_eq!(port_passive.max_ejection_percent, Some(80));
+
+    // Native per-port fields outside Istio's outlierDetection model must
+    // survive when the raw port mask is re-projected for a selected subset.
+    let authored_port_passive = prepared.upstreams[0]
+        .port_overrides
+        .get_mut(&8080)
+        .and_then(|override_slot| override_slot.passive_health_check.as_mut())
+        .expect("port passive health");
+    authored_port_passive.unhealthy_status_codes = vec![429, 503];
+    authored_port_passive.gateway_error_codes = Some(vec![502, 504]);
+    authored_port_passive.split_external_local_origin_errors = Some(true);
+    prepared.resolve_dispatch_port_overrides();
+
+    let reprojected = prepared.proxies[0]
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&8080))
+        .and_then(|override_slot| override_slot.passive_health_check.as_ref())
+        .expect("reprojected port passive health");
+    assert_eq!(reprojected.unhealthy_status_codes, vec![429, 503]);
+    assert_eq!(reprojected.gateway_error_codes, Some(vec![502, 504]));
+    assert_eq!(reprojected.split_external_local_origin_errors, Some(true));
+    assert_eq!(reprojected.unhealthy_threshold, 7);
+    assert_eq!(reprojected.unhealthy_window_seconds, 15);
+    assert_eq!(reprojected.healthy_after_seconds, 45);
+    assert_eq!(reprojected.max_ejection_percent, Some(80));
 }
 
 #[test]

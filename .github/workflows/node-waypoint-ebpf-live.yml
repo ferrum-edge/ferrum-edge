@@ -34,7 +34,7 @@ permissions:
 # manual dispatches share one lane and run to completion.
 concurrency:
   group: ${{ github.event_name == 'pull_request' && format('node-waypoint-ebpf-live-pr-{0}', github.event.pull_request.number) || (github.event_name == 'merge_group' && format('node-waypoint-ebpf-live-merge-group-{0}', github.event.merge_group.head_sha) || (github.event_name == 'push' && format('node-waypoint-ebpf-live-{0}', github.ref) || 'node-waypoint-ebpf-live-shared')) }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
 
 env:
   FERRUM_IMAGE_REPOSITORY: ferrum-edge
@@ -200,9 +200,11 @@ jobs:
           emit_suite_verdict node-waypoint-ebpf-live node_waypoint_relevant
 
   production-dockerfile-smoke-default:
-    name: Production Dockerfile default image
+    name: Production Dockerfile default image (registry reader)
     needs: production-dockerfile-plan
-    if: needs.production-dockerfile-plan.outputs.relevant == 'true'
+    if: needs.production-dockerfile-plan.outputs.relevant == 'true' && !(github.repository == 'ferrum-edge/ferrum-edge' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch'))
+    permissions:
+      contents: read
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -217,66 +219,27 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
-      - name: Time cache restore
+      - name: Record registry cache policy
         if: github.event.inputs.force_cold_cache != 'true'
-        run: python3 .github/scripts/ci_runtime_telemetry.py start --phase cache-restore
-
-      - name: Restore BuildKit local cache
-        if: github.event.inputs.force_cold_cache != 'true'
-        id: buildkit-cache
-        uses: actions/cache/restore@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
-        with:
-          path: ${{ runner.temp }}/production-dockerfile-smoke-default
-          key: production-dockerfile-smoke-default-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
-          restore-keys: |
-            production-dockerfile-smoke-default-v1-${{ runner.os }}-${{ runner.arch }}-
-
-      - name: Classify BuildKit cache restore
-        if: github.event.inputs.force_cold_cache != 'true'
-        id: cache-kind
-        env:
-          CACHE_HIT: ${{ steps.buildkit-cache.outputs.cache-hit }}
-          CACHE_MATCHED: ${{ steps.buildkit-cache.outputs.cache-matched-key }}
-          CACHE_PRIMARY: ${{ steps.buildkit-cache.outputs.cache-primary-key }}
-          FORK_PR: ${{ github.event.pull_request.head.repo.fork }}
-          CACHE_DIR: ${{ runner.temp }}/production-dockerfile-smoke-default
         run: |
-          set -euo pipefail
-          if [ "${FORK_PR:-}" = true ]; then
-            policy=fork-restore-only
-          else
-            policy=trusted-publish
-          fi
-          python3 .github/scripts/ci_runtime_telemetry.py classify-restore \
-            --name buildkit-local \
-            --hit "${CACHE_HIT}" \
-            --matched "${CACHE_MATCHED}" \
-            --primary "${CACHE_PRIMARY}" \
-            --path "$CACHE_DIR" \
-            --note "scope=production-dockerfile-smoke-default policy=${policy}"
-
-      - name: Finish cache restore timer
-        if: always() && github.event.inputs.force_cold_cache != 'true'
-        run: python3 .github/scripts/ci_runtime_telemetry.py end --phase cache-restore --status ${{ job.status == 'success' && '0' || '1' }}
+          python3 .github/scripts/ci_runtime_telemetry.py cache \
+            --name buildkit-registry \
+            --note "scope=production-dockerfile-smoke-default policy=anonymous-restore-only; actual layer reuse is reported by BuildKit"
 
       - name: Record cold-cache proof
         if: github.event.inputs.force_cold_cache == 'true'
         run: |
           python3 .github/scripts/ci_runtime_telemetry.py cache \
-            --name buildkit-local \
+            --name buildkit-registry \
             --hit false \
             --bytes 0 \
-            --note "scope=production-dockerfile-smoke-default policy=force-cold skipped restore and save"
+            --note "scope=production-dockerfile-smoke-default policy=force-cold skipped import and export"
 
       - name: Time image build
         run: python3 .github/scripts/ci_runtime_telemetry.py start --phase image-build
 
-      # Trusted exact github.sha hits restore cache-from and must not
-      # export or save. Trusted partial matches and misses export mode=max
-      # and save the new exact key. Fork PRs restore and must not export or
-      # save. force_cold_cache skips restore, export, and save.
-      - name: Build ordinary production runtime (trusted exact-hit restore-only)
-        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.kind == 'exact'
+      - name: Build ordinary production runtime with registry cache
+        if: github.event.inputs.force_cold_cache != 'true'
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
@@ -286,37 +249,8 @@ jobs:
             CARGO_PROFILE=pr-build
           load: true
           tags: ferrum-edge:production-default-smoke
-          cache-from: type=local,src=${{ runner.temp }}/production-dockerfile-smoke-default
           provenance: false
-
-      - name: Build ordinary production runtime
-        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
-        with:
-          context: .
-          file: Dockerfile
-          target: runtime
-          build-args: |
-            CARGO_PROFILE=pr-build
-          load: true
-          tags: ferrum-edge:production-default-smoke
-          cache-from: ${{ steps.buildkit-cache.outputs.cache-matched-key != '' && format('type=local,src={0}/production-dockerfile-smoke-default', runner.temp) || '' }}
-          cache-to: type=local,dest=${{ runner.temp }}/production-dockerfile-smoke-default-out,mode=max
-          provenance: false
-
-      - name: Build ordinary production runtime (fork restore-only)
-        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork == true
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
-        with:
-          context: .
-          file: Dockerfile
-          target: runtime
-          build-args: |
-            CARGO_PROFILE=pr-build
-          load: true
-          tags: ferrum-edge:production-default-smoke
-          cache-from: ${{ steps.buildkit-cache.outputs.cache-matched-key != '' && format('type=local,src={0}/production-dockerfile-smoke-default', runner.temp) || '' }}
-          provenance: false
+          cache-from: type=registry,ref=ghcr.io/ferrum-edge/ferrum-edge-buildcache:default-v1-linux-amd64-runtime
 
       - name: Build ordinary production runtime (cold cache)
         if: github.event.inputs.force_cold_cache == 'true'
@@ -335,37 +269,126 @@ jobs:
         if: always()
         run: python3 .github/scripts/ci_runtime_telemetry.py end --phase image-build --status ${{ job.status == 'success' && '0' || '1' }}
 
-      - name: Time cache save
-        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
-        run: python3 .github/scripts/ci_runtime_telemetry.py start --phase cache-save
-
-      - name: Prepare BuildKit cache for save
-        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true'
+      - name: Verify ordinary distroless runtime contract
         run: |
           set -euo pipefail
-          out="${RUNNER_TEMP}/production-dockerfile-smoke-default-out"
-          dest="${RUNNER_TEMP}/production-dockerfile-smoke-default"
-          if [ ! -d "$out" ]; then
-            echo "::error::fresh BuildKit cache export is missing; refusing to save a stale restore" >&2
+          python3 .github/scripts/ci_runtime_telemetry.py start --phase ordinary-inventory
+          ordinary_image=ferrum-edge:production-default-smoke
+          docker run --rm --entrypoint /app/ferrum-edge "$ordinary_image" version
+
+          inventory_image() {
+            image="$1"
+            output="$2"
+            container="$(docker create "$image")"
+            docker export "$container" | tar -tf - | sed -e 's#^\./##' -e 's#^/##' > "$output"
+            docker rm "$container" >/dev/null
+          }
+          inventory_image "$ordinary_image" ordinary-runtime-files.txt
+
+          grep -Fxq app/ferrum-edge ordinary-runtime-files.txt
+          if grep -Fxq usr/sbin/ip ordinary-runtime-files.txt; then
+            echo "ordinary runtime unexpectedly contains eBPF-only /usr/sbin/ip" >&2
             exit 1
           fi
-          rm -rf "$dest"
-          mv "$out" "$dest"
 
-      # Saved on main pushes only (issue #4643): the key carries `github.sha`,
-      # so a save from every pull-request head published ~2 GiB of new entries
-      # per head and evicted the shared Rust caches out of the 10 GiB quota.
-      # Pull requests keep restoring through the prefix `restore-keys` above.
-      - name: Save BuildKit local cache
-        if: github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/cache/save@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
+          for forbidden in \
+            bin/sh usr/bin/sh bin/bash usr/bin/bash bin/dash usr/bin/dash \
+            bin/ash usr/bin/ash bin/zsh usr/bin/zsh bin/ksh usr/bin/ksh \
+            bin/busybox usr/bin/busybox sbin/apk usr/sbin/apk usr/bin/apk \
+            usr/bin/apt usr/bin/apt-cache usr/bin/apt-get \
+            usr/bin/dpkg usr/bin/dpkg-query usr/bin/rpm usr/bin/yum \
+            usr/bin/dnf usr/bin/microdnf usr/sbin/iptables \
+            usr/sbin/ip6tables usr/sbin/nft; do
+            if grep -Fxq "$forbidden" ordinary-runtime-files.txt; then
+              echo "forbidden runtime tool is present: /$forbidden" >&2
+              exit 1
+            fi
+          done
+          python3 .github/scripts/ci_runtime_telemetry.py end --phase ordinary-inventory --status 0
+
+      - name: Summarize ordinary image runtime
+        if: always()
+        run: python3 .github/scripts/ci_runtime_telemetry.py summarize --title "Production Dockerfile default image"
+
+  production-dockerfile-smoke-default-write:
+    name: Production Dockerfile default image (registry writer)
+    needs: production-dockerfile-plan
+    if: needs.production-dockerfile-plan.outputs.relevant == 'true' && (github.repository == 'ferrum-edge/ferrum-edge' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch'))
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
-          path: ${{ runner.temp }}/production-dockerfile-smoke-default
-          key: production-dockerfile-smoke-default-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          persist-credentials: false
 
-      - name: Finish cache save timer
-        if: always() && github.event.inputs.force_cold_cache != 'true' && github.event.pull_request.head.repo.fork != true && steps.cache-kind.outputs.publish == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: python3 .github/scripts/ci_runtime_telemetry.py end --phase cache-save --status ${{ job.status == 'success' && '0' || '1' }}
+      - name: Initialize runtime telemetry
+        run: python3 .github/scripts/ci_runtime_telemetry.py init --quiet
+
+      - name: Log in to cache registry
+        if: github.event.inputs.force_cold_cache != 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+
+      - name: Record registry cache policy
+        if: github.event.inputs.force_cold_cache != 'true'
+        run: |
+          python3 .github/scripts/ci_runtime_telemetry.py cache \
+            --name buildkit-registry \
+            --note "scope=production-dockerfile-smoke-default policy=trusted-main-publish; actual layer reuse is reported by BuildKit"
+
+      - name: Record cold-cache proof
+        if: github.event.inputs.force_cold_cache == 'true'
+        run: |
+          python3 .github/scripts/ci_runtime_telemetry.py cache \
+            --name buildkit-registry \
+            --hit false \
+            --bytes 0 \
+            --note "scope=production-dockerfile-smoke-default policy=force-cold skipped import and export"
+
+      - name: Time image build
+        run: python3 .github/scripts/ci_runtime_telemetry.py start --phase image-build
+
+      - name: Build ordinary production runtime with registry cache
+        if: github.event.inputs.force_cold_cache != 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime
+          build-args: |
+            CARGO_PROFILE=pr-build
+          load: true
+          tags: ferrum-edge:production-default-smoke
+          provenance: false
+          cache-from: type=registry,ref=ghcr.io/ferrum-edge/ferrum-edge-buildcache:default-v1-linux-amd64-runtime
+          cache-to: type=registry,ref=ghcr.io/ferrum-edge/ferrum-edge-buildcache:default-v1-linux-amd64-runtime,mode=max,image-manifest=true,oci-mediatypes=true
+
+      - name: Build ordinary production runtime (cold cache)
+        if: github.event.inputs.force_cold_cache == 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime
+          build-args: |
+            CARGO_PROFILE=pr-build
+          load: true
+          tags: ferrum-edge:production-default-smoke
+          provenance: false
+
+      - name: Finish image build timer
+        if: always()
+        run: python3 .github/scripts/ci_runtime_telemetry.py end --phase image-build --status ${{ job.status == 'success' && '0' || '1' }}
 
       - name: Verify ordinary distroless runtime contract
         run: |
@@ -523,6 +546,7 @@ jobs:
     needs:
       - production-dockerfile-plan
       - production-dockerfile-smoke-default
+      - production-dockerfile-smoke-default-write
       - production-dockerfile-smoke-ebpf
     if: always()
     steps:
@@ -543,8 +567,12 @@ jobs:
             echo "No Dockerfile/runtime-sensitive paths changed. Image smoke skipped."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Fail when the ordinary production image did not succeed
-        if: needs.production-dockerfile-plan.outputs.relevant == 'true' && needs.production-dockerfile-smoke-default.result != 'success'
+      - name: Fail when the ordinary registry writer did not succeed exclusively
+        if: needs.production-dockerfile-plan.outputs.relevant == 'true' && (github.repository == 'ferrum-edge/ferrum-edge' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) && (needs.production-dockerfile-smoke-default-write.result != 'success' || needs.production-dockerfile-smoke-default.result != 'skipped')
+        run: exit 1
+
+      - name: Fail when the ordinary registry reader did not succeed exclusively
+        if: needs.production-dockerfile-plan.outputs.relevant == 'true' && !(github.repository == 'ferrum-edge/ferrum-edge' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) && (needs.production-dockerfile-smoke-default.result != 'success' || needs.production-dockerfile-smoke-default-write.result != 'skipped')
         run: exit 1
 
       - name: Fail when the eBPF production image did not succeed
@@ -558,11 +586,10 @@ jobs:
             echo "## Production Dockerfile eBPF image smoke"
             echo ""
             echo "Ordinary \`runtime\` and distroless \`runtime-ebpf\` images built in parallel"
-            echo "through BuildKit. Trusted exact \`${{ github.sha }}\` hits restore a scoped"
-            echo "local BuildKit cache and do not export or save. Trusted partial matches"
-            echo "and misses export \`mode=max\` and save the new exact key via pinned"
-            echo "\`actions/cache/restore\` and \`actions/cache/save\`; fork pull"
-            echo "requests restore that cache and do not save. Distroless inventories passed."
+            echo "through BuildKit with target-specific GHCR caches. Pull requests"
+            echo "import anonymously and never export. Only trusted main runs publish"
+            echo "the ordinary cache; the eBPF image reads Ambient's shared cache."
+            echo "Cold dispatch skips imports and exports. Distroless inventories passed."
             echo ""
             echo "Warm PR target: <=30 minutes, p95 <=45 minutes, measured on hosted runs."
           } >> "$GITHUB_STEP_SUMMARY"

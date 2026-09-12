@@ -213,6 +213,7 @@ impl ScalePerfHarness {
         // Run migrations first for postgres
         if db_type == "postgres" {
             let migrate_status = Command::new(binary_path)
+                .arg("run")
                 .env("FERRUM_MODE", "migrate")
                 .env("FERRUM_DB_TYPE", db_type)
                 .env("FERRUM_DB_URL", db_url)
@@ -224,6 +225,7 @@ impl ScalePerfHarness {
         }
 
         let mut command = Command::new(binary_path);
+        command.arg("run");
         command
             .env("FERRUM_MODE", "database")
             .env(

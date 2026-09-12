@@ -910,13 +910,13 @@ fn extension_count_is_bounded_at_thirty_two() {
 #[test]
 fn a_fresh_issuer_signed_response_for_the_configured_leaf_is_accepted() {
     let pki = build_pki();
-    let der = ResponseBuilder::new(&pki, now()).build();
+    let at = now();
+    let der = ResponseBuilder::new(&pki, at).build();
 
-    let acceptance =
-        validate_stapled_response_at(&der, &chain(&pki), now()).expect("accepted staple");
+    let acceptance = validate_stapled_response_at(&der, &chain(&pki), at).expect("accepted staple");
     assert_eq!(acceptance.der_len, der.len());
-    assert_eq!(acceptance.this_update, now() - 3_600);
-    assert_eq!(acceptance.next_update, now() + 3_600);
+    assert_eq!(acceptance.this_update, at - 3_600);
+    assert_eq!(acceptance.next_update, at + 3_600);
     assert!(!acceptance.delegated_responder);
 }
 
@@ -2233,14 +2233,14 @@ fn the_multi_certificate_loader_binds_the_staple_to_its_single_certificate() {
         is_default: true,
     }];
 
-    load_gateway_multi_cert_tls_config(&inputs, None, Some(&ocsp_path), &policy, 30, &[])
+    load_gateway_multi_cert_tls_config(&inputs, None, Some(&ocsp_path), &policy, 30, 0, &[])
         .expect("valid staple is admitted");
 
     let mut builder = ResponseBuilder::new(&pki, now());
     builder.serial = OTHER_SERIAL;
     std::fs::write(&ocsp_path, builder.build()).expect("rewrite ocsp");
     let error =
-        load_gateway_multi_cert_tls_config(&inputs, None, Some(&ocsp_path), &policy, 30, &[])
+        load_gateway_multi_cert_tls_config(&inputs, None, Some(&ocsp_path), &policy, 30, 0, &[])
             .expect_err("wrong-certificate staple is refused");
     let rendered = format!("{error:#}");
     assert!(rendered.contains("rejected"), "{rendered}");
@@ -2451,7 +2451,7 @@ fn the_single_entry_sni_frontend_serves_the_validated_staple() {
     }];
 
     let config =
-        load_gateway_multi_cert_tls_config(&inputs, None, Some(&ocsp_path), &policy, 30, &[])
+        load_gateway_multi_cert_tls_config(&inputs, None, Some(&ocsp_path), &policy, 30, 0, &[])
             .expect("valid staple is admitted");
     assert_eq!(
         served_staple(config, "localhost", b"h2"),
@@ -2467,7 +2467,7 @@ fn the_single_entry_sni_frontend_serves_the_validated_staple() {
         pki_second_certificate(dir.path(), "other.localhost"),
     ];
     let multi_config =
-        load_gateway_multi_cert_tls_config(&multi, None, Some(&ocsp_path), &policy, 30, &[])
+        load_gateway_multi_cert_tls_config(&multi, None, Some(&ocsp_path), &policy, 30, 0, &[])
             .expect("a multi-certificate data plane still loads");
     assert!(
         served_staple(multi_config, "localhost", b"h2").is_empty(),
@@ -2949,4 +2949,207 @@ fn a_dropped_staple_is_reported_by_the_tls_inventory_without_a_deadline() {
         after.next_update.is_none() && after.days_until_next_update.is_none(),
         "no deadline may be reported for material that is no longer stapled"
     );
+}
+
+// ── Gateway multi-certificate enrolment (issue #4773) ──────────────────────
+
+/// The Gateway-API multi-certificate frontend is enrolled in the same
+/// re-check as the single-certificate one.
+///
+/// It validated a staple and recorded its `nextUpdate` but registered with
+/// nothing, so no code path could retire the response: the listener kept
+/// stapling a "good" assertion past the end of its validity window, for a
+/// certificate that may since have been revoked. Clients that enforce staple
+/// freshness abort such a handshake; clients that do not accept the stale
+/// assertion. The single-certificate loader has been enrolled since issue
+/// #4505 item 4 — this is that same contract on its sibling certificate
+/// source (refs #4792).
+#[test]
+fn the_periodic_recheck_drops_a_gateway_multi_cert_staple_that_reached_next_update() {
+    let pki = build_pki();
+    let dir = tempfile::tempdir().expect("tempdir");
+    // One captured reference instant for the whole fixture. Reading the clock
+    // again below would let a second boundary put the expected deadline one
+    // second ahead of the staple's own embedded timestamp (PR #4875).
+    let issued_at = now();
+    let expires_at = issued_at + 3_600;
+    let mut builder = ResponseBuilder::new(&pki, issued_at);
+    builder.this_update = issued_at - 60;
+    builder.next_update = Some(expires_at);
+    let staple = builder.build();
+    let (cert_path, key_path, ocsp_path) = write_material(dir.path(), &pki, &staple);
+    let policy = tls_policy();
+
+    let inputs = vec![GatewayCertificateInput {
+        cert_source: cert_path.clone(),
+        key_source: key_path.clone(),
+        hostname: Some("localhost".to_string()),
+        identity: "ns/gw/listener".to_string(),
+        is_default: true,
+    }];
+
+    let config = load_gateway_multi_cert_tls_config(
+        &inputs,
+        None,
+        Some(&ocsp_path),
+        &policy,
+        30,
+        // Warning window off, so this case is only about the drop.
+        0,
+        &[],
+    )
+    .expect("a staple inside its window is admitted");
+
+    assert_eq!(
+        served_staple(Arc::clone(&config), "localhost", b"h2"),
+        staple,
+        "the SNI-selected certificate must serve the staple before nextUpdate"
+    );
+    // The same credential is reachable through the fallback slot as well, so
+    // an unindexed name observes the staple too.
+    assert_eq!(
+        served_staple(Arc::clone(&config), "unmatched.example.com", b"h2"),
+        staple,
+        "the fallback candidate must serve the staple before nextUpdate"
+    );
+
+    // Control: one second before the deadline the pass changes nothing.
+    let kept = ferrum_edge::tls::ocsp_recheck::run_recheck_at_scoped(
+        expires_at - 1,
+        Some(ocsp_path.as_str()),
+    );
+    assert_eq!(kept.dropped, 0, "a staple inside its window is kept");
+    assert_eq!(
+        kept.tracked, 1,
+        "the Gateway multi-certificate frontend must be tracked at all"
+    );
+    assert_eq!(
+        served_staple(Arc::clone(&config), "localhost", b"h2"),
+        staple,
+        "a kept staple keeps reaching the wire"
+    );
+    assert!(
+        ferrum_edge::tls::ocsp_recheck::dropped_staple_next_update(ocsp_path.as_str()).is_none(),
+        "nothing may be reported retired while the staple is still served"
+    );
+
+    // At the deadline it is retired on the very `ServerConfig` the listener
+    // already holds: a Gateway snapshot is not rebuilt without live reload, so
+    // the retirement has to happen inside the resolver.
+    let dropped =
+        ferrum_edge::tls::ocsp_recheck::run_recheck_at_scoped(expires_at, Some(ocsp_path.as_str()));
+    assert_eq!(dropped.dropped, 1, "the expired staple is dropped");
+    assert_eq!(
+        dropped.tracked, 0,
+        "and is no longer tracked: a refreshed response arrives as a new registration"
+    );
+    assert!(
+        served_staple(Arc::clone(&config), "localhost", b"h2").is_empty(),
+        "the SNI-selected certificate must carry no staple after the re-check"
+    );
+    assert!(
+        served_staple(Arc::clone(&config), "unmatched.example.com", b"h2").is_empty(),
+        "the fallback candidate must be retired too, not only the indexed name"
+    );
+    assert_eq!(
+        ferrum_edge::tls::ocsp_recheck::dropped_staple_next_update(ocsp_path.as_str()),
+        Some(expires_at),
+        "the retirement is reported so the TLS inventory stops advertising the deadline"
+    );
+
+    // Idempotent: a second pass has nothing left to do.
+    let again = ferrum_edge::tls::ocsp_recheck::run_recheck_at_scoped(
+        expires_at + 86_400,
+        Some(ocsp_path.as_str()),
+    );
+    assert_eq!(again.dropped, 0);
+}
+
+/// A Gateway staple comfortably inside its window survives every re-check the
+/// gateway performs while it stays valid, and keeps being served.
+///
+/// The control for the case above: the retirement must be driven by
+/// `nextUpdate` and nothing else. A pass that dropped a healthy staple would
+/// silently remove the freshness assertion stapling exists to provide.
+#[test]
+fn the_periodic_recheck_retains_a_fresh_gateway_multi_cert_staple() {
+    let pki = build_pki();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let issued_at = now();
+    let expires_at = issued_at + 30 * 86_400;
+    let mut builder = ResponseBuilder::new(&pki, issued_at);
+    builder.this_update = issued_at - 60;
+    builder.next_update = Some(expires_at);
+    let staple = builder.build();
+    let (cert_path, key_path, ocsp_path) = write_material(dir.path(), &pki, &staple);
+    let policy = tls_policy();
+
+    let inputs = vec![GatewayCertificateInput {
+        cert_source: cert_path.clone(),
+        key_source: key_path.clone(),
+        hostname: Some("localhost".to_string()),
+        identity: "ns/gw/listener".to_string(),
+        is_default: true,
+    }];
+
+    let config =
+        load_gateway_multi_cert_tls_config(&inputs, None, Some(&ocsp_path), &policy, 30, 0, &[])
+            .expect("a fresh staple is admitted");
+
+    for at in [issued_at, issued_at + 86_400, expires_at - 1] {
+        let outcome =
+            ferrum_edge::tls::ocsp_recheck::run_recheck_at_scoped(at, Some(ocsp_path.as_str()));
+        assert_eq!(outcome.dropped, 0, "a fresh staple must not be retired");
+        assert_eq!(
+            outcome.tracked, 1,
+            "and must stay tracked for the next pass"
+        );
+    }
+    assert_eq!(
+        served_staple(Arc::clone(&config), "localhost", b"h2"),
+        staple,
+        "a fresh staple keeps reaching the wire across re-check passes"
+    );
+    assert!(
+        ferrum_edge::tls::ocsp_recheck::dropped_staple_next_update(ocsp_path.as_str()).is_none(),
+        "a retained staple must not be reported as retired"
+    );
+}
+
+/// Enrolment is a shared contract, not a per-loader habit.
+///
+/// Issue #4773 happened because acceptance was written twice and enrolment
+/// once. Validation, the acceptance record, and registration now live in one
+/// helper in `crate::tls::ocsp_recheck`, and `register_stapled_response` is
+/// private to that module, so a third certificate source cannot validate a
+/// staple and quietly skip the machinery that retires it (refs #4792).
+#[test]
+fn every_certificate_source_accepts_a_staple_through_the_shared_helper() {
+    let recheck = include_str!("../../../src/tls/ocsp_recheck.rs");
+    assert!(
+        recheck.contains("\nfn register_stapled_response("),
+        "registration must stay private to the re-check module so `enroll` is the only way in"
+    );
+
+    for (path, source) in [
+        ("src/tls/mod.rs", include_str!("../../../src/tls/mod.rs")),
+        (
+            "src/tls/multi_cert.rs",
+            include_str!("../../../src/tls/multi_cert.rs"),
+        ),
+    ] {
+        assert!(
+            source.contains("accept_stapled_response("),
+            "{path} must accept a staple through the shared helper"
+        );
+        assert!(
+            !source.contains("ocsp::validate_stapled_response("),
+            "{path} must not validate a staple outside the shared helper: that is exactly how a \
+             certificate source ends up serving one nothing can retire"
+        );
+        assert!(
+            source.contains(".enroll(&"),
+            "{path} must enrol the accepted staple with the resolver that serves it"
+        );
+    }
 }

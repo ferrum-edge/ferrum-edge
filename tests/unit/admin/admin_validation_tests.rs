@@ -456,6 +456,7 @@ fn api_spec_restore_contract_requires_the_configured_validation_client() {
     let validation = &backend[recovered_graph..restore_inputs];
     assert!(validation.contains("http_client: &PluginHttpClient"));
     assert!(validation.contains("let http_client = http_client.clone();"));
+    assert!(validation.contains("if !plugin.enabled"));
     assert!(!validation.contains("PluginHttpClient::default()"));
 }
 

@@ -332,6 +332,18 @@ pub const K8S_NAMESPACE_RESOURCES: &[CoreResourceSpec] = &[CoreResourceSpec {
     field_selector: None,
 }];
 
+// Istio VirtualService destinations may select a Service port by name. Keep
+// this input available even when native Pod discovery is explicitly disabled;
+// otherwise the translator cannot resolve an otherwise valid destination.
+pub const ISTIO_CORE_RESOURCES: &[CoreResourceSpec] = &[CoreResourceSpec {
+    group: "",
+    version: "v1",
+    kind: "Service",
+    plural: "services",
+    namespaced: true,
+    field_selector: None,
+}];
+
 pub const GATEWAY_API_CORE_RESOURCES: &[CoreResourceSpec] = &[
     CoreResourceSpec {
         group: "",
@@ -1706,6 +1718,13 @@ pub(crate) async fn start_crd_watchers(
                 }),
         );
     }
+    if selection.watch_istio {
+        core_watch_plan.extend(
+            ISTIO_CORE_RESOURCES
+                .iter()
+                .map(|resource| (resource, namespaces.clone())),
+        );
+    }
     if selection.watch_gateway_api {
         core_watch_plan.extend(
             K8S_NAMESPACE_RESOURCES
@@ -2133,6 +2152,16 @@ mod tests {
         assert!(
             !kinds.contains("Node"),
             "Node locality is optional and must not require cluster-scoped RBAC for pod discovery"
+        );
+    }
+
+    #[test]
+    fn istio_core_resources_include_services_for_named_destination_ports() {
+        assert!(
+            ISTIO_CORE_RESOURCES
+                .iter()
+                .any(|resource| resource.kind == "Service"),
+            "Istio translation must watch Services even without Pod discovery"
         );
     }
 

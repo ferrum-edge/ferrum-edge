@@ -428,6 +428,7 @@ impl LoadTestHarness {
         // Run migrations for postgres
         if db_type == "postgres" {
             let migrate_status = Command::new(binary_path)
+                .arg("run")
                 .env("FERRUM_MODE", "migrate")
                 .env("FERRUM_DB_TYPE", db_type)
                 .env("FERRUM_DB_URL", db_url)
@@ -439,6 +440,7 @@ impl LoadTestHarness {
         }
 
         let mut cmd = Command::new(binary_path);
+        cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env(
                 "FERRUM_ADMIN_JWT_MAX_TTL",

@@ -13,6 +13,8 @@ use bytes::Bytes;
 use serde_json::Value;
 use tracing::warn;
 
+use crate::plugins::utils::sink_loss::{SinkLossReason, SinkLossSlot};
+
 /// Default process-wide retained-byte ceiling shared by every observability
 /// sink instance (256 MiB — one instance's `HARD_MAX_BUFFER_MAX_BYTES`).
 pub const PROCESS_MAX_RETAINED_BYTES_DEFAULT: usize = 268_435_456;
@@ -438,6 +440,8 @@ pub struct ByteBudget {
     max_bytes: usize,
     drops: AtomicU64,
     plugin_name: &'static str,
+    /// Pre-resolved process-counter slot for `ferrum_plugin_log_sink_records_dropped_total`.
+    sink_slot: SinkLossSlot,
     ceiling: Option<&'static RetainedByteCeiling>,
 }
 
@@ -448,6 +452,7 @@ impl ByteBudget {
             max_bytes: max_bytes.max(1),
             drops: AtomicU64::new(0),
             plugin_name,
+            sink_slot: SinkLossSlot::for_plugin(plugin_name),
             ceiling: None,
         }
     }
@@ -475,6 +480,7 @@ impl ByteBudget {
             max_bytes: max_bytes.max(1),
             drops: AtomicU64::new(0),
             plugin_name,
+            sink_slot: SinkLossSlot::for_plugin(plugin_name),
             ceiling: Some(ceiling),
         }
     }
@@ -508,7 +514,10 @@ impl ByteBudget {
         // never left held while the aggregate reservation fails.
         let process = if let Some(ceiling) = self.ceiling {
             let Some(process) = ceiling.try_acquire(bytes) else {
-                self.record_drop("process-wide retained-byte ceiling exhausted");
+                self.record_drop(
+                    SinkLossReason::ByteBudget,
+                    "process-wide retained-byte ceiling exhausted",
+                );
                 return None;
             };
             Some(process)
@@ -523,7 +532,7 @@ impl ByteBudget {
             });
         if reserved.is_err() {
             drop(process);
-            self.record_drop("retained-byte budget exhausted");
+            self.record_drop(SinkLossReason::ByteBudget, "retained-byte budget exhausted");
             return None;
         }
         Some(Arc::new(ByteLease {
@@ -533,7 +542,21 @@ impl ByteBudget {
         }))
     }
 
-    pub fn record_drop(&self, reason: &'static str) {
+    /// Count one lost record against both this instance's diagnostic tally and
+    /// the process-persistent `ferrum_plugin_log_sink_records_dropped_total`
+    /// family. `loss_reason` is a closed label; `reason` is the free-text
+    /// detail that only ever reaches the log line.
+    pub fn record_drop(&self, loss_reason: SinkLossReason, reason: &'static str) {
+        self.sink_slot.record_dropped(loss_reason, 1);
+        self.record_drop_local(reason);
+    }
+
+    /// Instance-local tally and warning only.
+    ///
+    /// Use this where the batching layer has already published the same lost
+    /// record; double counting would break the `accepted + dropped` identity
+    /// that makes the published family trustworthy.
+    pub fn record_drop_local(&self, reason: &'static str) {
         let dropped = self.drops.fetch_add(1, Ordering::Relaxed) + 1;
         if dropped == 1 || dropped.is_multiple_of(DROP_WARN_EVERY) {
             warn!(

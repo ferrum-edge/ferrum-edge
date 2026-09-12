@@ -1,0 +1,231 @@
+[
+  {
+    "name": "http-proxy-throttle",
+    "expected_error": "tcp_connection_throttle",
+    "config": {
+      "version": "1",
+      "proxies": [
+        {
+          "id": "fixture-proxy",
+          "listen_path": "/fixture",
+          "backend_scheme": "http",
+          "backend_host": "localhost",
+          "backend_port": 3000,
+          "plugins": [
+            {
+              "plugin_config_id": "throttle"
+            }
+          ]
+        }
+      ],
+      "consumers": [],
+      "plugin_configs": [
+        {
+          "id": "throttle",
+          "plugin_name": "tcp_connection_throttle",
+          "scope": "proxy",
+          "enabled": true,
+          "config": {
+            "max_connections_per_key": 1
+          },
+          "proxy_id": "fixture-proxy"
+        }
+      ],
+      "upstreams": []
+    }
+  },
+  {
+    "name": "global-throttle-without-tcp",
+    "expected_error": "tcp_connection_throttle",
+    "config": {
+      "version": "1",
+      "proxies": [
+        {
+          "id": "fixture-proxy",
+          "listen_path": "/fixture",
+          "backend_scheme": "http",
+          "backend_host": "localhost",
+          "backend_port": 3000
+        }
+      ],
+      "consumers": [],
+      "plugin_configs": [
+        {
+          "id": "throttle",
+          "plugin_name": "tcp_connection_throttle",
+          "scope": "global",
+          "enabled": true,
+          "config": {
+            "max_connections_per_key": 1
+          }
+        }
+      ],
+      "upstreams": []
+    }
+  },
+  {
+    "name": "duplicate-global-correlation",
+    "expected_error": "duplicate effective header_name",
+    "config": {
+      "version": "1",
+      "proxies": [
+        {
+          "id": "fixture-proxy",
+          "listen_path": "/fixture",
+          "backend_scheme": "http",
+          "backend_host": "localhost",
+          "backend_port": 3000
+        }
+      ],
+      "consumers": [],
+      "plugin_configs": [
+        {
+          "id": "correlation-0",
+          "plugin_name": "correlation_id",
+          "scope": "global",
+          "enabled": true,
+          "config": {}
+        },
+        {
+          "id": "correlation-1",
+          "plugin_name": "correlation_id",
+          "scope": "global",
+          "enabled": true,
+          "config": {
+            "header_name": "x-request-id"
+          },
+          "priority_override": 75
+        }
+      ],
+      "upstreams": []
+    }
+  },
+  {
+    "name": "valid-tcp-proxy-throttle",
+    "expected_error": null,
+    "config": {
+      "version": "1",
+      "proxies": [
+        {
+          "id": "fixture-proxy",
+          "backend_scheme": "tcp",
+          "backend_host": "localhost",
+          "backend_port": 3000,
+          "listen_port": 31001,
+          "plugins": [
+            {
+              "plugin_config_id": "throttle"
+            }
+          ]
+        }
+      ],
+      "consumers": [],
+      "plugin_configs": [
+        {
+          "id": "throttle",
+          "plugin_name": "tcp_connection_throttle",
+          "scope": "proxy",
+          "enabled": true,
+          "config": {
+            "max_connections_per_key": 1
+          },
+          "proxy_id": "fixture-proxy"
+        }
+      ],
+      "upstreams": []
+    }
+  },
+  {
+    "name": "valid-global-tcp-throttle",
+    "expected_error": null,
+    "config": {
+      "version": "1",
+      "proxies": [
+        {
+          "id": "fixture-proxy",
+          "backend_scheme": "tcp",
+          "backend_host": "localhost",
+          "backend_port": 3000,
+          "listen_port": 31001
+        }
+      ],
+      "consumers": [],
+      "plugin_configs": [
+        {
+          "id": "throttle",
+          "plugin_name": "tcp_connection_throttle",
+          "scope": "global",
+          "enabled": true,
+          "config": {
+            "max_connections_per_key": 1
+          }
+        }
+      ],
+      "upstreams": []
+    }
+  },
+  {
+    "name": "valid-single-correlation",
+    "expected_error": null,
+    "config": {
+      "version": "1",
+      "proxies": [
+        {
+          "id": "fixture-proxy",
+          "listen_path": "/fixture",
+          "backend_scheme": "http",
+          "backend_host": "localhost",
+          "backend_port": 3000
+        }
+      ],
+      "consumers": [],
+      "plugin_configs": [
+        {
+          "id": "correlation-0",
+          "plugin_name": "correlation_id",
+          "scope": "global",
+          "enabled": true,
+          "config": {}
+        }
+      ],
+      "upstreams": []
+    }
+  },
+  {
+    "name": "valid-distinct-correlation",
+    "expected_error": null,
+    "config": {
+      "version": "1",
+      "proxies": [
+        {
+          "id": "fixture-proxy",
+          "listen_path": "/fixture",
+          "backend_scheme": "http",
+          "backend_host": "localhost",
+          "backend_port": 3000
+        }
+      ],
+      "consumers": [],
+      "plugin_configs": [
+        {
+          "id": "correlation-0",
+          "plugin_name": "correlation_id",
+          "scope": "global",
+          "enabled": true,
+          "config": {}
+        },
+        {
+          "id": "correlation-1",
+          "plugin_name": "correlation_id",
+          "scope": "global",
+          "enabled": true,
+          "config": {
+            "header_name": "x-second-correlation"
+          },
+          "priority_override": 75
+        }
+      ],
+      "upstreams": []
+    }
+  }
+]

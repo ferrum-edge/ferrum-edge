@@ -11,7 +11,7 @@ use crate::config::types::{
     Upstream, UpstreamLocalityLbSetting, UpstreamPortOverride, UpstreamTarget,
     parse_failover_priority_entry,
 };
-use crate::health_check::ProxyHealthState;
+use crate::health_check::{ActiveUnhealthyTargets, ProxyHealthState};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
@@ -837,7 +837,11 @@ fn resolve_wrr_vec_candidate<'a>(
 ///   keyed by plain `host:port` (matches `LoadBalancer.host_port_keys`) —
 ///   resolved once via the outer `passive_health` DashMap before calling `select_target`
 pub struct HealthContext<'a> {
-    pub active_unhealthy: &'a DashMap<String, u64>,
+    /// Shared active-probe ejections. The balancer projects this map onto its
+    /// own targets once per map generation and reuses that snapshot until the
+    /// checker publishes a change, so unrelated upstreams' probe flips never
+    /// force a per-selection rescan of this upstream's keys.
+    pub active_unhealthy: &'a ActiveUnhealthyTargets,
     /// Pre-resolved per-proxy passive health state. `None` means no passive
     /// failures have been recorded for this proxy (all targets healthy).
     /// Resolved from `HealthChecker.passive_health.get(proxy_id)` at the call
@@ -852,15 +856,22 @@ pub struct HealthContext<'a> {
     pub max_ejection_percent: Option<u8>,
 }
 
-fn passive_ejections_to_readmit(
-    passive_ejected: &mut [(usize, u64)],
+/// How many of `ejected_in_scope` passive-only ejections the max-ejection cap
+/// forces back into rotation for a candidate pool of `total_targets`.
+///
+/// Callers re-admit that many ejections in ascending `(ejected_at_tick_ms,
+/// index)` order — earliest first, matching outlier-detection recovery
+/// intuition (targets that have waited longest get the first chance), with
+/// the index tie-break making the readmitted set deterministic.
+fn passive_readmit_count(
+    ejected_in_scope: usize,
     total_targets: usize,
     max_ejection_percent: Option<u8>,
 ) -> usize {
     let Some(max_pct) = max_ejection_percent else {
         return 0;
     };
-    if passive_ejected.is_empty() || total_targets == 0 {
+    if ejected_in_scope == 0 || total_targets == 0 {
         return 0;
     }
 
@@ -874,14 +885,115 @@ fn passive_ejections_to_readmit(
         .saturating_sub(1)
         / 100) as usize;
     let max_ejected = max_ejected.min(total_targets);
-    if passive_ejected.len() <= max_ejected {
-        return 0;
+    ejected_in_scope.saturating_sub(max_ejected)
+}
+
+/// Sentinel generation that never matches a live [`ActiveUnhealthyTargets`]
+/// generation, so a freshly built balancer always computes its first snapshot.
+const ACTIVE_ELIGIBILITY_UNSET: u64 = u64::MAX;
+
+/// Upper bound on cached per-proxy passive projections one balancer keeps.
+/// An upstream is normally routed by one or a few proxies; past this many the
+/// least recently refreshed entry is evicted and simply recomputed on demand.
+const PASSIVE_ELIGIBILITY_TABLE_CAP: usize = 32;
+
+/// Cached projection of one proxy's passive ejection map onto one balancer's
+/// targets, tagged with the [`crate::health_check::PassiveUnhealthyTargets`]
+/// generation it was computed from. Rebuilt only when that proxy ejects or
+/// recovers a target; the balancer itself is rebuilt on reload, which drops
+/// the whole table, so index alignment can never go stale.
+struct PassiveEligibility {
+    /// [`ProxyHealthState::id`] this projection belongs to.
+    proxy_id: u64,
+    generation: u64,
+    /// Word-packed per-target bits: bit `i` set means target `i` is in the
+    /// proxy's passive ejection map. `ceil(n / 64)` words.
+    ejected: Box<[u64]>,
+    /// The same ejections as `(index, ejected_at_tick_ms)`, sorted ascending
+    /// by `(tick, index)` — the order the max-ejection cap re-admits in — so
+    /// selection walks it without sorting or allocating.
+    ejected_by_age: Box<[(usize, u64)]>,
+}
+
+impl PassiveEligibility {
+    #[inline]
+    fn is_ejected(&self, idx: usize) -> bool {
+        self.ejected
+            .get(idx / 64)
+            .is_some_and(|word| word & (1u64 << (idx % 64)) != 0)
     }
 
-    // Re-admit the earliest passive ejections first, matching outlier-detection
-    // recovery intuition: targets that have waited longest get the first chance.
-    passive_ejected.sort_unstable_by_key(|&(_, ts)| ts);
-    passive_ejected.len() - max_ejected
+    /// Bitset-path view (`n <= MAX_BITSET_TARGETS`): the low 128 bits as a
+    /// `u128` ejected mask.
+    #[inline]
+    fn ejected_u128(&self) -> u128 {
+        let lo = self.ejected.first().copied().unwrap_or(0) as u128;
+        let hi = self.ejected.get(1).copied().unwrap_or(0) as u128;
+        lo | (hi << 64)
+    }
+}
+
+/// Borrow of a [`PassiveEligibility`] that keeps its backing storage alive:
+/// either the lock-free table snapshot it lives in (hit) or the freshly built
+/// projection (miss). No refcount traffic on the hit path.
+enum PassiveEligibilityRef {
+    Cached(arc_swap::Guard<Arc<Vec<Arc<PassiveEligibility>>>>, usize),
+    Fresh(Arc<PassiveEligibility>),
+}
+
+impl std::ops::Deref for PassiveEligibilityRef {
+    type Target = PassiveEligibility;
+
+    #[inline]
+    fn deref(&self) -> &PassiveEligibility {
+        match self {
+            Self::Cached(table, index) => &table[*index],
+            Self::Fresh(fresh) => fresh,
+        }
+    }
+}
+
+/// Cached projection of the shared active-unhealthy map onto one balancer's
+/// targets, tagged with the [`ActiveUnhealthyTargets`] generation it was
+/// computed from. Recomputed only when that generation moves — i.e. when an
+/// active probe anywhere in the gateway flips a target — never per selection.
+struct ActiveEligibility {
+    /// [`ActiveUnhealthyTargets::id`] of the map this was projected from.
+    map_id: u64,
+    generation: u64,
+    /// Word-packed per-target bits: bit `i` set means target `i` is
+    /// active-unhealthy. `ceil(n / 64)` words; empty when `n == 0`.
+    unhealthy: Box<[u64]>,
+    /// `true` when at least one bit is set. The all-healthy common case
+    /// short-circuits on this without reading `unhealthy`.
+    any_unhealthy: bool,
+}
+
+impl ActiveEligibility {
+    fn unset() -> Self {
+        Self {
+            map_id: 0,
+            generation: ACTIVE_ELIGIBILITY_UNSET,
+            unhealthy: Box::default(),
+            any_unhealthy: false,
+        }
+    }
+
+    #[inline]
+    fn is_unhealthy(&self, idx: usize) -> bool {
+        self.unhealthy
+            .get(idx / 64)
+            .is_some_and(|word| word & (1u64 << (idx % 64)) != 0)
+    }
+
+    /// Bitset-path view (`n <= MAX_BITSET_TARGETS`): the low 128 bits as a
+    /// `u128` unhealthy mask.
+    #[inline]
+    fn unhealthy_u128(&self) -> u128 {
+        let lo = self.unhealthy.first().copied().unwrap_or(0) as u128;
+        let hi = self.unhealthy.get(1).copied().unwrap_or(0) as u128;
+        lo | (hi << 64)
+    }
 }
 
 /// Parsed strategy for resolving the hash key used by consistent hashing.
@@ -3184,6 +3296,20 @@ pub struct LoadBalancer {
     /// "host:port" format as `host_port_keys`, enabling zero-allocation lookup
     /// via `write!()` into a thread-local buffer.
     target_index: HashMap<String, usize>,
+    /// `0..targets.len()` materialized once for the `> MAX_BITSET_TARGETS`
+    /// Vec path, which needs the unfiltered scope as a slice for strict
+    /// locality fallback. Empty on the bitset path, which never reads it.
+    all_indices: Vec<usize>,
+    /// Snapshot of which of this balancer's targets the shared active-probe
+    /// map currently ejects, keyed by that map's publication generation. See
+    /// [`ActiveEligibility`] and [`Self::active_eligibility`].
+    active_eligibility: ArcSwap<ActiveEligibility>,
+    /// Per-proxy passive projections, one entry per [`ProxyHealthState`] that
+    /// has selected through this balancer while holding passive ejections.
+    /// Copy-on-write: selections take a lock-free snapshot and scan the (tiny)
+    /// table by proxy id; a refresh clones the table with one entry replaced.
+    /// See [`PassiveEligibility`] and [`Self::passive_eligibility`].
+    passive_eligibility: ArcSwap<Vec<Arc<PassiveEligibility>>>,
     /// O(1) reverse lookup from an opaque sticky-session token to the index of
     /// the target it was minted for. This is what makes Gateway API session
     /// persistence *backend-bound*: a returning client resolves to the exact
@@ -3507,6 +3633,11 @@ impl LoadBalancer {
             .enumerate()
             .map(|(i, k)| (k.clone(), i))
             .collect();
+        let all_indices: Vec<usize> = if targets.len() > MAX_BITSET_TARGETS {
+            (0..targets.len()).collect()
+        } else {
+            Vec::new()
+        };
 
         // Pre-compute subset → target indices for O(1) subset routing.
         // A target belongs to a subset if its `tags` are a superset of the
@@ -3744,6 +3875,9 @@ impl LoadBalancer {
             target_locality_ranks,
             srv_priorities,
             target_index,
+            all_indices,
+            active_eligibility: ArcSwap::from_pointee(ActiveEligibility::unset()),
+            passive_eligibility: ArcSwap::from_pointee(Vec::new()),
             sticky_token_index,
             has_wildcard_host_target,
             algorithm,
@@ -4159,10 +4293,232 @@ impl LoadBalancer {
                 .any(|(_, target)| target.port == port && target.host.eq_ignore_ascii_case(host))
     }
 
-    /// Compute a stack-allocated bitset of healthy target indices in a single
-    /// pass. Each target requires at most 2 `DashMap` lookups (active + passive),
-    /// done once per `select()` call. All subsequent algorithm steps use free
-    /// bit tests on the resulting bitset.
+    /// Resolve the active-eligibility snapshot for the generation the shared
+    /// active map currently publishes, recomputing it only when that
+    /// generation moved since the last selection on this balancer.
+    ///
+    /// Ordering: the generation is read (`Acquire`) BEFORE the map is scanned.
+    /// A mutation that lands during the scan publishes (`Release`) a higher
+    /// generation afterwards, so the snapshot tagged with the older value is
+    /// discarded on the next selection — a racing write can be missed for one
+    /// selection at most, exactly the window a direct `DashMap` probe has.
+    #[inline]
+    fn active_eligibility(&self, h: &HealthContext<'_>) -> arc_swap::Guard<Arc<ActiveEligibility>> {
+        let generation = h.active_unhealthy.generation();
+        let snapshot = self.active_eligibility.load();
+        if snapshot.generation == generation && snapshot.map_id == h.active_unhealthy.id() {
+            return snapshot;
+        }
+        self.refresh_active_eligibility(h.active_unhealthy, generation)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn refresh_active_eligibility(
+        &self,
+        active: &ActiveUnhealthyTargets,
+        generation: u64,
+    ) -> arc_swap::Guard<Arc<ActiveEligibility>> {
+        let mut unhealthy = vec![0u64; self.target_keys.len().div_ceil(64)].into_boxed_slice();
+        let mut any_unhealthy = false;
+        for (idx, key) in self.target_keys.iter().enumerate() {
+            if active.contains_key(key) {
+                unhealthy[idx / 64] |= 1u64 << (idx % 64);
+                any_unhealthy = true;
+            }
+        }
+        // Two threads that miss together both store; whichever lands last wins
+        // and any snapshot tagged with a stale generation is simply recomputed
+        // on the next selection, so no CAS loop is needed.
+        self.active_eligibility.store(Arc::new(ActiveEligibility {
+            map_id: active.id(),
+            generation,
+            unhealthy,
+            any_unhealthy,
+        }));
+        self.active_eligibility.load()
+    }
+
+    /// Resolve this proxy's passive projection for the generation its
+    /// ejection map currently publishes, recomputing only when that
+    /// generation moved. Same ordering argument as [`Self::active_eligibility`].
+    #[inline]
+    fn passive_eligibility(&self, ps: &ProxyHealthState) -> PassiveEligibilityRef {
+        let generation = ps.unhealthy.generation();
+        let proxy_id = ps.id();
+        let table = self.passive_eligibility.load();
+        match table
+            .iter()
+            .position(|entry| entry.proxy_id == proxy_id && entry.generation == generation)
+        {
+            Some(index) => PassiveEligibilityRef::Cached(table, index),
+            None => PassiveEligibilityRef::Fresh(
+                self.refresh_passive_eligibility(ps, proxy_id, generation),
+            ),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn refresh_passive_eligibility(
+        &self,
+        ps: &ProxyHealthState,
+        proxy_id: u64,
+        generation: u64,
+    ) -> Arc<PassiveEligibility> {
+        let n = self.host_port_keys.len();
+        let mut ejected = vec![0u64; n.div_ceil(64)].into_boxed_slice();
+        let mut ejected_by_age: Vec<(usize, u64)> = Vec::new();
+        // Per-target probes (not a map walk): `DashMap::iter` allocates a
+        // guard per shard, and probing also keeps two targets that share one
+        // `host:port` both ejected.
+        for (idx, key) in self.host_port_keys.iter().enumerate() {
+            if let Some(entry) = ps.unhealthy.get(key) {
+                ejected[idx / 64] |= 1u64 << (idx % 64);
+                ejected_by_age.push((idx, entry.ejected_at_tick_ms));
+            }
+        }
+        ejected_by_age.sort_unstable_by_key(|&(idx, tick)| (tick, idx));
+        let fresh = Arc::new(PassiveEligibility {
+            proxy_id,
+            generation,
+            ejected,
+            ejected_by_age: ejected_by_age.into_boxed_slice(),
+        });
+        // Copy-on-write upsert. `rcu` retries if another refresh raced, so a
+        // concurrent refresh for a different proxy is never lost.
+        self.passive_eligibility.rcu(|table| {
+            let mut next: Vec<Arc<PassiveEligibility>> = Vec::with_capacity(table.len() + 1);
+            next.extend(
+                table
+                    .iter()
+                    .filter(|entry| entry.proxy_id != proxy_id)
+                    .cloned(),
+            );
+            if next.len() >= PASSIVE_ELIGIBILITY_TABLE_CAP {
+                next.remove(0);
+            }
+            next.push(Arc::clone(&fresh));
+            next
+        });
+        fresh
+    }
+
+    /// Bitset-path health filter shared by the full, index-scoped, and
+    /// mask-scoped entry points. Removes active-unhealthy candidates, then
+    /// passive ejections, then re-admits the earliest passive ejections the
+    /// max-ejection cap (sized to `candidate_count`) requires. Callers apply
+    /// the SRV tier filter to the result. Allocation-free.
+    ///
+    /// Requires `self.targets.len() <= MAX_BITSET_TARGETS`.
+    #[inline]
+    fn apply_health_to_mask(
+        &self,
+        h: &HealthContext<'_>,
+        mask: HealthBitset,
+        candidate_count: usize,
+    ) -> HealthBitset {
+        let active = self.active_eligibility(h);
+        let passive_len = h.proxy_passive.as_ref().map_or(0, |ps| ps.unhealthy.len());
+        // Common case: nothing is ejected anywhere that matters to this
+        // balancer — two atomic loads and no map traffic.
+        if !active.any_unhealthy && passive_len == 0 {
+            return mask;
+        }
+
+        // Active ejections are not subject to the cap — the target is
+        // genuinely unreachable.
+        let eligible = mask.bits & !active.unhealthy_u128();
+        if passive_len == 0 {
+            return HealthBitset::from_bits(eligible);
+        }
+        let Some(ps) = h.proxy_passive.as_ref() else {
+            return HealthBitset::from_bits(eligible);
+        };
+
+        // Only indices ejected by passive health alone (not active) count
+        // toward the cap and are candidates for re-admission.
+        let passive = self.passive_eligibility(ps);
+        let passive_only = eligible & passive.ejected_u128();
+        let mut bitset = HealthBitset::from_bits(eligible & !passive_only);
+        if passive_only == 0 {
+            return bitset;
+        }
+        let to_readmit = passive_readmit_count(
+            passive_only.count_ones() as usize,
+            candidate_count,
+            h.max_ejection_percent,
+        );
+        if to_readmit == 0 {
+            return bitset;
+        }
+        let mut readmitted = 0usize;
+        for &(idx, _) in passive.ejected_by_age.iter() {
+            if readmitted == to_readmit {
+                break;
+            }
+            if idx < MAX_BITSET_TARGETS && passive_only & (1u128 << idx) != 0 {
+                bitset.set(idx);
+                readmitted += 1;
+            }
+        }
+        bitset
+    }
+
+    /// Vec-path passive filter. `healthy` is ascending by original index and
+    /// already excludes active-unhealthy targets; ejected candidates the cap
+    /// does not re-admit are removed in place so the ordering invariant holds
+    /// without a re-sort. Allocates only when a cap actually re-admits.
+    fn apply_passive_ejections_vec(
+        &self,
+        h: &HealthContext<'_>,
+        ps: &ProxyHealthState,
+        candidate_count: usize,
+        healthy: &mut Vec<(usize, &Arc<UpstreamTarget>)>,
+    ) {
+        let passive = self.passive_eligibility(ps);
+        if passive.ejected_by_age.is_empty() {
+            return;
+        }
+        let in_scope = |idx: usize| {
+            healthy
+                .binary_search_by_key(&idx, |(candidate, _)| *candidate)
+                .is_ok()
+        };
+        let to_readmit = match h.max_ejection_percent {
+            None => 0,
+            Some(_) => {
+                let ejected_in_scope = passive
+                    .ejected_by_age
+                    .iter()
+                    .filter(|(idx, _)| in_scope(*idx))
+                    .count();
+                passive_readmit_count(ejected_in_scope, candidate_count, h.max_ejection_percent)
+            }
+        };
+        if to_readmit == 0 {
+            healthy.retain(|(idx, _)| !passive.is_ejected(*idx));
+            return;
+        }
+        // Keep the `to_readmit` earliest in-scope ejections; drop the rest.
+        let mut keep: Vec<usize> = Vec::with_capacity(to_readmit);
+        for &(idx, _) in passive.ejected_by_age.iter() {
+            if keep.len() == to_readmit {
+                break;
+            }
+            if in_scope(idx) {
+                keep.push(idx);
+            }
+        }
+        keep.sort_unstable();
+        healthy.retain(|(idx, _)| !passive.is_ejected(*idx) || keep.binary_search(idx).is_ok());
+    }
+
+    /// Compute a stack-allocated bitset of healthy target indices. Active
+    /// eligibility comes from the generation-cached snapshot and passive
+    /// ejections from the proxy's own (small) map, so the all-healthy common
+    /// case touches no `DashMap` at all. All subsequent algorithm steps use
+    /// free bit tests on the resulting bitset.
     ///
     /// Requires `self.targets.len() <= MAX_BITSET_TARGETS`.
     #[inline]
@@ -4171,45 +4527,7 @@ impl LoadBalancer {
         let Some(h) = health else {
             return self.filter_srv_priority_bitset(HealthBitset::all(n));
         };
-
-        // Fast check: if both health maps are empty, all targets are healthy.
-        if h.active_unhealthy.is_empty()
-            && h.proxy_passive
-                .as_ref()
-                .is_none_or(|ps| ps.unhealthy.is_empty())
-        {
-            return self.filter_srv_priority_bitset(HealthBitset::all(n));
-        }
-
-        let mut bitset = HealthBitset::empty();
-        // Track which indices are ejected only by passive health (not active),
-        // so the ejection cap can selectively re-admit the earliest ones.
-        let mut passive_ejected: Vec<(usize, u64)> = Vec::new();
-
-        for i in 0..n {
-            // Active: pre-computed "upstream_id::host:port" key
-            if h.active_unhealthy.contains_key(&self.target_keys[i]) {
-                // Active ejections are not subject to the cap — the target is
-                // genuinely unreachable.
-                continue;
-            }
-            // Passive: direct "host:port" lookup in proxy's own map
-            if let Some(ref ps) = h.proxy_passive
-                && let Some(entry) = ps.unhealthy.get(&self.host_port_keys[i])
-            {
-                passive_ejected.push((i, entry.ejected_at_tick_ms));
-                continue;
-            }
-            bitset.set(i);
-        }
-
-        let to_readmit =
-            passive_ejections_to_readmit(&mut passive_ejected, n, h.max_ejection_percent);
-        for &(idx, _) in passive_ejected.iter().take(to_readmit) {
-            bitset.set(idx);
-        }
-
-        self.filter_srv_priority_bitset(bitset)
+        self.filter_srv_priority_bitset(self.apply_health_to_mask(h, HealthBitset::all(n), n))
     }
 
     /// Compute healthy indices for a pre-filtered target set. This keeps
@@ -4222,53 +4540,20 @@ impl LoadBalancer {
         health: Option<&HealthContext<'_>>,
         indices: &[usize],
     ) -> HealthBitset {
+        // RFC 2782 tier selection is not a health filter: it must run on the
+        // `None`-health, all-healthy, and post-ejection paths alike, or an
+        // all-healthy subset / per-port dispatch would round-robin a DR tier
+        // alongside its primary tier.
         let Some(h) = health else {
             return self.filter_srv_priority_bitset(bitset_for_indices(indices));
         };
-
-        if h.active_unhealthy.is_empty()
-            && h.proxy_passive
-                .as_ref()
-                .is_none_or(|ps| ps.unhealthy.is_empty())
-        {
-            // Every candidate is healthy, but RFC 2782 tier selection is not a
-            // health filter: it must still run, exactly as on the `None`-health
-            // and post-ejection paths below, or an all-healthy subset /
-            // per-port dispatch would round-robin a DR tier alongside its
-            // primary tier.
-            return self.filter_srv_priority_bitset(bitset_for_indices(indices));
-        }
-
-        let mut bitset = HealthBitset::empty();
-        let mut passive_ejected: Vec<(usize, u64)> = Vec::new();
-
-        for &i in indices {
-            debug_assert!(i < self.targets.len());
-            if i >= self.targets.len() {
-                continue;
-            }
-            if h.active_unhealthy.contains_key(&self.target_keys[i]) {
-                continue;
-            }
-            if let Some(ref ps) = h.proxy_passive
-                && let Some(entry) = ps.unhealthy.get(&self.host_port_keys[i])
-            {
-                passive_ejected.push((i, entry.ejected_at_tick_ms));
-                continue;
-            }
-            bitset.set(i);
-        }
-
-        let to_readmit = passive_ejections_to_readmit(
-            &mut passive_ejected,
-            indices.len(),
-            h.max_ejection_percent,
+        // Candidates beyond `targets.len()` cannot occur on this path (subset
+        // and port lanes are built from the same target list); the mask drops
+        // them and the cap keeps the caller's `indices.len()` sizing.
+        let mask = HealthBitset::from_bits(
+            bitset_for_indices(indices).bits & HealthBitset::all(self.targets.len()).bits,
         );
-        for &(idx, _) in passive_ejected.iter().take(to_readmit) {
-            bitset.set(idx);
-        }
-
-        self.filter_srv_priority_bitset(bitset)
+        self.filter_srv_priority_bitset(self.apply_health_to_mask(h, mask, indices.len()))
     }
 
     /// Alloc-free analogue of [`Self::compute_health_bitset_for_indices`] that
@@ -4287,46 +4572,10 @@ impl LoadBalancer {
         let Some(h) = health else {
             return self.filter_srv_priority_bitset(*mask);
         };
-
-        if h.active_unhealthy.is_empty()
-            && h.proxy_passive
-                .as_ref()
-                .is_none_or(|ps| ps.unhealthy.is_empty())
-        {
-            return self.filter_srv_priority_bitset(*mask);
-        }
-
         let candidate_count = mask.count();
-        let mut bitset = HealthBitset::empty();
-        let mut passive_ejected: Vec<(usize, u64)> = Vec::new();
-
-        mask.for_each_set_bit(|i| {
-            debug_assert!(i < self.targets.len());
-            if i >= self.targets.len() {
-                return;
-            }
-            if h.active_unhealthy.contains_key(&self.target_keys[i]) {
-                return;
-            }
-            if let Some(ref ps) = h.proxy_passive
-                && let Some(entry) = ps.unhealthy.get(&self.host_port_keys[i])
-            {
-                passive_ejected.push((i, entry.ejected_at_tick_ms));
-                return;
-            }
-            bitset.set(i);
-        });
-
-        let to_readmit = passive_ejections_to_readmit(
-            &mut passive_ejected,
-            candidate_count,
-            h.max_ejection_percent,
-        );
-        for &(idx, _) in passive_ejected.iter().take(to_readmit) {
-            bitset.set(idx);
-        }
-
-        self.filter_srv_priority_bitset(bitset)
+        let in_range =
+            HealthBitset::from_bits(mask.bits & HealthBitset::all(self.targets.len()).bits);
+        self.filter_srv_priority_bitset(self.apply_health_to_mask(h, in_range, candidate_count))
     }
 
     /// Collect healthy targets into a Vec — fallback for upstreams with >128
@@ -4347,31 +4596,27 @@ impl LoadBalancer {
             return all;
         };
 
-        let mut healthy: Vec<(usize, &Arc<UpstreamTarget>)> = Vec::new();
-        let mut passive_ejected: Vec<(usize, u64)> = Vec::new();
+        let active = self.active_eligibility(h);
+        let passive_len = h.proxy_passive.as_ref().map_or(0, |ps| ps.unhealthy.len());
 
-        for (i, target) in self.targets.iter().enumerate() {
-            if h.active_unhealthy.contains_key(&self.target_keys[i]) {
-                continue;
-            }
-            if let Some(ref ps) = h.proxy_passive
-                && let Some(entry) = ps.unhealthy.get(&self.host_port_keys[i])
-            {
-                passive_ejected.push((i, entry.ejected_at_tick_ms));
-                continue;
-            }
-            healthy.push((i, target));
+        // Sized up front: the old grow-by-doubling `Vec::new()` cost ~10
+        // reallocations per selection at 1,000 targets.
+        let mut healthy: Vec<(usize, &Arc<UpstreamTarget>)> = Vec::with_capacity(n);
+        if active.any_unhealthy {
+            healthy.extend(
+                self.targets
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !active.is_unhealthy(*i)),
+            );
+        } else {
+            healthy.extend(self.targets.iter().enumerate());
         }
 
-        let to_readmit =
-            passive_ejections_to_readmit(&mut passive_ejected, n, h.max_ejection_percent);
-        if to_readmit > 0 {
-            for &(idx, _) in passive_ejected.iter().take(to_readmit) {
-                healthy.push((idx, &self.targets[idx]));
-            }
-            // Readmits were appended out of enumeration order; restore the
-            // ascending original-index invariant used by WRR Vec cache keys.
-            healthy.sort_unstable_by_key(|(idx, _)| *idx);
+        if passive_len > 0
+            && let Some(ps) = h.proxy_passive.as_ref()
+        {
+            self.apply_passive_ejections_vec(h, ps, n, &mut healthy);
         }
 
         self.filter_srv_priority_vec(&mut healthy);
@@ -4398,35 +4643,24 @@ impl LoadBalancer {
             return all;
         };
 
-        let mut healthy: Vec<(usize, &Arc<UpstreamTarget>)> = Vec::new();
-        let mut passive_ejected: Vec<(usize, u64)> = Vec::new();
+        let active = self.active_eligibility(h);
+        let passive_len = h.proxy_passive.as_ref().map_or(0, |ps| ps.unhealthy.len());
 
+        let mut healthy: Vec<(usize, &Arc<UpstreamTarget>)> = Vec::with_capacity(indices.len());
         for &i in indices {
             let Some(target) = self.targets.get(i) else {
                 continue;
             };
-            if h.active_unhealthy.contains_key(&self.target_keys[i]) {
-                continue;
-            }
-            if let Some(ref ps) = h.proxy_passive
-                && let Some(entry) = ps.unhealthy.get(&self.host_port_keys[i])
-            {
-                passive_ejected.push((i, entry.ejected_at_tick_ms));
+            if active.is_unhealthy(i) {
                 continue;
             }
             healthy.push((i, target));
         }
 
-        let to_readmit = passive_ejections_to_readmit(
-            &mut passive_ejected,
-            indices.len(),
-            h.max_ejection_percent,
-        );
-        if to_readmit > 0 {
-            for &(idx, _) in passive_ejected.iter().take(to_readmit) {
-                healthy.push((idx, &self.targets[idx]));
-            }
-            healthy.sort_unstable_by_key(|(idx, _)| *idx);
+        if passive_len > 0
+            && let Some(ps) = h.proxy_passive.as_ref()
+        {
+            self.apply_passive_ejections_vec(h, ps, indices.len(), &mut healthy);
         }
 
         self.filter_srv_priority_vec(&mut healthy);
@@ -5917,13 +6151,13 @@ impl LoadBalancer {
         ctx_key: &str,
         health: Option<&HealthContext<'_>>,
     ) -> Option<TargetSelection> {
-        let scope_indices: Vec<usize> = (0..self.targets.len()).collect();
+        let scope_indices: &[usize] = &self.all_indices;
         let healthy = self.healthy_targets_vec(health);
         if healthy.is_empty() {
             let all: Vec<(usize, &Arc<UpstreamTarget>)> = self.targets.iter().enumerate().collect();
             let (all, _) = self.preferred_locality_candidates(
                 all,
-                &scope_indices,
+                scope_indices,
                 self.locality_lb.as_ref(),
                 self.failover_enabled,
             );
@@ -5936,7 +6170,7 @@ impl LoadBalancer {
         }
         let (healthy, degraded) = self.preferred_locality_candidates(
             healthy,
-            &scope_indices,
+            scope_indices,
             self.locality_lb.as_ref(),
             self.failover_enabled,
         );
@@ -8227,7 +8461,7 @@ mod tests {
         );
 
         // Mark every target as active-unhealthy.
-        let active_unhealthy: DashMap<String, u64> = DashMap::new();
+        let active_unhealthy = ActiveUnhealthyTargets::new();
         for t in &targets {
             active_unhealthy.insert(target_key("upstream-ch", t), 1);
         }
@@ -8272,7 +8506,7 @@ mod tests {
         assert!(!lb.hash_ring.is_empty());
 
         // Mark every target as active-unhealthy.
-        let active_unhealthy: DashMap<String, u64> = DashMap::new();
+        let active_unhealthy = ActiveUnhealthyTargets::new();
         for t in &targets {
             active_unhealthy.insert(target_key("upstream-large", t), 1);
         }
@@ -8394,7 +8628,7 @@ mod tests {
             None,
         );
         // Eject the orig-dst target via active health.
-        let active_unhealthy: DashMap<String, u64> = DashMap::new();
+        let active_unhealthy = ActiveUnhealthyTargets::new();
         active_unhealthy.insert(target_key("upstream-pt", &targets[1]), 1);
         let health = HealthContext {
             active_unhealthy: &active_unhealthy,

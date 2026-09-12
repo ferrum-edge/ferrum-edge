@@ -296,6 +296,51 @@ fn test_reject_abort_body_not_string() {
 }
 
 #[test]
+fn test_abort_body_null_and_omission_are_empty() {
+    for config in [
+        json!({"abort": {"status_code": 503, "percentage": 100.0, "body": null}}),
+        json!({"abort": {"status_code": 503, "percentage": 100.0, "body": ""}}),
+        json!({"abort": {"status_code": 503, "percentage": 100.0}}),
+    ] {
+        FaultInjectionPlugin::new(&config).unwrap_or_else(|error| {
+            panic!("null/empty/omitted abort.body must be admitted: {config} ({error})")
+        });
+    }
+}
+
+fn json_number_config(field_json: &str) -> serde_json::Value {
+    serde_json::from_str(field_json).expect("JSON number fixture")
+}
+
+#[test]
+fn test_integral_json_numbers_are_admitted() {
+    for config in [
+        json_number_config(r#"{"abort":{"status_code":503.0,"percentage":100}}"#),
+        json_number_config(r#"{"abort":{"status_code":5.03e2,"percentage":100}}"#),
+        json_number_config(r#"{"abort":{"status_code":503,"percentage":100,"grpc_status":14.0}}"#),
+        json_number_config(r#"{"delay":{"duration_ms":80.0,"percentage":100}}"#),
+    ] {
+        FaultInjectionPlugin::new(&config).unwrap_or_else(|error| {
+            panic!("integral JSON number must be admitted: {config} ({error})")
+        });
+    }
+}
+
+#[test]
+fn test_fractional_json_numbers_are_rejected() {
+    for config in [
+        json_number_config(r#"{"abort":{"status_code":503.1,"percentage":100}}"#),
+        json_number_config(r#"{"abort":{"status_code":503,"percentage":100,"grpc_status":14.5}}"#),
+        json_number_config(r#"{"delay":{"duration_ms":80.5,"percentage":100}}"#),
+    ] {
+        assert!(
+            FaultInjectionPlugin::new(&config).is_err(),
+            "fractional JSON number must be rejected: {config}"
+        );
+    }
+}
+
+#[test]
 fn test_reject_missing_abort_percentage() {
     let err = FaultInjectionPlugin::new(&json!({
         "abort": { "status_code": 503 }
@@ -655,12 +700,22 @@ async fn test_fault_rejection_shaping_matches_request_protocols() {
                 Some("14"),
                 "{protocol}"
             );
+            assert_eq!(
+                normalized.headers.get("content-type").map(String::as_str),
+                Some("application/grpc"),
+                "{protocol}"
+            );
         } else {
             assert_eq!(normalized.http_status, StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(&normalized.body[..], b"fault", "{protocol}");
             assert_eq!(normalized.grpc_status, None, "{protocol}");
             assert!(
                 !normalized.headers.contains_key("grpc-status"),
+                "{protocol}"
+            );
+            assert_eq!(
+                normalized.headers.get("content-type").map(String::as_str),
+                Some("text/plain"),
                 "{protocol}"
             );
         }
@@ -687,6 +742,89 @@ async fn test_fault_rejection_shaping_matches_request_protocols() {
     );
     assert_eq!(normalized.http_status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(!normalized.headers.contains_key("grpc-status"));
+    assert_eq!(
+        normalized.headers.get("content-type").map(String::as_str),
+        Some("text/plain")
+    );
+}
+
+#[tokio::test]
+async fn test_abort_content_type_matches_configured_body() {
+    for (body, expected_type) in [
+        ("fault injected", "text/plain"),
+        ("line1\n\"quoted\"\\back — ünîcödé", "text/plain"),
+        (r#"{"error":"injected"}"#, "application/json"),
+        ("", "text/plain"),
+    ] {
+        let plugin = FaultInjectionPlugin::new(&json!({
+            "abort": {
+                "status_code": 503,
+                "percentage": 100.0,
+                "body": body
+            }
+        }))
+        .unwrap();
+        let mut ctx = make_ctx();
+        let PluginResult::Reject {
+            status_code,
+            body: reject_body,
+            headers,
+        } = run_before_proxy(&plugin, &mut ctx).await
+        else {
+            panic!("abort must reject");
+        };
+        assert_eq!(reject_body, body);
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some(expected_type),
+            "plugin header for {body:?}"
+        );
+        let normalized = normalize_reject_response(
+            StatusCode::from_u16(status_code).unwrap(),
+            reject_body.as_bytes(),
+            &headers,
+            false,
+        );
+        assert_eq!(
+            normalized.headers.get("content-type").map(String::as_str),
+            Some(expected_type),
+            "normalized header for {body:?}"
+        );
+        assert_eq!(&normalized.body[..], body.as_bytes());
+    }
+
+    let plugin = FaultInjectionPlugin::new(&json!({
+        "abort": {
+            "status_code": 503,
+            "percentage": 100.0,
+            "grpc_status": 14,
+            "body": "fault injected"
+        }
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    set_request_http_flavor_for_test(&mut ctx, HttpFlavor::Grpc);
+    let PluginResult::Reject {
+        status_code,
+        body,
+        headers,
+    } = run_before_proxy_with_content_type(&plugin, &mut ctx, "application/grpc").await
+    else {
+        panic!("native gRPC abort must reject");
+    };
+    let normalized = normalize_reject_response(
+        StatusCode::from_u16(status_code).unwrap(),
+        body.as_bytes(),
+        &headers,
+        true,
+    );
+    assert_eq!(normalized.http_status, StatusCode::OK);
+    assert!(normalized.body.is_empty());
+    assert_eq!(normalized.grpc_status, Some(14));
+    assert_eq!(
+        normalized.headers.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
 }
 
 #[tokio::test]
@@ -856,6 +994,31 @@ fn test_runtime_overlay_scope_accepted() {
         "runtime_overlay_scope": "checkout"
     }));
     assert!(plugin.is_ok(), "non-empty scope must be accepted");
+}
+
+#[test]
+fn test_runtime_overlay_scope_follows_rust_unicode_whitespace() {
+    let abort = json!({"status_code": 503, "percentage": 50.0});
+    let nel = FaultInjectionPlugin::new(&json!({
+        "abort": abort,
+        "runtime_overlay_scope": "\u{0085}"
+    }));
+    assert!(
+        nel.is_err(),
+        "U+0085 is Rust White_Space and must not be a scope"
+    );
+
+    FaultInjectionPlugin::new(&json!({
+        "abort": {"status_code": 503, "percentage": 50.0},
+        "runtime_overlay_scope": "\u{FEFF}"
+    }))
+    .expect("U+FEFF is not Rust White_Space and must be a valid scope");
+
+    let nbsp = FaultInjectionPlugin::new(&json!({
+        "abort": {"status_code": 503, "percentage": 50.0},
+        "runtime_overlay_scope": "\u{00A0}"
+    }));
+    assert!(nbsp.is_err(), "U+00A0 is Rust White_Space");
 }
 
 #[test]

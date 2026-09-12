@@ -86,6 +86,46 @@ pub use router_cache::{RouteMatch, RouterCache};
 /// The leading underscore signals that this module is not part of the public API.
 #[doc(hidden)]
 pub mod _test_support {
+    /// Exercise the dispatch coordinate rebase and its cloned diagnostic context.
+    pub fn rebase_backend_path_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        path: String,
+        strip_len: &mut usize,
+    ) -> (String, usize) {
+        ctx.matched_path_strip_len = *strip_len;
+        let path = crate::proxy::rebase_route_override_path(ctx, path, strip_len);
+        let cloned_offset = ctx
+            .clone_for_final_request_body_hooks()
+            .matched_path_strip_len;
+        (path, cloned_offset)
+    }
+
+    /// Exercise the WebSocket-handshake body-digest proof (issue #5000) without
+    /// standing up a transport. `plugins` decides whether any configured policy
+    /// asked for digests; `ctx` supplies the handshake's framing headers.
+    pub fn publish_websocket_handshake_body_digests_for_test(
+        plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+    ) {
+        crate::proxy::publish_websocket_handshake_body_digests(plugins, ctx);
+    }
+
+    pub fn websocket_backend_path_for_test(
+        proxy: &crate::config::types::Proxy,
+        path: &str,
+        strip_len: usize,
+    ) -> Result<String, crate::proxy::InvalidBackendPath> {
+        crate::proxy::build_websocket_backend_url_with_target(
+            proxy,
+            path,
+            "",
+            &proxy.backend_host,
+            proxy.backend_port,
+            strip_len,
+            None,
+        )
+    }
+
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -100,6 +140,7 @@ pub mod _test_support {
     use crate::modes::mesh::startup_rollback_test_seams as mesh_startup_rollback_seams;
     use crate::modes::node_agent::startup_cleanup_test_seams as node_agent_cleanup_seams;
     use crate::plugins::Plugin;
+    use crate::plugins::oidc_relying_party::discovery_test_seams as oidc_discovery_seams;
     use crate::plugins::oidc_relying_party::refresh_flight_test_seams as oidc_refresh_flight_seams;
 
     /// Parse-only URI authority and Host header a Unix WebSocket handshake uses.
@@ -651,17 +692,11 @@ pub mod _test_support {
         ctx.mcp_aggregate_sse.is_some()
     }
 
-    /// Whether this request is still holding an OPEN multiplexed stream
+    /// Whether this request is still holding an OPEN JSON-RPC request stream
     /// identity. Used to prove the request-side open happens before the slow
     /// aggregate work, and that a terminal delivery released it.
     pub fn mcp_sse_stream_is_open_for_test(ctx: &crate::plugins::RequestContext) -> bool {
         ctx.mcp_sse_stream.is_some()
-    }
-
-    /// Whether final body policy reserved an aggregate-SSE event that is still
-    /// invisible pending the committed-response boundary.
-    pub fn mcp_sse_publication_is_pending_for_test(ctx: &crate::plugins::RequestContext) -> bool {
-        ctx.mcp_sse_publication.is_some()
     }
 
     /// Drop just the multiplexed stream lease, modelling a request that ended
@@ -768,6 +803,19 @@ pub mod _test_support {
         headers: Vec<String>,
     ) {
         ctx.set_request_headers_to_redact(Arc::new(headers));
+    }
+
+    /// Model proxy core's typed backend-dispatch provenance for direct plugin
+    /// lifecycle tests that never enter an HTTP dispatch path. `error_class:
+    /// None` records an authoritative backend response; a class with
+    /// `request_on_wire: false` records a pre-wire refusal, and with `true` an
+    /// ambiguous post-wire failure.
+    pub fn record_backend_dispatch_outcome_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        error_class: Option<crate::retry::ErrorClass>,
+        request_on_wire: bool,
+    ) {
+        ctx.record_backend_dispatch_outcome(error_class, request_on_wire);
     }
 
     /// Model the transport-owned empty-body proof for direct plugin lifecycle
@@ -1645,6 +1693,16 @@ pub mod _test_support {
         crate::proxy::x_gateway_error_for_backend_failure(connection_error, status)
     }
 
+    pub fn response_policy_observability_for_test(
+        ctx: &crate::plugins::RequestContext,
+        status: u16,
+    ) -> (Option<crate::retry::ErrorClass>, Option<&'static str>) {
+        (
+            ctx.response_policy_error_class(None),
+            crate::proxy::x_gateway_error_for_response(ctx, false, status),
+        )
+    }
+
     pub fn apply_authoritative_backend_gateway_error_header_for_test(
         response_headers: &mut HashMap<String, String>,
         connection_error: bool,
@@ -2114,6 +2172,36 @@ pub mod _test_support {
             refresh_token,
             refresh_after_unix,
         })
+    }
+
+    // ── OIDC discovery endpoint overrides (issue #4761) ────────────────────
+
+    /// Resolve a live discovery document with optional operator-supplied
+    /// `userinfo_endpoint` / `end_session_endpoint` overrides, returning the
+    /// effective optional endpoints as `(userinfo, end_session)`.
+    pub async fn oidc_resolve_discovery_for_test(
+        http_client: &crate::plugins::PluginHttpClient,
+        discovery_url: &str,
+        explicit_userinfo_endpoint: Option<String>,
+        explicit_end_session_endpoint: Option<String>,
+    ) -> Result<(Option<String>, Option<String>), String> {
+        let resolved = oidc_discovery_seams::resolve_discovery_for_test(
+            http_client,
+            discovery_url,
+            explicit_userinfo_endpoint,
+            explicit_end_session_endpoint,
+        )
+        .await?;
+        Ok((resolved.userinfo_endpoint, resolved.end_session_endpoint))
+    }
+
+    /// Await a plugin's background discovery task and return the resolved
+    /// optional endpoints as `(userinfo, end_session)`. Consumes the plugin so
+    /// the discovery task can be awaited to completion.
+    pub async fn oidc_resolved_discovery_endpoints_for_test(
+        plugin: crate::plugins::oidc_relying_party::OidcRelyingParty,
+    ) -> Option<(Option<String>, Option<String>)> {
+        plugin.resolved_discovery_endpoints_for_tests().await
     }
 
     // ── OIDC refresh single-flight seams (issue #4640) ──────────────────────
@@ -2855,6 +2943,14 @@ pub mod _test_support {
         plugin.inflight_count_snapshot_for_tests()
     }
 
+    /// Whether a constructed `request_deduplication` instance's Redis client
+    /// requires the no-eviction retention screen (`None` in local mode).
+    pub fn request_deduplication_redis_requires_no_eviction_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+    ) -> Option<bool> {
+        plugin.redis_requires_no_eviction_for_tests()
+    }
+
     pub fn request_deduplication_request_identity_for_test(
         plugin: &crate::plugins::request_deduplication::RequestDeduplication,
         ctx: &crate::plugins::RequestContext,
@@ -2917,6 +3013,31 @@ pub mod _test_support {
         http_client: &crate::plugins::PluginHttpClient,
     ) -> Result<(), String> {
         crate::plugins::kafka_logging::validate_producer_admission(config, http_client)
+    }
+
+    /// Deterministic probe: terminal broker failures and immediate librdkafka
+    /// rejections must reach the process-cumulative per-plugin loss family.
+    ///
+    /// Returns `(sink_error_delta, queue_full_delta, delivery_failed,
+    /// queue_rejected)`. The two deltas read process-wide counters a concurrent
+    /// test can only increase, so assert on them as lower bounds.
+    pub fn kafka_logging_probe_terminal_loss_accounting_for_test(
+        record_count: usize,
+        queue_max_messages: Option<u32>,
+    ) -> Result<(u64, u64, u64, u64), String> {
+        crate::plugins::kafka_logging::probe_terminal_loss_accounting_for_test(
+            record_count,
+            queue_max_messages,
+        )
+    }
+
+    /// The exact SASL credential bytes the constructor would hand librdkafka,
+    /// so the verbatim-credential contract can be asserted directly.
+    pub fn kafka_logging_parsed_sasl_credentials_for_test(
+        config: &serde_json::Value,
+        http_client: &crate::plugins::PluginHttpClient,
+    ) -> Result<(Option<String>, Option<String>), String> {
+        crate::plugins::kafka_logging::parsed_sasl_credentials_for_test(config, http_client)
     }
 
     pub fn kafka_logging_serialize_http_with_config_for_test(
@@ -3103,9 +3224,53 @@ pub mod _test_support {
         })
     }
 
+    /// Whether the trace exporter retries `status` for the named payload kind
+    /// (`"otlp"`, `"zipkin"`, `"datadog"`). `None` for an unknown kind.
+    pub fn otel_tracing_status_is_retryable_for_test(provider: &str, status: u16) -> Option<bool> {
+        crate::plugins::otel_tracing::trace_status_is_retryable_for_test(provider, status)
+    }
+
+    /// Parse a collector `Retry-After` value against a fixed clock, in
+    /// milliseconds. `None` when the value is absent or unparseable.
+    pub fn otel_tracing_parse_retry_after_for_test(value: &str, now_unix_secs: u64) -> Option<u64> {
+        crate::plugins::otel_tracing::parse_retry_after_for_test(value, now_unix_secs)
+    }
+
+    /// The exporter's delay in milliseconds before the retry following
+    /// `attempt` (`1` = the first retry), for fixed jitter entropy.
+    pub fn otel_tracing_retry_delay_ms_for_test(
+        base_ms: u64,
+        attempt: u32,
+        retry_after_ms: Option<u64>,
+        entropy: u64,
+    ) -> u64 {
+        crate::plugins::otel_tracing::trace_retry_delay_ms_for_test(
+            base_ms,
+            attempt,
+            retry_after_ms,
+            entropy,
+        )
+    }
+
     // ── plugins/soap_ws_security ────────────────────────────────────────────
     pub fn soap_count_wsu_id_occurrences_for_test(xml: &str, id: &str) -> Result<usize, String> {
         crate::plugins::soap_ws_security::count_wsu_id_occurrences(xml, id)
+    }
+
+    pub fn soap_exclusive_canonicalize_with_budget_for_test(
+        xml: &str,
+        local_name: &str,
+        budget_bytes: usize,
+    ) -> (Result<String, String>, usize) {
+        crate::plugins::soap_ws_security::exclusive_canonicalize_with_budget_for_test(
+            xml,
+            local_name,
+            budget_bytes,
+        )
+    }
+
+    pub fn soap_canonicalization_source_len_for_test(xml: &str, local_name: &str) -> Option<usize> {
+        crate::plugins::soap_ws_security::canonicalization_source_len_for_test(xml, local_name)
     }
 
     pub fn soap_exclusive_canonicalize_element_for_test(
@@ -3996,6 +4161,14 @@ pub mod _test_support {
     /// Defined idle-timeout policy Close (RFC 6455 1001).
     pub fn ws_idle_timeout_policy_close_frame_for_test() -> CloseFrame {
         crate::proxy::ws_idle_timeout_policy_close_frame()
+    }
+
+    /// Defined relay-failure policy Close mapping `ErrorClass` to 1002/1011/1001.
+    pub fn ws_relay_failure_close_frame_for_test(
+        error_class: crate::retry::ErrorClass,
+        draining: bool,
+    ) -> CloseFrame {
+        crate::proxy::ws_relay_failure_close_frame(error_class, draining)
     }
 
     /// Class for a WebSocket capacity overflow used when the relay maps
@@ -5235,6 +5408,15 @@ pub mod _test_support {
             }
             other => Err(format!("unsupported rate-limit plugin: {other}")),
         }
+    }
+
+    /// Mark a constructed `rate_limiting` policy's centralized store
+    /// unavailable so its next enforcement decision fails closed. `false` when
+    /// the policy is local-only and has no client to mark.
+    pub fn rate_limiting_mark_redis_unavailable_for_test(
+        plugin: &crate::plugins::rate_limiting::RateLimiting,
+    ) -> bool {
+        plugin.mark_redis_unavailable_for_test()
     }
 
     /// Refusal a `rate_limiting` policy emits while the centralized store is
@@ -8416,16 +8598,53 @@ pub mod _test_support {
     }
 
     /// Fallible Unix-to-monotonic conversion with injected clocks, so external
-    /// tests can prove a wall-clock rollback would extend a *fresh* conversion
-    /// and that unrepresentable inputs fail closed.
+    /// tests can prove a wall-clock rollback would extend a *fresh* conversion,
+    /// that an unusable interval fails closed, and that an expiry beyond the
+    /// representable monotonic range admits with no bound (issue #5396).
     pub fn try_credential_deadline_from_unix_seconds_at_for_test(
         expires_at_unix: i64,
         leeway_seconds: u64,
         now_unix: u64,
         now_mono: tokio::time::Instant,
-    ) -> Option<tokio::time::Instant> {
+    ) -> crate::plugins::utils::auth_flow::CredentialDeadline {
         crate::plugins::utils::auth_flow::try_credential_deadline_from_unix_seconds_at(
             expires_at_unix,
+            leeway_seconds,
+            now_unix,
+            now_mono,
+        )
+    }
+
+    /// Infallible Unix-to-monotonic conversion with injected clocks, the one
+    /// the JSON `exp` callers use (issue #5420). `None` is the admitted
+    /// far-future case — an expiry this platform's monotonic clock cannot
+    /// express — while an unusable interval still converts to the injected
+    /// `now_mono`, i.e. a deadline already elapsed.
+    pub fn credential_deadline_from_unix_seconds_at_for_test(
+        expires_at_unix: i64,
+        leeway_seconds: u64,
+        now_unix: u64,
+        now_mono: tokio::time::Instant,
+    ) -> Option<tokio::time::Instant> {
+        crate::plugins::utils::auth_flow::credential_deadline_from_unix_seconds_at(
+            expires_at_unix,
+            leeway_seconds,
+            now_unix,
+            now_mono,
+        )
+    }
+
+    /// The same conversion driven from already-validated claims, so the `exp`
+    /// extraction `jwt_auth` and `jwks_auth` authenticate through is covered at
+    /// an injected clock (issue #5420).
+    pub fn credential_deadline_from_claims_at_for_test(
+        claims: &serde_json::Value,
+        leeway_seconds: u64,
+        now_unix: u64,
+        now_mono: tokio::time::Instant,
+    ) -> Option<tokio::time::Instant> {
+        crate::plugins::utils::auth_flow::credential_deadline_from_claims_at(
+            claims,
             leeway_seconds,
             now_unix,
             now_mono,
@@ -9640,6 +9859,12 @@ pub mod _test_support {
     /// hook-ingress channel) that external coverage drives through the
     /// production datagram paths.
     pub use crate::proxy::udp_proxy::UdpAuthorizationSessionProbe;
+
+    /// A real plain-UDP session driven through the production non-blocking
+    /// client→backend admission and its bounded per-session backend-send writer
+    /// (issue #5045), with only the backend send itself injectable so a parked
+    /// send needs no sleep.
+    pub use crate::proxy::udp_proxy::{UdpEgressAdmissionForTest, UdpEgressWriterProbe};
 
     /// The fixed PRE-COMMITMENT terminal the H1/H2 dispatch funnel substitutes
     /// when a request-upload authorization expiry cancelled the backend
@@ -10991,7 +11216,19 @@ pub mod _test_support {
         http_status: u16,
         initial_terminal_metadata: Option<HashMap<String, String>>,
     ) -> crate::proxy::ProxyBody {
-        body.into_grpc_web_streaming(content_type, http_status, initial_terminal_metadata)
+        body.into_grpc_web_streaming(content_type, http_status, initial_terminal_metadata, false)
+    }
+
+    /// Same as [`proxy_body_into_grpc_web_streaming_for_test`], with the
+    /// non-gRPC HTTP error entity suppression the translation owner records for
+    /// an unframed backend error document.
+    pub fn proxy_body_into_grpc_web_streaming_suppressed_for_test(
+        body: crate::proxy::ProxyBody,
+        content_type: &str,
+        http_status: u16,
+        initial_terminal_metadata: Option<HashMap<String, String>>,
+    ) -> crate::proxy::ProxyBody {
+        body.into_grpc_web_streaming(content_type, http_status, initial_terminal_metadata, true)
     }
 
     pub fn take_streaming_initial_terminal_metadata_for_test(
@@ -11187,30 +11424,75 @@ pub mod _test_support {
         )
     }
 
-    pub fn udp_logging_classify_dtls_batch_size_for_test(
-        dtls_enabled: bool,
+    pub fn udp_logging_classify_batch_size_for_test(
         payload_len: usize,
         batch_len: usize,
-        max_plaintext: usize,
+        max_datagram_bytes: usize,
     ) -> &'static str {
-        use crate::plugins::udp_logging::DtlsBatchSizeDecision;
-        match crate::plugins::udp_logging::classify_dtls_batch_size(
-            dtls_enabled,
+        use crate::plugins::udp_logging::BatchSizeDecision;
+        match crate::plugins::udp_logging::classify_batch_size(
             payload_len,
             batch_len,
-            max_plaintext,
+            max_datagram_bytes,
         ) {
-            DtlsBatchSizeDecision::SendAsIs => "send_as_is",
-            DtlsBatchSizeDecision::RejectOversizedSingle => "reject_oversized_single",
-            DtlsBatchSizeDecision::SplitPerEntry => "split_per_entry",
+            BatchSizeDecision::SendAsIs => "send_as_is",
+            BatchSizeDecision::RejectOversizedSingle => "reject_oversized_single",
+            BatchSizeDecision::SplitPerEntry => "split_per_entry",
         }
+    }
+
+    /// Effective per-datagram ceiling for the active transport.
+    pub fn udp_logging_effective_datagram_limit_for_test(
+        dtls_enabled: bool,
+        remote_addr: Option<std::net::SocketAddr>,
+    ) -> usize {
+        crate::plugins::udp_logging::effective_datagram_limit(dtls_enabled, remote_addr)
+    }
+
+    /// Largest `max_entry_bytes` whose own datagram still fits `limit`.
+    pub fn udp_logging_max_deliverable_entry_bytes_for_test(max_datagram_bytes: usize) -> usize {
+        crate::plugins::udp_logging::max_deliverable_entry_bytes(max_datagram_bytes)
+    }
+
+    /// Process-wide count of records rejected alone by the datagram gate.
+    pub fn udp_logging_local_record_drops_for_test() -> u64 {
+        crate::plugins::udp_logging::local_record_drops_for_test()
+    }
+
+    /// Lost-record total for injected split-batch retry sequences.
+    ///
+    /// Each inner slice is one attempt. Labels: `"reject"` (deterministic
+    /// local size rejection), `"ok"` (delivered), `"transport"` (transport
+    /// error). Matches production: local rejects count only on a completed
+    /// attempt; exhausting retries counts the original batch once.
+    pub fn udp_logging_split_retry_lost_record_count_for_test(attempts: &[&[&str]]) -> u64 {
+        use crate::plugins::udp_logging::SplitEntryOutcome;
+        let parsed: Vec<Vec<SplitEntryOutcome>> = attempts
+            .iter()
+            .map(|attempt| {
+                attempt
+                    .iter()
+                    .map(|label| match *label {
+                        "reject" => SplitEntryOutcome::LocalReject,
+                        "ok" => SplitEntryOutcome::Delivered,
+                        "transport" => SplitEntryOutcome::TransportError,
+                        other => panic!(
+                            "udp_logging split-retry fixture label must be \
+                             reject/ok/transport, got {other}"
+                        ),
+                    })
+                    .collect()
+            })
+            .collect();
+        let refs: Vec<&[SplitEntryOutcome]> = parsed.iter().map(Vec::as_slice).collect();
+        crate::plugins::udp_logging::split_retry_lost_record_count(&refs)
     }
 
     pub fn udp_logging_classify_serialized_summaries_for_test(
         summaries: &[crate::plugins::TransactionSummary],
-        max_plaintext: usize,
+        max_datagram_bytes: usize,
     ) -> Result<(&'static str, usize), String> {
-        use crate::plugins::udp_logging::DtlsBatchSizeDecision;
+        use crate::plugins::udp_logging::BatchSizeDecision;
         use crate::plugins::utils::ByteBudget;
         use crate::plugins::utils::byte_budget::accounted_summary_bytes;
         use crate::plugins::utils::summary_log_budget::serialize_under_byte_budget;
@@ -11226,14 +11508,14 @@ pub mod _test_support {
             entries.push(payload);
         }
         let (decision, payload_len) =
-            crate::plugins::udp_logging::classify_serialized_dtls_batch_for_test(
+            crate::plugins::udp_logging::classify_serialized_batch_for_test(
                 &entries,
-                max_plaintext,
+                max_datagram_bytes,
             )?;
         let label = match decision {
-            DtlsBatchSizeDecision::SendAsIs => "send_as_is",
-            DtlsBatchSizeDecision::RejectOversizedSingle => "reject_oversized_single",
-            DtlsBatchSizeDecision::SplitPerEntry => "split_per_entry",
+            BatchSizeDecision::SendAsIs => "send_as_is",
+            BatchSizeDecision::RejectOversizedSingle => "reject_oversized_single",
+            BatchSizeDecision::SplitPerEntry => "split_per_entry",
         };
         Ok((label, payload_len))
     }
@@ -11467,6 +11749,30 @@ pub mod _test_support {
         crate::dtls::dtls_datagram_metadata_refusal_accounting_for_test(refusals_in_window)
     }
 
+    /// External coverage for the frontend DTLS handshake-timeout diagnostic
+    /// (GHSA-6j9w-xjqj-85x8): every abandoned handshake is counted while the
+    /// warning is rate-limited to one record per window. See
+    /// [`crate::dtls::dtls_handshake_timeout_warning_accounting_for_test`].
+    pub fn dtls_handshake_timeout_warning_accounting_for_test(
+        timeouts_in_window: u64,
+    ) -> Result<(u64, u64, u64), String> {
+        crate::dtls::dtls_handshake_timeout_warning_accounting_for_test(timeouts_in_window)
+    }
+
+    /// External coverage for the frontend DTLS per-source-IP pre-handshake
+    /// bound (GHSA-cc8p-2cqj-7fgg). See
+    /// [`crate::dtls::dtls_pre_handshake_per_source_ip_admission_for_test`].
+    pub async fn dtls_pre_handshake_per_source_ip_admission_for_test(
+        max_per_source: u64,
+        attempts_from_one_source: u16,
+    ) -> Result<(usize, usize, u64), String> {
+        crate::dtls::dtls_pre_handshake_per_source_ip_admission_for_test(
+            max_per_source,
+            attempts_from_one_source,
+        )
+        .await
+    }
+
     /// Observe Ferrum-managed DTLS loader key DER after zeroization and before
     /// the backing allocation is released (issue #3224 loader ownership path).
     pub fn load_dtls_certificate_with_rustls_key_drop_hook_for_test(
@@ -11485,8 +11791,8 @@ pub mod _test_support {
         crate::plugins::udp_logging::dtls_send_timeout_requires_sender_reset_for_test()
     }
 
-    pub fn udp_logging_local_dtls_size_rejection_preserves_sender_for_test() -> bool {
-        crate::plugins::udp_logging::local_dtls_size_rejection_preserves_sender_for_test()
+    pub fn udp_logging_local_size_rejection_preserves_sender_for_test() -> bool {
+        crate::plugins::udp_logging::local_size_rejection_preserves_sender_for_test()
     }
 
     pub fn udp_logging_transport_dtls_failure_requires_sender_reset_for_test() -> bool {
@@ -11931,6 +12237,66 @@ pub mod _test_support {
                 .try_reserve_request_permit(bytes)
                 .map(RequestBufferPermitProbe)
         }
+    }
+
+    /// What the shared charged content-coding chain decoder — the one
+    /// `compression`'s opt-in `decompress_request` normalizer now runs
+    /// (`GHSA-q76p-952x-7c3v`) — decided for one coding list, projected so
+    /// external tests can assert on it without reaching into the crate-private
+    /// error type.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum ChargedCodingChainOutcome {
+        /// Decoded under every bound, with the working-set charge released.
+        Decoded(Vec<u8>),
+        /// A coding token the strict decoder does not implement.
+        Unsupported,
+        /// Malformed, truncated, Large-Window Brotli, or trailing data.
+        Malformed,
+        /// Over a per-layer, cumulative, or amplification bound.
+        TooLarge,
+        /// The aggregate budget could not admit the decode's working set. The
+        /// GATEWAY-local capacity terminal, deliberately not a byte fault.
+        CapacityRefused,
+    }
+
+    /// Decode one canonical coding list through the PRODUCTION charged decoder,
+    /// charged against an ISOLATED budget so a parallel test binary can observe
+    /// admission and release deterministically.
+    ///
+    /// `codings` are lowercase tokens in APPLICATION order, exactly as
+    /// `compression` hands them over after classification.
+    pub fn decode_charged_coding_chain_in(
+        probe: &ResponseBufferBudgetProbe,
+        codings: &[String],
+        body: &[u8],
+        max_decoded_bytes: usize,
+        max_cumulative_bytes: usize,
+        max_amplification_ratio: u32,
+    ) -> ChargedCodingChainOutcome {
+        use crate::plugins::charged_decode::{
+            ChargedDecodeError, decode_charged_content_coding_chain,
+        };
+        let limits = crate::plugins::utils::content_encoding::DecodeLimits {
+            max_decoded_bytes,
+            max_cumulative_bytes,
+            // The caller bounds the layer COUNT before classification; this
+            // decoder is handed an already-bounded list.
+            max_codings: codings.len().max(1),
+            max_amplification_ratio,
+        };
+        match decode_charged_content_coding_chain(codings, body, limits, probe.0.handle()) {
+            Ok(plaintext) => ChargedCodingChainOutcome::Decoded(plaintext),
+            Err(ChargedDecodeError::Unsupported) => ChargedCodingChainOutcome::Unsupported,
+            Err(ChargedDecodeError::Malformed) => ChargedCodingChainOutcome::Malformed,
+            Err(ChargedDecodeError::TooLarge) => ChargedCodingChainOutcome::TooLarge,
+            Err(ChargedDecodeError::CapacityRefused) => ChargedCodingChainOutcome::CapacityRefused,
+        }
+    }
+
+    /// The exact backend-request header filter the H3 cross-protocol bridge
+    /// applies to both its plain and gRPC builders (issue #5110).
+    pub fn cross_protocol_backend_header_is_stripped_for_test(name: &str) -> bool {
+        crate::http3::cross_protocol::should_skip_cross_protocol_backend_header(name)
     }
 
     /// Whether an error class is neutral to circuit-breaker, passive-health, and
@@ -12746,11 +13112,20 @@ pub mod _test_support {
     }
 
     /// Response-side declared-length reject predicate used by every dispatch path.
+    /// Bodyless `HEAD` / `1xx` / `204` / `205` / `304` replies must not reject
+    /// on a representation `Content-Length`.
     pub fn declared_response_length_exceeds_limit_for_test(
+        method: &str,
+        status: u16,
         headers: &std::collections::HashMap<String, String>,
         max_response_body_size_bytes: usize,
     ) -> Option<usize> {
-        crate::proxy::declared_response_length_exceeds_limit(headers, max_response_body_size_bytes)
+        crate::proxy::declared_response_length_exceeds_limit(
+            method,
+            status,
+            headers,
+            max_response_body_size_bytes,
+        )
     }
 
     pub async fn collect_h1h2_request_body_with_deadline_for_test<F, T, E>(
@@ -13830,6 +14205,23 @@ pub mod _test_support {
         )
     }
 
+    /// The `ai_semantic_firewall` supported extraction paths: the request list
+    /// and the response list, in declaration order.
+    ///
+    /// These are the same arrays `openapi.yaml` publishes as the `enum` and
+    /// `default` of `AiSemanticFirewallConfig.extraction.request_json_paths` /
+    /// `response_json_paths`, and the same set `docs/plugins.md` tabulates
+    /// under "Supported provider shapes". Exposed so the OpenAPI parity test
+    /// can assert that three-way agreement instead of carrying a second copy of
+    /// the list that can silently drift.
+    pub fn ai_semantic_firewall_extraction_paths_for_test()
+    -> (&'static [&'static str], &'static [&'static str]) {
+        (
+            crate::plugins::ai_semantic_firewall::DEFAULT_REQUEST_JSON_PATHS,
+            crate::plugins::ai_semantic_firewall::DEFAULT_RESPONSE_JSON_PATHS,
+        )
+    }
+
     /// Build an email channel with deterministic `*_env` resolution for unit
     /// tests. Production uses [`crate::notifications::channels::EmailChannel::new`]
     /// and real `std::env::var`.
@@ -13841,5 +14233,308 @@ pub mod _test_support {
         crate::notifications::channels::EmailChannel::new_with_env_lookup(name, value, &|var| {
             env.get(var).cloned().ok_or(std::env::VarError::NotPresent)
         })
+    }
+
+    // ── Response coalescing (issue #5040) ───────────────────────────────────
+    //
+    // `proxy::body::Coalescing` is the ONE adapter every reqwest, direct-H2 /
+    // gRPC and native-H3 streaming response body is built on. The seam below
+    // scripts a `FrameSource` and drives `Body::poll_frame` one poll at a time
+    // so external tests assert the lazy-aggregation contract against the
+    // production adapter rather than a copy of it: construction reserves
+    // nothing, a one-frame response reaches the client on the backend's own
+    // `Bytes`, and an aggregation buffer exists only once a second frame has
+    // to be merged into the first.
+
+    /// Frame the scripted coalescing source yields.
+    type CoalesceFrame = http_body::Frame<bytes::Bytes>;
+
+    /// Error type the scripted coalescing source yields.
+    type CoalesceFrameError = crate::proxy::body::ProxyBodyError;
+
+    /// The production default flush target (128 KiB) the HTTP/1.1 and
+    /// HTTP/2-via-reqwest response paths construct the coalescer with.
+    pub fn default_coalesce_target_bytes() -> usize {
+        crate::proxy::body::COALESCE_TARGET
+    }
+
+    /// One scripted backend event for [`CoalesceProbe`].
+    #[derive(Clone, Debug)]
+    pub enum CoalesceStep {
+        /// A DATA frame carrying exactly these bytes (may be empty).
+        Data(bytes::Bytes),
+        /// A trailers frame.
+        Trailers(http::HeaderMap),
+        /// A source error carrying this message.
+        Error(String),
+        /// The backend has produced nothing yet.
+        Pending,
+        /// End of stream.
+        End,
+    }
+
+    /// What one `Body::poll_frame` on the coalescer produced.
+    #[derive(Debug)]
+    pub enum CoalesceOutcome {
+        Data(bytes::Bytes),
+        Trailers(http::HeaderMap),
+        Error(String),
+        Pending,
+        End,
+    }
+
+    impl CoalesceOutcome {
+        /// The DATA payload, or `None` for every other outcome.
+        pub fn data(&self) -> Option<&bytes::Bytes> {
+            match self {
+                Self::Data(data) => Some(data),
+                _ => None,
+            }
+        }
+
+        /// The trailer map, or `None` for every other outcome.
+        pub fn trailers(&self) -> Option<&http::HeaderMap> {
+            match self {
+                Self::Trailers(trailers) => Some(trailers),
+                _ => None,
+            }
+        }
+
+        /// The error message, or `None` for every other outcome.
+        pub fn error(&self) -> Option<&str> {
+            match self {
+                Self::Error(message) => Some(message.as_str()),
+                _ => None,
+            }
+        }
+
+        /// Stable short name, for assertion messages.
+        pub fn name(&self) -> &'static str {
+            match self {
+                Self::Data(_) => "data",
+                Self::Trailers(_) => "trailers",
+                Self::Error(_) => "error",
+                Self::Pending => "pending",
+                Self::End => "end",
+            }
+        }
+    }
+
+    /// A `FrameSource` that replays scripted steps, counts polls, and records
+    /// its own drop so a cancelled body can be observed after it is gone.
+    struct CoalesceScriptedSource {
+        steps: std::collections::VecDeque<CoalesceStep>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for CoalesceScriptedSource {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    impl crate::proxy::body::FrameSource for CoalesceScriptedSource {
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<CoalesceFrame, CoalesceFrameError>>> {
+            let this = self.get_mut();
+            this.polls.fetch_add(1, Ordering::Release);
+            match this.steps.pop_front().unwrap_or(CoalesceStep::End) {
+                CoalesceStep::Data(data) => {
+                    std::task::Poll::Ready(Some(Ok(http_body::Frame::data(data))))
+                }
+                CoalesceStep::Trailers(trailers) => {
+                    std::task::Poll::Ready(Some(Ok(http_body::Frame::trailers(trailers))))
+                }
+                CoalesceStep::Error(message) => {
+                    let err: CoalesceFrameError = Box::new(std::io::Error::other(message));
+                    std::task::Poll::Ready(Some(Err(err)))
+                }
+                CoalesceStep::Pending => std::task::Poll::Pending,
+                CoalesceStep::End => std::task::Poll::Ready(None),
+            }
+        }
+    }
+
+    /// A production `Coalescing` under test plus the scripted source feeding
+    /// it.
+    ///
+    /// The source is built by [`CoalesceProbe::new`] /
+    /// [`CoalesceProbe::with_flush_after`], the adapter itself only by
+    /// [`CoalesceProbe::construct`], so an allocation-counting test can measure
+    /// construction on its own with no probe setup inside the window.
+    pub struct CoalesceProbe {
+        source: Option<CoalesceScriptedSource>,
+        body: Option<crate::proxy::body::Coalescing<CoalesceScriptedSource>>,
+        target_bytes: usize,
+        buffer_capacity: Option<usize>,
+        content_length: Option<u64>,
+        flush_after: Option<Duration>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl CoalesceProbe {
+        /// The reqwest / direct-H2 shape: no timed flush, and the aggregation
+        /// capacity the production constructor derives from `target_bytes`.
+        pub fn new(
+            steps: Vec<CoalesceStep>,
+            target_bytes: usize,
+            content_length: Option<u64>,
+        ) -> Self {
+            Self::build(steps, target_bytes, None, content_length, None)
+        }
+
+        /// The native-HTTP/3 shape: an explicit aggregation capacity plus the
+        /// timed flush bounding how long a sub-target frame may be held.
+        pub fn with_flush_after(
+            steps: Vec<CoalesceStep>,
+            target_bytes: usize,
+            buffer_capacity: usize,
+            content_length: Option<u64>,
+            flush_after: Duration,
+        ) -> Self {
+            Self::build(
+                steps,
+                target_bytes,
+                Some(buffer_capacity),
+                content_length,
+                Some(flush_after),
+            )
+        }
+
+        fn build(
+            steps: Vec<CoalesceStep>,
+            target_bytes: usize,
+            buffer_capacity: Option<usize>,
+            content_length: Option<u64>,
+            flush_after: Option<Duration>,
+        ) -> Self {
+            let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let source = CoalesceScriptedSource {
+                steps: steps.into_iter().collect(),
+                polls: Arc::clone(&polls),
+                dropped: Arc::clone(&dropped),
+            };
+            Self {
+                source: Some(source),
+                body: None,
+                target_bytes,
+                buffer_capacity,
+                content_length,
+                flush_after,
+                polls,
+                dropped,
+            }
+        }
+
+        /// Build the adapter. Idempotent, and performed automatically by the
+        /// first [`CoalesceProbe::poll_once`]; call it explicitly to keep
+        /// construction outside an allocation-measurement window.
+        pub fn construct(&mut self) {
+            use crate::proxy::body::Coalescing;
+
+            if self.body.is_some() {
+                return;
+            }
+            let Some(source) = self.source.take() else {
+                return;
+            };
+            let body = match self.buffer_capacity {
+                Some(capacity) => Coalescing::with_flush_after_and_capacity(
+                    source,
+                    self.target_bytes,
+                    capacity,
+                    self.content_length,
+                    self.flush_after,
+                ),
+                None => Coalescing::new(source, self.target_bytes, self.content_length),
+            };
+            self.body = Some(body);
+        }
+
+        /// Drive exactly one `Body::poll_frame` with a no-op waker.
+        pub fn poll_once(&mut self) -> CoalesceOutcome {
+            self.construct();
+            let Some(body) = self.body.as_mut() else {
+                return CoalesceOutcome::End;
+            };
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            match http_body::Body::poll_frame(std::pin::Pin::new(body), &mut cx) {
+                std::task::Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(data) => CoalesceOutcome::Data(data),
+                    Err(frame) => match frame.into_trailers() {
+                        Ok(trailers) => CoalesceOutcome::Trailers(trailers),
+                        Err(_) => CoalesceOutcome::End,
+                    },
+                },
+                std::task::Poll::Ready(Some(Err(err))) => CoalesceOutcome::Error(err.to_string()),
+                std::task::Poll::Ready(None) => CoalesceOutcome::End,
+                std::task::Poll::Pending => CoalesceOutcome::Pending,
+            }
+        }
+
+        /// `Body::is_end_stream` on the constructed adapter.
+        pub fn is_end_stream(&self) -> bool {
+            match self.body.as_ref() {
+                Some(body) => http_body::Body::is_end_stream(body),
+                None => false,
+            }
+        }
+
+        /// The exact `Body::size_hint`, when the adapter publishes one.
+        pub fn size_hint_exact(&self) -> Option<u64> {
+            let body = self.body.as_ref()?;
+            http_body::Body::size_hint(body).exact()
+        }
+
+        /// Lazy-accumulator state: `"unconstructed"`, `"empty"`, `"single"`
+        /// (one frame held with no aggregation buffer) or `"merged"`.
+        pub fn buffer_state(&self) -> &'static str {
+            match self.body.as_ref() {
+                Some(body) => body.buffer_state_name(),
+                None => "unconstructed",
+            }
+        }
+
+        /// Capacity of the aggregation `BytesMut`, or `0` while none has been
+        /// allocated.
+        pub fn aggregation_capacity(&self) -> usize {
+            match self.body.as_ref() {
+                Some(body) => body.aggregation_capacity(),
+                None => 0,
+            }
+        }
+
+        /// Bytes currently held pending a flush.
+        pub fn buffered_len(&self) -> usize {
+            match self.body.as_ref() {
+                Some(body) => body.buffered_len(),
+                None => 0,
+            }
+        }
+
+        /// Capacity of the retained aggregation region the next merge would
+        /// reuse, or `0` when the adapter holds none.
+        pub fn retained_region_capacity(&self) -> usize {
+            match self.body.as_ref() {
+                Some(body) => body.retained_region_capacity(),
+                None => 0,
+            }
+        }
+
+        /// Times the scripted source has been polled. Shared, so it stays
+        /// readable after the probe is dropped.
+        pub fn source_polls(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+            Arc::clone(&self.polls)
+        }
+
+        /// Set once the scripted source has been dropped.
+        pub fn source_dropped(&self) -> Arc<std::sync::atomic::AtomicBool> {
+            Arc::clone(&self.dropped)
+        }
     }
 }

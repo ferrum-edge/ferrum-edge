@@ -481,7 +481,7 @@ pub fn check_env_config_enforced(env_config: &EnvConfig) -> Result<(), String> {
         (
             "FERRUM_ADMIN_TLS_NO_VERIFY",
             env_config.admin_tls_no_verify,
-            "admin API client TLS server certificate verification",
+            "admin listener client-certificate requirement and verification",
         ),
         (
             "FERRUM_ALLOW_INSECURE_ADMIN_HTTP",

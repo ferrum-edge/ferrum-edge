@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ferrum_edge::modes::mesh::config::{
-    MeshConfig, MeshExtAuthzProvider, MeshPolicy, MeshRule, PolicyAction, PolicyScope,
+    MESH_EXT_AUTHZ_PROCESS_CONCURRENT_CALLS, MeshConfig, MeshExtAuthzProvider, MeshPolicy,
+    MeshRule, PolicyAction, PolicyScope,
 };
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use ferrum_edge::plugins::PluginHttpClient;
@@ -1394,4 +1395,93 @@ mod live_datapath {
             "the provider must be contacted once the body is available"
         );
     }
+}
+
+// ── Process-wide check budget (advisory GHSA-4f6g-8xxw-qm99) ───────────────
+//
+// The in-flight ceiling is a RESOURCE bound: each permit holder occupies a
+// socket, a buffered check body, and a task for a provider round trip. It was
+// owned per executor, so N enabled `mesh_authz` instances each opened their own
+// budget and a reload published a replacement with a full pool while the
+// retiring generation's checks were still running on their own. It is one
+// process-wide pool now, and these prove the aggregate contract without opening
+// the whole budget's worth of live connections.
+
+#[tokio::test]
+async fn two_independent_executors_draw_from_one_process_wide_check_budget() {
+    let first = executor(vec![provider(9000)]);
+    let second = executor(vec![provider(9001)]);
+
+    assert!(
+        Arc::ptr_eq(first.check_budget(), second.check_budget()),
+        "independently constructed executors must share ONE budget"
+    );
+    assert_eq!(
+        first.check_budget().available_permits(),
+        MESH_EXT_AUTHZ_PROCESS_CONCURRENT_CALLS,
+        "the shared budget starts at the documented process-wide ceiling"
+    );
+}
+
+/// A reload builds a replacement executor while the retiring one's checks are
+/// still in flight. Both draw on the same pool, so the replacement cannot
+/// restart with a full budget, and the retiring generation's permits stay
+/// charged until its checks finish.
+#[tokio::test]
+async fn a_reload_generation_cannot_reopen_a_fresh_budget() {
+    let stub = start_stub(StubBehavior::Allow).await;
+    let retiring = executor(vec![provider(stub.port)]);
+
+    // Stand in for the retiring generation's in-flight checks by holding its
+    // whole budget. Taking the permits directly keeps the test deterministic
+    // and avoids opening 128 live provider connections. The budget is
+    // process-static and is released before this test returns; CI runs the
+    // integration suites under nextest, one process per test.
+    let held = Arc::clone(retiring.check_budget())
+        .acquire_many_owned(MESH_EXT_AUTHZ_PROCESS_CONCURRENT_CALLS as u32)
+        .await
+        .expect("the process budget is never closed");
+    assert_eq!(retiring.check_budget().available_permits(), 0);
+
+    let replacement = executor(vec![provider(stub.port)]);
+    assert_eq!(
+        replacement.check_budget().available_permits(),
+        0,
+        "a replacement generation must NOT reopen a fresh budget"
+    );
+
+    let refused = check(&replacement, "sample-ext-authz", &request_headers()).await;
+    assert_eq!(
+        refused,
+        MeshExtAuthzOutcome::Deny {
+            status: 403,
+            headers: Vec::new(),
+            reason: MeshExtAuthzReason::ConcurrencyExhausted,
+        },
+        "at the ceiling the check is refused immediately, never queued"
+    );
+    assert_eq!(
+        stub.calls.load(Ordering::SeqCst),
+        0,
+        "a refused check must not reach the provider"
+    );
+
+    // Releasing the retiring generation's permits restores capacity exactly
+    // once, and the replacement serves normally again.
+    drop(held);
+    assert_eq!(
+        replacement.check_budget().available_permits(),
+        MESH_EXT_AUTHZ_PROCESS_CONCURRENT_CALLS,
+        "permits are released exactly once when their holders finish"
+    );
+
+    let allowed = check(&replacement, "sample-ext-authz", &request_headers()).await;
+    assert_eq!(
+        allowed,
+        MeshExtAuthzOutcome::Allow {
+            reason: MeshExtAuthzReason::Allowed,
+        },
+        "capacity restored, so the check runs"
+    );
+    assert_eq!(stub.calls.load(Ordering::SeqCst), 1);
 }

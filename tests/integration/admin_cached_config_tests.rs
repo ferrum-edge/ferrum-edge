@@ -21,6 +21,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::scaffolding::ports;
+
 /// Test configuration
 #[derive(Clone)]
 struct TestConfig {
@@ -1247,6 +1249,158 @@ async fn test_health_endpoint_returns_503_until_startup_is_ready() {
     assert_eq!(body["ready"], true);
 }
 
+fn stream_readiness_admin_state(
+    tc: &TestConfig,
+    proxy_state: Option<ferrum_edge::proxy::ProxyState>,
+    mode: &str,
+) -> AdminState {
+    AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(tc),
+        metrics_auth: Default::default(),
+        cached_config: None,
+        proxy_state,
+        mode: mode.to_string(),
+        read_only: true,
+        admin_audit_enabled: false,
+        admin_audit_fallback_dir: Some(crate::common::isolated_audit_fallback_dir()),
+        admin_require_namespace_claim: false,
+        startup_ready: Some(Arc::new(AtomicBool::new(true))),
+        serving_degraded: None,
+        serving_listener_failures: None,
+        gateway_listener_status: None,
+        gateway_listener_failure_fails_readiness: false,
+        db_available: None,
+        config_rejected: None,
+        admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "127.0.0.1".to_string(),
+        admin_allowed_cidrs: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::none()),
+        cached_db_health: Arc::new(ArcSwap::from_pointee(None)),
+        db_health_refresh: Arc::new(tokio::sync::Mutex::new(())),
+        dp_registry: None,
+        mesh_registry: None,
+        cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        mesh_runtime_state: None,
+        admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
+        runtime_config_apply: None,
+    }
+}
+
+/// Exercise handle_admin_request_inner through the real HTTP server with a
+/// full ProxyState. The held port makes the hard failure deterministic; soft
+/// deferral must skip that same occupied port before the bind probe.
+#[tokio::test]
+async fn test_stream_listener_health_and_status_readiness_tiers() {
+    use ferrum_edge::config::EnvConfig;
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+    use ferrum_edge::proxy::ProxyState;
+    use ferrum_edge::proxy::stream_listener::StreamListenerDegradation;
+
+    let tc = TestConfig::default();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    for (mode, frontend_tls) in [
+        ("dp", Some(false)),
+        ("dp", Some(true)),
+        ("cp", None),
+        ("node_agent", None),
+    ] {
+        let blocked = ports::reserve_port().await.unwrap();
+        let (runtime_shutdown, runtime_shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut background_tasks = Vec::new();
+        let mut manager = None;
+        let proxy_state = if let Some(frontend_tls) = frontend_tls {
+            let mut proxy = create_test_proxy("stream-readiness", "/", "127.0.0.1", 9999);
+            proxy.listen_path = None;
+            proxy.listen_port = Some(blocked.port);
+            proxy.backend_scheme = Some(BackendScheme::Tcp);
+            proxy.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
+            proxy.frontend_tls = frontend_tls;
+            let config = GatewayConfig {
+                proxies: vec![proxy],
+                ..GatewayConfig::default()
+            };
+            let env_config = EnvConfig {
+                stream_proxy_bind_address: "127.0.0.1".to_string(),
+                pool_warmup_enabled: false,
+                ..EnvConfig::default()
+            };
+            let (proxy, tasks) = ProxyState::new(
+                config,
+                DnsCache::new(DnsConfig::default()),
+                env_config,
+                None,
+                Some(runtime_shutdown_rx),
+            )
+            .expect("stream readiness proxy state");
+            background_tasks = tasks;
+            let listeners = proxy.stream_listener_manager.clone();
+            let failures = listeners.reconcile().await;
+            assert_eq!(failures.len(), usize::from(!frontend_tls));
+            let snapshot = listeners.stream_bind_failures();
+            assert_eq!(snapshot.len(), 1);
+            assert!(matches!(
+                (frontend_tls, snapshot[0].kind),
+                (true, StreamListenerDegradation::FrontendTlsDeferred)
+                    | (false, StreamListenerDegradation::BindFailed)
+            ));
+            manager = Some(listeners);
+            Some(proxy)
+        } else {
+            None
+        };
+        let state = stream_readiness_admin_state(&tc, proxy_state, mode);
+        let (base_url, admin_shutdown) = start_test_admin(state).await;
+        let ready = frontend_tls != Some(false);
+        let status = if frontend_tls.is_some() {
+            "degraded"
+        } else {
+            "ok"
+        };
+        for path in ["/health", "/status"] {
+            for detailed in [false, true] {
+                let mut request = client.get(format!("{base_url}{path}"));
+                if detailed {
+                    request = request.bearer_auth(generate_test_token(&tc));
+                }
+                let response = request.send().await.unwrap();
+                assert_eq!(response.status(), if ready { 200 } else { 503 });
+                let body: Value = response.json().await.unwrap();
+                assert_eq!(body["status"], status);
+                assert_eq!(body["ready"], ready);
+                if detailed {
+                    assert_eq!(body["mode"], mode);
+                } else {
+                    assert_eq!(body, json!({"status": status, "ready": ready}));
+                }
+            }
+        }
+        admin_shutdown.send(true).unwrap();
+        if let Some(manager) = manager {
+            manager.shutdown_all().await;
+        }
+        let _ = runtime_shutdown.send(true);
+        for task in background_tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        drop(blocked);
+    }
+}
+
 // ---- Config updates are reflected in cached reads ----
 
 #[tokio::test]
@@ -1884,6 +2038,44 @@ async fn create_db_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDi
         .expect("Failed to connect to test database");
     let state = db_admin_state(tc, db, None);
     (state, temp_dir)
+}
+
+#[tokio::test]
+async fn file_admission_cases_match_admin_batch_and_sqlite_full_load() {
+    let cases: Vec<Value> =
+        serde_json::from_str(include_str!("../fixtures/file_admission_cases.json")).unwrap();
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let tc = TestConfig::default();
+        let (state, _dir) = create_db_admin_state(&tc).await;
+        let db = state.db.as_ref().unwrap().clone();
+        let (base_url, _shutdown) = start_test_admin(state).await;
+        let token = generate_test_token(&tc);
+        let mut batch = case["config"].clone();
+        batch.as_object_mut().unwrap().remove("version");
+        let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+        let loaded = db.load_full_config("ferrum").await.unwrap();
+        if let Some(expected) = case["expected_error"].as_str() {
+            assert_eq!(status, 400, "{name}: {body}");
+            assert!(body.to_string().contains(expected), "{name}: {body}");
+            assert!(
+                loaded.proxies.is_empty(),
+                "{name}: rejected batch persisted"
+            );
+            assert!(
+                loaded.plugin_configs.is_empty(),
+                "{name}: rejected plugins persisted"
+            );
+        } else {
+            assert_eq!(status, 201, "{name}: {body}");
+            assert_eq!(loaded.proxies.len(), 1, "{name}");
+            assert_eq!(
+                loaded.plugin_configs.len(),
+                batch["plugin_configs"].as_array().unwrap().len(),
+                "{name}"
+            );
+        }
+    }
 }
 
 fn db_admin_state(
@@ -8238,11 +8430,14 @@ async fn test_proxy_invalid_association_does_not_fall_back_and_put_repairs() {
     .execute(&pool)
     .await
     .expect("proxy insert must succeed");
+    // Only the proxy association is corrupt. The global CORS configuration
+    // itself must be valid so clearing that association repairs the candidate.
     sqlx::query(
         "INSERT INTO plugin_configs \
          (id, namespace, plugin_name, config, scope, proxy_id, enabled, created_at, updated_at) \
-         VALUES ('global-invalid', 'ferrum', 'cors', '{}', 'global', NULL, 1, ?, ?)",
+         VALUES ('global-invalid', 'ferrum', 'cors', ?, 'global', NULL, 1, ?, ?)",
     )
+    .bind(json!({"allowed_origins": ["*"]}).to_string())
     .bind(&ts)
     .bind(&ts)
     .execute(&pool)
@@ -8655,6 +8850,92 @@ async fn test_stream_proxy_admin_persists_only_valid_shared_sni_listener_groups(
         body.to_string().contains("overlapping hosts"),
         "Expected the canonical listener-group conflict diagnostic: {body:?}"
     );
+}
+
+#[tokio::test]
+async fn batch_rejects_stream_port_conflict_with_persisted_proxy() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let existing = json!({
+        "id": "batch-port-existing",
+        "backend_scheme": "tcp",
+        "backend_host": "existing.internal",
+        "backend_port": 5432,
+        "listen_port": 19014
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &existing).await;
+    assert_eq!(status, 201, "stream proxy seed failed: {body:?}");
+
+    let conflicting_batch = json!({
+        "proxies": [{
+            "id": "batch-port-conflict",
+            "backend_scheme": "tcp",
+            "backend_host": "conflict.internal",
+            "backend_port": 5432,
+            "listen_port": 19014
+        }]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &conflicting_batch).await;
+
+    assert_eq!(
+        status, 400,
+        "batch persisted a conflicting stream port: {body:?}"
+    );
+    assert!(
+        body.to_string().contains("Duplicate listen_port 19014"),
+        "expected the canonical listener-group conflict diagnostic: {body:?}"
+    );
+    let (status, _, _) = admin_get(&base_url, "/proxies/batch-port-conflict", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_FOUND,
+        "rejected stream proxy must not be persisted"
+    );
+}
+
+/// A batch that joins an existing, valid shared-SNI listener group must be
+/// admitted: the port-bucket candidate is re-projected (`resolve_upstream_tls`)
+/// and limited to the ports the batch touches, so neither a half-projected
+/// peer nor an unrelated legacy conflict elsewhere in the namespace can turn a
+/// valid group into a rejection.
+#[tokio::test]
+async fn batch_admits_stream_proxy_joining_valid_shared_sni_group() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let tenant_a = json!({
+        "id": "batch-sni-tenant-a",
+        "backend_scheme": "tcp",
+        "backend_host": "tenant-a.internal",
+        "backend_port": 443,
+        "listen_port": 19015,
+        "hosts": ["tenant-a.example.com"]
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &tenant_a).await;
+    assert_eq!(status, 201, "stream proxy seed failed: {body:?}");
+
+    let joining_batch = json!({
+        "proxies": [{
+            "id": "batch-sni-tenant-b",
+            "backend_scheme": "tcp",
+            "backend_host": "tenant-b.internal",
+            "backend_port": 443,
+            "listen_port": 19015,
+            "hosts": ["tenant-b.example.com"]
+        }]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &joining_batch).await;
+    assert_eq!(
+        status, 201,
+        "a valid shared-SNI group must survive batch admission: {body:?}"
+    );
+    let (status, _, _) = admin_get(&base_url, "/proxies/batch-sni-tenant-b", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
 }
 
 /// An L4 `stream_match` group of `tcps` proxies is a shape the shared-port
@@ -9137,6 +9418,53 @@ async fn test_cluster_endpoint_requires_auth() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn test_cluster_endpoint_reports_authenticated_configsync_subscription() {
+    use ferrum_edge::grpc::cp_server::{CpGrpcServer, DpNodeRegistry};
+    use ferrum_edge::grpc::dp_client::generate_dp_jwt;
+    use ferrum_edge::grpc::proto::SubscribeRequest;
+    use ferrum_edge::grpc::proto::config_sync_server::ConfigSync;
+
+    let tc = TestConfig::default();
+    let registry = Arc::new(DpNodeRegistry::new());
+    let mut state = create_pagination_admin_state(&tc);
+    state.mode = "cp".to_string();
+    state.dp_registry = Some(registry.clone());
+    let secret = "test-cluster-configsync-secret";
+    let (server, _tx) = CpGrpcServer::builder(
+        Arc::new(ArcSwap::from_pointee(GatewayConfig::default())),
+        secret.to_string(),
+    )
+    .registry(registry)
+    .build();
+    let mut request = tonic::Request::new(SubscribeRequest {
+        node_id: "cluster-dp".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "ferrum".to_string(),
+        real_ip_header: Some(String::new()),
+        supports_heartbeat: false,
+    });
+    let dp_token = generate_dp_jwt(secret, "cluster-dp").unwrap();
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {dp_token}").parse().unwrap(),
+    );
+    let stream = server.subscribe(request).await.unwrap();
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/cluster", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["connected_data_planes"], 1);
+    assert_eq!(body["data_planes"][0]["node_id"], "cluster-dp");
+    assert_eq!(body["data_planes"][0]["status"], "online");
+
+    drop(stream);
+    let (status, body, _) = admin_get(&base_url, "/cluster", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["connected_data_planes"], 0);
 }
 
 #[tokio::test]
@@ -9985,5 +10313,64 @@ async fn proxy_put_omitting_plugins_preserves_associations_and_empty_array_clear
         stored["plugins"],
         json!([]),
         "an explicit `\"plugins\": []` must clear the associations: {stored:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_admin_rejects_second_effective_load_testing_before_persistence() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let db = Arc::clone(state.db.as_ref().unwrap());
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let proxy = json!({
+        "id": "load-owner", "listen_path": "/load-owner",
+        "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(status, 201, "proxy creation failed: {body}");
+    let plugin = |id| {
+        json!({
+            "id": id, "plugin_name": "load_testing", "scope": "proxy",
+            "proxy_id": "load-owner", "enabled": true,
+            "config": {"key": "test-load-key-0123456789abcdef!!",
+                "concurrent_clients": 1, "duration_seconds": 1, "gateway_port": 8000}
+        })
+    };
+    let (status, body) =
+        admin_post(&base_url, "/plugins/config", &token, &plugin("load-first")).await;
+    assert_eq!(status, 201, "first valid instance must commit: {body}");
+    let before = db.get_proxy("ferrum", "load-owner").await.unwrap().unwrap();
+    assert_eq!(before.plugins.len(), 1);
+    assert_eq!(before.plugins[0].plugin_config_id, "load-first");
+
+    let (status, body) =
+        admin_post(&base_url, "/plugins/config", &token, &plugin("load-second")).await;
+    assert_eq!(
+        status, 400,
+        "second effective instance was persisted: {body}"
+    );
+    assert!(
+        body.to_string().contains("at most one effective instance"),
+        "{body}"
+    );
+    assert!(
+        db.get_plugin_config("ferrum", "load-second")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        db.get_plugin_config("ferrum", "load-first")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let after = db.get_proxy("ferrum", "load-owner").await.unwrap().unwrap();
+    assert_eq!(after.plugins.len(), 1);
+    assert_eq!(after.plugins[0].plugin_config_id, "load-first");
+    assert_eq!(
+        after.updated_at, before.updated_at,
+        "rejected write touched the proxy"
     );
 }

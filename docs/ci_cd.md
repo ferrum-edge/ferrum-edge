@@ -59,6 +59,7 @@ adding, removing, or materially changing a workflow.
 | `fuzz.yml` | Fuzz | Weekly schedule, manual | Sanitizer-backed libFuzzer lane for hostile parser targets; see [fuzz.md](fuzz.md). |
 | `scaling-regression.yml` | Scheduled Scaling Regression | Weekly schedule, manual | Runs the 30k proxy scale and 10k proxy load-stress tests excluded from PR CI. A follow-on publisher upserts a `severity:high` issue when the matrix is red. Publisher jobs share `scaling-gate-publisher` with `queue: max` and `cancel-in-progress: false` so overlapping weekly/daily work stays queued; GitHub does not guarantee FIFO, so issue mutation is generation-aware and close is compare-and-set against the recorded run id. |
 | `scaling-gate-freshness.yml` | Scheduled Scaling Gate Freshness | Daily schedule, manual | Fail-closed freshness check of the latest scaling-regression run on `main`. Only a completed success within eight days may close that issue; a newer failure, cancel, timeout, skip, or in-progress run keeps it open, as does stale or missing history. The publish step runs even when static verification fails so a broken contract cannot stay silent. Shares the generation-aware publisher concurrency group (`queue: max`). |
+| `performance-regression.yml` | Performance Regression | Daily schedule on `main`, manual | Out-of-band self-relative overhead benchmark, Criterion microbenchmarks, and the protocol-perf / mesh-baseline static contracts. Not a PR or main-push check; a red run marks the daily `main` tip as regressed. |
 | `protocol-perf-regression.yml` | Protocol Performance Regression | Weekly schedule, manual | Scheduled multi-protocol throughput/latency regression with churn, soak, resource plateaus, reload-under-load, versioned alert-only budgets, and machine-readable trends. Not a required PR check; see [protocol_perf_regression.md](protocol_perf_regression.md). |
 | `mesh-performance-baselines.yml` | Mesh Performance Baselines | Manual (`workflow_dispatch`) and reusable (`workflow_call`) | Provenance-complete collection of mesh Criterion + HBONE/DNS E2E baseline artifacts for [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) on pinned `ubuntu-24.04`. Uploads `mesh-performance-baselines-<sha>`; fails selected-suite acceptance when gates are false (artifacts still upload); does not invent `baseline.md` numbers. |
 | `claude-review.yml` | Claude PR Review | `@claude review` issue comment on PRs | Maintainer-triggered AI review comments. |
@@ -70,6 +71,7 @@ adding, removing, or materially changing a workflow.
 | `gateways-protocol-benchmark.yml` | Gateways Protocol Benchmark | Manual | Gateway/protocol benchmark harness. |
 | `connection-saturation-benchmark.yml` | Connection Saturation Benchmark | Manual | Connection saturation benchmark suite. |
 | `scale-benchmark.yml` | Resources Scale Benchmark | Manual | Large resource/config scale benchmark suite. |
+| `ci-latency-report.yml` | CI Latency Report | Manual, weekly schedule, and PR/push on its own sources | Read-only Actions-API latency report for [#4672](https://github.com/ferrum-edge/ferrum-edge/issues/4672): queued time, execution, serial dependency waves, attempt numbers, cancellations and whole-required-set completion. Holds `contents: read` + `actions: read` only, dispatches nothing, and is **not** a required check. |
 | `root-merge-gate-attestation.yml` | Root Merge Gate Attestation | Manual (`workflow_dispatch` on `main` only) | Supplies the single required human-root approval for one exact independently reviewed PR head after hosted checks and review-thread resolution; see [Root Merge Gate Attestation](#root-merge-gate-attestation). |
 
 ### CI Pipeline Flow
@@ -262,33 +264,31 @@ cold-cache run still proves every live contract within the existing job
 timeouts.
 
 **Production images.** The ordinary `runtime` and distroless `runtime-ebpf`
-targets build in parallel with `docker/build-push-action`. The ordinary image
-restores a schema- and architecture-scoped local BuildKit cache (`type=local`)
-through pinned `actions/cache/restore`, using
-`production-dockerfile-smoke-default-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}`
-and its matching architecture prefix. The `v1` component is the local cache
-schema. The eBPF image instead reads Ambient's public, target-specific GHCR
-cache anonymously, with no export or Actions archive save. Ambient's trusted
-main writer maintains that shared cache. Both images preserve the explicit
-cold-cache dispatch path.
+targets build in parallel with `docker/build-push-action`. Both import public,
+target-specific GHCR BuildKit caches. The ordinary target uses
+`ghcr.io/ferrum-edge/ferrum-edge-buildcache:default-v1-linux-amd64-runtime`;
+the eBPF image shares Ambient's `ambient-v1-linux-amd64-runtime-ebpf` cache.
+Neither recipe restores or saves an Actions cache archive.
 
-For the ordinary image's local cache, `actions/cache/restore` v4 outputs are classified strictly: `cache-hit == 'true'`
-is an exact primary-key hit; `cache-hit == 'false'` is a restore-key partial
-match (still a hit); empty `cache-hit` plus empty `cache-matched-key` is an
-ordinary miss. Exact and partial hits require a nonempty matched key and an
-existing restored directory; contradictory tuples fail closed.
+Relevant pushes and manual dispatches on `refs/heads/main` in
+`ferrum-edge/ferrum-edge` select the ordinary image writer, with
+`contents: read` and `packages: write`. All other events select the anonymous
+reader with only `contents: read`. The aggregate requires the selected recipe
+to pass and the other to be skipped. Both recipes build the same Dockerfile,
+`runtime` target and `pr-build` profile, load the image locally and run the
+same executable and distroless inventory checks. They publish no production
+image. Only the warm main writer exports `mode=max` registry cache metadata;
+cache export failure fails that job. An absent registry cache can cold-build.
 
-Trusted same-repository pull requests and `workflow_dispatch` never export or
-save on an exact `${{ github.sha }}` hit: that path builds restore-only with
-`cache-from` and no `cache-to`/`actions/cache/save`, so it does not pay for a
-`mode=max` export or upload. Only a partial match or miss uses the publishing
-BuildKit step, exports a fresh `*-out` directory, and saves the new exact key.
-The cache-save preparation step requires that fresh export and fails rather than
-relabeling the restored/stale destination. Fork pull requests restore and must
-not have a save or cache-publication step. `force_cold_cache` skips restore and
-save. Job summaries time cache-restore, image-build/export, and cache-save
-separately, and record the restore action's classified hit kind plus the
-measured restored directory size; unknown is never rendered as a miss or `0 B`.
+`force_cold_cache` skips registry login, import and export. Image-build timing
+includes registry transfer; BuildKit logs establish actual layer reuse.
+Telemetry reports unknown registry hit/bytes, without inventing an Actions
+restore hit or measured size. Existing default-image Actions archives expire
+under LRU, with no further writes from this workflow. No cache limit, package
+visibility or spending setting is changed. The namespace is already public;
+activation still requires a successful trusted-main export followed by an
+anonymous reader with observed BuildKit reuse.
+
 The Dockerfile declares `ARG FEATURES` after the shared apt and manifest layers
 so those two feature sets reuse toolchain work. A trusted-base copy of
 `.github/scripts/ci_runtime_plan.py` reads a NUL-delimited
@@ -459,10 +459,10 @@ into its key, and a randomized root made every lane unrestorable (#4643). It per
 `SCCACHE_GHA_ENABLED` as empty so a later step cannot re-enable the
 credential-bearing GHA backend. Install failure clears the rustc wrapper and
 continues uncached. Compiler outputs use a 2 GiB local directory persisted by
-rust-cache / the FIPS producer archive. Production-image cache restore and save stay inside the
-pinned `actions/cache/*` actions; PR-controlled `run:` steps only measure the
-restored directory and move the BuildKit local export. Workflows stay
-`permissions: contents: read`. Static checks live in
+rust-cache / the FIPS producer archive. Production-image caches use pinned
+BuildKit registry imports and trusted-main exports. PR recipes remain
+`permissions: contents: read`; only the mutually exclusive trusted-main
+publisher receives `packages: write`. Static checks live in
 `.github/scripts/verify_ci_runtime_cache.py`. The cache-credential gate is
 structural: `fips-build.yml` may invoke only a closed allowlist of pinned
 actions and the two local shell-only composites (`setup-sccache`,
@@ -574,10 +574,13 @@ the live datapath compiled without re-running it.
 
 The CI workflow is triggered by every pull request, every merge-queue
 `merge_group` check request, and every push to `main`.
-The independent, read-only `CI Policy` job runs the complete trusted Cross
-verifier self-tests and workflow scan on every CI event, including light-mode
-PRs. It starts alongside `CI Plan`, so policy validation overlaps application
-compilation instead of adding its full runtime before compilation can begin.
+The independent, read-only `CI Policy` job runs the trusted Cross verifier's
+workflow scan on every CI event, including light-mode PRs. It starts alongside
+`CI Plan`, so policy validation overlaps application compilation instead of
+adding its full runtime before compilation can begin. The verifier's own
+static self-tests are not repeated on every event: they run in
+`trusted-policy-candidate.yml` whenever the verifier or a workflow changes,
+which is the only time their verdict can move.
 `Tests` directly needs both jobs and unconditionally rejects failed, cancelled,
 skipped, or missing policy results and missing/invalid completion output. The
 `verified=true` output is written only after the complete verifier succeeds;
@@ -608,13 +611,77 @@ by suppressing checks or synthesizing successful release proof. See
 [policy performance measurement](ci_policy_performance.md) for the rollout
 measurements, whose hosted results remain pending until collected.
 
-The `CI Plan` job selects `full` or `light` mode. Pull requests and
-merge-group runs whose entire diff is limited to ordinary documentation,
-`.agents/**`, `.claude/**`, Markdown outside `vendor/`, or license files use
-light mode and preserve a fast `Tests` aggregate without starting the Rust/build
-matrix. Documentation that
-deliberately triggers a live datapath suite (including the mesh, SPIRE,
-configuration, NodeWaypoint, and CI contract/runbook files) remains full mode.
+The `CI Plan` job selects `full` or `light` mode and, inside full mode, a
+per-job gate for every compile-based job. Pull requests and merge-group runs
+whose entire diff is limited to ordinary documentation, `.agents/**`,
+`.claude/**`, Markdown outside `vendor/`, or license files use light mode and
+preserve a fast `Tests` aggregate without starting the Rust/build matrix.
+Documentation never schedules a live datapath suite on a pull request any more.
+
+### Pull-request gating and main-only validation
+
+A pull request runs only the validation its diff can affect; every push to
+`main` runs everything. The planner (`pr_ci_plan.py`, executed from the
+trusted base) emits one `run_*` output per job group and the `Tests`
+aggregate accepts a skipped job only when its gate was `false`:
+
+| Gate | Schedules | Pull-request trigger surface |
+|---|---|---|
+| `run_rust` | Unit Tests, Lint, Integration, Functional, Redis regression | `src/`, `tests/` (except `tests/k8s/`), `custom_plugins/`, `ebpf/`, `proto/`, `vendor/`, Cargo/toolchain/`build.rs`, `ferrum.conf`, `openapi.yaml`, `deny.toml`, `ci.yml`, the Rust setup actions |
+| `run_artifacts` | Build Test Artifacts | `run_rust` or `run_helm` |
+| `run_acme` | ACME Feature Tests (`--features acme`, own job) | `src/tls/`, `tests/acme_dns01/`, `tests/unit/tls/`, build graph |
+| `run_conformance` | Mesh Conformance Tests | `tests/conformance/`, mesh/xDS/k8s translation modules, build graph |
+| `run_service_integration` | Service Integration (testcontainers) | `tests/service_integration/`, service discovery, the LDAP/Kafka/OIDC/introspection/chargeback plugins, DB loaders, build graph |
+| `run_ebpf_userspace` | Build eBPF Userspace Loader | `src/ebpf/`, `src/capture/`, node-agent modes, `ebpf/`, build graph |
+| `run_fuzz_smoke` | Fuzz Smoke (property tests) | `fuzz/`, `src/fuzz_support.rs`, the parsers it links, `Cargo.*`, `vendor/` |
+| `run_platform_build` | Build (`pr-build` profile, `cloud-secrets`) | build graph, `src/secrets/`, the binary entry points |
+| `run_vendor_patches` | Vendored Patch Regressions | `vendor/`, `Cargo.*`, toolchain |
+| `run_dependency_audit` | Dependency Audit (cargo-deny) | `Cargo.*`, `deny.toml`, `vendor/`, `ebpf/`, the dependency-policy and vendored-patch lifecycle docs, the advisory/lifecycle scripts |
+| `run_helm` | Helm Chart | `charts/`, Dockerfiles, the Kubernetes-facing runtime modules, chart lint scripts |
+| `run_secrets_backends`, `run_pkcs11` | Secret Backends, PKCS#11 SoftHSM | unchanged feature-scoped surfaces |
+| `run_ebpf_kernel_live`, `run_netns_capture_live`, `run_two_cluster_live` | the three privileged ci.yml live suites | only their owner modules and harnesses; never the Cargo build graph |
+
+The same principle governs the dedicated workflows. `fips-build.yml` compiles
+the FIPS profile on a pull request only when FIPS-specific logic changes
+(`src/fips/`, `src/tls/`, `src/dtls/`, the provider-installing listeners, the
+FIPS-aware tests, the Cargo feature graph, `docs/fips.md`, and the gate's own
+workflow/scripts); `coverage.yml` skips every instrumented shard on a pull
+request unless the coverage controllers themselves change; the Kind live
+suites (`live_suite_path_filter.py`, `ci_runtime_plan.py`) fire only for their
+own harness, tooling, and the Kubernetes-facing modules they exist to test.
+The performance regression check is fully out of band: `performance-regression.yml`
+runs once a day against the tip of `main` (and on manual dispatch), never on a
+pull request or a main push.
+A regression in any of these on an ordinary source change turns `main` red
+for that commit, which makes the commit ineligible for a production release
+(see [Publish-blocking required checks](#publish-blocking-required-checks));
+it does not cost every unrelated pull request a Kind cluster or a FIPS build.
+
+### Main-push concurrency
+
+Every workflow that runs on `push` to `main` keys its concurrency group on
+the ref with `cancel-in-progress` **false** for pushes (superseded
+`pull_request` / `merge_group` runs are still cancelled). A run in flight
+finishes and at most one newer push waits behind it, so `main` converges on a
+complete exact-SHA validation set instead of cancelling almost every run
+before it can finish. Intermediate SHAs skipped by that coalescing carry no
+evidence and are simply not releasable; after a burst of merges the tip is
+validated by every workflow. Dispatch **Start Production Release** from a
+quiet `main` and, if the gate reports a pending run, let it complete.
+
+### Rust cache lanes
+
+The repository cache is a 10 GB LRU quota, so lanes are few and owned.
+`setup-rust-ci` restores for every job but saves only from the designated
+lane producer (`save: "true"`) on a trusted `refs/heads/main` run; the
+sccache local store is no longer persisted (the restored `target/` already
+skips dependency compilation). Lanes: `ci-debug` (produced by Unit Tests;
+shared by every debug-profile job through identical `CARGO_BUILD_JOBS` /
+`CARGO_PROFILE_DEV_DEBUG` job env), `ci-lint` (produced by Lint), the
+main-only `fuzz-smoke` lane, `ci-coverage`, and the separately governed FIPS
+contract lane. The direct eBPF-program cache also retains its main-push writer;
+binary and benchmark sites are restore-only (`save-if: "false"`).
+
 The planner runs `git diff --check` for PR/merge-group diff hygiene and disables
 rename detection when classifying paths, so both the source and destination of a
 rename are checked. `CI Plan` collects those paths as a NUL-delimited
@@ -627,13 +694,13 @@ every job gate on, and are omitted from the step summary rather than
 interpolated into Markdown. The same `--no-renames` fail-closed classification applies
 to `coverage.yml` coverage planning, `gateway-api-conformance.yml` relevance
 filtering, and the `performance-regression` path classifier on both
-`pull_request` and `merge_group` diffs. Coverage planning is shard-scoped on
-classifiable pull-request and merge-group diffs: `lib-unit` always runs with the
-affected integration shards, plugin-only diffs keep the plugin gate but reuse
-the `lib-unit` profraw/artifacts, and push to `main`, schedule, dispatch, empty
-or unavailable diffs, controller edits, dependency/build-graph inputs, unknown
-paths, and malformed/hostile path transport fail closed to the full coverage
-matrix. The `Merge Coverage` aggregate verifies exact planned shard outcomes and
+`pull_request` and `merge_group` diffs. Coverage planning skips every
+instrumented shard on classifiable pull-request and merge-group diffs (the
+`Merge Coverage` check reports success in under a minute); controller edits,
+empty or unavailable diffs, and malformed/hostile path transport fail closed to
+the full matrix, and push to `main`, schedule, and dispatch always run the full
+matrix. The path-scoped shard classification is retained as
+`select_scoped_plan` for diagnostics. The `Merge Coverage` aggregate verifies exact planned shard outcomes and
 artifact presence so a skipped shard cannot false-green the required check.
 Merge-group planning diffs
 `merge_group.base_sha...HEAD` and executes the planner from that base SHA so a
@@ -758,9 +825,10 @@ Live labs that compile the same default-feature `cargo build --profile pr-build
 Lanes whose cache-affecting inputs differ keep private keys: CNI additionally
 links `ferrum-cni` (`ci-cni-lifecycle-live`), NodeWaypoint rebuilds with
 `--features cloud-secrets,ebpf` plus a nightly bpfel toolchain
-(`ci-node-waypoint-ebpf-live`), and Ambient Host UDP compiles the debug-profile
-lib/functional test binaries (`ci-ambient-host-udp-live`). Kind, kubectl, and
-Helm downloads used by those labs are restored inside
+(`ci-node-waypoint-ebpf-live`). Ambient Host UDP instead shares the default
+debug-profile lib/functional dependencies with Netns and Two-Cluster through
+`ci-netns-capture-live`. Kind, kubectl, and Helm downloads used by those labs
+are restored inside
 `.github/actions/setup-kubernetes-tools` under an exact key of pinned
 versions/checksums, install subset, and runner OS/arch; checksums are verified
 after both restore and download. That compile-cache and tool-download sharing
@@ -933,15 +1001,25 @@ pushes to `main`. The commands below are grouped by job, not run as one
 sequential shell script:
 
 ```bash
-# test-unit: compile the inline and external targets together, then run the
-# inline lib, unchanged four-test plugin-hardening exact gate, kTLS live-kernel
-# proof, and complete external unit suite in the same job. The joint no-run
-# step prevents a runner-loss window between two full target compilations.
-cargo test --lib --test unit_tests --no-run
-cargo test --lib
+# test-unit: a five-shard matrix (lib / core / plugins-a / plugins-b /
+# gateway-core). The former 642k-line `unit_tests` crate is four targets
+# compiled in parallel: `unit_tests` (config, admin, tls, identity, secrets,
+# cli, ...), `unit_plugins_a_tests` (plugin test files a–j),
+# `unit_plugins_b_tests` (k–z), and `unit_gateway_core_tests`; the `lib`
+# shard compiles the inline `#[cfg(test)]` harness alone and runs it plus the
+# kTLS live-kernel proof. Each shard precompiles its target in one Cargo
+# invocation before running anything, so a runner loss cannot land between a
+# compile and a run. The plugins-b shard hosts the four-test plugin-hardening
+# exact gate. Per-shard passing floors live in run_unit_ci.py.
+cargo test $UNIT_PRECOMPILE_TARGETS --no-run      # "--lib" on lib, "--test <target>" elsewhere
+cargo test --lib                                   # lib shard
 FERRUM_KTLS_LIVE_REQUIRED=1 cargo test --lib -- --ignored --test-threads=1 \
-  proxy::ktls_live_kernel_tests
-cargo test --test unit_tests
+  proxy::ktls_live_kernel_tests                    # lib shard
+cargo test --test "$UNIT_TARGET"                   # every other shard
+
+# test-acme (path-gated: src/tls/, tests/acme_dns01/, tests/unit/tls/, build
+# graph): the optional feature compiles the library a second time, so it has
+# its own job instead of extending the Unit Tests critical path.
 cargo test --features acme --lib --test acme_dns01_tests --no-run
 cargo test --features acme --lib tls::acme::client::tests
 cargo test --features acme --test acme_dns01_tests
@@ -962,8 +1040,8 @@ cargo nextest run --archive-file integration-tests-*.tar.zst \
   <shard filters>
 
 # build-test-artifacts (one job/cache for both archives and both binaries)
-cargo build --profile pr-build --bin ferrum-edge
-cargo build --config profile.dev.debug=0 --bin ferrum-cni
+cargo build --bin ferrum-edge
+cargo build --bin ferrum-cni
 cargo nextest archive --test integration_tests ...
 cargo nextest archive --test functional_tests ...
 
@@ -1205,10 +1283,9 @@ image from those cached host-built artifacts instead of recompiling inside
 Docker. A separate production-Dockerfile smoke builds the ordinary `runtime`
 target (which must omit `ip`) and the privileged `runtime-ebpf` target (which
 must contain `ip`) **in parallel** through BuildKit. The ordinary target
-uses its scoped local Actions archive; the eBPF target anonymously imports
-Ambient's matching GHCR cache without exporting or saving another archive.
-The ordinary cache records measured restored bytes and saves only on main
-pushes; pull requests restore without saving.
+uses its own public GHCR cache with a trusted-main writer; the eBPF target
+anonymously imports Ambient's matching GHCR cache. Pull requests do not export
+or save either cache.
 Each job then checks a normalized
 filesystem inventory for shells and package managers. A trusted-base path
 planner reads a NUL-delimited `git diff --name-only --no-renames -z` listing and
@@ -1353,8 +1430,8 @@ package must be public before anonymous imports can reuse it. Existing GHA
 entries expire under LRU. See the registry migration section below.
 
 The Fuzz Smoke lane's separate main-only save remains owned by PR #3918. The
-ordinary NodeWaypoint image retains its local BuildKit contract from PR #3889;
-the eBPF image now shares Ambient's registry cache. FIPS handoff is unchanged.
+ordinary NodeWaypoint image uses its dedicated GHCR registry cache; the eBPF
+image shares Ambient's registry cache. FIPS handoff is unchanged.
 
 The shared `setup-rust-ci` action applies the same restore-only policy to the
 Swatinem rust-cache: `save-if` is true only when the event is neither
@@ -1371,42 +1448,31 @@ rust-cache producer/consumer sites keep their existing fork-only `save-if`
 contract — that workflow's caching architecture is generation-pinned
 separately (PR #3889).
 
-**Rust-cache quota diet (#4643, part 2).** The editable direct rust-cache
-calls in `ci.yml` (`build-binaries`, `build-ebpf`) and the six on-demand
-benchmark workflows now save only on
-`github.event_name == 'push' && github.ref == 'refs/heads/main'`. Because the
-benchmark workflows only have `workflow_dispatch` triggers, they restore
-existing entries but publish no new ones, including on manual `main` runs.
-Their existing keys remain isolated; they do not gain a new cache producer.
-The binary producer retains separate `release` and `prbuild` keys, so its
-PR/merge-group builds cannot restore the release-profile cache and will
-compile cold once old `prbuild` entries expire.
+**Rust-cache quota diet (#4643, current state).** The initial direct-site
+change from `fix/issue-4643-cache-lane-diet` / #4665 is integrated. The shared
+`setup-rust-ci` action now archives Cargo downloads and target dependencies,
+without the duplicate sccache directory, and defaults to restore-only.
+The Unit core shard owns `ci-debug`, Lint owns `ci-lint`, and coverage's
+lib-unit shard owns `ci-coverage`. All three explicitly set
+`cache-on-failure: "false"`: a failed setup/fetch/compile must not reserve an
+incomplete immutable key that later exact-hit consumers cannot enrich.
+This also forgoes saving when tests fail after compilation; no compile-complete
+predicate is inferred. Existing incomplete entries are not deleted by the fix.
+The separate FIPS producer/handoff contract is unchanged.
 
-Lanes that cache useful Cargo targets stop also archiving the bounded 2 GiB
-`.cache/sccache` directory. Comparison, connection-saturation, and
-gateways-protocol benchmarks compile their host tools in nested workspaces
-and build the gateway in Docker; their default root `target/` archive never
-covered those host tools. They now set `cache-targets: "false"`, retaining
-only Cargo downloads and the compiler-cache restore path. No new shared
-sccache service or credential export is introduced.
+The main-only `fuzz-smoke` lane currently archives its target tree, without a
+sccache directory. The earlier target-only experiment showed that dropping
+compiler-store reuse can increase sanitizer time despite a target-cache hit.
+Restore-only benchmark and binary jobs do not create new cache producers.
+Ambient and NodeWaypoint image caches now use their separate GHCR contracts.
 
-| Lane / shared key | Expected archive after the diet (not yet measured) |
-|---|---|
-| `build-<target>-release` | Cargo downloads + target dependencies; previous archive minus its compressed sccache subset (up to 2 GiB before compression) |
-| `build-<target>-prbuild` | 0 new bytes; PR and merge-group saves disabled |
-| `ci-ebpf-programs` | Cargo downloads + `ebpf/target`; previous archive minus its compressed sccache subset, when the existing cache step runs |
-| `ci-perf-bench`, `ci-payload-bench`, `ci-scale-bench` | 0 new bytes on dispatch; restore paths are Cargo downloads + root target dependencies |
-| `ci-comparison-bench`, `ci-connection-saturation`, `ci-gateways-protocol-bench` | 0 new bytes on dispatch; restore paths are Cargo downloads + sccache, without root target |
-
-This is a partial quota reduction, not evidence that the repository fits
-under 10 GB. The frozen `setup-rust-ci` action still archives both target and
-sccache for Unit Tests (`ci-test`), Lint (`ci-lint`), Build Test Artifacts,
-coverage, and its other callers; it exposes neither `cache-targets` nor
-`cache-directories` nor `save-if` overrides. Changing that common policy
-requires a trusted direct-to-`main` generation. The frozen `fuzz-smoke` lane
-(reported at about 4.3 GB) still needs shrinking/splitting through a separate
-policy generation. FIPS, release publication, and `ci-perf` (#4090) keep
-their existing arrangements. Existing large entries are left to LRU expiry.
+The [September 8 hosted audit](ci_throughput_2026-09-08.md) records a complete
+seven-entry inventory of 5,785,469,165 bytes and primary-log exact restores in
+Unit, Lint and Build Test Artifacts. It also records a 29m40s sanitizer stage
+with zero compiler-cache hits despite an exact target-cache restore. These
+measurements supersede the initial archive-size estimates and the old claim
+that the shared composite still duplicates sccache. Durable retention and
+same-input compiler reuse remain acceptance requirements, not assumptions.
 
 To measure, capture this inventory before and after a subsequent `main`
 push, then again after a PR run based on that push (retain the output with
@@ -1421,7 +1487,7 @@ Compare the **same entry IDs** across snapshots: entries created before the
 later `main` push must still exist afterward and show `last_accessed_at` >
 `created_at` after the PR restore. Sum `size_in_bytes` across all pages and
 refs, including BuildKit caches, against the 10 GB repository quota; group
-by lane to replace the estimates above with measured compressed sizes. A
+by lane to track measured compressed sizes over time. A
 newly created replacement key is not survival evidence. Confirm `Restored
 from cache key …` in Unit Tests, Lint, and Build Test Artifacts logs, and
 record Unit Tests' precompile duration. Keep #4643 open until that evidence
@@ -1454,27 +1520,23 @@ executes (`package-ferrum-runtime-image`, `setup-kubernetes-tools`,
 detection fails or returns a non-boolean verdict, reports green when relevance
 was proven `false`, and otherwise reports the live job's result.
 
-#### 6. Performance Regression Job
+#### 6. Performance Regression Job (`performance-regression.yml`)
 
-**Runs**: `ubuntu-latest`
-
-Runs on full-mode PRs, pushes to `main`, and manual dispatches. Immediately after
-checkout, the job always runs lightweight protocol-perf static validation (no
-benchmarks): workflow verifier `--self-test`, repository-contract verification,
-evaluator `--self-test`, and `python3 -m py_compile` on
-`tests/performance/multi_protocol/run_protocol_regression_scenarios.py`. PRs then
-apply a performance-sensitive path filter; unrelated PRs skip the expensive
-benchmark and report success. On pull requests and merge-queue groups, changed
-files are collected with `git diff --name-only --no-renames` so both sides of a
-rename are classified and a move into an irrelevant path cannot suppress the
-benchmark. The PR gate covers proxy and connection hot paths,
-the file-mode startup path used by this benchmark, performance fixtures, and
-dependency/build-graph inputs. Plugin-internal, admin, secrets, and unrelated
-operating-mode changes are excluded because this plain HTTP/1.1 file-mode route
-cannot observe them. If the PR diff cannot be computed, the benchmark runs to
-fail closed. Relevant PRs and all `main` pushes build the gateway in the
-`ci-release` profile, build `tests/performance/backend_server`, start both
-services, and run:
+**Runs**: `ubuntu-latest`, once a day (`schedule`, 06:17 UTC) against the tip
+of `main`, and on manual dispatch. It is not part of `ci.yml`, the `Tests`
+aggregate, or any pull-request or main-push validation: the ci-release build,
+the self-relative overhead benchmark, and the Criterion microbenchmarks are
+deliberately out of band so they never sit on the PR or merge critical path.
+A red daily run marks that `main` tip as performance-regressed for triage.
+Immediately after checkout, the job always runs lightweight protocol-perf static
+validation (no benchmarks): workflow verifier `--self-test`,
+repository-contract verification, evaluator `--self-test`, and
+`python3 -m py_compile` on
+`tests/performance/multi_protocol/run_protocol_regression_scenarios.py`. The
+change classifier is retained for manual dispatch parity; on the scheduled and
+dispatched events it schedules every benchmark. The job builds the gateway in
+the `ci-release` profile, builds `tests/performance/backend_server`, starts both
+services, and runs:
 
 ```bash
 python3 tests/performance/ci_overhead_bench.py \
@@ -1751,7 +1813,8 @@ Trusted policy therefore carries a second, additive contract —
 | `production-dockerfile-plan` | whole job |
 | `production-dockerfile-smoke` | whole job (aggregate) |
 | `node-waypoint-ebpf-live-gate` | whole job (aggregate) |
-| `production-dockerfile-smoke-default` | `needs` + `if` only |
+| `production-dockerfile-smoke-default` | whole anonymous-reader job |
+| `production-dockerfile-smoke-default-write` | whole trusted-main writer job |
 | `production-dockerfile-smoke-ebpf` | `needs` + `if` only |
 | `node-waypoint-ebpf-live` | `needs` + `if` only |
 
@@ -1760,7 +1823,7 @@ single object-id pin, blob type/mode/size checks, `python3 -I` isolation,
 `true|false` verdict guard, and both `emit_suite_verdict` calls are one
 fail-closed unit. The two aggregates are frozen whole because their condition
 chains are the entire difference between "skipped because the trusted base
-proved irrelevance" and "green because the live job never ran". The three
+proved irrelevance" and "green because the live job never ran". The remaining two
 consumer jobs keep only their binding frozen, because their bodies are ordinary
 build and live-test recipes that must stay editable. Deleting the workflow is
 rejected too: a contract a `git rm` retires is the same weaker-than-it-looks
@@ -2762,6 +2825,81 @@ The GHCR path is `ghcr.io/${{ github.repository }}` in the workflows, so it auto
 
 ## Image Signatures, SBOMs, and Provenance
 
+**Open release verification follow-up ([#4856](https://github.com/ferrum-edge/ferrum-edge/issues/4856)):**
+[release run 33984483575, job 101372033947](https://github.com/ferrum-edge/ferrum-edge/actions/runs/33984483575/job/101372033947)
+failed on 2026-09-05 after pulling the pinned Syft image. Its combined scan/jq
+step returned 1 without identifying the failed operation; signing and
+verification were skipped and no SPDX artifact survived. The contract below
+describes the required release behavior, not proof that this release met it.
+
+The failed source `af1bfcccc1c9eefc1aa118e8eff8fd218e9e6c4a` required a nonempty
+`documentDescribes` array. That is **not the current predicate**:
+[commit c27e5e55e](https://github.com/ferrum-edge/ferrum-edge/commit/c27e5e55eda97047a35af0bb0fd87fea760dcb82)
+already corrected the production check and its trusted policy to also accept
+`SPDXRef-DOCUMENT` / `DESCRIBES` relationships. The existing fix is also recorded
+in [release retry PR #4666](https://github.com/ferrum-edge/ferrum-edge/pull/4666).
+Do not duplicate that fix or rebaseline the trusted policy.
+
+[Hosted diagnostic run 34162011344](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34162011344)
+retained all six Docker Hub inventories. Every manifest inspection, manifest
+predicate, Syft scan, and current SPDX predicate exited 0; each SPDX validation
+printed `true`. The inventories use SPDX-2.3, omit `documentDescribes`, and each
+contain one document `DESCRIBES` relationship. The retained summaries report:
+
+| Family | amd64 job / packages | arm64 job / packages |
+| --- | --- | --- |
+| standard | 101865584659 / 15 | 101865584550 / 15 |
+| ebpf | 101865584752 / 16 | 101865584707 / 16 |
+| ebpftools | 101865584704 / 102 | 101865584749 / 102 |
+
+These actual inventories expose the historical predicate mismatch and support
+the already merged correction. The failed release's original inventory is
+unavailable, so they do not prove that no other operation failed in that run.
+The smoke now checks each newly generated inventory against both predicates:
+current validation must succeed, and the historical predicate copied from the
+failed source must reject it with exactly jq exit 1. A launch, parse, or missing
+file error is not accepted as historical rejection.
+
+`release-sbom-smoke.yml` provides a read-only hosted diagnostic path on PRs and
+main pushes that change the release workflow or smoke harness. It scans the
+three immutable manifest digests recorded in that run on Docker Hub, on both
+`linux/amd64` and `linux/arm64` (six independent matrix entries). All six GHCR
+entries in run 34162011344 stopped at manifest discovery with HTTP 401 from
+`https://ghcr.io/token?scope=repository%3Aferrum-edge%2Fferrum-edge%3Apull&service=ghcr.io`.
+Their `manifest.stderr.txt` and `status.json` artifacts preserve that separate
+anonymous-access limitation; no Syft scan ran. This is why the anonymous smoke
+uses the demonstrated public Docker Hub path. It does not explain the
+authenticated release failure or remove per-registry release verification.
+
+The harness extracts manifest/SPDX jq predicates from `release.yml` and checks
+its literal Syft command against the extracted production command before
+scanning. Executable commands remain statically inspectable by trusted policy;
+extracted workflow shell text is only compared and retained as data. It does
+not execute Ferrum images. Hosted regressions exercise both SPDX description
+encodings, historical rejection, missing/empty content, command drift, scanner
+failure with partial output, launch failure, and timeout evidence. No registry
+login, signing, publication, or OIDC permission is used.
+
+For each entry, the `release-sbom-*` artifact is retained for 14 days, including
+on failure: `status.json` identifies the immutable subject, platform descriptor,
+and each operation's exit/timeout status; separate stdout/stderr files distinguish
+manifest inspection, Syft failure, and jq rejection; `spdx-summary.json` reports
+field shapes/counts; and any generated SPDX file plus the exact predicate and
+scan command and historical predicate are retained. Historical validation has
+its own stdout/stderr and actual/expected exit status. Only anonymous scans of
+these public images supply the evidence. Do not add credentials or authenticated
+debug dumps to this lane.
+
+This diagnostic lane leaves the frozen privileged release job and its inputs
+unchanged. It does not repair existing attestations or retain evidence from
+future release jobs themselves. Root must inspect the repaired harness's hosted
+historical/current results, reconcile #4856 with the already merged correction
+and release retry, arrange nonsecret future release failure artifacts through
+the authorized trusted-policy process, and verify signatures, provenance,
+immutable subjects, and both platform inventories for all three image families
+in **both registries**. A green smoke run alone is insufficient for issue closure
+or downstream reliance on the release's attestation claim.
+
 Every version-tag release signs and attests the final standard, `-ebpf`, and
 `-ebpf-tools` multi-architecture image digests in both Docker Hub and GHCR. The
 per-platform push-by-digest builds deliberately retain `provenance: false`:
@@ -3186,32 +3324,48 @@ the version, iproute2 and distroless inventory assertions, image timing and
 required aggregate. Registry import runs within image-build timing; BuildKit
 logs provide actual layer-reuse evidence. Telemetry records unknown hit/bytes
 for registry reads rather than claiming an Actions cache hit. A missing cache
-can still produce a correct cold build. The ordinary default image retains
-its separate local-cache contract. All package and billing settings stay as-is.
+can still produce a correct cold build. The ordinary default image uses its
+own `default-v1-linux-amd64-runtime` registry cache, maintained only by the
+trusted-main writer in this workflow. All package and billing settings stay as-is.
 
 ### Shared default-profile live dependency cache (#4643)
 
-Netns Source Capture and Two-Cluster Mesh Live use the existing
-`ci-netns-capture-live` key. Both run on the same Linux runner/toolchain setup,
-with the same default features, Cargo profile, native dependencies, workspace
-and compiler flags. Both build the gateway and `functional_tests`; Netns also
-builds the inline library tests. The pinned Rust cache removes workspace
-binaries and keeps external dependencies plus the compiler store, so either
+Netns Source Capture, Two-Cluster Mesh Live and Ambient host-UDP live-kernel
+use the existing `ci-netns-capture-live` key. All use `setup-rust-ci`, default
+features, the default Cargo profile, native dependencies, workspace and
+compiler flags. Ambient pins Ubuntu 24.04; the other two use `ubuntu-latest`,
+which currently resolves to the same image family. The cache still includes
+its platform/toolchain/environment hash, and Cargo checks build fingerprints.
+All three build the gateway and `functional_tests`; Netns and Ambient also
+build the inline library tests. The pinned Rust cache removes workspace
+binaries and keeps external dependencies plus the compiler store, so any
 completed producer supplies the shared dependency archive. Cargo still checks
 source fingerprints and each job independently executes its own required tests.
 
-The 2026-09-06 main inventory held separate Netns/Two-Cluster archives of
-2,638,376,752 / 2,638,386,367 bytes. Sharing their existing namespace removes a
-duplicate roughly 2.64 GB producer without invalidating the Netns cache. The
-trusted-main-only save rule and all job triggers, budgets, commands, dependency
-edges and test assertions are unchanged. Unit, lint, feature-specific and
-archive-builder profiles keep their separate keys. Reassess this pairing if
-either job changes its build profile, features, toolchain or target layout.
+The September 7 logs showed an additional key split: Ambient's environment
+hash was `c3076958`, while Netns/Two-Cluster used `08f74bf7`. The main CI
+workflow exports `CARGO_NET_RETRY=10` and `CARGO_HTTP_MULTIPLEXING=false`;
+Ambient previously relied on the same values in `.cargo/config.toml`. The
+pinned Rust cache hashes the exported variables even though these two settings
+only affect downloading. Ambient now explicitly exports the same values and
+uses the existing Netns namespace, so the complete key can match. Merely
+changing the shared-key label without matching those inputs would still
+create two archives.
 
-Hosted validation must confirm the Two-Cluster reader restores the Netns key
-and passes its complete live suite. The broader quota issue still requires
-Unit/Lint/Artifacts retention across subsequent main runs; this change alone
-is not evidence that every required cache survives.
+The completed Ambient/Netns archives were 2,637,841,434 / 2,637,871,806 bytes.
+Sharing removes another roughly 2.64 GB duplicate producer. Ambient's separate
+GHCR image cache is unaffected. The trusted-main-only save rule and all job
+triggers, budgets, build commands, dependency edges and test assertions are
+unchanged. The frozen Ambient contract and regression mutations require the
+matching namespace and explicit network settings. Unit, lint, feature-specific
+and archive-builder profiles keep separate keys. Reassess this sharing if any
+job changes its build profile, features, toolchain, environment or target layout.
+
+Hosted validation must confirm Ambient restores the full Netns key and passes
+its complete live suite. Only after integration and a successful shared-cache
+read should an unused legacy Ambient archive be retired. The broader quota
+issue still requires Unit/Lint/Artifacts retention across subsequent main runs;
+this change alone is not evidence that every required cache survives.
 
 ### Completed-job Rust cache saves (#4643)
 
@@ -3242,3 +3396,293 @@ reviewed policy adoption. No generation admission or ruleset change is retained.
 Known incomplete archives need separate evidence-based retirement so a subsequent
 successful main producer can populate their keys. Do not purge unrelated caches.
 Capacity stays at 10 GB and spending budgets stay at $0.
+
+
+### CI latency report (#4672)
+
+`.github/scripts/ci_latency_report.py` is the read-only latency report issue
+[#4672](https://github.com/ferrum-edge/ferrum-edge/issues/4672) asks for before
+any cancellation, batching, or cadence policy is changed. It reads the Actions
+API and separates:
+
+- **queued time** — job creation to job start, per job and in aggregate;
+- **execution** — job start to job completion, with a slowest-job table;
+- **serial dependency** — run creation to the last job completion, plus a
+  dispatch-wave count. A wave is a group of jobs created within 30s of each
+  other; the wave count approximates dependency depth because the Actions API
+  does not expose `needs:` edges. It is labelled as an approximation in the
+  rendered report, not presented as a graph read;
+- **attempt number** — the run-attempt histogram and the number of distinct
+  heads validated more than once;
+- **cancellations** — run conclusions per event, and the job-execution minutes
+  that landed inside runs that were eventually cancelled. That second figure
+  includes jobs that completed *before* the cancellation, so it is not a claim
+  that every minute was wasted, and a `cancelled` conclusion is not by itself
+  evidence of pending coalescing rather than a lost hosted runner;
+- **whole-required-set completion** — per exact `(head_sha, event)` pair, how
+  many heads had every required context succeed and how long that took. The
+  required-context inventory is read from
+  `.github/required-publication-checks.json`, so the report cannot drift from
+  the publication gate's own list. `push` heads exclude the
+  pull-request-head-only context (`Trusted Cross Build Policy`), which
+  structurally cannot run for a push; counting its absence as latency would be
+  wrong. Incomplete heads stay in the denominator, and the percentiles cover
+  only complete sets, so they carry survivorship bias.
+
+Collect across **all** workflows (the default), not just `ci.yml`: a
+collection narrowed to one workflow can never complete a required set, and the
+rendered report says how many of the required workflows the collection
+actually contained so a narrow window cannot be misread as a finding.
+
+Run it from the `CI Latency Report` workflow (`workflow_dispatch`, or the
+Monday 07:00 UTC schedule). The workflow uploads `ci-latency-report`
+containing the rendered Markdown, the JSON summary, and the raw run/job
+records it was computed from, so a later reader can re-derive the numbers
+without re-querying the API:
+
+```bash
+python3 -I .github/scripts/ci_latency_report.py --self-test
+python3 -I .github/scripts/ci_latency_report.py --check-inventory
+python3 -I .github/scripts/ci_latency_report.py \
+  --repository ferrum-edge/ferrum-edge --workflow all --runs 400 \
+  --output-dir ci-latency-report
+python3 -I .github/scripts/ci_latency_report.py \
+  --input-dir ci-latency-report/raw --output-dir rerender
+```
+
+The lane holds `contents: read` and `actions: read`, never dispatches,
+re-runs, or cancels anything, and is not a branch-protection-required check.
+Pull requests run only the offline self-test and the inventory parse; the API
+collection is paid on an explicit dispatch or the weekly schedule. The Actions
+listing API caps a query at 1,000 results, so the tool caps `--runs` at 1,000
+and a wider window has to be collected in slices, exactly as the week-long
+baseline audit on #4672 was.
+
+#### What this does *not* settle
+
+The acceptance criterion on #4672 is a representative week compared against
+the week-long baseline recorded on that issue (2026-08-30 → 2026-09-05:
+p50/p95 exact-SHA required-set readiness of 94.1/220.9 min for PR heads and
+64.7/115.3 min for merge groups, 91.7% main-push cancellation, and 1,635.2
+CI-only runner-minutes per merged PR). This tool makes that comparison
+repeatable; it does not perform it. Collect a complete post-change week with
+the same definitions before treating the issue as satisfied.
+
+#### Merge-queue batching and coordinated cadence (evaluation, not a decision)
+
+Latest-wins cancellation on superseded pull-request heads stays exactly as it
+is. It is the cheapest correct policy for a head that no longer exists, and
+#4672 explicitly asks to keep it.
+
+The open question is `main`. The main workflow intentionally cancels
+superseded main runs, and publication requires a complete exact-SHA set, so a
+push burst can prevent any main validation run from finishing and discards
+unsaved warm caches. Three options, with what each would actually cost:
+
+1. **Enable a merge-queue rule.** The active ruleset (`Main merge queue and
+   root review gate`) is named for a queue but currently contains only
+   deletion protection, non-fast-forward protection, and the required status
+   checks — there is **no `merge_queue` rule**. Historical merge-group runs are
+   evidence that a queue was once configured, not that one is required today.
+   Enabling one batches landings, so `main` receives fewer, larger pushes and
+   each validation run has a better chance of completing. The measured cost is
+   real: the baseline week spent 85,207 CI runner-minutes on merge-group runs,
+   22,721 of them in runs that were eventually cancelled, because every
+   synthesized SHA is validated in addition to the pull-request head. Any
+   change here is a separately reviewed repository-settings proposal, not a
+   workflow edit.
+2. **Coordinated update cadence with no settings change.** Land already
+   reviewed, green, independent pull requests in deliberate batches and follow
+   the resulting combined main validation while it is progressing, rather than
+   merging continuously. This is the current operational practice. It needs no
+   ruleset change and no extra synthesized-SHA validation, but it depends on
+   an operator, and the waiting time of a ready-to-land change is a cost that
+   must be measured separately rather than assumed to be zero.
+3. **Relax main-push cancellation.** Rejected as written: letting every
+   superseded main run finish converts the 91.7% cancellation rate into
+   runner-minutes rather than removing it, and a stale run must never be
+   allowed to overwrite newer artifacts.
+
+The decision belongs to maintainers. What this repository can supply first is
+the post-change week from the report above, measured with the same joins as
+the baseline. Nothing here changes concurrency, required gates, test
+eligibility, artifact producer/head matching, merge-base policy, or any
+repository setting.
+
+
+### Sanitizer smoke on the main critical path (#4694)
+
+**Status: not changeable by a pull request.** The `fuzz-smoke` job in `ci.yml`
+is byte-frozen by the trusted policy (`CI_FUZZ_SMOKE_JOB_GENERATIONS` in
+`.github/scripts/verify_cross_build_policy.py`), and so is its wiring into the
+required `test` aggregate (`CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS`). Every
+command, toolchain pin, target name, and libFuzzer bound in that job is part of
+the contract. Adding a `--profile` argument to `cargo fuzz run`, adding a step,
+or moving the job out of the `test` aggregate all change bytes no pull request
+may change, and `verify_cross_build_policy.py` is itself unmodifiable by a pull
+request. Both options in
+[#4694](https://github.com/ferrum-edge/ferrum-edge/issues/4694) are therefore
+direct-to-`main` changes, applied as a new admitted generation pair.
+
+Half of the "off the critical path" option is already done. Issues #3902 and
+#4238 narrowed the sanitizer step to `push: main` and `workflow_dispatch`
+only, so pull requests and merge groups pay the deterministic property smoke
+alone. What remains on the critical path is `main`'s own `Tests` aggregate.
+
+#### Expected saving from the recorded timing evidence
+
+The measurements collected on #4694 and in
+[ci_throughput_2026-09-08.md](ci_throughput_2026-09-08.md) do not support the
+bounded-profile experiment, and they do support the cache path instead:
+
+| Variant | Cold first-target sanitizer compile | Whole sanitizer step | Executed iterations |
+|---|---:|---:|---|
+| Shipping optimized (cold, run 34018271780) | 37m22s | 41m35s | 512 per target |
+| Shipping optimized (cold control, run 34028933678) | — | 36m05s | 512 per target |
+| `dev` opt-level 0 (run 34026677585) | — | 19m46s | **45** on `config_decode`, 512 on the other six |
+| `dev` opt-level 1 (run 34028543883) | — | 40m21s | 512 per target |
+| Exact fuzz-cache hit (run 34087106670) | **1m09s** | **5m19s** | 512 per target |
+| Exact fuzz-cache hit (run 34165057380) | — | 29m40s | 512 per target |
+
+Read honestly: the only reduced-optimization variant that saved meaningful
+compile time was opt-level 0, at roughly **22 minutes (≈52%) off the cold
+sanitizer step** — and it is inadmissible, because it lost 467 of the 512
+required `config_decode` iterations inside the unchanged time bound, which is
+exactly the coverage #4694 forbids trading away. Opt-level 1 kept the
+iterations and showed **no repeatable benefit**: its apparent 3% gain against
+an earlier cold run did not survive comparison with a concurrent control on
+which it was slower. Different hosted runners and commits make these
+descriptive observations, not causal estimates.
+
+An exact fuzz-cache hit, by contrast, removed roughly **38 minutes** from the
+first-target compile (1m09s versus 38m56s on the immediately preceding cold
+producer) with no profile, target-inventory, or bound change at all. The
+29m40s reading on run 34165057380 is a warm restore of a lane that no longer
+archives the compiler store, with 0 compiler hits and 16 misses — which is why
+the next experiment worth running is a same-input compiler-store comparison
+under [#4643](https://github.com/ferrum-edge/ferrum-edge/issues/4643), not
+another optimization-profile guess.
+
+#### If the bounded profile is attempted anyway
+
+It is a direct-to-`main` change with these parts, applied atomically:
+
+1. a `[profile.fuzz-smoke]` section in `fuzz/Cargo.toml` inheriting `release`,
+   with reduced `opt-level` and `debug`, AddressSanitizer untouched;
+2. `--profile fuzz-smoke` added to the six-target loop **and** to the
+   `datagram_client_address` invocation in `ci.yml`'s `fuzz-smoke` job, leaving
+   `-runs`, `-max_total_time`, `-max_len`, `-timeout` and `-rss_limit_mb`
+   byte-identical, and leaving `fuzz.yml`'s scheduled discovery lane optimized;
+3. a new `CI_FUZZ_SMOKE_JOB_GENERATIONS` entry in
+   `verify_cross_build_policy.py` whose adopted text is the edited job, with
+   `CI_FUZZ_SMOKE_BOUNDED_BUDGET` and `CI_FUZZ_SMOKE_DATAGRAM_BUDGET` still
+   appearing verbatim exactly once so the budget cannot move with the profile;
+4. a `main` run that reports the **actual** per-target iteration counts, not
+   just a pass, because opt-level 0 already passed while silently losing 91%
+   of one target's executions.
+
+Nothing here has been adopted. AddressSanitizer, the seven-target inventory,
+every input-size limit, and every execution bound remain as they are.
+
+
+### Release build tail: timings, budgets, and the profile experiment (#4674)
+
+**Status: budgets and timings capture landed directly on `main` (2026-09-09);
+the shipping-profile experiment remains not adopted.** The `build-release-binaries`
+job now carries `timeout-minutes: 180` with 165 on each build step and uploads
+`target/cargo-timings/` as `release-build-timings-<target>` (14-day retention),
+and `build-release-arm64-cross` carries `timeout-minutes: 120`; the frozen
+ARM64 job digest in `verify_cross_build_policy.py` was moved in the same
+commit. Everything below records why those numbers were chosen and why the
+change could not travel through a pull request: `release.yml`'s
+`build-release-arm64-cross` is digest-frozen in `WORKFLOW_CONTRACTS`, and
+`build-release-binaries` is read as Cross-sensitive and held to `main`'s own
+text by the whole-job surface comparison (its former #4301/#4355 generation
+pairs are retired precisely because issue #4423 moved it again directly on
+`main`). Adding `--timings`, a timings-artifact upload, or a `timeout-minutes`
+to either producer is therefore a direct-to-`main` change. See
+[Admitted CI job SHA-256 generation transitions](#admitted-ci-job-sha-256-generation-transitions-temporary)
+and [Published x86_64 GNU producer contract (standing)](#published-x86_64-gnu-producer-contract-standing).
+
+#### Observed tail, and the budget it justifies
+
+| Producer / target | Observation | Source |
+|---|---:|---|
+| `build-release-binaries` — macOS aarch64 (job) | 2h16m18s | main CI run 34008463614 |
+| `build-release-binaries` — macOS x86_64 (job) | 2h00m21s | main CI run 34008463614 |
+| `build-release-binaries` — Windows x86_64 (compile step) | 84m36s | main CI run 34008463614 |
+| `build-release-binaries` — Linux x86_64 (compile step) | 38m21s | main CI run 34008463614 |
+| `build-release-arm64-cross` — ARM64 (compile step) | 45m39s | main CI run 34008463614 |
+| Cold shipping-profile study, macOS aarch64 / x86_64 / Windows | 55m35s / 54m20s / 54m10s | run 34071933579 |
+| Same-source host comparison, `macos-15` vs `macos-15-intel` | 4,184.63s / 4,668.32s | run 34084116391 |
+
+Every one of those jobs currently runs with no `timeout-minutes`, i.e. the
+360-minute Actions default. That default is an accident, not a budget: a hung
+release build burns six hours of a serialized publication path before anyone
+sees a failure.
+
+Derived budgets, using the worst observed job duration plus headroom for a
+cold cache and a slow runner:
+
+- `build-release-binaries`: **`timeout-minutes: 180` at the job level with
+  `timeout-minutes: 165` on the build step** — 1.32× the 136.3-minute worst
+  observed job. This is not a new number: the non-publishing
+  `release-platform-study.yml` already runs the same three cold shipping-profile
+  compiles under exactly that 180/165 pair, so the publishing producer would
+  simply stop being the only place without one.
+- `build-release-arm64-cross`: **`timeout-minutes: 120`** — 2.6× its 45m39s
+  observed compile step, leaving room for image pull and sysroot preparation.
+
+Both are far below 360 and above anything ever observed to succeed. Raise a
+number when a *successful* run exceeds it; do not raise one to absorb a hang.
+
+#### Timings capture that preserves logs on timeout
+
+A job cancelled by a job-level `timeout-minutes` skips its remaining steps, so
+the capture has to be arranged to survive it:
+
+1. append `--timings` to the native `Build release binary` step (the macOS and
+   Windows cells; the x86_64 GNU cell builds through the pinned sysroot script
+   and would need the same flag threaded there);
+2. give **that step** its own `timeout-minutes` (165) below the job budget
+   (180), so the job is still alive when the build step is killed —
+   `release-platform-study.yml` already demonstrates this exact pairing;
+3. upload `target/cargo-timings/` with `if: always()`, under a name distinct
+   from the canonical `release-binaries-<target>` artifact — a second uploader
+   of the canonical name is refused outright by
+   `linux_gnu_producer_contract_errors`, and the timings artifact must never
+   be able to collide with the bytes the ABI gate scanned.
+
+Cargo writes one HTML report plus a JSON sidecar per invocation, single-digit
+megabytes. Bound it with `retention-days: 14` and `if-no-files-found: warn`,
+since a cell that failed before codegen legitimately has no report.
+
+#### Shipping-profile experiment plan (not adopted)
+
+The shipping profile — `opt-level = 3`, fat LTO, one codegen unit — is
+**unchanged** and must stay unchanged until a runtime-regression budget is
+agreed in advance. The measurements that exist already argue against a naive
+swap:
+
+- Same-host paired study (run 34064983492, one AMD EPYC 7763, four vCPUs,
+  fresh separate targets, compiler caching disabled): fat/thin compile
+  1,804.24s / 1,085.28s — thin was 39.8% faster — but the executable grew
+  21.8% (93,403,200 → 113,730,080 bytes) and gateway throughput fell across
+  every protocol (HTTP/1.1 −5.45%, HTTP/1.1+TLS −6.07%, HTTP/2 −4.97%,
+  HTTP/3 −3.65%), with HTTP/2 p99 up a median 15.04% and one TCP+TLS p99 pair
+  up 42.92%. Compilation order was fixed fat-then-thin, so OS/source cache
+  effects remain a confounder, and these are short-run descriptive numbers,
+  not confidence bounds.
+- A native Intel macOS host was 11.56% *slower* than its ARM counterpart on
+  the same source, so "bigger runner" is not an established win either.
+
+The remaining work is therefore ordered as: (1) land the timings capture and
+the finite budgets above, direct to `main`; (2) agree an explicit tolerated
+throughput/p99 regression budget *before* any profile comparison is scored;
+(3) re-run the non-publishing studies in `release-platform-study.yml` /
+`release-profile-study.yml` against that budget, including protected ARM64
+Cross phase measurements and oldest-baseline ABI/install/image results on
+every platform whose compiler or linker settings change. No CI verification
+profile is ever published as a release, and exact-SHA publication gates,
+protected Cross isolation, FIPS boundaries and reproducible toolchain inputs
+are untouched by any of this.

@@ -18,6 +18,8 @@
 //!   arbitrary extra headers.
 //! - **Authentication**: `Authorization` header for Bearer/Basic auth.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use crate::fips::backend::rand::{SecureRandom, SystemRandom};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -40,6 +42,7 @@ use super::utils::byte_budget::{
     record_batch_materialization_loss,
 };
 use super::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema, resolve_schema};
+use super::utils::sink_loss::{self, SinkLossReason};
 use super::utils::{
     BatchConfig, BatchConfigDefaults, DeferredBatchingLogger, HttpBatchDrainOutcome,
     MAX_BATCH_RETRIES, MAX_BATCH_RETRY_DELAY_MS, PluginHttpClient, RetryPolicy, build_batch_config,
@@ -204,7 +207,10 @@ impl LokiByteBudget {
         // Process ceiling first: a failed aggregate reservation must never
         // leave per-instance bytes held.
         let Some(process) = self.ceiling.try_acquire(bytes) else {
-            self.record_drop("process-wide retained-byte ceiling exhausted");
+            self.record_drop(
+                SinkLossReason::ByteBudget,
+                "process-wide retained-byte ceiling exhausted",
+            );
             return None;
         };
         let reserved = self
@@ -215,7 +221,10 @@ impl LokiByteBudget {
             });
         if reserved.is_err() {
             drop(process);
-            self.record_drop("retained-content byte budget exhausted");
+            self.record_drop(
+                SinkLossReason::ByteBudget,
+                "retained-content byte budget exhausted",
+            );
             return None;
         }
 
@@ -226,7 +235,10 @@ impl LokiByteBudget {
         }))
     }
 
-    fn record_drop(&self, reason: &str) {
+    /// Count one lost record on the instance tally and on the process-wide
+    /// `ferrum_plugin_log_sink_records_dropped_total` family.
+    fn record_drop(&self, loss_reason: SinkLossReason, reason: &str) {
+        sink_loss::record_dropped(LOKI_PLUGIN_NAME, loss_reason, 1);
         let dropped = self.dropped_count.fetch_add(1, Ordering::Relaxed) + 1;
         if dropped == 1 || dropped.is_multiple_of(LOKI_DROP_WARN_EVERY) {
             warn!(
@@ -469,7 +481,7 @@ impl LokiLogging {
         Ok(Self {
             batch_config,
             flush_config,
-            logger: DeferredBatchingLogger::new(),
+            logger: DeferredBatchingLogger::for_plugin("loki_logging"),
             endpoint_hostname,
             label_config,
             schema,
@@ -730,25 +742,36 @@ where
     let mut writer = BoundedJsonWriter::new(max_entry_bytes);
     if let Err(error) = serde_json::to_writer(&mut writer, value) {
         if writer.limit_exceeded {
-            byte_budget.record_drop("serialized entry exceeded max_entry_bytes");
+            byte_budget.record_drop(
+                SinkLossReason::RecordTooLarge,
+                "serialized entry exceeded max_entry_bytes",
+            );
         } else {
+            byte_budget.record_drop(SinkLossReason::SinkError, "entry serialization failed");
             warn!("Loki logging: failed to serialize {kind}: {error}");
         }
         return None;
     }
     let labels = build_labels();
     let Some(retained_bytes) = retained_entry_bytes(writer.bytes.len(), &labels) else {
-        byte_budget.record_drop("entry and labels exceeded byte accounting range");
+        byte_budget.record_drop(
+            SinkLossReason::RecordTooLarge,
+            "entry and labels exceeded byte accounting range",
+        );
         return None;
     };
     if retained_bytes > max_entry_bytes {
-        byte_budget.record_drop("entry and labels exceeded max_entry_bytes");
+        byte_budget.record_drop(
+            SinkLossReason::RecordTooLarge,
+            "entry and labels exceeded max_entry_bytes",
+        );
         return None;
     }
     lease.shrink_to(retained_bytes);
     match String::from_utf8(writer.bytes) {
         Ok(line) => Some((Arc::<str>::from(line), labels, lease)),
         Err(error) => {
+            byte_budget.record_drop(SinkLossReason::SinkError, "serialized entry was not UTF-8");
             warn!("Loki logging: serialized {kind} was not UTF-8: {error}");
             None
         }
@@ -1376,7 +1399,8 @@ async fn send_batch(cfg: &LokiFlushConfig, batch: &[LokiEntry]) -> Result<(), St
         match send_batch_once(cfg, payload.bytes(), content_encoding).await {
             LokiAttemptOutcome::Delivered => return Ok(()),
             LokiAttemptOutcome::Terminal(error) => {
-                warn!(
+                record_loki_batch_discard(entry_count);
+                warn_sampled!(
                     plugin = "loki_logging",
                     "Loki logging: batch discarded after terminal delivery failure ({} entries lost): {}",
                     entry_count,
@@ -1385,7 +1409,7 @@ async fn send_batch(cfg: &LokiFlushConfig, batch: &[LokiEntry]) -> Result<(), St
                 return Ok(());
             }
             LokiAttemptOutcome::Retryable(error) if attempt < attempts => {
-                warn!(
+                warn_sampled!(
                     plugin = "loki_logging",
                     "Loki logging: batch flush failed (attempt {}/{}): {}",
                     attempt,
@@ -1395,7 +1419,8 @@ async fn send_batch(cfg: &LokiFlushConfig, batch: &[LokiEntry]) -> Result<(), St
                 tokio::time::sleep(cfg.retry.backoff_delay(attempt)).await;
             }
             LokiAttemptOutcome::Retryable(error) => {
-                warn!(
+                record_loki_batch_discard(entry_count);
+                warn_sampled!(
                     plugin = "loki_logging",
                     "Loki logging: batch discarded after {} attempts ({} entries lost): {}",
                     attempts,
@@ -1462,6 +1487,18 @@ enum LokiAttemptOutcome {
     Delivered,
     Retryable(String),
     Terminal(String),
+}
+
+/// Loki owns status classification and retries inside [`send_batch`] and
+/// returns `Ok(())` on both terminal and exhausted-retry loss so the shared
+/// batching logger does not start a second retry loop. Count every lost
+/// record here; `Ok(())` is otherwise treated as a successful flush.
+fn record_loki_batch_discard(entry_count: usize) {
+    sink_loss::record_dropped(
+        LOKI_PLUGIN_NAME,
+        SinkLossReason::BatchDiscard,
+        entry_count as u64,
+    );
 }
 
 fn loki_drain_diagnostic(drain: HttpBatchDrainOutcome) -> String {

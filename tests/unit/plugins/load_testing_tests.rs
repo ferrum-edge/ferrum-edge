@@ -14,6 +14,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::oneshot;
 
+use super::plugin_utils::capture_logs;
+
 const VALID_KEY: &str = "test-load-key-0123456789abcdef!!"; // exactly 32 chars
 
 type StalledRequestObserver = (u16, oneshot::Receiver<()>, oneshot::Receiver<()>);
@@ -1848,4 +1850,646 @@ async fn test_synthetic_and_fanout_h2_h3_parity_strips_protocol_invalid_fields()
         );
     }
     wait_until_idle(&plugin).await;
+}
+
+// ---------------------------------------------------------------------------
+// Replay fidelity: the snapshot is the pristine ingress view (issue #5157)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_replay_snapshots_ingress_headers_not_the_transformed_map() {
+    let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_port = local_listener.local_addr().unwrap().port();
+    let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_port = remote_listener.local_addr().unwrap().port();
+    let local_capture = tokio::spawn(capture_one_http_request(local_listener));
+    let remote_capture = tokio::spawn(capture_one_http_request(remote_listener));
+
+    let plugin = LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 2,
+            "gateway_port": local_port,
+            "gateway_addresses": [format!("http://127.0.0.1:{remote_port}")],
+            "request_timeout_ms": 1000
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/headertransform".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    ctx.request_body_bytes = Some(Bytes::new());
+    // Ingress view: what the client actually sent.
+    ctx.headers = HashMap::from([
+        ("x-loadtesting-key".to_string(), VALID_KEY.to_string()),
+        ("x-stage-one".to_string(), "sample".to_string()),
+        ("host".to_string(), "gateway.example".to_string()),
+    ]);
+    // Effective view after an earlier non-idempotent rename chain
+    // (`X-Stage-Two` -> `X-Stage-Three`, then `X-Stage-One` -> `X-Stage-Two`).
+    // Replaying THIS map would apply the chain a second time on re-entry.
+    let mut headers = HashMap::from([
+        ("x-loadtesting-key".to_string(), VALID_KEY.to_string()),
+        ("x-stage-two".to_string(), "sample".to_string()),
+        ("host".to_string(), "gateway.example".to_string()),
+    ]);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    for (label, capture) in [("synthetic", local_capture), ("fan-out", remote_capture)] {
+        let raw = tokio::time::timeout(Duration::from_secs(3), capture)
+            .await
+            .unwrap_or_else(|_| panic!("{label} request timeout"))
+            .unwrap_or_else(|_| panic!("{label} capture task"));
+        let (_, replayed, _) = parse_captured_request(&raw);
+        assert_eq!(
+            replayed.get("x-stage-one").map(String::as_str),
+            Some("sample"),
+            "{label} replay must carry the original client header: {replayed:?}"
+        );
+        assert!(
+            !replayed.contains_key("x-stage-two"),
+            "{label} replay carried an already-transformed header, so the rule chain \
+             applies twice: {replayed:?}"
+        );
+        assert_eq!(
+            replayed.get("host").map(String::as_str),
+            Some("gateway.example"),
+            "{label} replay must still preserve Host for routing: {replayed:?}"
+        );
+    }
+    wait_until_idle(&plugin).await;
+}
+
+// ---------------------------------------------------------------------------
+// Fan-out reports peers that never admitted a cohort (issue #5158)
+// ---------------------------------------------------------------------------
+
+/// Accept one request on `listener` and answer with a fixed status line plus
+/// optional extra header lines. Returns the captured request bytes.
+async fn answer_one_request_with_status(
+    listener: tokio::net::TcpListener,
+    status_line: &'static str,
+    extra_headers: &'static str,
+) -> Vec<u8> {
+    let (mut socket, _) = listener.accept().await.expect("accept");
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 8192];
+    loop {
+        let n = socket.read(&mut tmp).await.expect("read");
+        assert!(n > 0, "connection closed before complete request");
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        assert!(buf.len() < 64 * 1024, "request grew too large");
+    }
+    let response =
+        format!("{status_line}\r\n{extra_headers}Content-Length: 0\r\nConnection: close\r\n\r\n");
+    let _ = socket.write_all(response.as_bytes()).await;
+    buf
+}
+
+async fn fanout_peer_response_logs(
+    status_line: &'static str,
+    extra_headers: &'static str,
+) -> String {
+    let (logs, _guard) = capture_logs();
+    let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_port = local_listener.local_addr().unwrap().port();
+    let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_port = remote_listener.local_addr().unwrap().port();
+    let local_capture = tokio::spawn(capture_one_http_request(local_listener));
+    let remote_capture = tokio::spawn(answer_one_request_with_status(
+        remote_listener,
+        status_line,
+        extra_headers,
+    ));
+
+    let plugin = LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": local_port,
+            "gateway_addresses": [format!("http://127.0.0.1:{remote_port}")],
+            "request_timeout_ms": 500
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/peerstatus".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    ctx.request_body_bytes = Some(Bytes::new());
+    let mut headers = HashMap::from([("x-loadtesting-key".to_string(), VALID_KEY.to_string())]);
+    let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let _ = tokio::time::timeout(Duration::from_secs(3), remote_capture)
+        .await
+        .expect("fan-out request timeout")
+        .expect("fan-out capture task");
+    let _ = tokio::time::timeout(Duration::from_secs(3), local_capture).await;
+    wait_until_idle(&plugin).await;
+    // Give the detached fan-out task a turn to finish reporting.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    logs.contents()
+}
+
+#[tokio::test]
+async fn test_fanout_reports_peer_http_rejection_and_redirect_without_leaking_the_key() {
+    for (status_line, extra_headers, expected_status) in [
+        ("HTTP/1.1 503 Service Unavailable", "", "503"),
+        ("HTTP/1.1 401 Unauthorized", "", "401"),
+        ("HTTP/1.1 429 Too Many Requests", "", "429"),
+        (
+            "HTTP/1.1 302 Found",
+            "Location: /redirect-destination\r\n",
+            "302",
+        ),
+    ] {
+        let logs = fanout_peer_response_logs(status_line, extra_headers).await;
+        assert!(
+            logs.contains("remote node did not acknowledge the fan-out trigger"),
+            "peer answering {status_line} must be reported: {logs}"
+        );
+        assert!(
+            logs.contains(expected_status),
+            "peer diagnostic must name the observed status {expected_status}: {logs}"
+        );
+        assert!(
+            !logs.contains(VALID_KEY),
+            "peer diagnostic must never echo the trigger key: {logs}"
+        );
+        assert!(
+            !logs.contains("/redirect-destination"),
+            "peer diagnostic must never echo a peer-chosen location: {logs}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_fanout_accepts_the_documented_204_acknowledgment_without_a_warning() {
+    let logs = fanout_peer_response_logs("HTTP/1.1 204 No Content", "").await;
+    assert!(
+        !logs.contains("remote node did not acknowledge the fan-out trigger"),
+        "the documented 204 acknowledgment must not be reported as a failure: {logs}"
+    );
+    assert!(
+        !logs.contains("failed to fan out trigger to remote node"),
+        "an acknowledged fan-out must not report a transport failure: {logs}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// HTTPS replays keep the copied Host as the request authority (issue #5155)
+// ---------------------------------------------------------------------------
+
+/// A TLS listener that advertises `h2` ahead of `http/1.1` in ALPN, exactly
+/// like a Ferrum HTTPS frontend with HTTP/2 enabled. A replay client that does
+/// not pin HTTP/1.1 negotiates `h2` here and then sends `:authority` from the
+/// dial URL while the copied `Host` still names the triggering virtual host —
+/// the pair Ferrum's ingress consistency check correctly rejects with 400.
+async fn spawn_h2_preferring_tls_capture(
+    status_line: &'static str,
+) -> (u16, tokio::task::JoinHandle<(Option<Vec<u8>>, Vec<u8>)>) {
+    use rcgen::{CertificateParams, KeyPair};
+    use tokio_rustls::TlsAcceptor;
+
+    let _ = ferrum_edge::fips::base_crypto_provider().install_default();
+    let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate replay key");
+    let params = CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("replay cert params");
+    let cert = params.self_signed(&key).expect("self-sign replay cert");
+    let certs = rustls_pemfile::certs(&mut cert.pem().as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("parse replay certificate");
+    let signing_key = rustls_pemfile::private_key(&mut key.serialize_pem().as_bytes())
+        .expect("parse replay key")
+        .expect("replay key present");
+    let mut server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        ferrum_edge::fips::base_crypto_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("replay TLS protocol versions")
+    .with_no_client_auth()
+    .with_single_cert(certs, signing_key)
+    .expect("replay TLS server config");
+    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind replay TLS listener");
+    let port = listener
+        .local_addr()
+        .expect("replay listener address")
+        .port();
+    let handle = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept replay connection");
+        let mut tls = TlsAcceptor::from(Arc::new(server_config))
+            .accept(stream)
+            .await
+            .expect("replay TLS handshake");
+        let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 8192];
+        while !buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.len() < 64 * 1024 {
+            match tls.read(&mut tmp).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            }
+        }
+        let response = format!("{status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let _ = tls.write_all(response.as_bytes()).await;
+        let _ = tls.shutdown().await;
+        (alpn, buf)
+    });
+    (port, handle)
+}
+
+#[tokio::test]
+async fn test_https_loopback_replay_pins_http_1_1_and_keeps_the_copied_host() {
+    let (port, capture) = spawn_h2_preferring_tls_capture("HTTP/1.1 200 OK").await;
+    let plugin = LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 2,
+            "gateway_port": port,
+            "gateway_tls": true,
+            "request_timeout_ms": 1000
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/tlsloop".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    ctx.request_body_bytes = Some(Bytes::new());
+    let mut headers = HashMap::from([
+        ("x-loadtesting-key".to_string(), VALID_KEY.to_string()),
+        ("host".to_string(), "api.example.com".to_string()),
+    ]);
+    let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let (alpn, raw) = tokio::time::timeout(Duration::from_secs(10), capture)
+        .await
+        .expect("HTTPS replay timeout")
+        .expect("HTTPS capture task");
+    assert_eq!(
+        alpn.as_deref(),
+        Some(b"http/1.1".as_slice()),
+        "the loopback replay client must not negotiate h2: a copied Host and the dial \
+         authority would then disagree and every replay would be rejected with 400"
+    );
+    let (request_line, replay_headers, _) = parse_captured_request(&raw);
+    assert_eq!(request_line, "POST /tlsloop HTTP/1.1");
+    assert_eq!(
+        replay_headers.get("host").map(String::as_str),
+        Some("api.example.com"),
+        "the replay must still select the triggering virtual host: {replay_headers:?}"
+    );
+    wait_until_idle(&plugin).await;
+}
+
+#[tokio::test]
+async fn test_https_peer_fanout_pins_http_1_1_and_keeps_the_copied_host() {
+    use ferrum_edge::config::types::DEFAULT_NAMESPACE;
+    use ferrum_edge::config::{BackendEgressPolicy, PoolConfig};
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+
+    let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_port = local_listener.local_addr().unwrap().port();
+    let local_capture = tokio::spawn(capture_one_http_request(local_listener));
+    let (peer_port, peer_capture) =
+        spawn_h2_preferring_tls_capture("HTTP/1.1 204 No Content").await;
+
+    // The peer presents a self-signed certificate, so the shared plugin client
+    // used for fan-out is built with verification disabled for this fixture
+    // only. Protocol selection is what the test asserts.
+    let http_client = PluginHttpClient::new(
+        &PoolConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        1000,
+        0,
+        100,
+        true,
+        None,
+        Arc::new(Vec::new()),
+        DEFAULT_NAMESPACE,
+        BackendEgressPolicy::unrestricted(),
+        Arc::new(Vec::new()),
+        0,
+    );
+    let plugin = LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": local_port,
+            "gateway_addresses": [format!("https://127.0.0.1:{peer_port}")],
+            "request_timeout_ms": 1000
+        }),
+        http_client,
+    )
+    .unwrap();
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/tlsfanout".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    ctx.request_body_bytes = Some(Bytes::new());
+    let mut headers = HashMap::from([
+        ("x-loadtesting-key".to_string(), VALID_KEY.to_string()),
+        ("host".to_string(), "api.example.com".to_string()),
+    ]);
+    let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let (alpn, raw) = tokio::time::timeout(Duration::from_secs(10), peer_capture)
+        .await
+        .expect("HTTPS fan-out timeout")
+        .expect("HTTPS fan-out capture task");
+    assert_eq!(
+        alpn.as_deref(),
+        Some(b"http/1.1".as_slice()),
+        "the fan-out client must not negotiate h2 with an HTTPS peer"
+    );
+    let (request_line, fanout_headers, _) = parse_captured_request(&raw);
+    assert_eq!(request_line, "POST /tlsfanout HTTP/1.1");
+    assert_eq!(
+        fanout_headers.get("host").map(String::as_str),
+        Some("api.example.com"),
+        "the fan-out must still select the triggering virtual host: {fanout_headers:?}"
+    );
+    assert_eq!(
+        fanout_headers
+            .get("x-loadtesting-fanout")
+            .map(String::as_str),
+        Some("1")
+    );
+
+    let _ = tokio::time::timeout(Duration::from_secs(3), local_capture).await;
+    wait_until_idle(&plugin).await;
+}
+
+#[test]
+fn test_shared_plugin_client_exposes_an_http_1_1_companion() {
+    assert!(
+        PluginHttpClient::default().get_http1().is_ok(),
+        "fan-out has no HTTP/1.1 transport without the shared companion"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// OpenAPI / constructor admission parity (issues #5159 and #5160)
+// ---------------------------------------------------------------------------
+
+/// Merge `extra` over a minimal valid `load_testing` config.
+fn schema_case_config(extra: &serde_json::Value) -> serde_json::Value {
+    let mut config = json!({
+        "key": VALID_KEY,
+        "concurrent_clients": 1,
+        "duration_seconds": 1,
+        "gateway_port": 18099
+    });
+    for (name, value) in extra.as_object().expect("case overrides must be an object") {
+        config[name.as_str()] = value.clone();
+    }
+    config
+}
+
+#[test]
+fn test_openapi_load_testing_schema_matches_constructor_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/LoadTestingConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("LoadTestingConfig schema compiles");
+
+    let above_u64: serde_json::Value =
+        serde_json::from_str("18446744073709551616").expect("2^64 literal parses");
+    let rejected = [
+        // Intrinsic peer-URL grammar (issue #5159).
+        json!({ "gateway_addresses": ["nonsense"] }),
+        json!({ "gateway_addresses": ["ftp://127.0.0.1:42424"] }),
+        json!({ "gateway_addresses": ["http://user:pass@127.0.0.1:42424"] }),
+        json!({ "gateway_addresses": ["http://127.0.0.1:42424?x=y"] }),
+        json!({ "gateway_addresses": ["http://127.0.0.1:42424#frag"] }),
+        // The constructor parses this as a serde_json u64 (issue #5160).
+        json!({ "max_response_body_bytes": above_u64 }),
+    ];
+    for case in &rejected {
+        let config = schema_case_config(case);
+        assert!(
+            !validator.is_valid(&config),
+            "OpenAPI admits a value the constructor rejects: {case}"
+        );
+        assert!(
+            LoadTesting::new(&config, PluginHttpClient::default()).is_err(),
+            "the constructor must reject: {case}"
+        );
+    }
+
+    let accepted = [
+        json!({ "gateway_addresses": ["http://127.0.0.1:42424"] }),
+        json!({ "gateway_addresses": ["https://node1:8443"] }),
+        json!({ "gateway_addresses": ["https://node1:8443/"] }),
+        json!({ "gateway_addresses": ["http://[::1]:42424"] }),
+        json!({ "gateway_addresses": serde_json::Value::Null }),
+        json!({ "max_response_body_bytes": u64::MAX }),
+        json!({ "max_response_body_bytes": 1 }),
+        json!({ "max_response_body_bytes": serde_json::Value::Null }),
+    ];
+    for case in &accepted {
+        let config = schema_case_config(case);
+        assert!(
+            validator.is_valid(&config),
+            "OpenAPI rejects a value the constructor admits: {case}"
+        );
+        assert!(
+            LoadTesting::new(&config, PluginHttpClient::default()).is_ok(),
+            "the constructor must admit: {case}"
+        );
+    }
+
+    let load_testing = &spec["components"]["schemas"]["LoadTestingConfig"]["properties"];
+    assert_eq!(
+        load_testing["max_response_body_bytes"]["maximum"],
+        json!(u64::MAX),
+        "the documented response cap must carry the constructor's uint64 ceiling"
+    );
+    assert!(
+        load_testing["gateway_addresses"]["items"]["pattern"].is_string(),
+        "peer entries must model the admitted URL grammar, not just a non-empty string"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Listener-port defaults follow ferrum.conf / --settings (issue #5156)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_listener_port_resolution_follows_the_settings_file() {
+    const CHILD_CASE: &str = "FERRUM_TEST_LOAD_TESTING_SETTINGS_CASE";
+    const BASE: &str = "unit::plugins::load_testing_tests::\
+                        test_listener_port_resolution_follows_the_settings_file";
+
+    if let Ok(case) = std::env::var(CHILD_CASE) {
+        // Each child owns a fresh immutable ConfFile cache and process
+        // environment, so `FERRUM_CONF_PATH` is read exactly once here.
+        let config = |extra: serde_json::Value| schema_case_config_without_port(&extra);
+        match case.as_str() {
+            "settings_zero_http_is_rejected" => {
+                let err = LoadTesting::new(&config(json!({})), PluginHttpClient::default())
+                    .err()
+                    .expect("a settings-file disabled HTTP listener must fail closed");
+                assert!(err.contains("resolved gateway port is 0"), "got: {err}");
+                assert!(err.contains("HTTP (FERRUM_PROXY_HTTP_PORT)"), "got: {err}");
+            }
+            "settings_zero_https_is_rejected" => {
+                let err = LoadTesting::new(
+                    &config(json!({ "gateway_tls": true })),
+                    PluginHttpClient::default(),
+                )
+                .err()
+                .expect("a settings-file disabled HTTPS listener must fail closed");
+                assert!(err.contains("resolved gateway port is 0"), "got: {err}");
+                assert!(
+                    err.contains("HTTPS (FERRUM_PROXY_HTTPS_PORT)"),
+                    "got: {err}"
+                );
+            }
+            "environment_overrides_settings" => {
+                assert!(
+                    LoadTesting::new(&config(json!({})), PluginHttpClient::default()).is_ok(),
+                    "an enabled environment port must override a disabled settings-file port"
+                );
+            }
+            "explicit_port_overrides_settings_zero" => {
+                assert!(
+                    LoadTesting::new(
+                        &config(json!({ "gateway_port": 18080 })),
+                        PluginHttpClient::default()
+                    )
+                    .is_ok(),
+                    "an explicit gateway_port must override a disabled settings-file listener"
+                );
+            }
+            "settings_port_selects_the_local_target" => {
+                // The settings-file port is the effective loopback target, so a
+                // peer naming it is a self-fan-out alias and the hardcoded 8000
+                // default is an ordinary remote address.
+                let err = LoadTesting::new(
+                    &config(json!({ "gateway_addresses": ["http://127.0.0.1:18081"] })),
+                    PluginHttpClient::default(),
+                )
+                .err()
+                .expect("the settings-file port must be the local loopback target");
+                assert!(err.contains("local loopback"), "got: {err}");
+                assert!(
+                    LoadTesting::new(
+                        &config(json!({ "gateway_addresses": ["http://127.0.0.1:8000"] })),
+                        PluginHttpClient::default()
+                    )
+                    .is_ok(),
+                    "the hardcoded default must not be treated as the local target"
+                );
+            }
+            other => panic!("unknown settings case {other}"),
+        }
+        return;
+    }
+
+    for (case, settings, environment) in [
+        (
+            "settings_zero_http_is_rejected",
+            "FERRUM_PROXY_HTTP_PORT = 0\n",
+            None,
+        ),
+        (
+            "settings_zero_https_is_rejected",
+            "FERRUM_PROXY_HTTPS_PORT = 0\n",
+            None,
+        ),
+        (
+            "environment_overrides_settings",
+            "FERRUM_PROXY_HTTP_PORT = 0\n",
+            Some(("FERRUM_PROXY_HTTP_PORT", "18080")),
+        ),
+        (
+            "explicit_port_overrides_settings_zero",
+            "FERRUM_PROXY_HTTP_PORT = 0\n",
+            None,
+        ),
+        (
+            "settings_port_selects_the_local_target",
+            "FERRUM_PROXY_HTTP_PORT = 18081\n",
+            None,
+        ),
+    ] {
+        let directory = tempfile::tempdir().expect("settings temp dir");
+        let settings_path = directory.path().join("ferrum.conf");
+        std::fs::write(&settings_path, settings).expect("write settings file");
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg(BASE)
+            .env("FERRUM_CONF_PATH", &settings_path)
+            .env(CHILD_CASE, case)
+            .env_remove("FERRUM_PROXY_HTTP_PORT")
+            .env_remove("FERRUM_PROXY_HTTPS_PORT");
+        if let Some((name, value)) = environment {
+            command.env(name, value);
+        }
+        let output = command.output().expect("spawn settings child");
+        assert!(
+            output.status.success(),
+            "settings case {case} failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "settings case {case} did not run:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}
+
+/// [`schema_case_config`] without the explicit `gateway_port`, so listener
+/// resolution decides the loopback target.
+fn schema_case_config_without_port(extra: &serde_json::Value) -> serde_json::Value {
+    let mut config = json!({
+        "key": VALID_KEY,
+        "concurrent_clients": 1,
+        "duration_seconds": 1
+    });
+    for (name, value) in extra.as_object().expect("case overrides must be an object") {
+        config[name.as_str()] = value.clone();
+    }
+    config
 }

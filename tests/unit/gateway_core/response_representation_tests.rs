@@ -194,6 +194,24 @@ async fn gzip_encoded_body_is_decoded_redacted_and_served_as_identity() {
 }
 
 #[tokio::test]
+async fn gzip_members_or_padding_after_the_first_member_reject_a_claimed_response() {
+    for suffix in [gzip(b""), gzip(b" "), vec![0]] {
+        let mut headers = json_headers();
+        headers.insert("content-encoding".to_string(), "gzip".to_string());
+        let mut encoded = gzip(br#"{"keep":1}"#);
+        encoded.extend_from_slice(&suffix);
+
+        let (replaced, _, status, headers, _, reason) =
+            run_backend_transform(200, headers, encoded).await;
+
+        assert!(replaced);
+        assert_eq!(status, 502);
+        assert_eq!(reason.as_deref(), Some("malformed_content_coding"));
+        assert!(!headers.contains_key("content-encoding"));
+    }
+}
+
+#[tokio::test]
 async fn brotli_encoded_body_is_decoded_and_redacted() {
     let mut headers = json_headers();
     headers.insert("content-encoding".to_string(), "br".to_string());

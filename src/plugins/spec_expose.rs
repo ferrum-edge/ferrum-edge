@@ -22,14 +22,15 @@
 //! time), the fetched spec body is cached in-process with a TTL so that
 //! `/specz` requests do not re-fetch the upstream document on every call.
 //! The cache is opportunistic: the first request triggers a fetch and stores
-//! the body+content-type; subsequent requests within the TTL serve directly
-//! from memory. On TTL expiry, the next request re-fetches. Failed fetches are
-//! negatively cached with bounded exponential backoff, and at most a fixed
-//! number of callers can wait for the single in-flight fetch. This keeps the
-//! anonymous endpoint from accumulating unbounded tasks during an origin
-//! outage. A zero TTL disables the durable positive cache, but concurrent
-//! callers already admitted to the same fetch generation still share its
-//! successful completion.
+//! the identity body+content-type (origin `Content-Encoding` is decoded
+//! before cache and `/specz`); subsequent requests within the TTL serve
+//! directly from memory. On TTL expiry, the next request re-fetches. Failed
+//! fetches are negatively cached with bounded exponential backoff, and at most
+//! a fixed number of callers can wait for the single in-flight fetch. This
+//! keeps the anonymous endpoint from accumulating unbounded tasks during an
+//! origin outage. A zero TTL disables the durable positive cache, but
+//! concurrent callers already admitted to the same fetch generation still
+//! share its successful completion.
 //!
 //! TTL is controlled by `cache_ttl_seconds` (default 300s = 5 min).
 //! Set to 0 to disable durable positive caching; callers admitted before an
@@ -53,6 +54,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::header::HeaderValue;
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -65,6 +67,7 @@ use crate::dns::DnsCacheResolver;
 use crate::retry::classify_reqwest_error;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
+use super::utils::content_encoding::{DecodeLimits, decode_content_encoding};
 use super::utils::response_body::{
     BoundedReadError, parse_max_response_body_bytes, read_response_body_bounded,
 };
@@ -84,6 +87,10 @@ const FAILURE_BACKOFF_MAX_SECONDS: u64 = 30;
 const FETCH_BUSY_BODY: &[u8] =
     br#"{"error":"API specification fetch is busy; retry after the indicated delay"}"#;
 const FETCH_BUSY_BODY_LENGTH: &str = "76";
+/// Bounded origin `Content-Encoding` decode: gzip / `x-gzip` / `br` /
+/// identity. Unsupported or malformed coding is a sanitized 502.
+const MAX_SPEC_CONTENT_CODINGS: usize = 4;
+const MAX_SPEC_DECODE_AMPLIFICATION_RATIO: u32 = 1024;
 /// Private request marker kept only until the rejection-response hook phase.
 /// It ensures HEAD carries the full GET representation through body policy and
 /// suppresses it only after those hooks have established the final metadata.
@@ -578,8 +585,10 @@ impl SpecExpose {
         // endpoint should not spend memory or time proving an oversized hint
         // wrong.
         // The plugin HTTP client is built without reqwest auto-decompression
-        // features today. If that changes, do not rely on this hint for safety:
-        // the streaming guard still remains authoritative.
+        // features. Coded origin bodies are read under this cap, then decoded
+        // to identity under the same byte bound. Do not enable unbounded
+        // client auto-decode: the streaming guard and the bounded decoder are
+        // the resource limits.
         if let Some(content_length) = response.content_length()
             && content_length > self.max_response_body_bytes as u64
         {
@@ -609,6 +618,30 @@ impl SpecExpose {
             })
             .unwrap_or_else(|| "application/octet-stream".to_string());
 
+        let content_encoding = match response.headers().get("content-encoding") {
+            None => None,
+            Some(value) => match value.to_str() {
+                Ok(raw) => {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        spec_origin = %self.spec_origin,
+                        "spec_expose: upstream Content-Encoding is not valid ASCII"
+                    );
+                    return Err(fetch_failure(
+                        502,
+                        "Failed to decode API specification from upstream",
+                    ));
+                }
+            },
+        };
+
         let body = read_response_body_bounded(response, self.max_response_body_bytes)
             .await
             .map_err(|e| match e {
@@ -631,6 +664,32 @@ impl SpecExpose {
                     fetch_failure(502, "Failed to read API specification response body")
                 }
             })?;
+
+        let body = match decode_identity_spec_body(
+            content_encoding.as_deref(),
+            body,
+            self.max_response_body_bytes,
+        ) {
+            Ok(body) => body,
+            Err(DecodeSpecBodyError::TooLarge) => {
+                tracing::warn!(
+                    spec_origin = %self.spec_origin,
+                    max_response_body_bytes = self.max_response_body_bytes,
+                    "spec_expose: decoded upstream spec exceeds configured limit"
+                );
+                return Err(body_too_large_failure());
+            }
+            Err(DecodeSpecBodyError::Unsupported) => {
+                tracing::warn!(
+                    spec_origin = %self.spec_origin,
+                    "spec_expose: upstream Content-Encoding could not be decoded"
+                );
+                return Err(fetch_failure(
+                    502,
+                    "Failed to decode API specification from upstream",
+                ));
+            }
+        };
 
         let entry = CachedSpec {
             body,
@@ -765,6 +824,46 @@ fn fetch_failure(status_code: u16, message: impl Into<String>) -> FetchFailure {
         body: json!({ "error": message.into() }).to_string(),
         retry_after_seconds: 1,
     }
+}
+
+enum DecodeSpecBodyError {
+    TooLarge,
+    Unsupported,
+}
+
+/// Decode a coded origin document to identity bytes before cache/serve.
+///
+/// `/specz` is unauthenticated and must not advertise identity JSON over gzip
+/// (or other) bytes. Supported codings are the shared decoder set (`gzip` /
+/// `x-gzip`, `br`, `identity`). Unsupported or malformed coding lists fail
+/// closed. Decoded size and amplification are capped so a coded origin cannot
+/// expand past `max_response_body_bytes`.
+fn decode_identity_spec_body(
+    content_encoding: Option<&str>,
+    body: Bytes,
+    max_bytes: usize,
+) -> Result<Bytes, DecodeSpecBodyError> {
+    let decoded = decode_content_encoding(
+        content_encoding,
+        body.as_ref(),
+        DecodeLimits {
+            max_decoded_bytes: max_bytes,
+            max_cumulative_bytes: max_bytes.saturating_mul(MAX_SPEC_CONTENT_CODINGS),
+            max_codings: MAX_SPEC_CONTENT_CODINGS,
+            max_amplification_ratio: MAX_SPEC_DECODE_AMPLIFICATION_RATIO,
+        },
+    )
+    .map_err(|error| {
+        if error.contains("exceeds") {
+            DecodeSpecBodyError::TooLarge
+        } else {
+            DecodeSpecBodyError::Unsupported
+        }
+    })?;
+    Ok(match decoded {
+        Cow::Borrowed(_) => body,
+        Cow::Owned(bytes) => Bytes::from(bytes),
+    })
 }
 
 #[async_trait]
@@ -914,6 +1013,8 @@ fn spec_response(entry: CachedSpec) -> PluginResult {
     // `/specz` is unauthenticated and serves an upstream-influenced body, so
     // prevent browsers from MIME-sniffing it into HTML/JS execution in the
     // gateway's own origin even if the (sanitized) content-type is permissive.
+    // The cached body is always identity-coded; origin Content-Encoding was
+    // decoded at fetch time and is never forwarded.
     headers.insert("x-content-type-options".to_string(), "nosniff".to_string());
     PluginResult::RejectBinary {
         status_code: 200,

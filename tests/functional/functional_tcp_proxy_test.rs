@@ -12,9 +12,7 @@
 //! All tests are marked `#[ignore]` — run with:
 //!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_tcp_proxy --ignored --nocapture
 
-use crate::common::{
-    configure_coverage_gateway_command, explicit_test_binary, shutdown_gateway_child,
-};
+use crate::common::{GatewayChildGuard, configure_coverage_gateway_command, explicit_test_binary};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -196,8 +194,11 @@ fn gateway_binary_path() -> String {
     }
 }
 
-fn shutdown_gateway(gateway: &mut std::process::Child) {
-    shutdown_gateway_child(gateway);
+/// Shut a spawned gateway down early. The guard would do this on drop; calling
+/// it explicitly keeps the graceful teardown at the point the test intends,
+/// and is idempotent so the drop path cannot reap the child twice.
+fn shutdown_gateway(gateway: &mut GatewayChildGuard) {
+    gateway.shutdown();
 }
 
 fn start_gateway_with_extra_env(
@@ -208,8 +209,9 @@ fn start_gateway_with_extra_env(
     tls_key_path: Option<&str>,
     extra_env: &[(&str, &str)],
     identity: &crate::common::SpawnedGatewayIdentity,
-) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+) -> Result<GatewayChildGuard, Box<dyn std::error::Error>> {
     let mut cmd = std::process::Command::new(gateway_binary_path());
+    cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
@@ -232,19 +234,21 @@ fn start_gateway_with_extra_env(
     }
     identity.apply_to_command(&mut cmd);
 
-    Ok(cmd.spawn()?)
+    // Owned at the instant of spawn: every path out of a fixture from here on,
+    // panic included, kills and reaps this child (issue #4991).
+    Ok(GatewayChildGuard::new(cmd.spawn()?))
 }
 
 /// Wait until `child` owns `admin_port`. Unauthenticated `/health` and
 /// CIDR-granted health detail are not identity: a parallel test can steal
 /// the bind-drop port and answer 200 after this child has already exited.
 async fn wait_for_owned_gateway(
-    child: &mut std::process::Child,
+    child: &mut GatewayChildGuard,
     admin_port: u16,
     identity: &crate::common::SpawnedGatewayIdentity,
 ) -> bool {
     crate::common::wait_for_owned_gateway_identity(
-        child,
+        child.child_mut(),
         admin_port,
         identity,
         Duration::from_secs(30),
@@ -293,12 +297,12 @@ async fn connect_tcp_proxy(proxy_port: u16) -> tokio::net::TcpStream {
 /// to handle the bind-drop-rebind port race. The `make_config` closure receives
 /// `(proxy_listen_port, config_dir)` and must return the config file content.
 ///
-/// Returns (child, proxy_listen_port, admin_port, TempDir).
+/// Returns (gateway guard, proxy_listen_port, admin_port, TempDir).
 async fn start_gateway_with_retry<F>(
     make_config: F,
     tls_cert_path: Option<&str>,
     tls_key_path: Option<&str>,
-) -> (std::process::Child, u16, u16, TempDir)
+) -> (GatewayChildGuard, u16, u16, TempDir)
 where
     F: Fn(u16) -> String,
 {
@@ -310,7 +314,7 @@ async fn start_gateway_with_retry_extra_env<F>(
     tls_cert_path: Option<&str>,
     tls_key_path: Option<&str>,
     extra_env: &[(&str, &str)],
-) -> (std::process::Child, u16, u16, TempDir)
+) -> (GatewayChildGuard, u16, u16, TempDir)
 where
     F: Fn(u16) -> String,
 {
@@ -1114,7 +1118,7 @@ plugin_configs: []
 
     #[cfg(unix)]
     {
-        let pid = gateway.id();
+        let pid = gateway.id().expect("the guard still owns the child");
         let _ = std::process::Command::new("kill")
             .args(["-HUP", &pid.to_string()])
             .output();
@@ -1687,14 +1691,223 @@ plugin_configs: []
 
     // The bound is per source, not per listener: a different source IP still
     // gets its own full budget while the first source is saturated.
-    let other_source = try_relay("127.0.0.2", proxy_port).await;
-    assert!(
-        other_source.is_some(),
-        "a second source IP must still be admitted while another source is at its cap"
-    );
+    //
+    // This half needs a genuinely different source ADDRESS, which a second
+    // ephemeral port cannot supply. Linux assigns all of `127.0.0.0/8` to `lo`,
+    // so `127.0.0.2` is always bindable there; macOS assigns only `127.0.0.1`
+    // to `lo0` unless an operator adds an alias (issue #4983). Report the
+    // missing prerequisite explicitly rather than failing as a per-source-cap
+    // defect — the cap assertions above already ran on every host.
+    let mut other_source = None;
+    let mut second_source_bound = false;
+    for candidate in ["127.0.0.2", "127.0.0.3", "127.0.0.4", "127.0.0.5"] {
+        if std::net::TcpListener::bind((candidate, 0)).is_err() {
+            continue;
+        }
+        second_source_bound = true;
+        other_source = try_relay(candidate, proxy_port).await;
+        break;
+    }
+    if second_source_bound {
+        assert!(
+            other_source.is_some(),
+            "a second source IP must still be admitted while another source is at its cap"
+        );
+    } else {
+        eprintln!(
+            "skipping the second-source half of \
+             test_tcp_proxy_per_source_ip_connection_limit: this host assigns no secondary \
+             IPv4 loopback address"
+        );
+    }
 
     drop(other_source);
     drop(held);
     shutdown_gateway(&mut gateway);
     backend.abort();
+}
+
+#[ignore]
+#[tokio::test]
+async fn test_userspace_tls_write_timeout_preserves_request_then_push_session() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = listener.local_addr().unwrap().port();
+    let backend_task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                if stream.read_u8().await.ok() != Some(b'S') {
+                    return;
+                }
+                for byte in 0..30u8 {
+                    if stream.write_all(&[byte]).await.is_err() {
+                        return;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+                if stream.read_u8().await.ok() == Some(b'Q') {
+                    let _ = stream.write_all(b"!").await;
+                }
+            });
+        }
+    });
+    let cert_path = std::fs::canonicalize("tests/certs/server.crt")
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let key_path = std::fs::canonicalize("tests/certs/server.key")
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry_extra_env(
+        |proxy_port| {
+            format!(
+                r#"
+version: "1"
+proxies:
+  - id: "userspace-request-then-push"
+    listen_port: {proxy_port}
+    backend_scheme: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    frontend_tls: true
+    backend_write_timeout_ms: 500
+    backend_read_timeout_ms: 0
+    tcp_idle_timeout_seconds: 30
+consumers: []
+plugin_configs: []
+"#
+            )
+        },
+        Some(&cert_path),
+        Some(&key_path),
+        &[("FERRUM_KTLS_ENABLED", "false")],
+    )
+    .await;
+    let socket = connect_tcp_proxy(proxy_port).await;
+    let mut stream = insecure_tls_connector()
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            socket,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        stream.write_all(b"S").await.unwrap();
+        for expected in 0..30u8 {
+            assert_eq!(stream.read_u8().await.unwrap(), expected);
+        }
+        stream.write_all(b"Q").await.unwrap();
+        assert_eq!(stream.read_u8().await.unwrap(), b'!');
+    })
+    .await
+    .expect("userspace TLS relay must not time out a drained client write queue");
+    shutdown_gateway(&mut gateway);
+    backend_task.abort();
+}
+
+/// Issue #4991: a fixture that panics after a successful startup must still
+/// kill and reap its gateway, and release the ports that child owned.
+///
+/// A raw `std::process::Child` does nothing on drop, so before
+/// [`crate::common::GatewayChildGuard`] every assertion failure between spawn
+/// and the explicit shutdown call left a live gateway reparented to init,
+/// holding its listen ports against every later run. This forces exactly that
+/// shape — a real gateway, proven relaying, then a panic — and asserts the
+/// teardown that must follow it.
+#[ignore]
+#[tokio::test]
+async fn test_gateway_guard_reaps_the_child_on_a_panicking_fixture() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = listener.local_addr().unwrap().port();
+    let backend = start_tcp_echo_server_on(listener).await;
+
+    let (gateway, proxy_port, admin_port, _dir) = start_gateway_with_retry(
+        |proxy_port| {
+            format!(
+                r#"
+version: "1"
+proxies:
+  - id: "tcp-teardown-regression"
+    listen_port: {proxy_port}
+    backend_scheme: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+
+consumers: []
+plugin_configs: []
+"#
+            )
+        },
+        None,
+        None,
+    )
+    .await;
+
+    // Prove the child is genuinely up and owns the proxy port before the panic,
+    // so a passing teardown assertion cannot come from a gateway that never
+    // started.
+    let mut stream = connect_tcp_proxy(proxy_port).await;
+    stream.write_all(b"alive").await.expect("relay write");
+    let mut echoed = [0u8; 5];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut echoed))
+        .await
+        .expect("relay read timed out")
+        .expect("relay read");
+    assert_eq!(&echoed, b"alive");
+    drop(stream);
+
+    let pid = gateway.id().expect("the guard still owns the child");
+
+    // The failure shape from the issue: a fixture panics with the gateway in
+    // scope. The guard is dropped by the unwind, not by any explicit call.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _gateway = gateway;
+        panic!("deliberate teardown-regression panic, not a real failure");
+    }));
+    assert!(outcome.is_err(), "the fixture must actually have panicked");
+
+    // The child is gone, not merely killed-and-unreaped: `shutdown_gateway_child`
+    // waits, so the pid must no longer name a live process.
+    assert!(
+        !process_is_alive(pid),
+        "the unwind must have killed and reaped the gateway child (pid {pid})"
+    );
+
+    // ...and both ports it owned are bindable again.
+    for port in [proxy_port, admin_port] {
+        assert!(
+            wait_for_bindable_port(port).await,
+            "port {port} must be released once the gateway child is reaped"
+        );
+    }
+
+    backend.abort();
+}
+
+/// Whether `pid` still names a live process. `kill(pid, 0)` reports
+/// permissions/existence without delivering a signal.
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    false
+}
+
+/// Bind `port` on loopback, retrying briefly: a killed listener's socket can
+/// stay claimed for a moment while the kernel finishes closing it.
+async fn wait_for_bindable_port(port: u16) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)).await {
+            drop(listener);
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
 }

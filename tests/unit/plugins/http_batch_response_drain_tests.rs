@@ -164,7 +164,7 @@ async fn shared_helper_reuses_http11_connection_across_successful_batches() {
             .post(&url)
             .body("[]");
         let result = client.execute(req, "http_batch_drain_test").await;
-        handle_http_batch_response("http_batch_drain_test", 1, result)
+        handle_http_batch_response("http_batch_drain_test", "", 1, result)
             .await
             .expect("2xx with drained ACK must succeed");
     }
@@ -204,7 +204,7 @@ async fn shared_helper_reuses_http11_connection_across_retryable_then_success() 
             "http_batch_drain_retry",
         )
         .await;
-    let err = handle_http_batch_response("http_batch_drain_retry", 1, first)
+    let err = handle_http_batch_response("http_batch_drain_retry", "", 1, first)
         .await
         .expect_err("503 must remain retryable");
     assert!(err.contains("503"), "{err}");
@@ -220,7 +220,7 @@ async fn shared_helper_reuses_http11_connection_across_retryable_then_success() 
             "http_batch_drain_retry",
         )
         .await;
-    handle_http_batch_response("http_batch_drain_retry", 1, second)
+    handle_http_batch_response("http_batch_drain_retry", "", 1, second)
         .await
         .expect("follow-up 200 must succeed");
 
@@ -284,7 +284,7 @@ async fn shared_helper_rejects_oversized_advertised_content_length_without_block
             "http_batch_drain_cl",
         )
         .await;
-    handle_http_batch_response("http_batch_drain_cl", 1, live)
+    handle_http_batch_response("http_batch_drain_cl", "", 1, live)
         .await
         .expect("2xx remains success even when the ACK body is oversized");
     assert!(

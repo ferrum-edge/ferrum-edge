@@ -505,6 +505,7 @@ fn start_gateway(
     let admin_port = admin.port;
     let (stdout, stderr) = logs.stdio()?;
     let mut command = std::process::Command::new(gateway_binary_path());
+    command.arg("run");
     command
         .env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)

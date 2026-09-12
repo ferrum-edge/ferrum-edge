@@ -1,10 +1,12 @@
 //! Tests for request_termination plugin
 
+use ferrum_edge::_test_support::{normalize_reject_response, set_request_http_flavor_for_test};
+use ferrum_edge::HttpFlavor;
 use ferrum_edge::plugins::request_termination::{
     REQUEST_TERMINATION_CONFIG_KEYS, REQUEST_TERMINATION_TRIGGER_KEYS, RequestTermination,
 };
 use ferrum_edge::plugins::{HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
-use http::HeaderMap;
+use http::{HeaderMap, StatusCode};
 use serde_json::json;
 
 fn make_ctx(method: &str, path: &str) -> RequestContext {
@@ -123,6 +125,16 @@ fn test_status_code_non_integer_rejects_creation() {
 }
 
 #[test]
+fn test_integral_status_code_json_numbers_are_admitted() {
+    let config =
+        serde_json::from_str(r#"{"status_code":503.0}"#).expect("integral JSON number fixture");
+    RequestTermination::new(&config).expect("503.0 must be admitted as 503");
+    let fractional =
+        serde_json::from_str(r#"{"status_code":503.1}"#).expect("fractional JSON number fixture");
+    assert!(RequestTermination::new(&fractional).is_err());
+}
+
+#[test]
 fn test_invalid_content_type_rejects_creation() {
     let err = RequestTermination::new(&json!({
         "content_type": "text/plain\r\nx-bad: yes"
@@ -187,6 +199,36 @@ fn test_trigger_rejects_path_prefix_without_leading_slash() {
 
     assert!(err.contains("path_prefix"), "got: {err}");
     assert!(err.contains("start with '/'"), "got: {err}");
+}
+
+#[test]
+fn test_trigger_rejects_path_prefix_with_query_or_space() {
+    for (prefix, needle) in [
+        ("/a?b", "query delimiter"),
+        ("/admin ", "literal space"),
+        ("/api name", "literal space"),
+        ("/a#frag", "fragment delimiter"),
+    ] {
+        let err = RequestTermination::new(&json!({
+            "trigger": { "path_prefix": prefix }
+        }))
+        .err()
+        .unwrap_or_else(|| panic!("unreachable path_prefix {prefix:?} must be rejected"));
+        assert!(
+            err.contains("path_prefix"),
+            "prefix {prefix:?} error: {err}"
+        );
+        assert!(err.contains(needle), "prefix {prefix:?} error: {err}");
+    }
+
+    for prefix in ["/", "/admin", "/v1.0/users", "*"] {
+        RequestTermination::new(&json!({
+            "trigger": { "path_prefix": prefix }
+        }))
+        .unwrap_or_else(|error| {
+            panic!("reachable path_prefix {prefix:?} must be admitted: {error}")
+        });
+    }
 }
 
 #[tokio::test]
@@ -1036,4 +1078,57 @@ fn test_config_key_constants_match_documented_surface() {
         REQUEST_TERMINATION_TRIGGER_KEYS,
         ["path_prefix", "header", "header_value"]
     );
+}
+
+#[tokio::test]
+async fn test_native_grpc_maps_to_trailers_only_error() {
+    let plugin = RequestTermination::new(&json!({})).unwrap();
+    let mut ctx = make_ctx("POST", "/pkg.Service/Method");
+    set_request_http_flavor_for_test(&mut ctx, HttpFlavor::Grpc);
+    let PluginResult::Reject {
+        status_code,
+        body,
+        headers,
+    } = plugin.on_request_received(&mut ctx).await
+    else {
+        panic!("expected Reject");
+    };
+    let normalized = normalize_reject_response(
+        StatusCode::from_u16(status_code).unwrap(),
+        body.as_bytes(),
+        &headers,
+        true,
+    );
+    assert_eq!(normalized.http_status, StatusCode::OK);
+    assert!(normalized.body.is_empty());
+    assert_eq!(normalized.grpc_status, Some(14));
+    assert_eq!(
+        normalized.headers.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
+    assert_eq!(
+        normalized.headers.get("grpc-message").map(String::as_str),
+        Some("Service unavailable")
+    );
+
+    let plugin = RequestTermination::new(&json!({"status_code": 200})).unwrap();
+    let mut ctx = make_ctx("POST", "/pkg.Service/Method");
+    set_request_http_flavor_for_test(&mut ctx, HttpFlavor::Grpc);
+    let PluginResult::Reject {
+        status_code,
+        body,
+        headers,
+    } = plugin.on_request_received(&mut ctx).await
+    else {
+        panic!("expected Reject");
+    };
+    let normalized = normalize_reject_response(
+        StatusCode::from_u16(status_code).unwrap(),
+        body.as_bytes(),
+        &headers,
+        true,
+    );
+    assert_eq!(normalized.http_status, StatusCode::OK);
+    assert!(normalized.body.is_empty());
+    assert_eq!(normalized.grpc_status, Some(13));
 }

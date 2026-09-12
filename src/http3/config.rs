@@ -280,7 +280,10 @@ pub struct Http3ServerConfig {
     /// Maximum concurrent bidirectional streams per connection
     pub max_concurrent_streams: u32,
     /// Connection idle timeout exactly as `FERRUM_HTTP3_IDLE_TIMEOUT`
-    /// configures it. This is the value the H3 **backend** pools use.
+    /// configures it. This is the value the H3 **backend** pools install on
+    /// their `quinn::TransportConfig` (issue #4756); `Duration::ZERO` disables
+    /// the idle timer (RFC 9000 §10.1). See
+    /// [`H3BackendTransportParams::resolve`].
     pub idle_timeout: Duration,
     /// The QUIC `max_idle_timeout` the HTTP/3 **frontend** listener installs.
     ///
@@ -308,23 +311,49 @@ pub struct Http3ServerConfig {
     // conservative.  On modern networks they limit throughput similarly
     // to HTTP/2's small defaults.  These settings let operators raise
     // the limits to match their available bandwidth.
-    /// Per-stream receive window in bytes.
+    //
+    // The windows are split by TRUST PLANE (issue #4755). The `*_window`
+    // fields below govern only the FRONTEND listener, which serves untrusted
+    // clients and is therefore deliberately conservative; the
+    // `backend_*_window` fields govern the gateway's own H3 connections to
+    // upstreams. One triple for both planes meant that restoring backend
+    // throughput also re-opened the frontend amplification exposure.
+    /// Per-stream receive window in bytes for the **frontend** listener
+    /// (`FERRUM_HTTP3_STREAM_RECEIVE_WINDOW`).
     /// Controls how much data a peer can send on a single stream before
     /// the receiver must send a flow-control credit update.
-    /// Default: 16 MiB (16_777_216).
+    /// Default: [`H3_FRONTEND_STREAM_RECEIVE_WINDOW`] (256 KiB).
     pub stream_receive_window: u64,
 
-    /// Connection-level receive window in bytes.
+    /// Connection-level receive window in bytes for the **frontend** listener
+    /// (`FERRUM_HTTP3_RECEIVE_WINDOW`).
     /// Aggregate budget shared across all concurrent streams.
     /// Should be ≥ stream_receive_window × expected_concurrency.
-    /// Default: 128 MiB (134_217_728).
+    /// Default: [`H3_FRONTEND_RECEIVE_WINDOW`] (2 MiB).
     pub receive_window: u64,
 
-    /// Per-connection send window in bytes.
+    /// Per-connection send window in bytes for the **frontend** listener
+    /// (`FERRUM_HTTP3_SEND_WINDOW`).
     /// Controls how much data can be in flight (sent but unacknowledged)
     /// across all streams on a single QUIC connection.
-    /// Default: 64 MiB (67_108_864).
+    /// Default: [`H3_FRONTEND_SEND_WINDOW`] (2 MiB).
     pub send_window: u64,
+
+    /// Per-stream receive window in bytes for **backend** pool connections
+    /// (`FERRUM_HTTP3_BACKEND_STREAM_RECEIVE_WINDOW`).
+    /// Default: [`H3_STREAM_RECEIVE_WINDOW_DEFAULT`] (8 MiB).
+    pub backend_stream_receive_window: u64,
+
+    /// Connection-level receive window in bytes for **backend** pool
+    /// connections (`FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW`). This is the
+    /// aggregate governor for every multiplexed stream on one backend QUIC
+    /// connection. Default: [`H3_RECEIVE_WINDOW_DEFAULT`] (32 MiB).
+    pub backend_receive_window: u64,
+
+    /// Per-connection send window in bytes for **backend** pool connections
+    /// (`FERRUM_HTTP3_BACKEND_SEND_WINDOW`).
+    /// Default: [`H3_SEND_WINDOW_DEFAULT`] (8 MiB).
+    pub backend_send_window: u64,
 
     /// Initial QUIC path MTU in bytes (`TransportConfig::initial_mtu`).
     /// quinn's default is 1200 (the QUIC minimum), which forces ~9 packets
@@ -344,6 +373,9 @@ impl Http3ServerConfig {
             stream_receive_window: env.http3_stream_receive_window,
             receive_window: env.http3_receive_window,
             send_window: env.http3_send_window,
+            backend_stream_receive_window: env.http3_backend_stream_receive_window,
+            backend_receive_window: env.http3_backend_receive_window,
+            backend_send_window: env.http3_backend_send_window,
             initial_mtu: env.http3_initial_mtu,
             handshake_timeout: Duration::from_secs(env.frontend_tls_handshake_timeout_seconds),
         }
@@ -372,12 +404,104 @@ impl Default for Http3ServerConfig {
             stream_receive_window: H3_FRONTEND_STREAM_RECEIVE_WINDOW,
             receive_window: H3_FRONTEND_RECEIVE_WINDOW,
             send_window: H3_FRONTEND_SEND_WINDOW,
+            backend_stream_receive_window: H3_STREAM_RECEIVE_WINDOW_DEFAULT,
+            backend_receive_window: H3_RECEIVE_WINDOW_DEFAULT,
+            backend_send_window: H3_SEND_WINDOW_DEFAULT,
             initial_mtu: 1500,
             // Default mirrors `EnvConfig::default().frontend_tls_handshake_timeout_seconds`
             // (10 seconds). `Duration::ZERO` here would silently disable the bound.
             handshake_timeout: Duration::from_secs(10),
         }
     }
+}
+
+/// The QUIC transport parameters every HTTP/3 **backend** pool connection
+/// installs (issues #4755 and #4756).
+///
+/// Resolved as plain data so the three backend constructors in
+/// `crate::http3::client` share ONE derivation and cannot drift, and so the
+/// resolved values are assertable: `quinn::TransportConfig`'s fields are
+/// private, so "the backend pool carries the backend windows and the
+/// configured idle timeout" is only checkable about the input otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct H3BackendTransportParams {
+    /// Initial QUIC path MTU (`FERRUM_HTTP3_INITIAL_MTU`, shared with the
+    /// frontend listener — it is a path property, not a trust-plane budget).
+    pub initial_mtu: u16,
+    /// Per-stream receive window from
+    /// `FERRUM_HTTP3_BACKEND_STREAM_RECEIVE_WINDOW`.
+    pub stream_receive_window: quinn::VarInt,
+    /// Connection-level receive window from `FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW`.
+    pub receive_window: quinn::VarInt,
+    /// Connection-level send window from `FERRUM_HTTP3_BACKEND_SEND_WINDOW`.
+    pub send_window: u64,
+    /// `max_idle_timeout` from `FERRUM_HTTP3_IDLE_TIMEOUT`.
+    ///
+    /// `None` when the operator configured `0`, which disables the idle timer
+    /// (RFC 9000 §10.1) — quinn treats `None` and `Some(0)` identically in
+    /// `negotiate_max_idle_timeout`, and `None` is the representation that
+    /// says so. Before issue #4756 the backend pools set nothing here at all,
+    /// so quinn-proto's 30 s default applied and — because RFC 9000 §10.1
+    /// negotiates the MINIMUM of the two endpoints' values — no larger
+    /// configured timeout could ever take effect.
+    pub max_idle_timeout: Option<quinn::IdleTimeout>,
+}
+
+impl H3BackendTransportParams {
+    /// Derive the backend transport parameters from the H3 configuration.
+    ///
+    /// Fails only when the configured idle timeout cannot be encoded as a QUIC
+    /// variable-length integer of milliseconds; the windows fall back to the
+    /// compiled backend defaults through `quic_varint_or_default` exactly as
+    /// the frontend listener's do.
+    pub fn resolve(cfg: &Http3ServerConfig) -> Result<Self, anyhow::Error> {
+        let max_idle_timeout: Option<quinn::IdleTimeout> = if cfg.idle_timeout.is_zero() {
+            None
+        } else {
+            Some(
+                quinn::IdleTimeout::try_from(cfg.idle_timeout)
+                    .map_err(|e| anyhow::anyhow!("Invalid HTTP/3 backend idle timeout: {}", e))?,
+            )
+        };
+
+        Ok(Self {
+            initial_mtu: cfg.initial_mtu,
+            stream_receive_window: quic_varint_or_default(
+                cfg.backend_stream_receive_window,
+                H3_STREAM_RECEIVE_WINDOW_DEFAULT,
+            ),
+            receive_window: quic_varint_or_default(
+                cfg.backend_receive_window,
+                H3_RECEIVE_WINDOW_DEFAULT,
+            ),
+            send_window: cfg.backend_send_window,
+            max_idle_timeout,
+        })
+    }
+
+    /// Install these parameters on a `quinn::TransportConfig`.
+    pub fn apply(&self, transport_config: &mut quinn::TransportConfig) {
+        transport_config.initial_mtu(self.initial_mtu);
+        transport_config.stream_receive_window(self.stream_receive_window);
+        transport_config.receive_window(self.receive_window);
+        transport_config.send_window(self.send_window);
+        transport_config.max_idle_timeout(self.max_idle_timeout);
+    }
+}
+
+/// Build the `quinn::TransportConfig` shared by every H3 backend pool
+/// connection.
+///
+/// The single construction site for backend QUIC transport tuning: the pooled
+/// direct-backend constructor, the explicit-target/retry constructor, and the
+/// standalone `Http3Client` all call it, so no backend dial can silently
+/// inherit quinn's defaults again.
+pub fn build_backend_transport_config(
+    cfg: &Http3ServerConfig,
+) -> Result<quinn::TransportConfig, anyhow::Error> {
+    let mut transport_config = quinn::TransportConfig::default();
+    H3BackendTransportParams::resolve(cfg)?.apply(&mut transport_config);
+    Ok(transport_config)
 }
 
 #[cfg(test)]

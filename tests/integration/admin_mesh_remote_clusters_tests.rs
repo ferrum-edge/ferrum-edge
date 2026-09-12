@@ -207,7 +207,8 @@ fn install_accepted_slice_with_config(runtime: &MeshRuntimeState) {
         ..MeshSlice::default()
     };
     runtime.install_slice(slice.clone());
-    runtime.record_applied_slice(&slice);
+    let token = runtime.begin_revision_apply(&slice);
+    runtime.record_applied_slice_with_token(&slice, token);
 }
 
 #[tokio::test]

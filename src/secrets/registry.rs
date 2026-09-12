@@ -576,6 +576,18 @@ fn unsupported_cloud_suffix_for_base_key(key: &str) -> Option<(&'static str, &'s
 }
 
 pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
+    resolve_env_secrets(None).await
+}
+
+/// Resolve a bounded set of endpoint settings without materializing them into
+/// the environment. Unrelated sources are neither validated nor fetched.
+pub(crate) async fn resolve_selected_env_secrets(
+    keys: &[&str],
+) -> Result<ResolvedEnvSecrets, String> {
+    resolve_env_secrets(Some(keys)).await
+}
+
+async fn resolve_env_secrets(keys: Option<&[&str]>) -> Result<ResolvedEnvSecrets, String> {
     let mut to_resolve: HashMap<String, Vec<(String, String, BackendKind)>> = HashMap::new();
     // Collected rather than returned on first sight: `std::env::vars_os()` order
     // varies between processes, so returning inside the loop would let two
@@ -602,6 +614,19 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
     // so an unrelated variable is skipped by the prefix screen below and never
     // decoded at all.
     for (raw_key_os, value_os) in std::env::vars_os() {
+        if let Some(keys) = keys {
+            let selected = raw_key_os.to_str().is_some_and(|raw_key| {
+                keys.contains(&raw_key)
+                    || EXTERNAL_SECRET_SUFFIXES.iter().any(|suffix| {
+                        raw_key
+                            .strip_suffix(*suffix)
+                            .is_some_and(|base| keys.contains(&base))
+                    })
+            });
+            if !selected {
+                continue;
+            }
+        }
         // Screened on raw bytes so a non-Unicode name is rejected here rather
         // than decoded. `FERRUM_` is ASCII, and `as_encoded_bytes` guarantees
         // ASCII substrings match at the same positions they would in the

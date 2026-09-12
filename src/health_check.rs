@@ -602,6 +602,372 @@ impl PassiveEjection {
     }
 }
 
+/// Process-wide publication counter for the active-unhealthy target set.
+///
+/// Every mutation of any [`ActiveUnhealthyTargets`] bumps this counter AFTER
+/// the map change lands (`Release`). Load balancers tag their cached
+/// active-eligibility snapshot with the value they observed (`Acquire`)
+/// BEFORE scanning the map, so a mutation that races a scan is guaranteed to
+/// leave the counter ahead of the tag and force a recompute on the next
+/// selection. Being process-wide (rather than per map instance) means a
+/// balancer can never mistake one checker's generation `N` for another
+/// checker's generation `N` after a `HealthChecker` swap.
+static ACTIVE_HEALTH_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Result of [`ActiveUnhealthyTargets::insert_if_vacant`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VacantInsert {
+    /// The key was absent and the caller's value was published.
+    Inserted,
+    /// The key was already present; nothing changed.
+    Occupied,
+    /// The key was absent but the caller declined to publish under the lock.
+    Declined,
+}
+
+/// Process-unique ids for [`ActiveUnhealthyTargets`] instances; see
+/// [`ActiveUnhealthyTargets::id`].
+static ACTIVE_UNHEALTHY_TARGETS_IDS: AtomicU64 = AtomicU64::new(1);
+
+/// Active-probe unhealthy set: `"namespace|upstream_id::host:port"` → epoch ms
+/// of the ejection, shared by every proxy that routes through the upstream.
+///
+/// Wraps the `DashMap` so every mutation publishes a generation bump (see
+/// [`ACTIVE_HEALTH_GENERATION`]). The selection hot path never scans this map
+/// while the generation it cached is still current, and never calls
+/// `DashMap::is_empty()` / `len()`, which lock every shard.
+#[derive(Debug)]
+pub struct ActiveUnhealthyTargets {
+    map: DashMap<String, u64>,
+    id: u64,
+}
+
+impl Default for ActiveUnhealthyTargets {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ActiveUnhealthyTargets {
+    pub fn new() -> Self {
+        Self {
+            map: DashMap::new(),
+            id: ACTIVE_UNHEALTHY_TARGETS_IDS.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// Process-unique id of this map instance. Cached projections are keyed
+    /// on `(id, generation)` so a balancer handed a different checker's map
+    /// at the same generation recomputes instead of reusing the other map's
+    /// projection.
+    #[inline]
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Current publication generation. Cheap (one relaxed-cost `Acquire`
+    /// load of a read-mostly cache line); safe to call per selection.
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        ACTIVE_HEALTH_GENERATION.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn publish(&self) {
+        ACTIVE_HEALTH_GENERATION.fetch_add(1, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.map.contains_key(key)
+    }
+
+    pub fn get(&self, key: &str) -> Option<dashmap::mapref::one::Ref<'_, String, u64>> {
+        self.map.get(key)
+    }
+
+    /// Locks every shard — observability / tests only, never per selection.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Locks every shard — observability / tests only, never per selection.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn iter(&self) -> dashmap::iter::Iter<'_, String, u64> {
+        self.map.iter()
+    }
+
+    pub fn insert(&self, key: String, ejected_at_epoch_ms: u64) -> Option<u64> {
+        let previous = self.map.insert(key, ejected_at_epoch_ms);
+        self.publish();
+        previous
+    }
+
+    /// Publish `value()` only when `key` is absent. `value` runs under the
+    /// entry lock and may return `None` to decline (e.g. the caller's probe
+    /// generation was retired while waiting for the lock), in which case the
+    /// map is left untouched and no generation bump is published.
+    pub fn insert_if_vacant(
+        &self,
+        key: String,
+        value: impl FnOnce() -> Option<u64>,
+    ) -> VacantInsert {
+        use dashmap::mapref::entry::Entry;
+        let outcome = match self.map.entry(key) {
+            Entry::Occupied(_) => VacantInsert::Occupied,
+            Entry::Vacant(vacant) => match value() {
+                Some(ejected_at_epoch_ms) => {
+                    vacant.insert(ejected_at_epoch_ms);
+                    VacantInsert::Inserted
+                }
+                None => VacantInsert::Declined,
+            },
+        };
+        if outcome == VacantInsert::Inserted {
+            self.publish();
+        }
+        outcome
+    }
+
+    pub fn remove(&self, key: &str) -> Option<(String, u64)> {
+        let removed = self.map.remove(key);
+        if removed.is_some() {
+            self.publish();
+        }
+        removed
+    }
+
+    pub fn remove_if(
+        &self,
+        key: &str,
+        predicate: impl FnOnce(&String, &u64) -> bool,
+    ) -> Option<(String, u64)> {
+        let removed = self.map.remove_if(key, predicate);
+        if removed.is_some() {
+            self.publish();
+        }
+        removed
+    }
+
+    pub fn retain(&self, mut keep: impl FnMut(&String, &mut u64) -> bool) {
+        let mut removed = false;
+        self.map.retain(|key, value| {
+            let kept = keep(key, value);
+            removed |= !kept;
+            kept
+        });
+        if removed {
+            self.publish();
+        }
+    }
+
+    pub fn clear(&self) {
+        self.map.clear();
+        self.publish();
+    }
+}
+
+/// Per-proxy passive ejection set: `"host:port"` → [`PassiveEjection`].
+///
+/// Wraps the `DashMap` with two atomics the selection hot path reads instead
+/// of touching the map: an O(1) occupancy counter (so "this proxy has no
+/// passive ejections" is one load, not the every-shard lock of
+/// `DashMap::is_empty()`) and a per-instance publication generation that
+/// balancers key their cached per-proxy eligibility projection on. Every
+/// mutation goes through this type so neither can drift from the contents.
+///
+/// Generation ordering mirrors [`ActiveUnhealthyTargets`]: bumped with
+/// `Release` AFTER the map change; readers load it with `Acquire` BEFORE
+/// probing the map, so a racing write always leaves the counter ahead of the
+/// snapshot it may have been missed by.
+#[derive(Debug, Default)]
+pub struct PassiveUnhealthyTargets {
+    map: DashMap<String, PassiveEjection>,
+    len: std::sync::atomic::AtomicUsize,
+    generation: AtomicU64,
+}
+
+/// Mutable view of one ejection record. Publishes a generation bump when
+/// dropped (before the shard lock is released) so in-place edits invalidate
+/// cached projections exactly like inserts and removals do.
+pub struct PassiveEjectionMut<'a> {
+    inner: dashmap::mapref::one::RefMut<'a, String, PassiveEjection>,
+    generation: &'a AtomicU64,
+}
+
+impl std::ops::Deref for PassiveEjectionMut<'_> {
+    type Target = PassiveEjection;
+
+    fn deref(&self) -> &PassiveEjection {
+        self.inner.value()
+    }
+}
+
+impl std::ops::DerefMut for PassiveEjectionMut<'_> {
+    fn deref_mut(&mut self) -> &mut PassiveEjection {
+        self.inner.value_mut()
+    }
+}
+
+impl Drop for PassiveEjectionMut<'_> {
+    fn drop(&mut self) {
+        // Runs before `inner` (and its shard write lock) is dropped, so any
+        // reader that observes the new generation also observes the edit.
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+}
+
+impl PassiveUnhealthyTargets {
+    pub fn new() -> Self {
+        Self {
+            map: DashMap::new(),
+            len: std::sync::atomic::AtomicUsize::new(0),
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    /// Number of ejected `host:port` entries. One atomic load; safe per
+    /// selection. May transiently lag a concurrent insert/remove by one, which
+    /// selection tolerates exactly as it tolerates a racing `DashMap` write.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Publication generation of this proxy's ejection set. Changes on every
+    /// insert, replace, removal, and in-place edit.
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn publish(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.map.contains_key(key)
+    }
+
+    pub fn get(&self, key: &str) -> Option<dashmap::mapref::one::Ref<'_, String, PassiveEjection>> {
+        self.map.get(key)
+    }
+
+    pub fn get_mut(&self, key: &str) -> Option<PassiveEjectionMut<'_>> {
+        self.map.get_mut(key).map(|inner| PassiveEjectionMut {
+            inner,
+            generation: &self.generation,
+        })
+    }
+
+    pub fn iter(&self) -> dashmap::iter::Iter<'_, String, PassiveEjection> {
+        self.map.iter()
+    }
+
+    pub fn insert(&self, key: String, ejection: PassiveEjection) -> Option<PassiveEjection> {
+        let previous = self.map.insert(key, ejection);
+        if previous.is_none() {
+            self.len.fetch_add(1, Ordering::Release);
+        }
+        self.publish();
+        previous
+    }
+
+    /// Insert or replace `ejection` when `decide(existing)` approves, holding
+    /// the entry lock across the decision so publishers on this key serialize
+    /// with recovery. Returns whether the map changed.
+    pub fn insert_if(
+        &self,
+        key: String,
+        ejection: PassiveEjection,
+        decide: impl FnOnce(Option<&PassiveEjection>) -> bool,
+    ) -> bool {
+        use dashmap::mapref::entry::Entry;
+        let changed = match self.map.entry(key) {
+            Entry::Occupied(mut occupied) => {
+                if !decide(Some(occupied.get())) {
+                    return false;
+                }
+                occupied.insert(ejection);
+                true
+            }
+            Entry::Vacant(vacant) => {
+                if !decide(None) {
+                    return false;
+                }
+                vacant.insert(ejection);
+                self.len.fetch_add(1, Ordering::Release);
+                true
+            }
+        };
+        if changed {
+            self.publish();
+        }
+        changed
+    }
+
+    pub fn remove(&self, key: &str) -> Option<(String, PassiveEjection)> {
+        let removed = self.map.remove(key);
+        if removed.is_some() {
+            self.len.fetch_sub(1, Ordering::Release);
+            self.publish();
+        }
+        removed
+    }
+
+    /// Remove `key` when `predicate(current)` approves. The predicate runs
+    /// under the shard write lock, so callers may retire per-target state in
+    /// it knowing no concurrent publisher can slip between the check and the
+    /// removal.
+    pub fn remove_if(
+        &self,
+        key: &str,
+        predicate: impl FnOnce(&String, &PassiveEjection) -> bool,
+    ) -> Option<(String, PassiveEjection)> {
+        let removed = self.map.remove_if(key, predicate);
+        if removed.is_some() {
+            self.len.fetch_sub(1, Ordering::Release);
+            self.publish();
+        }
+        removed
+    }
+
+    pub fn retain(&self, mut keep: impl FnMut(&String, &mut PassiveEjection) -> bool) {
+        let mut removed = 0usize;
+        self.map.retain(|key, value| {
+            let kept = keep(key, value);
+            if !kept {
+                removed += 1;
+            }
+            kept
+        });
+        if removed > 0 {
+            self.len.fetch_sub(removed, Ordering::Release);
+            self.publish();
+        }
+    }
+
+    pub fn clear(&self) {
+        self.retain(|_, _| false);
+    }
+}
+
+/// Process-unique ids for [`ProxyHealthState`] instances. Balancers key their
+/// cached passive projections on this id (never on the `Arc` address, which
+/// an allocator may reuse), so a proxy whose state was dropped and recreated
+/// can never inherit a stale projection.
+static PROXY_HEALTH_STATE_IDS: AtomicU64 = AtomicU64::new(1);
+
 /// Per-proxy passive health state for a set of targets.
 ///
 /// Wraps `unhealthy` and `states` DashMaps keyed by `host:port`. One instance
@@ -609,17 +975,26 @@ impl PassiveEjection {
 /// outer `DashMap<proxy_id, Arc<ProxyHealthState>>`.
 pub struct ProxyHealthState {
     /// host:port → ejection record (deadline + owning upstream).
-    pub unhealthy: DashMap<String, PassiveEjection>,
+    pub unhealthy: PassiveUnhealthyTargets,
     /// host:port → failure/success tracking state.
     states: DashMap<String, Arc<TargetHealth>>,
+    /// Process-unique instance id; see [`PROXY_HEALTH_STATE_IDS`].
+    id: u64,
 }
 
 impl ProxyHealthState {
     fn new() -> Self {
         Self {
-            unhealthy: DashMap::new(),
+            unhealthy: PassiveUnhealthyTargets::new(),
             states: DashMap::new(),
+            id: PROXY_HEALTH_STATE_IDS.fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    /// Process-unique id of this instance.
+    #[inline]
+    pub fn id(&self) -> u64 {
+        self.id
     }
 }
 
@@ -656,28 +1031,17 @@ fn try_publish_consecutive_ejection(
     ejection: PassiveEjection,
     my_generation: u64,
 ) -> bool {
-    use dashmap::mapref::entry::Entry;
-    match proxy_state.unhealthy.entry(key.to_owned()) {
-        Entry::Occupied(mut occupied) => {
-            if let Some(existing_generation) = occupied.get().consecutive_generation
+    proxy_state
+        .unhealthy
+        .insert_if(key.to_owned(), ejection, |existing| {
+            if let Some(existing_generation) =
+                existing.and_then(|current| current.consecutive_generation)
                 && existing_generation >= my_generation
             {
                 return false;
             }
-            if state.consecutive_generation() != my_generation {
-                return false;
-            }
-            occupied.insert(ejection);
-            true
-        }
-        Entry::Vacant(vacant) => {
-            if state.consecutive_generation() != my_generation {
-                return false;
-            }
-            vacant.insert(ejection);
-            true
-        }
-    }
+            state.consecutive_generation() == my_generation
+        })
 }
 
 /// Manages health state for all upstream targets.
@@ -702,7 +1066,9 @@ fn try_publish_consecutive_ejection(
 pub struct HealthChecker {
     /// Active unhealthy targets: "upstream_id::host:port" → epoch_ms.
     /// Written by active health check probes, shared across all proxies.
-    pub active_unhealthy_targets: Arc<DashMap<String, u64>>,
+    /// Every mutation publishes a generation bump that invalidates the
+    /// per-balancer eligibility snapshots (see [`ActiveUnhealthyTargets`]).
+    pub active_unhealthy_targets: Arc<ActiveUnhealthyTargets>,
     /// Active probe health state, keyed by "upstream_id::host:port".
     active_target_states: Arc<DashMap<String, Arc<TargetHealth>>>,
     /// Per-proxy passive health state: proxy_id → Arc<ProxyHealthState>.
@@ -897,7 +1263,7 @@ impl HealthChecker {
             "default health-check HTTP client",
         );
         Self {
-            active_unhealthy_targets: Arc::new(DashMap::new()),
+            active_unhealthy_targets: Arc::new(ActiveUnhealthyTargets::new()),
             active_target_states: Arc::new(DashMap::new()),
             passive_health: Arc::new(DashMap::new()),
             default_http_client: client,
@@ -960,7 +1326,7 @@ impl HealthChecker {
             "default health-check HTTP client",
         );
         Self {
-            active_unhealthy_targets: Arc::new(DashMap::new()),
+            active_unhealthy_targets: Arc::new(ActiveUnhealthyTargets::new()),
             active_target_states: Arc::new(DashMap::new()),
             passive_health: Arc::new(DashMap::new()),
             default_http_client: client,
@@ -2765,18 +3131,12 @@ impl HealthChecker {
                         // re-check in between — never log while holding the
                         // DashMap shard (logging can stall concurrent prune /
                         // probe ownership on the same shard).
-                        let inserted = {
-                            use dashmap::mapref::entry::Entry;
-                            match unhealthy_targets.entry(key.clone()) {
-                                Entry::Occupied(_) => false,
-                                Entry::Vacant(entry) => {
-                                    if is_retired() {
-                                        return;
-                                    }
-                                    entry.insert(wall_now_epoch_ms());
-                                    true
-                                }
-                            }
+                        let inserted = match unhealthy_targets.insert_if_vacant(key.clone(), || {
+                            (!is_retired()).then(wall_now_epoch_ms)
+                        }) {
+                            VacantInsert::Inserted => true,
+                            VacantInsert::Occupied => false,
+                            VacantInsert::Declined => return,
                         };
                         if inserted {
                             warn!(
@@ -4193,24 +4553,25 @@ fn remove_due_consecutive_ejection(
     generation: u64,
     now: u64,
 ) -> Option<PassiveEjection> {
-    use dashmap::mapref::entry::Entry;
-    match proxy_state.unhealthy.entry(hp.to_owned()) {
-        Entry::Occupied(occupied) => {
-            let current = occupied.get();
+    // The predicate runs under the shard write lock, so retiring packed G
+    // here happens strictly before the entry is dropped and before any
+    // publisher blocked on this key can observe the vacancy.
+    proxy_state
+        .unhealthy
+        .remove_if(hp, |_, current| {
             if !(current.auto_recover
                 && now >= current.recover_at_tick_ms
                 && current.recover_at_tick_ms == snapshotted.recover_at_tick_ms
                 && current.consecutive_generation == Some(generation))
             {
-                return None;
+                return false;
             }
             if let Some(state) = proxy_state.states.get(hp) {
                 state.retire_consecutive_generation(generation);
             }
-            Some(occupied.remove())
-        }
-        Entry::Vacant(_) => None,
-    }
+            true
+        })
+        .map(|(_, removed)| removed)
 }
 
 fn recover_due_passive_ejections_inner(

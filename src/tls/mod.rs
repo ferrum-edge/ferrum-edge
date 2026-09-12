@@ -45,6 +45,7 @@ mod shared_store_tests;
 pub mod source;
 #[cfg(test)]
 mod store_atomicity_tests;
+pub(crate) mod store_dir;
 // `spiffe` exposes Phase A scaffolding for Phase C — every public item is
 // dead from the binary's perspective until a later phase wires it in.
 #[allow(dead_code)]
@@ -1138,17 +1139,6 @@ pub struct FrontendTlsCandidate {
     pub client_trust: AcceptedClientTrust,
 }
 
-/// The identity and deadline of a staple this load accepted, carried from the
-/// OCSP admission block to the registration that arms the periodic re-check.
-struct AcceptedStaple {
-    /// The operator's configured source string — the TLS inventory's
-    /// `source.identifier`, so the two agree about which entry was retired.
-    configured_source_id: String,
-    /// The already-redacted display id, the only form ever logged.
-    display_source_id: String,
-    next_update: i64,
-}
-
 /// [`load_tls_config_with_client_auth_from_sources_and_ocsp`] that also returns
 /// the accepted candidate's client-trust identity.
 #[allow(clippy::too_many_arguments)]
@@ -1183,44 +1173,24 @@ pub fn load_frontend_tls_candidate(
     // to *this* leaf and issuer. Accepting arbitrary bytes here made a reload
     // able to publish a staple that strict clients abort on, while the log said
     // the response had loaded successfully.
-    let mut accepted_staple: Option<AcceptedStaple> = None;
+    let mut accepted_staple: Option<crate::tls::ocsp_recheck::AcceptedStaple> = None;
     let ocsp_response = match ocsp_response_source {
         Some(source) => {
             let material = load_material_blocking(source, MaterialKind::Ocsp)?;
             let bytes = material.bytes.expose_secret().to_vec();
-            let acceptance = crate::tls::ocsp::validate_stapled_response(&bytes, &cert_chain)
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "OCSP response source '{}' was rejected: {error}",
-                        material.display_source_id
-                    )
-                })?;
-            info!(
-                ocsp_source = %material.display_source_id,
-                ocsp_der_bytes = acceptance.der_len,
-                ocsp_this_update = acceptance.this_update,
-                ocsp_next_update = acceptance.next_update,
-                ocsp_delegated_responder = acceptance.delegated_responder,
-                "Validated and stapled OCSP response for server TLS config"
-            );
-            // Lead-time notice (issue #4505). Ferrum has no OCSP responder
-            // client, so nothing inside the gateway re-fetches these bytes;
-            // this warn is the operator's cue to refresh before the deadline.
-            // The periodic re-check armed below re-fires it hourly while the
-            // staple stays inside the window, and retires the staple outright
-            // once it reaches `nextUpdate`.
-            warn_if_revocation_material_near_expiry(
-                "ocsp",
-                &material.display_source_id,
-                acceptance.next_update,
+            // One shared "accept a staple" contract for every certificate
+            // source (issue #4773, refs #4792): validation, the acceptance
+            // record, and the lead-time notice all live in
+            // `crate::tls::ocsp_recheck`, and the value it returns is the only
+            // thing the periodic re-check can be armed with.
+            accepted_staple = Some(crate::tls::ocsp_recheck::accept_stapled_response(
+                &bytes,
+                &cert_chain,
+                crate::tls::ocsp_recheck::StapleTarget::ConfiguredListener,
+                source.source_id(),
+                material.display_source_id.clone(),
                 revocation_expiry_warning_days,
-                ASN1Time::now().timestamp(),
-            );
-            accepted_staple = Some(AcceptedStaple {
-                configured_source_id: source.source_id(),
-                display_source_id: material.display_source_id.clone(),
-                next_update: acceptance.next_update,
-            });
+            )?);
             bytes
         }
         None => Vec::new(),
@@ -1238,18 +1208,9 @@ pub fn load_frontend_tls_candidate(
 
     // Issue #4505 item 4: hand the exact resolver this candidate installs to
     // the periodic re-check, which retires the staple once it reaches
-    // `nextUpdate`. Registration happens whether or not live reload is enabled
-    // — without it there is no other event that could ever revisit these bytes.
-    // The registry holds only a `Weak`, so a candidate that is never published
-    // (a rejected reload, a `validate` run) drops out on its own.
+    // `nextUpdate`.
     if let Some(accepted_staple) = accepted_staple {
-        crate::tls::ocsp_recheck::register_stapled_response(
-            &cert_resolver,
-            accepted_staple.configured_source_id,
-            accepted_staple.display_source_id,
-            accepted_staple.next_update,
-            revocation_expiry_warning_days,
-        );
+        accepted_staple.enroll(&cert_resolver);
     }
     let cert_resolver: Arc<dyn rustls::server::ResolvesServerCert> = cert_resolver;
 

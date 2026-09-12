@@ -75,7 +75,7 @@ fn tls_policy() -> TlsPolicy {
 }
 
 fn server_config(certificates: &[GatewayCertificateInput]) -> Arc<rustls::ServerConfig> {
-    load_gateway_multi_cert_tls_config(certificates, None, None, &tls_policy(), 30, &[])
+    load_gateway_multi_cert_tls_config(certificates, None, None, &tls_policy(), 30, 30, &[])
         .expect("multi-certificate server config")
 }
 
@@ -382,6 +382,7 @@ fn one_unloadable_certificate_fails_the_whole_set_closed() {
         None,
         &tls_policy(),
         30,
+        30,
         &[],
     );
 
@@ -416,6 +417,7 @@ fn an_invalid_explicit_listener_hostname_fails_the_whole_set_closed() {
         None,
         None,
         &tls_policy(),
+        30,
         30,
         &[],
     )
@@ -455,6 +457,7 @@ fn conflicting_explicit_listener_claims_fail_the_runtime_snapshot_closed() {
         None,
         &tls_policy(),
         30,
+        30,
         &[],
     )
     .expect_err("a ConfigSync collision must not bypass translator withdrawal");
@@ -477,6 +480,7 @@ fn one_listener_identity_cannot_carry_inconsistent_hostnames() {
         None,
         None,
         &tls_policy(),
+        30,
         30,
         &[],
     )
@@ -507,6 +511,7 @@ fn a_mismatched_certificate_and_key_pair_is_refused() {
         None,
         &tls_policy(),
         30,
+        30,
         &[],
     );
 
@@ -516,7 +521,7 @@ fn a_mismatched_certificate_and_key_pair_is_refused() {
 #[test]
 fn an_empty_certificate_set_is_refused() {
     ensure_crypto_provider();
-    let result = load_gateway_multi_cert_tls_config(&[], None, None, &tls_policy(), 30, &[]);
+    let result = load_gateway_multi_cert_tls_config(&[], None, None, &tls_policy(), 30, 30, &[]);
     assert!(result.is_err());
 }
 
@@ -554,7 +559,7 @@ fn runtime_refuses_a_hand_built_certificate_set_over_the_admission_bound() {
         .collect();
 
     let error =
-        load_gateway_multi_cert_tls_config(&certificates, None, None, &tls_policy(), 30, &[])
+        load_gateway_multi_cert_tls_config(&certificates, None, None, &tls_policy(), 30, 30, &[])
             .expect_err("the runtime must enforce the same resident certificate bound");
     assert!(error.to_string().contains("certificate set exceeds"));
 }

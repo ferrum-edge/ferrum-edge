@@ -278,6 +278,7 @@ where
         let observability_token = mint_observability_token();
 
         let mut cmd = std::process::Command::new(gateway_binary_path());
+        cmd.arg("run");
         cmd.env("FERRUM_MODE", "file")
             .env("FERRUM_FILE_CONFIG_PATH", config_path.to_str().unwrap())
             .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())

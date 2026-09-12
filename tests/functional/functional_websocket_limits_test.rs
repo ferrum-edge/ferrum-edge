@@ -266,6 +266,7 @@ async fn start_gateway_with_retry(
         let gateway_port = free_port().await;
         let admin_port = free_port().await;
         let mut cmd = std::process::Command::new(gateway_binary_path());
+        cmd.arg("run");
         cmd.env("FERRUM_MODE", "file")
             .env("FERRUM_FILE_CONFIG_PATH", config_path)
             .env("FERRUM_PROXY_HTTP_PORT", gateway_port.to_string())

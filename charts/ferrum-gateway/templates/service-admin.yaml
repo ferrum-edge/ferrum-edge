@@ -19,8 +19,7 @@ metadata:
   name: {{ include "ferrum-gateway.adminServiceName" . }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "ferrum-gateway.labels" . | nindent 4 }}
-    app.kubernetes.io/component: gateway-admin
+    {{- include "ferrum-gateway.labels" (dict "root" . "component" "gateway-admin") | nindent 4 }}
   {{- with .Values.admin.service.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}

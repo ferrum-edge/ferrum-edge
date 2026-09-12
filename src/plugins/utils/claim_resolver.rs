@@ -48,14 +48,6 @@ pub fn parse_claim_path_value(field: &str, value: &Value, plugin: &str) -> Resul
     Ok(path.to_string())
 }
 
-/// Escape characters that could cause JSON injection in response bodies.
-pub fn html_escape(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
-}
-
 fn normalize_claim_to_vec(value: &Value) -> Vec<String> {
     match value {
         Value::String(s) => s.split_whitespace().map(ToOwned::to_owned).collect(),

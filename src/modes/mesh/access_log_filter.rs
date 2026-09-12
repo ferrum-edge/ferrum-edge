@@ -36,7 +36,7 @@ pub enum AccessLogFilterExpr {
     #[serde(rename = "min_latency_ms")]
     MinLatencyMs { value: u64 },
     #[serde(rename = "errors_only")]
-    ErrorsOnly,
+    ErrorsOnly {},
 }
 
 /// HTTP transaction fields used to evaluate access-log filters.
@@ -90,7 +90,7 @@ pub fn evaluate_access_log_filter_expr(
         AccessLogFilterExpr::StatusCodeMin { value } => ctx.response_status_code >= *value,
         AccessLogFilterExpr::StatusCodeMax { value } => ctx.response_status_code <= *value,
         AccessLogFilterExpr::MinLatencyMs { value } => ctx.latency_total_ms >= (*value as f64),
-        AccessLogFilterExpr::ErrorsOnly => ctx.is_terminal_failure,
+        AccessLogFilterExpr::ErrorsOnly {} => ctx.is_terminal_failure,
     }
 }
 
@@ -111,7 +111,7 @@ pub fn evaluate_access_log_filter_expr_for_stream(
             false
         }
         AccessLogFilterExpr::MinLatencyMs { value } => ctx.duration_ms >= (*value as f64),
-        AccessLogFilterExpr::ErrorsOnly => ctx.has_error,
+        AccessLogFilterExpr::ErrorsOnly {} => ctx.has_error,
     }
 }
 
@@ -140,7 +140,7 @@ pub fn validate_access_log_filter_expr(expr: &AccessLogFilterExpr) -> Result<(),
             AccessLogFilterExpr::StatusCodeMin { .. }
             | AccessLogFilterExpr::StatusCodeMax { .. }
             | AccessLogFilterExpr::MinLatencyMs { .. }
-            | AccessLogFilterExpr::ErrorsOnly => {}
+            | AccessLogFilterExpr::ErrorsOnly {} => {}
         }
     }
     Ok(())
@@ -571,7 +571,7 @@ fn apply_atom_to_filter(
                 })?,
             )?;
         }
-        AccessLogFilterExpr::ErrorsOnly => filter.errors_only = true,
+        AccessLogFilterExpr::ErrorsOnly {} => filter.errors_only = true,
         AccessLogFilterExpr::And { .. } | AccessLogFilterExpr::Or { .. } => {
             return Err(
                 "internal access log filter canonicalization produced an unexpected boolean node"

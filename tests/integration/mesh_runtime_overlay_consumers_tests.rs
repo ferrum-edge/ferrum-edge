@@ -1,6 +1,6 @@
 //! Integration coverage for the RTDS runtime-overlay consumer dispatch.
 //!
-//! `MeshRuntimeState::record_applied_slice` fans an accepted slice's
+//! `MeshRuntimeState::record_applied_slice_with_token` fans an accepted slice's
 //! process-wide knobs out to header transformer gates and tracing log levels.
 //! Fault percentages are request-epoch-local and covered by fault
 //! materialization/generation tests.
@@ -50,7 +50,8 @@ fn install_slice_with_overlay(state: &MeshRuntimeState, overlay: MeshRuntimeOver
         ..MeshSlice::default()
     };
     state.install_slice(slice.clone());
-    state.record_applied_slice(&slice);
+    let token = state.begin_revision_apply(&slice);
+    state.record_applied_slice_with_token(&slice, token);
 }
 
 #[test]

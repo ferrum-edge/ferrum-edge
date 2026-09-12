@@ -349,6 +349,56 @@ bare TCP accept let an unrelated H2 fixture that had claimed the released
 proxy port answer the RFC 8441 Extended CONNECT handshake and reset it
 with `PROTOCOL_ERROR` (issue #3435).
 
+## Spawned Gateway Teardown
+
+A `std::process::Child` does **not** kill its process when it is dropped. A
+bespoke spawner that only calls `shutdown_gateway(...)` on the happy path
+therefore leaks a live gateway on every early exit — an assertion panic, an
+early `return`, a `?` — and that orphan keeps its listen ports, reparented to
+init, contaminating every later run on a fixture with fixed ports (issue #4991).
+
+`tests/common/gateway_harness.rs` exports `GatewayChildGuard` for those
+spawners: wrap the child at the instant it is spawned, borrow it through
+`child_mut()` for `try_wait` readiness probes, and call `shutdown()` where the
+test wants a graceful teardown. `shutdown()` is idempotent and `Drop` runs it,
+so teardown is a property of scope rather than of reaching the last line.
+`TestGateway` already has the equivalent `Drop`. The contract is covered by
+`functional_tcp_proxy_test::test_gateway_guard_reaps_the_child_on_a_panicking_fixture`,
+which starts a real gateway, proves it relays, then panics inside
+`catch_unwind` and asserts both that the child is reaped and that its ports are
+bindable again.
+
+## Host-Dependent Socket Fixtures
+
+Three socket behaviours that Linux fixtures routinely assume are not portable
+to the macOS hosts developers build on (issue #4983). Fixtures must either
+avoid them or report the missing prerequisite explicitly — never fail as though
+the gateway were at fault:
+
+- **Secondary loopback addresses.** Linux assigns all of `127.0.0.0/8` to `lo`,
+  so `127.0.0.2` always binds. macOS assigns only `127.0.0.1` to `lo0`, and
+  binding an alias fails with `EADDRNOTAVAIL`. Where the fixture needs two
+  distinct *listen* identities, IPv6 loopback (`::1`) is the portable stand-in;
+  where it needs two IPv4 *source* addresses or two A records on one port
+  (`http2_pool_tests`, the per-source TCP cap, the UDP hook-concurrency gate),
+  probe for an alias and skip with a message naming the prerequisite. Note that
+  UDP sessions are keyed by the full client `SocketAddr`, so per-session
+  isolation only needs a second ephemeral **port**, not a second address.
+- **Refused connects.** A bound-but-unlistened TCP socket answers a SYN with
+  RST on Linux; Darwin drops it, so the connect hangs until the caller's own
+  timeout. `tests/scaffolding/ports.rs` states this as
+  `REFUSED_TCP_PORT_REFUSES_CONNECT_IMMEDIATELY`; the reservation's *ownership*
+  guarantee is unconditional, its observable failure category is not.
+- **Datagram ceilings.** macOS defaults `net.inet.udp.maxdgram` to 9216, so a
+  ~16 KiB datagram — including the record a max-size DTLS plaintext produces —
+  fails with `EMSGSIZE` before it leaves the socket. Size in-limit transport
+  probes under that ceiling and assert local size gates separately from
+  transport.
+
+Also beware `SO_REUSEADDR`: on Darwin a `127.0.0.1` listener and a `0.0.0.0`
+listener can hold one port at the same time. A fixture whose precondition is
+"the gateway cannot bind" must contest the *same* address the gateway uses.
+
 ## In-Process Test Harness
 
 The scripted-backend test harness (`tests/scaffolding/harness.rs`) ships

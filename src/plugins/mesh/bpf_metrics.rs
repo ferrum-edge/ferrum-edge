@@ -318,6 +318,11 @@ fn render_latency_histogram(
     sum: u64,
     count: u64,
 ) {
+    // Bucket and count atomics are sampled independently. If an observation
+    // lands between those loads, the finite buckets can be newer than count.
+    // Clamp the rendered count so Prometheus always sees a valid histogram
+    // whose +Inf bucket and _count cover every rendered finite bucket.
+    let rendered_count = cumulative.last().copied().unwrap_or(count).max(count);
     let _ = writeln!(out, "# HELP {prefix}_{metric} {help}");
     let _ = writeln!(out, "# TYPE {prefix}_{metric} histogram");
     for (le, &bucket_count) in BPF_LATENCY_BUCKET_LE_LABELS.iter().zip(cumulative.iter()) {
@@ -326,9 +331,12 @@ fn render_latency_histogram(
             "{prefix}_{metric}_bucket{{le=\"{le}\"}} {bucket_count}"
         );
     }
-    let _ = writeln!(out, "{prefix}_{metric}_bucket{{le=\"+Inf\"}} {count}");
+    let _ = writeln!(
+        out,
+        "{prefix}_{metric}_bucket{{le=\"+Inf\"}} {rendered_count}"
+    );
     let _ = writeln!(out, "{prefix}_{metric}_sum {sum}");
-    let _ = writeln!(out, "{prefix}_{metric}_count {count}");
+    let _ = writeln!(out, "{prefix}_{metric}_count {rendered_count}");
 }
 
 /// Every root `config` key `__mesh_bpf_metrics` reads. Unknown root keys fail

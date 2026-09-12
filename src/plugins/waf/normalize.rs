@@ -54,6 +54,12 @@ const MAX_NUMERIC_ENTITY_DIGITS: usize = 16;
 /// flag returned by [`decoded_variants_with_residual`]).
 const MAX_DECODE_ROUNDS: usize = 3;
 
+/// Maximum hex digits inside a braced `\u{...}` escape (Rust/JS both cap a
+/// scalar value at six). The terminator search in [`decode_escape`] is bounded
+/// by this before it scans, so an unterminated candidate costs constant work
+/// rather than a suffix scan the caller then repeats one byte later.
+const MAX_BRACED_ESCAPE_HEX_DIGITS: usize = 6;
+
 /// Produce normalized decodings of `text` distinct from the raw input, and
 /// report whether the layered decode left an actively-decoding residual.
 ///
@@ -109,11 +115,10 @@ pub(super) fn decoded_variants_with_residual(text: &str) -> (Vec<String>, bool) 
 /// one view. A reading the declaration does not settle — a bare
 /// `charset=utf-16` / `utf-32` with no BOM, an ambiguous `FF FE 00 00`
 /// prefix, or a charset that disagrees with the BOM — yields both candidate
-/// views, capped at [`MAX_WIDE_CHARSET_VIEWS`], and still asks the scanner to
-/// keep the raw/lossy view (`include_lossy`).
+/// views, capped at [`MAX_WIDE_CHARSET_VIEWS`]. The scanner always keeps the
+/// raw/lossy view and its transformations alongside these additional views.
 pub(super) struct WideCharsetViews {
     views: [Option<String>; MAX_WIDE_CHARSET_VIEWS],
-    include_lossy: bool,
     /// The body declares a charset this WAF cannot transcode at all (UTF-7,
     /// ISO-2022-*, HZ-GB-2312, EBCDIC). Its encoded form can hide ASCII text
     /// from the raw scan, so the caller reports it rather than treating the
@@ -125,7 +130,6 @@ impl WideCharsetViews {
     pub(super) fn empty() -> Self {
         Self {
             views: [None, None],
-            include_lossy: false,
             uninspectable_charset: false,
         }
     }
@@ -133,7 +137,6 @@ impl WideCharsetViews {
     fn resolved(text: String) -> Self {
         Self {
             views: [Some(text), None],
-            include_lossy: false,
             uninspectable_charset: false,
         }
     }
@@ -146,23 +149,12 @@ impl WideCharsetViews {
     /// coverage it had before transcoding.
     fn unresolved(first: String, second: String) -> Self {
         if first == second {
-            let mut out = Self::resolved(first);
-            out.include_lossy = true;
-            return out;
+            return Self::resolved(first);
         }
         Self {
             views: [Some(first), Some(second)],
-            include_lossy: true,
             uninspectable_charset: false,
         }
-    }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.views.iter().all(Option::is_none)
-    }
-
-    pub(super) fn include_lossy(&self) -> bool {
-        self.include_lossy
     }
 
     /// Whether the declared charset is one the WAF cannot transcode; see
@@ -230,13 +222,13 @@ enum WideEndian<E> {
     },
 }
 
-/// Decode already-admitted UTF-16 / UTF-32 request bodies into inspection
+/// Decode already-admitted UTF-16 / UTF-32 bodies into inspection
 /// views.
 ///
 /// This helper does not decide whether a body is eligible for WAF inspection;
-/// the request content-type/multipart/binary gates run before the scanner. It
-/// only creates the text views used by active request-body rules. Ordinary
-/// UTF-8 bodies return [`WideCharsetViews::empty`] without allocating.
+/// the direction-specific content-type/multipart/binary gates run first. It
+/// only creates views used by active body rules and encoding specials.
+/// Ordinary UTF-8 returns [`WideCharsetViews::empty`] without allocating.
 ///
 /// UTF-32 BOMs are recognized first (see [`utf32_bom`]): a UTF-32LE BOM is
 /// `FF FE 00 00` and would otherwise be misread as a UTF-16LE BOM. When a
@@ -260,6 +252,34 @@ pub(super) fn decode_wide_charset_body_views(
 }
 
 fn wide_charset_body_views(body: &[u8], content_type: Option<&str>) -> WideCharsetViews {
+    // With no declaration or BOM, require the NUL placement of two ASCII
+    // UTF-16 units or one ASCII UTF-32 unit in the first four octets. Do not
+    // infer a charset from arbitrary interior NULs or try every binary body.
+    // The signature selects only a width; retain both endians and raw text,
+    // using the same fixed view cap as a bare declared wide charset.
+    if charset_value(content_type).is_none()
+        && utf32_bom(body).is_none()
+        && utf16_bom(body).is_none()
+        && let [a, b, c, d, ..] = body
+    {
+        let ascii = |byte: u8| byte != 0 && byte.is_ascii();
+        if (*a == 0 && *b == 0 && *c == 0 && ascii(*d))
+            || (ascii(*a) && *b == 0 && *c == 0 && *d == 0)
+        {
+            return WideCharsetViews::unresolved(
+                decode_utf32(body, Utf32Endian::Little),
+                decode_utf32(body, Utf32Endian::Big),
+            );
+        }
+        if (*a == 0 && ascii(*b) && *c == 0 && ascii(*d))
+            || (ascii(*a) && *b == 0 && ascii(*c) && *d == 0)
+        {
+            return WideCharsetViews::unresolved(
+                decode_utf16(body, Utf16Endian::Little),
+                decode_utf16(body, Utf16Endian::Big),
+            );
+        }
+    }
     if charset_is_unspecified_utf32(content_type) && utf32_bom(body).is_none() {
         return WideCharsetViews::unresolved(
             decode_utf32(body, Utf32Endian::Little),
@@ -661,9 +681,18 @@ fn decode_escape(after: &[u8]) -> Option<(u32, usize)> {
     match after.first()? {
         b'u' | b'U' => {
             if after.get(1) == Some(&b'{') {
-                let rel = after[2..].iter().position(|&c| c == b'}')?;
-                let hex = &after[2..2 + rel];
-                if hex.is_empty() || hex.len() > 6 {
+                // Bound the terminator search BEFORE scanning. The caller
+                // advances a single byte per refused candidate, so searching
+                // the whole remaining slice for `}` here made a run of `\u{`
+                // quadratic in client-controlled text. A valid escape can only
+                // carry `MAX_BRACED_ESCAPE_HEX_DIGITS` hex digits, so a `}`
+                // further out is an over-width candidate either way and is
+                // refused after constant work.
+                let limit = MAX_BRACED_ESCAPE_HEX_DIGITS + 1;
+                let window = &after[2..after.len().min(2 + limit)];
+                let rel = window.iter().position(|&c| c == b'}')?;
+                let hex = &window[..rel];
+                if hex.is_empty() {
                     return None;
                 }
                 Some((hex_n(hex)?, 2 + rel + 1))
@@ -878,6 +907,36 @@ mod tests {
         assert_eq!(unicode_unescape(r"😀"), "\u{1F600}");
         assert_eq!(unicode_unescape(r"\u{3c}script"), "<script");
         assert_eq!(unicode_unescape(r"\x3cscript"), "<script");
+    }
+
+    #[test]
+    fn braced_unicode_escape_refuses_an_over_width_candidate_in_constant_work() {
+        // Six hex digits is the ceiling, so the widest valid escape decodes...
+        assert_eq!(unicode_unescape(r"\u{10FFFF}"), "\u{10FFFF}");
+        // ...and a seventh digit is refused, leaving the literal backslash.
+        assert_eq!(unicode_unescape(r"\u{1000000}"), r"\u{1000000}");
+        // A terminator beyond the ceiling is refused without being searched
+        // for: `decode_escape` never inspects past the bounded window.
+        assert_eq!(decode_escape(b"u{1234567}"), None);
+        assert_eq!(decode_escape(b"u{}"), None);
+        assert_eq!(decode_escape(b"u{3c}"), Some((0x3c, 5)));
+    }
+
+    #[test]
+    fn unterminated_braced_escapes_do_not_scan_the_whole_remaining_input() {
+        // The caller advances one byte per refused candidate, so an unbounded
+        // terminator search here is quadratic in client-controlled text. This
+        // input is a pure passthrough after the bound; before it, the same
+        // input cost ~10^11 byte comparisons (GHSA-27g8-5rv5-m3pf).
+        let payload = r"\u{".repeat(350_000);
+        let started = std::time::Instant::now();
+        let decoded = unicode_unescape(&payload);
+        assert_eq!(decoded, payload);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "bounded escape parsing must stay linear, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

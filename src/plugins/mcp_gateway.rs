@@ -5,8 +5,11 @@
 //! discovery catalogs in aggregate-router mode, and routes namespaced MCP tool,
 //! resource, and prompt calls to configured upstream MCP servers.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use crate::fips::approved::Sha256;
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures_util::StreamExt;
@@ -16,18 +19,22 @@ use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
 use url::Url;
 
-use crate::config::types::{BackendScheme, BackendTlsConfig};
+use crate::config::types::{BackendScheme, BackendTlsConfig, Consumer};
 use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::mcp_aggregate_sse::{
     AggregateSseBounds, AggregateSseBroker, AggregateSseError, StreamIdentity,
 };
-use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext};
+use super::{
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
+    meaningful_identity,
+};
 
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
 const DEFAULT_SESSION_TTL_SECONDS: u64 = 3600;
@@ -77,6 +84,16 @@ const MCP_SSE_SESSION_UNAVAILABLE: i64 = -32013;
 const MAX_OUTPUT_SCHEMA_DEPTH: usize = 32;
 /// Maximum JSON nodes admitted while auditing a discovered tool `outputSchema`.
 const MAX_OUTPUT_SCHEMA_NODES: usize = 20_000;
+
+/// Process-wide `mcp_gateway` instance sequence.
+///
+/// Several instances may serve one proxy on disjoint `endpoint.path` scopes,
+/// and all of them are invoked on every response phase of every request, so the
+/// response phases need a positive identity for the instance that admitted a
+/// request rather than re-deriving one from a path a route rewrite can rebase.
+/// Monotonic and never reused, so a reloaded generation is never mistaken for
+/// the predecessor it replaced.
+static MCP_GATEWAY_INSTANCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Authoritative closed sets of `mcp_gateway` configuration keys.
 const MCP_CONFIG_KEYS: &[&str] = &[
@@ -141,13 +158,8 @@ const MCP_VALIDATION_KEYS: &[&str] = &[
     "validate_tool_arguments",
     "validate_tool_results",
 ];
-const MCP_OBSERVABILITY_KEYS: &[&str] = &[
-    "emit_metadata",
-    "log_argument_hash",
-    "log_raw_arguments",
-    "log_raw_results",
-    "log_result_hash",
-];
+const MCP_OBSERVABILITY_KEYS: &[&str] =
+    &["emit_metadata", "log_argument_hash", "log_raw_arguments"];
 const MCP_SERVER_KEYS: &[&str] = &[
     "enabled",
     "expose_prompts",
@@ -313,10 +325,23 @@ struct McpSessionConfig {
     initialize_upstreams: InitializeStrategy,
     session_ttl: Duration,
     max_sessions: usize,
-    /// When true (default), aggregate-router GET with `Accept: text/event-stream`
-    /// attaches a multiplexed SSE listener. When false, GET keeps the legacy
-    /// 405 rejection so operators can disable multiplexing without changing
-    /// mode. Transparent mode never uses this flag.
+    /// When true, the aggregate router serves the event-stream half of MCP
+    /// Streamable HTTP: a GET with `Accept: text/event-stream` attaches the one
+    /// multiplexed server-message listener for the downstream session, and a
+    /// POST whose JSON-RPC result had to be fetched is answered with its OWN
+    /// `text/event-stream` response on that same POST.
+    ///
+    /// Response placement follows the advertised transport exactly. A POST
+    /// carrying a request is answered on that POST — `application/json` when
+    /// the gateway already holds the result, its own event stream when it does
+    /// not — `202` stays reserved for a POST carrying only notifications and
+    /// responses, and the session GET stream never carries a response to a
+    /// request that arrived on a POST.
+    ///
+    /// Defaults to **false** because the listener surface is optional: with it
+    /// off, aggregate GET keeps its 405 and every request is answered with
+    /// `application/json` on its own POST, which is equally conforming.
+    /// Transparent mode never uses this flag.
     sse_multiplexing: bool,
     sse_bounds: AggregateSseBounds,
 }
@@ -373,15 +398,14 @@ struct McpValidationConfig {
     max_batch_response_bytes: usize,
 }
 
+/// Result-side observation knobs are deliberately absent: `log_raw_results`
+/// and `log_result_hash` had no producer anywhere in the plugin, so they are
+/// rejected as unknown keys rather than accepted and ignored.
 #[derive(Debug, Clone)]
 struct McpObservabilityConfig {
     emit_metadata: bool,
     log_raw_arguments: bool,
     log_argument_hash: bool,
-    #[allow(dead_code)] // Parsed for V1 config compatibility; result logging is not emitted in V1.
-    log_raw_results: bool,
-    #[allow(dead_code)] // Parsed for V1 config compatibility; result hashing is not emitted in V1.
-    log_result_hash: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -429,6 +453,8 @@ impl McpMessageKind {
 struct McpEnvelope {
     jsonrpc: String,
     id: Option<Value>,
+    raw_id: Option<Box<RawValue>>,
+    raw_cancel_id: Option<Box<RawValue>>,
     method: Option<String>,
     params: Option<Value>,
     #[allow(dead_code)] // Kept in the parsed envelope shape for response classification.
@@ -447,11 +473,174 @@ struct McpEnvelope {
 /// oversized attacker-controlled id can be neither cloned nor reflected.
 enum BatchMember {
     /// The raw slice was within the per-member cap and materialized cleanly.
-    Admitted(Value),
+    Admitted(Value, Option<Box<RawValue>>, Option<Box<RawValue>>),
     /// The raw slice exceeded the per-member cap (or could not be
     /// materialized). Yields a bounded `id: null` Invalid Request at this
     /// member's input position.
     Rejected,
+}
+
+impl BatchMember {
+    fn raw_id(&self) -> Option<&RawValue> {
+        match self {
+            Self::Admitted(_, id, _) => id.as_deref(),
+            Self::Rejected => None,
+        }
+    }
+}
+
+/// Read an envelope field without ever converting a numeric token to f64.
+fn raw_json_rpc_field<'a>(body: &'a [u8], field: &str) -> Option<&'a RawValue> {
+    let object: BTreeMap<String, &RawValue> = serde_json::from_slice(body).ok()?;
+    object.get(field).copied()
+}
+
+/// Both raw tokens the correlation paths need, from ONE top-level pass.
+///
+/// `id` correlates the response, `params.requestId` names the stream a
+/// `notifications/cancelled` cancels. Reading them separately would re-walk a
+/// body that may be megabytes of `tools/call` arguments for each field.
+fn raw_json_rpc_correlation_ids(body: &[u8]) -> (Option<Box<RawValue>>, Option<Box<RawValue>>) {
+    let Ok(object) = serde_json::from_slice::<BTreeMap<String, &RawValue>>(body) else {
+        return (None, None);
+    };
+    let id = object.get("id").copied().map(ToOwned::to_owned);
+    let cancel_id = object
+        .get("params")
+        .and_then(|params| raw_json_rpc_field(params.get().as_bytes(), "requestId"))
+        .map(ToOwned::to_owned);
+    (id, cancel_id)
+}
+
+/// Byte ceiling on a client-controlled JSON-RPC id token reflected verbatim
+/// into a gateway-authored singleton response.
+///
+/// The batch path is already bounded by `validation.max_batch_response_bytes`
+/// and the SSE identity by `sessions.sse_max_stream_id_bytes`, but a singleton
+/// refusal has no such budget: without this bound a multi-megabyte id would be
+/// mirrored back at request size. An id past the bound is refused with a fixed
+/// `-32600` that does not echo it.
+const MCP_MAX_REFLECTED_ID_BYTES: usize = 4096;
+
+/// Keep the original id token while serializing a mediated envelope. This is
+/// deliberately local to MCP; all other JSON values retain their existing
+/// serde_json semantics. Neither ids nor raw payloads are logged.
+struct JsonRpcWithRawId<'a> {
+    value: &'a Value,
+    id: Option<&'a RawValue>,
+    /// Whether a `null` id in `value` is also replaced by the raw token.
+    ///
+    /// Ordinary mediation must NOT: a notification and a deliberately id-less
+    /// refusal both carry `id: null`, and inventing an id for them would
+    /// misattribute the response. Only a terminal that has no other way to
+    /// name the request it answers — see [`correlate_response_id`] — opts in.
+    replace_null_id: bool,
+}
+
+impl<'a> JsonRpcWithRawId<'a> {
+    fn preserving(value: &'a Value, id: Option<&'a RawValue>) -> Self {
+        Self {
+            value,
+            id,
+            replace_null_id: false,
+        }
+    }
+}
+
+impl serde::Serialize for JsonRpcWithRawId<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let Some(object) = self.value.as_object() else {
+            return serde::Serialize::serialize(self.value, serializer);
+        };
+        let mut map = serializer.serialize_map(Some(object.len()))?;
+        for (key, value) in object {
+            if key == "id"
+                && (self.replace_null_id || !value.is_null())
+                && let Some(id) = self.id
+            {
+                map.serialize_entry(key, id)?;
+                continue;
+            }
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
+}
+
+/// Re-emit `result`'s JSON-RPC id as the exact token `id` carried on the wire,
+/// leaving a legitimately `null` id alone.
+fn restore_response_id(result: PluginResult, id: Option<&RawValue>) -> PluginResult {
+    rewrite_response_id(result, id, false)
+}
+
+/// As [`restore_response_id`], but also names `id` on a response that would
+/// otherwise carry `id: null`. Reserved for a gateway-authored terminal that
+/// replaces an answer the client is still waiting on: an uncorrelated refusal
+/// leaves that call pending forever.
+fn correlate_response_id(result: PluginResult, id: &RawValue) -> PluginResult {
+    rewrite_response_id(result, Some(id), true)
+}
+
+fn rewrite_response_id(
+    result: PluginResult,
+    id: Option<&RawValue>,
+    replace_null_id: bool,
+) -> PluginResult {
+    let Some(id) = id else {
+        return result;
+    };
+    let PluginResult::Reject {
+        status_code,
+        body,
+        headers,
+    } = result
+    else {
+        return result;
+    };
+    if id.get().len() > MCP_MAX_REFLECTED_ID_BYTES {
+        return json_rpc_error(
+            None,
+            -32600,
+            "Invalid MCP JSON-RPC request",
+            Some("JSON-RPC id exceeded the reflected-id byte bound".to_string()),
+        );
+    }
+    // serde already emitted the same token: a `tools/list` catalog response can
+    // be megabytes, and re-parsing plus re-serializing it to reach an identical
+    // result is pure cost. The shallow field scan borrows, so nothing but the
+    // token itself is materialized.
+    let already_emitted =
+        raw_json_rpc_field(body.as_bytes(), "id").is_some_and(|current| current.get() == id.get());
+    if already_emitted {
+        return PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        };
+    }
+    let Ok(value) = serde_json::from_str::<Value>(&body) else {
+        return PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        };
+    };
+    match serde_json::to_string(&JsonRpcWithRawId {
+        value: &value,
+        id: Some(id),
+        replace_null_id,
+    }) {
+        Ok(body) => PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        },
+        Err(_) => json_rpc_error(None, -32603, "MCP response serialization failed", None),
+    }
 }
 
 #[derive(Clone)]
@@ -490,7 +679,19 @@ struct PromptCatalogEntry {
     upstream_name: String,
     server_id: String,
     namespace: String,
+    title: Option<String>,
     description: Option<String>,
+    /// The MCP `Prompt.arguments` array exactly as the upstream declared it
+    /// (`name`, optional `title` / `description`, optional `required`).
+    ///
+    /// This is what a client reads to know which values to collect before
+    /// calling `prompts/get`, so it is retained and republished verbatim.
+    /// Argument names are prompt-local, not catalog-global, and are therefore
+    /// never namespaced. A non-array value is not a conforming argument list
+    /// and is dropped rather than republished under the standard field name.
+    arguments: Option<Value>,
+    /// Nonstandard upstream-declared `argumentsSchema`, carried through
+    /// unchanged for upstreams that publish one alongside `arguments`.
     arguments_schema: Option<Value>,
     enabled: bool,
     #[allow(dead_code)] // Stored for drift/operational metadata extensions.
@@ -667,6 +868,70 @@ enum McpCatalogError {
     Refresh(String),
 }
 
+/// Authenticated principal that minted a downstream MCP session.
+///
+/// A downstream session is the gateway's per-user isolation boundary: it owns a
+/// private discovery catalog and the mediated upstream sessions reached through
+/// it. Binding the session to the principal that created it keeps the session id
+/// from being a pure bearer capability that any caller who learns it can reuse.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum McpSessionPrincipal {
+    /// Gateway-mapped `Consumer`, keyed by namespace plus the stable record id
+    /// (falling back to the username when the record carries no id).
+    Consumer { namespace: String, key: String },
+    /// Externally authenticated identity with no `Consumer` mapping, as set by
+    /// plugins such as `jwks_auth`.
+    Identity(String),
+}
+
+impl McpSessionPrincipal {
+    /// Consumer comparison key: the stable id when present, else the username.
+    fn consumer_key(consumer: &Consumer) -> &str {
+        if consumer.id.trim().is_empty() {
+            consumer.username.as_str()
+        } else {
+            consumer.id.as_str()
+        }
+    }
+
+    /// Whether this request carries any authenticated principal at all. A proxy
+    /// with no authentication plugin has none, and session binding is a no-op
+    /// there rather than a refusal.
+    fn context_has_principal(ctx: &RequestContext) -> bool {
+        ctx.identified_consumer.is_some()
+            || meaningful_identity(ctx.authenticated_identity.as_deref()).is_some()
+    }
+
+    /// Resolve the principal to bind, preferring a gateway-mapped Consumer over
+    /// an external identity, matching `RequestContext::effective_identity`.
+    /// Allocates once per session mint, never on the reuse path.
+    fn from_context(ctx: &RequestContext) -> Option<Self> {
+        if let Some(consumer) = ctx.identified_consumer.as_ref() {
+            return Some(Self::Consumer {
+                namespace: consumer.namespace.clone(),
+                key: Self::consumer_key(consumer).to_string(),
+            });
+        }
+        meaningful_identity(ctx.authenticated_identity.as_deref())
+            .map(|identity| Self::Identity(identity.to_string()))
+    }
+
+    /// Compare the bound principal against the current request without
+    /// allocating: this runs on every session reuse.
+    fn matches_context(&self, ctx: &RequestContext) -> bool {
+        let consumer = ctx.identified_consumer.as_deref();
+        let identity = meaningful_identity(ctx.authenticated_identity.as_deref());
+        match self {
+            Self::Consumer { namespace, key } => consumer.is_some_and(|current| {
+                current.namespace == *namespace && Self::consumer_key(current) == key.as_str()
+            }),
+            // A Consumer-mapped caller is a different principal even when the
+            // mapped username equals the external identity string.
+            Self::Identity(bound) => consumer.is_none() && identity == Some(bound.as_str()),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct DownstreamMcpSession {
     #[allow(dead_code)] // Useful in snapshots/debug views; map key is used for lookup.
@@ -674,6 +939,9 @@ struct DownstreamMcpSession {
     protocol_version: String,
     client_info: Option<Value>,
     client_capabilities: Option<Value>,
+    /// Principal that created this session, or `None` when the request carried
+    /// no authenticated principal (deployments with no authentication plugin).
+    principal: Option<McpSessionPrincipal>,
     upstream_sessions: HashMap<String, UpstreamMcpSession>,
     catalog: Arc<RwLock<McpCatalog>>,
     // Per-session catalog refresh lock: serializes discovery for *this* session's
@@ -698,6 +966,9 @@ struct UpstreamMcpSession {
 
 /// MCP-aware gateway/router plugin.
 pub struct McpGateway {
+    /// Identity this instance stamps onto the requests it admits, so its own
+    /// response-phase policies apply to those requests and to no others.
+    instance_id: u64,
     enabled: bool,
     mode: McpGatewayMode,
     endpoint_path: String,
@@ -749,6 +1020,16 @@ impl McpGateway {
         let endpoint_path = optional_string_from_object(endpoint, "path")?
             .ok_or_else(|| "mcp_gateway: 'endpoint.path' is required".to_string())?;
         validate_path(&endpoint_path, "endpoint.path")?;
+        // The endpoint reserves its whole slash-delimited subtree, so a root
+        // endpoint would reserve the entire origin and 404 every other handler
+        // on the proxy. Refuse it at admission rather than discovering it as a
+        // total outage on the first request after a reload.
+        if endpoint_path == "/" {
+            return Err(
+                "mcp_gateway: 'endpoint.path' must not be '/': an MCP endpoint reserves its whole path subtree, so a root endpoint would refuse every other request on this proxy; use a sub-path such as '/mcp'"
+                    .to_string(),
+            );
+        }
 
         let supported_protocol_versions =
             optional_string_vec_from_object(endpoint, "protocol_versions")?
@@ -778,6 +1059,39 @@ impl McpGateway {
                 "mcp_gateway: 'validation.validate_tool_results' requires mode 'aggregate_router' because transparent_proxy has no mediated tool catalog"
                     .to_string(),
             );
+        }
+        if mode == McpGatewayMode::TransparentProxy {
+            // Presence matters: even an explicit default must not promise a
+            // catalog policy that this mode cannot enforce.
+            for (section, fields) in [
+                (
+                    "policy",
+                    &["default_action", "tools", "hide_denied_tools"][..],
+                ),
+                (
+                    "discovery",
+                    &[
+                        "aggregate_prompts",
+                        "aggregate_resources",
+                        "aggregate_tools",
+                        "cache_ttl_seconds",
+                        "hide_denied_items",
+                        "namespace_separator",
+                        "on_new_tool",
+                        "on_schema_change",
+                    ][..],
+                ),
+            ] {
+                if let Some(config) = optional_object(object, section)? {
+                    for field in fields {
+                        if config.contains_key(*field) {
+                            return Err(format!(
+                                "mcp_gateway: '{section}.{field}' requires mode 'aggregate_router' because transparent_proxy has no mediated tool catalog"
+                            ));
+                        }
+                    }
+                }
+            }
         }
         let servers = parse_servers(object, sessions.initialize_upstreams)?;
         if servers.is_empty() {
@@ -875,6 +1189,7 @@ impl McpGateway {
         // the live per-session `McpCatalog`, not from `config`; see
         // `response_presentation_policy`.
         Ok(Self {
+            instance_id: MCP_GATEWAY_INSTANCE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
             enabled,
             mode,
             endpoint_path,
@@ -899,13 +1214,42 @@ impl McpGateway {
         ctx.path == self.endpoint_path
     }
 
+    fn within_endpoint_scope(&self, ctx: &RequestContext) -> bool {
+        let scope = self.endpoint_path.trim_end_matches('/');
+        ctx.path == scope
+            || ctx
+                .path
+                .strip_prefix(scope)
+                .is_some_and(|tail| tail.starts_with('/'))
+    }
+
+    /// Claim this request for this instance. Called once, from the same
+    /// `before_proxy` guard that decides this instance serves the request.
+    fn claim_request(&self, ctx: &mut RequestContext) {
+        ctx.mcp_owner_instance = Some(self.instance_id);
+    }
+
+    /// Whether this instance admitted this request and may therefore act on it
+    /// in the response phases.
+    ///
+    /// Every configured `mcp_gateway` instance is invoked on every response
+    /// phase, so without this an instance scoped to `/a` would consume the
+    /// private claims staged by the instance scoped to `/b` and enforce its own
+    /// `validation.max_upstream_response_bytes` against them — and a sibling
+    /// whose inner `config.enabled` is `false` would do so while configured off.
+    fn owns_request(&self, ctx: &RequestContext) -> bool {
+        self.enabled && ctx.mcp_owner_instance == Some(self.instance_id)
+    }
+
+    /// Whether a request body may be read as JSON.
+    ///
+    /// Media types and subtypes are case-insensitive (RFC 9110 8.3.1), so this
+    /// shares the one classifier the response side already uses rather than
+    /// keeping a second, stricter copy: `application/vnd.audit+JSON` names the
+    /// same media type as `application/vnd.audit+json` and must be admitted
+    /// identically. A request with no `Content-Type` at all is still admitted.
     fn content_type_is_json(headers: &HashMap<String, String>) -> bool {
-        header_value(headers, "content-type").is_none_or(|value| {
-            let media_type = value.split(';').next().unwrap_or(value).trim();
-            media_type.eq_ignore_ascii_case("application/json")
-                || media_type.eq_ignore_ascii_case("application/json-rpc")
-                || media_type.ends_with("+json")
-        })
+        header_value(headers, "content-type").is_none_or(mcp_content_type_is_json)
     }
 
     /// Whether the raw request body is shaped like a JSON-RPC batch, decided
@@ -1214,11 +1558,41 @@ impl McpGateway {
         session.last_seen.elapsed() >= self.sessions.session_ttl
     }
 
+    /// Whether the caller may reuse this downstream session.
+    ///
+    /// A session minted under an authenticated principal is usable only by that
+    /// same principal; possession of the session id alone is not sufficient. A
+    /// session minted with no principal (a proxy with no authentication plugin)
+    /// stays usable only while the request likewise carries no principal, so the
+    /// check is a no-op for unauthenticated deployments and fail-closed
+    /// otherwise. An unknown session id is left to the liveness check, which
+    /// produces the existing error.
+    fn downstream_session_principal_matches(
+        &self,
+        downstream_session_id: &str,
+        ctx: &RequestContext,
+    ) -> bool {
+        match self.session_store.get(downstream_session_id) {
+            Some(session) => match session.principal.as_ref() {
+                Some(principal) => principal.matches_context(ctx),
+                None => !McpSessionPrincipal::context_has_principal(ctx),
+            },
+            None => true,
+        }
+    }
+
     async fn touch_downstream_session(
         &self,
         downstream_session_id: &str,
         ctx: &RequestContext,
     ) -> bool {
+        // Session ownership is checked before liveness so a caller presenting
+        // someone else's session id can neither extend its idle lifetime nor
+        // observe whether it exists: a mismatch is refused with exactly the
+        // same "session not found" shape as an unknown id.
+        if !self.downstream_session_principal_matches(downstream_session_id, ctx) {
+            return false;
+        }
         let expired = self
             .session_store
             .get(downstream_session_id)
@@ -1276,6 +1650,10 @@ impl McpGateway {
         client_capabilities: Option<Value>,
     ) -> Result<String, AggregateSseError> {
         let downstream_session_id = uuid::Uuid::new_v4().to_string();
+        // Bind the session to the principal that minted it. Resolved before the
+        // admission critical section so the only work under the lock stays the
+        // in-memory scan/insert.
+        let principal = McpSessionPrincipal::from_context(ctx);
 
         // Enforce the cap and reclaim sessions atomically, but keep upstream
         // DELETE I/O *out* of the critical section. Under the admission lock we do
@@ -1344,6 +1722,7 @@ impl McpGateway {
                     protocol_version,
                     client_info,
                     client_capabilities,
+                    principal,
                     upstream_sessions,
                     catalog: Arc::clone(&catalog),
                     catalog_refresh_lock: Arc::new(Mutex::new(())),
@@ -1760,6 +2139,14 @@ impl McpGateway {
 
     /// Aggregate-router GET: attach the one multiplexed SSE listener for a live
     /// downstream session. Transparent mode never reaches this path.
+    ///
+    /// A freshly attached listener is the MCP server-to-client channel: it never
+    /// carries the response to a request that arrived on a POST, because that
+    /// answer belongs to the POST connection and
+    /// [`Self::deliver_deferred_response_on_post`] is the only place a JSON-RPC
+    /// response is written. A `GET` bearing `Last-Event-ID` is the one exception
+    /// the transport allows — that is resumption of a stream an earlier POST
+    /// began, so the retained replay window is served from the same ring.
     async fn handle_aggregate_sse_get(
         &self,
         ctx: &mut RequestContext,
@@ -1823,22 +2210,29 @@ impl McpGateway {
     }
 
     /// Record how this request's JSON-RPC response was finally delivered:
-    /// `multiplexed` on the event stream, `inline` on the POST, or `suppressed`
-    /// because the client cancelled it. Fixed tokens only.
+    /// `post_stream` on the POST's own event stream, `inline` as
+    /// `application/json` on the POST, or `suppressed` because the client
+    /// cancelled it. Fixed tokens only.
     fn note_sse_delivery(ctx: &mut RequestContext, outcome: &str) {
         Self::note_metadata(ctx, "mcp.sse.delivery", outcome);
     }
 
-    /// Whether this dispatch may multiplex its terminal JSON-RPC response.
+    /// Whether this dispatch may answer with a POST-attached event stream.
     ///
     /// Notification-form messages produce no JSON-RPC response at all, batch
     /// members are assembled into one HTTP response array by the batch
-    /// restriction, and `initialize` answers with the session header an event
-    /// stream cannot carry (and has no session to attach to yet). None of those
-    /// may open a stream identity.
-    fn sse_multiplex_eligible(
+    /// restriction, and `initialize` answers with the session header this
+    /// gateway stamps on the ordinary JSON reply. None of those may open a
+    /// stream identity.
+    ///
+    /// The client's `Accept` is load bearing rather than advisory. MCP requires
+    /// a client to accept both `application/json` and `text/event-stream`, and
+    /// the server picks; a client that offered only JSON is answered with JSON
+    /// (RFC 9110 12.5.1) instead of a representation it said it cannot read.
+    fn sse_post_stream_eligible(
         &self,
         ctx: &RequestContext,
+        headers: &HashMap<String, String>,
         envelope: &McpEnvelope,
         method: &str,
     ) -> bool {
@@ -1848,16 +2242,22 @@ impl McpGateway {
             && envelope.id.is_some()
             && !self.batch_forbids_upstream(ctx)
             && method != "initialize"
+            && super::mcp_aggregate_sse::headers_request_aggregate_sse(headers)
     }
 
-    /// Open the multiplexed request stream for this dispatch, BEFORE the method
+    /// Open the request stream identity for this dispatch, BEFORE the method
     /// handler runs any catalog refresh, upstream initialize, or backend
     /// dispatch.
     ///
     /// Opening here is what makes cancellation meaningful: a concurrent
     /// `notifications/cancelled` on another connection finds a genuinely open
     /// stream while this one is still doing its slow work, and the eventual
-    /// response is then suppressed instead of being published late.
+    /// response is then suppressed instead of being written late.
+    ///
+    /// A session `GET` listener is deliberately NOT a precondition. The stream
+    /// this identity governs is the POST's own response stream, so a client that
+    /// never opens the listener still gets Streamable HTTP delivery, per-session
+    /// concurrency bounds, duplicate-id refusal, and cancellation.
     ///
     /// Every refusal falls back to the ordinary inline JSON response. An id
     /// that is not a representable identity is never coerced into one, so a
@@ -1869,20 +2269,17 @@ impl McpGateway {
         envelope: &McpEnvelope,
         method: &str,
     ) {
-        if !self.sse_multiplex_eligible(ctx, envelope, method) {
+        if !self.sse_post_stream_eligible(ctx, headers, envelope, method) {
             return;
         }
         let Some(session_id) = self.downstream_session_id_from_headers(headers) else {
             return;
         };
-        if !self.sse_broker.has_listener(&session_id) {
-            return;
-        }
-        let Some(id) = envelope.id.as_ref() else {
+        let Some(id) = envelope.raw_id.as_deref() else {
             return;
         };
         let max_id_bytes = self.sessions.sse_bounds.max_stream_id_bytes;
-        let identity = match StreamIdentity::from_json_rpc_id(id, max_id_bytes) {
+        let identity = match StreamIdentity::from_raw_json_rpc_id(id, max_id_bytes) {
             Ok(identity) => identity,
             Err(error) => {
                 Self::note_sse_error(ctx, error);
@@ -1903,9 +2300,10 @@ impl McpGateway {
     ///
     /// Bare status responses (the `404` that asks a client to re-initialize,
     /// the `202` notification acknowledgement) and any response carrying a
-    /// downstream session header are NOT multiplexable: an event stream cannot
-    /// convey either, so they stay on the POST.
-    fn is_multiplexable_dispatch_response(
+    /// downstream session header are NOT that: they are transport-level
+    /// answers a cancellation must never replace with an empty event stream, so
+    /// they are returned exactly as dispatch authored them.
+    fn is_terminal_json_rpc_dispatch_response(
         &self,
         status_code: u16,
         body: &str,
@@ -1920,37 +2318,29 @@ impl McpGateway {
         header_value(headers, "content-type").is_some_and(mcp_content_type_is_json)
     }
 
-    /// Decide how a gateway-authored terminal response will be delivered, and
-    /// STAGE the multiplexable ones for the response lifecycle. Nothing is ever
-    /// published from here.
+    /// Deliver a dispatch result whose JSON-RPC answer the gateway ALREADY
+    /// holds: it stays a plain `application/json` reply on the POST.
     ///
-    /// `before_proxy` runs long before any response phase has seen these bytes.
-    /// Publishing an event here — and replacing the POST with an empty `202` —
-    /// would put a gateway-authored JSON-RPC payload on the wire that a
-    /// configured response-body WAF rule, `body_validator` response schema,
-    /// `ai_response_guard` redaction, response transform, or the authoritative
-    /// final client-visible body/header policy never inspected, while those
-    /// policies ran over the empty `202` instead. Upstream-routed responses have
-    /// always published from the final phase; this keeps both producers on the
-    /// same governed representation.
+    /// This is the "ready" half of the Streamable HTTP rule. `tools/list`,
+    /// `prompts/list`, `resources/list`, `ping`, and every gateway-authored
+    /// JSON-RPC error are complete the moment `before_proxy` returns them, so
+    /// there is nothing to wait for and no reason to open an event stream: the
+    /// response is written to the POST as JSON, and the request's stream
+    /// identity is settled here rather than carried through the response
+    /// lifecycle.
     ///
-    /// So a multiplexable response is returned UNCHANGED with its stream lease
-    /// still on the context. Ferrum's synthetic-response lifecycle carries those
-    /// exact bytes through every response phase, and
-    /// [`Self::multiplex_final_response`] — reached from
-    /// `on_final_response_body` on that same lifecycle — reserves whatever
-    /// representation the client is actually allowed to receive. Publication
-    /// waits for `on_response_committed`, after the POST-side acknowledgement
-    /// has survived final header policy; otherwise the governed response stays
-    /// inline.
+    /// `PluginResult::Continue` is the "deferred" half: the request is being
+    /// routed upstream and its result does not exist yet, so the lease stays on
+    /// the context and [`Self::deliver_deferred_response_on_post`] owns the
+    /// terminal decision once the governed bytes exist.
     ///
-    /// Keeping the lease open until then also keeps cancellation meaningful for
-    /// the whole of the response lifecycle, not just up to dispatch.
-    ///
-    /// `PluginResult::Continue` means the request is being routed upstream and
-    /// its response does not exist yet, so the lease likewise stays on the
-    /// context and the same final-phase decision owns it.
-    fn deliver_dispatch_result_via_sse(
+    /// A cancellation that landed while the gateway was producing a ready
+    /// result is still honoured — the answer becomes an event stream that
+    /// closes carrying no message — but only for a real JSON-RPC response.
+    /// Transport-level answers (the `404` that asks a client to re-initialize,
+    /// a `202` acknowledgement, an `initialize` reply carrying the session
+    /// header) are returned exactly as dispatch authored them.
+    fn deliver_ready_dispatch_result(
         &self,
         ctx: &mut RequestContext,
         result: PluginResult,
@@ -1964,21 +2354,22 @@ impl McpGateway {
                 body,
                 headers,
             } => (status_code, body, headers),
-            // `Continue` routes this request upstream, so its response does not
-            // exist yet: keep the lease and let the response-side hook own the
-            // terminal decision. Any other shape is likewise returned untouched
-            // with the lease reinstalled, so the context drop still releases the
-            // identity exactly once.
-            other => {
+            // Routed upstream: the response does not exist yet, so keep the
+            // lease and let the response-side hook own the terminal decision.
+            PluginResult::Continue => {
                 ctx.mcp_sse_stream = Some(stream);
+                return PluginResult::Continue;
+            }
+            // No aggregate dispatch arm authors a binary short-circuit, but a
+            // future one must still release the identity exactly once rather
+            // than silently retaining a lease no phase will settle.
+            other => {
+                stream.settle_inline();
+                Self::note_sse_delivery(ctx, "inline");
                 return other;
             }
         };
-        if !self.is_multiplexable_dispatch_response(status_code, &body, &headers) {
-            // A bare status response or a session-header-bearing reply can
-            // never become an event, and no later response phase can turn it
-            // into one. Release the identity now rather than carrying a lease
-            // the final phase would only settle.
+        if !self.is_terminal_json_rpc_dispatch_response(status_code, &body, &headers) {
             stream.settle_inline();
             Self::note_sse_delivery(ctx, "inline");
             return PluginResult::Reject {
@@ -1987,36 +2378,60 @@ impl McpGateway {
                 headers,
             };
         }
-        // Staged, not published. `mcp.route_decision` records the DISPATCH
-        // decision; `mcp.sse.delivery`, written at reservation refusal or the
-        // committed boundary, is the authoritative delivery outcome.
-        ctx.mcp_sse_stream = Some(stream);
-        Self::note_route_decision(ctx, "sse_multiplex");
-        PluginResult::Reject {
-            status_code,
-            body,
-            headers,
+        match stream.settle_for_inline_response() {
+            Err(AggregateSseError::StreamCancelled) => {
+                Self::note_sse_error(ctx, AggregateSseError::StreamCancelled);
+                Self::note_route_decision(ctx, "sse_cancelled");
+                Self::note_sse_delivery(ctx, "suppressed");
+                Self::post_attached_stream_response(
+                    super::mcp_aggregate_sse::post_attached_stream_without_response(),
+                )
+            }
+            _ => {
+                Self::note_sse_delivery(ctx, "inline");
+                PluginResult::Reject {
+                    status_code,
+                    body,
+                    headers,
+                }
+            }
         }
     }
 
-    /// Reserve the FINAL governed JSON-RPC response for the session's SSE
-    /// listener and select the POST-side empty `202`.
+    /// The POST-attached `text/event-stream` response for one JSON-RPC request.
     ///
-    /// One decision point for both producers: an upstream-routed response and a
-    /// gateway-authored one staged by [`Self::deliver_dispatch_result_via_sse`]
-    /// arrive here identically, after normalization, response-body
-    /// inspection/guardrails, semantic response transforms, and the
-    /// authoritative final client-visible body policy have produced the exact
-    /// representation the client is allowed to receive.
+    /// Ordinary buffered representation: the whole stream is known when it is
+    /// framed, so it is written and closed like any other short-circuit body on
+    /// HTTP/1.1, HTTP/2, and native HTTP/3 alike. The session's long-lived `GET`
+    /// listener is the only streaming body this plugin produces, and it is
+    /// reached through a different (empty-bodied) rejection.
+    fn post_attached_stream_response(body: Bytes) -> PluginResult {
+        PluginResult::RejectBinary {
+            status_code: 200,
+            body,
+            headers: sse_listener_headers(),
+        }
+    }
+
+    /// Answer a DEFERRED request on its own POST-attached event stream.
     ///
-    /// Nothing becomes listener-visible here. A successful admission stores a
-    /// private RAII publication on the request context; the observe-only
-    /// committed hook publishes it only if the empty `202` survives the final
-    /// response-header lifecycle. This keeps a gateway-authored synthetic
-    /// response from escaping a policy that replaces that acknowledgement after
-    /// the body hook, while shared broker reservation accounting makes the
-    /// eventual commit capacity-infallible.
-    fn multiplex_final_response(
+    /// This is the terminal decision for every request whose result had to be
+    /// fetched — `tools/call`, `prompts/get`, `resources/read`, and every
+    /// passthrough method routed to the primary upstream. It runs after
+    /// normalization, response-body inspection/guardrails, semantic response
+    /// transforms, and the authoritative final client-visible body policy have
+    /// produced the exact representation the client is allowed to receive, so
+    /// the event carries precisely the bytes an inline JSON answer would have
+    /// carried.
+    ///
+    /// The stream is the POST's own response, so there is no cross-connection
+    /// visibility to guard and no two-phase reservation: a later header or
+    /// response policy that replaces this representation simply replaces what
+    /// the client receives, exactly as it would replace any other governed
+    /// response. The event is retained as already-delivered replay history so a
+    /// broken POST stream can be resumed with `Last-Event-ID`; a freshly
+    /// attached `GET` listener starts past it and never sees it.
+    fn deliver_deferred_response_on_post(
         &self,
         ctx: &mut RequestContext,
         response_status: u16,
@@ -2024,11 +2439,11 @@ impl McpGateway {
         body: &[u8],
     ) -> Option<PluginResult> {
         let stream = ctx.mcp_sse_stream.take()?;
-        // An MCP JSON-RPC response is multiplexable only when the FINAL response
-        // is the protocol's ordinary 200 representation. Converting a 4xx/5xx
-        // (or any other status) into the POST-side 202 would erase the failure
-        // semantics of a policy replacement or an upstream error and move that
-        // body onto a stream as though it were a successful JSON-RPC response.
+        // A JSON-RPC response is carried as an event only when the FINAL
+        // response is the protocol's ordinary 200 representation. Reframing a
+        // 4xx/5xx (or any other status) as a 200 event stream would erase the
+        // failure semantics of a policy replacement or an upstream error and
+        // present that body as though it were a successful JSON-RPC response.
         // The session-header exclusion is re-checked here, not only at dispatch:
         // an event stream cannot convey it whichever phase added it.
         let inspectable = response_status == 200
@@ -2042,16 +2457,41 @@ impl McpGateway {
             Self::note_sse_delivery(ctx, "inline");
             return None;
         }
-        match stream.reserve_encoded(body) {
-            Ok(publication) => {
-                ctx.mcp_sse_publication = Some(publication);
-                Some(empty_response(202))
+        match stream.post_attached_response(body) {
+            Ok(framed) => {
+                Self::note_route_decision(ctx, "sse_post_stream");
+                Self::note_sse_delivery(ctx, "post_stream");
+                Some(Self::post_attached_stream_response(framed))
             }
             Err(AggregateSseError::StreamCancelled) => {
                 Self::note_sse_error(ctx, AggregateSseError::StreamCancelled);
                 Self::note_route_decision(ctx, "sse_cancelled");
                 Self::note_sse_delivery(ctx, "suppressed");
-                Some(empty_response(202))
+                Some(Self::post_attached_stream_response(
+                    super::mcp_aggregate_sse::post_attached_stream_without_response(),
+                ))
+            }
+            Err(AggregateSseError::ResponseEnvelopeInvalid) => {
+                Self::note_sse_error(ctx, AggregateSseError::ResponseEnvelopeInvalid);
+                // Distinct from "inline" (the answer was delivered on the POST
+                // as the upstream produced it) and "suppressed" (the client
+                // cancelled): the upstream answer was DISCARDED and replaced.
+                Self::note_sse_delivery(ctx, "refused");
+                let refusal = json_rpc_error(
+                    None,
+                    -32603,
+                    "Invalid upstream MCP response: id or envelope did not match the request",
+                    None,
+                );
+                // The client is still waiting on this request id. A refusal
+                // carrying `id: null` would never resolve that pending call, so
+                // the identity this request opened names it. Numeric identities
+                // are their exact admitted wire token.
+                let token = serde_json::value::RawValue::from_string(stream.json_rpc_id_token());
+                Some(match token {
+                    Ok(id) => correlate_response_id(refusal, &id),
+                    Err(_) => refusal,
+                })
             }
             Err(error) => {
                 Self::note_sse_error(ctx, error);
@@ -2064,16 +2504,13 @@ impl McpGateway {
     /// Release the request's stream identity because this POST is answering
     /// inline. Idempotent, and a no-op when no stream was opened.
     fn settle_sse_stream_inline(ctx: &mut RequestContext) {
-        if let Some(publication) = ctx.mcp_sse_publication.take() {
-            publication.abort();
-        }
         if let Some(stream) = ctx.mcp_sse_stream.take() {
             stream.settle_inline();
             Self::note_sse_delivery(ctx, "inline");
         }
     }
 
-    /// Cancel the multiplexed stream a `notifications/cancelled` names.
+    /// Cancel the request stream a `notifications/cancelled` names.
     ///
     /// This is a SIDE EFFECT only: the notification keeps its ordinary routing
     /// (including passthrough to the primary upstream when configured), and a
@@ -2089,17 +2526,14 @@ impl McpGateway {
         let Some(session_id) = self.downstream_session_id_from_headers(headers) else {
             return;
         };
-        let request_id = envelope
-            .params
-            .as_ref()
-            .and_then(|params| params.get("requestId"));
+        let request_id = envelope.raw_cancel_id.as_deref();
         let Some(request_id) = request_id else {
             let missing = AggregateSseError::StreamIdMissing;
             Self::note_sse_cancel(ctx, missing.reason_token());
             return;
         };
         let max_id_bytes = self.sessions.sse_bounds.max_stream_id_bytes;
-        let identity = match StreamIdentity::from_json_rpc_id(request_id, max_id_bytes) {
+        let identity = match StreamIdentity::from_raw_json_rpc_id(request_id, max_id_bytes) {
             Ok(identity) => identity,
             Err(error) => {
                 Self::note_sse_cancel(ctx, error.reason_token());
@@ -3019,17 +3453,32 @@ impl McpGateway {
             &self.discovery.namespace_separator,
             &name,
         );
+        let arguments = match item.get("arguments") {
+            Some(value) if value.is_array() => Some(value.clone()),
+            _ => None,
+        };
         let arguments_schema = item.get("argumentsSchema").cloned();
-        let schema_hash = hash_value(arguments_schema.as_ref().unwrap_or(&Value::Null));
+        // Drift is tracked over the whole declared parameter surface, so a
+        // change to the standard `arguments` array is as visible as one to the
+        // nonstandard schema field.
+        let schema_hash = hash_value(&json!({
+            "arguments": arguments,
+            "argumentsSchema": arguments_schema,
+        }));
         Some(PromptCatalogEntry {
             public_name,
             upstream_name: name,
             server_id: server.server_id.clone(),
             namespace: server.namespace.clone(),
+            title: item
+                .get("title")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
             description: item
                 .get("description")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
+            arguments,
             arguments_schema,
             enabled: true,
             discovered_at,
@@ -3445,19 +3894,32 @@ impl McpGateway {
                 .insert("mcp.policy_decision".to_string(), "allow".to_string());
         }
 
-        if self.validation.validate_tool_arguments {
-            let empty_arguments;
-            let arguments = match envelope
+        // Argument observation and argument validation are independent
+        // settings, so the arguments are derived once for whichever of them is
+        // configured. Observation must NOT inherit `validate_tool_arguments`:
+        // an operator who turns schema validation off still gets the
+        // `observability.log_argument_hash` / `log_raw_arguments` metadata the
+        // configuration surface promises. Raw emission stays opt-in.
+        let empty_arguments;
+        let arguments = if self.validation.validate_tool_arguments
+            || self.observability.log_argument_hash
+            || self.observability.log_raw_arguments
+        {
+            match envelope
                 .params
                 .as_ref()
                 .and_then(|params| params.get("arguments"))
             {
-                Some(arguments) => arguments,
+                Some(arguments) => Some(arguments),
                 None => {
                     empty_arguments = json!({});
-                    &empty_arguments
+                    Some(&empty_arguments)
                 }
-            };
+            }
+        } else {
+            None
+        };
+        if let Some(arguments) = arguments {
             if self.observability.log_argument_hash {
                 ctx.metadata
                     .insert("mcp.arguments_hash".to_string(), hash_value(arguments));
@@ -3466,26 +3928,28 @@ impl McpGateway {
                 ctx.metadata
                     .insert("mcp.arguments".to_string(), arguments.to_string());
             }
-            match validate_json_schema(&entry.input_validator, arguments) {
-                Ok(()) => {
-                    if self.observability.emit_metadata {
-                        ctx.metadata
-                            .insert("mcp.schema_validation".to_string(), "pass".to_string());
+            if self.validation.validate_tool_arguments {
+                match validate_json_schema(&entry.input_validator, arguments) {
+                    Ok(()) => {
+                        if self.observability.emit_metadata {
+                            ctx.metadata
+                                .insert("mcp.schema_validation".to_string(), "pass".to_string());
+                        }
                     }
-                }
-                Err(_) => {
-                    if self.observability.emit_metadata {
-                        ctx.metadata
-                            .insert("mcp.schema_validation".to_string(), "fail".to_string());
-                        ctx.metadata
-                            .insert("mcp.route_decision".to_string(), "deny".to_string());
+                    Err(_) => {
+                        if self.observability.emit_metadata {
+                            ctx.metadata
+                                .insert("mcp.schema_validation".to_string(), "fail".to_string());
+                            ctx.metadata
+                                .insert("mcp.route_decision".to_string(), "deny".to_string());
+                        }
+                        return json_rpc_error(
+                            envelope.id.clone(),
+                            -32602,
+                            "Invalid MCP tool arguments",
+                            None,
+                        );
                     }
-                    return json_rpc_error(
-                        envelope.id.clone(),
-                        -32602,
-                        "Invalid MCP tool arguments",
-                        None,
-                    );
                 }
             }
         }
@@ -3854,11 +4318,17 @@ impl McpGateway {
         envelope: &McpEnvelope,
     ) -> PluginResult {
         let Some(server) = self.primary_server() else {
-            return json_rpc_error(
-                envelope.id.clone(),
-                -32002,
-                "Unknown upstream MCP server",
-                None,
+            // Reached from both the singleton and the whole-batch transparent
+            // route, neither of which passes this terminal through the
+            // aggregate dispatch restore, so it echoes its own id token here.
+            return restore_response_id(
+                json_rpc_error(
+                    envelope.id.clone(),
+                    -32002,
+                    "Unknown upstream MCP server",
+                    None,
+                ),
+                envelope.raw_id.as_deref(),
             );
         };
         if self.observability.emit_metadata {
@@ -3945,7 +4415,7 @@ impl McpGateway {
                             self.restore_batch_request_metadata(ctx, headers, &BTreeSet::new());
                             ctx.metadata
                                 .insert("mcp.route_decision".to_string(), "deny".to_string());
-                            return response;
+                            return restore_response_id(response, envelope.raw_id.as_deref());
                         }
                         responses.push(Value::Null);
                         envelopes.push(Some(envelope));
@@ -3960,26 +4430,29 @@ impl McpGateway {
         }
 
         if invalid {
-            let response_values =
-                responses
-                    .into_iter()
-                    .zip(envelopes.iter())
-                    .filter_map(|(slot, envelope)| match envelope {
-                        // A valid notification never receives a JSON-RPC response,
-                        // even when an invalid sibling prevents the whole HTTP
-                        // batch from being forwarded.
-                        Some(envelope)
-                            if matches!(envelope.message_kind, McpMessageKind::Notification) =>
-                        {
-                            None
-                        }
-                        Some(envelope) => Some(json_rpc_error_value(
+            let response_values = responses
+                .into_iter()
+                .zip(envelopes.iter())
+                .zip(batch.iter())
+                .filter_map(|((slot, envelope), item)| match envelope {
+                    // A valid notification never receives a JSON-RPC response,
+                    // even when an invalid sibling prevents the whole HTTP
+                    // batch from being forwarded.
+                    Some(envelope)
+                        if matches!(envelope.message_kind, McpMessageKind::Notification) =>
+                    {
+                        None
+                    }
+                    Some(envelope) => Some((
+                        item.raw_id(),
+                        json_rpc_error_value(
                             envelope.id.clone(),
                             -32600,
                             "JSON-RPC batch was not forwarded because a sibling member was invalid",
-                        )),
-                        None => Some(slot),
-                    });
+                        ),
+                    )),
+                    None => Some((item.raw_id(), slot)),
+                });
             // Apply the response budget while the synthetic array is assembled,
             // not after serializing the entire result. Admitted member ids are
             // bounded by the request/item caps, but their combined reflected
@@ -3990,10 +4463,11 @@ impl McpGateway {
             // error.
             let mut bounded_responses = Vec::new();
             let mut response_bytes = 2usize;
-            for value in response_values {
+            for (raw_id, value) in response_values {
                 if let Err(response) = self.push_bounded_batch_response(
                     &mut bounded_responses,
                     &mut response_bytes,
+                    raw_id,
                     value,
                 ) {
                     self.clear_batch_item_routing_state(ctx);
@@ -4024,6 +4498,8 @@ impl McpGateway {
             .unwrap_or(McpEnvelope {
                 jsonrpc: "2.0".to_string(),
                 id: None,
+                raw_id: None,
+                raw_cancel_id: None,
                 method: None,
                 params: None,
                 result: None,
@@ -4101,9 +4577,12 @@ impl McpGateway {
                 Ok(envelope) => envelope,
                 Err(error) => {
                     saw_response_bearing = true;
-                    if let Err(response) =
-                        self.push_bounded_batch_response(&mut responses, &mut response_bytes, error)
-                    {
+                    if let Err(response) = self.push_bounded_batch_response(
+                        &mut responses,
+                        &mut response_bytes,
+                        item.raw_id(),
+                        error,
+                    ) {
                         return self.fail_batch_closed(ctx, headers, &inbound_headers, response);
                     }
                     continue;
@@ -4117,6 +4596,7 @@ impl McpGateway {
                 if let Err(response) = self.push_bounded_batch_response(
                     &mut responses,
                     &mut response_bytes,
+                    item.raw_id(),
                     json_rpc_error_value(
                         envelope.id.clone(),
                         -32600,
@@ -4143,6 +4623,7 @@ impl McpGateway {
                 if let Err(response) = self.push_bounded_batch_response(
                     &mut responses,
                     &mut response_bytes,
+                    item.raw_id(),
                     json_rpc_error_value(
                         envelope.id.clone(),
                         MCP_BATCH_SESSION_LIFECYCLE_AMBIGUOUS,
@@ -4168,6 +4649,7 @@ impl McpGateway {
                 if let Err(response) = self.push_bounded_batch_response(
                     &mut responses,
                     &mut response_bytes,
+                    item.raw_id(),
                     json_rpc_error_value(
                         envelope.id.clone(),
                         MCP_BATCH_UPSTREAM_ROUTING_UNSUPPORTED,
@@ -4213,6 +4695,7 @@ impl McpGateway {
                         if let Err(response) = self.push_bounded_batch_response(
                             &mut responses,
                             &mut response_bytes,
+                            item.raw_id(),
                             json_rpc_error_value(
                                 envelope.id.clone(),
                                 MCP_BATCH_SESSION_LIFECYCLE_AMBIGUOUS,
@@ -4228,9 +4711,12 @@ impl McpGateway {
                         }
                         continue;
                     }
-                    if let Err(response) =
-                        self.push_bounded_batch_response(&mut responses, &mut response_bytes, value)
-                    {
+                    if let Err(response) = self.push_bounded_batch_response(
+                        &mut responses,
+                        &mut response_bytes,
+                        item.raw_id(),
+                        value,
+                    ) {
                         return self.fail_batch_closed(ctx, headers, &inbound_headers, response);
                     }
                 }
@@ -4248,6 +4734,7 @@ impl McpGateway {
                         if let Err(response) = self.push_bounded_batch_response(
                             &mut responses,
                             &mut response_bytes,
+                            item.raw_id(),
                             json_rpc_error_value(
                                 id,
                                 MCP_BATCH_UPSTREAM_ROUTING_UNSUPPORTED,
@@ -4407,8 +4894,14 @@ impl McpGateway {
                     // Deliberately do not parse or read this member's id.
                     return BatchMember::Rejected;
                 }
+                if crate::util::json_dup_keys::slice_ambiguity(raw.as_bytes()).is_some() {
+                    return BatchMember::Rejected;
+                }
                 match serde_json::from_str::<Value>(raw) {
-                    Ok(value) => BatchMember::Admitted(value),
+                    Ok(value) => {
+                        let (raw_id, raw_cancel_id) = raw_json_rpc_correlation_ids(raw.as_bytes());
+                        BatchMember::Admitted(value, raw_id, raw_cancel_id)
+                    }
                     Err(_) => BatchMember::Rejected,
                 }
             })
@@ -4436,7 +4929,7 @@ impl McpGateway {
     /// `id: null` Invalid Request values; other malformed members reflect only
     /// their already-materialized id.
     fn validate_batch_member(&self, member: &BatchMember) -> Result<McpEnvelope, Value> {
-        let BatchMember::Admitted(item) = member else {
+        let BatchMember::Admitted(item, raw_id, raw_cancel_id) = member else {
             // The raw slice was never materialized, so there is no id to echo.
             return Err(json_rpc_error_value(
                 None,
@@ -4452,31 +4945,37 @@ impl McpGateway {
             ));
         }
         let member_id = item.get("id").cloned();
-        parse_mcp_envelope_value(item)
+        parse_mcp_envelope_value(item, raw_id.clone())
+            .map(|mut envelope| {
+                envelope.raw_cancel_id = raw_cancel_id.clone();
+                envelope
+            })
             .map_err(|_| json_rpc_error_value(member_id, -32600, "Invalid MCP JSON-RPC request"))
     }
 
     fn push_bounded_batch_response(
         &self,
-        responses: &mut Vec<Value>,
+        responses: &mut Vec<Box<RawValue>>,
         response_bytes: &mut usize,
+        id: Option<&RawValue>,
         value: Value,
     ) -> Result<(), PluginResult> {
-        let encoded_item = match serde_json::to_vec(&value) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                return Err(json_rpc_error(
-                    None,
-                    -32600,
-                    "Invalid Request",
-                    Some("JSON-RPC batch response could not be measured".to_string()),
-                ));
-            }
-        };
+        let encoded_item =
+            match serde_json::value::to_raw_value(&JsonRpcWithRawId::preserving(&value, id)) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return Err(json_rpc_error(
+                        None,
+                        -32600,
+                        "Invalid Request",
+                        Some("JSON-RPC batch response could not be measured".to_string()),
+                    ));
+                }
+            };
         let separator_bytes = usize::from(!responses.is_empty());
         let Some(next_response_bytes) = response_bytes
             .checked_add(separator_bytes)
-            .and_then(|bytes| bytes.checked_add(encoded_item.len()))
+            .and_then(|bytes| bytes.checked_add(encoded_item.get().len()))
         else {
             return Err(json_rpc_error(
                 None,
@@ -4493,7 +4992,7 @@ impl McpGateway {
                 Some("JSON-RPC batch exceeded max_batch_response_bytes".to_string()),
             ));
         }
-        responses.push(value);
+        responses.push(encoded_item);
         *response_bytes = next_response_bytes;
         Ok(())
     }
@@ -4502,16 +5001,22 @@ impl McpGateway {
     /// response header: session lifecycle is singleton-only, so there is no
     /// batch-owned session to advertise (and therefore no way to name a session
     /// the store does not hold).
-    fn bounded_batch_json_response(&self, responses: Vec<Value>) -> PluginResult {
-        let body = Value::Array(responses);
-        match serde_json::to_vec(&body) {
+    fn bounded_batch_json_response(&self, responses: Vec<Box<RawValue>>) -> PluginResult {
+        match serde_json::to_string(&responses) {
             Ok(bytes) if bytes.len() > self.validation.max_batch_response_bytes => json_rpc_error(
                 None,
                 -32600,
                 "Invalid Request",
                 Some("JSON-RPC batch exceeded max_batch_response_bytes".to_string()),
             ),
-            Ok(_) => json_response(200, body, None),
+            Ok(body) => PluginResult::Reject {
+                status_code: 200,
+                body,
+                headers: HashMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+            },
             Err(_) => json_rpc_error(
                 None,
                 -32600,
@@ -4640,7 +5145,7 @@ impl McpGateway {
         if let Some(response) =
             self.unsupported_protocol_version_response(ctx, envelope, protocol_version.as_deref())
         {
-            return response;
+            return restore_response_id(response, envelope.raw_id.as_deref());
         }
         if let Some(session_id) = self.downstream_session_id_from_headers(headers) {
             if self.mode == McpGatewayMode::AggregateRouter
@@ -4657,7 +5162,7 @@ impl McpGateway {
             return self.handle_transparent_post(ctx, headers, envelope);
         }
 
-        // `notifications/cancelled` additionally cancels the multiplexed stream
+        // `notifications/cancelled` additionally cancels the request stream
         // it names, as a side effect that does not intercept dispatch: the
         // notification keeps its ordinary routing (including passthrough to the
         // primary upstream when `passthrough_unknown_methods` is configured).
@@ -4665,7 +5170,7 @@ impl McpGateway {
             self.cancel_sse_stream_for_notification(ctx, headers, envelope);
         }
 
-        // Open the multiplexed stream identity BEFORE the handler runs, so the
+        // Open the request stream identity BEFORE the handler runs, so the
         // whole slow part of the request — catalog refresh, upstream
         // initialize, backend dispatch — is cancellable, and so every terminal
         // aggregate response below funnels through one delivery decision
@@ -4674,13 +5179,15 @@ impl McpGateway {
         let result = self
             .dispatch_aggregate_method(ctx, headers, envelope, method, protocol_version)
             .await;
-        self.deliver_dispatch_result_via_sse(ctx, result)
+        let result = restore_response_id(result, envelope.raw_id.as_deref());
+        self.deliver_ready_dispatch_result(ctx, result)
     }
 
     /// Aggregate-router method dispatch. Every arm returns the response as it
-    /// would be answered inline; whether that response is written to the POST or
-    /// multiplexed onto the session's event stream is decided once, by
-    /// [`Self::deliver_dispatch_result_via_sse`].
+    /// would be answered inline; whether that response is written to the POST as
+    /// JSON or, for a request routed upstream, as the POST's own event stream is
+    /// decided once, by [`Self::deliver_ready_dispatch_result`] and
+    /// [`Self::deliver_deferred_response_on_post`].
     async fn dispatch_aggregate_method(
         &self,
         ctx: &mut RequestContext,
@@ -4898,6 +5405,41 @@ impl McpGateway {
         }
     }
 
+    /// Name the pending request on a gateway-authored terminal.
+    ///
+    /// The admitted request id retained on the context is authoritative: it is
+    /// the exact wire token the client sent, and it is available on paths where
+    /// the response body carries no usable id at all (an upstream 5xx page, a
+    /// backend timeout, an uninspectable representation). The response body's
+    /// own id is only a fallback for a context that never admitted a singleton
+    /// id, and it can preserve an existing token but never fill in `null`.
+    fn correlate_gateway_terminal(
+        ctx: &RequestContext,
+        result: PluginResult,
+        body: &[u8],
+    ) -> PluginResult {
+        match ctx
+            .mcp_request_json_rpc_id
+            .clone()
+            .and_then(|id| RawValue::from_string(id).ok())
+        {
+            Some(id) => correlate_response_id(result, &id),
+            None => restore_response_id(result, raw_json_rpc_field(body, "id")),
+        }
+    }
+
+    /// Refuse a tool result at response-header time, naming the admitted
+    /// request id. No response body is available at this phase, so the retained
+    /// id is the only thing that can correlate the refusal.
+    fn reject_invalid_tool_result_for_request(
+        &self,
+        ctx: &mut RequestContext,
+        reason: &str,
+    ) -> PluginResult {
+        let rejection = self.reject_invalid_tool_result(ctx, None, reason);
+        Self::correlate_gateway_terminal(ctx, rejection, &[])
+    }
+
     fn reject_invalid_tool_result(
         &self,
         ctx: &mut RequestContext,
@@ -4913,7 +5455,7 @@ impl McpGateway {
                 .insert("mcp.route_decision".to_string(), "deny".to_string());
         }
         // Reason is a gateway-controlled category string — never a result body.
-        warn!(
+        warn_sampled!(
             reason,
             "MCP gateway rejecting tools/call result that failed outputSchema validation"
         );
@@ -5023,12 +5565,13 @@ impl Plugin for McpGateway {
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         self.requires_response_body_buffering()
+            && self.owns_request(ctx)
             && (ctx.mcp_validate_tool_result.is_some()
-                // A routed request that opened a multiplexed stream needs its
-                // complete client-visible representation to publish one SSE
-                // event. If the refinement below declines to buffer it, the
-                // response is streamed inline instead and the lease releases
-                // the identity — the response is never lost either way.
+                // A routed request that opened a stream identity needs its
+                // complete client-visible representation to frame the one SSE
+                // event its POST answers with. If the refinement below declines
+                // to buffer it, the response is streamed inline instead and the
+                // lease releases the identity — never lost either way.
                 || ctx.mcp_sse_stream.is_some()
                 || ctx
                     .metadata
@@ -5084,10 +5627,28 @@ impl Plugin for McpGateway {
         if ctx.has_ai_stream_router_claim() {
             return PluginResult::Continue;
         }
-        if !self.enabled || !self.matches_endpoint(ctx) {
+        if !self.enabled || !self.within_endpoint_scope(ctx) {
             return PluginResult::Continue;
         }
+        // From here on this instance owns the request. Every response phase
+        // reads that claim before touching this request's private MCP state.
+        self.claim_request(ctx);
         self.emit_base_metadata(ctx);
+        if !self.matches_endpoint(ctx) {
+            // A reserved descendant is refused, exactly like the 405 below, so
+            // the decision has to read as a denial rather than as this plugin
+            // never having applied.
+            ctx.metadata
+                .insert("mcp.route_decision".to_string(), "deny".to_string());
+            return PluginResult::Reject {
+                status_code: 404,
+                body: json_rpc_error_value(None, -32600, "Unknown MCP endpoint").to_string(),
+                headers: HashMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+            };
+        }
 
         if ctx.method.eq_ignore_ascii_case("GET") {
             if self.mode == McpGatewayMode::TransparentProxy {
@@ -5141,19 +5702,16 @@ impl Plugin for McpGateway {
         }
 
         if !ctx.method.eq_ignore_ascii_case("POST") {
-            if self.mode == McpGatewayMode::AggregateRouter {
-                ctx.metadata
-                    .insert("mcp.route_decision".to_string(), "deny".to_string());
-                return PluginResult::Reject {
-                    status_code: 405,
-                    body: json!({"error": "unsupported MCP aggregate HTTP method"}).to_string(),
-                    headers: HashMap::from([(
-                        "content-type".to_string(),
-                        "application/json".to_string(),
-                    )]),
-                };
-            }
-            return PluginResult::Continue;
+            ctx.metadata
+                .insert("mcp.route_decision".to_string(), "deny".to_string());
+            return PluginResult::Reject {
+                status_code: 405,
+                body: json!({"error": "unsupported MCP HTTP method"}).to_string(),
+                headers: HashMap::from([
+                    ("content-type".to_string(), "application/json".to_string()),
+                    ("allow".to_string(), "GET, POST, DELETE".to_string()),
+                ]),
+            };
         }
         if !Self::content_type_is_json(headers) {
             return json_rpc_error(None, -32600, "Invalid MCP JSON-RPC request", None);
@@ -5175,14 +5733,32 @@ impl Plugin for McpGateway {
             };
             return self.handle_jsonrpc_batch(ctx, headers, &batch).await;
         }
+        if crate::util::json_dup_keys::slice_ambiguity(body).is_some() {
+            return json_rpc_error(None, -32600, "Invalid MCP JSON-RPC request", None);
+        }
         let parsed: Value = match serde_json::from_slice(body) {
             Ok(value) => value,
             Err(_) => return json_rpc_error(None, -32600, "Invalid MCP JSON-RPC request", None),
         };
-        let envelope = match parse_mcp_envelope_value(&parsed) {
+        let (raw_id, raw_cancel_id) = raw_json_rpc_correlation_ids(body);
+        let mut envelope = match parse_mcp_envelope_value(&parsed, raw_id) {
             Ok(envelope) => envelope,
             Err(_) => return json_rpc_error(None, -32600, "Invalid MCP JSON-RPC request", None),
         };
+        envelope.raw_cancel_id = raw_cancel_id;
+        // Retain the admitted request id privately. A gateway-authored terminal
+        // decided in a RESPONSE phase (result validation, an uninspectable
+        // upstream representation, an upstream transport failure) is authored
+        // long after the request body is gone, and an error carrying `id: null`
+        // never resolves the call the client is still waiting on. Only a
+        // bounded request-form id is retained; notifications, batch bodies, and
+        // unparsable requests stay eligible for `id: null`.
+        if envelope.message_kind == McpMessageKind::Request
+            && let Some(raw_id) = envelope.raw_id.as_deref()
+            && raw_id.get().len() <= MCP_MAX_REFLECTED_ID_BYTES
+        {
+            ctx.mcp_request_json_rpc_id = Some(raw_id.get().to_string());
+        }
         self.dispatch_post_envelope(ctx, headers, &envelope).await
     }
 
@@ -5293,7 +5869,8 @@ impl Plugin for McpGateway {
             return None;
         }
         params.insert(param, Value::String(upstream_value));
-        match serde_json::to_vec(&value) {
+        let preserved = JsonRpcWithRawId::preserving(&value, raw_json_rpc_field(body, "id"));
+        match serde_json::to_vec(&preserved) {
             Ok(rewritten) => Some(rewritten),
             Err(_) => {
                 if trusted_tool_rewrite {
@@ -5420,7 +5997,8 @@ impl Plugin for McpGateway {
         // that cannot fit marks the pending capacity-refusal signal so the
         // shared transform loop installs the gateway terminal instead of
         // forwarding the original upstream body.
-        match crate::proxy::response_buffer_budget::bounded_json_vec(&value, retained_ceiling) {
+        let preserved = JsonRpcWithRawId::preserving(&value, raw_json_rpc_field(body, "id"));
+        match crate::proxy::response_buffer_budget::bounded_json_vec(&preserved, retained_ceiling) {
             Some(rewritten) => Some(rewritten),
             None => {
                 ctx.mark_buffered_response_capacity_refusal_pending();
@@ -5454,7 +6032,7 @@ impl Plugin for McpGateway {
     }
 
     fn may_enforce_response_body_policy(&self, ctx: &RequestContext) -> bool {
-        self.enabled
+        self.owns_request(ctx)
             && self.mode == McpGatewayMode::AggregateRouter
             && self.validation.validate_tool_results
             && ctx.mcp_validate_tool_result.is_some()
@@ -5475,32 +6053,32 @@ impl Plugin for McpGateway {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if ctx.mcp_validate_tool_result.is_none() {
+        // Response-phase policy is instance-scoped: a sibling instance on a
+        // disjoint endpoint (or one configured off) must not consume this
+        // request's validator claim or apply its own response bounds to it.
+        if !self.owns_request(ctx) || ctx.mcp_validate_tool_result.is_none() {
             return PluginResult::Continue;
         }
         // Streamed SSE cannot be validated against a compiled output schema
         // without a separate streaming validator. Fail closed rather than
         // releasing an unvalidated tool result.
         if super::utils::sse::original_response_is_event_stream(ctx, response_headers) {
-            return self.reject_invalid_tool_result(
+            return self.reject_invalid_tool_result_for_request(
                 ctx,
-                None,
                 "event-stream tool results require a bounded JSON representation",
             );
         }
         if header_value(response_headers, "content-type")
             .is_some_and(|value| !mcp_content_type_is_json(value))
         {
-            return self.reject_invalid_tool_result(
+            return self.reject_invalid_tool_result_for_request(
                 ctx,
-                None,
                 "tool result content-type is not inspectable JSON",
             );
         }
         if !Self::response_encoding_allows_rewrite(response_headers) {
-            return self.reject_invalid_tool_result(
+            return self.reject_invalid_tool_result_for_request(
                 ctx,
-                None,
                 "encoded tool results require an identity representation",
             );
         }
@@ -5511,9 +6089,8 @@ impl Plugin for McpGateway {
         // bypass. The actual collected length is checked again in the final
         // hook to cover a lying upstream.
         if !self.response_length_allows_rewrite(response_headers) {
-            return self.reject_invalid_tool_result(
+            return self.reject_invalid_tool_result_for_request(
                 ctx,
-                None,
                 "tool result lacks a bounded acceptable content-length",
             );
         }
@@ -5525,20 +6102,18 @@ impl Plugin for McpGateway {
     /// Two things happen here, in this order. First the plugin's own fail-closed
     /// enforcement decides the response; a replacement it authors is answered
     /// inline on the POST, and the request's stream identity is released rather
-    /// than publishing a gateway error under it. Only a response that survived
-    /// enforcement unchanged is eligible to be multiplexed onto the session's
-    /// event stream.
+    /// than framing a gateway error as this request's event stream. Only a
+    /// response that survived enforcement unchanged is eligible for
+    /// POST-attached event-stream delivery.
     ///
-    /// This is the SINGLE reservation point for aggregate SSE. It owns the
-    /// terminal admission decision for `tools/call`, `prompts/get`,
-    /// `resources/read`, and
-    /// every passthrough method routed to the primary upstream, and equally for
-    /// the gateway-authored responses (`tools/list`, `prompts/list`,
-    /// `resources/list`, `ping`, gateway JSON-RPC errors) that
-    /// [`Self::deliver_dispatch_result_via_sse`] staged in `before_proxy` and
-    /// that reach this hook on Ferrum's synthetic-response lifecycle. Both
-    /// therefore reserve only bytes that the configured response-body policies
-    /// have already accepted. The committed hook is the sole visibility point.
+    /// This is the SINGLE delivery point for a DEFERRED request — `tools/call`,
+    /// `prompts/get`, `resources/read`, and every passthrough method routed to
+    /// the primary upstream. Gateway-authored responses (`tools/list`,
+    /// `prompts/list`, `resources/list`, `ping`, gateway JSON-RPC errors) are
+    /// already complete at dispatch, so they were settled in `before_proxy` and
+    /// reach this hook with no stream identity left to deliver. Either way the
+    /// bytes written to the client are the ones the configured response-body
+    /// policies have already accepted.
     async fn on_final_response_body(
         &self,
         ctx: &mut RequestContext,
@@ -5546,54 +6121,20 @@ impl Plugin for McpGateway {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        if !self.owns_request(ctx) {
+            return PluginResult::Continue;
+        }
         let enforced =
             self.enforce_final_response_body(ctx, response_status, response_headers, body);
         if !matches!(enforced, PluginResult::Continue) {
             Self::settle_sse_stream_inline(ctx);
-            return enforced;
+            return Self::correlate_gateway_terminal(ctx, enforced, body);
         }
-        match self.multiplex_final_response(ctx, response_status, response_headers, body) {
+        let deferred =
+            self.deliver_deferred_response_on_post(ctx, response_status, response_headers, body);
+        match deferred {
             Some(replacement) => replacement,
             None => PluginResult::Continue,
-        }
-    }
-
-    fn requires_response_committed_hook(&self) -> bool {
-        true
-    }
-
-    async fn on_response_committed(
-        &self,
-        ctx: &mut RequestContext,
-        response_status: u16,
-        _response_headers: &HashMap<String, String>,
-        body: &[u8],
-    ) {
-        let Some(publication) = ctx.mcp_sse_publication.take() else {
-            return;
-        };
-        // The reservation was made for one fixed empty acknowledgement. If a
-        // later reject/header phase selected anything else, keep that response
-        // inline and make the event permanently invisible.
-        if response_status != 202 || !body.is_empty() {
-            publication.abort();
-            Self::note_sse_delivery(ctx, "inline");
-            return;
-        }
-        match publication.commit() {
-            Ok(_) => Self::note_sse_delivery(ctx, "multiplexed"),
-            Err(AggregateSseError::StreamCancelled) => {
-                Self::note_sse_error(ctx, AggregateSseError::StreamCancelled);
-                Self::note_route_decision(ctx, "sse_cancelled");
-                Self::note_sse_delivery(ctx, "suppressed");
-            }
-            Err(error) => {
-                // Session deletion/retirement can race this boundary. The POST
-                // acknowledgement is already final, so record a fixed token and
-                // suppress rather than panic or expose a stale payload.
-                Self::note_sse_error(ctx, error);
-                Self::note_sse_delivery(ctx, "suppressed");
-            }
         }
     }
 
@@ -5607,9 +6148,9 @@ impl Plugin for McpGateway {
 }
 
 /// Fail-closed response-body enforcement, split out of the trait hook so the
-/// multiplexed SSE delivery decision has exactly one place to read its verdict:
-/// a gateway-authored replacement is answered inline, never published as an
-/// event under the caller's stream identity.
+/// POST-attached SSE delivery decision has exactly one place to read its
+/// verdict: a gateway-authored replacement is answered inline as JSON, never
+/// framed as the caller's own event stream.
 impl McpGateway {
     fn enforce_final_response_body(
         &self,
@@ -6009,7 +6550,10 @@ fn expand_public_resource_template(
     (capture_index == captures.len()).then_some(public_uri)
 }
 
-fn parse_mcp_envelope_value(value: &Value) -> Result<McpEnvelope, String> {
+fn parse_mcp_envelope_value(
+    value: &Value,
+    raw_id: Option<Box<RawValue>>,
+) -> Result<McpEnvelope, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "JSON-RPC envelope must be an object".to_string())?;
@@ -6043,6 +6587,8 @@ fn parse_mcp_envelope_value(value: &Value) -> Result<McpEnvelope, String> {
     Ok(McpEnvelope {
         jsonrpc,
         id,
+        raw_id,
+        raw_cancel_id: None,
         method,
         params,
         result,
@@ -6577,7 +7123,7 @@ fn json_rpc_error(
 ) -> PluginResult {
     let mut metadata = Map::new();
     if let Some(detail) = internal_detail.as_deref() {
-        warn!(
+        warn_sampled!(
             code,
             message,
             internal_detail = %detail,
@@ -6965,11 +7511,20 @@ fn tool_entry_to_public_value(entry: &ToolCatalogEntry) -> Value {
 fn prompt_entry_to_public_value(entry: &PromptCatalogEntry) -> Value {
     let mut object = Map::new();
     object.insert("name".to_string(), Value::String(entry.public_name.clone()));
+    if let Some(title) = &entry.title {
+        object.insert("title".to_string(), Value::String(title.clone()));
+    }
     if let Some(description) = &entry.description {
         object.insert(
             "description".to_string(),
             Value::String(format!("[{}] {}", entry.namespace, description)),
         );
+    }
+    // Only the prompt NAME is namespaced. Argument names are prompt-local, so
+    // the declared argument list is republished exactly as discovered — a
+    // client that cannot see it cannot know what `prompts/get` requires.
+    if let Some(arguments) = &entry.arguments {
+        object.insert("arguments".to_string(), arguments.clone());
     }
     if let Some(arguments_schema) = &entry.arguments_schema {
         object.insert("argumentsSchema".to_string(), arguments_schema.clone());
@@ -7377,12 +7932,12 @@ fn parse_sessions(object: &Map<String, Value>) -> Result<McpSessionConfig, Strin
         initialize_upstreams,
         session_ttl: Duration::from_secs(session_ttl_seconds),
         max_sessions,
-        sse_multiplexing: optional_bool_from_object(sessions, "sse_multiplexing")?.unwrap_or(true),
+        sse_multiplexing: optional_bool_from_object(sessions, "sse_multiplexing")?.unwrap_or(false),
         sse_bounds: parse_sse_bounds(sessions)?,
     })
 }
 
-/// Parse the `sessions.sse_*` bounds for the aggregate SSE multiplexer.
+/// Parse the `sessions.sse_*` bounds for the aggregate SSE broker.
 ///
 /// Range enforcement lives in [`AggregateSseBounds::validate`], which produces
 /// field-specific diagnostics that never echo the configured value; this only
@@ -7615,10 +8170,6 @@ fn parse_observability(object: &Map<String, Value>) -> Result<McpObservabilityCo
             .unwrap_or(false),
         log_argument_hash: optional_bool_from_object(observability, "log_argument_hash")?
             .unwrap_or(true),
-        log_raw_results: optional_bool_from_object(observability, "log_raw_results")?
-            .unwrap_or(false),
-        log_result_hash: optional_bool_from_object(observability, "log_result_hash")?
-            .unwrap_or(false),
     })
 }
 
@@ -7754,9 +8305,133 @@ fn authority_for_host_port(
     }
 }
 
+/// Whether `scope` reserves `other` as a strict slash-delimited descendant.
+fn endpoint_scope_contains(scope: &str, other: &str) -> bool {
+    other
+        .strip_prefix(scope)
+        .is_some_and(|tail| tail.starts_with('/'))
+}
+
+/// Whether two endpoint scopes reserve overlapping request paths.
+///
+/// Scopes are already trailing-slash trimmed, so `/mcp` and `/mcp/` are the
+/// same scope, `/mcp` contains `/mcp/v2`, and `/mcp` is disjoint from `/mcpx`.
+fn endpoint_scopes_nest(left: &str, right: &str) -> bool {
+    left == right || endpoint_scope_contains(left, right) || endpoint_scope_contains(right, left)
+}
+
+/// Reject two enabled `mcp_gateway` instances whose endpoint scopes nest on one
+/// proxy.
+///
+/// Multiple scoped instances of one plugin are ordinarily allowed, but an MCP
+/// endpoint reserves its whole slash-delimited subtree and answers 404 inside
+/// it. A gateway on `/mcp/v2` under one on `/mcp` is therefore unreachable —
+/// deterministically in transparent mode, and non-deterministically in
+/// aggregate mode where both instances share the `MCP_GATEWAY` priority. No
+/// single instance can see the conflict, so it is decided over the merged
+/// configuration here.
+pub fn validate_composition(
+    config: &crate::config::types::GatewayConfig,
+) -> Result<(), Vec<String>> {
+    use crate::config::types::{PluginConfig, PluginScope};
+
+    // Keyed by `(namespace, id)` exactly like the runtime merge's scoped-plugin
+    // map: a proxy only resolves associations in its own namespace.
+    let plugin_by_scoped_id: HashMap<(&str, &str), &PluginConfig> = config
+        .plugin_configs
+        .iter()
+        .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
+        .collect();
+
+    let mut errors = Vec::new();
+    for proxy in &config.proxies {
+        // Shadowing is decided by the outer `enabled` flag alone: a scoped
+        // instance replaces every same-named global for this proxy even when
+        // its own inner switch is off, so the effective set is resolved first
+        // and only then asked which members actually reserve a path.
+        let local: Vec<&PluginConfig> = proxy
+            .plugins
+            .iter()
+            .filter_map(|association| {
+                let plugin = *plugin_by_scoped_id.get(&(
+                    proxy.namespace.as_str(),
+                    association.plugin_config_id.as_str(),
+                ))?;
+                if !plugin.enabled || plugin.plugin_name != "mcp_gateway" {
+                    return None;
+                }
+                let scope_applies = match plugin.scope {
+                    PluginScope::Proxy => plugin.proxy_id.as_deref() == Some(proxy.id.as_str()),
+                    // Proxy-group instances are required to omit `proxy_id`;
+                    // the explicit association is what makes them applicable.
+                    PluginScope::ProxyGroup => true,
+                    PluginScope::Global => false,
+                };
+                scope_applies.then_some(plugin)
+            })
+            .collect();
+        let effective: Vec<&PluginConfig> = if local.is_empty() {
+            config
+                .plugin_configs
+                .iter()
+                .filter(|plugin| {
+                    plugin.enabled
+                        && plugin.scope == PluginScope::Global
+                        && plugin.plugin_name == "mcp_gateway"
+                })
+                .collect()
+        } else {
+            local
+        };
+
+        // An instance whose inner `enabled` is false returns `Continue` for
+        // every request, so it reserves nothing and cannot pre-empt a sibling.
+        let scopes: Vec<(&str, &str)> = effective
+            .into_iter()
+            .filter(|plugin| {
+                plugin
+                    .config
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true)
+            })
+            .filter_map(|plugin| {
+                let path = plugin
+                    .config
+                    .get("endpoint")
+                    .and_then(|endpoint| endpoint.get("path"))
+                    .and_then(Value::as_str)?;
+                Some((plugin.id.as_str(), path.trim_end_matches('/')))
+            })
+            .collect();
+        for (index, (id, scope)) in scopes.iter().enumerate() {
+            for (other_id, other_scope) in scopes.iter().skip(index + 1) {
+                if !endpoint_scopes_nest(scope, other_scope) {
+                    continue;
+                }
+                errors.push(format!(
+                    "mcp_gateway instances '{id}' and '{other_id}' on proxy '{}' have nesting \
+                     endpoint.path scopes: an MCP endpoint reserves its whole path subtree and \
+                     answers 404 inside it, so one of these gateways can never be reached. Give \
+                     them disjoint endpoint.path values, or disable one of them on this proxy",
+                    proxy.id
+                ));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
 fn validate_path(path: &str, field: &str) -> Result<(), String> {
     if path.is_empty() || !path.starts_with('/') {
         return Err(format!("mcp_gateway: '{field}' must be a non-empty path"));
+    }
+    if let Some(reason) = crate::policy_path::non_canonical_policy_path_reason(path) {
+        return Err(format!("mcp_gateway: '{field}' is not canonical: {reason}"));
     }
     Ok(())
 }

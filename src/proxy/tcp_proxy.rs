@@ -45,7 +45,7 @@ use crate::plugins::{
 use crate::proxy::stream_error::{
     StreamSetupError, StreamSetupKind, find_stream_setup_error, stream_dns_setup_error,
 };
-use crate::proxy::{LoadBalancerConnectionGuard, stream_lb_accounting_target};
+use crate::proxy::{HalfOpenProbeGuard, LoadBalancerConnectionGuard, stream_lb_accounting_target};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 use crate::retry::ErrorClass;
 
@@ -1496,7 +1496,7 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    bidirectional_copy(
+    bidirectional_copy_for_relay(
         client,
         backend,
         idle_timeout,
@@ -1504,7 +1504,6 @@ where
         backend_read_timeout,
         backend_write_timeout,
         buf_size,
-        None,
     )
     .await
 }
@@ -3001,10 +3000,8 @@ struct TcpConnParams {
     backend_scheme: BackendScheme,
     dns_override: Option<String>,
     dns_cache_ttl_seconds: Option<u64>,
-    backend_connect_timeout_ms: u64,
     backend_read_timeout_ms: u64,
     backend_write_timeout_ms: u64,
-    tcp_idle_timeout_seconds: u64,
     /// Hard cap on Phase 2 (half-close drain). Applies even when the session
     /// idle timeout is disabled, preventing a stalled peer from wedging the
     /// drain future forever. `0` disables the cap.
@@ -3040,13 +3037,13 @@ struct TcpConnParams {
     backend_proxy_protocol: Option<crate::config::types::BackendProxyProtocol>,
 }
 
-/// Lightweight snapshot of the proxy fields needed per TCP connection.
-/// Includes circuit breaker config and target key for circuit breaker checks.
+/// Connection-owned circuit breaker config, target key, and probe slot.
+/// The guard releases an unsettled probe if setup or relay is cancelled.
 struct TcpConnCbInfo {
     namespace: String,
     cb_config: Option<crate::config::types::CircuitBreakerConfig>,
     cb_target_key: Option<String>,
-    is_half_open_probe: bool,
+    cb_probe: HalfOpenProbeGuard,
 }
 
 /// Backend target info resolved during connection setup, available for logging
@@ -3775,21 +3772,9 @@ async fn handle_tcp_connection_inner(
             namespace: proxy.namespace.clone(),
             cb_config: proxy.circuit_breaker.clone(),
             cb_target_key,
-            is_half_open_probe: false,
+            cb_probe: HalfOpenProbeGuard::none(),
         };
 
-        // Honor DestinationRule per-port `connect_timeout_ms` and
-        // `tcp_idle_timeout_seconds` overrides on the L4/TCP path. The override
-        // is keyed by destination policy port and lives on the proxy's
-        // pre-computed `dispatch_port_overrides` map — single field read, no
-        // DashMap/ArcSwap traversal. `Some(0)` idle is an explicit disable.
-        let port_override = proxy
-            .dispatch_port_overrides
-            .as_ref()
-            .and_then(|m| m.get(&backend_policy_port));
-        let effective_backend_connect_timeout_ms = port_override
-            .and_then(|override_config| override_config.connect_timeout_ms)
-            .unwrap_or(proxy.backend_connect_timeout_ms);
         let params = TcpConnParams {
             backend_host,
             backend_port,
@@ -3797,13 +3782,8 @@ async fn handle_tcp_connection_inner(
             backend_scheme: proxy.effective_scheme(),
             dns_override: proxy.dns_override.clone(),
             dns_cache_ttl_seconds: proxy.dns_cache_ttl_seconds,
-            backend_connect_timeout_ms: effective_backend_connect_timeout_ms,
             backend_read_timeout_ms: proxy.backend_read_timeout_ms,
             backend_write_timeout_ms: proxy.backend_write_timeout_ms,
-            tcp_idle_timeout_seconds: port_override
-                .and_then(|override_config| override_config.tcp_idle_timeout_seconds)
-                .or(proxy.tcp_idle_timeout_seconds)
-                .unwrap_or(global_tcp_idle_timeout),
             tcp_half_close_max_wait_seconds,
             retry: proxy.retry.clone(),
             upstream_id: proxy.upstream_id.clone(),
@@ -3975,12 +3955,6 @@ async fn handle_tcp_connection_inner(
             client_local_addr,
         )?;
 
-        let connect_timeout = Duration::from_millis(params.backend_connect_timeout_ms);
-        let idle_timeout = if params.tcp_idle_timeout_seconds > 0 {
-            Some(Duration::from_secs(params.tcp_idle_timeout_seconds))
-        } else {
-            None
-        };
         let half_close_cap = if params.tcp_half_close_max_wait_seconds > 0 {
             Some(Duration::from_secs(params.tcp_half_close_max_wait_seconds))
         } else {
@@ -4036,7 +4010,7 @@ async fn handle_tcp_connection_inner(
                 // connect if the passthrough target is open. This mirrors the
                 // terminating TCP path; passthrough still records backend outcomes
                 // below, so it must also honor breaker admission and preserve the
-                // half-open probe flag for the matching record_success/failure call.
+                // half-open probe guard for the matching record_success/failure call.
                 // Keep the admitted Arc so post-admission PROXY write failures settle
                 // the exact selected breaker rather than a get_or_create miss/transient.
                 if let Some(ref cb_config) = cb_info.cb_config {
@@ -4047,7 +4021,12 @@ async fn handle_tcp_connection_inner(
                         cb_config,
                     ) {
                         Ok((cb, is_half_open_probe)) => {
-                            cb_info.is_half_open_probe = is_half_open_probe;
+                            if attempt == 0 {
+                                cb_info.cb_probe =
+                                    HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe);
+                            } else {
+                                cb_info.cb_probe.rearm(&cb, is_half_open_probe);
+                            }
                             admitted_cb = Some(cb);
                         }
                         Err(_) => {
@@ -4082,15 +4061,7 @@ async fn handle_tcp_connection_inner(
                 .await;
                 let candidates = match resolved_candidates {
                     Err(termination) => {
-                        if let Some(ref cb_config) = cb_info.cb_config {
-                            let cb = circuit_breaker_cache.get_or_create(
-                                &cb_info.namespace,
-                                proxy_id,
-                                cb_info.cb_target_key.as_deref(),
-                                cb_config,
-                            );
-                            cb.record_neutral(cb_info.is_half_open_probe);
-                        }
+                        cb_info.cb_probe.release_neutral();
                         retryable = false;
                         return Err(settle_stream_auth_setup_expiry(
                             termination,
@@ -4113,9 +4084,9 @@ async fn handle_tcp_connection_inner(
                             // HALF_OPEN probe slot NEUTRALLY (mirrors the non-passthrough
                             // TCP/UDP paths). Genuine DNS/transport failures still count.
                             if crate::dns::is_egress_policy_denial(&e) {
-                                cb.record_neutral(cb_info.is_half_open_probe);
+                                cb_info.cb_probe.release_neutral();
                             } else {
-                                cb.record_failure(502, true, cb_info.is_half_open_probe);
+                                cb.record_failure(502, true, cb_info.cb_probe.take_slot());
                             }
                         }
                         return Err(stream_dns_setup_error(&params.backend_host, e));
@@ -4145,15 +4116,7 @@ async fn handle_tcp_connection_inner(
                         // outcome. If the breaker admission above claimed a
                         // half-open probe slot, release it neutrally so passthrough
                         // traffic cannot wedge HALF_OPEN.
-                        if let Some(ref cb_config) = cb_info.cb_config {
-                            let cb = circuit_breaker_cache.get_or_create(
-                                &cb_info.namespace,
-                                proxy_id,
-                                cb_info.cb_target_key.as_deref(),
-                                cb_config,
-                            );
-                            cb.record_neutral(cb_info.is_half_open_probe);
-                        }
+                        cb_info.cb_probe.release_neutral();
                         return Err(StreamSetupError::with_source(
                             StreamSetupKind::BackendMaxConnectionsExceeded,
                             format!(
@@ -4165,6 +4128,17 @@ async fn handle_tcp_connection_inner(
                         .into());
                     }
                 };
+
+                // Target rotation can cross DestinationRule policy-port lanes.
+                // Resolve the connect budget for every attempt rather than
+                // retaining the failed target's per-port policy.
+                let (backend_connect_timeout_ms, _) = tcp_timeout_policy(
+                    &params,
+                    params.backend_policy_port,
+                    proxy,
+                    global_tcp_idle_timeout,
+                );
+                let connect_timeout = Duration::from_millis(backend_connect_timeout_ms);
 
                 // Connect plain TCP to backend (no TLS origination — the client's encrypted
                 // stream passes through directly to the backend which terminates TLS).
@@ -4188,15 +4162,7 @@ async fn handle_tcp_connection_inner(
                     within_stream_auth_deadline(stream_auth_deadline, connect_attempt).await;
                 let (backend_stream, addr) = match bounded_connect {
                     Err(termination) => {
-                        if let Some(ref cb_config) = cb_info.cb_config {
-                            let cb = circuit_breaker_cache.get_or_create(
-                                &cb_info.namespace,
-                                proxy_id,
-                                cb_info.cb_target_key.as_deref(),
-                                cb_config,
-                            );
-                            cb.record_neutral(cb_info.is_half_open_probe);
-                        }
+                        cb_info.cb_probe.release_neutral();
                         retryable = false;
                         return Err(settle_stream_auth_setup_expiry(
                             termination,
@@ -4208,7 +4174,7 @@ async fn handle_tcp_connection_inner(
                         .map_err(|error| match error {
                             crate::dns::CandidateConnectError::TimedOut { last_addr } => anyhow::anyhow!(
                                 "Backend TCP connect budget exhausted after {}ms (last={})",
-                                params.backend_connect_timeout_ms,
+                                backend_connect_timeout_ms,
                                 last_addr
                             ),
                             crate::dns::CandidateConnectError::Failed { source, .. } => source,
@@ -4228,7 +4194,7 @@ async fn handle_tcp_connection_inner(
                                     cb_info.cb_target_key.as_deref(),
                                     cb_config,
                                 );
-                                cb.record_failure(502, true, cb_info.is_half_open_probe);
+                                cb.record_failure(502, true, cb_info.cb_probe.take_slot());
                             }
                         })?,
                 };
@@ -4284,7 +4250,6 @@ async fn handle_tcp_connection_inner(
                             params.backend_port,
                         )
                     });
-                    cb_info.is_half_open_probe = false;
                     backend_info.backend_target =
                         format_backend_target(&params.backend_host, params.backend_port);
                     backend_info.backend_resolved_ip = None;
@@ -4307,6 +4272,16 @@ async fn handle_tcp_connection_inner(
         };
         backend_info.backend_resolved_ip = Some(addr.ip().to_string());
         let passthrough_port_override = resolve_port_override(&params, params.backend_policy_port);
+        // The relay belongs to the target that ultimately connected, so its
+        // idle watchdog must use that target's policy lane as well.
+        let (_, tcp_idle_timeout_seconds) = tcp_timeout_policy(
+            &params,
+            params.backend_policy_port,
+            proxy,
+            global_tcp_idle_timeout,
+        );
+        let idle_timeout =
+            (tcp_idle_timeout_seconds > 0).then(|| Duration::from_secs(tcp_idle_timeout_seconds));
 
         // Apply DR `connectionPool.tcp.tcpKeepalive` on the freshly connected
         // backend socket. Best-effort: a `setsockopt` failure logs and
@@ -4331,9 +4306,7 @@ async fn handle_tcp_connection_inner(
             .await
             {
                 Err(termination) => {
-                    if let Some(cb) = admitted_cb.as_deref() {
-                        cb.record_neutral(cb_info.is_half_open_probe);
-                    }
+                    cb_info.cb_probe.release_neutral();
                     return Err(settle_stream_auth_setup_expiry(
                         termination,
                         stream_ctx,
@@ -4345,7 +4318,7 @@ async fn handle_tcp_connection_inner(
             write_res.inspect_err(|_| {
                 record_admitted_cb_proxy_v2_write_failure(
                     admitted_cb.as_deref(),
-                    cb_info.is_half_open_probe,
+                    cb_info.cb_probe.take_slot(),
                 );
             })?;
         }
@@ -4356,9 +4329,7 @@ async fn handle_tcp_connection_inner(
         if let Some(termination) =
             crate::proxy::auth_lifetime::expired_authorization(stream_auth_deadline)
         {
-            if let Some(cb) = admitted_cb.as_deref() {
-                cb.record_neutral(cb_info.is_half_open_probe);
-            }
+            cb_info.cb_probe.release_neutral();
             return Err(settle_stream_auth_setup_expiry(
                 termination,
                 stream_ctx,
@@ -4462,10 +4433,10 @@ async fn handle_tcp_connection_inner(
             );
             match copy_result.first_failure.as_ref() {
                 Some(failure) if relay_failure_is_client_facing(failure) => {
-                    cb.record_neutral(cb_info.is_half_open_probe);
+                    cb_info.cb_probe.release_neutral();
                 }
-                Some(_) => cb.record_failure(502, true, cb_info.is_half_open_probe),
-                None => cb.record_success(cb_info.is_half_open_probe),
+                Some(_) => cb.record_failure(502, true, cb_info.cb_probe.take_slot()),
+                None => cb.record_success(cb_info.cb_probe.take_slot()),
             }
         }
 
@@ -4479,12 +4450,6 @@ async fn handle_tcp_connection_inner(
     }
 
     let is_backend_tls = params.backend_scheme == BackendScheme::Tcps;
-    let connect_timeout = Duration::from_millis(params.backend_connect_timeout_ms);
-    let idle_timeout = if params.tcp_idle_timeout_seconds > 0 {
-        Some(Duration::from_secs(params.tcp_idle_timeout_seconds))
-    } else {
-        None
-    };
     let half_close_cap = if params.tcp_half_close_max_wait_seconds > 0 {
         Some(Duration::from_secs(params.tcp_half_close_max_wait_seconds))
     } else {
@@ -4881,25 +4846,7 @@ async fn handle_tcp_connection_inner(
                     cb_info.cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(502, true, cb_info.is_half_open_probe);
-            }
-        };
-
-    // Helper: release a half-open probe slot claimed by `can_execute` without
-    // recording success or failure. Used when the gateway rejects the
-    // connection locally (DestinationRule maxConnections cap), which is not a
-    // backend outcome — `record_neutral` decrements `half_open_in_flight` only
-    // when a probe was held and leaves breaker health untouched.
-    let record_cb_neutral =
-        |cb_cache: &CircuitBreakerCache, proxy_id: &str, cb_info: &TcpConnCbInfo| {
-            if let Some(ref cb_config) = cb_info.cb_config {
-                let cb = cb_cache.get_or_create(
-                    &cb_info.namespace,
-                    proxy_id,
-                    cb_info.cb_target_key.as_deref(),
-                    cb_config,
-                );
-                cb.record_neutral(cb_info.is_half_open_probe);
+                cb.record_failure(502, true, cb_info.cb_probe.take_slot());
             }
         };
 
@@ -4954,9 +4901,8 @@ async fn handle_tcp_connection_inner(
             ));
         }
         // Circuit breaker check — reject before attempting backend connection if open.
-        // When admitted, capture whether this is a half-open probe so downstream
-        // record_failure/record_success calls only decrement the in-flight counter
-        // for actual probe requests.
+        // Own the admitted probe through setup and relay, including cancellation.
+        // A retry rearms the consumed guard on the newly admitted target.
         if let Some(ref cb_config) = current_cb_info.cb_config {
             match circuit_breaker_cache.can_execute(
                 &current_cb_info.namespace,
@@ -4964,8 +4910,13 @@ async fn handle_tcp_connection_inner(
                 current_cb_info.cb_target_key.as_deref(),
                 cb_config,
             ) {
-                Ok((_cb, is_half_open_probe)) => {
-                    current_cb_info.is_half_open_probe = is_half_open_probe;
+                Ok((cb, is_half_open_probe)) => {
+                    if attempt == 0 {
+                        current_cb_info.cb_probe =
+                            HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe);
+                    } else {
+                        current_cb_info.cb_probe.rearm(&cb, is_half_open_probe);
+                    }
                 }
                 Err(_) => {
                     if can_retry && attempt < max_retries {
@@ -4996,14 +4947,9 @@ async fn handle_tcp_connection_inner(
                             // previous guard drops the abandoned one (issue #4514).
                             _lb_guard =
                                 arm_lb_guard(&current_host, current_port, current_policy_port);
-                            current_cb_info = TcpConnCbInfo {
-                                namespace: current_cb_info.namespace.clone(),
-                                cb_config: current_cb_info.cb_config.clone(),
-                                cb_target_key: params.upstream_id.as_ref().map(|_| {
-                                    crate::circuit_breaker::target_key(&current_host, current_port)
-                                }),
-                                is_half_open_probe: false,
-                            };
+                            current_cb_info.cb_target_key = params.upstream_id.as_ref().map(|_| {
+                                crate::circuit_breaker::target_key(&current_host, current_port)
+                            });
                             // Update backend info to reflect the retry target.
                             backend_info.backend_target =
                                 format_backend_target(&current_host, current_port);
@@ -5044,7 +4990,7 @@ async fn handle_tcp_connection_inner(
                 // released NEUTRALLY: neither an expired client credential nor
                 // a withdrawn client-trust decision is a backend outcome, and
                 // leaking the slot would wedge the breaker in HALF_OPEN.
-                record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
+                current_cb_info.cb_probe.release_neutral();
                 return Err(settle_stream_setup_interrupt(
                     interrupt,
                     stream_ctx,
@@ -5064,7 +5010,7 @@ async fn handle_tcp_connection_inner(
                 // leaking it, else `half_open_in_flight` stays consumed and the
                 // breaker can never recover.
                 if crate::dns::is_egress_policy_denial(&e) {
-                    record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
+                    current_cb_info.cb_probe.release_neutral();
                 } else {
                     record_cb_failure(circuit_breaker_cache, proxy_id, &current_cb_info);
                 }
@@ -5097,14 +5043,10 @@ async fn handle_tcp_connection_inner(
                     // Re-arm stream connection accounting on the new target before the
                     // previous guard drops the abandoned one (issue #4514).
                     _lb_guard = arm_lb_guard(&current_host, current_port, current_policy_port);
-                    current_cb_info = TcpConnCbInfo {
-                        namespace: current_cb_info.namespace.clone(),
-                        cb_config: current_cb_info.cb_config.clone(),
-                        cb_target_key: params.upstream_id.as_ref().map(|_| {
-                            crate::circuit_breaker::target_key(&current_host, current_port)
-                        }),
-                        is_half_open_probe: false,
-                    };
+                    current_cb_info.cb_target_key = params
+                        .upstream_id
+                        .as_ref()
+                        .map(|_| crate::circuit_breaker::target_key(&current_host, current_port));
                     // Update backend info to reflect the retry target.
                     backend_info.backend_target =
                         format_backend_target(&current_host, current_port);
@@ -5115,11 +5057,10 @@ async fn handle_tcp_connection_inner(
                     // it is bounded by the same absolute plan — and the same
                     // client-trust retirement — every other setup stage uses.
                     // No circuit-breaker settlement is owed here: this attempt's
-                    // outcome was already recorded above and
-                    // `current_cb_info.is_half_open_probe` was cleared for the
-                    // next target, so no HALF_OPEN probe slot is held across
-                    // the wait. Nothing has been written to a backend, so the
-                    // interruption is settled exactly once and returned.
+                    // outcome already consumed `current_cb_info.cb_probe`, so
+                    // no HALF_OPEN probe slot is held across the wait. Nothing
+                    // has been written to a backend, so the interruption is
+                    // settled exactly once and returned.
                     if let Some(ref retry_config) = params.retry {
                         let backoff = crate::retry::retry_delay(retry_config, attempt);
                         if let Err(interrupt) = retry_backoff_within_stream_setup_bounds(
@@ -5170,13 +5111,13 @@ async fn handle_tcp_connection_inner(
                     "TCP backend rejected: maxConnections reached"
                 );
                 // Release any half-open probe slot claimed for this target
-                // before retrying (which resets is_half_open_probe) or
+                // before retrying (which rearms the guard) or
                 // returning (which records no outcome). A gateway-local
                 // maxConnections rejection must not leak the probe slot —
                 // otherwise a HALF_OPEN breaker stays wedged (always rejecting)
                 // until a config reload. This is neutral: the cap is not a
                 // backend failure.
-                record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
+                current_cb_info.cb_probe.release_neutral();
                 if can_retry
                     && attempt < max_retries
                     && let Some(next) = try_next_enforced_target(
@@ -5199,14 +5140,10 @@ async fn handle_tcp_connection_inner(
                     // Re-arm stream connection accounting on the new target before the
                     // previous guard drops the abandoned one (issue #4514).
                     _lb_guard = arm_lb_guard(&current_host, current_port, current_policy_port);
-                    current_cb_info = TcpConnCbInfo {
-                        namespace: current_cb_info.namespace.clone(),
-                        cb_config: current_cb_info.cb_config.clone(),
-                        cb_target_key: params.upstream_id.as_ref().map(|_| {
-                            crate::circuit_breaker::target_key(&current_host, current_port)
-                        }),
-                        is_half_open_probe: false,
-                    };
+                    current_cb_info.cb_target_key = params
+                        .upstream_id
+                        .as_ref()
+                        .map(|_| crate::circuit_breaker::target_key(&current_host, current_port));
                     backend_info.backend_target =
                         format_backend_target(&current_host, current_port);
                     backend_info.backend_resolved_ip = None;
@@ -5223,11 +5160,10 @@ async fn handle_tcp_connection_inner(
                     // it is bounded by the same absolute plan — and the same
                     // client-trust retirement — every other setup stage uses.
                     // No circuit-breaker settlement is owed here: this attempt's
-                    // outcome was already recorded above and
-                    // `current_cb_info.is_half_open_probe` was cleared for the
-                    // next target, so no HALF_OPEN probe slot is held across
-                    // the wait. Nothing has been written to a backend, so the
-                    // interruption is settled exactly once and returned.
+                    // outcome already consumed `current_cb_info.cb_probe`, so
+                    // no HALF_OPEN probe slot is held across the wait. Nothing
+                    // has been written to a backend, so the interruption is
+                    // settled exactly once and returned.
                     if let Some(ref retry_config) = params.retry {
                         let backoff = crate::retry::retry_delay(retry_config, attempt);
                         if let Err(interrupt) = retry_backoff_within_stream_setup_bounds(
@@ -5257,8 +5193,14 @@ async fn handle_tcp_connection_inner(
             }
         };
 
-        // Attempt backend TCP connection (with optional TLS origination)
-        let current_host_ref = current_host.as_str();
+        // Resolve every attempt from the selected policy lane, including retries
+        // after DNS, circuit-breaker, or connection-limit rejection.
+        let (backend_connect_timeout_ms, _) =
+            tcp_timeout_policy(&params, current_policy_port, proxy, global_tcp_idle_timeout);
+        let connect_timeout = Duration::from_millis(backend_connect_timeout_ms);
+        // The authenticated TLS name is independent of the socket dial host.
+        // Keep the cached verifier (including mesh identity policy) unchanged.
+        let tls_server_name = proxy.resolved_tls.sni.as_deref().unwrap_or(&current_host);
         let params_ref = &params;
         let outbound_pp = outbound_proxy_v2_header.as_deref();
         let connect_attempt = crate::dns::connect_candidates(
@@ -5269,7 +5211,7 @@ async fn handle_tcp_connection_inner(
                 if is_backend_tls {
                     connect_backend_tls_cached(
                         addr,
-                        current_host_ref,
+                        tls_server_name,
                         connect_timeout,
                         cached_backend_tls,
                         params_ref.tcp_fastopen_enabled,
@@ -5322,7 +5264,7 @@ async fn handle_tcp_connection_inner(
                 // recording a backend outcome. `backend_inflight_guard_attempt`
                 // is dropped by this return, so the per-target inflight slot is
                 // released too.
-                record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
+                current_cb_info.cb_probe.release_neutral();
                 return Err(settle_stream_setup_interrupt(
                     interrupt,
                     stream_ctx,
@@ -5334,7 +5276,7 @@ async fn handle_tcp_connection_inner(
             Ok(result) => result.map_err(|error| match error {
                 crate::dns::CandidateConnectError::TimedOut { last_addr } => anyhow::anyhow!(
                     "Backend TCP connect budget exhausted after {}ms (last={})",
-                    params.backend_connect_timeout_ms,
+                    backend_connect_timeout_ms,
                     last_addr
                 ),
                 crate::dns::CandidateConnectError::Failed { source, .. } => source,
@@ -5397,14 +5339,10 @@ async fn handle_tcp_connection_inner(
                     // Re-arm stream connection accounting on the new target before the
                     // previous guard drops the abandoned one (issue #4514).
                     _lb_guard = arm_lb_guard(&current_host, current_port, current_policy_port);
-                    current_cb_info = TcpConnCbInfo {
-                        namespace: current_cb_info.namespace.clone(),
-                        cb_config: current_cb_info.cb_config.clone(),
-                        cb_target_key: params.upstream_id.as_ref().map(|_| {
-                            crate::circuit_breaker::target_key(&current_host, current_port)
-                        }),
-                        is_half_open_probe: false,
-                    };
+                    current_cb_info.cb_target_key = params
+                        .upstream_id
+                        .as_ref()
+                        .map(|_| crate::circuit_breaker::target_key(&current_host, current_port));
                     // Update backend info to reflect the retry target.
                     backend_info.backend_target =
                         format_backend_target(&current_host, current_port);
@@ -5415,11 +5353,10 @@ async fn handle_tcp_connection_inner(
                     // it is bounded by the same absolute plan — and the same
                     // client-trust retirement — every other setup stage uses.
                     // No circuit-breaker settlement is owed here: this attempt's
-                    // outcome was already recorded above and
-                    // `current_cb_info.is_half_open_probe` was cleared for the
-                    // next target, so no HALF_OPEN probe slot is held across
-                    // the wait. Nothing has been written to a backend, so the
-                    // interruption is settled exactly once and returned.
+                    // outcome already consumed `current_cb_info.cb_probe`, so
+                    // no HALF_OPEN probe slot is held across the wait. Nothing
+                    // has been written to a backend, so the interruption is
+                    // settled exactly once and returned.
                     if let Some(ref retry_config) = params.retry {
                         let backoff = crate::retry::retry_delay(retry_config, attempt);
                         if let Err(interrupt) = retry_backoff_within_stream_setup_bounds(
@@ -5444,6 +5381,10 @@ async fn handle_tcp_connection_inner(
             }
         }
     };
+    let (_, tcp_idle_timeout_seconds) =
+        tcp_timeout_policy(&params, current_policy_port, proxy, global_tcp_idle_timeout);
+    let idle_timeout =
+        (tcp_idle_timeout_seconds > 0).then(|| Duration::from_secs(tcp_idle_timeout_seconds));
     let (_backend_socket_addr, mut backend_stream, _backend_inflight_guard) = backend_addr;
     let _ = last_connect_err; // consumed by retry loop logging
     let _backend_session_guard = TcpBackendSessionGuard::new(metrics);
@@ -5493,7 +5434,7 @@ async fn handle_tcp_connection_inner(
                     // credential nor a withdrawn client-trust decision is a
                     // backend outcome, so the breaker, passive health, and the
                     // adaptive buffer tracker are all left untouched.
-                    record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
+                    current_cb_info.cb_probe.release_neutral();
                     return Err(settle_stream_setup_interrupt(
                         interrupt,
                         stream_ctx,
@@ -5510,7 +5451,7 @@ async fn handle_tcp_connection_inner(
                     // Same neutral settlement as an expiry: a withdrawn client
                     // trust decision is a local authorization event, never
                     // evidence about the upstream.
-                    record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
+                    current_cb_info.cb_probe.release_neutral();
                     return Err(settle_stream_trust_withdrawal(
                         client_trust_session,
                         &client_trust_settled,
@@ -5533,7 +5474,7 @@ async fn handle_tcp_connection_inner(
     // no inspected prefix reached here) before the relay moves a single byte.
     // Trust first, for the same reason it leads every other pairing.
     if client_trust_session.is_some_and(|session| session.is_retired()) {
-        record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
+        current_cb_info.cb_probe.release_neutral();
         return Err(settle_stream_trust_withdrawal(
             client_trust_session,
             &client_trust_settled,
@@ -5542,7 +5483,7 @@ async fn handle_tcp_connection_inner(
     if let Some(termination) =
         crate::proxy::auth_lifetime::expired_authorization(stream_auth_deadline)
     {
-        record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
+        current_cb_info.cb_probe.release_neutral();
         return Err(settle_stream_auth_setup_expiry(
             termination,
             stream_ctx,
@@ -5840,10 +5781,10 @@ async fn handle_tcp_connection_inner(
         );
         match copy_result.first_failure.as_ref() {
             Some(failure) if relay_failure_is_client_facing(failure) => {
-                cb.record_neutral(current_cb_info.is_half_open_probe);
+                current_cb_info.cb_probe.release_neutral();
             }
-            Some(_) => cb.record_failure(502, true, current_cb_info.is_half_open_probe),
-            None => cb.record_success(current_cb_info.is_half_open_probe),
+            Some(_) => cb.record_failure(502, true, current_cb_info.cb_probe.take_slot()),
+            None => cb.record_success(current_cb_info.cb_probe.take_slot()),
         }
     }
 
@@ -6203,10 +6144,8 @@ mod backend_target_selection_tests {
             backend_scheme: BackendScheme::Tcp,
             dns_override: None,
             dns_cache_ttl_seconds: None,
-            backend_connect_timeout_ms: 1000,
             backend_read_timeout_ms: 0,
             backend_write_timeout_ms: 0,
-            tcp_idle_timeout_seconds: 60,
             tcp_half_close_max_wait_seconds: 0,
             retry: None,
             upstream_id: Some("orders".to_string()),
@@ -6219,6 +6158,52 @@ mod backend_target_selection_tests {
             health_port_scope: None,
             backend_proxy_protocol: None,
         }
+    }
+
+    #[test]
+    fn tcp_retry_timeouts_follow_current_policy_port() {
+        let mut proxy = proxy_with_subset(None);
+        proxy.backend_connect_timeout_ms = 5_000;
+        proxy.tcp_idle_timeout_seconds = Some(300);
+        proxy.dispatch_port_overrides = Some(HashMap::from([
+            (
+                6379,
+                crate::config::types::ResolvedPortOverride {
+                    connect_timeout_ms: Some(9_000),
+                    tcp_idle_timeout_seconds: Some(0),
+                    ..Default::default()
+                },
+            ),
+            (
+                6380,
+                crate::config::types::ResolvedPortOverride {
+                    connect_timeout_ms: Some(250),
+                    tcp_idle_timeout_seconds: Some(2),
+                    ..Default::default()
+                },
+            ),
+        ]));
+        let mut params = retry_params();
+        params.backend_policy_port = 6379;
+        params.dispatch_port_overrides = proxy.dispatch_port_overrides.clone();
+
+        assert_eq!(
+            tcp_timeout_policy(&params, params.backend_policy_port, &proxy, 600),
+            (9_000, 0)
+        );
+
+        params.backend_policy_port = 6380;
+        assert_eq!(
+            tcp_timeout_policy(&params, params.backend_policy_port, &proxy, 600),
+            (250, 2)
+        );
+
+        params.backend_policy_port = 6381;
+        assert_eq!(
+            tcp_timeout_policy(&params, params.backend_policy_port, &proxy, 600),
+            (5_000, 300),
+            "a lane without overrides must not inherit the initial target's values"
+        );
     }
 
     #[test]
@@ -7611,6 +7596,25 @@ fn resolve_port_override(
         .and_then(|m| m.get(&port))
 }
 
+/// Resolve TCP timeouts for the selected policy port on either relay path.
+/// A lane without overrides uses proxy/global defaults, never the first lane.
+fn tcp_timeout_policy(
+    params: &TcpConnParams,
+    policy_port: u16,
+    proxy: &Proxy,
+    global_tcp_idle_timeout: u64,
+) -> (u64, u64) {
+    let port_override = resolve_port_override(params, policy_port);
+    let connect_timeout_ms = port_override
+        .and_then(|override_config| override_config.connect_timeout_ms)
+        .unwrap_or(proxy.backend_connect_timeout_ms);
+    let idle_timeout_seconds = port_override
+        .and_then(|override_config| override_config.tcp_idle_timeout_seconds)
+        .or(proxy.tcp_idle_timeout_seconds)
+        .unwrap_or(global_tcp_idle_timeout);
+    (connect_timeout_ms, idle_timeout_seconds)
+}
+
 /// Try to acquire a per-target open-connection slot for DR
 /// `connectionPool.tcp.maxConnections`, delegating to the shared
 /// `BackendConnectionLimiter`. Returns:
@@ -7950,6 +7954,7 @@ mod outbound_proxy_v2_passthrough_cb_tests {
             failure_status_codes: vec![500],
             half_open_max_requests: 1,
             trip_on_connection_errors: true,
+            half_open_probe_dwell_seconds: None,
         };
         Arc::new(CircuitBreaker::new(config))
     }
@@ -8331,6 +8336,69 @@ impl CopyDirectionState {
     }
 }
 
+// The queue state and watermark are private. Keep their deterministic
+// transition check here; end-to-end timeout coverage lives in tests/.
+#[cfg(test)]
+mod copy_direction_queue_tests {
+    use super::*;
+    use std::task::Context;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn write_watermark_disarms_only_after_drain_and_rearms_for_new_data() {
+        let (mut client, mut client_peer) = tokio::io::duplex(8);
+        let (mut backend, mut backend_peer) = tokio::io::duplex(1);
+        let mut state = CopyDirectionState::new(8);
+        let bytes = AtomicU64::new(0);
+        let write_watermark = AtomicU64::new(u64::MAX);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        client_peer.write_all(b"abc").await.unwrap();
+        for expected in b"abc" {
+            assert!(
+                poll_copy_direction(
+                    &mut cx,
+                    Pin::new(&mut client),
+                    Pin::new(&mut backend),
+                    &mut state,
+                    &bytes,
+                    None,
+                    None,
+                    Some(&write_watermark),
+                )
+                .is_pending()
+            );
+            if *expected == b'c' {
+                assert!(state.phase == CopyPhase::Reading);
+                assert_eq!(write_watermark.load(Ordering::Relaxed), u64::MAX);
+            } else {
+                assert!(state.phase == CopyPhase::Writing);
+                assert_ne!(write_watermark.load(Ordering::Relaxed), u64::MAX);
+                assert_eq!(backend_peer.read_u8().await.unwrap(), *expected);
+            }
+        }
+        assert_eq!(bytes.load(Ordering::Relaxed), 3);
+        // The final byte still occupies the backend socket buffer. A new
+        // client byte is now queued but cannot make write progress.
+        client_peer.write_all(b"d").await.unwrap();
+        assert!(
+            poll_copy_direction(
+                &mut cx,
+                Pin::new(&mut client),
+                Pin::new(&mut backend),
+                &mut state,
+                &bytes,
+                None,
+                None,
+                Some(&write_watermark),
+            )
+            .is_pending()
+        );
+        assert!(state.phase == CopyPhase::Writing);
+        assert_ne!(write_watermark.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(bytes.load(Ordering::Relaxed), 3);
+    }
+}
+
 enum Phase1Outcome {
     ClientToBackend(Result<(), (StreamIoSide, std::io::Error)>),
     BackendToClient(Result<(), (StreamIoSide, std::io::Error)>),
@@ -8480,6 +8548,11 @@ where
                     }
                 }
 
+                // Nothing remains queued for the backend. Client silence
+                // must not retain the previous write-stall deadline.
+                if let Some(wm) = write_watermark {
+                    wm.store(u64::MAX, Ordering::Relaxed);
+                }
                 state.pos = 0;
                 state.cap = 0;
                 state.phase = CopyPhase::Reading;
@@ -9821,16 +9894,67 @@ fn classify_splice_worker_failure(
     }
 }
 
+/// Tokio's default `max_blocking_threads`, used when `FERRUM_BLOCKING_THREADS`
+/// is unset. Mirrors the value the runtime builder itself defaults to.
+pub const DEFAULT_BLOCKING_THREADS: usize = 512;
+
+/// Divisor applied to the blocking pool to size the io_uring splice relay cap.
+///
+/// Each admitted relay holds TWO blocking threads (one per direction) for the
+/// whole connection lifetime, so a cap of `pool / 4` relays consumes at most
+/// half the pool at saturation and always leaves half for everything else —
+/// including the overload monitor's open-FD count and config reload, which run
+/// on the same pool (issue #4786). Relays beyond the cap transparently fall
+/// back to the async splice path rather than queueing.
+///
+/// At the default 512-thread pool this reproduces the previous hardcoded 128,
+/// so nothing changes for a deployment that never touched
+/// `FERRUM_BLOCKING_THREADS`; a smaller pool now shrinks the cap with it
+/// instead of letting relays claim the whole thing.
+const IO_URING_SPLICE_POOL_DIVISOR: usize = 4;
+
+/// Derive the concurrent io_uring splice relay cap from the configured
+/// blocking pool size.
+///
+/// Never returns 0: a one-thread pool still admits a single relay, because the
+/// alternative is silently disabling io_uring splice on a configuration that
+/// asked for it.
+pub fn derive_io_uring_splice_max_concurrent(blocking_threads: Option<usize>) -> usize {
+    let pool = blocking_threads.unwrap_or(DEFAULT_BLOCKING_THREADS).max(1);
+    (pool / IO_URING_SPLICE_POOL_DIVISOR).max(1)
+}
+
 #[cfg(target_os = "linux")]
-const IO_URING_SPLICE_MAX_CONCURRENT: usize = 128;
+static IO_URING_SPLICE_MAX_CONCURRENT: OnceLock<usize> = OnceLock::new();
 
 #[cfg(target_os = "linux")]
 static IO_URING_SPLICE_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
+/// Seed the relay cap from the process configuration.
+///
+/// Called once from startup, before any listener is bound, so the first relay
+/// observes the derived value. Idempotent: a later call (or a relay that
+/// arrived first) leaves the already-published cap in place, because the
+/// semaphore it sized cannot be resized without losing outstanding permits.
+#[cfg(target_os = "linux")]
+pub fn initialize_io_uring_splice_limit(blocking_threads: Option<usize>) {
+    let _ =
+        IO_URING_SPLICE_MAX_CONCURRENT.set(derive_io_uring_splice_max_concurrent(blocking_threads));
+}
+
+/// No-op on non-Linux targets, where io_uring splice does not exist.
+#[cfg(not(target_os = "linux"))]
+pub fn initialize_io_uring_splice_limit(_blocking_threads: Option<usize>) {}
+
+#[cfg(target_os = "linux")]
+fn io_uring_splice_max_concurrent() -> usize {
+    *IO_URING_SPLICE_MAX_CONCURRENT.get_or_init(|| derive_io_uring_splice_max_concurrent(None))
+}
+
 #[cfg(target_os = "linux")]
 fn io_uring_splice_limit() -> Arc<Semaphore> {
     IO_URING_SPLICE_LIMIT
-        .get_or_init(|| Arc::new(Semaphore::new(IO_URING_SPLICE_MAX_CONCURRENT)))
+        .get_or_init(|| Arc::new(Semaphore::new(io_uring_splice_max_concurrent())))
         .clone()
 }
 
@@ -9887,7 +10011,7 @@ async fn bidirectional_splice_io_uring_bounded_or_async(
         .await
     } else {
         debug!(
-            max_concurrent = IO_URING_SPLICE_MAX_CONCURRENT,
+            max_concurrent = io_uring_splice_max_concurrent(),
             "io_uring splice concurrency limit reached; falling back to async splice"
         );
         bidirectional_splice(
@@ -10487,12 +10611,8 @@ fn libc_splice_loop(
                 ));
             }
         }
-        // See the io_uring loop's analogous block — the c2b worker must fire
-        // `backend_write_timeout_ms` even when stuck in the Reading phase, to
-        // match `bidirectional_copy`'s parent-watchdog semantics and the
-        // libc-async splice path's parent watchdog. The watermark is
-        // `u64::MAX` until c2b primes it on its first successful read, so
-        // this check stays inert until c2b actually carries data.
+        // The write watermark is disarmed whenever the pipe drains, so
+        // waiting for new client bytes cannot count as a backend write stall.
         if write_wm_active && let Some(wm) = write_watermark {
             let last = wm.load(Ordering::Relaxed);
             if coarse_now_ms().saturating_sub(last) >= write_timeout_ms {
@@ -10633,6 +10753,9 @@ fn libc_splice_loop(
                     ));
                 }
             }
+            if let Some(wm) = write_watermark {
+                wm.store(u64::MAX, Ordering::Relaxed);
+            }
         } else if n == 0 {
             shutdown_write_fd(dst_fd);
             return Ok(total);
@@ -10667,9 +10790,7 @@ fn libc_splice_loop(
                         ));
                     }
                 }
-                // Mirror the outer-loop check: the c2b worker must also
-                // fire backend_write_timeout when stuck in Phase 1 with
-                // stale queued bytes. See the outer-loop comment above.
+                // Keep the same queue-aware watermark as the outer check.
                 if write_wm_active && let Some(wm) = write_watermark {
                     let last = wm.load(Ordering::Relaxed);
                     if coarse_now_ms().saturating_sub(last) >= write_timeout_ms {
@@ -10742,7 +10863,8 @@ fn create_splice_pipe(desired_size: usize) -> Result<(i32, i32), anyhow::Error> 
 /// caller (Phase 1 watchdog in `bidirectional_splice`) reads it to fire
 /// `backend_read_timeout_ms` when the b2c direction's backend stops sending.
 /// `write_watermark` is primed when src→pipe produces queued bytes and
-/// refreshed on every successful pipe→dst splice. The caller fires
+/// refreshed on every successful pipe→dst splice, then disarmed when the
+/// pipe drains. The caller fires
 /// `backend_write_timeout_ms` from it for the c2b direction. Both are
 /// `Option<&AtomicU64>` because c2b only carries write_watermark and b2c only
 /// carries read_watermark — they share scope with the watchdog instead of
@@ -10897,6 +11019,9 @@ async fn splice_one_direction_no_guard(
                     half_close_relay_write_side(dst, dst_is_ktls).await?;
                     return Ok(());
                 }
+            }
+            if let Some(ref wm) = write_watermark {
+                wm.store(u64::MAX, Ordering::Relaxed);
             }
         } else if n == 0 {
             // EOF — source closed.
@@ -11173,6 +11298,9 @@ async fn resolve_ktls_splice_einval(
             }
             bytes.fetch_add(len as u64, Ordering::Relaxed);
             refresh_splice_write_progress(last_activity, write_watermark);
+            if let Some(wm) = write_watermark {
+                wm.store(u64::MAX, Ordering::Relaxed);
+            }
             KtlsSpliceEinval::Resume
         }
         KtlsRecvOutcome::Control { record_type, len } => {

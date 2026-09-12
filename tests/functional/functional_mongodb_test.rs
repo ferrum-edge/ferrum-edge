@@ -162,6 +162,7 @@ impl MongoTestHarness {
         let binary_path = find_binary()?;
 
         let mut command = Command::new(binary_path);
+        command.arg("run");
         command
             .env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "mongodb")
@@ -337,6 +338,7 @@ impl MongoTestHarness {
         let ca_cert_path = format!("{}/ca.crt", cert_dir);
         let tls_mode = if insecure { "require" } else { "verify-full" };
         let mut command = Command::new(binary_path);
+        command.arg("run");
         command
             .env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "mongodb")
@@ -415,6 +417,7 @@ impl MongoTestHarness {
         let client_key_path = format!("{}/client.key", cert_dir);
 
         let mut command = Command::new(binary_path);
+        command.arg("run");
         command
             .env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "mongodb")

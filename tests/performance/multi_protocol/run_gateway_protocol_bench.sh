@@ -65,6 +65,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# DURATION is used in Bash arithmetic below. Validate it before arithmetic
+# expansion so caller-controlled values cannot be evaluated as expressions.
+if [[ ! $DURATION =~ ^[0-9]+$ ]]; then
+    echo "--duration must be a non-negative integer" >&2
+    exit 2
+fi
+
 # UDP protocols are fixed to 1 KB regardless of caller.
 case "$PROTOCOL" in
     udp|udp-dtls) PAYLOAD_SIZES="1024" ;;

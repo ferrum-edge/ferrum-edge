@@ -2,12 +2,13 @@
 
 use chrono::Utc;
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, Consumer, DispatchKind, Proxy, default_namespace,
+    AuthMode, BackendScheme, Consumer, DispatchKind, PluginAssociation, PluginConfig, PluginScope,
+    Proxy, default_namespace,
 };
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use hmac::{KeyInit, Mac};
 use http::HeaderMap;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
@@ -140,7 +141,12 @@ pub fn create_test_context() -> RequestContext {
 }
 
 /// Build a request context whose raw header map contains `value`, then run
-/// `materialize_headers()` so non-visible-ASCII values stay out of `ctx.headers`.
+/// `materialize_headers()`.
+///
+/// `value` is always valid UTF-8, so materialization keeps it byte-exact (issue
+/// #5010). The divergence these repros exercise is the RFC-bound visible-ASCII
+/// credential policy in `header_extract`, which reads the retained RAW map and
+/// still reports a non-ASCII field line as present-but-malformed.
 pub fn context_with_materialized_raw_header(name: &str, value: &str) -> RequestContext {
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
@@ -158,23 +164,29 @@ pub fn context_with_materialized_raw_header(name: &str, value: &str) -> RequestC
     );
     ctx.set_raw_headers(raw);
     ctx.materialize_headers();
-    assert!(
-        !ctx.headers.contains_key(name.to_ascii_lowercase().as_str())
-            && !ctx.headers.contains_key(name),
-        "non-ASCII header values must stay out of the materialized map in this repro"
+    assert_eq!(
+        ctx.headers
+            .get(name.to_ascii_lowercase().as_str())
+            .map(String::as_str),
+        Some(value),
+        "valid UTF-8 header values must be materialized byte-exact in this repro"
     );
     ctx
 }
 
-/// Build a request context from raw header bytes that `materialize_headers()`
-/// omits, then materialize the rest of the map.
+/// Build a request context from raw header bytes, then materialize the map.
+///
+/// Bytes that are not valid UTF-8 cannot be represented in the materialized map
+/// and stay out of it; valid UTF-8 is materialized byte-exact.
 pub fn context_with_materialized_raw_header_bytes(name: &str, value: &[u8]) -> RequestContext {
     let ctx = context_with_materialized_raw_header_lines(name, &[value]);
-    assert!(
-        !ctx.headers.contains_key(name.to_ascii_lowercase().as_str())
-            && !ctx.headers.contains_key(name),
-        "non-materializable header values must stay out of the materialized map in this repro"
-    );
+    if std::str::from_utf8(value).is_err() {
+        assert!(
+            !ctx.headers.contains_key(name.to_ascii_lowercase().as_str())
+                && !ctx.headers.contains_key(name),
+            "non-UTF-8 header values must stay out of the materialized map in this repro"
+        );
+    }
     ctx
 }
 
@@ -437,6 +449,38 @@ pub fn assert_continue(result: PluginResult) {
     }
 }
 
+/// Assert that a validated far-future credential expiry was admitted without an
+/// *effective* deadline (issue #5420).
+///
+/// Which of the two admissible answers a platform gives is decided by its
+/// monotonic clock rather than by the plugin: a `timespec`-backed
+/// `tokio::time::Instant` carries `i64` seconds and can express
+/// `now + (i64::MAX - now_unix)`, so it publishes that astronomically distant
+/// bound, while a narrower representation saturates and publishes no bound at
+/// all. Both admit the credential. What must never happen — the regression
+/// issue #5420 fixed — is a bound that has ALREADY elapsed, which is how the
+/// old collapse onto `now` presented a token the JWT layer had just validated
+/// as live.
+///
+/// The conversion's `Unbounded` branch itself is proven deterministically, on
+/// every platform, by the injected-clock tests in
+/// `auth_flow_credential_deadline_tests`.
+#[allow(dead_code)]
+pub fn assert_no_effective_credential_deadline(ctx: &RequestContext) {
+    // Longer than any authenticated stream this gateway holds open, so a
+    // deadline still beyond it is indistinguishable from an absent one.
+    const A_YEAR: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 60 * 60);
+
+    if let Some(deadline) = ferrum_edge::_test_support::request_credential_deadline_at(ctx) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            remaining > A_YEAR,
+            "a validated far-future expiry must publish either no monotonic bound or one \
+             far beyond any real session, never one that already elapsed: {remaining:?} left"
+        );
+    }
+}
+
 /// Assert that a plugin result is Reject with optional status code check
 #[allow(dead_code)]
 pub fn assert_reject(result: PluginResult, expected_status: Option<u16>) {
@@ -501,19 +545,101 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
     }
 }
 
+/// A global `tracing` dispatcher whose only job is to keep callsite interest
+/// from collapsing to `never`. `tracing::subscriber::set_default` installs a
+/// thread-local dispatcher and does NOT rebuild the global interest cache, so a
+/// callsite that some other test hit first (before any dispatcher existed) can
+/// stay cached as disabled and a later thread-local capture sees nothing. With
+/// this floor registered, `rebuild_interest_cache()` yields `sometimes` for
+/// every callsite and captures work regardless of test ordering. The unit suite
+/// is split across several test binaries, so no test may rely on another
+/// module having installed a global subscriber earlier in the process.
+struct InterestFloorSubscriber;
+
+impl tracing::Subscriber for InterestFloorSubscriber {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::TRACE)
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Install [`InterestFloorSubscriber`] as the global default exactly once for
+/// this test binary. Idempotent and tolerant of an already-set global default.
+/// Call it before installing a thread-local capturing subscriber, then run
+/// `tracing::callsite::rebuild_interest_cache()` after `set_default`.
+#[allow(dead_code)]
+pub fn install_interest_floor() {
+    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let _ = tracing::subscriber::set_global_default(InterestFloorSubscriber);
+    });
+}
+
+/// Guarantee `FERRUM_BASIC_AUTH_HMAC_SECRET` is set for tests that construct
+/// every registered plugin (`basic_auth` refuses to start without it). The
+/// monolithic unit binary used to inherit the value from `basic_auth_tests`
+/// running earlier in the same process; each split binary must set it itself.
+/// Sets only when absent, under the shared env lock, so env-scoped tests that
+/// deliberately clear the variable are not raced.
+#[allow(dead_code)]
+pub fn ensure_basic_auth_test_secret() {
+    const KEY: &str = "FERRUM_BASIC_AUTH_HMAC_SECRET";
+    let _guard = crate::unit::env_lock::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if std::env::var_os(KEY).is_none() {
+        // SAFETY: serialized by ENV_LOCK with every env-mutating unit test, and
+        // the value is a fixed test constant set once for the process.
+        unsafe {
+            std::env::set_var(KEY, "unit-test-basic-auth-hmac-secret-0123456789abcdef");
+        }
+    }
+}
+
 /// Install a thread-local capturing subscriber for the duration of the returned
 /// guard. Use `flavor = "current_thread"` so plugin flush workers stay on the
 /// thread the subscriber is installed for.
 #[allow(dead_code)]
 pub fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+    capture_logs_at_level(tracing::Level::INFO)
+}
+
+/// Capture every event when a diagnostic's warning is shared and sampled.
+#[allow(dead_code)]
+pub fn capture_debug_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+    capture_logs_at_level(tracing::Level::DEBUG)
+}
+
+fn capture_logs_at_level(
+    level: tracing::Level,
+) -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+    install_interest_floor();
     let writer = CapturedLogs::default();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
+        .with_max_level(level)
         .with_target(false)
         .without_time()
         .with_writer(writer.clone())
         .finish();
     let guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
     (writer, guard)
 }
 
@@ -526,5 +652,330 @@ pub fn assert_no_secrets(logs: &str, context: &str, secrets: &[&str]) {
             !logs.contains(secret),
             "{context} leaked {secret:?} into diagnostics: {logs}"
         );
+    }
+}
+
+// ---- Shared plugin fixtures (formerly in plugin_cache_tests) ----
+
+/// Returns the minimal valid config for a given plugin name so that `create_plugin` succeeds.
+#[allow(dead_code)]
+pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
+    match plugin_name {
+        "access_control" => json!({"allowed_consumers": ["testuser"]}),
+        "tcp_connection_throttle" => json!({"max_connections_per_key": 10}),
+        "ip_restriction" => json!({"allow": ["0.0.0.0/0"]}),
+        "geo_restriction" => json!({
+            "db_path": "/nonexistent/GeoIP2-Country.mmdb",
+            "allow_countries": ["US"]
+        }),
+        "rate_limiting" => json!({
+            "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]
+        }),
+        "request_transformer" => {
+            json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]})
+        }
+        "response_transformer" => {
+            json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]})
+        }
+        "request_size_limiting" => json!({"max_bytes": 1048576}),
+        "waf" => json!({ "mode": "monitor" }),
+        "response_size_limiting" => json!({"max_bytes": 1048576}),
+        "ws_message_size_limiting" => json!({"max_frame_bytes": 65536}),
+        "ws_rate_limiting" => json!({"frames_per_second": 100}),
+        "body_validator" => json!({"required_fields": ["name"]}),
+        "graphql" => json!({"max_depth": 100}),
+        "grpc_method_router" => json!({"allow_methods": ["test.Svc/Method"]}),
+        "grpc_deadline" => json!({"max_deadline_ms": 30000}),
+        "ai_rate_limiter" => json!({"token_limit": 100000}),
+        "cors" => json!({"allowed_origins": ["*"]}),
+        "response_caching" => json!({"ttl_seconds": 60}),
+        "http_logging" => json!({"endpoint_url": "http://localhost:9200/logs"}),
+        "tcp_logging" => json!({"host": "localhost", "port": 5140}),
+        "ws_logging" => json!({"endpoint_url": "ws://localhost:9300/logs"}),
+        "otel_tracing" => json!({"endpoint": "http://localhost:4318/v1/traces"}),
+        // `hmac_auth` defaults to the single-use `ferrum-hmac-v2` profile, which
+        // requires an explicit replay-scope declaration.
+        "hmac_auth" => json!({"replay_scope": "process"}),
+        "jwks_auth" => {
+            json!({"providers": [{"jwks_uri": "http://127.0.0.1:9/.well-known/jwks.json"}]})
+        }
+        "oauth2_introspection" => json!({
+            "providers": [{
+                "introspection_endpoint": "http://127.0.0.1:9/introspect",
+                "client_auth": {"method": "none"}
+            }]
+        }),
+        "oidc_relying_party" => json!({
+            "providers": [{
+                "issuer": "https://issuer.example.com",
+                "authorization_endpoint": "https://issuer.example.com/authorize",
+                "token_endpoint": "https://issuer.example.com/token",
+                "jwks_uri": "https://issuer.example.com/jwks",
+                "client_id": "ferrum-gateway",
+                "client_auth": {"method": "client_secret_basic", "client_secret": "secret"},
+                "scopes": ["openid", "profile"],
+                "redirect_uri": "https://app.example.com/oauth/callback",
+                "callback_path": "/oauth/callback",
+                "logout_path": "/oauth/logout"
+            }],
+            "session": {
+                "store": "cookie",
+                "encryption_secret": "01234567890123456789012345678901"
+            },
+            "behavior": {"trusted_redirect_hosts": ["app.example.com"]}
+        }),
+        "udp_rate_limiting" => json!({"datagrams_per_second": 1000}),
+        "serverless_function" => {
+            json!({"provider": "azure_functions", "function_url": "https://example.com/func"})
+        }
+        "request_mirror" => json!({"mirror_host": "mirror.local"}),
+        "load_testing" => json!({
+            "key": "test-load-key-0123456789abcdef!!",
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": 8000
+        }),
+        "fault_injection" => json!({
+            "abort": {"status_code": 503, "percentage": 100.0},
+            "runtime_overlay_scope": "checkout"
+        }),
+        "udp_logging" => json!({"host": "127.0.0.1", "port": 9514}),
+        "statsd_logging" => json!({"host": "127.0.0.1", "port": 8125}),
+        "loki_logging" => json!({"endpoint_url": "http://localhost:3100/loki/api/v1/push"}),
+        "kafka_logging" => json!({"broker_list": "localhost:9092", "topic": "test-logs"}),
+        "request_deduplication" => json!({}),
+        "response_mock" => json!({"rules": [{"path": "/test", "body": "mock"}]}),
+        "openapi_validator" => json!({
+            "operations": [{
+                "method": "GET",
+                "path_template": "/health",
+                "path_regex": "^/health$",
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "type": "object"
+                            }
+                        }
+                    }
+                }
+            }]
+        }),
+        "ai_federation" => {
+            json!({"providers": [{"name": "test", "provider_type": "openai", "api_key": "sk-test"}]})
+        }
+        "ai_stream_router" => json!({
+            "providers": [{
+                "name": "test",
+                "provider_type": "openai",
+                "endpoint": "https://api.openai.com/v1/chat/completions",
+                "api_key": "sk-test",
+                "model_patterns": ["gpt-*"]
+            }]
+        }),
+        "mcp_gateway" => json!({
+            "mode": "transparent_proxy",
+            "endpoint": {"path": "/mcp"},
+            "servers": {
+                "tools": {
+                    "upstream_url": "http://mcp-gateway.example/mcp",
+                    "namespace": "tools"
+                }
+            }
+        }),
+        "a2a_gateway" => json!({
+            "discovery": {"rewrite_agent_card_urls": false},
+            "mode": "transparent_proxy",
+            "endpoint": {
+                "path": "/a2a",
+                "agent_card_path": "/.well-known/agent-card.json",
+                "grpc_services": ["a2a.v1.A2AService"]
+            }
+        }),
+        "ai_semantic_firewall" => json!({
+            "provider": {
+                "type": "openai_compatible_embeddings",
+                "endpoint": "http://127.0.0.1:9/v1/embeddings",
+                "request_timeout_ms": 100
+            }
+        }),
+        "ai_tool_governor" => json!({
+            "tools": { "github.create_pr": { "action": "allow" } }
+        }),
+        "ai_transcript_audit" => json!({
+            "sink": {"endpoint_url": "https://localhost:9200/audit"}
+        }),
+        "ldap_auth" => json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
+        }),
+        "spec_expose" => json!({"spec_url": "https://example.com/openapi.yaml"}),
+        "api_chargeback" => {
+            json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0.00001}]})
+        }
+        "api_chargeback_sink" => json!({
+            "clickhouse": {
+                "url": "http://127.0.0.1:8123",
+                "database": "default",
+                "table": "ferrum_charge_events"
+            },
+            "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.00001}],
+            "spool": {"enabled": false}
+        }),
+        "ai_response_guard" => json!({"pii_patterns": ["ssn"], "action": "reject"}),
+        "ai_request_guard" => json!({"max_messages": 100}),
+        "transaction_log_schema" => {
+            json!({"schemas": {"default": {"summary_type": "both"}}})
+        }
+        "mesh_route_dispatch" => json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "canary"}
+            }]
+        }),
+        "mesh_outbound_registry" => {
+            json!({"registry": ["reviews.default.svc.cluster.local"]})
+        }
+        "opa" => json!({
+            "opa_host": "http://127.0.0.1:8181",
+            "policy_path": "ferrum/authz/allow"
+        }),
+        "proxy_alerts" => json!({
+            "channels": {
+                "ops": { "type": "slack", "webhook_url": "https://hooks.slack.com/x" }
+            },
+            "rules": [{
+                "name": "r", "type": "error_rate",
+                "status_codes": [500], "threshold_percent": 5.0,
+                "channels": ["ops"]
+            }]
+        }),
+        _ => json!({}),
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
+    Proxy {
+        id: id.to_string(),
+        namespace: default_namespace(),
+        name: Some(format!("Proxy {}", id)),
+        hosts: vec![],
+        listen_path: Some(listen_path.to_string()),
+        backend_scheme: Some(BackendScheme::Http),
+        dispatch_kind: DispatchKind::from(BackendScheme::Http),
+        backend_host: "localhost".to_string(),
+        backend_port: 3000,
+        backend_path: None,
+        strip_listen_path: true,
+        preserve_host_header: false,
+        backend_connect_timeout_ms: 5000,
+        backend_read_timeout_ms: 30000,
+        backend_write_timeout_ms: 30000,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        resolved_tls: Default::default(),
+        dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
+        dns_override: None,
+        dns_cache_ttl_seconds: None,
+        auth_mode: AuthMode::Single,
+        plugins: plugin_ids
+            .into_iter()
+            .map(|id| PluginAssociation {
+                plugin_config_id: id.to_string(),
+            })
+            .collect(),
+
+        pool_idle_timeout_seconds: None,
+        pool_enable_http_keep_alive: None,
+        pool_enable_http2: None,
+        pool_tcp_keepalive_seconds: None,
+        pool_http2_keep_alive_interval_seconds: None,
+        pool_http2_keep_alive_timeout_seconds: None,
+        pool_http2_initial_stream_window_size: None,
+        pool_http2_initial_connection_window_size: None,
+        pool_http2_adaptive_window: None,
+        pool_http2_max_frame_size: None,
+        pool_http2_max_concurrent_streams: None,
+        pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
+        pool_max_requests_per_connection: None,
+        pool_http1_max_pending_requests: None,
+        upstream_id: None,
+        upstream_subset: None,
+        api_spec_id: None,
+        circuit_breaker: None,
+        retry: None,
+        response_body_mode: Default::default(),
+        listen_port: None,
+        frontend_tls: false,
+        passthrough: false,
+        udp_idle_timeout_seconds: 60,
+        tcp_idle_timeout_seconds: Some(300),
+        websocket_idle_timeout_seconds: None,
+        allowed_methods: None,
+        allowed_ws_origins: vec![],
+        udp_max_response_amplification_factor: None,
+        stream_proxy_protocol: None,
+        backend_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        pending_limit_scope: None,
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn make_plugin_config(
+    id: &str,
+    plugin_name: &str,
+    scope: PluginScope,
+    proxy_id: Option<&str>,
+    enabled: bool,
+) -> PluginConfig {
+    // Some plugins now require non-empty config to be created successfully.
+    let config = minimal_plugin_config(plugin_name);
+    PluginConfig {
+        id: id.to_string(),
+        namespace: default_namespace(),
+        plugin_name: plugin_name.to_string(),
+        config,
+        scope,
+        proxy_id: proxy_id.map(|s| s.to_string()),
+        enabled,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn make_plugin_config_with_json(
+    id: &str,
+    plugin_name: &str,
+    config: serde_json::Value,
+    scope: PluginScope,
+    proxy_id: Option<&str>,
+) -> PluginConfig {
+    PluginConfig {
+        id: id.to_string(),
+        namespace: default_namespace(),
+        plugin_name: plugin_name.to_string(),
+        config,
+        scope,
+        proxy_id: proxy_id.map(|s| s.to_string()),
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
     }
 }

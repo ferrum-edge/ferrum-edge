@@ -91,12 +91,12 @@ impl MeshOutboundEnforcement {
     /// on this gateway (typically `15001` in sidecar / ambient topologies).
     /// Stream listeners bound to other ports skip enforcement.
     ///
-    /// Returns `None` when the resulting registry would be empty *and*
-    /// no outbound capture ports are configured — there is nothing to
-    /// enforce. Callers should treat that as "no enforcement active" and
+    /// Returns `None` when no outbound capture ports are configured — there
+    /// is nothing to enforce. Callers should treat that as "no enforcement active" and
     /// store a `None` in the slot. An empty registry with a non-empty
     /// port list IS a valid fail-closed configuration (every destination
-    /// is denied), so we keep that.
+    /// is denied), so we keep that. Invalid mesh-derived entries also retain
+    /// a deny-all registry instead of disabling the enforcement gate.
     pub fn from_slice(
         slice: &MeshSlice,
         cluster_domain: &str,
@@ -112,7 +112,16 @@ impl MeshOutboundEnforcement {
         }
         let registry_entries = slice.build_known_destinations(cluster_domain);
         let registry =
-            OutboundRegistry::new(&serde_json::json!({ "registry": registry_entries })).ok()?;
+            match OutboundRegistry::new(&serde_json::json!({ "registry": registry_entries })) {
+                Ok(registry) => registry,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "Invalid mesh outbound registry; denying all destinations"
+                    );
+                    OutboundRegistry::deny_all()
+                }
+            };
         let mut outbound_listen_ports = outbound_listen_ports;
         outbound_listen_ports.retain(|port| *port != 0);
         outbound_listen_ports.sort_unstable();

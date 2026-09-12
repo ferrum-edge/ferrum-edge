@@ -82,6 +82,7 @@ fn start_gateway_in_file_mode(
 ) -> std::process::Child {
     let binary_path = gateway_binary_path();
     let mut cmd = std::process::Command::new(binary_path);
+    cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())

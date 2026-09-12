@@ -81,7 +81,80 @@ pub struct CircuitBreaker {
     /// Unix epoch milliseconds for diagnostics only. Never consulted for a
     /// breaker state transition, so wall-clock jumps cannot change recovery.
     last_failure_epoch_ms: AtomicU64,
+    /// Process-relative monotonic tick of the NEWEST HALF_OPEN probe admission
+    /// of the current open cycle, and the dwell's only time input.
+    ///
+    /// Probe slots are anonymous — a release does not say which admission it
+    /// settles — so the dwell is armed off the newest admission rather than a
+    /// per-slot timestamp: if the newest admission is older than the dwell,
+    /// then EVERY slot still held was admitted at least a dwell ago. That is
+    /// strictly conservative (it can never reclaim a probe that was admitted
+    /// within the dwell) which is the direction that matters, because a reclaim
+    /// while a real probe is still in flight lets a second probe reach the
+    /// backend the breaker is protecting.
+    ///
+    /// Written before the CAS that admits a probe (and before the CAS that
+    /// publishes HALF_OPEN) so any thread that observes this cycle's packed
+    /// value also observes this cycle's tick, never one left over from an
+    /// earlier cycle. A thread that then loses its CAS has only refreshed the
+    /// tick, which delays a reclaim by at most one dwell — the safe direction.
+    half_open_admission_tick_ms: AtomicU64,
+    /// Reclaimed-but-not-yet-settled probe slots in the current open cycle.
+    ///
+    /// A reclaim returns a slot on behalf of a probe that may still settle
+    /// later. Because slots are anonymous, that late settle cannot be told
+    /// apart from a live probe's; letting it decrement a second time would
+    /// make the in-flight count UNDER-state the probes actually running and
+    /// over-admit. Instead each reclaim records one unit of debt and the next
+    /// release consumes it instead of decrementing, so a reclaim plus its
+    /// stale settle costs exactly one slot in aggregate — the same
+    /// exactly-once property `HalfOpenProbeGuard::take_slot` gives the
+    /// dispatch paths. Cleared whenever the count is zeroed en masse (reopen
+    /// or close), because those transitions already forget every slot.
+    half_open_reclaim_debt: AtomicU32,
+    /// Monotonic count of probe slots this breaker has reclaimed. Exported as
+    /// `ferrum_circuit_breaker_probe_reclaimed_total`; any non-zero value is a
+    /// probe-slot leak that the dwell has downgraded from a permanent outage
+    /// to a bounded delay.
+    probe_reclaimed: AtomicU64,
+    /// Effective dwell in milliseconds, derived once from
+    /// `half_open_probe_dwell_seconds` / `timeout_seconds`.
+    half_open_probe_dwell_ms: u64,
+    /// Cache key (`namespace|proxy_id` or `namespace|proxy_id::host:port`).
+    /// Used ONLY to name the proxy and target in the reclaim warning; the
+    /// `host:port` is deliberately confined to the log and never becomes a
+    /// metric label.
+    identity: String,
     config: CircuitBreakerConfig,
+}
+
+/// Outcome of one bounded attempt to claim a HALF_OPEN probe slot.
+enum SlotClaim {
+    /// Admitted as a half-open probe; the caller owns one slot.
+    Probe,
+    /// The breaker recovered to CLOSED under us — ordinary admission.
+    Closed,
+    /// Every probe slot is held by a probe that has not settled.
+    Exhausted,
+    /// The breaker is (re)OPEN — reject.
+    Rejected,
+}
+
+/// Effective HALF_OPEN dwell, in milliseconds.
+///
+/// Unset derives `max(timeout_seconds * 2, 60)` seconds: long enough that an
+/// ordinary slow backend dispatch finishes first, and never shorter than a
+/// minute even for a breaker configured with a tiny `timeout_seconds`. A
+/// configured value is clamped up to `timeout_seconds` (a dwell shorter than
+/// the open window would reclaim probes faster than the breaker admits them)
+/// and to at least 1 second (a zero dwell would reclaim every probe on the
+/// very next admission attempt).
+fn derive_half_open_probe_dwell_ms(config: &CircuitBreakerConfig) -> u64 {
+    let seconds = match config.half_open_probe_dwell_seconds {
+        Some(configured) => configured.max(config.timeout_seconds).max(1),
+        None => config.timeout_seconds.saturating_mul(2).max(60),
+    };
+    seconds.saturating_mul(1000)
 }
 
 /// Error returned when the circuit is open.
@@ -96,12 +169,24 @@ impl std::fmt::Display for CircuitOpenError {
 
 impl CircuitBreaker {
     pub fn new(config: CircuitBreakerConfig) -> Self {
+        Self::with_identity(String::new(), config)
+    }
+
+    /// Cache-backed constructor. `identity` is the breaker's cache key, carried
+    /// solely so the probe-reclaim warning can name the proxy and target.
+    fn with_identity(identity: String, config: CircuitBreakerConfig) -> Self {
+        let half_open_probe_dwell_ms = derive_half_open_probe_dwell_ms(&config);
         Self {
             packed: AtomicU64::new(pack_full(0, STATE_CLOSED, 0)),
             failure_count: AtomicU32::new(0),
             success_count: AtomicU32::new(0),
             last_failure_tick_ms: AtomicU64::new(0),
             last_failure_epoch_ms: AtomicU64::new(0),
+            half_open_admission_tick_ms: AtomicU64::new(0),
+            half_open_reclaim_debt: AtomicU32::new(0),
+            probe_reclaimed: AtomicU64::new(0),
+            half_open_probe_dwell_ms,
+            identity,
             config,
         }
     }
@@ -157,6 +242,12 @@ impl CircuitBreaker {
                     // (OPEN→HALF_OPEN is the same open cycle): the desired value
                     // carries the same generation observed in `packed`.
                     let generation = packed_generation(packed);
+                    // Arm this cycle's dwell BEFORE publishing HALF_OPEN, so a
+                    // concurrent `can_execute` that observes the new HALF_OPEN
+                    // cannot read a tick left over from an earlier cycle and
+                    // immediately "reclaim" the probe this CAS is admitting.
+                    self.half_open_admission_tick_ms
+                        .store(now, Ordering::Relaxed);
                     match self.packed.compare_exchange(
                         pack_full(generation, STATE_OPEN, 0),
                         pack_full(generation, STATE_HALF_OPEN, 1),
@@ -171,7 +262,7 @@ impl CircuitBreaker {
                         Err(actual) => match packed_state(actual) {
                             // Another thread already opened the half-open cycle;
                             // claim a slot through the same bounded CAS.
-                            STATE_HALF_OPEN => self.try_acquire_half_open_slot(),
+                            STATE_HALF_OPEN => self.try_acquire_half_open_slot(Some(now)),
                             // Recovered to closed in the meantime.
                             STATE_CLOSED => Ok(false),
                             // Still open (lost the race to a concurrent reopen) —
@@ -183,28 +274,65 @@ impl CircuitBreaker {
                     Err(CircuitOpenError)
                 }
             }
-            STATE_HALF_OPEN => self.try_acquire_half_open_slot(),
+            STATE_HALF_OPEN => self.try_acquire_half_open_slot(monotonic_now_ms),
             _ => Ok(false),
         }
     }
 
-    /// Claim one half-open probe slot without exceeding the limit, checking the
-    /// state and the count together in a single CAS.
+    /// Claim one half-open probe slot, reclaiming a stalled one first if the
+    /// dwell has elapsed.
     ///
     /// The OPEN→HALF_OPEN transition winner claims its first slot directly in
     /// `can_execute()` (count=1 is published atomically with HALF_OPEN). The
     /// remaining admission paths — a transition CAS-loser that finds the state
     /// already HALF_OPEN, and a steady-state HALF_OPEN request — funnel through
-    /// this bounded CAS, so the number of concurrently admitted probes can never
-    /// exceed `half_open_max_requests`. Because the expected value carries BOTH
-    /// the state and the count, an admission cannot succeed once the breaker has
-    /// left HALF_OPEN (a concurrent reopen or close), which closes the
-    /// admit-after-reopen race.
+    /// here.
+    ///
+    /// When every slot is held, one stalled slot is reclaimed if the dwell has
+    /// elapsed (see [`Self::reclaim_stalled_half_open_slot`]) and admission is
+    /// re-evaluated once for this caller. Without a reclaim this is exactly the
+    /// pre-existing bounded-CAS admission.
+    fn try_acquire_half_open_slot(
+        &self,
+        monotonic_now_ms: Option<u64>,
+    ) -> Result<bool, CircuitOpenError> {
+        // HALF_OPEN is the recovery path, not the hot path: the CLOSED arm of
+        // `can_execute` is still one atomic load and never reads the clock.
+        let now = monotonic_now_ms.unwrap_or_else(crate::socket_opts::monotonic_now_ms);
+        match self.claim_half_open_slot(now) {
+            SlotClaim::Probe => Ok(true),
+            SlotClaim::Closed => Ok(false),
+            SlotClaim::Rejected => Err(CircuitOpenError),
+            SlotClaim::Exhausted => {
+                if !self.reclaim_stalled_half_open_slot(now) {
+                    return Err(CircuitOpenError);
+                }
+                // Exactly one retry: the reclaim freed one slot, and losing it
+                // to a concurrent admission is an ordinary rejection.
+                match self.claim_half_open_slot(now) {
+                    SlotClaim::Probe => Ok(true),
+                    SlotClaim::Closed => Ok(false),
+                    _ => Err(CircuitOpenError),
+                }
+            }
+        }
+    }
+
+    /// Claim one half-open probe slot without exceeding the limit, checking the
+    /// state and the count together in a single CAS, and distinguishing "every
+    /// slot is held" (which the dwell may act on) from "the breaker left
+    /// HALF_OPEN" (which it must not).
+    ///
+    /// Because the expected value carries BOTH the state and the count, an
+    /// admission cannot succeed once the breaker has left HALF_OPEN (a
+    /// concurrent reopen or close), which closes the admit-after-reopen race,
+    /// and the number of concurrently admitted probes can never exceed
+    /// `half_open_max_requests`.
     ///
     /// The limit is floored at 1 (a breaker configured with
     /// `half_open_max_requests == 0` must still admit a single probe to be able
     /// to recover) and capped at the 30-bit count field.
-    fn try_acquire_half_open_slot(&self) -> Result<bool, CircuitOpenError> {
+    fn claim_half_open_slot(&self, monotonic_now_ms: u64) -> SlotClaim {
         let max = self.config.half_open_max_requests.clamp(1, COUNT_MASK);
         loop {
             let packed = self.packed.load(Ordering::Acquire);
@@ -212,8 +340,14 @@ impl CircuitBreaker {
                 STATE_HALF_OPEN => {
                     let count = packed_count(packed);
                     if count >= max {
-                        return Err(CircuitOpenError);
+                        return SlotClaim::Exhausted;
                     }
+                    // Arm the dwell off this admission BEFORE the CAS publishes
+                    // it, so the admitted slot can never be observed with a
+                    // stale tick. Losing the CAS only refreshes the tick, which
+                    // delays a reclaim by at most one dwell.
+                    self.half_open_admission_tick_ms
+                        .store(monotonic_now_ms, Ordering::Relaxed);
                     // Preserve the generation (steady-state HALF_OPEN admission is
                     // the same open cycle); `packed` already carries it.
                     match self.packed.compare_exchange_weak(
@@ -222,19 +356,97 @@ impl CircuitBreaker {
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     ) {
-                        Ok(_) => return Ok(true),
+                        Ok(_) => return SlotClaim::Probe,
                         // State or count moved under us — re-evaluate against the
                         // fresh value (which may now be OPEN/CLOSED).
                         Err(_) => continue,
                     }
                 }
                 // Reopened after the caller observed HALF_OPEN — do not admit.
-                STATE_OPEN => return Err(CircuitOpenError),
+                STATE_OPEN => return SlotClaim::Rejected,
                 // Recovered to closed — normal closed-state admission.
-                STATE_CLOSED => return Ok(false),
-                _ => return Ok(false),
+                STATE_CLOSED => return SlotClaim::Closed,
+                _ => return SlotClaim::Closed,
             }
         }
+    }
+
+    /// Reclaim ONE probe slot that has been held past the dwell (issue #4980).
+    ///
+    /// Defence in depth behind `HalfOpenProbeGuard` (GHSA-4cq4-3f3f-mq76): every
+    /// known dispatch path settles its slot structurally, but the state machine
+    /// has no other timer out of HALF_OPEN, so a slot that some future path
+    /// leaks would shed the backend with `503 circuit_breaker_open` for the rest
+    /// of the process lifetime. With the dwell that outage degrades to a bounded
+    /// delay, and `ferrum_circuit_breaker_probe_reclaimed_total` plus the warning
+    /// below make the leak visible instead of silent.
+    ///
+    /// Health counters are deliberately untouched: a reclaim is not evidence
+    /// about the backend, so it neither heals nor reopens the breaker — it only
+    /// returns the slot so the next probe can be admitted.
+    ///
+    /// Returns whether a slot was actually reclaimed.
+    fn reclaim_stalled_half_open_slot(&self, monotonic_now_ms: u64) -> bool {
+        let stalled_since = self.half_open_admission_tick_ms.load(Ordering::Acquire);
+        if monotonic_now_ms.saturating_sub(stalled_since) < self.half_open_probe_dwell_ms {
+            return false;
+        }
+        // Claim the right to reclaim by advancing the tick: only one thread can
+        // move it off `stalled_since`, so concurrent callers that all observe
+        // the same stalled cycle reclaim ONE slot between them, and the next
+        // reclaim is a full dwell away. A breaker whose every slot leaked is
+        // therefore drained one slot per dwell, with one warning each.
+        if self
+            .half_open_admission_tick_ms
+            .compare_exchange(
+                stalled_since,
+                monotonic_now_ms,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        let reclaimed = self
+            .packed
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |packed| {
+                // A reopen/close since the stall check already zeroed the count
+                // and forgot every slot; there is nothing to reclaim.
+                if packed_state(packed) != STATE_HALF_OPEN {
+                    return None;
+                }
+                let count = packed_count(packed);
+                if count == 0 {
+                    return None;
+                }
+                Some(pack_full(
+                    packed_generation(packed),
+                    STATE_HALF_OPEN,
+                    count - 1,
+                ))
+            })
+            .is_ok();
+        if !reclaimed {
+            return false;
+        }
+        // Record the debt the next release consumes, so the leaked probe
+        // settling late cannot decrement a second time.
+        let _ =
+            self.half_open_reclaim_debt
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |debt| {
+                    Some(debt.saturating_add(1))
+                });
+        self.probe_reclaimed.fetch_add(1, Ordering::Relaxed);
+        warn!(
+            "Circuit breaker reclaimed a half-open probe slot for {} after {}s without a settle: \
+             the probe never released it. A fresh probe is admitted now; if this repeats, a \
+             dispatch path is leaking probe slots (see \
+             ferrum_circuit_breaker_probe_reclaimed_total).",
+            self.log_identity(),
+            self.half_open_probe_dwell_ms / 1000
+        );
+        true
     }
 
     /// Record a successful response, transitioning from half-open to closed
@@ -284,6 +496,9 @@ impl CircuitBreaker {
                             info!("Circuit breaker closing (recovered)");
                             self.failure_count.store(0, Ordering::Relaxed);
                             self.success_count.store(0, Ordering::Relaxed);
+                            // The close zeroed the count and forgot every slot,
+                            // so any outstanding reclaim debt is settled too.
+                            self.half_open_reclaim_debt.store(0, Ordering::Relaxed);
                             break;
                         }
                     }
@@ -538,6 +753,9 @@ impl CircuitBreaker {
                         .is_ok()
                     {
                         warn!("Circuit breaker reopening (probe failed)");
+                        // The reopen zeroed the count and forgot every slot, so
+                        // any outstanding reclaim debt is settled too.
+                        self.half_open_reclaim_debt.store(0, Ordering::Relaxed);
                         break;
                     }
                 }
@@ -551,6 +769,21 @@ impl CircuitBreaker {
     /// reopen/close — so a straggler from a previous half-open cycle can neither
     /// drive the counter below 0 nor perturb the packed state.
     fn release_half_open_slot(&self) {
+        // A dwell reclaim already returned one slot on behalf of a probe that
+        // had not settled. Slots are anonymous, so the FIRST release after a
+        // reclaim is taken as the compensating one: consume the debt instead of
+        // decrementing again. In aggregate a reclaim plus its late settle costs
+        // exactly one slot, which is what keeps the in-flight count from
+        // under-stating the probes actually running (and over-admitting).
+        if self
+            .half_open_reclaim_debt
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |debt| {
+                debt.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return;
+        }
         let _ = self
             .packed
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |packed| {
@@ -597,6 +830,33 @@ impl CircuitBreaker {
     #[allow(dead_code)]
     pub fn half_open_in_flight(&self) -> u32 {
         packed_count(self.packed.load(Ordering::Acquire))
+    }
+
+    /// Probe slots this breaker has reclaimed after the HALF_OPEN dwell.
+    ///
+    /// Exported per proxy as `ferrum_circuit_breaker_probe_reclaimed_total`.
+    /// Any non-zero value means a dispatch path leaked a probe slot and the
+    /// dwell downgraded the resulting outage to a bounded delay (#4980).
+    pub fn probe_reclaimed_total(&self) -> u64 {
+        self.probe_reclaimed.load(Ordering::Relaxed)
+    }
+
+    /// Effective HALF_OPEN dwell in milliseconds, after the derivation and
+    /// clamps in [`derive_half_open_probe_dwell_ms`].
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn half_open_probe_dwell_ms(&self) -> u64 {
+        self.half_open_probe_dwell_ms
+    }
+
+    /// Name used for the probe-reclaim warning: the cache key when the breaker
+    /// is cached, and an explicit placeholder for a transient (uncached) one.
+    fn log_identity(&self) -> &str {
+        if self.identity.is_empty() {
+            "<uncached breaker>"
+        } else {
+            &self.identity
+        }
     }
 
     /// Last failure timestamp in epoch milliseconds (for testing).
@@ -742,7 +1002,8 @@ impl CircuitBreakerCache {
                 if occupied.get().config() == config {
                     return occupied.get().clone();
                 }
-                let cb = Arc::new(CircuitBreaker::new(config.clone()));
+                let identity = occupied.key().clone();
+                let cb = Arc::new(CircuitBreaker::with_identity(identity, config.clone()));
                 occupied.insert(cb.clone());
                 cb
             }
@@ -756,9 +1017,13 @@ impl CircuitBreakerCache {
                     );
                     // Transient breaker: not cached, so overflow traffic does
                     // not retain state across requests and cannot grow the map.
-                    return Arc::new(CircuitBreaker::new(config.clone()));
+                    return Arc::new(CircuitBreaker::with_identity(
+                        vacant.key().clone(),
+                        config.clone(),
+                    ));
                 }
-                let cb = Arc::new(CircuitBreaker::new(config.clone()));
+                let identity = vacant.key().clone();
+                let cb = Arc::new(CircuitBreaker::with_identity(identity, config.clone()));
                 vacant.insert(cb.clone());
                 cb
             }
@@ -861,6 +1126,18 @@ impl CircuitBreakerCache {
                     cb.success_count(),
                 )
             })
+            .collect()
+    }
+
+    /// Per-breaker count of HALF_OPEN probe slots reclaimed after the dwell.
+    ///
+    /// Keys are the same runtime keys [`Self::snapshot`] returns, so the metric
+    /// renderer aggregates them per proxy without ever exposing the `host:port`
+    /// suffix as a label.
+    pub fn probe_reclaimed_snapshot(&self) -> Vec<(String, u64)> {
+        self.breakers
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().probe_reclaimed_total()))
             .collect()
     }
 

@@ -41,7 +41,7 @@ SCENARIOS_PATH = (
 )
 RUNBOOK_PATH = REPO_ROOT / "docs" / "protocol_perf_regression.md"
 CI_CD_PATH = REPO_ROOT / "docs" / "ci_cd.md"
-CI_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+CI_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "performance-regression.yml"
 MULTI_PROTOCOL_DIR = REPO_ROOT / "tests" / "performance" / "multi_protocol"
 RUN_PROTOCOL_TEST_PATH = MULTI_PROTOCOL_DIR / "run_protocol_test.sh"
 NATIVE_FERRUM_CONFIGS = (
@@ -64,10 +64,10 @@ SETUP_RUST_CI_WORKSPACES_PASSTHROUGH = "workspaces: ${{ inputs.workspaces }}"
 RUST_CACHE_WITH_KEYS = (
     "shared-key",
     "workspaces",
-    "cache-directories",
     # Required by the CI runtime-cache contract (verify_ci_runtime_cache):
-    # cache-on-failure keeps post-job saves on ordinary failures, and save-if
-    # gates publication to trusted refs/heads/main runs. Still a closed set —
+    # cache-on-failure is honored only for a lane producer, and save-if gates
+    # publication to a producer on a trusted refs/heads/main run. The sccache
+    # store is no longer persisted (no cache-directories). Still a closed set —
     # any other key remains a trust-broadening extra.
     "cache-on-failure",
     "save-if",
@@ -279,7 +279,7 @@ def validate_setup_rust_ci_workspaces(text: str, failures: list[str]) -> None:
     require(
         mapping_keys(with_block, indent=8) == list(RUST_CACHE_WITH_KEYS),
         "setup-rust-ci rust-cache with: keys must stay shared-key, workspaces, "
-        "and cache-directories (no trust-broadening extras)",
+        "cache-on-failure, and save-if (no trust-broadening extras)",
         failures,
     )
     require(
@@ -300,7 +300,7 @@ def validate_performance_regression_workspaces(text: str, failures: list[str]) -
     )
     require(
         performance_job is not None,
-        "ci.yml must contain the performance-regression job",
+        "performance-regression.yml must contain the performance-regression job",
         failures,
     )
     body = performance_job.group("body") if performance_job else ""
@@ -309,26 +309,26 @@ def validate_performance_regression_workspaces(text: str, failures: list[str]) -
     )
     require(
         bool(setup_step),
-        "ci.yml performance-regression must use setup-rust-ci",
+        "performance-regression.yml performance-regression must use setup-rust-ci",
         failures,
     )
     with_block = mapping_block(setup_step, "with", indent=8)
     require(
         'shared-key: "ci-perf"' in with_block,
-        'ci.yml performance-regression setup-rust-ci must keep shared-key "ci-perf"',
+        'performance-regression.yml performance-regression setup-rust-ci must keep shared-key "ci-perf"',
         failures,
     )
     entries = parse_workspaces_entries(with_block, key_indent=10)
     require(
         entries == list(PERF_CACHE_WORKSPACES),
-        "ci.yml performance-regression rust-cache workspaces must be exactly "
+        "performance-regression.yml performance-regression rust-cache workspaces must be exactly "
         "`. -> target` then `tests/performance/mesh -> target`",
         failures,
     )
     require(
         "cache-all-crates:" not in setup_step
         and "cache-directories:" not in setup_step,
-        "ci.yml performance-regression must not broaden rust-cache trust inputs",
+        "performance-regression.yml performance-regression must not broaden rust-cache trust inputs",
         failures,
     )
 
@@ -581,45 +581,45 @@ def validate_pr_ci_contract(text: str, failures: list[str]) -> None:
     )
     require(
         performance_job is not None,
-        "ci.yml must contain the performance-regression job",
+        "performance-regression.yml must contain the performance-regression job",
         failures,
     )
     performance_body = performance_job.group("body") if performance_job else ""
     require(
         "    permissions:\n      contents: read" in performance_body,
-        "ci.yml performance-regression must use contents: read",
+        "performance-regression.yml performance-regression must use contents: read",
         failures,
     )
     require(
         "persist-credentials: false" in performance_body,
-        "ci.yml performance-regression checkout must not persist credentials",
+        "performance-regression.yml performance-regression checkout must not persist credentials",
         failures,
     )
     require(
         "Verify protocol-perf contracts (static)" in text,
-        "ci.yml Performance Regression Check must run protocol-perf static contracts",
+        "performance-regression.yml Performance Regression Check must run protocol-perf static contracts",
         failures,
     )
     require(
         "verify_protocol_perf_regression_workflow.py --self-test" in text,
-        "ci.yml must run the protocol-perf workflow verifier self-test",
+        "performance-regression.yml must run the protocol-perf workflow verifier self-test",
         failures,
     )
     require(
         "verify_protocol_perf_regression_workflow.py\n" in text
         or "verify_protocol_perf_regression_workflow.py" in text,
-        "ci.yml must run repository-contract verification for protocol-perf",
+        "performance-regression.yml must run repository-contract verification for protocol-perf",
         failures,
     )
     require(
         "evaluate_protocol_perf_budgets.py --self-test" in text,
-        "ci.yml must run the protocol-perf evaluator self-test",
+        "performance-regression.yml must run the protocol-perf evaluator self-test",
         failures,
     )
     require(
         "python3 -m py_compile tests/performance/multi_protocol/run_protocol_regression_scenarios.py"
         in text,
-        "ci.yml must syntax-check the protocol regression scenario harness",
+        "performance-regression.yml must syntax-check the protocol regression scenario harness",
         failures,
     )
     # Ensure the static gate is not buried behind optional benchmark path filters.
@@ -628,13 +628,13 @@ def validate_pr_ci_contract(text: str, failures: list[str]) -> None:
     detect_idx = text.find("Detect performance-sensitive changes")
     require(
         checkout_idx != -1 and static_idx != -1 and detect_idx != -1,
-        "ci.yml must contain performance-regression, static protocol-perf, and path detect steps",
+        "performance-regression.yml must contain performance-regression, static protocol-perf, and path detect steps",
         failures,
     )
     if checkout_idx != -1 and static_idx != -1 and detect_idx != -1:
         require(
             checkout_idx < static_idx < detect_idx,
-            "ci.yml must run protocol-perf static contracts after checkout and before "
+            "performance-regression.yml must run protocol-perf static contracts after checkout and before "
             "optional benchmark path gating",
             failures,
         )
@@ -678,7 +678,7 @@ def validate_repository_contract(failures: list[str]) -> None:
     require(SCENARIOS_PATH.is_file(), f"missing scenarios harness: {SCENARIOS_PATH}", failures)
     require(RUNBOOK_PATH.is_file(), f"missing runbook: {RUNBOOK_PATH}", failures)
     require(CI_CD_PATH.is_file(), f"missing CI/CD docs: {CI_CD_PATH}", failures)
-    require(CI_WORKFLOW_PATH.is_file(), f"missing CI workflow: {CI_WORKFLOW_PATH}", failures)
+    require(CI_WORKFLOW_PATH.is_file(), f"missing performance regression workflow: {CI_WORKFLOW_PATH}", failures)
     require(
         SETUP_RUST_CI_PATH.is_file(),
         f"missing setup-rust-ci action: {SETUP_RUST_CI_PATH}",
@@ -957,9 +957,8 @@ runs:
       with:
         shared-key: ${{ inputs.shared-key }}
         workspaces: ${{ inputs.workspaces }}
-        cache-directories: ${{ github.workspace }}/.cache/sccache
-        cache-on-failure: "true"
-        save-if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.fork != true }}
+        cache-on-failure: ${{ inputs.save == 'true' && inputs.cache-on-failure == 'true' }}
+        save-if: ${{ inputs.save == 'true' && github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.fork != true }}
 """
     setup_ok: list[str] = []
     validate_setup_rust_ci_workspaces(good_setup_rust_ci, setup_ok)
@@ -1021,8 +1020,8 @@ runs:
     extra_cache_keys: list[str] = []
     validate_setup_rust_ci_workspaces(
         good_setup_rust_ci.replace(
-            "        cache-directories: ${{ github.workspace }}/.cache/sccache\n",
-            "        cache-directories: ${{ github.workspace }}/.cache/sccache\n"
+            "        workspaces: ${{ inputs.workspaces }}\n",
+            "        workspaces: ${{ inputs.workspaces }}\n"
             "        cache-all-crates: true\n",
         ),
         extra_cache_keys,

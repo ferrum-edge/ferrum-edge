@@ -17,6 +17,209 @@ use tokio::net::{TcpListener, TcpStream};
 
 const STARTUP_ATTEMPTS: u32 = 3;
 
+/// Issue #4784: the origin, request transformer, and response transformer must
+/// retain distinct attribution while enforcing their directional size ceilings.
+#[tokio::test]
+#[ignore]
+async fn transformer_response_size_policy_status_logging_and_attribution() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = listener.local_addr().unwrap().port();
+    let backend_task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let mut chunk = [0u8; 2048];
+                    let len = stream.read(&mut chunk).await.unwrap();
+                    if len == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&chunk[..len]);
+                }
+                let request = String::from_utf8_lossy(&request);
+                let body = if request.starts_with("GET /backend") {
+                    "x".repeat(129)
+                } else {
+                    "{}".to_string()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+        }
+    });
+    let mut proxies = Vec::new();
+    let mut plugin_configs = vec![serde_json::json!({
+        "id": "logs",
+        "plugin_name": "stdout_logging",
+        "scope": "global",
+        "enabled": true,
+        "config": {}
+    })];
+    for (route, transformer, payload_bytes) in [
+        ("backend", None, 0),
+        ("request", Some("request_transformer"), 115),
+        ("response", Some("response_transformer"), 115),
+        ("boundary", Some("response_transformer"), 114),
+    ] {
+        // File-mode proxies only run the plugin configs they attach; a
+        // `proxy_id` on the config alone does not bind it to the route.
+        let mut attached = vec![serde_json::json!({
+            "plugin_config_id": format!("{route}-limit")
+        })];
+        if transformer.is_some() {
+            attached.push(serde_json::json!({
+                "plugin_config_id": format!("{route}-transform")
+            }));
+        }
+        proxies.push(serde_json::json!({
+            "id": route,
+            "listen_path": format!("/{route}"),
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": false,
+            "pool_enable_http2": false,
+            "plugins": attached
+        }));
+        plugin_configs.push(serde_json::json!({
+            "id": format!("{route}-limit"),
+            "proxy_id": route,
+            "plugin_name": if route == "request" {
+                "request_size_limiting"
+            } else {
+                "response_size_limiting"
+            },
+            "scope": "proxy",
+            "enabled": true,
+            "config": {"max_bytes": 128}
+        }));
+        if let Some(transformer) = transformer {
+            plugin_configs.push(serde_json::json!({
+                "id": format!("{route}-transform"),
+                "proxy_id": route,
+                "plugin_name": transformer,
+                "scope": "proxy",
+                "enabled": true,
+                "config": {"rules": [{
+                    "operation": "add",
+                    "target": "body",
+                    "key": "padding",
+                    "value": "x".repeat(payload_bytes)
+                }]}
+            }));
+        }
+    }
+    let config = serde_json::json!({
+        "version": "1",
+        "proxies": proxies,
+        "plugin_configs": plugin_configs,
+        "consumers": []
+    });
+    let mut gateway = TestGateway::builder()
+        .mode_file(serde_yaml::to_string(&config).unwrap())
+        .log_level("warn")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .capture_output()
+        .spawn()
+        .await
+        .unwrap();
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .unwrap();
+    let client = reqwest::Client::builder()
+        .http1_only()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    for (route, expected_status, expected_header) in [
+        ("backend", 502, Some("backend_error")),
+        ("request", 413, None),
+        ("response", 502, Some("overload")),
+        ("boundary", 200, None),
+    ] {
+        let url = format!("http://127.0.0.1:{}/{route}", gateway.proxy_port);
+        let response = if route == "request" {
+            client
+                .post(url)
+                .header("content-type", "application/json")
+                .body("{}")
+        } else {
+            client.get(url)
+        }
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status().as_u16(), expected_status, "{route}");
+        assert_eq!(
+            response
+                .headers()
+                .get("x-gateway-error")
+                .map(|v| v.to_str().unwrap()),
+            expected_header,
+            "{route}",
+        );
+        let body = response.text().await.unwrap();
+        if route == "response" {
+            assert_eq!(body, r#"{"error":"Response body too large","limit":128}"#);
+        } else if route == "boundary" {
+            assert_eq!(body.len(), 128);
+        }
+    }
+    // Access logs use the nonblocking writer; wait a bounded interval for flush.
+    let mut logs = String::new();
+    for _ in 0..20 {
+        logs = gateway.read_combined_captured_output().unwrap();
+        if logs.contains("\"proxy_id\":\"boundary\"") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    for (route, class) in [
+        ("backend", Some("response_body_too_large")),
+        ("request", None),
+        ("response", Some("dispatch_policy_rejected")),
+        ("boundary", None),
+    ] {
+        let row = logs
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|row| row["proxy_id"] == route)
+            .unwrap_or_else(|| panic!("missing {route} transaction: {logs}"));
+        if let Some(class) = class {
+            assert_eq!(row["error_class"], class, "{route}: {logs}");
+        }
+    }
+    let warning = logs
+        .lines()
+        .find(|line| line.contains("output exceeds response size policy"))
+        .unwrap_or_else(|| panic!("missing transformer warning: {logs}"));
+    assert!(warning.contains("WARN"), "{warning}");
+    assert!(warning.contains("response_transformer"), "{warning}");
+    assert!(warning.contains("produced_bytes_at_least"), "{warning}");
+    assert!(warning.contains("129"), "{warning}");
+    assert!(warning.contains("128"), "{warning}");
+    assert!(
+        logs.lines()
+            .any(|line| line.contains("WARN") && line.contains("Backend response body")),
+        "{logs}"
+    );
+    assert_eq!(
+        logs.lines()
+            .filter(|line| line.contains("output exceeds response size policy"))
+            .count(),
+        1,
+        "{logs}",
+    );
+    gateway.shutdown();
+    backend_task.abort();
+}
+
 struct ChunkedHarness {
     _gateway: TestGateway,
     backend_task: tokio::task::JoinHandle<()>,

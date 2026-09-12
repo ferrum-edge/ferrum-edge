@@ -39,6 +39,8 @@ pub struct GrpcResponse {
     pub http_status: u16,
     /// Initial response headers (excluding trailers).
     pub headers: HeaderMap,
+    /// Whether the first response HEADERS frame carried END_STREAM on the wire.
+    pub initial_headers_end_stream: bool,
     /// Concatenated message bodies with gRPC 5-byte prefix stripped. If the
     /// server emitted multiple messages, they're concatenated in order —
     /// tests that care about individual messages should inspect
@@ -73,6 +75,9 @@ impl GrpcResponse {
             && let Ok(n) = s.parse()
         {
             return Some(n);
+        }
+        if !self.initial_headers_end_stream {
+            return None;
         }
         let raw = self.headers.get("grpc-status")?.to_str().ok()?;
         raw.parse().ok()
@@ -132,6 +137,9 @@ impl GrpcResponse {
             && let Some(v) = t.get("grpc-message").and_then(|v| v.to_str().ok())
         {
             return Some(v);
+        }
+        if !self.initial_headers_end_stream {
+            return None;
         }
         self.headers.get("grpc-message")?.to_str().ok()
     }
@@ -331,6 +339,7 @@ impl GrpcClient {
                 return Ok(GrpcResponse {
                     http_status: 0,
                     headers: HeaderMap::new(),
+                    initial_headers_end_stream: false,
                     messages: Vec::new(),
                     raw_body_frames: Vec::new(),
                     trailers: None,
@@ -346,6 +355,7 @@ impl GrpcClient {
                 return Ok(GrpcResponse {
                     http_status: 0,
                     headers: HeaderMap::new(),
+                    initial_headers_end_stream: false,
                     messages: Vec::new(),
                     raw_body_frames: Vec::new(),
                     trailers: None,
@@ -414,6 +424,7 @@ impl GrpcClient {
                     return Ok(GrpcResponse {
                         http_status,
                         headers,
+                        initial_headers_end_stream,
                         messages: Vec::new(),
                         raw_body_frames: Vec::new(),
                         trailers: None,
@@ -444,6 +455,7 @@ impl GrpcClient {
         Ok(GrpcResponse {
             http_status,
             headers,
+            initial_headers_end_stream,
             messages,
             raw_body_frames: raw_frames,
             trailers,
@@ -554,7 +566,7 @@ const FIRST_HEADERS_OPEN: u8 = 2;
 /// so it uses an atomic rather than a lock — the client's read path is on the
 /// h2 connection task while the assertions run on the test task.
 #[derive(Debug, Default)]
-struct InboundResponseFraming {
+pub(crate) struct InboundResponseFraming {
     /// One of the `FIRST_HEADERS_*` constants. Written at most once so a
     /// trailers HEADERS block can never restate the initial response's shape.
     first_headers: AtomicU8,
@@ -581,7 +593,7 @@ impl InboundResponseFraming {
     /// `true` only when a response HEADERS block was observed AND it carried
     /// `END_STREAM`. An unobserved response (never possible once the response
     /// future has resolved) reports `false`, keeping the caller strict.
-    fn initial_headers_end_stream(&self) -> bool {
+    pub(crate) fn initial_headers_end_stream(&self) -> bool {
         self.first_headers.load(Ordering::Acquire) == FIRST_HEADERS_END_STREAM
     }
 }
@@ -647,14 +659,14 @@ impl H2FrameScanner {
 /// Transport wrapper that records inbound HTTP/2 framing while passing bytes
 /// through untouched. Wraps whatever IO the request path uses, so it sees
 /// plaintext h2c frames and post-decryption h2-over-TLS frames alike.
-struct FrameObservingIo<T> {
+pub(crate) struct FrameObservingIo<T> {
     io: T,
     framing: Arc<InboundResponseFraming>,
     scanner: H2FrameScanner,
 }
 
 impl<T> FrameObservingIo<T> {
-    fn new(io: T, framing: Arc<InboundResponseFraming>) -> Self {
+    pub(crate) fn new(io: T, framing: Arc<InboundResponseFraming>) -> Self {
         Self {
             io,
             framing,
@@ -910,12 +922,34 @@ mod tests {
         GrpcResponse {
             http_status,
             headers,
+            initial_headers_end_stream: grpc_status_header.is_some()
+                && grpc_status_trailer.is_none(),
             messages: Vec::new(),
             raw_body_frames: Vec::new(),
             trailers,
             stream_error: None,
             request_send_error: None,
         }
+    }
+
+    #[test]
+    fn initial_grpc_status_requires_wire_end_stream() {
+        let mut malformed = response(200, Some("5"), None);
+        malformed.initial_headers_end_stream = false;
+        malformed
+            .headers
+            .insert("grpc-message", "missing".parse().unwrap());
+        assert_eq!(malformed.grpc_status(), None);
+        assert_eq!(malformed.grpc_message(), None);
+        assert_eq!(malformed.effective_grpc_status(), 2);
+        malformed.initial_headers_end_stream = true;
+        assert_eq!(malformed.grpc_status(), Some(5));
+        assert_eq!(malformed.grpc_message(), Some("missing"));
+        assert_eq!(malformed.effective_grpc_status(), 5);
+
+        let mut real_trailers = response(200, Some("5"), Some("7"));
+        real_trailers.initial_headers_end_stream = false;
+        assert_eq!(real_trailers.grpc_status(), Some(7));
     }
 
     #[test]

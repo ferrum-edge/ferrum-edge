@@ -16,7 +16,8 @@ on:
 
 concurrency:
   group: coverage-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
-  cancel-in-progress: true
+  # Pushes to main are never cancelled (see ci.yml); superseded PR runs are.
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 permissions:
   actions: read
@@ -187,6 +188,11 @@ jobs:
       - uses: ./.github/actions/setup-rust-ci
         with:
           shared-key: "ci-coverage"
+          # The lib-unit shard compiles the superset of the instrumented
+          # dependency graph and is the lane's sole producer on main.
+          save: ${{ matrix.kind == 'lib-unit' && 'true' || 'false' }}
+          # Publish a complete instrumented dependency lane only after success.
+          cache-on-failure: "false"
 
       - name: Install cargo-llvm-cov and cargo-nextest
         uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
@@ -203,12 +209,15 @@ jobs:
         if: matrix.kind == 'lib-unit'
         run: |
           set -euo pipefail
-          # One llvm-cov invocation compiles lib + unit_tests together so a
+          # One llvm-cov invocation compiles lib + the four unit targets together so a
           # runner-loss after the library suite does not throw away that compile
           # and then recompile ferrum-edge for the unit-test target (#3888).
           cargo llvm-cov --no-report \
             --lib \
-            --test unit_tests
+            --test unit_tests \
+            --test unit_plugins_a_tests \
+            --test unit_plugins_b_tests \
+            --test unit_gateway_core_tests
         env:
           RUST_BACKTRACE: 1
 

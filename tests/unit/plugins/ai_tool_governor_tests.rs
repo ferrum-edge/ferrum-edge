@@ -5,9 +5,17 @@ use ferrum_edge::{
     config::{BackendAllowIps, BackendEgressPolicy},
     plugins::{
         Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult, RequestContext,
-        ResponseStreamAction, ResponseStreamInspector, ai_tool_governor::AiToolGovernor,
-        available_plugins, correlation_id::CorrelationId, create_plugin_with_http_client,
-        create_response_stream_inspector, plugin_failure_policy, priority, validate_plugin_config,
+        ResponseStreamAction, ResponseStreamInspector,
+        ai_tool_governor::{
+            AI_TOOL_GOVERNOR_APPROVAL_KEYS, AI_TOOL_GOVERNOR_BLOCKED_PATTERN_KEYS,
+            AI_TOOL_GOVERNOR_CONFIG_KEYS, AI_TOOL_GOVERNOR_INSPECT_KEYS,
+            AI_TOOL_GOVERNOR_OBSERVABILITY_KEYS, AI_TOOL_GOVERNOR_RESPONSE_KEYS,
+            AI_TOOL_GOVERNOR_TOOL_POLICY_KEYS, AiToolGovernor,
+        },
+        available_plugins,
+        correlation_id::CorrelationId,
+        create_plugin_with_http_client, create_response_stream_inspector, plugin_failure_policy,
+        priority, validate_plugin_config,
     },
     proxy::deferred_log::BodyOutcome,
 };
@@ -11956,5 +11964,691 @@ async fn streaming_unknown_shape_enforce_cut_still_records_observation() {
             .map(String::as_str),
         Some("unrecognized_tool_call_shape"),
         "a cut stream must still explain itself in the summary"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Typed configuration admission and OpenAPI parity (#5286, #5287, #5288, #5291)
+// ---------------------------------------------------------------------------
+
+/// Compile the published `AiToolGovernorConfig` component so admission cases can
+/// be checked against the schema operator tooling actually consumes.
+fn openapi_config_validator() -> jsonschema::Validator {
+    let spec: Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/AiToolGovernorConfig",
+        "components": spec["components"].clone()
+    });
+    jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("AiToolGovernorConfig compiles")
+}
+
+/// Runtime admission and the published schema must reach the same verdict.
+fn assert_admission_parity(
+    validator: &jsonschema::Validator,
+    config: &Value,
+    admitted: bool,
+    label: &str,
+) {
+    let runtime_error = try_make(config.clone()).err();
+    assert_eq!(
+        runtime_error.is_none(),
+        admitted,
+        "{label}: runtime admission disagreed ({runtime_error:?})"
+    );
+    assert_eq!(
+        validator.is_valid(config),
+        admitted,
+        "{label}: openapi schema disagreed"
+    );
+}
+
+/// Issue #5286: a present-but-non-string `risk` is an operator mistake, not an
+/// omission, and must never resolve to the `low` default.
+#[test]
+fn non_string_tool_risk_is_rejected_rather_than_defaulted() {
+    let validator = openapi_config_validator();
+    let with_risk = |risk: Value| {
+        json!({
+            "default_action": "deny",
+            "tools": { "lookup": { "action": "allow", "risk": risk } }
+        })
+    };
+
+    for wrong in [
+        json!(7),
+        json!(null),
+        json!(false),
+        json!(["high"]),
+        json!({ "level": "high" }),
+    ] {
+        let config = with_risk(wrong.clone());
+        let err = try_make(config.clone())
+            .err()
+            .expect("a present non-string risk must fail admission");
+        assert!(err.contains("'risk'"), "{err}");
+        assert!(err.contains("must be a string"), "{err}");
+        assert!(err.contains("lookup"), "error must name the tool: {err}");
+        assert!(!validator.is_valid(&config), "schema must reject {wrong}");
+    }
+
+    // A non-enum *string* keeps its existing, distinct diagnostic.
+    let misspelled = with_risk(json!("severe"));
+    let err = try_make(misspelled.clone())
+        .err()
+        .expect("an unknown risk band must fail admission");
+    assert!(err.contains("invalid risk"), "{err}");
+    assert!(!validator.is_valid(&misspelled));
+
+    // Omission and every valid spelling are unchanged.
+    for spelling in ["low", "medium", "high", "critical"] {
+        assert_admission_parity(&validator, &with_risk(json!(spelling)), true, spelling);
+    }
+    let omitted = json!({
+        "default_action": "deny",
+        "tools": { "lookup": { "action": "allow" } }
+    });
+    assert_admission_parity(&validator, &omitted, true, "risk omitted");
+}
+
+/// The omission default itself must not regress while the type check is added.
+#[tokio::test]
+async fn omitted_tool_risk_still_reports_low() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "danger": { "action": "deny" } }
+    }));
+    let mut ctx = create_test_context();
+    let body = response_with_tool_call("danger", "{}");
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+            .await,
+        Some(403),
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.risk")
+            .map(String::as_str),
+        Some("low")
+    );
+}
+
+/// Issue #5286: the same rule for the approval error policy, whose silent
+/// default is the fail-closed `reject` posture.
+#[test]
+fn non_string_approval_fail_on_error_is_rejected_rather_than_defaulted() {
+    let validator = openapi_config_validator();
+    let with_policy = |fail_on_error: Value| {
+        json!({
+            "default_action": "deny",
+            "tools": { "deploy": { "action": "require_approval" } },
+            "approval": {
+                "endpoint_url": "https://approval.example/decide",
+                "fail_on_error": fail_on_error
+            }
+        })
+    };
+
+    for wrong in [json!(7), json!(null), json!(true), json!([]), json!({})] {
+        let config = with_policy(wrong.clone());
+        let err = try_make(config.clone())
+            .err()
+            .expect("a present non-string fail_on_error must fail admission");
+        assert!(err.contains("approval.fail_on_error"), "{err}");
+        assert!(err.contains("must be a string"), "{err}");
+        assert!(!validator.is_valid(&config), "schema must reject {wrong}");
+    }
+
+    let misspelled = with_policy(json!("refuse"));
+    let err = try_make(misspelled.clone())
+        .err()
+        .expect("an unknown error policy must fail admission");
+    assert!(err.contains("must be one of"), "{err}");
+    assert!(!validator.is_valid(&misspelled));
+
+    for spelling in ["reject", "warn", "allow"] {
+        assert_admission_parity(&validator, &with_policy(json!(spelling)), true, spelling);
+    }
+    let omitted = json!({
+        "default_action": "deny",
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": { "endpoint_url": "https://approval.example/decide" }
+    });
+    assert_admission_parity(&validator, &omitted, true, "fail_on_error omitted");
+}
+
+/// Issue #5288: `url::Url` normalizes the scheme before the http/https check, so
+/// the published pattern must admit the same case variants the runtime does.
+#[test]
+fn approval_endpoint_scheme_case_matches_runtime_url_normalization() {
+    let validator = openapi_config_validator();
+    let with_url = |url: &str| {
+        json!({
+            "default_action": "deny",
+            "tools": { "deploy": { "action": "require_approval" } },
+            "approval": { "endpoint_url": url }
+        })
+    };
+
+    for url in [
+        "http://approval.example/decide",
+        "https://approval.example/decide",
+        "HTTP://approval.example/decide",
+        "HTTPS://approval.example/decide",
+        "HtTpS://approval.example/decide",
+    ] {
+        assert_admission_parity(&validator, &with_url(url), true, url);
+    }
+
+    for url in [
+        "ftp://approval.example/decide",
+        "FTP://approval.example/decide",
+        "file:///etc/passwd",
+        "not-a-url",
+    ] {
+        assert_admission_parity(&validator, &with_url(url), false, url);
+    }
+}
+
+/// Issue #5287: unknown-key rejection runs before the `enabled: false` short
+/// circuit and reaches every nested fixed-shape layer, so the disabled schema
+/// branch must close those layers too — while still tolerating the ignored
+/// values a never-parsed draft may carry.
+#[test]
+fn disabled_config_schema_and_runtime_agree_on_nested_keys() {
+    let validator = openapi_config_validator();
+
+    // Unknown property names fail closed at every nesting level, even inert.
+    assert_admission_parity(
+        &validator,
+        &json!({ "enabled": false, "modde": "enforce" }),
+        false,
+        "root typo",
+    );
+    assert_admission_parity(
+        &validator,
+        &json!({ "enabled": false, "inspect": { "typo": true } }),
+        false,
+        "inspect typo",
+    );
+    assert_admission_parity(
+        &validator,
+        &json!({ "enabled": false, "tools": { "lookup": { "typo": true } } }),
+        false,
+        "tool policy typo",
+    );
+    assert_admission_parity(
+        &validator,
+        &json!({
+            "enabled": false,
+            "tools": { "lookup": { "blocked_arg_patterns": [{ "nmae": "s", "regex": "x" }] } }
+        }),
+        false,
+        "blocked pattern typo",
+    );
+    assert_admission_parity(
+        &validator,
+        &json!({ "enabled": false, "approval": { "endpoint_ur": "https://a.example/x" } }),
+        false,
+        "approval typo",
+    );
+    assert_admission_parity(
+        &validator,
+        &json!({ "enabled": false, "response": { "deny_status": 403 } }),
+        false,
+        "response typo",
+    );
+    assert_admission_parity(
+        &validator,
+        &json!({ "enabled": false, "observability": { "emit_meta": true } }),
+        false,
+        "observability typo",
+    );
+
+    // Known names keep ignored-value semantics: a disabled draft is never
+    // parsed, so wrong-typed and out-of-range values stay admissible.
+    assert_admission_parity(&validator, &json!({ "enabled": false }), true, "minimal");
+    assert_admission_parity(
+        &validator,
+        &json!({ "enabled": false, "mode": 7, "tools": null }),
+        true,
+        "ignored scalars",
+    );
+    assert_admission_parity(
+        &validator,
+        &json!({ "enabled": false, "inspect": "off", "response": 3 }),
+        true,
+        "non-object nested values",
+    );
+    assert_admission_parity(
+        &validator,
+        &json!({ "enabled": false, "tools": { "lookup": 7 } }),
+        true,
+        "non-object tool policy",
+    );
+    assert_admission_parity(
+        &validator,
+        &json!({
+            "enabled": false,
+            "tools": { "lookup": { "action": "allow", "risk": 7 } }
+        }),
+        true,
+        "wrong-typed tool policy value",
+    );
+    assert_admission_parity(
+        &validator,
+        &json!({
+            "enabled": false,
+            "tools": { "lookup": { "blocked_arg_patterns": "nope" } }
+        }),
+        true,
+        "non-array blocked patterns",
+    );
+    assert_admission_parity(
+        &validator,
+        &json!({
+            "enabled": false,
+            "tools": { "lookup": { "json_schema": { "anything": true } } }
+        }),
+        true,
+        "open json_schema document",
+    );
+    assert_admission_parity(
+        &validator,
+        &json!({
+            "enabled": false,
+            "approval": { "endpoint_url": 7, "cache_ttl_seconds": 99999999 }
+        }),
+        true,
+        "wrong-typed approval values",
+    );
+}
+
+/// Issue #5291: the overview calls the dedicated guide the complete schema, so
+/// every key the runtime allowlists must appear in its configuration reference.
+#[test]
+fn configuration_guide_documents_every_accepted_key() {
+    let guide = include_str!("../../../docs/plugins/ai_tool_governor.md");
+    let reference = guide
+        .split_once("## Configuration reference")
+        .expect("guide must carry a configuration reference")
+        .1
+        .split_once("\n## Examples")
+        .expect("the configuration reference must end before the examples")
+        .0;
+
+    for key in AI_TOOL_GOVERNOR_CONFIG_KEYS
+        .iter()
+        .chain(AI_TOOL_GOVERNOR_INSPECT_KEYS)
+        .chain(AI_TOOL_GOVERNOR_TOOL_POLICY_KEYS)
+        .chain(AI_TOOL_GOVERNOR_BLOCKED_PATTERN_KEYS)
+        .chain(AI_TOOL_GOVERNOR_APPROVAL_KEYS)
+        .chain(AI_TOOL_GOVERNOR_RESPONSE_KEYS)
+        .chain(AI_TOOL_GOVERNOR_OBSERVABILITY_KEYS)
+    {
+        assert!(
+            reference.contains(&format!("`{key}`")),
+            "configuration reference omits '{key}'"
+        );
+    }
+
+    // Bounds and defaults an operator cannot guess from the key name alone.
+    for documented in ["2592000", "30000", "1500", "`300`", "`0` disables"] {
+        assert!(
+            reference.contains(documented),
+            "configuration reference omits {documented}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wrong-typed admission diagnostics (#5395)
+// ---------------------------------------------------------------------------
+
+/// Issue #5395: a present-but-non-string `action` was reported as
+/// `is missing required 'action'`, sending an operator hunting for a key that
+/// is right there in the document. Name the supplied JSON kind instead, exactly
+/// as `risk` and `approval.fail_on_error` already do.
+#[test]
+fn non_string_tool_action_is_reported_as_a_type_error_not_a_missing_key() {
+    let validator = openapi_config_validator();
+    let with_action = |action: Value| {
+        json!({
+            "default_action": "deny",
+            "tools": { "lookup": { "action": action } }
+        })
+    };
+
+    for (wrong, kind) in [
+        (json!(7), "a number"),
+        (json!(null), "null"),
+        (json!(false), "a boolean"),
+        (json!(["allow"]), "an array"),
+        (json!({ "verb": "allow" }), "an object"),
+    ] {
+        let config = with_action(wrong.clone());
+        let err = try_make(config.clone())
+            .err()
+            .expect("a present non-string action must fail admission");
+        assert!(err.contains("'action'"), "{err}");
+        assert!(err.contains("must be a string"), "{err}");
+        assert!(
+            err.contains(kind),
+            "the error must name the JSON kind: {err}"
+        );
+        assert!(
+            err.contains("lookup"),
+            "the error must name the tool: {err}"
+        );
+        assert!(
+            !err.contains("missing"),
+            "a supplied key must not be reported as missing: {err}"
+        );
+        assert!(!validator.is_valid(&config), "schema must reject {wrong}");
+    }
+
+    // An omitted key keeps the missing-key diagnostic...
+    let omitted = json!({ "default_action": "deny", "tools": { "lookup": {} } });
+    let err = try_make(omitted.clone())
+        .err()
+        .expect("an omitted action must fail admission");
+    assert!(err.contains("missing required 'action'"), "{err}");
+    assert!(!validator.is_valid(&omitted));
+
+    // ...and a non-enum *string* keeps its own distinct diagnostic.
+    let misspelled = with_action(json!("permit"));
+    let err = try_make(misspelled.clone())
+        .err()
+        .expect("an unknown action must fail admission");
+    assert!(err.contains("invalid action"), "{err}");
+    assert!(!validator.is_valid(&misspelled));
+
+    // Every valid spelling reachable without an approval webhook is unchanged.
+    for spelling in ["allow", "deny", "dry_run"] {
+        assert_admission_parity(&validator, &with_action(json!(spelling)), true, spelling);
+    }
+}
+
+/// Issue #5395: the same rule for `approval.endpoint_url`, where a non-string
+/// value — and an empty string, which the published schema rejects with
+/// `minLength: 1` — were both reported as the key being required.
+#[test]
+fn non_string_approval_endpoint_url_is_reported_as_a_type_error_not_a_missing_key() {
+    let validator = openapi_config_validator();
+    let with_endpoint = |endpoint_url: Value| {
+        json!({
+            "default_action": "deny",
+            "tools": { "deploy": { "action": "require_approval" } },
+            "approval": { "endpoint_url": endpoint_url }
+        })
+    };
+
+    for (wrong, kind) in [
+        (json!(7), "a number"),
+        (json!(null), "null"),
+        (json!(true), "a boolean"),
+        (json!(["https://approve.example/x"]), "an array"),
+        (json!({ "url": "https://approve.example/x" }), "an object"),
+    ] {
+        let config = with_endpoint(wrong.clone());
+        let err = try_make(config.clone())
+            .err()
+            .expect("a present non-string endpoint_url must fail admission");
+        assert!(err.contains("'approval.endpoint_url'"), "{err}");
+        assert!(err.contains("must be a string"), "{err}");
+        assert!(
+            err.contains(kind),
+            "the error must name the JSON kind: {err}"
+        );
+        assert!(
+            !err.contains("is required"),
+            "a supplied key must not be reported as required: {err}"
+        );
+        assert!(!validator.is_valid(&config), "schema must reject {wrong}");
+    }
+
+    // A present empty string is empty, not absent.
+    let empty = with_endpoint(json!(""));
+    let err = try_make(empty.clone())
+        .err()
+        .expect("an empty endpoint_url must fail admission");
+    assert!(err.contains("must not be empty"), "{err}");
+    assert!(!err.contains("is required"), "{err}");
+    assert!(!validator.is_valid(&empty), "minLength: 1 must reject \"\"");
+
+    // An omitted key keeps the required-key diagnostic.
+    let omitted = json!({
+        "default_action": "deny",
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": { "timeout_ms": 1500 }
+    });
+    let err = try_make(omitted.clone())
+        .err()
+        .expect("an omitted endpoint_url must fail admission");
+    assert!(err.contains("'approval.endpoint_url' is required"), "{err}");
+    assert!(!validator.is_valid(&omitted));
+
+    // A valid URL is unchanged.
+    assert_admission_parity(
+        &validator,
+        &with_endpoint(json!("https://approval.example/decide")),
+        true,
+        "valid endpoint_url",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Bounded per-stream observation ledgers
+//
+// The `ai_tool_governor.*` comma-delimited observation fields aggregate across
+// every completed batch of one response stream: per-batch state resets at each
+// release boundary, but the metadata slot lives until the stream terminates.
+// Without an explicit ceiling a backend that keeps emitting batches of distinct
+// tool names grows that slot for the life of the stream, and deduplication that
+// rescans the whole accumulated string per appended value makes the work grow
+// with it. Unlimited streaming is a documented response-byte setting, so no
+// wire-byte ceiling can serve as the bound.
+// ---------------------------------------------------------------------------
+
+/// A streaming config that permits every observed call, so successive batches
+/// are released and folded into the per-stream ledger rather than cut.
+fn streaming_ledger_config() -> Value {
+    json!({
+        "default_action": "allow",
+        "tools": { "keep": { "action": "allow" } },
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+    })
+}
+
+/// One complete OpenAI-shaped streaming tool-call batch: the `tool_calls` delta
+/// plus the `finish_reason` frame that closes it.
+fn sse_tool_call_batch(index: usize, name: &str) -> String {
+    format!(
+        concat!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,",
+            "\"id\":\"call_{index}\",\"function\":{{\"name\":\"{name}\",",
+            "\"arguments\":\"{{}}\"}}}}]}}}}]}}\n\n",
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},",
+            "\"finish_reason\":\"tool_calls\"}}]}}\n\n"
+        ),
+        index = index,
+        name = name
+    )
+}
+
+/// Drive `batches` complete tool-call batches through one stream and fold the
+/// per-stream slot into `ctx.metadata`, as the terminal hook does in production.
+async fn drive_ledger_stream(plugin: Arc<AiToolGovernor>, body: String) -> RequestContext {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut ctx = create_test_context();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("stream inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+    assert!(!terminated, "every batch is permitted, so nothing is cut");
+    drop(inspector);
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(out.len() as u64))
+        .await;
+    assert_eq!(
+        plugin.pending_stream_metadata_len(),
+        0,
+        "the terminal hook must release the per-stream slot"
+    );
+    ctx
+}
+
+/// A stream of distinct tool names stops at the entry cap and says how many
+/// distinct observations it dropped, instead of retaining all of them.
+#[tokio::test]
+async fn streaming_observation_ledger_is_capped_and_counts_omissions() {
+    let plugin = Arc::new(make(streaming_ledger_config()));
+    let cap = AiToolGovernor::max_metadata_ledger_entries();
+    let batches = cap + 25;
+    let mut body = String::new();
+    for index in 0..batches {
+        body.push_str(&sse_tool_call_batch(index, &format!("tool_{index}")));
+    }
+    body.push_str("data: [DONE]\n\n");
+
+    let ctx = drive_ledger_stream(plugin, body).await;
+
+    let names = ctx
+        .metadata
+        .get("ai_tool_governor.tool_names")
+        .expect("a governed stream must record its tool names");
+    let entries: Vec<&str> = names.split(',').collect();
+    assert_eq!(entries.len(), cap, "the ledger must stop at its entry cap");
+    assert!(
+        names.len() <= AiToolGovernor::max_metadata_ledger_bytes(),
+        "the ledger must stay inside its byte budget: {} bytes",
+        names.len()
+    );
+    assert_eq!(entries[0], "tool_0", "the earliest observations are kept");
+    assert_eq!(entries[cap - 1], format!("tool_{}", cap - 1));
+    assert!(
+        !names.contains(&format!("tool_{}", batches - 1)),
+        "a value past the cap must not be retained"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get(AiToolGovernor::observations_omitted_key())
+            .map(String::as_str),
+        Some((batches - cap).to_string().as_str()),
+        "a capped ledger must report exactly how many distinct values it dropped"
+    );
+    // Enforcement and the aggregate decision are untouched by truncation.
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.decision")
+            .map(String::as_str),
+        Some("allow")
+    );
+}
+
+/// Repeats collapse: an arbitrarily long stream that keeps naming the SAME tool
+/// retains one entry and omits nothing, so deduplication is what bounds it —
+/// not the cap.
+#[tokio::test]
+async fn repeated_stream_observations_dedup_without_growing_the_ledger() {
+    let plugin = Arc::new(make(streaming_ledger_config()));
+    let batches = AiToolGovernor::max_metadata_ledger_entries() * 4;
+    let mut body = String::new();
+    for index in 0..batches {
+        body.push_str(&sse_tool_call_batch(index, "repeat_tool"));
+    }
+    body.push_str("data: [DONE]\n\n");
+
+    let ctx = drive_ledger_stream(plugin, body).await;
+
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.tool_names")
+            .map(String::as_str),
+        Some("repeat_tool"),
+        "{batches} identical observations must collapse to one entry"
+    );
+    // Every batch carried the same `{}` arguments, so its hash repeats too.
+    let hashes = ctx
+        .metadata
+        .get("ai_tool_governor.arguments_hashes")
+        .expect("hash_arguments defaults on");
+    assert!(
+        !hashes.contains(','),
+        "identical arguments must record one hash: {hashes}"
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key(AiToolGovernor::observations_omitted_key()),
+        "nothing was dropped, so no omission count belongs in the summary"
+    );
+}
+
+/// An individual observed value is bounded too: tool names come from the
+/// governed payload and carry no length limit of their own.
+#[tokio::test]
+async fn long_observed_tool_name_is_truncated_with_a_marker() {
+    let plugin = make(json!({
+        "default_action": "allow",
+        "tools": { "keep": { "action": "allow" } }
+    }));
+    let max = AiToolGovernor::max_metadata_value_bytes();
+    let marker = AiToolGovernor::metadata_value_truncation_marker();
+    let long_name = "z".repeat(max * 2);
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(
+                &mut ctx,
+                200,
+                &mut json_headers(),
+                &response_with_tool_call(&long_name, "{}"),
+            )
+            .await,
+    );
+
+    let names = ctx
+        .metadata
+        .get("ai_tool_governor.tool_names")
+        .expect("an allowed call still records its name");
+    assert_eq!(
+        names,
+        &format!("{}{marker}", "z".repeat(max)),
+        "a long name must be stored as a marked, bounded prefix"
+    );
+    assert!(
+        names.len() < long_name.len(),
+        "the retained value must be shorter than the observed one"
+    );
+}
+
+/// Turning metadata off keeps the whole ledger — omission count included — out
+/// of the transaction summary, and allocates no per-stream slot to bound.
+#[tokio::test]
+async fn disabled_metadata_records_no_observation_ledger() {
+    let mut config = streaming_ledger_config();
+    config["observability"] = json!({ "emit_metadata": false });
+    let plugin = Arc::new(make(config));
+    let batches = AiToolGovernor::max_metadata_ledger_entries() + 5;
+    let mut body = String::new();
+    for index in 0..batches {
+        body.push_str(&sse_tool_call_batch(index, &format!("tool_{index}")));
+    }
+    body.push_str("data: [DONE]\n\n");
+
+    let ctx = drive_ledger_stream(plugin, body).await;
+
+    let governor_keys: Vec<&String> = ctx
+        .metadata
+        .keys()
+        .filter(|key| key.starts_with("ai_tool_governor."))
+        .collect();
+    assert!(
+        governor_keys.is_empty(),
+        "emit_metadata: false must publish nothing: {governor_keys:?}"
     );
 }

@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use base64::Engine as _;
+use ferrum_edge::_test_support::request_credential_deadline_at;
 use ferrum_edge::ConsumerIndex;
+use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::AuthMode;
 use ferrum_edge::plugins::{
     Plugin, PluginHttpClient, PluginResult, RequestContext, key_auth::KeyAuth,
@@ -17,7 +19,8 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::plugin_utils::{
-    assert_continue, assert_reject_body, context_with_materialized_raw_header, create_test_consumer,
+    assert_continue, assert_no_effective_credential_deadline, assert_reject_body,
+    context_with_materialized_raw_header, create_test_consumer,
 };
 
 struct InvalidSecondaryAuth;
@@ -363,6 +366,65 @@ async fn active_token_sets_authenticated_identity_when_no_consumer_match() {
     assert_continue(result);
     assert_eq!(ctx.authenticated_identity.as_deref(), Some("external-user"));
     assert_eq!(ctx.auth_method, Some("oauth2_introspection"));
+}
+
+#[tokio::test]
+async fn active_token_with_a_far_future_exp_is_admitted_without_an_effective_deadline() {
+    // Issue #5420: an introspection `exp` beyond what this platform's monotonic
+    // `Instant` can express describes a valid long-lived grant. It must admit
+    // with NO bound rather than with one that has already elapsed. On a
+    // `timespec`-backed clock the same `exp` stays representable and publishes
+    // an astronomically distant bound instead; both are admissions, and the
+    // conversion's unbounded branch itself is proven at an injected clock in
+    // `auth_flow_credential_deadline_tests`.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "active": true,
+            "username": "external-user",
+            "exp": i64::MAX
+        })))
+        .mount(&server)
+        .await;
+
+    let endpoint = format!("{}/introspect", server.uri());
+    let plugin = Oauth2Introspection::new(&config(&endpoint), PluginHttpClient::default()).unwrap();
+    let mut ctx = make_ctx("far-future-exp-token");
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+
+    assert_continue(result);
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("external-user"));
+    assert_no_effective_credential_deadline(&ctx);
+}
+
+#[tokio::test]
+async fn active_token_with_a_representable_exp_still_publishes_a_deadline() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "active": true,
+            "username": "external-user",
+            "exp": 9_999_999_999u64
+        })))
+        .mount(&server)
+        .await;
+
+    let endpoint = format!("{}/introspect", server.uri());
+    let plugin = Oauth2Introspection::new(&config(&endpoint), PluginHttpClient::default()).unwrap();
+    let mut ctx = make_ctx("bounded-exp-token");
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+
+    assert_continue(result);
+    assert!(
+        request_credential_deadline_at(&ctx).is_some(),
+        "an ordinary introspection expiry must still bound the authenticated stream"
+    );
 }
 
 #[tokio::test]
@@ -1890,4 +1952,187 @@ async fn oauth2_non_materialized_authorization_rejects_invalid_not_missing() {
         .await;
     assert_reject_body(result, r#"{"error":"Invalid Authorization header"}"#);
     assert!(ctx.authenticated_identity.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// private_key_jwt key/algorithm admission — issue #5015
+// ---------------------------------------------------------------------------
+
+fn private_key_jwt_config(alg: &str, private_key_pem: &str) -> serde_json::Value {
+    json!({
+        "providers": [{
+            "introspection_endpoint": "https://idp.example.com/introspect",
+            "client_auth": {
+                "method": "private_key_jwt",
+                "client_id": "ferrum-edge",
+                "private_key_jwt_alg": alg,
+                "private_key_pem": private_key_pem
+            }
+        }]
+    })
+}
+
+fn generated_private_key_pem(params: &'static rcgen::SignatureAlgorithm) -> String {
+    rcgen::KeyPair::generate_for(params)
+        .expect("test key generated")
+        .serialize_pem()
+}
+
+/// A P-384 PEM decodes as a valid EC key under `ES256` too, so PEM parsing
+/// alone used to admit a provider that could never sign: every request then
+/// returned `503` without ever contacting the IdP, on a configuration
+/// `validate` had reported as good. Admission now proves the pair.
+#[test]
+fn oauth2_private_key_jwt_rejects_a_key_the_selected_algorithm_cannot_sign_with() {
+    let p256 = generated_private_key_pem(&rcgen::PKCS_ECDSA_P256_SHA256);
+    let p384 = generated_private_key_pem(&rcgen::PKCS_ECDSA_P384_SHA384);
+
+    for (alg, pem, label) in [
+        ("ES256", &p384, "ES256 with a P-384 key"),
+        ("ES384", &p256, "ES384 with a P-256 key"),
+    ] {
+        let config = private_key_jwt_config(alg, pem);
+        let Err(error) = Oauth2Introspection::new(&config, PluginHttpClient::default()) else {
+            panic!("{label} must be rejected at admission");
+        };
+        assert!(
+            error.contains("private_key_pem") && error.contains("private_key_jwt_alg"),
+            "{label}: the error must name both fields, got: {error}"
+        );
+        assert!(
+            !error.contains("BEGIN"),
+            "{label}: the error must not echo key material, got: {error}"
+        );
+    }
+}
+
+#[test]
+fn oauth2_private_key_jwt_admits_every_matching_key_and_algorithm_pair() {
+    let rsa = generated_private_key_pem(&rcgen::PKCS_RSA_SHA256);
+    let p256 = generated_private_key_pem(&rcgen::PKCS_ECDSA_P256_SHA256);
+    let p384 = generated_private_key_pem(&rcgen::PKCS_ECDSA_P384_SHA384);
+
+    for (alg, pem, label) in [
+        ("RS256", &rsa, "RS256 with an RSA key"),
+        ("ES256", &p256, "ES256 with a P-256 key"),
+        ("ES384", &p384, "ES384 with a P-384 key"),
+    ] {
+        let config = private_key_jwt_config(alg, pem);
+        Oauth2Introspection::new(&config, PluginHttpClient::default())
+            .unwrap_or_else(|error| panic!("{label} must be admitted, got: {error}"));
+    }
+}
+
+/// The published schema types every `client_auth` key as a string. The
+/// constructor now agrees even for a key the selected method never reads, so a
+/// config cannot pass admission while every schema validator rejects it.
+#[test]
+fn oauth2_client_auth_rejects_a_wrong_typed_value_the_method_never_reads() {
+    let config = json!({
+        "providers": [{
+            "introspection_endpoint": "http://127.0.0.1:8181/introspect",
+            "client_auth": {"method": "none", "client_secret": 123}
+        }]
+    });
+    let Err(error) = Oauth2Introspection::new(&config, PluginHttpClient::default()) else {
+        panic!("a non-string client_secret must be rejected");
+    };
+    assert!(
+        error.contains("client_auth.client_secret must be a string"),
+        "unexpected error: {error}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Endpoint-credential redaction — advisory GHSA-4ghp-v85j-5hvq
+// ---------------------------------------------------------------------------
+
+const PATH_CANARY: &str = "oauth2-path-canary";
+const QUERY_CANARY: &str = "oauth2-query-canary";
+
+fn assert_endpoint_canaries_absent(logs: &str, context: &str) {
+    for canary in [PATH_CANARY, QUERY_CANARY] {
+        assert!(!logs.contains(canary), "{context} leaked {canary}: {logs}");
+    }
+}
+
+/// A slow introspection call must not print the configured endpoint's path or
+/// query: `introspection_endpoint` legitimately accepts both, operators embed
+/// reusable credentials there, and the Admin API already redacts them.
+#[tokio::test(flavor = "current_thread")]
+async fn oauth2_slow_introspection_diagnostics_never_print_endpoint_credentials() {
+    let (logs, guard) = super::plugin_utils::capture_logs();
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/{PATH_CANARY}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "active": true,
+            "username": "external-user"
+        })))
+        .mount(&server)
+        .await;
+
+    let base = server.uri();
+    let endpoint = format!("{base}/{PATH_CANARY}?access_token={QUERY_CANARY}");
+    // Threshold 0 makes every call "slow", so the diagnostic always fires.
+    let client = PluginHttpClient::from_pool_config_with_threshold(&PoolConfig::default(), 0);
+    let plugin = Oauth2Introspection::new(&config(&endpoint), client)
+        .expect("a credential-bearing endpoint is admitted");
+
+    let mut ctx = make_ctx("redaction-canary-token");
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_continue(result);
+
+    drop(guard);
+    let captured = logs.contents();
+    assert!(
+        captured.contains("Slow plugin HTTP call"),
+        "the slow-call diagnostic must have been emitted: {captured}"
+    );
+    assert_endpoint_canaries_absent(&captured, "introspection diagnostics");
+}
+
+/// Discovery failures are reported through the retry worker's warning, so the
+/// error they carry may not be a stringified transport error: `reqwest::Error`
+/// prints the complete request URL through `Display`.
+#[tokio::test(flavor = "current_thread")]
+async fn oauth2_discovery_failure_diagnostics_never_print_endpoint_credentials() {
+    let (logs, guard) = super::plugin_utils::capture_logs();
+
+    // Bind then drop so the port is closed and discovery fails on connect.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let discovery_url = format!("http://{addr}/{PATH_CANARY}?api_key={QUERY_CANARY}");
+    let config = json!({
+        "providers": [{
+            "discovery_url": discovery_url,
+            "client_auth": {"method": "none"}
+        }]
+    });
+    let plugin = Oauth2Introspection::new(&config, PluginHttpClient::default())
+        .expect("a credential-bearing discovery URL is admitted");
+    plugin
+        .start_background_tasks()
+        .expect("discovery tasks start");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !logs.contents().contains("OIDC discovery failed")
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(plugin);
+    drop(guard);
+
+    let captured = logs.contents();
+    assert!(
+        captured.contains("OIDC discovery failed"),
+        "the discovery failure must have been reported: {captured}"
+    );
+    assert_endpoint_canaries_absent(&captured, "discovery diagnostics");
 }

@@ -87,7 +87,6 @@ VERIFY_STEP = r"""      - id: verify
           trusted_policy="$RUNNER_TEMP/verify-cross-build-policy.py"
           git show "${TRUSTED_BASE_SHA}:${policy}" > "$trusted_policy"
           python3 -I "$trusted_policy" \
-            --self-test \
             --config Cross.toml \
             --cargo-config Cargo.toml \
             --ci-workflow .github/workflows/ci.yml \
@@ -240,7 +239,7 @@ class PolicyParallelTests(unittest.TestCase):
             ("POLICY_VERIFIED: ${{ needs.ci-policy.outputs.verified }}", "POLICY_VERIFIED: 'true'"),
             ('verified: ${{ steps.verify.outputs.verified }}', "verified: 'true'"),
             ('python3 -I "$trusted_policy"', 'python3 "$policy"'),
-            ('            --self-test \\\n            --config Cross.toml', '            --config Cross.toml'),
+            ('            --config Cross.toml \\\n', '            --self-test \\\n            --config Cross.toml \\\n'),
             ('git show "${TRUSTED_BASE_SHA}:${policy}"', 'git show "HEAD:${policy}"'),
             ('base_ref="$TRUSTED_BASE_SHA"', 'base_ref="HEAD"'),
             ('trusted_base="$EVENT_BASE_SHA"', 'trusted_base="$checked_out"'),

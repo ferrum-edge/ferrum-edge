@@ -19,7 +19,9 @@ use ferrum_edge::proxy::backend_capabilities::{
 };
 use ferrum_edge::proxy::grpc_proxy::GrpcConnectionPool;
 use ferrum_edge::proxy::http2_pool::Http2ConnectionPool;
-use ferrum_edge::tls::backend::{BackendTlsConfigCache, pool_key_host_port_prefix};
+use ferrum_edge::tls::backend::{
+    BackendTlsConfigCache, SvidGenerationMatcher, pool_key_host_port_prefix,
+};
 use ferrum_edge::tls::source::SYSTEM_TRUST_ROOTS_SOURCE;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -206,6 +208,8 @@ async fn connection_pool_key_uses_numeric_generation_only_for_workload_svid() {
         svid_key.contains("|svidg=7|rcfg="),
         "workload SVID client cert should partition by numeric generation: {svid_key}"
     );
+    assert!(SvidGenerationMatcher::new(7).matches(&svid_key));
+    assert!(!SvidGenerationMatcher::new(70).matches(&svid_key));
 
     let mut static_proxy = minimal_proxy();
     static_proxy.resolved_tls.client_cert_path = Some("/operator/client.pem".to_string());
@@ -215,6 +219,37 @@ async fn connection_pool_key_uses_numeric_generation_only_for_workload_svid() {
         static_key.contains("|svidg=static|rcfg="),
         "operator-supplied client cert should not partition on SVID rotation: {static_key}"
     );
+    assert!(!SvidGenerationMatcher::new(7).matches(&static_key));
+}
+
+#[test]
+fn svid_drain_matches_complete_generation_fields_across_pool_key_layouts() {
+    let matcher = SvidGenerationMatcher::new(7);
+    for key in [
+        "backend|svidg=7",
+        "backend|svidg=7#3",
+        "backend|svidg=7|rcfg=i3600;aw1",
+        "backend|svidg=7|future=field#3",
+    ] {
+        assert!(matcher.matches(key), "must drain {key}");
+    }
+    for key in [
+        "backend|svidg=70|rcfg=i3600",
+        "backend|svidg=70#3",
+        "backend|svidg=70",
+        "backend|svidg=static|rcfg=i3600",
+        "backend|svidg=7x|rcfg=i3600",
+        "backend|svidg=07|rcfg=i3600",
+        "backend|svidg=|rcfg=i3600",
+        "backend|svidg=7|other|svidg=8|rcfg=i3600",
+        "backend%7Csvidg=7|rcfg=i3600",
+        "backend",
+    ] {
+        assert!(!matcher.matches(key), "must retain {key}");
+    }
+    let maximum = SvidGenerationMatcher::new(u64::MAX);
+    assert!(maximum.matches("backend|svidg=18446744073709551615|rcfg=i3600"));
+    assert!(!maximum.matches("backend|svidg=184467440737095516150|rcfg=i3600"));
 }
 
 #[tokio::test]

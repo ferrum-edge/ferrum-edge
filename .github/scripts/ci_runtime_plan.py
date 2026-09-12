@@ -16,43 +16,52 @@ import sys
 import tempfile
 from pathlib import Path, PurePosixPath
 
+# Pull-request relevance for the runtime suites. Each suite lists the
+# surfaces it exists to exercise; everything on the shared skip allowlist
+# below (source, tests, the Cargo build graph, docs, ...) skips the expensive
+# gate on a pull request and is exercised by the same suite on every push to
+# `main`. Paths that are neither sensitive nor allowlisted still force-run.
 SUITE_PATTERNS: dict[str, tuple[str, ...]] = {
     # Production Dockerfile smoke builds the ordinary `runtime` image and the
-    # distroless `runtime-ebpf` image from the root Dockerfile. Skip only when
-    # the diff cannot change that image, its build context, or this planner.
+    # distroless `runtime-ebpf` image from the root Dockerfile. On a pull
+    # request only the image definition, its staging inputs, the BPF program
+    # tree the eBPF image compiles, and this planner are sensitive; whether
+    # the Rust sources compile is proven by the ordinary CI lane.
     "production-dockerfile-smoke": (
         r"^Dockerfile$",
         r"^\.dockerignore$",
-        r"^Cargo\.(toml|lock)$",
-        r"^rust-toolchain\.toml$",
-        r"^\.cargo/",
-        r"^vendor/",
-        r"^build\.rs$",
-        r"^proto/",
-        r"^src/",
-        r"^custom_plugins/",
         r"^ebpf/",
         r"^\.github/scripts/stage_iproute2_runtime\.sh$",
         r"^\.github/workflows/node-waypoint-ebpf-live\.yml$",
         r"^\.github/scripts/ci_runtime_plan\.py$",
         r"^\.github/scripts/ci_runtime_telemetry\.py$",
         r"^\.github/scripts/verify_ci_runtime_cache\.py$",
+        r"^\.github/actions/package-ferrum-runtime-image/",
     ),
     # FIPS compile/clippy/test rebuilds the aws-lc-fips-sys module and the
     # unit/integration binaries that carry the handshake and key-admission
-    # assertions. Feature-policy stays cheap and always runs. Clippy uses
-    # `--lib --tests`, so every compiled tests/ input is sensitive.
+    # assertions. On a pull request only FIPS-specific logic is sensitive: the
+    # crypto-provider selection and inventory (`src/fips/`, `src/tls/`, DTLS,
+    # the QUIC/TLS listeners that install a provider), the FIPS-aware tests,
+    # the Cargo feature graph, and the gate's own workflow/scripts. Every
+    # other source change is validated under the FIPS feature on the push to
+    # `main`; a commit that breaks the FIPS build is simply not releasable.
     "fips-build": (
         r"^Cargo\.(toml|lock)$",
         r"^rust-toolchain\.toml$",
         r"^\.cargo/",
         r"^vendor/",
         r"^build\.rs$",
-        r"^proto/",
-        r"^src/",
-        r"^custom_plugins/",
-        r"^ebpf/",
-        r"^tests/",
+        r"^src/fips/",
+        r"^src/tls/",
+        r"^src/dtls/",
+        r"^src/cli\.rs$",
+        r"^src/http3/server\.rs$",
+        r"^src/proxy/gateway_listener\.rs$",
+        r"^src/modes/mesh/app_probe\.rs$",
+        r"^tests/unit/tls/",
+        r"^tests/unit/plugins/soap_ws_security_tests\.rs$",
+        r"^tests/integration/(cp_grpc_handshake_admission|http3_integration)_tests\.rs$",
         r"^docs/fips\.md$",
         r"^\.github/workflows/fips-build\.yml$",
         r"^\.github/scripts/check_fips_feature_policy\.py$",
@@ -63,85 +72,42 @@ SUITE_PATTERNS: dict[str, tuple[str, ...]] = {
         r"^\.github/actions/setup-fast-linker/",
         r"^\.github/actions/setup-rust-ci/",
     ),
-    # Kind/eBPF NodeWaypoint live datapath. Sensitive paths started as the
-    # pre-#3888 `pull_request.paths` set: the workflow trigger was a
-    # production-image superset, but this suite must not inherit that
-    # broadening. That historical set enumerated `src/proxy/` file by file and
-    # was already stale when #3888 froze it, so every NodeWaypoint datapath
-    # module added after it silently skipped the only gate that exercises it.
-    # `^src/proxy/node_waypoint_` is a prefix on purpose: those modules exist
-    # solely to implement this suite, so a new one must be sensitive by
-    # construction rather than by remembering to extend a list.
-    #
-    # Since #3908 this suite is the ONLY relevance authority for the live job:
-    # `node-waypoint-ebpf-live.yml` carries no workflow-level `paths:` filter
-    # any more, so a diff that reaches none of these patterns (and none of the
-    # `SUITE_SAFE_PATTERNS` allowlist) is what decides the Kind/eBPF job skips.
-    # `verify_ci_runtime_cache.py` probes every pattern here.
+    # Kind/eBPF NodeWaypoint live datapath. `^src/proxy/node_waypoint_` is a
+    # prefix on purpose: those modules exist solely to implement this suite,
+    # so a new one must be sensitive by construction. Since #3908 this suite
+    # is the ONLY relevance authority for the live job (the workflow carries
+    # no `paths:` filter). Shared runtime trees are validated by the ordinary
+    # shards on the PR and by this suite on every push to `main`.
     "node-waypoint-ebpf-live": (
         r"^\.github/workflows/node-waypoint-ebpf-live\.yml$",
         r"^\.dockerignore$",
         r"^\.github/actions/package-ferrum-runtime-image/",
         r"^\.github/actions/setup-kubernetes-tools/",
-        # Local composite actions the live job also executes: `setup-rust-ci`
-        # (which itself runs `setup-sccache` and `setup-fast-linker`) builds
-        # both runtime binaries, and `setup-bpf-linker` installs the linker the
-        # nightly BPF ELF build needs. The retired `paths:` list named none of
-        # them, so an edit could change what the live datapath compiled without
-        # ever re-running it.
         r"^\.github/actions/setup-rust-ci/",
         r"^\.github/actions/setup-sccache/",
         r"^\.github/actions/setup-fast-linker/",
         r"^\.github/actions/setup-bpf-linker/",
-        r"^Cargo\.(toml|lock)$",
         r"^Dockerfile$",
         r"^Dockerfile\.iproute2-layer$",
-        # The live job builds the tools-capable UDP steering image from this
-        # layer (`docker build --file Dockerfile.ebpf-tools-layer`) and asserts
-        # the steering tools it ships. Neither the retired `paths:` list nor
-        # this suite reached it: the workflow started and every job skipped.
         r"^Dockerfile\.ebpf-tools-layer$",
         r"^Dockerfile\.release$",
         r"^\.github/scripts/stage_iproute2_runtime\.sh$",
-        r"^build\.rs$",
-        r"^proto/",
         r"^ebpf/",
         r"^src/capture/",
         r"^src/ebpf/",
-        r"^src/grpc/",
-        r"^src/identity/",
         r"^src/k8s_controller/",
-        r"^src/modes/control_plane\.rs$",
         r"^src/modes/mesh/",
         r"^src/modes/node_agent\.rs$",
         r"^src/plugins/mesh/",
-        r"^src/plugins/prometheus_metrics\.rs$",
         r"^src/proxy/hbone_pool\.rs$",
+        r"^src/proxy/hbone_proxy\.rs$",
         r"^src/proxy/mesh_tcp_egress\.rs$",
         r"^src/proxy/mesh_tcp_inbound\.rs$",
-        r"^src/proxy/mod\.rs$",
-        r"^src/proxy/hbone_proxy\.rs$",
         r"^src/proxy/netns_capture\.rs$",
-        # Every `src/proxy/node_waypoint_*` module: ingress capture plus the
-        # UDP destination/identity/reply-source/steering modules that back the
-        # `node_waypoint.udp.*` and `node_waypoint.dtls.*` live assertions.
         r"^src/proxy/node_waypoint_",
-        # Materializes the NodeWaypoint UDP/DTLS listeners and scopes DTLS
-        # reload by owner generation.
-        r"^src/proxy/stream_listener\.rs$",
-        r"^src/proxy/tcp_proxy\.rs$",
-        # Carries NodeWaypoint UDP session destination and source scoping.
-        r"^src/proxy/udp_proxy\.rs$",
-        r"^src/router_cache\.rs$",
-        r"^src/socket_opts\.rs$",
         r"^charts/ferrum-mesh/",
         r"^tests/k8s/lib/",
         r"^tests/k8s/node_waypoint_ebpf_live/",
-        r"^docs/mesh\.md$",
-        r"^docs/mesh_supported_matrix\.md$",
-        r"^docs/node_agent\.md$",
-        r"^docs/ci_cd\.md$",
-        r"^docs/plans/node_waypoint_transport_adr\.md$",
     ),
 }
 
@@ -200,18 +166,27 @@ KNOWN_SAFE_PATTERNS: tuple[str, ...] = (
 # `vendor/**`, `.cargo/**`, `rust-toolchain.toml`, `custom_plugins/**`) so
 # those diffs skip the Kind/eBPF live job unless they also match the prior
 # NodeWaypoint scope above. Unknown paths still force-run.
+# Shared skip allowlist for the ordinary compile inputs. These trees are
+# validated by the ordinary CI lane on the pull request and by every runtime
+# suite on the push to `main`, so a diff confined to them skips the expensive
+# gate. Unknown paths still force-run.
+ORDINARY_COMPILE_SAFE_PATTERNS: tuple[str, ...] = (
+    r"^src/",
+    r"^tests/",
+    r"^Cargo\.(toml|lock)$",
+    r"^rust-toolchain\.toml$",
+    r"^\.cargo/",
+    r"^vendor/",
+    r"^build\.rs$",
+    r"^proto/",
+    r"^custom_plugins/",
+    r"^ebpf/",
+)
+
 SUITE_SAFE_PATTERNS: dict[str, tuple[str, ...]] = {
-    "production-dockerfile-smoke": KNOWN_SAFE_PATTERNS + (r"^tests/",),
-    "fips-build": KNOWN_SAFE_PATTERNS,
-    "node-waypoint-ebpf-live": KNOWN_SAFE_PATTERNS
-    + (
-        r"^src/",
-        r"^vendor/",
-        r"^\.cargo/",
-        r"^rust-toolchain\.toml$",
-        r"^custom_plugins/",
-        r"^tests/",
-    ),
+    "production-dockerfile-smoke": KNOWN_SAFE_PATTERNS + ORDINARY_COMPILE_SAFE_PATTERNS,
+    "fips-build": KNOWN_SAFE_PATTERNS + ORDINARY_COMPILE_SAFE_PATTERNS,
+    "node-waypoint-ebpf-live": KNOWN_SAFE_PATTERNS + ORDINARY_COMPILE_SAFE_PATTERNS,
 }
 
 COMPILED = {
@@ -409,13 +384,7 @@ def self_test() -> int:
     cases: list[tuple[str, list[str], bool]] = [
         ("production-dockerfile-smoke", ["Dockerfile"], True),
         ("production-dockerfile-smoke", [".dockerignore"], True),
-        ("production-dockerfile-smoke", ["src/main.rs"], True),
-        ("production-dockerfile-smoke", ["Cargo.lock"], True),
-        ("production-dockerfile-smoke", ["vendor/foo/src/lib.rs"], True),
         ("production-dockerfile-smoke", ["ebpf/src/lib.rs"], True),
-        ("production-dockerfile-smoke", ["custom_plugins/mod.rs"], True),
-        ("production-dockerfile-smoke", ["proto/ferrum.proto"], True),
-        ("production-dockerfile-smoke", ["build.rs"], True),
         (
             "production-dockerfile-smoke",
             [".github/scripts/stage_iproute2_runtime.sh"],
@@ -426,99 +395,85 @@ def self_test() -> int:
             [".github/workflows/node-waypoint-ebpf-live.yml"],
             True,
         ),
+        ("production-dockerfile-smoke", [".github/scripts/ci_runtime_plan.py"], True),
         (
             "production-dockerfile-smoke",
-            [".github/scripts/ci_runtime_plan.py"],
+            [".github/actions/package-ferrum-runtime-image/action.yml"],
             True,
         ),
-        (
-            "production-dockerfile-smoke",
-            ["tests/k8s/node_waypoint_ebpf_live/run.sh"],
-            False,
-        ),
+        # Ordinary compile inputs are proven by the ordinary CI lane on the
+        # PR and by this smoke on every push to main.
+        ("production-dockerfile-smoke", ["src/main.rs"], False),
+        ("production-dockerfile-smoke", ["Cargo.lock"], False),
+        ("production-dockerfile-smoke", ["vendor/foo/src/lib.rs"], False),
+        ("production-dockerfile-smoke", ["custom_plugins/mod.rs"], False),
+        ("production-dockerfile-smoke", ["proto/ferrum.proto"], False),
+        ("production-dockerfile-smoke", ["build.rs"], False),
+        ("production-dockerfile-smoke", ["tests/k8s/node_waypoint_ebpf_live/run.sh"], False),
         ("production-dockerfile-smoke", ["docs/ci_cd.md"], False),
         ("production-dockerfile-smoke", ["docs/mesh.md"], False),
         ("production-dockerfile-smoke", ["charts/ferrum-mesh/values.yaml"], False),
         ("production-dockerfile-smoke", ["README.md"], False),
         ("production-dockerfile-smoke", ["Dockerfile.release"], False),
         ("production-dockerfile-smoke", ["Dockerfile.iproute2-layer"], False),
+        # FIPS-specific logic is sensitive on a pull request.
+        ("fips-build", ["src/fips/policy.rs"], True),
         ("fips-build", ["src/tls/mod.rs"], True),
+        ("fips-build", ["src/tls/backend.rs"], True),
+        ("fips-build", ["src/dtls/mod.rs"], True),
+        ("fips-build", ["src/cli.rs"], True),
+        ("fips-build", ["src/http3/server.rs"], True),
+        ("fips-build", ["src/proxy/gateway_listener.rs"], True),
         ("fips-build", ["tests/unit/tls/fips_policy_tests.rs"], True),
+        ("fips-build", ["tests/unit/tls/fips_key_admission_tests.rs"], True),
         ("fips-build", ["tests/integration/cp_grpc_handshake_admission_tests.rs"], True),
-        ("fips-build", ["tests/unit_tests.rs"], True),
-        ("fips-build", ["tests/integration_tests.rs"], True),
-        ("fips-build", ["tests/common/mod.rs"], True),
-        ("fips-build", ["tests/scaffolding/harness.rs"], True),
-        ("fips-build", ["tests/fixtures/test_rsa_public.pem"], True),
-        ("fips-build", ["tests/functional/functional_admin_test.rs"], True),
-        ("fips-build", ["tests/k8s/mesh_e2e_sidecar/run.sh"], True),
+        ("fips-build", ["tests/integration/http3_integration_tests.rs"], True),
+        ("fips-build", ["tests/unit/plugins/soap_ws_security_tests.rs"], True),
         ("fips-build", ["Cargo.toml"], True),
+        ("fips-build", ["Cargo.lock"], True),
+        ("fips-build", ["vendor/foo/src/lib.rs"], True),
         ("fips-build", ["docs/fips.md"], True),
         ("fips-build", [".github/workflows/fips-build.yml"], True),
         ("fips-build", [".github/scripts/check_fips_feature_policy.py"], True),
         ("fips-build", [".github/actions/setup-sccache/action.yml"], True),
+        # Everything else compiles under the FIPS feature on the push to main.
+        ("fips-build", ["src/proxy/tcp_proxy.rs"], False),
+        ("fips-build", ["src/plugins/cors.rs"], False),
+        ("fips-build", ["src/admin/mod.rs"], False),
+        ("fips-build", ["src/modes/mesh/mod.rs"], False),
+        ("fips-build", ["tests/unit_tests.rs"], False),
+        ("fips-build", ["tests/integration_tests.rs"], False),
+        ("fips-build", ["tests/common/mod.rs"], False),
+        ("fips-build", ["tests/scaffolding/harness.rs"], False),
+        ("fips-build", ["tests/fixtures/test_rsa_public.pem"], False),
+        ("fips-build", ["tests/functional/functional_admin_test.rs"], False),
+        ("fips-build", ["tests/k8s/mesh_e2e_sidecar/run.sh"], False),
+        ("fips-build", ["proto/ferrum.proto"], False),
+        ("fips-build", ["custom_plugins/mod.rs"], False),
         ("fips-build", ["docs/ci_cd.md"], False),
         ("fips-build", ["README.md"], False),
         ("fips-build", ["charts/ferrum-mesh/values.yaml"], False),
-        (
-            "production-dockerfile-smoke",
-            ["src/\nmain.rs"],
-            True,
-        ),
-        (
-            "fips-build",
-            ["src/\nmain.rs"],
-            True,
-        ),
-        (
-            "production-dockerfile-smoke",
-            ['"src/main.rs"'],
-            True,
-        ),
-        (
-            "production-dockerfile-smoke",
-            ['"Dockerfile"'],
-            True,
-        ),
-        (
-            "fips-build",
-            ["README.md"],
-            False,
-        ),
+        # Paths that match no pattern (here: shell-quoted names) are unknown
+        # and force-run. Control characters never reach decide_relevance():
+        # read_changed_files() raises UnsafeChangedFiles first, which the
+        # transport self-test below proves.
+        ("production-dockerfile-smoke", ['"src/main.rs"'], True),
+        ("production-dockerfile-smoke", ['"Dockerfile"'], True),
+        # NodeWaypoint: its own datapath modules, harness, and image inputs.
         ("node-waypoint-ebpf-live", ["src/ebpf/mod.rs"], True),
         ("node-waypoint-ebpf-live", ["src/capture/mod.rs"], True),
-        ("node-waypoint-ebpf-live", ["src/grpc/mod.rs"], True),
-        ("node-waypoint-ebpf-live", ["src/identity/mod.rs"], True),
         ("node-waypoint-ebpf-live", ["src/k8s_controller/mod.rs"], True),
-        ("node-waypoint-ebpf-live", ["src/modes/control_plane.rs"], True),
         ("node-waypoint-ebpf-live", ["src/modes/mesh/mod.rs"], True),
         ("node-waypoint-ebpf-live", ["src/modes/node_agent.rs"], True),
         ("node-waypoint-ebpf-live", ["src/plugins/mesh/mod.rs"], True),
-        ("node-waypoint-ebpf-live", ["src/plugins/prometheus_metrics.rs"], True),
         ("node-waypoint-ebpf-live", ["src/proxy/hbone_pool.rs"], True),
         ("node-waypoint-ebpf-live", ["src/proxy/mesh_tcp_egress.rs"], True),
         ("node-waypoint-ebpf-live", ["src/proxy/mesh_tcp_inbound.rs"], True),
-        ("node-waypoint-ebpf-live", ["src/proxy/mod.rs"], True),
         ("node-waypoint-ebpf-live", ["src/proxy/hbone_proxy.rs"], True),
         ("node-waypoint-ebpf-live", ["src/proxy/netns_capture.rs"], True),
         (
             "node-waypoint-ebpf-live",
             ["src/proxy/node_waypoint_ingress_capture.rs"],
-            True,
-        ),
-        (
-            "node-waypoint-ebpf-live",
-            ["src/proxy/node_waypoint_udp_destination.rs"],
-            True,
-        ),
-        (
-            "node-waypoint-ebpf-live",
-            ["src/proxy/node_waypoint_udp_identity.rs"],
-            True,
-        ),
-        (
-            "node-waypoint-ebpf-live",
-            ["src/proxy/node_waypoint_udp_reply_source.rs"],
             True,
         ),
         (
@@ -533,24 +488,12 @@ def self_test() -> int:
             ["src/proxy/node_waypoint_not_yet_written.rs"],
             True,
         ),
-        ("node-waypoint-ebpf-live", ["src/proxy/stream_listener.rs"], True),
-        ("node-waypoint-ebpf-live", ["src/proxy/tcp_proxy.rs"], True),
-        ("node-waypoint-ebpf-live", ["src/proxy/udp_proxy.rs"], True),
-        # The prefix must not swallow unrelated `src/proxy/` modules; those
-        # still skip the 120-minute Kind/eBPF job.
-        ("node-waypoint-ebpf-live", ["src/proxy/grpc_proxy.rs"], False),
-        ("node-waypoint-ebpf-live", ["src/proxy/headers.rs"], False),
-        ("node-waypoint-ebpf-live", ["src/router_cache.rs"], True),
-        ("node-waypoint-ebpf-live", ["src/socket_opts.rs"], True),
         ("node-waypoint-ebpf-live", ["ebpf/src/lib.rs"], True),
-        ("node-waypoint-ebpf-live", ["proto/ferrum.proto"], True),
-        ("node-waypoint-ebpf-live", ["Cargo.toml"], True),
-        ("node-waypoint-ebpf-live", ["Cargo.lock"], True),
         ("node-waypoint-ebpf-live", ["Dockerfile"], True),
         ("node-waypoint-ebpf-live", ["Dockerfile.iproute2-layer"], True),
         ("node-waypoint-ebpf-live", ["Dockerfile.release"], True),
+        ("node-waypoint-ebpf-live", ["Dockerfile.ebpf-tools-layer"], True),
         ("node-waypoint-ebpf-live", [".dockerignore"], True),
-        ("node-waypoint-ebpf-live", ["build.rs"], True),
         (
             "node-waypoint-ebpf-live",
             [".github/scripts/stage_iproute2_runtime.sh"],
@@ -571,45 +514,35 @@ def self_test() -> int:
             [".github/actions/setup-kubernetes-tools/action.yml"],
             True,
         ),
-        # Local composite actions the live job executes directly, or through
-        # `setup-rust-ci`, which runs `setup-sccache` and `setup-fast-linker`.
-        (
-            "node-waypoint-ebpf-live",
-            [".github/actions/setup-rust-ci/action.yml"],
-            True,
-        ),
-        (
-            "node-waypoint-ebpf-live",
-            [".github/actions/setup-sccache/action.yml"],
-            True,
-        ),
-        (
-            "node-waypoint-ebpf-live",
-            [".github/actions/setup-fast-linker/action.yml"],
-            True,
-        ),
-        (
-            "node-waypoint-ebpf-live",
-            [".github/actions/setup-bpf-linker/action.yml"],
-            True,
-        ),
-        ("node-waypoint-ebpf-live", ["Dockerfile.ebpf-tools-layer"], True),
+        ("node-waypoint-ebpf-live", [".github/actions/setup-rust-ci/action.yml"], True),
+        ("node-waypoint-ebpf-live", [".github/actions/setup-sccache/action.yml"], True),
+        ("node-waypoint-ebpf-live", [".github/actions/setup-fast-linker/action.yml"], True),
+        ("node-waypoint-ebpf-live", [".github/actions/setup-bpf-linker/action.yml"], True),
         ("node-waypoint-ebpf-live", ["charts/ferrum-mesh/values.yaml"], True),
-        (
-            "node-waypoint-ebpf-live",
-            ["tests/k8s/node_waypoint_ebpf_live/run.sh"],
-            True,
-        ),
+        ("node-waypoint-ebpf-live", ["tests/k8s/node_waypoint_ebpf_live/run.sh"], True),
         ("node-waypoint-ebpf-live", ["tests/k8s/lib/helpers.sh"], True),
-        ("node-waypoint-ebpf-live", ["docs/mesh.md"], True),
-        ("node-waypoint-ebpf-live", ["docs/mesh_supported_matrix.md"], True),
-        ("node-waypoint-ebpf-live", ["docs/node_agent.md"], True),
-        ("node-waypoint-ebpf-live", ["docs/ci_cd.md"], True),
-        (
-            "node-waypoint-ebpf-live",
-            ["docs/plans/node_waypoint_transport_adr.md"],
-            True,
-        ),
+        # Shared runtime trees, the build graph, and documentation stay on main.
+        ("node-waypoint-ebpf-live", ["src/grpc/mod.rs"], False),
+        ("node-waypoint-ebpf-live", ["src/identity/mod.rs"], False),
+        ("node-waypoint-ebpf-live", ["src/modes/control_plane.rs"], False),
+        ("node-waypoint-ebpf-live", ["src/plugins/prometheus_metrics.rs"], False),
+        ("node-waypoint-ebpf-live", ["src/proxy/mod.rs"], False),
+        ("node-waypoint-ebpf-live", ["src/proxy/stream_listener.rs"], False),
+        ("node-waypoint-ebpf-live", ["src/proxy/tcp_proxy.rs"], False),
+        ("node-waypoint-ebpf-live", ["src/proxy/udp_proxy.rs"], False),
+        ("node-waypoint-ebpf-live", ["src/proxy/grpc_proxy.rs"], False),
+        ("node-waypoint-ebpf-live", ["src/proxy/headers.rs"], False),
+        ("node-waypoint-ebpf-live", ["src/router_cache.rs"], False),
+        ("node-waypoint-ebpf-live", ["src/socket_opts.rs"], False),
+        ("node-waypoint-ebpf-live", ["proto/ferrum.proto"], False),
+        ("node-waypoint-ebpf-live", ["Cargo.toml"], False),
+        ("node-waypoint-ebpf-live", ["Cargo.lock"], False),
+        ("node-waypoint-ebpf-live", ["build.rs"], False),
+        ("node-waypoint-ebpf-live", ["docs/mesh.md"], False),
+        ("node-waypoint-ebpf-live", ["docs/mesh_supported_matrix.md"], False),
+        ("node-waypoint-ebpf-live", ["docs/node_agent.md"], False),
+        ("node-waypoint-ebpf-live", ["docs/ci_cd.md"], False),
+        ("node-waypoint-ebpf-live", ["docs/plans/node_waypoint_transport_adr.md"], False),
         ("node-waypoint-ebpf-live", ["src/main.rs"], False),
         ("node-waypoint-ebpf-live", ["src/admin/mod.rs"], False),
         ("node-waypoint-ebpf-live", ["src/modes/database.rs"], False),
@@ -619,32 +552,16 @@ def self_test() -> int:
         ("node-waypoint-ebpf-live", ["rust-toolchain.toml"], False),
         ("node-waypoint-ebpf-live", ["custom_plugins/mod.rs"], False),
         ("node-waypoint-ebpf-live", ["README.md"], False),
-        # Root-level documentation must not pay for the 120-minute Kind/eBPF
-        # cluster now that the workflow-level `paths:` filter is retired.
         ("node-waypoint-ebpf-live", ["ARCHITECTURE.md"], False),
         ("node-waypoint-ebpf-live", ["PRODUCTION_READINESS.md"], False),
         ("node-waypoint-ebpf-live", ["CHANGELOG.md"], False),
         ("production-dockerfile-smoke", ["PRODUCTION_READINESS.md"], False),
         ("fips-build", ["PRODUCTION_READINESS.md"], False),
-        # The allowlist entry holds no `/`, so it cannot reach into a directory
-        # and turn a real source path into a skip.
+        # `src/ebpf/` is sensitive even for a README inside it (prefix match).
         ("node-waypoint-ebpf-live", ["src/ebpf/README.md"], True),
-        ("production-dockerfile-smoke", ["src/ebpf/README.md"], True),
-        (
-            "node-waypoint-ebpf-live",
-            [".github/scripts/ci_runtime_plan.py"],
-            False,
-        ),
-        (
-            "node-waypoint-ebpf-live",
-            [".github/scripts/verify_ci_runtime_cache.py"],
-            False,
-        ),
-        (
-            "node-waypoint-ebpf-live",
-            ["src/main.rs", "src/ebpf/mod.rs"],
-            True,
-        ),
+        ("production-dockerfile-smoke", ["src/ebpf/README.md"], False),
+        ("node-waypoint-ebpf-live", [".github/scripts/ci_runtime_plan.py"], False),
+        ("node-waypoint-ebpf-live", [".github/scripts/verify_ci_runtime_cache.py"], False),
     ]
     failures: list[str] = []
     for suite, changed, expected in cases:

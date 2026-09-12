@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 #[command(
     name = "ferrum-edge",
     version,
+    subcommand_required = true,
+    arg_required_else_help = true,
     about = "A high-performance edge proxy built in Rust"
 )]
 pub struct Cli {
@@ -138,7 +140,7 @@ pub struct VersionArgs {
 
 #[derive(clap::Args)]
 pub struct HealthArgs {
-    /// Path to ferrum.conf for inferred admin ports (env values take precedence).
+    /// Path to ferrum.conf for inferred admin host and ports (env takes precedence).
     #[arg(short = 's', long = "settings")]
     pub settings: Option<PathBuf>,
 
@@ -147,9 +149,9 @@ pub struct HealthArgs {
     #[arg(short = 'p', long = "port")]
     pub port: Option<u16>,
 
-    /// Admin API host to connect to.
-    #[arg(long, default_value = "127.0.0.1")]
-    pub host: String,
+    /// Admin API host (defaults to the effective admin bind address).
+    #[arg(long)]
+    pub host: Option<String>,
 
     /// Use TLS (HTTPS) to connect to the admin API.
     /// Selected automatically when HTTP is disabled and --port is not supplied.
@@ -416,16 +418,30 @@ pub fn apply_ambient_udp_preflight_overrides(args: &AmbientUdpPreflightArgs) {
 pub fn infer_file_mode() {
     use crate::config::conf_file::ConfFile;
 
-    // `-m/--mode` was already written to the environment by
-    // `apply_run_overrides` / `apply_validate_overrides`, so this one check
-    // covers CLI and env alike.
-    if direct_env_var_is_set("FERRUM_MODE") {
+    // Read only after startup has materialized FERRUM_CONF_PATH suffixes.
+    // A failed settings load is reported by admission; never discover over it.
+    let Ok(conf) = ConfFile::load() else {
+        return;
+    };
+    if conf.get("FERRUM_FILE_CONFIG_PATH").is_none()
+        && let Some(path) = resolve_spec_path(None)
+    {
+        // SAFETY: startup only, before logging workers or the serving runtime.
+        unsafe { std::env::set_var("FERRUM_FILE_CONFIG_PATH", path) };
+    }
+    if direct_env_var_is_set("FERRUM_MODE")
+        || conf
+            .get("FERRUM_MODE")
+            .is_some_and(|mode| !mode.trim().is_empty())
+    {
         return;
     }
-    let conf_mode = ConfFile::load()
-        .ok()
-        .and_then(|conf| conf.get("FERRUM_MODE").map(str::to_string));
-    infer_file_mode_from_conf_mode(conf_mode.as_deref());
+    if direct_env_var_is_set("FERRUM_FILE_CONFIG_PATH")
+        || conf.get("FERRUM_FILE_CONFIG_PATH").is_some()
+    {
+        // SAFETY: startup only, before logging workers or the serving runtime.
+        unsafe { std::env::set_var("FERRUM_MODE", "file") };
+    }
 }
 
 /// Apply the file-mode smart default after the immutable settings snapshot has
@@ -456,7 +472,8 @@ fn apply_common_overrides(settings: Option<&Path>, spec: Option<&Path>) {
         unsafe { std::env::set_var("FERRUM_CONF_PATH", path) };
     }
 
-    if let Some(path) = resolve_spec_path(spec) {
+    // Discovery waits until secrets and the selected settings file are available.
+    if let Some(path) = spec.map(resolve_path) {
         // SAFETY: single-threaded context, before tokio runtime.
         unsafe { std::env::set_var("FERRUM_FILE_CONFIG_PATH", path) };
     }
@@ -1098,35 +1115,91 @@ impl std::io::Write for DeadlineTcpStream {
     }
 }
 
-/// Resolve only the settings needed by the one-shot health probe. Explicit
-/// ports keep their existing independent behavior; inferred ports use the same
-/// stable settings reader and env-over-conf resolver as gateway startup.
-fn resolve_health_target(args: &HealthArgs) -> Result<(u16, bool), String> {
-    use crate::config::conf_file::ConfFile;
-    use crate::config::env_config::resolve_var;
-
-    if let Some(port) = args.port {
-        return Ok((port, args.tls));
+/// Resolve only endpoint inputs; do not fetch gateway credentials or mutate
+/// the process environment. The registry retains startup conflict, Unicode,
+/// timeout, provider-feature, and source-reference redaction rules.
+fn health_env_values(keys: &[&str]) -> Result<std::collections::HashMap<String, String>, String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "Cannot create health settings runtime".to_string())?;
+    let resolved = rt.block_on(crate::secrets::resolve_selected_env_secrets(keys))?;
+    let mut values: std::collections::HashMap<String, String> = resolved.vars.into_iter().collect();
+    for key in keys {
+        if !values.contains_key(*key)
+            && let Ok(value) = std::env::var(key)
+        {
+            values.insert((*key).to_string(), value);
+        }
     }
-    let conf = match resolve_settings_path(args.settings.as_deref()) {
-        Some(path) => ConfFile::load_from_path(&path, false)?,
-        None => ConfFile::load()?,
+    Ok(values)
+}
+
+fn resolve_health_target(args: &HealthArgs) -> Result<(String, u16, bool), String> {
+    use crate::config::conf_file::ConfFile;
+
+    if let (Some(host), Some(port)) = (&args.host, args.port) {
+        return Ok((host.clone(), port, args.tls));
+    }
+    let mut keys = Vec::new();
+    if args.settings.is_none() {
+        keys.push("FERRUM_CONF_PATH");
+    }
+    if args.host.is_none() {
+        keys.push("FERRUM_ADMIN_BIND_ADDRESS");
+    }
+    if args.port.is_none() && !args.tls {
+        keys.push("FERRUM_ADMIN_HTTP_PORT");
+    }
+    let mut values = health_env_values(&keys)?;
+    let conf = if let Some(path) = &args.settings {
+        ConfFile::load_from_path(path, false)?
+    } else if let Some(path) = values.get("FERRUM_CONF_PATH") {
+        let (path, absent_ok) = crate::config::conf_file::conf_path_selection(Some(path));
+        ConfFile::load_from_path(&path, absent_ok)
+            .map_err(|_| "Cannot load settings selected by FERRUM_CONF_PATH".to_string())?
+    } else if let Some(path) = resolve_settings_path(None) {
+        ConfFile::load_from_path(&path, false)?
+    } else {
+        ConfFile::default()
     };
-    let configured_port = |key: &str, default: u16| -> Result<u16, String> {
-        match resolve_var(&conf, key) {
+    let configured_port =
+        |values: &std::collections::HashMap<String, String>, key: &str, default| match values
+            .get(key)
+            .map(String::as_str)
+            .or_else(|| conf.get(key))
+        {
             Some(value) => value
                 .parse::<u16>()
                 .map_err(|_| format!("{key} must be an integer from 0 to 65535")),
             None => Ok(default),
+        };
+    let use_tls = args.tls
+        || (args.port.is_none() && configured_port(&values, "FERRUM_ADMIN_HTTP_PORT", 9000)? == 0);
+    if args.port.is_none() && use_tls {
+        values.extend(health_env_values(&["FERRUM_ADMIN_HTTPS_PORT"])?);
+    }
+    let port = match args.port {
+        Some(port) => port,
+        None if use_tls => configured_port(&values, "FERRUM_ADMIN_HTTPS_PORT", 9443)?,
+        None => configured_port(&values, "FERRUM_ADMIN_HTTP_PORT", 9000)?,
+    };
+    let host = if let Some(host) = &args.host {
+        host.clone()
+    } else {
+        let value = values
+            .get("FERRUM_ADMIN_BIND_ADDRESS")
+            .map(String::as_str)
+            .or_else(|| conf.get("FERRUM_ADMIN_BIND_ADDRESS"))
+            .unwrap_or("127.0.0.1");
+        match value.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(ip)) if ip.is_unspecified() => "127.0.0.1".to_string(),
+            Ok(std::net::IpAddr::V6(ip)) if ip.is_unspecified() => "::1".to_string(),
+            Ok(ip) => ip.to_string(),
+            Err(_) => return Err("FERRUM_ADMIN_BIND_ADDRESS must be an IP address".to_string()),
         }
     };
-    let use_tls = args.tls || configured_port("FERRUM_ADMIN_HTTP_PORT", 9000)? == 0;
-    let port = if use_tls {
-        configured_port("FERRUM_ADMIN_HTTPS_PORT", 9443)?
-    } else {
-        configured_port("FERRUM_ADMIN_HTTP_PORT", 9000)?
-    };
-    Ok((port, use_tls))
+    Ok((host, port, use_tls))
 }
 
 /// Check gateway health by connecting to the admin API.
@@ -1136,8 +1209,8 @@ fn resolve_health_target(args: &HealthArgs) -> Result<(u16, bool), String> {
 /// whenever the process and admin listener are up — the correct target for a
 /// Kubernetes livenessProbe so an alive-but-unready pod is not restart-looped.
 ///
-/// Uses a raw TCP connection + minimal HTTP/1.1 request to avoid pulling in
-/// async runtime or reqwest for this one-shot diagnostic.
+/// Uses a raw TCP connection and minimal HTTP/1.1 request after resolving
+/// endpoint inputs on a temporary current-thread runtime.
 ///
 /// When `--tls` is passed, wraps the TCP socket in a rustls `StreamOwned` for
 /// HTTPS. This is needed when `FERRUM_ADMIN_HTTP_PORT=0` disables plaintext.
@@ -1145,18 +1218,28 @@ pub fn execute_health(args: &HealthArgs) -> Result<(), String> {
     use std::net::{TcpStream, ToSocketAddrs};
     use std::time::Instant;
 
-    let (port, use_tls) = resolve_health_target(args)?;
+    let (host, port, use_tls) = resolve_health_target(args)?;
+    if port == 0 {
+        return Err("The selected admin listener is disabled (port 0)".to_string());
+    }
+    if host.is_empty()
+        || host
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+    {
+        return Err("Invalid health host".to_string());
+    }
 
-    let addr_str = format_host_port(&args.host, port);
+    let addr_str = format_host_port(&host, port);
     let sock_addr = addr_str
         .to_socket_addrs()
-        .map_err(|e| format!("Cannot resolve {}: {}", addr_str, e))?
+        .map_err(|_| "Cannot resolve health endpoint".to_string())?
         .next()
-        .ok_or_else(|| format!("No addresses found for {}", addr_str))?;
+        .ok_or_else(|| "No addresses found for health endpoint".to_string())?;
     let stream = TcpStream::connect_timeout(&sock_addr, HEALTH_RESPONSE_TIMEOUT)
-        .map_err(|e| format!("Cannot connect to {}: {}", addr_str, e))?;
+        .map_err(|_| "Cannot connect to health endpoint".to_string())?;
 
-    let host_header = format_host_port(&args.host, port);
+    let host_header = format_host_port(&host, port);
     let path = if args.live { "/live" } else { "/health" };
     let request =
         format!("GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n");
@@ -1167,7 +1250,7 @@ pub fn execute_health(args: &HealthArgs) -> Result<(), String> {
         health_request_tls(
             stream,
             &request,
-            &args.host,
+            &host,
             args.tls_no_verify,
             response_deadline,
         )?
@@ -1406,7 +1489,7 @@ fn health_request_tls(
     }
 
     let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
-        .map_err(|e| format!("Invalid server name '{}': {}", host, e))?;
+        .map_err(|_| "Invalid health TLS server name".to_string())?;
 
     let conn = rustls::ClientConnection::new(Arc::new(tls_config), server_name).map_err(|e| {
         format!(
@@ -1416,9 +1499,9 @@ fn health_request_tls(
     })?;
 
     let mut tls_stream = rustls::StreamOwned::new(conn, stream);
-    tls_stream
-        .write_all(request.as_bytes())
-        .map_err(|e| format!("Failed to send TLS request: {}", e))?;
+    tls_stream.write_all(request.as_bytes()).map_err(|_| {
+        "Failed to send TLS request; check endpoint and certificate trust".to_string()
+    })?;
     read_health_response_head(&mut tls_stream, deadline, "TLS")
 }
 
@@ -1605,7 +1688,11 @@ mod tests {
             };
             let actual = resolve_health_target(&args);
             match expected {
-                Ok(target) => assert_eq!(actual.unwrap(), *target),
+                Ok(target) => {
+                    let (host, port, tls) = actual.unwrap();
+                    assert_eq!(host, "127.0.0.1");
+                    assert_eq!((port, tls), *target);
+                }
                 Err(message) => assert!(actual.unwrap_err().contains(*message)),
             }
             return;
@@ -1688,7 +1775,7 @@ mod tests {
         let args = HealthArgs {
             settings: None,
             port: Some(port),
-            host: "::1".to_string(),
+            host: Some("::1".to_string()),
             tls: false,
             tls_no_verify: false,
             live: false,

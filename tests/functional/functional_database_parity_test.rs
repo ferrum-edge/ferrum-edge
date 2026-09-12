@@ -29,6 +29,7 @@ fn gateway_binary() -> &'static str {
 
 fn run_migrate(action: &str, db_type: &str, db_url: &str) -> std::process::Output {
     Command::new(gateway_binary())
+        .arg("run")
         .env("FERRUM_MODE", "migrate")
         .env("FERRUM_MIGRATE_ACTION", action)
         .env("FERRUM_DB_TYPE", db_type)

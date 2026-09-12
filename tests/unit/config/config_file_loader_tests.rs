@@ -3,6 +3,110 @@ use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, PluginSc
 use std::io::Write;
 use tempfile::NamedTempFile;
 
+#[test]
+fn file_admission_rejects_runtime_invalid_graphs_at_load_and_reload() {
+    let cases: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../../fixtures/file_admission_cases.json")).unwrap();
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let mut candidate: ferrum_edge::config::types::GatewayConfig =
+            serde_json::from_value(case["config"].clone()).unwrap();
+        candidate.normalize_fields();
+        let shared_errors =
+            ferrum_edge::_test_support::collect_rejecting_runtime_config_errors_for_test(
+                &candidate,
+            );
+        if let Some(expected) = case["expected_error"].as_str() {
+            assert!(
+                shared_errors.iter().any(|error| error.contains(expected)),
+                "{name}: shared admission: {shared_errors:?}"
+            );
+        } else {
+            assert!(shared_errors.is_empty(), "{name}: {shared_errors:?}");
+        }
+        for extension in [".json", ".yaml"] {
+            let mut file = NamedTempFile::with_suffix(extension).unwrap();
+            let contents = if extension == ".json" {
+                serde_json::to_string(&case["config"]).unwrap()
+            } else {
+                serde_yaml::to_string(&case["config"]).unwrap()
+            };
+            write!(file, "{contents}").unwrap();
+            let path = file.path().to_str().unwrap();
+            let policy = ferrum_edge::config::BackendEgressPolicy::unrestricted();
+            for (operation, result) in [
+                ("load", load_config_from_file(path, 30, &policy, "ferrum")),
+                (
+                    "reload",
+                    reload_config_from_file(path, 30, &policy, "ferrum"),
+                ),
+            ] {
+                if let Some(expected) = case["expected_error"].as_str() {
+                    let error = result.expect_err(name).to_string();
+                    assert!(
+                        error.contains(expected),
+                        "{name} {extension} {operation}: {error}"
+                    );
+                } else {
+                    let config = result
+                        .unwrap_or_else(|error| panic!("{name} {extension} {operation}: {error}"));
+                    assert_eq!(config.proxies.len(), 1, "{name}");
+                    assert_eq!(
+                        config.plugin_configs.len(),
+                        case["config"]["plugin_configs"].as_array().unwrap().len(),
+                        "{name}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn file_and_database_full_loads_keep_the_shared_rejecting_admission_gate() {
+    // Behavioral coverage above and in the admin/CLI suites uses the same
+    // fixtures. This wiring guard also covers Mongo without requiring a live
+    // Mongo service in the unit lane, and prevents a new hand-maintained list
+    // from silently dropping future shared rejection rules.
+    for (name, source, start, end) in [
+        (
+            "file",
+            include_str!("../../../src/config/file_loader.rs"),
+            "pub fn load_config_from_file(",
+            "/// Decode and validate a config document from in-memory bytes.",
+        ),
+        (
+            "SQL",
+            include_str!("../../../src/config/db_loader.rs"),
+            "pub async fn load_full_config_for_purpose(",
+            "pub async fn load_namespace_snapshot(",
+        ),
+        (
+            "Mongo",
+            include_str!("../../../src/config/mongo_store.rs"),
+            "async fn load_full_config_for_purpose(",
+            "\n        async fn ",
+        ),
+    ] {
+        let body = source.split_once(start).expect(name).1;
+        let body = body.split_once(end).expect(name).0;
+        assert!(
+            body.contains("collect_rejecting_runtime_config_errors(&config)"),
+            "{name} full load must inherit the shared rejecting-validator set"
+        );
+        if name == "file" {
+            let rejecting = body
+                .find("collect_rejecting_runtime_config_errors(&config)")
+                .unwrap();
+            let local_files = body.find(".validate_plugin_file_dependencies(").unwrap();
+            assert!(
+                rejecting < local_files,
+                "a rejected graph must not publish an MMDB validation handoff"
+            );
+        }
+    }
+}
+
 // ============================================================================
 // Basic Loading Tests
 // ============================================================================

@@ -266,26 +266,60 @@ fn request_declared_length_reject_is_disabled_by_an_unlimited_ceiling() {
 fn response_declared_length_reject_matches_the_request_side_semantics() {
     // Inclusive boundary.
     assert_eq!(
-        declared_response_length_exceeds_limit_for_test(&map("1024"), 1024),
+        declared_response_length_exceeds_limit_for_test("GET", 200, &map("1024"), 1024),
         None
     );
     assert_eq!(
-        declared_response_length_exceeds_limit_for_test(&map("1025"), 1024),
+        declared_response_length_exceeds_limit_for_test("GET", 200, &map("1025"), 1024),
         Some(1025)
     );
     // Repeated identical values are honored.
     assert_eq!(
-        declared_response_length_exceeds_limit_for_test(&map("2048, 2048"), 1024),
+        declared_response_length_exceeds_limit_for_test("GET", 200, &map("2048, 2048"), 1024),
         Some(2048)
     );
     // Ambiguity does not invent a length.
     assert_eq!(
-        declared_response_length_exceeds_limit_for_test(&map("2048, 4096"), 1024),
+        declared_response_length_exceeds_limit_for_test("GET", 200, &map("2048, 4096"), 1024),
         None
     );
     // Unlimited ceiling disables the fast path.
     assert_eq!(
-        declared_response_length_exceeds_limit_for_test(&map("999999"), 0),
+        declared_response_length_exceeds_limit_for_test("GET", 200, &map("999999"), 0),
+        None
+    );
+}
+
+/// A representation `Content-Length` on HEAD / 1xx / 204 / 205 / 304 is not a
+/// transferable-body size. The shared core fast path must not 502 those replies
+/// when the advertised length is above the route or global ceiling (issue #5116).
+#[test]
+fn response_declared_length_skips_bodyless_head_and_304() {
+    for (method, status) in [
+        ("HEAD", 200u16),
+        ("head", 200),
+        ("GET", 304),
+        ("GET", 204),
+        ("GET", 205),
+        ("GET", 100),
+        ("HEAD", 304),
+    ] {
+        assert_eq!(
+            declared_response_length_exceeds_limit_for_test(method, status, &map("1025"), 1024),
+            None,
+            "bodyless {method} {status} representation length must not trip the ceiling"
+        );
+    }
+    assert_eq!(
+        declared_response_length_exceeds_limit_for_test("GET", 200, &map("1025"), 1024),
+        Some(1025)
+    );
+    assert_eq!(
+        declared_response_length_exceeds_limit_for_test("GET", 206, &map("1025"), 1024),
+        Some(1025)
+    );
+    assert_eq!(
+        declared_response_length_exceeds_limit_for_test("HEAD", 200, &map("1024"), 1024),
         None
     );
 }

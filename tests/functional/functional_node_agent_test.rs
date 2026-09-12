@@ -72,9 +72,12 @@ async fn node_agent_boots_with_contract_env_and_exposes_metrics() {
         let log_file = fs::File::create(&log_path).expect("node_agent log file");
         let log_err = log_file.try_clone().expect("clone node_agent log file");
         let mut command = Command::new(gateway_binary_path());
+        command.arg("run");
         prepend_noop_shell(&mut command, tmp.path());
+        let metrics_token = uuid::Uuid::new_v4().to_string();
         let mut child = command
             .env("FERRUM_MODE", "node_agent")
+            .env("FERRUM_POOL_SHARD_AMOUNT", "1")
             .env("FERRUM_NODE_AGENT_NODE_NAME", "functional-node")
             .env("FERRUM_NODE_AGENT_PROXY_MODE", "node_waypoint")
             .env("FERRUM_NODE_AGENT_ADMIN_ENABLED", "true")
@@ -84,9 +87,10 @@ async fn node_agent_boots_with_contract_env_and_exposes_metrics() {
             .env("FERRUM_NODE_AGENT_FALLBACK_MODE", "iptables")
             .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
             .env("FERRUM_ADMIN_HTTPS_PORT", "0")
-            // /metrics is gated by default; allowlist the loopback scrape (node_agent
-            // generates a random admin JWT secret, so a token can't be minted here).
-            .env("FERRUM_METRICS_ALLOWED_CIDRS", "127.0.0.1/32,::1")
+            // Bind readiness to this child's per-attempt bearer token; a
+            // loopback-allowlisted foreign metrics listener is not evidence.
+            .env("FERRUM_METRICS_ALLOWED_CIDRS", "")
+            .env("FERRUM_METRICS_BEARER_TOKEN", &metrics_token)
             .env("FERRUM_LOG_LEVEL", "debug")
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_err))
@@ -101,7 +105,7 @@ async fn node_agent_boots_with_contract_env_and_exposes_metrics() {
                 exited = Some(status);
                 break;
             }
-            if let Ok(response) = client.get(&url).send().await
+            if let Ok(response) = client.get(&url).bearer_auth(&metrics_token).send().await
                 && response.status().is_success()
             {
                 last_body = response.text().await.expect("metrics body");

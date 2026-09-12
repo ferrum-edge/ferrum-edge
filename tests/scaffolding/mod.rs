@@ -50,6 +50,7 @@
 pub mod backends;
 pub mod certs;
 pub mod clients;
+pub mod dedup_dispatch;
 pub mod harness;
 pub mod matrix;
 pub mod network;

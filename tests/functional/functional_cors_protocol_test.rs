@@ -156,7 +156,8 @@ async fn functional_cors_forwarded_preflight_and_composition_match_h1_h2_h3() {
     ] {
         assert_eq!(response.status, StatusCode::FORBIDDEN);
         assert!(
-            String::from_utf8_lossy(&response.body).contains("CORS method not allowed: DELETE"),
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()
+                == serde_json::json!({"error": "CORS method not allowed"}),
             "later CORS policy must reject the conflicting preflight method: {response:?}"
         );
     }
@@ -209,8 +210,8 @@ async fn functional_cors_forwarded_preflight_and_composition_match_h1_h2_h3() {
     ] {
         assert_eq!(response.status, StatusCode::FORBIDDEN);
         assert!(
-            String::from_utf8_lossy(&response.body)
-                .contains("CORS header not allowed: Authorization"),
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()
+                == serde_json::json!({"error": "CORS header not allowed"}),
             "later CORS policy must reject the conflicting header: {response:?}"
         );
     }
@@ -266,7 +267,8 @@ async fn functional_cors_forwarded_preflight_and_composition_match_h1_h2_h3() {
     ] {
         assert_eq!(response.status, StatusCode::FORBIDDEN);
         assert!(
-            String::from_utf8_lossy(&response.body).contains("CORS method not allowed: GET"),
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()
+                == serde_json::json!({"error": "CORS method not allowed"}),
             "the empty Istio preflight list must narrow the native approval: {response:?}"
         );
     }

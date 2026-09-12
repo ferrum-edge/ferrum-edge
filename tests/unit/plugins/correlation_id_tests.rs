@@ -87,6 +87,77 @@ fn test_constructor_rejects_invalid_header_name_chars() {
 }
 
 #[test]
+fn test_constructor_trims_rust_unicode_whitespace_but_not_bom() {
+    let nel = "\u{0085}X-Audit\u{0085}".to_string();
+    let plugin = CorrelationId::new(&json!({ "header_name": nel }))
+        .expect("U+0085 is Rust White_Space and must be trimmed");
+    assert_eq!(plugin.correlation_id_header_name(), Some("x-audit"));
+
+    let bom = "\u{feff}x-audit\u{feff}".to_string();
+    let err = CorrelationId::new(&json!({ "header_name": bom }))
+        .err()
+        .expect("U+FEFF is not Rust White_Space and must not be trimmed");
+    assert!(err.contains("not permitted"), "got: {err}");
+}
+
+#[test]
+fn test_constructor_admits_http_builder_limit_and_rejects_overlong_names() {
+    let maximum = "a".repeat(65_535);
+    let plugin = CorrelationId::new(&json!({ "header_name": maximum.clone() }))
+        .expect("65,535-byte HTTP field name is the accepted builder limit");
+    assert_eq!(plugin.correlation_id_header_name(), Some(maximum.as_str()));
+    assert!(
+        http::header::HeaderName::from_bytes(maximum.as_bytes()).is_ok(),
+        "admitted name must be representable as HeaderName"
+    );
+
+    let padded = format!(" \t{maximum}\n");
+    let trimmed = CorrelationId::new(&json!({ "header_name": padded }))
+        .expect("surrounding whitespace is trimmed before the length check");
+    assert_eq!(trimmed.correlation_id_header_name(), Some(maximum.as_str()));
+
+    let overlong = "a".repeat(65_536);
+    let err = CorrelationId::new(&json!({ "header_name": overlong }))
+        .err()
+        .expect("65,536-byte header name must be rejected at admission");
+    assert!(err.contains("65,535"), "got: {err}");
+    assert!(
+        err.len() < 200,
+        "overlong-name diagnostic must stay bounded, got {} bytes",
+        err.len()
+    );
+}
+
+#[tokio::test]
+async fn test_max_length_header_name_forwards_and_echoes() {
+    let maximum = "a".repeat(65_535);
+    let plugin = CorrelationId::new(&json!({ "header_name": maximum.clone() }))
+        .expect("65,535-byte HTTP field name is the accepted builder limit");
+    let mut ctx = make_ctx();
+    plugin_utils::assert_continue(plugin.on_request_received(&mut ctx).await);
+    let generated = ctx
+        .headers
+        .get(&maximum)
+        .expect("request hook must install the configured header")
+        .clone();
+    assert!(uuid::Uuid::parse_str(&generated).is_ok());
+
+    let mut outgoing = HashMap::new();
+    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut outgoing).await);
+    assert_eq!(
+        outgoing.get(&maximum).map(String::as_str),
+        Some(generated.as_str())
+    );
+
+    let mut response = HashMap::new();
+    plugin_utils::assert_continue(plugin.after_proxy(&mut ctx, 200, &mut response).await);
+    assert_eq!(
+        response.get(&maximum).map(String::as_str),
+        Some(generated.as_str())
+    );
+}
+
+#[test]
 fn test_constructor_rejects_protocol_managed_and_security_sensitive_header_names() {
     for header_name in [
         "API-Key",

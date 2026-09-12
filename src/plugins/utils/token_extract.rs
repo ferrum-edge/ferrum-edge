@@ -66,8 +66,8 @@ pub enum TokenLocationExtract {
 
 pub fn extract_authorization_bearer(ctx: &RequestContext) -> ExtractedCredential {
     // `Authorization: Bearer` conveys a base64url token (RFC 6750 §2.1), i.e.
-    // visible ASCII. A present field line that `materialize_headers()` omitted
-    // is malformed credential material, not an absent header.
+    // visible ASCII. A present field line that is not visible ASCII is malformed
+    // credential material, not an absent header.
     match lookup_configured_header(ctx, "authorization", None) {
         ConfiguredHeaderLookup::Absent => ExtractedCredential::Missing,
         ConfiguredHeaderLookup::PresentNonMaterialized => ExtractedCredential::InvalidFormat(
@@ -95,6 +95,43 @@ pub fn bearer_credential_from_authorization_value(value: &str) -> ExtractedCrede
     }
 }
 
+/// Read an access token presented under the RFC 9449 `DPoP` authorization
+/// scheme (§7.1).
+///
+/// Separate from [`extract_authorization_bearer`] on purpose: a `DPoP`-scheme
+/// presentation asserts a key-bound token, so only a caller that actually
+/// validates the accompanying proof may accept one. A plugin without a DPoP
+/// contract must keep treating the scheme as foreign, which is what the bearer
+/// extractor does.
+pub fn extract_authorization_dpop(ctx: &RequestContext) -> ExtractedCredential {
+    match lookup_configured_header(ctx, "authorization", None) {
+        ConfiguredHeaderLookup::Absent => ExtractedCredential::Missing,
+        ConfiguredHeaderLookup::PresentNonMaterialized => ExtractedCredential::InvalidFormat(
+            r#"{"error":"Invalid Authorization header"}"#.to_string(),
+        ),
+        ConfiguredHeaderLookup::Value(value) => dpop_credential_from_authorization_value(&value),
+    }
+}
+
+/// Classify an `Authorization` header value against the RFC 9449 `DPoP`
+/// scheme. Mirrors [`bearer_credential_from_authorization_value`]: a foreign
+/// scheme is `Missing` (not applicable), while an applicable `DPoP` value with
+/// an empty token is `InvalidFormat` so a malformed applicable credential is
+/// refused rather than skipped.
+pub fn dpop_credential_from_authorization_value(value: &str) -> ExtractedCredential {
+    let scheme = value
+        .split(|c: char| c.is_ascii_whitespace())
+        .next()
+        .unwrap_or_default();
+    if !scheme.eq_ignore_ascii_case("dpop") {
+        return ExtractedCredential::Missing;
+    }
+    match crate::plugins::strip_auth_scheme(value, "DPoP") {
+        Some(token) => ExtractedCredential::BearerToken(token.to_string()),
+        None => ExtractedCredential::InvalidFormat(r#"{"error":"Empty DPoP token"}"#.to_string()),
+    }
+}
+
 pub fn extract_from_location(
     location: &TokenLocation,
     ctx: &RequestContext,
@@ -104,8 +141,8 @@ pub fn extract_from_location(
             ConfiguredHeaderLookup::Absent => TokenLocationExtract::Missing,
             // Bearer/JWT/opaque tokens are ASCII by grammar (RFC 6750 §2.1
             // base64url, JWS compact serialisation, RFC 6749 opaque tokens). A
-            // present field line that `materialize_headers()` omitted is
-            // malformed credential material, not an absent header.
+            // present field line that is not visible ASCII is malformed
+            // credential material, not an absent header.
             ConfiguredHeaderLookup::PresentNonMaterialized => TokenLocationExtract::Credential(
                 ExtractedCredential::InvalidFormat(r#"{"error":"Invalid token"}"#.to_string()),
             ),

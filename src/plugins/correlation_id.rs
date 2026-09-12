@@ -4,6 +4,7 @@
 //! through the proxy chain. If the client sends one, it is preserved.
 
 use async_trait::async_trait;
+use http::header::HeaderName;
 use serde_json::Value;
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -11,6 +12,8 @@ use uuid::Uuid;
 use super::{Plugin, PluginResult, RequestContext};
 
 const INSTANCE_METADATA_PREFIX: &str = "correlation_id.instance.";
+/// `http::header::HeaderName` rejects names longer than this (`http` crate `MAX_LEN`).
+const MAX_HTTP_FIELD_NAME_LEN: usize = 65_535;
 
 const RESERVED_HEADER_NAMES: &[&str] = &[
     "api-key",
@@ -99,26 +102,7 @@ impl CorrelationId {
         let header_name = match config.get("header_name") {
             None => "x-request-id".to_string(),
             Some(Value::Null) => "x-request-id".to_string(),
-            Some(Value::String(s)) => {
-                let trimmed = s.trim();
-                if trimmed.is_empty() {
-                    return Err(
-                        "correlation_id: 'header_name' must be a non-empty string".to_string()
-                    );
-                }
-                if !is_valid_http_header_name(trimmed) {
-                    return Err(format!(
-                        "correlation_id: 'header_name' contains characters not permitted in HTTP header names (RFC 7230 token): {trimmed:?}"
-                    ));
-                }
-                let lower = trimmed.to_ascii_lowercase();
-                if is_reserved_header_name(&lower) {
-                    return Err(format!(
-                        "correlation_id: 'header_name' is protocol-managed or security-sensitive and cannot be used for correlation IDs: {trimmed:?}"
-                    ));
-                }
-                lower
-            }
+            Some(Value::String(s)) => parse_configured_header_name(s)?,
             Some(other) => {
                 return Err(format!(
                     "correlation_id: 'header_name' must be a string, got: {}",
@@ -167,21 +151,52 @@ pub(crate) fn is_reserved_header_name(name: &str) -> bool {
     RESERVED_HEADER_NAMES.contains(&name)
 }
 
-/// Validate an HTTP header name per RFC 7230 §3.2.6 token grammar.
-/// A token is one or more printable ASCII characters from the tchar set
-/// (excludes separators like `:`, `(`, `)`, `<`, `>`, `@`, etc.).
-fn is_valid_http_header_name(name: &str) -> bool {
-    if name.is_empty() {
-        return false;
+fn parse_configured_header_name(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("correlation_id: 'header_name' must be a non-empty string".to_string());
     }
-    name.bytes().all(|b| {
-        matches!(b,
-            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
-            | b'0'..=b'9'
-            | b'A'..=b'Z'
-            | b'a'..=b'z'
+    if trimmed.len() > MAX_HTTP_FIELD_NAME_LEN {
+        return Err(
+            "correlation_id: 'header_name' exceeds the 65,535-byte HTTP field-name limit"
+                .to_string(),
+        );
+    }
+    let header_name = HeaderName::from_bytes(trimmed.as_bytes()).map_err(|_| {
+        format!(
+            "correlation_id: 'header_name' contains characters not permitted in HTTP header names (RFC 7230 token): {}",
+            render_header_name_for_error(trimmed)
         )
-    })
+    })?;
+    let lower = header_name.as_str().to_string();
+    if is_reserved_header_name(&lower) {
+        return Err(format!(
+            "correlation_id: 'header_name' is protocol-managed or security-sensitive and cannot be used for correlation IDs: {}",
+            render_header_name_for_error(trimmed)
+        ));
+    }
+    Ok(lower)
+}
+
+fn render_header_name_for_error(name: &str) -> String {
+    const MAX_RENDERED_BYTES: usize = 96;
+
+    let mut rendered = String::with_capacity(MAX_RENDERED_BYTES + 3);
+    let mut chars = name.chars().peekable();
+    while let Some(character) = chars.next() {
+        let escaped = character.escape_default();
+        let escaped_len = escaped.clone().count();
+        if rendered.len() + escaped_len > MAX_RENDERED_BYTES {
+            rendered.push_str("...");
+            break;
+        }
+        rendered.extend(escaped);
+        if rendered.len() == MAX_RENDERED_BYTES && chars.peek().is_some() {
+            rendered.push_str("...");
+            break;
+        }
+    }
+    rendered
 }
 
 /// Validate an untrusted inbound correlation id value.

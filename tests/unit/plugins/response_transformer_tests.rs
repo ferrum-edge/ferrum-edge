@@ -2399,15 +2399,60 @@ fn a_disabled_or_header_only_instance_never_pins_a_body() {
     ));
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn response_transform_size_policy_admits_the_exact_boundary() {
+    for payload_bytes in [113, 114, 115] {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+            ResponseTransformer::new(&json!({
+                "rules": [{
+                    "operation": "add",
+                    "target": "body",
+                    "key": "padding",
+                    "value": "x".repeat(payload_bytes)
+                }]
+            }))
+            .unwrap(),
+        )];
+        let mut ctx = make_ctx();
+        ctx.max_response_body_size_bytes = 128;
+        let mut status = 200;
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+        let mut body = bytes::Bytes::from_static(b"{}");
+        let logs = capture_debug_logs(|| async {
+            let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+                &plugins,
+                &mut ctx,
+                &mut status,
+                &mut headers,
+                &mut body,
+                None,
+                false,
+            )
+            .await;
+            assert_eq!(replaced, payload_bytes > 114);
+        })
+        .await;
+        if payload_bytes <= 114 {
+            assert_eq!(status, 200);
+            assert_eq!(body.len(), payload_bytes + 14);
+            assert!(!logs.contains("WARN"), "{logs}");
+        } else {
+            assert_eq!(status, 502);
+            assert!(logs.contains("produced_bytes_at_least=129"), "{logs}");
+        }
+    }
+}
+
 /// A claimed JSON rewrite that cannot fit the retained ceiling must mark the
 /// pending capacity-refusal signal. Ordinary unclaimed / semantic no-op paths
 /// must leave that signal clear so the shared transform loop keeps treating
 /// them as no-ops (GHSA-pwcm-6rh8-f2gh).
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn claimed_body_rewrite_marks_capacity_refusal_distinct_from_noop() {
     use ferrum_edge::_test_support::{
-        RESPONSE_BUFFER_OVERLOAD_BODY, RESPONSE_BUFFER_OVERLOAD_STATUS,
-        stamp_original_response_metadata_for_test,
+        response_policy_observability_for_test, stamp_original_response_metadata_for_test,
         take_buffered_response_capacity_refusal_pending_for_test,
         transform_buffered_response_body_with_deadline_full_for_test,
     };
@@ -2464,11 +2509,12 @@ async fn claimed_body_rewrite_marks_capacity_refusal_distinct_from_noop() {
         "ordinary unclaimed None must not mark a capacity refusal"
     );
 
-    // Full buffered lifecycle must install the shared HTTP capacity terminal
+    // Full buffered lifecycle must install the deterministic HTTP policy terminal
     // rather than forwarding the original body after a claimed refusal.
     let plugin = Arc::new(amplifying) as Arc<dyn Plugin>;
     let mut loop_ctx = make_ctx();
     loop_ctx.max_response_body_size_bytes = 40;
+    loop_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
     let mut status = 200u16;
     let mut loop_headers = HashMap::from([
         ("content-type".to_string(), "application/json".to_string()),
@@ -2476,21 +2522,328 @@ async fn claimed_body_rewrite_marks_capacity_refusal_distinct_from_noop() {
     ]);
     stamp_original_response_metadata_for_test(&mut loop_ctx, status, &loop_headers);
     let mut body_buf = bytes::Bytes::from(body.to_vec());
-    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
-        &[plugin],
-        &mut loop_ctx,
-        &mut status,
-        &mut loop_headers,
-        &mut body_buf,
-        None,
-        false,
-    )
+    let logs = capture_debug_logs(|| async {
+        let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+            &[plugin],
+            &mut loop_ctx,
+            &mut status,
+            &mut loop_headers,
+            &mut body_buf,
+            None,
+            false,
+        )
+        .await;
+        assert!(replaced);
+    })
     .await;
-    assert!(replaced);
-    assert_eq!(status, RESPONSE_BUFFER_OVERLOAD_STATUS);
-    assert_eq!(&body_buf[..], RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes());
+    assert_eq!(status, 502);
+    assert_eq!(
+        &body_buf[..],
+        br#"{"error":"Response body too large","limit":40}"#,
+    );
+    assert_eq!(loop_headers["x-gateway-error"], "overload");
+    assert_eq!(
+        response_policy_observability_for_test(&loop_ctx, status),
+        (
+            Some(ferrum_edge::retry::ErrorClass::DispatchPolicyRejected),
+            Some("overload"),
+        )
+    );
+    let warnings: Vec<_> = logs.lines().filter(|line| line.contains("WARN")).collect();
+    assert!(warnings.len() <= 1, "{logs}");
+    let rejection = logs
+        .lines()
+        .find(|line| line.contains("DEBUG") && line.contains("produced_bytes_at_least="))
+        .expect("each refusal retains its debug diagnostic");
+    assert!(rejection.contains("response_transformer"), "{logs}");
+    assert!(rejection.contains("proxy_id="), "{logs}");
+    assert!(rejection.contains("produced_bytes_at_least=210"), "{logs}");
+    assert!(rejection.contains("ceiling=40"), "{logs}");
+    assert!(
+        !logs.contains(&"x".repeat(200)),
+        "payload must not be logged"
+    );
     assert!(
         !take_buffered_response_capacity_refusal_pending_for_test(&mut loop_ctx),
         "the shared transform loop must consume the pending signal"
     );
+}
+
+#[test]
+fn cookie_rename_is_refused_in_both_directions() {
+    for (source, destination) in [
+        ("Set-Cookie", "X-Cookie"),
+        ("X-Cookie", "SET-COOKIE"),
+        ("set-cookie", "set-cookie"),
+    ] {
+        let error = ResponseTransformer::new(&json!({"rules": [{
+            "target": "header", "operation": "rename", "key": source, "new_key": destination
+        }]}))
+        .err()
+        .expect("cookie rename must fail before any response is processed");
+        assert!(error.contains("rule[0]"));
+        assert!(error.contains("set-cookie"));
+    }
+}
+
+#[tokio::test]
+async fn ordinary_response_rename_preserves_all_cookie_values() {
+    let plugin = ResponseTransformer::new(&json!({"rules": [{
+        "target": "header", "operation": "rename", "key": "x-old", "new_key": "x-new"
+    }]}))
+    .unwrap();
+    for cookies in [None, Some("one=1"), Some("one=1\ntwo=2\nthree=3")] {
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+        let mut headers = HashMap::from([("x-old".to_string(), "value".to_string())]);
+        if let Some(cookies) = cookies {
+            headers.insert("set-cookie".to_string(), cookies.to_string());
+        }
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, 200, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(headers.get("set-cookie").map(String::as_str), cookies);
+        assert_eq!(headers.get("x-new").map(String::as_str), Some("value"));
+        assert!(!headers.contains_key("x-old"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #5107 — the gRPC-Web trailer-retention exception is REQUEST-qualified.
+// An unrelated static header rule beside a JSON body rule must not withhold an
+// ordinary SSE or binary response until origin EOF.
+// ---------------------------------------------------------------------------
+
+fn mixed_header_and_body_plugin() -> ResponseTransformer {
+    ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "update", "target": "header", "key": "X-Audit", "value": "yes"},
+            {"operation": "update", "target": "body", "key": "state", "value": "changed"}
+        ]
+    }))
+    .unwrap()
+}
+
+/// A context `grpc_web` has actually translated, built exactly as the plugin
+/// builds it on the request path.
+async fn translated_grpc_web_ctx() -> RequestContext {
+    use ferrum_edge::plugins::grpc_web::{GrpcWebPlugin, request_is_grpc_web_translated};
+
+    let grpc_web = GrpcWebPlugin::new(&json!({})).unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/pkg.Service/Watch".to_string(),
+    );
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web+proto".to_string(),
+    );
+    assert!(matches!(
+        grpc_web.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    let mut outgoing = ctx.headers.clone();
+    assert!(matches!(
+        grpc_web.before_proxy(&mut ctx, &mut outgoing).await,
+        PluginResult::Continue
+    ));
+    assert!(request_is_grpc_web_translated(&ctx));
+    ctx
+}
+
+#[test]
+fn a_mixed_header_and_body_instance_releases_ordinary_non_json_responses() {
+    let mixed = mixed_header_and_body_plugin();
+    let body_only = body_update_plugin();
+    let ctx = make_ctx();
+
+    for content_type in [
+        "text/event-stream",
+        "text/event-stream; charset=utf-8",
+        "application/octet-stream",
+        "image/png",
+        "video/mp4",
+        "application/grpc+json",
+    ] {
+        let response_headers = headers_from(&[("content-type", content_type)]);
+        assert!(
+            !body_only.should_buffer_response_body_for_content_type(
+                &ctx,
+                Some(content_type),
+                200,
+                &response_headers,
+            ),
+            "control: the body-only instance already releases `{content_type}`"
+        );
+        assert!(
+            !mixed.should_buffer_response_body_for_content_type(
+                &ctx,
+                Some(content_type),
+                200,
+                &response_headers,
+            ),
+            "an unrelated header rule must not withhold `{content_type}`"
+        );
+    }
+}
+
+#[test]
+fn a_mixed_instance_still_buffers_json_and_untyped_responses() {
+    let mixed = mixed_header_and_body_plugin();
+    let ctx = make_ctx();
+
+    let json_headers = headers_from(&[("content-type", "application/json")]);
+    assert!(mixed.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &json_headers,
+    ));
+    assert!(mixed.should_buffer_response_body_for_content_type(&ctx, None, 200, &HashMap::new()));
+
+    // Ambiguous event-stream lookalikes remain bounded.
+    for content_type in [
+        "application/json; profile=event-stream",
+        "text/event-stream-like",
+    ] {
+        let response_headers = headers_from(&[("content-type", content_type)]);
+        assert!(
+            mixed.should_buffer_response_body_for_content_type(
+                &ctx,
+                Some(content_type),
+                200,
+                &response_headers,
+            ),
+            "ambiguous media type must stay buffered: {content_type}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn translated_grpc_web_still_retains_the_buffered_trailer_policy() {
+    let mixed = mixed_header_and_body_plugin();
+    let ctx = translated_grpc_web_ctx().await;
+
+    assert!(
+        mixed.requires_buffered_grpc_web_trailer_policy(&ctx),
+        "the capability answer is unchanged for a translated request"
+    );
+    for content_type in ["application/grpc-web+proto", "text/event-stream"] {
+        let response_headers = headers_from(&[("content-type", content_type)]);
+        assert!(
+            mixed.should_buffer_response_body_for_content_type(
+                &ctx,
+                Some(content_type),
+                200,
+                &response_headers,
+            ),
+            "a translated gRPC-Web response keeps the buffered view: {content_type}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_route_override_only_instance_is_also_request_qualified() {
+    use ferrum_edge::plugins::utils::route_header_transform::{
+        RouteHeaderTransformOp, RouteHeaderTransformRule,
+    };
+
+    let plugin = body_update_plugin();
+    let route_rules = vec![RouteHeaderTransformRule {
+        operation: RouteHeaderTransformOp::Update,
+        key: "x-route".to_string(),
+        value: Some("yes".to_string()),
+    }];
+    let published = Some(Arc::new(route_rules));
+
+    let mut ordinary = make_ctx();
+    ordinary.route_override_response_transform = published.clone();
+    let sse = headers_from(&[("content-type", "text/event-stream")]);
+    assert!(
+        !plugin.should_buffer_response_body_for_content_type(
+            &ordinary,
+            Some("text/event-stream"),
+            200,
+            &sse,
+        ),
+        "a route override on an ordinary request must not withhold SSE"
+    );
+
+    let mut translated = translated_grpc_web_ctx().await;
+    translated.route_override_response_transform = published;
+    let grpc_web = "application/grpc-web+proto";
+    let framed = headers_from(&[("content-type", grpc_web)]);
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &translated,
+        Some(grpc_web),
+        200,
+        &framed,
+    ));
+}
+
+#[test]
+fn the_shared_response_refinement_streams_a_mixed_instance_event_stream() {
+    use ferrum_edge::_test_support::refine_stream_response_for_content_type_for_test;
+
+    let proxy = create_test_proxy();
+    let ctx = make_ctx();
+    let mixed: Vec<Arc<dyn Plugin>> = vec![Arc::new(mixed_header_and_body_plugin())];
+
+    let sse = headers_from(&[("content-type", "text/event-stream")]);
+    let streams = refine_stream_response_for_content_type_for_test(&proxy, &mixed, &ctx, 200, &sse);
+    assert!(streams, "an ordinary SSE response must be released");
+
+    let json_headers = headers_from(&[("content-type", "application/json")]);
+    let buffers =
+        refine_stream_response_for_content_type_for_test(&proxy, &mixed, &ctx, 200, &json_headers);
+    assert!(!buffers, "a JSON response is still collected");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #5108 — body rules reject operation-incompatible `new_key` by PRESENCE.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn response_body_rules_reject_explicitly_null_new_key() {
+    for operation in ["add", "update", "remove"] {
+        let mut rule = json!({
+            "operation": operation,
+            "target": "body",
+            "key": "v",
+            "new_key": null
+        });
+        if operation != "remove" {
+            rule["value"] = json!(1);
+        }
+        let error = ResponseTransformer::new(&json!({"rules": [rule]}))
+            .err()
+            .expect("an explicit null new_key must fail admission");
+        let needle = format!("must not be set for body '{operation}'");
+        assert!(error.contains("'new_key'"), "got: {error}");
+        assert!(error.contains(&needle), "got: {error}");
+    }
+}
+
+#[test]
+fn response_body_rules_keep_explicit_null_as_a_value() {
+    for operation in ["add", "update"] {
+        let config = json!({
+            "rules": [
+                {"operation": operation, "target": "body", "key": "v", "value": null}
+            ]
+        });
+        assert!(ResponseTransformer::new(&config).is_ok(), "{operation}");
+    }
+}
+
+#[test]
+fn a_null_response_body_rename_target_is_still_missing() {
+    let config = json!({
+        "rules": [{"operation": "rename", "target": "body", "key": "a", "new_key": null}]
+    });
+    let error = ResponseTransformer::new(&config)
+        .err()
+        .expect("rename without a new_key must fail");
+    assert!(error.contains("requires a 'new_key'"), "got: {error}");
 }

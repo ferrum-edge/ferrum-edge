@@ -1,0 +1,429 @@
+name: Performance Regression
+
+# Out-of-band performance regression check. It runs once a day against the
+# tip of `main` (plus manual dispatch) instead of on every pull request and
+# every merge, so the ci-release build, the self-relative overhead benchmark,
+# and the Criterion microbenchmarks never sit on the PR or main critical path.
+# A regression turns this scheduled run red; the daily cadence bounds how far
+# `main` can drift before it is noticed. `performance-regression` remains the
+# job id so the static contract verifiers keep binding to it by name.
+on:
+  schedule:
+    # 06:17 UTC daily; the offset avoids the top-of-hour GitHub scheduler surge.
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-regression
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+
+jobs:
+  performance-regression:
+    name: Performance Regression Check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Lightweight protocol-perf contract gates (no benchmarks): keep evaluator /
+      # workflow/harness integrity on the required PR CI surface. The scheduled
+      # multi-protocol bench in protocol-perf-regression.yml stays non-required.
+      - name: Verify protocol-perf contracts (static)
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_protocol_perf_regression_workflow.py --self-test
+          python3 .github/scripts/verify_protocol_perf_regression_workflow.py
+          python3 tests/performance/multi_protocol/evaluate_protocol_perf_budgets.py --self-test
+          python3 -m py_compile tests/performance/multi_protocol/run_protocol_regression_scenarios.py
+
+      # Lightweight mesh-baseline workflow contracts (no collection): keep
+      # acceptance/runner-pin/interval-evidence wiring on required full-mode PR
+      # CI. helm-chart is path-gated on charts/ and would skip this surface.
+      - name: Verify mesh performance baselines workflow contract
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_mesh_performance_baselines_workflow.py --self-test
+          python3 .github/scripts/verify_mesh_performance_baselines_workflow.py
+
+      - name: Self-test RR and WRR selection benchmark verifiers
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_rr_selection_benchmark.py --self-test
+          python3 .github/scripts/verify_wrr_selection_benchmark.py --self-test
+
+      - name: Detect performance-sensitive changes
+        id: perf_changes
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          set -euo pipefail
+
+          run_benchmark=true
+          run_ip_restriction_benchmark=false
+          run_wrr_benchmark=false
+          run_rr_benchmark=false
+          run_ai_semantic_cache_benchmark=false
+          reason="Performance regression checks always run for ${EVENT_NAME} events."
+          changed_files=""
+
+          if [ "${EVENT_NAME}" = "pull_request" ] || [ "${EVENT_NAME}" = "merge_group" ]; then
+            if [ "${EVENT_NAME}" = "merge_group" ]; then
+              if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+                echo "::error::merge_group base_sha missing or malformed" >&2
+                exit 1
+              fi
+              if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
+                git fetch --no-tags origin "${MERGE_BASE_SHA}"
+              fi
+              perf_base="$MERGE_BASE_SHA"
+            else
+              perf_base="origin/${BASE_REF}"
+            fi
+            if changed_files="$(git diff --name-only --no-renames "${perf_base}...HEAD" 2>/dev/null)"; then
+              run_benchmark=false
+              reason="No performance-sensitive paths changed."
+
+              # This smoke benchmark drives plain HTTP/1.1 through a file-mode
+              # proxy route. Gate it on shared/deep proxy hot paths, file-mode
+              # startup, and dependency/build surfaces that can affect that
+              # measurement. Individual plugin implementations, admin,
+              # secrets, and unrelated operating modes are not observable here
+              # and should not pay for a 17-minute release build.
+              while IFS= read -r path; do
+                # Every top-level src/*.rs module is shared runtime
+                # infrastructure (request_epoch, overload, load balancing,
+                # pooling, adaptive concurrency, metrics — see the CLAUDE.md
+                # source layout) consumed on or beside the measured request
+                # path; gate the whole tier instead of enumerating files.
+                # `case` globs match `/`, so test the tier explicitly:
+                # starts with src/, ends with .rs, no deeper directory.
+                rest="${path#src/}"
+                if [ "${rest}" != "${path}" ] \
+                  && [ "${rest%.rs}" != "${rest}" ] \
+                  && [ "${rest#*/}" = "${rest}" ]; then
+                  run_benchmark=true
+                  reason="Performance-sensitive paths changed."
+                  break
+                fi
+                case "${path}" in
+                  src/proxy/*|src/http3/*|src/dns/*|src/pool/*|\
+                  src/config/*|src/plugins/mod.rs|\
+                  src/modes/file.rs|src/modes/mod.rs|\
+                  vendor/*|ebpf/*|tests/performance/*|proto/*|.cargo/*|.github/actions/*|\
+                  build.rs|ferrum.conf|Cargo.toml|Cargo.lock|rust-toolchain.toml|\
+                  .github/workflows/ci.yml)
+                    run_benchmark=true
+                    reason="Performance-sensitive paths changed."
+                    break
+                    ;;
+                esac
+              done <<<"${changed_files}"
+            else
+              run_benchmark=true
+              reason="Could not diff against ${perf_base}; running benchmark to be safe."
+              changed_files=""
+            fi
+          fi
+
+          # Issue #4105: a ci.yml path hit is not enough to schedule the four
+          # Criterion microbenchmarks. Inspect ci.yml hunks and only count
+          # edits that can change Criterion invocation, verifier inputs, or
+          # this job's build profile. Unreadable diffs fail closed.
+          ci_yml_schedules_microbenchmarks=false
+          if [ "${EVENT_NAME}" = "pull_request" ] || [ "${EVENT_NAME}" = "merge_group" ]; then
+            if [ -z "${changed_files}" ] && [ "${run_benchmark}" = "true" ]; then
+              ci_yml_schedules_microbenchmarks=true
+            elif printf '%s\n' "${changed_files}" | grep -Fxq '.github/workflows/ci.yml'; then
+              if ci_yml_diff="$(git diff -U0 --no-renames "${perf_base}...HEAD" -- .github/workflows/ci.yml 2>/dev/null)"; then
+                if printf '%s\n' "${ci_yml_diff}" \
+                  | grep -E '^[+-]' \
+                  | grep -Ev '^[+-]{3} ' \
+                  | grep -Eqi 'bench|criterion|verify_[a-z0-9_]*_benchmark|min-parallel-speedup|max-scaling-ratio|max-ns-per-instance|manifest-path|ci-release|CARGO_PROFILE|RUSTFLAGS'; then
+                  ci_yml_schedules_microbenchmarks=true
+                fi
+              else
+                ci_yml_schedules_microbenchmarks=true
+              fi
+            fi
+          fi
+          echo "ci.yml microbenchmark trigger (content-sensitive): ${ci_yml_schedules_microbenchmarks}"
+
+          if [ "${EVENT_NAME}" != "pull_request" ] && [ "${EVENT_NAME}" != "merge_group" ] || [ "${ci_yml_schedules_microbenchmarks}" = "true" ] || grep -Eq '^(src/plugins/(ip_restriction\.rs|mod\.rs)|tests/performance/mesh/(Cargo\.(toml|lock)|benches/ip_restriction\.rs)|\.github/scripts/verify_ip_restriction_benchmark\.py)$' <<<"${changed_files}"; then
+            run_ip_restriction_benchmark=true
+          fi
+
+          if [ "${EVENT_NAME}" != "pull_request" ] && [ "${EVENT_NAME}" != "merge_group" ] || [ "${ci_yml_schedules_microbenchmarks}" = "true" ] || grep -Eq '^(src/load_balancer\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/wrr_selection\.rs)|\.github/scripts/verify_wrr_selection_benchmark\.py)$' <<<"${changed_files}"; then
+            run_wrr_benchmark=true
+          fi
+
+          if [ "${EVENT_NAME}" != "pull_request" ] && [ "${EVENT_NAME}" != "merge_group" ] || [ "${ci_yml_schedules_microbenchmarks}" = "true" ] || grep -Eq '^(src/load_balancer\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/rr_selection\.rs)|\.github/scripts/(verify_rr_selection_benchmark\.py|run_rr_selection_comparison\.(py|sh)))$' <<<"${changed_files}"; then
+            run_rr_benchmark=true
+          fi
+
+          if [ "${EVENT_NAME}" != "pull_request" ] && [ "${EVENT_NAME}" != "merge_group" ] || [ "${ci_yml_schedules_microbenchmarks}" = "true" ] || grep -Eq '^(src/plugins/ai_semantic_cache\.rs|tests/unit/plugins/ai_semantic_cache_tests\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/ai_semantic_cache_cleanup\.rs)|\.github/scripts/verify_ai_semantic_cache_cleanup_benchmark\.py)$' <<<"${changed_files}"; then
+            run_ai_semantic_cache_benchmark=true
+          fi
+
+          if [ -n "${changed_files}" ]; then
+            printf '%s\n' "${changed_files}" > "${RUNNER_TEMP}/performance-regression-changed-files.txt"
+          else
+            : > "${RUNNER_TEMP}/performance-regression-changed-files.txt"
+          fi
+
+          {
+            echo "run=${run_benchmark}"
+            echo "run_ip_restriction_benchmark=${run_ip_restriction_benchmark}"
+            echo "run_wrr_benchmark=${run_wrr_benchmark}"
+            echo "run_rr_benchmark=${run_rr_benchmark}"
+            echo "run_ai_semantic_cache_benchmark=${run_ai_semantic_cache_benchmark}"
+            echo "reason=${reason}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - uses: ./.github/actions/setup-rust-ci
+        if: steps.perf_changes.outputs.run == 'true' || steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true' || steps.perf_changes.outputs.run_wrr_benchmark == 'true' || steps.perf_changes.outputs.run_rr_benchmark == 'true' || steps.perf_changes.outputs.run_ai_semantic_cache_benchmark == 'true'
+        # setup-sccache deliberately installs the verified wrapper under a fresh
+        # runner-private path. Hide that runner-unique identity only from the
+        # nested rust-cache key calculation; setup-sccache still publishes the
+        # verified path through GITHUB_ENV for the benchmark steps below.
+        env:
+          RUSTC_WRAPPER: ""
+          CARGO_BUILD_RUSTC_WRAPPER: ""
+        with:
+          shared-key: "ci-perf"
+          workspaces: |
+            . -> target
+            tests/performance/mesh -> target
+
+      - name: Stabilize performance compiler wrapper identity
+        run: |
+          set -euo pipefail
+          source="${FERRUM_SCCACHE_BIN:-}"
+          if [ -z "$source" ] || [ ! -x "$source" ]; then
+            printf '%s\n' 'RUSTC_WRAPPER=' 'CARGO_BUILD_RUSTC_WRAPPER=' >> "$GITHUB_ENV"
+            echo "sccache is unavailable; performance builds will run uncached"
+            exit 0
+          fi
+
+          stable_root="${RUNNER_TEMP}/ferrum-performance-sccache"
+          stable_wrapper="${stable_root}/bin/sccache"
+          rm -rf "$stable_root"
+          mkdir -p "${stable_root}/bin"
+          cp -- "$source" "$stable_wrapper"
+          chmod 0755 "$stable_wrapper"
+          printf '%s\n' \
+            "RUSTC_WRAPPER=${stable_wrapper}" \
+            "CARGO_BUILD_RUSTC_WRAPPER=${stable_wrapper}" >> "$GITHUB_ENV"
+          echo "Performance compiler wrapper activated at a deterministic runner-local path"
+
+      - name: Run IP restriction worst-case microbenchmark
+        if: steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true'
+        run: |
+          cargo bench --manifest-path tests/performance/mesh/Cargo.toml --bench ip_restriction
+          python3 .github/scripts/verify_ip_restriction_benchmark.py \
+            --criterion-root tests/performance/mesh/target/criterion \
+            --max-scaling-ratio 8 \
+            --max-ns-per-instance 10000
+
+      - name: Run WRR selection contention microbenchmark
+        if: steps.perf_changes.outputs.run_wrr_benchmark == 'true'
+        run: |
+          cargo bench --manifest-path tests/performance/mesh/Cargo.toml --bench wrr_selection
+          python3 .github/scripts/verify_wrr_selection_benchmark.py --self-test
+          python3 .github/scripts/verify_wrr_selection_benchmark.py \
+            --criterion-root tests/performance/mesh/target/criterion \
+            --min-parallel-speedup 1.10
+
+      - name: Run RoundRobin selection contention microbenchmark
+        if: steps.perf_changes.outputs.run_rr_benchmark == 'true'
+        env:
+          RR_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event_name == 'push' && github.event.before || '' }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+            export RR_BASE_SHA="$(git rev-parse HEAD^)"
+          fi
+          python3 .github/scripts/verify_rr_selection_benchmark.py --self-test
+          bash .github/scripts/run_rr_selection_comparison.sh
+
+      - name: Run AI semantic-cache cleanup p99 microbenchmark
+        if: steps.perf_changes.outputs.run_ai_semantic_cache_benchmark == 'true'
+        run: |
+          cargo bench --manifest-path tests/performance/mesh/Cargo.toml --bench ai_semantic_cache_cleanup
+          python3 .github/scripts/verify_ai_semantic_cache_cleanup_benchmark.py \
+            --criterion-root tests/performance/mesh/target/criterion \
+            --max-scaling-ratio 3 \
+            --output tests/performance/ci_results/ai_semantic_cache_cleanup.json
+
+      - name: Build release binaries
+        if: steps.perf_changes.outputs.run == 'true'
+        run: |
+          cargo build --profile ci-release --bin ferrum-edge
+          cd tests/performance && cargo build --release --bin backend_server
+
+      - name: Start backend server
+        if: steps.perf_changes.outputs.run == 'true'
+        run: |
+          tests/performance/target/release/backend_server > /tmp/backend.log 2>&1 &
+          echo "BACKEND_PID=$!" >> "${GITHUB_ENV}"
+          for i in $(seq 1 15); do
+            if curl -sf http://127.0.0.1:3001/health > /dev/null 2>&1; then
+              echo "Backend ready"
+              break
+            fi
+            if [ "$i" -eq 15 ]; then
+              echo "Backend failed to start"
+              cat /tmp/backend.log
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Start gateway
+        if: steps.perf_changes.outputs.run == 'true'
+        run: |
+          FERRUM_MODE=file \
+          FERRUM_FILE_CONFIG_PATH="$(pwd)/tests/performance/perf_config.yaml" \
+          FERRUM_LOG_LEVEL=error \
+          FERRUM_ADD_VIA_HEADER=false \
+          FERRUM_POOL_MAX_IDLE_PER_HOST=200 \
+          FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
+          FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
+          FERRUM_POOL_ENABLE_HTTP2=false \
+          FERRUM_POOL_WARMUP_ENABLED=true \
+          ./target/ci-release/ferrum-edge run > /tmp/gateway.log 2>&1 &
+          echo "GATEWAY_PID=$!" >> "${GITHUB_ENV}"
+          for i in $(seq 1 15); do
+            if curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; then
+              echo "Gateway ready"
+              break
+            fi
+            if [ "$i" -eq 15 ]; then
+              echo "Gateway failed to start"
+              cat /tmp/gateway.log
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Run self-relative performance test
+        if: steps.perf_changes.outputs.run == 'true'
+        timeout-minutes: 5
+        run: |
+          mkdir -p tests/performance/ci_results
+          python3 tests/performance/ci_overhead_bench.py \
+            --gateway-url http://127.0.0.1:8000/api/users \
+            --backend-url http://127.0.0.1:3001/api/users \
+            --gateway-health-url http://127.0.0.1:8000/health \
+            --concurrency 50 \
+            --duration 5 \
+            --iterations 3 \
+            --warmup 2 \
+            --overhead-threshold 50 \
+            --output tests/performance/ci_results/overhead_results.json
+
+      - name: Stop services
+        if: always() && steps.perf_changes.outputs.run == 'true'
+        run: |
+          kill "${BACKEND_PID:-}" 2>/dev/null || true
+          kill "${GATEWAY_PID:-}" 2>/dev/null || true
+
+      - name: Upload performance results
+        if: always() && (steps.perf_changes.outputs.run == 'true' || steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true' || steps.perf_changes.outputs.run_wrr_benchmark == 'true' || steps.perf_changes.outputs.run_rr_benchmark == 'true' || steps.perf_changes.outputs.run_ai_semantic_cache_benchmark == 'true')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: performance-results
+          path: |
+            tests/performance/ci_results/
+            tests/performance/mesh/target/criterion/ip_restriction_lookup/
+            tests/performance/mesh/target/criterion/wrr_selection/
+            tests/performance/mesh/target/criterion/rr_selection/
+            tests/performance/mesh/target/criterion/ai_semantic_cache_cleanup_hot_path/
+          retention-days: 30
+
+      - name: Post performance summary
+        if: always()
+        env:
+          RUN: ${{ steps.perf_changes.outputs.run }}
+          RUN_IP_RESTRICTION: ${{ steps.perf_changes.outputs.run_ip_restriction_benchmark }}
+          RUN_WRR: ${{ steps.perf_changes.outputs.run_wrr_benchmark }}
+          RUN_RR: ${{ steps.perf_changes.outputs.run_rr_benchmark }}
+          RUN_AI_SEMANTIC_CACHE: ${{ steps.perf_changes.outputs.run_ai_semantic_cache_benchmark }}
+          REASON: ${{ steps.perf_changes.outputs.reason }}
+        run: |
+          {
+            echo "## Performance Regression Check"
+            echo ""
+          } >> "${GITHUB_STEP_SUMMARY}"
+          if [ "${RUN_IP_RESTRICTION}" = "true" ]; then
+            {
+              echo "IP restriction lookup guard executed: 10,000/100-rule mean ratio <= 8x and 10,000-rule mean <= 10 microseconds per plugin instance."
+              echo ""
+            } >> "${GITHUB_STEP_SUMMARY}"
+          fi
+          if [ "${RUN_WRR}" = "true" ]; then
+            {
+              echo "WRR selection contention guard executed: mandatory 4-thread/1-thread throughput speedup >= 1.10x on 32/129-target fixtures; 4-target 5:1:1:1 fixture remains measured (informational parallel speedup under Arc strong-count hotspot; 4/32 1-thread serial-wall ratio ceiling). A parallel-floor miss is a hard failure only when an independent-process CPU control at the same thread count still clears 1.10x (median of 5); if the control also misses, the floor is advisory because the runner is oversubscribed."
+              echo ""
+            } >> "${GITHUB_STEP_SUMMARY}"
+          fi
+          if [ "${RUN_RR}" = "true" ]; then
+            {
+              echo "RoundRobin selection guard compared the same 2-target workload at 1 and 8 threads against an immutable baseline, with three interleaved runs per revision on one runner. Missing evidence fails; a consistent regression beyond all measured 95% intervals plus Criterion's 1% noise threshold fails. See rr-comparison/comparison.json and provenance.json."
+              echo ""
+            } >> "${GITHUB_STEP_SUMMARY}"
+          fi
+          if [ "${RUN_AI_SEMANTIC_CACHE}" = "true" ]; then
+            {
+              echo "AI semantic-cache cleanup guard executed: Criterion sample p99 at 10,000 and 100,000 retained entries; 100,000/10,000 p99 ratio <= 3x."
+              echo ""
+            } >> "${GITHUB_STEP_SUMMARY}"
+          fi
+          if [ "${RUN}" != "true" ]; then
+            {
+              echo "Skipped self-relative gateway benchmark: ${REASON}"
+              echo ""
+              echo "Relevant paths:"
+              echo "- Shared runtime infrastructure: every top-level \`src/*.rs\` module (request epoch, overload, load balancing, pooling, adaptive concurrency, metrics, startup — all consumed on or beside the measured request path)."
+              echo "- Proxy and connection hot paths: \`src/proxy/**\`, \`src/http3/**\`, \`src/dns/**\`, and \`src/pool/**\`."
+              echo "- File-mode gateway path: \`src/config/**\` (env/conf precedence, file loading, validation, pool tuning, and domain types all feed the measured startup and request flow), \`src/plugins/mod.rs\`, \`src/modes/file.rs\`, and \`src/modes/mod.rs\`."
+              echo "- Build and dependency graph: \`vendor/**\`, \`ebpf/**\`, \`tests/performance/**\`, \`proto/**\`, \`.cargo/**\`, \`build.rs\`, \`ferrum.conf\`, \`Cargo.toml\`, \`Cargo.lock\`, \`rust-toolchain.toml\`, \`.github/workflows/ci.yml\`, and \`.github/actions/**\`."
+              echo ""
+              echo "Changed files:"
+              echo '```'
+              if [ -s "${RUNNER_TEMP}/performance-regression-changed-files.txt" ]; then
+                cat "${RUNNER_TEMP}/performance-regression-changed-files.txt"
+              else
+                echo "(none)"
+              fi
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          if [ -f tests/performance/ci_results/overhead_results.json ]; then
+            {
+              echo '```json'
+              cat tests/performance/ci_results/overhead_results.json
+              echo ''
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "Performance tests did not produce results." >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+  # Fast verification builds. PRs and main build Linux only; merge groups
+  # retain fast native compile/link checks. Production builds live in release.yml.

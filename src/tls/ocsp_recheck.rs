@@ -34,7 +34,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
-use tracing::{debug, warn};
+use rustls::pki_types::CertificateDer;
+use tracing::{debug, info, warn};
+use x509_parser::prelude::ASN1Time;
 
 use crate::tls::acme::AcmeTlsAlpnResolver;
 
@@ -101,6 +103,151 @@ pub struct RecheckOutcome {
     pub warned: usize,
 }
 
+/// A certificate resolver whose stapled OCSP response can be retired at
+/// runtime.
+///
+/// [`AcmeTlsAlpnResolver`] either serves one certificate directly or delegates
+/// to an inner resolver — today the Gateway multi-certificate SNI index in
+/// [`crate::tls::multi_cert`]. Both arms can carry a staple, so both must be
+/// able to give one up. An inner resolver that could not would be a
+/// certificate source silently exempt from this module, which is precisely the
+/// gap issue #4773 reported: the Gateway frontend validated a staple, recorded
+/// its `nextUpdate`, and then had no way to stop serving it.
+pub trait StapleRetiringResolver: rustls::server::ResolvesServerCert {
+    /// Retire the stapled OCSP response this resolver serves, returning
+    /// whether one was actually removed.
+    ///
+    /// Must publish atomically: a handshake running concurrently with the
+    /// retirement has to observe either the stapled or the stapleless
+    /// credential, never a torn one, and must not block on the retirement.
+    fn drop_stapled_ocsp_response(&self) -> bool;
+}
+
+/// What a staple is being attached to, for the operator-facing rejection
+/// message and the acceptance log record.
+#[derive(Clone, Copy)]
+pub(crate) enum StapleTarget<'a> {
+    /// The operator-configured single-certificate frontend/admin listener.
+    ConfiguredListener,
+    /// One Gateway-delivered certificate, named by its public
+    /// `serving-namespace/serialized-owner/listener` identity.
+    GatewayCertificate(&'a str),
+}
+
+impl StapleTarget<'_> {
+    /// The operator-facing refusal, worded for the surface that configured the
+    /// response. Carries the redacted display id only.
+    fn rejection(self, display_source_id: &str, error: impl std::fmt::Display) -> anyhow::Error {
+        match self {
+            Self::ConfiguredListener => {
+                anyhow::anyhow!("OCSP response source '{display_source_id}' was rejected: {error}")
+            }
+            Self::GatewayCertificate(identity) => anyhow::anyhow!(
+                "Gateway certificate {identity} was configured with a stapled OCSP response that \
+                 was rejected: {error}"
+            ),
+        }
+    }
+}
+
+/// A staple that passed certificate-bound validation and is about to be
+/// served.
+///
+/// Constructed only by [`accept_stapled_response`] and consumed only by
+/// [`AcceptedStaple::enroll`]: that pair is the single "accept a staple"
+/// contract every certificate source goes through, so a third source cannot
+/// repeat issue #4773 by validating a response and forgetting to enrol it.
+/// [`register_stapled_response`] is deliberately private to this module for
+/// the same reason.
+#[must_use = "an accepted staple that is never enrolled is never retired; call `enroll`"]
+pub(crate) struct AcceptedStaple {
+    /// The operator's configured source string — the TLS inventory's
+    /// `source.identifier`, so the two agree about which entry was retired.
+    configured_source_id: String,
+    /// The already-redacted display id, the only form ever logged.
+    display_source_id: String,
+    next_update: i64,
+    /// `FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS` at acceptance, so the periodic
+    /// re-warn uses the same window the load-time warning did.
+    warning_days: u64,
+}
+
+impl AcceptedStaple {
+    /// Hand this staple, and the resolver that will serve it, to the periodic
+    /// re-check.
+    ///
+    /// Registration happens whether or not live reload is enabled — without it
+    /// there is no other event that could ever revisit these bytes. The
+    /// registry holds only a [`Weak`], so a resolver that is never published
+    /// (a rejected reload, a `validate` run) drops out on its own.
+    pub(crate) fn enroll(self, resolver: &Arc<AcmeTlsAlpnResolver>) {
+        register_stapled_response(
+            resolver,
+            self.configured_source_id,
+            self.display_source_id,
+            self.next_update,
+            self.warning_days,
+        );
+    }
+}
+
+/// Validate `response` against the chain that will serve it, log the
+/// acceptance, fire the lead-time warning, and return the record that must be
+/// enrolled.
+///
+/// Every certificate source shares this one definition (issue #4773, refs
+/// #4792): the single-certificate frontend/admin loader in
+/// [`crate::tls::load_frontend_tls_candidate`] and the Gateway
+/// multi-certificate loader in [`crate::tls::multi_cert`]. Ferrum has no OCSP
+/// responder client, so nothing inside the gateway re-fetches these bytes; the
+/// warning is the operator's cue to refresh before the deadline, and the
+/// re-check armed by [`AcceptedStaple::enroll`] re-fires it hourly while the
+/// staple stays inside the window and retires the staple outright once it
+/// reaches `nextUpdate`.
+pub(crate) fn accept_stapled_response(
+    response: &[u8],
+    cert_chain: &[CertificateDer<'_>],
+    target: StapleTarget<'_>,
+    configured_source_id: String,
+    display_source_id: String,
+    revocation_expiry_warning_days: u64,
+) -> Result<AcceptedStaple, anyhow::Error> {
+    let acceptance = crate::tls::ocsp::validate_stapled_response(response, cert_chain)
+        .map_err(|error| target.rejection(&display_source_id, error))?;
+    match target {
+        StapleTarget::ConfiguredListener => info!(
+            ocsp_source = %display_source_id,
+            ocsp_der_bytes = acceptance.der_len,
+            ocsp_this_update = acceptance.this_update,
+            ocsp_next_update = acceptance.next_update,
+            ocsp_delegated_responder = acceptance.delegated_responder,
+            "Validated and stapled OCSP response for server TLS config"
+        ),
+        StapleTarget::GatewayCertificate(identity) => info!(
+            gateway_certificate = %identity,
+            ocsp_source = %display_source_id,
+            ocsp_der_bytes = acceptance.der_len,
+            ocsp_this_update = acceptance.this_update,
+            ocsp_next_update = acceptance.next_update,
+            ocsp_delegated_responder = acceptance.delegated_responder,
+            "Validated and stapled OCSP response for Gateway certificate"
+        ),
+    }
+    crate::tls::warn_if_revocation_material_near_expiry(
+        "ocsp",
+        &display_source_id,
+        acceptance.next_update,
+        revocation_expiry_warning_days,
+        ASN1Time::now().timestamp(),
+    );
+    Ok(AcceptedStaple {
+        configured_source_id,
+        display_source_id,
+        next_update: acceptance.next_update,
+        warning_days: revocation_expiry_warning_days,
+    })
+}
+
 /// Record an accepted staple so the periodic re-check can retire it.
 ///
 /// Called by the loader that actually serves the response, with the resolver it
@@ -108,7 +255,7 @@ pub struct RecheckOutcome {
 /// time it is reached from inside a tokio runtime — a `validate` run, which
 /// loads the same material without a runtime, registers without spawning
 /// anything.
-pub(crate) fn register_stapled_response(
+fn register_stapled_response(
     resolver: &Arc<AcmeTlsAlpnResolver>,
     configured_source_id: String,
     display_source_id: String,

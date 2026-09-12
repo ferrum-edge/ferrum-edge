@@ -43,6 +43,30 @@ fn schema_accepts_admin_tls_and_https_port() {
 }
 
 #[test]
+fn node_agent_admin_http_port_strings_are_canonical_u16_values() {
+    let schema: serde_json::Value = serde_json::from_str(&read("values.schema.json"))
+        .expect("values.schema.json must be valid JSON");
+    let port_schema = schema
+        .pointer("/properties/nodeAgent/properties/admin/properties/port")
+        .expect("schema must define nodeAgent.admin.port");
+    let validator = jsonschema::validator_for(port_schema)
+        .expect("nodeAgent.admin.port must be a valid JSON schema");
+
+    for valid in ["0", "1", "9000", "65535"] {
+        assert!(
+            validator.is_valid(&serde_json::json!(valid)),
+            "canonical u16 port string {valid} must validate"
+        );
+    }
+    for invalid in ["00", "09000", "00000", "65536", "99999"] {
+        assert!(
+            !validator.is_valid(&serde_json::json!(invalid)),
+            "non-canonical or out-of-range port string {invalid} must be rejected"
+        );
+    }
+}
+
+#[test]
 fn daemonset_renders_managed_admin_https_and_tls_env() {
     let ds = read("templates/node-agent-daemonset.yaml");
     for needle in [

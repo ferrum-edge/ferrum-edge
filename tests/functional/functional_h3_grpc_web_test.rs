@@ -749,10 +749,13 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
     let (backend_cert, backend_key) = backend_ca.valid().expect("backend leaf");
     let backend = ScriptedGrpcBackend::builder_tls(backend_listener, &backend_cert, &backend_key)
         .expect("backend TLS")
+        // Translation keeps the message-format suffix on the native type:
+        // `application/grpc-web+json` → `application/grpc+json`. Default
+        // `proto` still uses the canonical bare `application/grpc`.
         .step(GrpcStep::AcceptRpc(MatchRpc::custom(|request| {
             request.method == "POST"
                 && request.path == "/echo.Echo/Unary"
-                && request.header("content-type") == Some("application/grpc")
+                && request.header("content-type") == Some("application/grpc+json")
         })))
         .step(GrpcStep::SendInitialHeaders)
         .step(GrpcStep::RespondMessage(Bytes::from_static(b"pong")))
@@ -763,7 +766,7 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
         .step(GrpcStep::AcceptRpc(MatchRpc::custom(|request| {
             request.method == "POST"
                 && request.path == "/echo.Echo/Unary"
-                && request.header("content-type") == Some("application/grpc")
+                && request.header("content-type") == Some("application/grpc+custom")
         })))
         .step(GrpcStep::SendInitialHeaders)
         .step(GrpcStep::RespondStatus {

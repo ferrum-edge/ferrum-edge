@@ -460,9 +460,21 @@ pub fn authenticated_stream_max_lifetime_seconds() -> u64 {
 /// a mapped Consumer or a permitted external identity. `auth_method` alone is
 /// not sufficient evidence, because a stream-side mechanism may stamp it
 /// without a principal.
+///
+/// A certificate-derived peer SPIFFE principal counts too
+/// (GHSA-qqg9-3r2g-fh44). The normal mesh injection installs `spiffe_identity`
+/// plus `mesh_authz` and does NOT require `mtls_auth`, so on those chains the
+/// SVID is the only thing authorizing the request; without this term the
+/// deadline `spiffe_identity` admits alongside it would never be consulted and
+/// the SPIFFE-only path would keep the indefinite authorized lifetime this
+/// contract exists to remove. Only the certificate-derived provenance qualifies
+/// — a kernel-attested (node-waypoint eBPF) or HBONE-asserted `peer_spiffe_id`
+/// carries no leaf validity window and is deliberately not conflated with one.
 #[inline]
 pub fn request_is_authenticated(ctx: &RequestContext) -> bool {
-    ctx.identified_consumer.is_some() || ctx.authenticated_identity.is_some()
+    ctx.identified_consumer.is_some()
+        || ctx.authenticated_identity.is_some()
+        || ctx.has_certificate_spiffe_principal()
 }
 
 /// Compute the effective authorization deadline for an admitted request.
