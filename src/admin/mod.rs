@@ -8084,18 +8084,17 @@ async fn batch_existing_resource_conflict(
 fn batch_needs_consumer_snapshot(batch: &RestorePayload) -> bool {
     batch.consumers.iter().any(|consumer| {
         consumer.has_credential("mtls_auth") || !consumer.credential_entries("hmac_auth").is_empty()
-    })
+    }) || batch
+        .plugin_configs
+        .iter()
+        .any(|plugin| plugin.plugin_name == "mtls_auth")
 }
 
 fn batch_needs_mtls_plugin_compat(batch: &RestorePayload) -> bool {
     batch
-        .plugin_configs
+        .proxies
         .iter()
-        .any(|plugin| plugin.plugin_name == "mtls_auth")
-        || batch
-            .proxies
-            .iter()
-            .any(|proxy| proxy.dispatch_kind.is_stream())
+        .any(|proxy| proxy.dispatch_kind.is_stream())
 }
 
 fn batch_submits_plugin_graph(batch: &RestorePayload) -> bool {
