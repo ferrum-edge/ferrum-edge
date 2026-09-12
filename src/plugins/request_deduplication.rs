@@ -1188,7 +1188,17 @@ impl RequestDeduplication {
                 let dns_cache = http_client.dns_cache();
                 let tls_no_verify = http_client.tls_no_verify();
                 let tls_ca_bundle_path = http_client.tls_ca_bundle_path();
-                Some(Arc::new(RedisRateLimitClient::new(
+                // Retention authority, not a generic operational client: an
+                // idempotency record IS this plugin's control, so every
+                // connection must first prove the endpoint will not evict live
+                // keys. An `allkeys-*` / `volatile-*` Redis under memory
+                // pressure would otherwise drop an acknowledged in-flight or
+                // completed record mid-lease and silently let a retried
+                // non-idempotent request execute twice, while Redis stayed
+                // reachable and every ownership transition stayed atomic
+                // (`GHSA-26gf-943w-w5x8`). A refused endpoint leaves
+                // `on_redis_unavailable` in charge — fail-closed by default.
+                Some(Arc::new(RedisRateLimitClient::for_retention_authority(
                     redis_config,
                     dns_cache.cloned(),
                     tls_no_verify,
@@ -1356,6 +1366,17 @@ impl RequestDeduplication {
     #[allow(dead_code)]
     pub(crate) fn inflight_count_snapshot_for_tests(&self) -> usize {
         self.local.inflight_count.load(Ordering::Relaxed)
+    }
+
+    /// Whether this instance's Redis client demands the no-eviction retention
+    /// proof, or `None` in local mode. Test support for `GHSA-26gf-943w-w5x8`:
+    /// the screen itself needs a live server, so coverage pins the requirement
+    /// the constructor asked for.
+    #[allow(dead_code)]
+    pub(crate) fn redis_requires_no_eviction_for_tests(&self) -> Option<bool> {
+        self.redis_client
+            .as_ref()
+            .map(|client| client.requires_no_eviction_screen_for_test())
     }
 
     #[allow(dead_code)]
@@ -2643,15 +2664,21 @@ impl RequestDeduplication {
         inflight_hint: usize,
         preserve_one_completed: bool,
     ) {
-        // Enforce max entries by removing oldest Completed entries first. Active
-        // (non-stale) InFlight markers are NEVER evicted by LRU because evicting
-        // them would release the in-flight lock while the original request is
-        // still executing — a duplicate retry for that key would then bypass the
-        // lock and re-execute side-effecting operations. Stale InFlight markers
-        // are dropped by the throttled expiry scan. This means max_entries can
-        // be temporarily exceeded if the cache is saturated with active
-        // in-flight work; correctness is strictly preferred over hitting the
-        // memory cap.
+        // Enforce max entries by removing oldest Completed entries first —
+        // oldest by COMPLETION sequence, not by last access. A replay clones
+        // the retained response without touching `completed_order`, so this is
+        // deliberately not LRU (documented as such in `docs/plugins.md`):
+        // refreshing the sequence would put a write into the replay hot path
+        // for a bounded, TTL-limited cache.
+        //
+        // Active (non-stale) InFlight markers are NEVER evicted because
+        // evicting them would release the in-flight lock while the original
+        // request is still executing — a duplicate retry for that key would
+        // then bypass the lock and re-execute side-effecting operations. Stale
+        // InFlight markers are dropped by the throttled expiry scan. This
+        // means max_entries can be temporarily exceeded if the cache is
+        // saturated with active in-flight work; correctness is strictly
+        // preferred over hitting the memory cap.
         let mut to_remove = completed_hint
             .saturating_add(inflight_hint)
             .saturating_sub(self.max_entries)
@@ -3406,12 +3433,25 @@ impl Plugin for RequestDeduplication {
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
+        // Deliberately NOT gated on the inbound header being present. This
+        // phase runs before every `before_proxy` hook, so it sees the client's
+        // headers, not the effective ones: a composed earlier header mutator
+        // (`request_transformer` at 3000, admitted by the plugin-cache ordering
+        // guard precisely so it can supply the key) has not run yet. Gating on
+        // the inbound header made that admitted composition fail closed with
+        // `400 Request body unavailable for idempotency fingerprint` on every
+        // body-bearing request whose key the transform was about to add.
+        //
+        // The cost is bounded and deliberate: only methods this instance
+        // deduplicates, only requests that actually declare a body, and only up
+        // to the same request-body limits every other buffering plugin obeys.
+        // Response-side narrowing (`should_buffer_response_body`, issue #1682)
+        // is untouched — a keyless request still streams its response and never
+        // holds an SSE body.
         self.applicable_methods
             .iter()
             .any(|method| method.eq_ignore_ascii_case(&ctx.method))
             && crate::proxy::request_may_have_body(&ctx.method, &ctx.headers)
-            && (self.enforce_required
-                || header_value_case_insensitive(&ctx.headers, &self.header_name).is_some())
     }
 
     async fn before_proxy(
@@ -4099,8 +4139,9 @@ impl Plugin for RequestDeduplication {
                 .await
             {
                 RedisPublication::Published { replayable: true } => {
-                    // Redis now carries the replay, so ordinary LRU eviction is
-                    // safe even for an externally executing terminal response.
+                    // Redis now carries the replay, so ordinary capacity
+                    // eviction is safe even for an externally executing
+                    // terminal response.
                     self.set_completed_barrier_retention(&key, &fingerprint, sequence, false);
                 }
                 // The response fits local retention but not the Redis payload

@@ -2616,12 +2616,41 @@ fn config_with_sidecar_bind(proxy: Proxy, port: u16, bind: IpAddr) -> GatewayCon
     }
 }
 
+/// A second loopback identity this host can actually bind, for fixtures that
+/// need the OLD address to stop accepting after a rebind.
+///
+/// A secondary IPv4 loopback alias (`127.0.0.2`) is configured by default on
+/// Linux but not on macOS, where binding it fails with `EADDRNOTAVAIL` (issue
+/// #4983). IPv6 loopback is the portable stand-in: like the alias — and unlike
+/// a wildcard, which would keep accepting on the original address — it is a
+/// genuinely distinct listen identity, so "the old bind is gone" stays
+/// provable. The probe takes an ephemeral port so it never races the contested
+/// one.
+async fn distinct_loopback_bind() -> Option<IpAddr> {
+    for candidate in [
+        IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2)),
+        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+    ] {
+        if let Ok(probe) = tokio::net::TcpListener::bind((candidate, 0)).await {
+            drop(probe);
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// A dedicated Sidecar ingress bind-address change must register as listener
 /// drift and rebind — port/scheme alone are not enough restart identity.
 #[tokio::test]
 async fn test_reconcile_restarts_on_dedicated_bind_address_change() {
     let first: IpAddr = "127.0.0.1".parse().expect("ip");
-    let second: IpAddr = "127.0.0.2".parse().expect("ip");
+    let Some(second) = distinct_loopback_bind().await else {
+        eprintln!(
+            "skipping test_reconcile_restarts_on_dedicated_bind_address_change: this host \
+             binds neither 127.0.0.2 nor ::1, so it cannot express a second listen identity"
+        );
+        return;
+    };
     let (manager, config_arc, port) = start_manager_with_config_arc_on_fresh_tcp_port(|port| {
         let proxy = create_stream_proxy("tcp-bind-rebind", BackendScheme::Tcp, port);
         config_with_sidecar_bind(proxy, port, first)

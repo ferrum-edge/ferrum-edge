@@ -264,11 +264,24 @@ pub async fn unbound_port() -> io::Result<u16> {
     Ok(reserve_port().await?.drop_and_take_port())
 }
 
+/// Whether a held [`RefusedTcpPort`] makes a connect fail IMMEDIATELY on this
+/// host.
+///
+/// A bound-but-unlistened TCP socket answers a SYN with RST on Linux, so a
+/// connect there fails at once with `ECONNREFUSED`. Darwin and the BSDs drop
+/// the SYN instead: the port stays owned exactly the same way, but a connect
+/// hangs until the client's own timeout (issue #4983). Ownership is the
+/// reservation's guarantee on every host; the observable failure is not, so a
+/// fixture must assert the category its host actually produces rather than
+/// assuming Linux's.
+pub const REFUSED_TCP_PORT_REFUSES_CONNECT_IMMEDIATELY: bool = cfg!(target_os = "linux");
+
 /// A TCP port bound on `127.0.0.1` without `listen()`.
 ///
-/// Connects receive a kernel `ECONNREFUSED` while the socket remains held,
-/// so a parallel test cannot steal the port. Drop the reservation to
-/// release the port.
+/// The socket stays held, so a parallel test cannot steal the port; drop the
+/// reservation to release it. A connect fails with a kernel `ECONNREFUSED`
+/// where [`REFUSED_TCP_PORT_REFUSES_CONNECT_IMMEDIATELY`] holds, and otherwise
+/// black-holes until the caller's own deadline.
 pub struct RefusedTcpPort {
     /// The reserved local port.
     pub port: u16,
@@ -387,14 +400,30 @@ mod tests {
         assert_eq!(udp.local_addr().unwrap().port(), udp.port);
     }
 
+    /// Ownership is unconditional; the connect failure is host-shaped. Both
+    /// halves are asserted explicitly so a host whose kernel changes behaviour
+    /// fails here rather than silently degrading every consumer that treats
+    /// this reservation as "a backend that is definitely down".
     #[tokio::test]
-    async fn reserve_refused_tcp_port_refuses_connect_and_cannot_be_stolen() {
+    async fn reserve_refused_tcp_port_fails_connect_and_cannot_be_stolen() {
         let reservation = reserve_refused_tcp_port().expect("reserve refused port");
         let port = reservation.port;
-        let err = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .expect_err("bound-but-not-listening port must refuse connect");
-        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+        let connect = tokio::time::timeout(
+            Duration::from_millis(500),
+            tokio::net::TcpStream::connect(("127.0.0.1", port)),
+        )
+        .await;
+        if REFUSED_TCP_PORT_REFUSES_CONNECT_IMMEDIATELY {
+            let err = connect
+                .expect("a refusing host must not black-hole the connect")
+                .expect_err("bound-but-not-listening port must refuse connect");
+            assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+        } else {
+            assert!(
+                connect.is_err(),
+                "a host that drops the SYN must leave the connect pending, not complete it"
+            );
+        }
         let steal = TcpListener::bind(("127.0.0.1", port)).await;
         assert!(
             steal.is_err(),

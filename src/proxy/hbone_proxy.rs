@@ -816,6 +816,17 @@ pub(super) async fn handle_hbone_request(
                 return build_response_from_normalized_reject(reject);
             }
         };
+    // GHSA-4cq4-3f3f-mq76: own the admitted HALF_OPEN probe slot with an RAII
+    // guard. Between here and the connect outcome below the relay awaits the
+    // client's upgrade handle and the backend dial, and a peer that vanishes in
+    // that window drops this future without running either settle site. Dropping
+    // the guard releases the slot NEUTRALLY instead of wedging the breaker.
+    let cb_probe = crate::proxy::HalfOpenProbeGuard::new(
+        state,
+        proxy,
+        cb_target_key.as_deref(),
+        cb_is_half_open_probe,
+    );
 
     let hbone_on_upgrade = match client_request_body {
         ClientRequestBody::Streaming(request) => {
@@ -941,7 +952,7 @@ pub(super) async fn handle_hbone_request(
                 settle_hbone_backend_connect_circuit_breaker_outcome(
                     &cb,
                     err.status,
-                    cb_is_half_open_probe,
+                    cb_probe.take_slot(),
                 );
             }
             ctx.metadata
@@ -977,7 +988,7 @@ pub(super) async fn handle_hbone_request(
             cb_target_key.as_deref(),
             cb_config,
         );
-        cb.record_success(cb_is_half_open_probe);
+        cb.record_success(cb_probe.take_slot());
     }
     if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target.as_deref())
         && let Some(upstream) = LoadBalancerCache::get_upstream_from(
@@ -1976,37 +1987,88 @@ where
     };
 
     // Local app → tunnel: receive datagrams from the destination socket, frame
-    // each, and write onto the tunnel. Activity here also keeps the session
+    // them, and write onto the tunnel. Activity here also keeps the session
     // alive; idle expiry is enforced by the shared watchdog below, not a
     // per-recv timeout (which would ignore tunnel→app activity).
+    //
+    // Datagrams that are ALREADY readable when one arrives are drained with
+    // `try_recv` into a bounded `FrameBatch` and written as one tunnel write
+    // (one h2 DATA frame instead of one per datagram). Nothing waits for a
+    // batch to fill: an isolated datagram is written at once, and the drain
+    // stops at the first `WouldBlock`. A datagram that does not fit the batch
+    // bound is held in `recv_buf` and opens the next batch, preserving FIFO
+    // order.
     let from_app_activity = last_activity.clone();
     let from_app_bytes = bytes_app_to_tunnel.clone();
     let from_app = async move {
         let mut recv_buf = vec![0u8; max];
-        let mut frame = BytesMut::with_capacity(2 + max);
+        let mut batch = crate::proxy::mesh_udp_frame::FrameBatch::new();
+        // A datagram received but not admitted to the just-written batch.
+        let mut held: Option<usize> = None;
+        // A `try_recv` error (not `WouldBlock`) ends the relay after the batch
+        // it interrupted has been written, matching the blocking `recv` path.
+        let mut recv_failed = false;
         loop {
-            let n = match socket.recv(&mut recv_buf).await {
-                Ok(n) => n,
-                Err(_) => break,
+            let first = match held.take() {
+                Some(n) => n,
+                None => match socket.recv(&mut recv_buf).await {
+                    Ok(n) => n,
+                    Err(_) => break,
+                },
             };
             from_app_activity.store(
                 crate::socket_opts::monotonic_now_ms(),
                 std::sync::atomic::Ordering::Relaxed,
             );
-            frame.clear();
-            if crate::proxy::mesh_udp_frame::encode_datagram(&mut frame, &recv_buf[..n]).is_err() {
+            batch.clear();
+            // Unreachable for a real datagram (`recv` never exceeds the buffer);
+            // skip rather than tear down, as before.
+            let _ = batch.push(&recv_buf[..first]);
+            loop {
+                match socket.try_recv(&mut recv_buf) {
+                    Ok(n) => {
+                        if !batch.accepts(n) {
+                            held = Some(n);
+                            break;
+                        }
+                        let _ = batch.push(&recv_buf[..n]);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => {
+                        recv_failed = true;
+                        break;
+                    }
+                }
+            }
+            if batch.is_empty() {
+                if recv_failed {
+                    break;
+                }
                 continue;
             }
             // Bound the write: a stalled HBONE peer (stopped reading / h2
             // flow-control exhausted) must not pin this task forever, especially
             // when the idle watchdog is disabled (codex r3). On stall, tear the
-            // relay down cleanly (break → tunnel half-close below).
-            match tokio::time::timeout(write_deadline, tunnel_write.write_all(&frame)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => break,
-                Err(_) => break, // write stalled past the deadline
+            // relay down cleanly (break → tunnel half-close below). Only the
+            // datagrams the tunnel fully accepted are counted as relayed.
+            match batch.write_to(&mut tunnel_write, write_deadline).await {
+                Ok(()) => {
+                    from_app_bytes.fetch_add(
+                        batch.payload_bytes() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                Err(failure) => {
+                    from_app_bytes.fetch_add(
+                        failure.committed_payload_bytes as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    break;
+                }
             }
-            from_app_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            if recv_failed {
+                break;
+            }
         }
         let _ = tunnel_write.shutdown().await;
     };

@@ -19,6 +19,8 @@
 //! construction time on a runtime node, the plugin degrades gracefully and
 //! lookups use `on_lookup_failure`; a readable but invalid database is rejected.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -303,7 +305,7 @@ impl GeoRestriction {
                     (PluginResult::Continue, None)
                 }
                 LookupFailureAction::Deny => {
-                    warn!(
+                    warn_sampled!(
                         client_ip = %client_ip,
                         db_path = %self.db_path,
                         plugin = "geo_restriction",
@@ -339,7 +341,7 @@ impl GeoRestriction {
                         return (PluginResult::Continue, None);
                     }
                     LookupFailureAction::Deny => {
-                        warn!(
+                        warn_sampled!(
                             client_ip = %client_ip,
                             plugin = "geo_restriction",
                             reason = "lookup_failed",
@@ -361,7 +363,7 @@ impl GeoRestriction {
 
         // Allow-list mode: only listed countries pass
         if !self.allow_countries.is_empty() && !self.allow_countries.contains(country) {
-            warn!(
+            warn_sampled!(
                 client_ip = %client_ip,
                 country = %country,
                 plugin = "geo_restriction",
@@ -380,7 +382,7 @@ impl GeoRestriction {
 
         // Deny-list mode: listed countries are blocked
         if self.deny_countries.contains(country) {
-            warn!(
+            warn_sampled!(
                 client_ip = %client_ip,
                 country = %country,
                 plugin = "geo_restriction",

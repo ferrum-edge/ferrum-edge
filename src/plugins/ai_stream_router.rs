@@ -220,6 +220,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 use url::{Host, Url};
 
+use super::utils::ai_model_glob::matches_model_glob;
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::content_encoding::{
     DecodeLimits, decode_content_encoding, parse_content_codings,
@@ -289,6 +290,13 @@ pub const AI_STREAM_ROUTER_PROVIDER_KEYS: &[&str] = &[
     "anthropic_version",
     "inherit_backend_tls",
 ];
+
+/// `anthropic-version` header value used when a provider omits the field.
+const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// UTF-8 byte-order mark. Legal as the very first bytes of an event stream, and
+/// stripped before framing is decided (issue #5299).
+const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 
 /// Admission diagnostic for the rejected `fallback` block (issue #3328).
 ///
@@ -474,7 +482,7 @@ impl StreamProvider {
     fn matches_model(&self, model: &str) -> bool {
         self.model_patterns
             .iter()
-            .any(|pat| simple_glob_match(pat, model))
+            .any(|pat| matches_model_glob(pat, model))
     }
 
     /// Whether this provider's response SSE is normalized for `model`, given the
@@ -844,18 +852,21 @@ impl AiStreamRouter {
             let endpoint = pv["endpoint"].as_str().ok_or(format!(
                 "ai_stream_router: provider '{name}' missing 'endpoint'"
             ))?;
-            let allow_plaintext = pv["allow_plaintext"].as_bool().unwrap_or(false);
+            let allow_plaintext = optional_bool(pv, "allow_plaintext")?.unwrap_or(false);
             let parsed = parse_endpoint(&name, endpoint, allow_plaintext, &backend_allow_ips)?;
 
             let api_key = config_or_env_str(pv, "api_key").ok_or(format!(
                 "ai_stream_router: provider '{name}' missing 'api_key'"
             ))?;
+            // Header-value validity is a per-byte property, so proving the key
+            // itself is sendable also proves the `Bearer {api_key}` form the
+            // OpenAI-compatible providers build from it.
+            validate_provider_header_value(&name, "api_key", &api_key)?;
             let auth = build_auth(provider_type, api_key);
 
-            let anthropic_version = pv["anthropic_version"]
-                .as_str()
-                .unwrap_or("2023-06-01")
-                .to_string();
+            let anthropic_version = optional_str(pv, "anthropic_version")?
+                .unwrap_or_else(|| DEFAULT_ANTHROPIC_VERSION.to_string());
+            validate_provider_header_value(&name, "anthropic_version", &anthropic_version)?;
 
             let inherit_backend_tls = optional_bool(pv, "inherit_backend_tls")?.unwrap_or(false);
 
@@ -1078,6 +1089,15 @@ fn parse_endpoint(
     } else {
         80
     };
+    // Port `0` disables a LISTENER; an outbound provider destination has no
+    // such meaning. Admitting it produced a route that every matching request
+    // failed to dial, long after `validate` reported the config as good
+    // (issue #5302).
+    if parsed.port() == Some(0) {
+        return Err(format!(
+            "ai_stream_router: provider '{provider_name}' endpoint '{endpoint}' must not use port 0; port 0 disables a listener and cannot be dialed as a provider destination"
+        ));
+    }
     let port = parsed.port().unwrap_or(default_port);
 
     // Rebuild the path and restore the `{model}` placeholder. The endpoint
@@ -1142,6 +1162,23 @@ fn optional_u64(config: &Value, field: &str) -> Result<Option<u64>, String> {
     }
 }
 
+/// Read an optional string field, rejecting a non-null value of the wrong type.
+///
+/// `as_str().unwrap_or(default)` silently accepted `anthropic_version: 123` and
+/// then sent the unrelated default version header, so the stored configuration
+/// and the effective behavior disagreed with no diagnostic anywhere (issue
+/// #5301). An explicit `null` still means omission, exactly as it does for
+/// [`optional_bool`] and [`optional_u64`].
+fn optional_str(config: &Value, field: &str) -> Result<Option<String>, String> {
+    match config.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_str()
+            .map(|s| Some(s.to_string()))
+            .ok_or_else(|| format!("ai_stream_router: '{field}' must be a string")),
+    }
+}
+
 fn optional_string_vec(config: &Value, field: &str) -> Result<Option<Vec<String>>, String> {
     let Some(value) = config.get(field) else {
         return Ok(None);
@@ -1166,6 +1203,25 @@ fn optional_string_vec(config: &Value, field: &str) -> Result<Option<Vec<String>
     Ok(Some(out))
 }
 
+/// Reject a configured provider string that cannot become an HTTP header value.
+///
+/// [`build_auth`] and [`apply_provider_boundary_headers`] hand these strings
+/// straight to the outbound header map, so a value carrying a newline or a
+/// control character was only discovered at dispatch: every request routed to
+/// that provider failed with a `502` the operator could not diagnose, while
+/// `ferrum-edge validate` reported the configuration as good (issue #5300).
+/// Screening the FINAL value here — after `${ENV_VAR}` resolution — turns an
+/// operator typo into a configuration error. The value itself is never echoed,
+/// because `api_key` is a live credential.
+fn validate_provider_header_value(provider: &str, field: &str, value: &str) -> Result<(), String> {
+    if reqwest::header::HeaderValue::from_str(value).is_err() {
+        return Err(format!(
+            "ai_stream_router: provider '{provider}' '{field}' is not a valid HTTP header value"
+        ));
+    }
+    Ok(())
+}
+
 /// Read a config string, resolving a `${ENV_VAR}` reference against the process
 /// environment.
 fn config_or_env_str(config: &Value, field: &str) -> Option<String> {
@@ -1186,46 +1242,12 @@ fn config_or_env_str(config: &Value, field: &str) -> Option<String> {
 // Model matching (glob)
 // ---------------------------------------------------------------------------
 
-/// Characters a `*` wildcard is not allowed to consume — mirrors
-/// `ai_federation` so a permissive `model_patterns` glob cannot smuggle
-/// URL-structural separators into a routed model name.
-const GLOB_WILDCARD_FORBIDDEN_CHARS: &[char] = &['/', '?', '#', '&', '\\', ' ', '\t', '\n', '\r'];
-
-/// Glob match supporting only `*` (matching any run of characters except the
-/// forbidden set). The pattern is anchored to both ends of `input`.
-fn simple_glob_match(pattern: &str, input: &str) -> bool {
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.len() == 1 {
-        return pattern == input;
-    }
-
-    let mut pos = 0;
-    for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-        if let Some(found) = input[pos..].find(part) {
-            if i == 0 && found != 0 {
-                return false;
-            }
-            let gap = &input[pos..pos + found];
-            if gap.contains(GLOB_WILDCARD_FORBIDDEN_CHARS) {
-                return false;
-            }
-            pos += found + part.len();
-        } else {
-            return false;
-        }
-    }
-
-    if !pattern.ends_with('*') && pos != input.len() {
-        return false;
-    }
-    if pattern.ends_with('*') && input[pos..].contains(GLOB_WILDCARD_FORBIDDEN_CHARS) {
-        return false;
-    }
-    true
-}
+// Model globs are matched by the shared `utils::ai_model_glob` helper: the
+// pattern is anchored to both ends of the model name and a `*` window may not
+// consume a URL-structural separator or whitespace. The matcher lives in
+// `plugins::utils` rather than here because `ai_federation` carries the same
+// contract, and the two private copies drifted into the same defect twice
+// (issues #5297 / #5392 here, #5255 there).
 
 /// `"stream": true` (a real boolean) is the only signal that claims a request.
 fn request_wants_streaming(openai_body: &Value) -> bool {
@@ -5275,8 +5297,7 @@ struct GeminiStreamNormalizer {
     tools_forbidden: bool,
     candidates: HashMap<u64, GeminiCandidateState>,
     saw_successful_finish: bool,
-    prompt_tokens: Option<u64>,
-    completion_tokens: Option<u64>,
+    usage: GeminiUsageCounters,
     call_id_prefix: String,
 }
 
@@ -5301,8 +5322,7 @@ impl GeminiStreamNormalizer {
             tools_forbidden,
             candidates: HashMap::new(),
             saw_successful_finish: false,
-            prompt_tokens: None,
-            completion_tokens: None,
+            usage: GeminiUsageCounters::default(),
             call_id_prefix: uuid::Uuid::new_v4().simple().to_string(),
         }
     }
@@ -5385,13 +5405,8 @@ impl GeminiStreamNormalizer {
     }
 
     fn write_usage_line(&mut self, out: &mut NormalizedSseOut) -> Result<(), &'static str> {
-        let (Some(p), Some(c)) = (self.prompt_tokens, self.completion_tokens) else {
+        let Some(usage) = self.usage.to_openai_usage()? else {
             return Ok(());
-        };
-        let Some(total) = p.checked_add(c) else {
-            return Err(
-                "upstream provider sent usage token counts that overflow u64 total; stream terminated",
-            );
         };
         let id = self.id();
         let payload = json!({
@@ -5400,11 +5415,7 @@ impl GeminiStreamNormalizer {
             "created": self.created,
             "model": self.model,
             "choices": [],
-            "usage": {
-                "prompt_tokens": p,
-                "completion_tokens": c,
-                "total_tokens": total,
-            },
+            "usage": usage,
         });
         out.write_sse_data_line(&payload);
         Ok(())
@@ -5511,23 +5522,44 @@ impl GeminiStreamNormalizer {
         true
     }
 
+    /// Consume one optional leading UTF-8 byte-order mark.
+    ///
+    /// Returns `false` while the buffered bytes are still a strict prefix of the
+    /// BOM: framing must not be decided from a byte that may turn out to be part
+    /// of a mark the client never sees.
+    fn strip_leading_bom(&mut self) -> bool {
+        if self.cursor != 0 {
+            return true;
+        }
+        if self.buf.starts_with(UTF8_BOM) {
+            self.set_cursor(UTF8_BOM.len());
+            self.scan_cursor = self.cursor;
+            return true;
+        }
+        if self.buf.len() < UTF8_BOM.len() && UTF8_BOM.starts_with(&self.buf) {
+            return false;
+        }
+        true
+    }
+
     fn detect_framing(&mut self) -> Result<(), &'static str> {
         if self.framing != GeminiFraming::Undecided {
             return Ok(());
         }
-        let unread = &self.buf[self.cursor..];
+        if !self.strip_leading_bom() {
+            return Ok(());
+        }
+        let unread = self.buf.get(self.cursor..).unwrap_or_default();
         let Some(first) = unread.iter().find(|b| !b.is_ascii_whitespace()).copied() else {
             return Ok(());
         };
         match first {
-            b'd' | b'e' | b':' => {
-                // `data:` / `event:` / SSE comment — treat as SSE once a letter
-                // or colon appears at the start of a line-ish stream.
-                self.framing = GeminiFraming::Sse;
-                Ok(())
-            }
             b'{' | b'[' => {
                 self.framing = GeminiFraming::JsonStream;
+                Ok(())
+            }
+            byte if sse_line_may_start_with(byte) => {
+                self.framing = GeminiFraming::Sse;
                 Ok(())
             }
             _ => Err(
@@ -5661,11 +5693,7 @@ impl GeminiStreamNormalizer {
         }
 
         if let Some(usage) = event.get("usageMetadata") {
-            match apply_gemini_usage_metadata(
-                usage,
-                &mut self.prompt_tokens,
-                &mut self.completion_tokens,
-            ) {
+            match apply_gemini_usage_metadata(usage, &mut self.usage) {
                 Ok(()) => {}
                 Err(message) => {
                     self.emit_upstream_error(message, out);
@@ -6298,20 +6326,95 @@ fn truncate_provider_error_message(message: &str) -> String {
     truncated
 }
 
+/// Overflow diagnostic shared by every normalized-usage addition.
+const GEMINI_USAGE_OVERFLOW_MESSAGE: &str =
+    "upstream provider sent usage token counts that overflow u64 total; stream terminated";
+
+/// Provider-reported Gemini token counters, kept in their native categories.
+///
+/// Gemini defines `totalTokenCount` as prompt + candidates + tool-use prompt +
+/// thoughts. Recomputing a normalized total from prompt and candidates alone
+/// therefore published a number BELOW what the provider billed for every
+/// thinking or tool-using generation, and the downstream consumers of the
+/// normalized OpenAI usage chunk (`ai_rate_limiter`, `ai_token_metrics`, and
+/// anything else reading `usage.total_tokens`) treat an explicit total as
+/// authoritative and complete. Carrying the provider's categories through the
+/// adapter is what keeps a normalized route's budget equal to a native one
+/// (`GHSA-v9p3-wj9f-wvpv`).
+#[derive(Default)]
+struct GeminiUsageCounters {
+    prompt: Option<u64>,
+    candidates: Option<u64>,
+    /// Reasoning ("thinking") output tokens. Billed, and part of the provider
+    /// total, but not part of `candidatesTokenCount`.
+    thoughts: Option<u64>,
+    /// Input-side tokens the provider billed for tool-use prompting.
+    tool_use_prompt: Option<u64>,
+    /// The provider's own authoritative total, when it sent one.
+    total: Option<u64>,
+}
+
+impl GeminiUsageCounters {
+    /// Render the terminal OpenAI-shaped `usage` object, or `None` when the
+    /// provider never reported both sides.
+    ///
+    /// An omitted counter is never charged as zero: prompt and candidate counts
+    /// must both have been reported before any usage is published at all, and
+    /// the optional categories only ever add to what the provider stated.
+    fn to_openai_usage(&self) -> Result<Option<Value>, &'static str> {
+        let (Some(prompt_base), Some(candidates)) = (self.prompt, self.candidates) else {
+            return Ok(None);
+        };
+        // Gemini bills tool-use prompting on the input side, and OpenAI's
+        // `completion_tokens` is defined to include reasoning tokens, so each
+        // extra category folds into the counter that already carries it.
+        let prompt = checked_usage_sum(prompt_base, self.tool_use_prompt)?;
+        let completion = checked_usage_sum(candidates, self.thoughts)?;
+        let derived = prompt
+            .checked_add(completion)
+            .ok_or(GEMINI_USAGE_OVERFLOW_MESSAGE)?;
+        // The provider's own total stays authoritative and may exceed the sum
+        // of the categories this adapter can represent (a category added by a
+        // later API revision). Never publish a total below the components
+        // printed in the same chunk either.
+        let total = self.total.map_or(derived, |reported| reported.max(derived));
+
+        let mut usage = json!({
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": total,
+        });
+        if let Some(thoughts) = self.thoughts
+            && let Some(object) = usage.as_object_mut()
+        {
+            object.insert(
+                "completion_tokens_details".to_string(),
+                json!({ "reasoning_tokens": thoughts }),
+            );
+        }
+        Ok(Some(usage))
+    }
+}
+
+fn checked_usage_sum(base: u64, extra: Option<u64>) -> Result<u64, &'static str> {
+    let Some(extra) = extra else {
+        return Ok(base);
+    };
+    base.checked_add(extra).ok_or(GEMINI_USAGE_OVERFLOW_MESSAGE)
+}
+
 /// Fail-closed Gemini `usageMetadata` admission for the stream normalizer.
 ///
 /// A present `usageMetadata` must be an object. Every present recognized count
 /// field (`promptTokenCount`, `candidatesTokenCount`, `completionTokenCount`,
-/// `totalTokenCount`) must be a JSON integer representable as `u64`. Omitted
-/// fields stay omitted. `candidatesTokenCount` is preferred over
-/// `completionTokenCount` when both are present and valid; a present malformed
-/// preferred field never falls through to the alternate. `totalTokenCount` is
-/// validated for shape only — published totals still come from checked
-/// `prompt + completion` addition at terminal usage emit.
+/// `thoughtsTokenCount`, `toolUsePromptTokenCount`, `totalTokenCount`) must be a
+/// JSON integer representable as `u64`. Omitted fields stay omitted.
+/// `candidatesTokenCount` is preferred over `completionTokenCount` when both are
+/// present and valid; a present malformed preferred field never falls through to
+/// the alternate.
 fn apply_gemini_usage_metadata(
     usage: &Value,
-    prompt_tokens: &mut Option<u64>,
-    completion_tokens: &mut Option<u64>,
+    counters: &mut GeminiUsageCounters,
 ) -> Result<(), &'static str> {
     let Some(usage) = usage.as_object() else {
         return Err(
@@ -6320,18 +6423,28 @@ fn apply_gemini_usage_metadata(
     };
 
     if let Some(prompt) = gemini_optional_usage_count(usage, "promptTokenCount")? {
-        *prompt_tokens = Some(prompt);
+        counters.prompt = Some(prompt);
     }
 
     // Validate every present recognized completion-side field first so a
     // malformed preferred key cannot silently fall back to the alternate.
     let candidates = gemini_optional_usage_count(usage, "candidatesTokenCount")?;
     let completion_alt = gemini_optional_usage_count(usage, "completionTokenCount")?;
-    // Documented / consumed shape: present totals must also be representable.
-    let _total = gemini_optional_usage_count(usage, "totalTokenCount")?;
+    let thoughts = gemini_optional_usage_count(usage, "thoughtsTokenCount")?;
+    let tool_use_prompt = gemini_optional_usage_count(usage, "toolUsePromptTokenCount")?;
+    let total = gemini_optional_usage_count(usage, "totalTokenCount")?;
 
     if let Some(completion) = candidates.or(completion_alt) {
-        *completion_tokens = Some(completion);
+        counters.candidates = Some(completion);
+    }
+    if let Some(thoughts) = thoughts {
+        counters.thoughts = Some(thoughts);
+    }
+    if let Some(tool_use_prompt) = tool_use_prompt {
+        counters.tool_use_prompt = Some(tool_use_prompt);
+    }
+    if let Some(total) = total {
+        counters.total = Some(total);
     }
     Ok(())
 }
@@ -6354,6 +6467,12 @@ fn gemini_optional_usage_count(
             }
             "completionTokenCount" => {
                 "upstream provider sent a malformed Gemini usageMetadata.completionTokenCount; stream terminated"
+            }
+            "thoughtsTokenCount" => {
+                "upstream provider sent a malformed Gemini usageMetadata.thoughtsTokenCount; stream terminated"
+            }
+            "toolUsePromptTokenCount" => {
+                "upstream provider sent a malformed Gemini usageMetadata.toolUsePromptTokenCount; stream terminated"
             }
             "totalTokenCount" => {
                 "upstream provider sent a malformed Gemini usageMetadata.totalTokenCount; stream terminated"
@@ -6752,27 +6871,44 @@ async fn normalize_provider_stream_buffered(
     out.finish()
 }
 
-/// Index just past the first complete SSE event boundary (a blank line), or
-/// `None` if no complete event is buffered yet. Handles both `\n\n` and
-/// `\r\n\r\n` terminators.
-fn next_event_boundary(buf: &[u8]) -> Option<usize> {
-    let lf = find_subslice(buf, b"\n\n").map(|i| i + 2);
-    let crlf = find_subslice(buf, b"\r\n\r\n").map(|i| i + 4);
-    match (lf, crlf) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
+/// Length of the SSE line terminator starting at `index`, or `None` when that
+/// byte does not begin one.
+///
+/// The event-stream grammar terminates a line with LF, CRLF, **or a lone CR**.
+/// A trailing `\r` at the very end of the buffer is treated as a complete lone
+/// CR rather than an unfinished CRLF: deferring it would strand the final event
+/// of a CR-delimited stream until EOF, and treating it as complete costs
+/// nothing, because the `\n` that may follow simply opens the next frame with
+/// an empty line, which carries no field.
+fn line_terminator_len(buf: &[u8], index: usize) -> Option<usize> {
+    match *buf.get(index)? {
+        b'\r' if buf.get(index + 1) == Some(&b'\n') => Some(2),
+        b'\r' | b'\n' => Some(1),
+        _ => None,
     }
 }
 
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
+/// Index just past the first complete SSE event boundary (a blank line), or
+/// `None` if no complete event is buffered yet.
+///
+/// An event ends at two consecutive line terminators, in any legal mix of LF,
+/// CRLF, and lone CR. Searching only for the literal `\n\n` / `\r\n\r\n`
+/// byte pairs turned a complete, successful CR-delimited provider stream into
+/// an upstream error with none of its content (issue #5298).
+fn next_event_boundary(buf: &[u8]) -> Option<usize> {
+    let mut index = 0;
+    while index < buf.len() {
+        let Some(first) = line_terminator_len(buf, index) else {
+            index += 1;
+            continue;
+        };
+        let after_first = index + first;
+        match line_terminator_len(buf, after_first) {
+            Some(second) => return Some(after_first + second),
+            None => index = after_first,
+        }
     }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+    None
 }
 
 fn is_known_anthropic_event(event_type: &str) -> bool {
@@ -6789,6 +6925,60 @@ fn is_known_anthropic_event(event_type: &str) -> bool {
     )
 }
 
+/// Whether `byte` can legally open an SSE line (a comment or a field name).
+///
+/// The event-stream grammar constrains a field name only to "not a colon and
+/// not a line terminator", so `id:`, `retry:`, and any field a provider adds
+/// later are all legal openers. Admitting exactly `d`, `e`, and `:` therefore
+/// rejected ordinary Gemini streams that merely carried an `id:` or `retry:`
+/// preamble (issue #5299). What still cannot appear at the head of a
+/// `text/event-stream` document is a C0 control or DEL — that is the signal
+/// that the provider sent binary or otherwise unframed bytes, so it remains the
+/// unrecognized-framing case.
+fn sse_line_may_start_with(byte: u8) -> bool {
+    !byte.is_ascii_control()
+}
+
+/// Iterator over the lines of one raw SSE frame.
+///
+/// `str::lines()` splits only on LF (stripping a preceding CR), so a provider
+/// frame delimited with lone CRs arrived as ONE unsplit line and none of its
+/// `data:` fields were ever seen (issue #5298). The event-stream grammar
+/// accepts LF, CRLF, and lone CR interchangeably, so all three are split here.
+struct SseLines<'a> {
+    rest: &'a str,
+}
+
+impl<'a> Iterator for SseLines<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        if self.rest.is_empty() {
+            return None;
+        }
+        let bytes = self.rest.as_bytes();
+        let Some(end) = bytes.iter().position(|b| matches!(b, b'\r' | b'\n')) else {
+            let line = self.rest;
+            self.rest = "";
+            return Some(line);
+        };
+        // `end` and `end + skip` both land on an ASCII terminator or one past
+        // it, so neither slice can split a multi-byte character.
+        let skip = if bytes[end] == b'\r' && bytes.get(end + 1) == Some(&b'\n') {
+            2
+        } else {
+            1
+        };
+        let line = &self.rest[..end];
+        self.rest = &self.rest[end + skip..];
+        Some(line)
+    }
+}
+
+fn sse_lines(text: &str) -> SseLines<'_> {
+    SseLines { rest: text }
+}
+
 /// Extract and concatenate the `data:` payload lines of one raw SSE event.
 ///
 /// The optional SSE `event:` name is retained so known Anthropic protocol
@@ -6800,7 +6990,7 @@ fn extract_sse_event_result(raw: &[u8]) -> Result<(Option<&str>, Option<String>)
     let mut data = String::new();
     let mut found = false;
     let mut event_name = None;
-    for line in text.lines() {
+    for line in sse_lines(text) {
         if let Some(rest) = line.strip_prefix("data:") {
             found = true;
             let rest = rest.strip_prefix(' ').unwrap_or(rest);

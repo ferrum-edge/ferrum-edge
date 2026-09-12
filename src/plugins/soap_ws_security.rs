@@ -31,6 +31,31 @@
 //! and `on_final_request_body_with_context` refuses to dispatch any message
 //! whose bytes changed after validation.
 //!
+//! ## Credential removal (opt-in)
+//!
+//! Verifying a PasswordText credential does not stop the envelope that carries
+//! it from reaching the backend, so every system behind the gateway is trusted
+//! with a reusable secret it usually has no use for (GHSA-xg9v-wc29-fc29).
+//! `username_token.remove_credential` deletes the verified `wsse:UsernameToken`
+//! — or the whole `wsse:Security` header, when the credential is all it carries
+//! — from the message the backend receives, leaving the authenticated identity
+//! and the application body.
+//!
+//! It is off by default, because a backend may legitimately read the token, and
+//! admission refuses every composition it could not sanitize honestly: it needs
+//! an enabled `username_token` with `password_type: PasswordText`, refuses an
+//! enabled `x509_signature` or `saml`, and refuses an explicit
+//! `content_type.allow_mtom: true`. At request time a signed envelope and a
+//! representation whose bytes cannot be spliced (a transcoded UTF-16 body, an
+//! MTOM package) are *refused*, never forwarded with the credential intact —
+//! declining to apply a security control the operator asked for is the defect,
+//! not the remedy.
+//!
+//! The final-body proof binds the **sanitized** representation, so the plugin's
+//! own rewrite is not mistaken for tampering while every other mutation is
+//! still refused: the transform re-derives the sanitized body from the recorded
+//! range and applies it only when the result reproduces that digest.
+//!
 //! ## Governed representations
 //!
 //! Media types are parsed structurally — `type/subtype` plus parameters — never
@@ -289,6 +314,18 @@
 //! prefix of a value the signature covered — the CVE-2017-11427 "SAML comment
 //! truncation" identity substitution. Two different readings of one element is
 //! the vulnerability; do not add a second one.
+//!
+//! That reader returns the concatenated character data **unchanged**. Blankness
+//! is decided with a trimmed view, but the value handed to issuer trust,
+//! audience binding, the Subject `NameID`, `Username`, and a PasswordText
+//! `Password` is byte for byte what the signature covered — a trimmed copy was
+//! the same verify-here/act-on-that split in a smaller form, and it also made a
+//! configured credential with significant surrounding spaces unusable. Only a
+//! field whose XML Schema datatype carries `whiteSpace = "collapse"` —
+//! `xsd:dateTime` instants and `xsd:base64Binary` payloads — is normalized, by
+//! `element_text_collapsed`.
+
+use crate::plugins::utils::log_sampling::warn_sampled;
 
 use crate::fips::backend::digest;
 use crate::fips::backend::signature as ring_sig;
@@ -301,7 +338,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
-use tracing::{debug, warn};
+use tracing::debug;
 use x509_parser::prelude::*;
 
 use crate::tls::source::{CertSource, MaterialKind, SecretString, load_material_blocking};
@@ -644,6 +681,7 @@ const USERNAME_TOKEN_CONFIG_KEYS: &[&str] = &[
     "created_clock_skew_seconds",
     "created_max_timestamp_divergence_seconds",
     "require_timestamp_binding",
+    "remove_credential",
 ];
 const CREDENTIAL_CONFIG_KEYS: &[&str] = &["username", "password"];
 const CONTENT_TYPE_CONFIG_KEYS: &[&str] = &["mode", "allow_mtom"];
@@ -1402,6 +1440,11 @@ pub struct SoapWsSecurity {
     /// When true (default), a PasswordDigest token must be accompanied by an
     /// outer `wsu:Timestamp` carrying a `Created` value to bind against.
     require_timestamp_binding: bool,
+    /// Opt-in: delete the verified `wsse:UsernameToken` from the message the
+    /// backend receives (GHSA-xg9v-wc29-fc29). Admission restricts it to an
+    /// unsigned PasswordText policy, so the removal can never delete bytes some
+    /// other mechanism proved integrity over.
+    remove_credential: bool,
     /// Process-local padding secret used only to equalize verification work on
     /// username lookup misses. Never authenticates a principal.
     dummy_password: String,
@@ -1665,6 +1708,14 @@ impl SoapWsSecurity {
             "require_timestamp_binding",
             true,
         )?;
+        // Off by default: the backend may legitimately consume the token, and a
+        // gateway must not silently change the message a deployment already
+        // relies on. Turning it on is the operator declaring that the backend
+        // needs the authenticated identity and the application body, not the
+        // reusable secret (GHSA-xg9v-wc29-fc29). The compositions it cannot
+        // sanitize are refused below rather than degraded.
+        let remove_credential =
+            soap_bool(ut_cfg, "config.username_token", "remove_credential", false)?;
         let ut_created_max_age = admitted_duration(
             "config.username_token",
             "created_max_age_seconds",
@@ -2210,6 +2261,52 @@ impl SoapWsSecurity {
         let reject_missing_security_header =
             soap_bool(root, "config", "reject_missing_security_header", true)?;
 
+        // ── Credential removal admission (GHSA-xg9v-wc29-fc29) ─────────
+        //
+        // Every composition this option cannot sanitize is refused here rather
+        // than at request time, because a policy that silently forwards the
+        // secret it promised to remove is worse than one that never offered.
+        if remove_credential {
+            if !username_token_enabled {
+                return Err(
+                    "soap_ws_security: 'config.username_token.remove_credential' requires \
+                     'config.username_token.enabled' to be true — there is no verified \
+                     credential to remove"
+                        .to_string(),
+                );
+            }
+            if password_type != PasswordType::PasswordText {
+                return Err(
+                    "soap_ws_security: 'config.username_token.remove_credential' is supported \
+                     only for password_type 'PasswordText' — a PasswordDigest token carries no \
+                     reusable plaintext secret, and deleting it would also remove the Nonce and \
+                     Created a backend may still read"
+                        .to_string(),
+                );
+            }
+            if x509_enabled || saml_enabled {
+                return Err(
+                    "soap_ws_security: 'config.username_token.remove_credential' cannot be \
+                     combined with an enabled 'config.x509_signature' or 'config.saml' — \
+                     rewriting the envelope would invalidate content a signature covers, so \
+                     the composition is refused instead of silently breaking it"
+                        .to_string(),
+                );
+            }
+            // Same shape as the X.509/MTOM refusal above: a multipart package
+            // cannot be re-framed around a shortened root part, so the runtime
+            // refuses such a request. Surface the contradiction at admission.
+            if allow_mtom_explicit && allow_mtom {
+                return Err(
+                    "soap_ws_security: 'config.content_type.allow_mtom' cannot be true while \
+                     'config.username_token.remove_credential' is true — an MTOM package \
+                     cannot be re-framed after the credential is removed, so such a request is \
+                     refused at runtime"
+                        .to_string(),
+                );
+            }
+        }
+
         // Must have at least one security feature enabled
         if !username_token_enabled && !x509_enabled && !saml_enabled && !require_timestamp {
             return Err(
@@ -2235,6 +2332,7 @@ impl SoapWsSecurity {
             ut_created_max_timestamp_divergence,
             ut_created_max_timestamp_divergence_seconds,
             require_timestamp_binding,
+            remove_credential,
             dummy_password,
             dummy_password_text_hash,
             x509_enabled,
@@ -2279,7 +2377,9 @@ impl SoapWsSecurity {
         else {
             return Ok(None);
         };
-        let raw = element_text(node)?
+        // `xsd:dateTime` collapses surrounding whitespace, so the instant is
+        // read through the collapsing reader rather than the opaque-value one.
+        let raw = element_text_collapsed(node)?
             .ok_or_else(|| format!("WS-Security: Timestamp {local_name} element is empty"))?;
         let parsed = parse_ws_datetime(&raw)
             .ok_or_else(|| format!("WS-Security: invalid {local_name} timestamp"))?;
@@ -2536,13 +2636,15 @@ impl SoapWsSecurity {
                         .ok_or_else(|| {
                             structural("WS-Security: PasswordDigest requires Nonce element")
                         })?;
-                let nonce_b64_raw = element_text(nonce_node)
+                let nonce_b64_raw = element_text_collapsed(nonce_node)
                     .map_err(UsernameTokenError::Structural)?
                     .ok_or_else(|| structural("WS-Security: Nonce element is empty"))?;
 
                 // One canonical form for both the digest input and the replay
-                // cache key (`element_text` already trims; being explicit keeps
-                // the two derivations from drifting apart). The length ceiling
+                // cache key. `wsse:Nonce` is `xsd:base64Binary`, so
+                // `element_text_collapsed` has already removed the surrounding
+                // whitespace the datatype does not carry; the explicit trim
+                // keeps the two derivations from drifting apart. The length ceiling
                 // is enforced on the *encoded* value before Base64 decoding, so
                 // an oversized nonce never allocates a decode buffer and is
                 // never retained.
@@ -2566,7 +2668,10 @@ impl SoapWsSecurity {
                         .ok_or_else(|| {
                             structural("WS-Security: PasswordDigest requires Created element")
                         })?;
-                let created = element_text(created_node)
+                // `xsd:dateTime` again: the collapsed lexical value is both the
+                // instant that is range-checked and the byte string hashed into
+                // the digest, so exactly one form exists for the two uses.
+                let created = element_text_collapsed(created_node)
                     .map_err(UsernameTokenError::Structural)?
                     .ok_or_else(|| structural("WS-Security: Created element is empty"))?;
 
@@ -2624,7 +2729,7 @@ impl SoapWsSecurity {
     /// process-local" knob: a per-replica fallback would silently reinstate the
     /// bypass the shared backend exists to close.
     fn shared_backend_unavailable() -> String {
-        warn!(
+        warn_sampled!(
             failure_class = Self::NONCE_SHARED_BACKEND_UNAVAILABLE_CLASS,
             "soap_ws_security: shared replay backend is unavailable"
         );
@@ -2632,7 +2737,7 @@ impl SoapWsSecurity {
     }
 
     fn nonce_too_long() -> String {
-        warn!(
+        warn_sampled!(
             failure_class = Self::NONCE_TOO_LONG_CLASS,
             "soap_ws_security: Nonce exceeds the maximum permitted length"
         );
@@ -2767,7 +2872,7 @@ impl SoapWsSecurity {
     }
 
     fn nonce_state_saturated() -> String {
-        warn!(
+        warn_sampled!(
             failure_class = Self::NONCE_STATE_SATURATED_CLASS,
             "soap_ws_security: replay protection state is at capacity"
         );
@@ -4486,6 +4591,44 @@ struct SoapPrincipal {
     principal: Option<String>,
     username: Option<String>,
     saml_subject: Option<String>,
+    /// Wire-byte range of the verified credential to delete before backend
+    /// dispatch, when `username_token.remove_credential` is on.
+    credential_strip: Option<(usize, usize)>,
+}
+
+/// Request metadata carrying the credential range this policy accepted, read
+/// back by [`SoapWsSecurity::transform_request_body_with_context`].
+///
+/// The range travels instead of the sanitized body: it is two integers rather
+/// than a second full copy of the message, and re-deriving the body from it in
+/// the transform phase is what proves nothing else rewrote the bytes in
+/// between — the splice only reproduces the bound digest if it is applied to
+/// the representation this policy authenticated.
+const CREDENTIAL_STRIP_RANGE_KEY: &str = "soap_ws_security.credential_strip_range";
+
+/// Fixed rejection for a governed representation whose credential cannot be
+/// spliced out — a transcoded UTF-16 body or an MTOM package.
+const CREDENTIAL_REMOVAL_UNSUPPORTED_MESSAGE: &str =
+    "WS-Security: this SOAP representation cannot have its UsernameToken removed";
+const CREDENTIAL_REMOVAL_UNSUPPORTED_CLASS: &str = "credential_removal_unsupported_representation";
+
+fn credential_removal_unsupported() -> SoapRejection {
+    SoapRejection::new(
+        415,
+        CREDENTIAL_REMOVAL_UNSUPPORTED_MESSAGE,
+        CREDENTIAL_REMOVAL_UNSUPPORTED_CLASS,
+    )
+}
+
+/// Delete `body[start..end)`, returning the shortened body.
+fn splice_out(body: &[u8], start: usize, end: usize) -> Option<Vec<u8>> {
+    if start > end || end > body.len() {
+        return None;
+    }
+    let mut sanitized = Vec::with_capacity(body.len() - (end - start));
+    sanitized.extend_from_slice(&body[..start]);
+    sanitized.extend_from_slice(&body[end..]);
+    Some(sanitized)
 }
 
 /// A terminal SOAP rejection: status, client-visible body, and the fixed
@@ -4621,7 +4764,7 @@ impl SoapWsSecurity {
         // PasswordDigest binding compares against this same element, and binding
         // against an unvalidated instant would be no binding at all.
         if let Err(error) = self.validate_timestamp(security, now) {
-            warn!(
+            warn_sampled!(
                 failure_class = "timestamp",
                 "soap_ws_security: timestamp validation failed"
             );
@@ -4639,7 +4782,7 @@ impl SoapWsSecurity {
                 Err(UsernameTokenError::InvalidCredentials) => {
                     // Generic response + stable failure class: do not log the
                     // candidate username or password/digest verification detail.
-                    warn!(
+                    warn_sampled!(
                         failure_class = UsernameTokenError::INVALID_CREDENTIALS_CLASS,
                         "soap_ws_security: UsernameToken authentication failed"
                     );
@@ -4650,7 +4793,7 @@ impl SoapWsSecurity {
                     });
                 }
                 Err(UsernameTokenError::Structural(detail)) => {
-                    warn!(
+                    warn_sampled!(
                         failure_class = UsernameTokenError::STRUCTURAL_CLASS,
                         "soap_ws_security: UsernameToken structural validation failed"
                     );
@@ -4681,7 +4824,7 @@ impl SoapWsSecurity {
                         .get_or_insert_with(|| cert_principal.to_string());
                 }
                 Err(error) => {
-                    warn!(
+                    warn_sampled!(
                         failure_class = "x509_signature",
                         "soap_ws_security: X.509 signature validation failed"
                     );
@@ -4702,7 +4845,7 @@ impl SoapWsSecurity {
                     principal.saml_subject = Some(name_id);
                 }
                 Err(error) => {
-                    warn!(
+                    warn_sampled!(
                         failure_class = "saml",
                         "soap_ws_security: SAML validation failed"
                     );
@@ -4711,7 +4854,88 @@ impl SoapWsSecurity {
             }
         }
 
+        // Locate the verified credential to delete, while the borrowed document
+        // is still alive. Only an unsigned PasswordText policy can reach this
+        // (see the admission rules), so nothing it deletes is covered by a
+        // signature the gateway verified — and a signature it did NOT verify is
+        // refused rather than quietly invalidated.
+        if self.remove_credential {
+            let strip = self.credential_strip_range(ctx, &body, security)?;
+            principal.credential_strip = Some(strip);
+        }
+
         Ok(Some(principal))
+    }
+
+    /// Wire-byte range of the verified `wsse:UsernameToken` — or of the whole
+    /// `wsse:Security` header when the credential is the only thing it carries.
+    ///
+    /// Splicing bytes out of the message is only sound when a byte offset in
+    /// the text that was parsed is also a byte offset in the body the backend
+    /// receives. That holds for a plain UTF-8 envelope (with or without a BOM)
+    /// and for nothing else: a UTF-16 body was transcoded on the way in, and an
+    /// MTOM envelope is one part inside a package whose framing would have to be
+    /// rebuilt. Those representations are REFUSED, never forwarded with the
+    /// credential intact — an operator who enabled removal asked for a security
+    /// property, and silently declining to apply it is the defect this closes.
+    fn credential_strip_range(
+        &self,
+        ctx: &RequestContext,
+        decoded: &str,
+        security: Node<'_, '_>,
+    ) -> Result<(usize, usize), SoapRejection> {
+        // An XMLDSIG signature anywhere in this envelope covers bytes the
+        // removal would delete or reposition. This policy does not verify it
+        // (x509_signature and saml are refused alongside removal at admission),
+        // so the gateway cannot know what it protects: refuse the message
+        // rather than hand the backend a signature that no longer verifies.
+        let signed = security
+            .document()
+            .descendants()
+            .any(|node| node.has_tag_name((XMLDSIG_NAMESPACE_URI, "Signature")));
+        if signed {
+            return Err(SoapRejection::new(
+                400,
+                "WS-Security: a signed SOAP envelope cannot have its UsernameToken removed",
+                "credential_removal_signed_envelope",
+            ));
+        }
+
+        let Some(wire) = ctx.request_body_bytes.as_deref() else {
+            return Err(credential_removal_unsupported());
+        };
+        // Decoding only ever strips a leading BOM, so a decoded UTF-8 envelope
+        // is a suffix of the wire body and a byte offset in one is a byte
+        // offset in the other. Every representation that is not — a transcoded
+        // UTF-16 body, an MTOM root part inside its package — fails this check.
+        let Some(prefix_len) = wire.len().checked_sub(decoded.len()) else {
+            return Err(credential_removal_unsupported());
+        };
+        if &wire[prefix_len..] != decoded.as_bytes() {
+            return Err(credential_removal_unsupported());
+        }
+        // The parsed document is `decoded.trim()`, so node ranges are relative
+        // to that; this is the offset of the trimmed text inside `decoded`.
+        let trimmed_prefix = decoded.len() - decoded.trim_start().len();
+
+        let token = unique_ns_child(security, WSSE_NAMESPACE_URI, "UsernameToken", "WS-Security");
+        let Some(token) = token.ok().flatten() else {
+            return Err(credential_removal_unsupported());
+        };
+        // Drop the whole Security header when the credential is all it holds:
+        // an emptied header is well-formed, but it still asks a
+        // `mustUnderstand` receiver to process a header with nothing in it.
+        let mut elements = security.children().filter(Node::is_element);
+        let only_credential = elements.all(|child| child.id() == token.id());
+        let removed = if only_credential { security } else { token };
+
+        let range = removed.range();
+        let start = prefix_len + trimmed_prefix + range.start;
+        let end = prefix_len + trimmed_prefix + range.end;
+        if start > end || end > wire.len() {
+            return Err(credential_removal_unsupported());
+        }
+        Ok((start, end))
     }
 
     /// Common request entry point for both phases.
@@ -4728,7 +4952,7 @@ impl SoapWsSecurity {
             SoapRequestDisposition::Governed(class) => class,
             SoapRequestDisposition::PassThrough => return PluginResult::Continue,
             SoapRequestDisposition::Reject(rejection) => {
-                warn!(
+                warn_sampled!(
                     failure_class = rejection.class(),
                     "soap_ws_security: request representation rejected on a SOAP-protected route"
                 );
@@ -4767,10 +4991,33 @@ impl SoapWsSecurity {
         // immediately before the final-body hooks — into an unconditional `500`
         // for every governed SOAP request.
         if self.establishes_identity() {
-            let authenticated_digest = ctx
-                .request_body_bytes
-                .as_ref()
-                .map(|bytes| sha256_array(bytes));
+            let authenticated_digest = if let Some((start, end)) = principal.credential_strip {
+                // With credential removal on, the proof binds the SANITIZED
+                // representation — the bytes this policy intends the backend to
+                // receive — not the credential-bearing one it validated.
+                // Binding the original instead would make the plugin's own
+                // rewrite look like the tampering the guard exists to catch,
+                // and re-binding after the rewrite would leave a window in
+                // which any transform could substitute a message and be
+                // re-blessed.
+                let sanitized = ctx
+                    .request_body_bytes
+                    .as_deref()
+                    .and_then(|wire| splice_out(wire, start, end));
+                let Some(sanitized) = sanitized else {
+                    // Unreachable for a range just derived from these bytes;
+                    // fail closed rather than forward the credential the
+                    // operator asked to have removed.
+                    return credential_removal_unsupported().into_plugin_result();
+                };
+                ctx.metadata.insert(
+                    CREDENTIAL_STRIP_RANGE_KEY.to_string(),
+                    format!("{start}:{end}"),
+                );
+                Some(sha256_array(&sanitized))
+            } else {
+                ctx.request_body_bytes.as_deref().map(sha256_array)
+            };
             ctx.soap_ws_security_authenticated_body_digest = authenticated_digest;
         }
 
@@ -5115,6 +5362,13 @@ impl Plugin for SoapWsSecurity {
         self.establishes_identity()
     }
 
+    /// Only an opt-in credential-removal policy rewrites the body, so an
+    /// ordinary SOAP policy keeps declaring nothing and stays composable with
+    /// every plugin that refuses a request-body transformer.
+    fn modifies_request_body(&self) -> bool {
+        self.remove_credential
+    }
+
     fn warmup_hostnames(&self) -> Vec<String> {
         match &self.nonce_backend {
             NonceReplayBackend::Shared(client) => client.warmup_hostname().into_iter().collect(),
@@ -5150,6 +5404,43 @@ impl Plugin for SoapWsSecurity {
         self.run_soap_policy(ctx, content_type, None).await
     }
 
+    /// Delete the verified credential from the backend-visible body
+    /// (GHSA-xg9v-wc29-fc29).
+    ///
+    /// The range recorded at validation is re-applied here rather than a
+    /// pre-built body being carried through the request: splicing at those
+    /// offsets only reproduces the digest bound in `authenticate` if the bytes
+    /// are still the ones this policy accepted. So the check below is both the
+    /// removal and the proof that the removal is being applied to the right
+    /// message — if anything rewrote the body first, the transform declines and
+    /// [`Self::on_final_request_body_with_context`] refuses the dispatch.
+    ///
+    /// Re-running on an already-sanitized body is likewise safe: the splice
+    /// lands on different bytes, the digest disagrees, and the body is left
+    /// exactly as it is.
+    async fn transform_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+        _content_type: Option<&str>,
+        _request_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        if !self.remove_credential {
+            return None;
+        }
+        let expected = ctx.soap_ws_security_authenticated_body_digest?;
+        let (start, end): (usize, usize) = ctx
+            .metadata
+            .get(CREDENTIAL_STRIP_RANGE_KEY)
+            .and_then(|range| range.split_once(':'))
+            .and_then(|(start, end)| Some((start.parse().ok()?, end.parse().ok()?)))?;
+        let sanitized = splice_out(body, start, end)?;
+        if sha256_array(&sanitized) != expected {
+            return None;
+        }
+        Some(sanitized)
+    }
+
     /// Refuse to dispatch a message whose backend-visible bytes are no longer
     /// the bytes this policy authenticated.
     ///
@@ -5164,6 +5455,11 @@ impl Plugin for SoapWsSecurity {
     /// against, so a timestamp-only policy — which authenticates nobody and
     /// makes no integrity claim — stays composable with request-body
     /// transformers instead of failing every governed request closed.
+    ///
+    /// Under `username_token.remove_credential` the recorded digest is the
+    /// SANITIZED representation, so this hook still refuses everything except
+    /// the plugin's own removal — including a removal that could not be applied,
+    /// which leaves the credential-bearing body here and fails closed.
     async fn on_final_request_body_with_context(
         &self,
         ctx: &mut RequestContext,
@@ -5176,7 +5472,7 @@ impl Plugin for SoapWsSecurity {
         if sha256_array(body) == expected {
             return PluginResult::Continue;
         }
-        warn!(
+        warn_sampled!(
             failure_class = "authenticated_body_mutated",
             "soap_ws_security: refusing to dispatch a SOAP message whose body changed after \
              WS-Security validation"
@@ -5465,8 +5761,19 @@ const MIXED_CONTENT_REJECTION: &str =
 /// carriers — is read through here so there is exactly ONE reading of an
 /// element's value in this module. Two readings is the vulnerability.
 ///
-/// Trimming is a normalization applied uniformly to the concatenated value; it
-/// never drops a text run.
+/// # The concatenated value is returned UNCHANGED (issue #5057)
+///
+/// Surrounding whitespace is used only to decide whether an otherwise-required
+/// element is blank; it is never stripped from the value that is returned. The
+/// signature covers the character data exactly as it appears, so a reader that
+/// returned a trimmed copy handed verification and consumption two different
+/// byte strings — the same class of gateway/backend split rule 2 exists to
+/// close, and the reason a configured PasswordText credential with significant
+/// leading or trailing spaces could never authenticate. A field whose XML
+/// Schema datatype really does carry `whiteSpace = "collapse"` — an
+/// `xsd:dateTime` instant or an `xsd:base64Binary` payload — is read through
+/// [`element_text_collapsed`] instead, which applies that datatype's own
+/// normalization and nothing else.
 fn element_text(node: Node<'_, '_>) -> Result<Option<String>, String> {
     let mut text = String::new();
     for child in node.children() {
@@ -5481,8 +5788,40 @@ fn element_text(node: Node<'_, '_>) -> Result<Option<String>, String> {
         }
         return Err(MIXED_CONTENT_REJECTION.to_string());
     }
+    // Blank-vs-present is the only decision whitespace takes part in. The value
+    // itself is handed back byte for byte.
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(text))
+}
+
+/// [`element_text`] for a value whose XML Schema datatype carries
+/// `whiteSpace = "collapse"`: an `xsd:dateTime` instant (`wsu:Created`,
+/// `wsu:Expires`) or an `xsd:base64Binary` payload (`wsse:Nonce`,
+/// `ds:SignatureValue`, `ds:DigestValue`, `wsse:BinarySecurityToken`,
+/// `ds:X509Certificate`).
+///
+/// Removing leading and trailing whitespace from those is the datatype's own
+/// lexical normalization, not a transformation of an opaque value: neither a
+/// timestamp nor a Base64 payload has a legitimate reading in which a
+/// surrounding space is part of the value. Every other element — `NameID`,
+/// `Issuer`, `Audience`, `Username`, and a PasswordText `Password` — is an
+/// opaque string whose spaces are significant and is read through
+/// [`element_text`] unchanged.
+///
+/// This is a normalization of the ONE reading [`element_text`] performs, not a
+/// second reading of the DOM: it never re-walks the node and never drops a text
+/// run.
+fn element_text_collapsed(node: Node<'_, '_>) -> Result<Option<String>, String> {
+    let Some(text) = element_text(node)? else {
+        return Ok(None);
+    };
     let trimmed = text.trim();
-    Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
+    if trimmed.len() == text.len() {
+        return Ok(Some(text));
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 /// Bounded, single-pass index of every XML id-bearing attribute in the
@@ -5618,6 +5957,82 @@ impl WorkBudget {
                 .to_string()
         })?;
         Ok(())
+    }
+}
+
+/// The canonical-output sink, which charges the shared [`WorkBudget`] **before**
+/// every append.
+///
+/// Charging the finished string afterwards bounded what the plugin *accepted*
+/// but not what it *built*: namespace declarations and `&amp;`-style escaping
+/// expand the output independently of the source subtree's byte count, so the
+/// complete over-budget representation was allocated, and the CPU to produce
+/// it spent, before the ceiling was consulted. A rejection cannot undo either.
+/// Charging first makes the ceiling a bound on the peak instead of a bound on
+/// the result: the writer stops at the first append that would exceed it, and
+/// the reserved capacity never exceeds what the budget still admits.
+struct BoundedCanonicalOutput<'budget> {
+    output: String,
+    budget: &'budget mut WorkBudget,
+}
+
+impl<'budget> BoundedCanonicalOutput<'budget> {
+    /// `hint` is the source subtree length — a good size estimate for a
+    /// canonical form — clamped to what the budget can still admit so a
+    /// doomed canonicalization cannot reserve the whole estimate first.
+    fn new(budget: &'budget mut WorkBudget, hint: usize) -> Self {
+        let capacity = hint.min(budget.remaining);
+        Self {
+            output: String::with_capacity(capacity),
+            budget,
+        }
+    }
+
+    fn push_str(&mut self, text: &str) -> Result<(), String> {
+        self.budget.charge(text.len())?;
+        self.output.push_str(text);
+        Ok(())
+    }
+
+    fn push(&mut self, character: char) -> Result<(), String> {
+        self.budget.charge(character.len_utf8())?;
+        self.output.push(character);
+        Ok(())
+    }
+
+    /// Escaping expands: one `&` becomes five bytes. Charging per emitted run
+    /// is what keeps that expansion inside the budget instead of discovering it
+    /// once the whole escaped string already exists.
+    fn push_text(&mut self, text: &str) -> Result<(), String> {
+        for character in text.chars() {
+            match character {
+                '&' => self.push_str("&amp;")?,
+                '<' => self.push_str("&lt;")?,
+                '>' => self.push_str("&gt;")?,
+                '\r' => self.push_str("&#xD;")?,
+                other => self.push(other)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn push_attribute_value(&mut self, value: &str) -> Result<(), String> {
+        for character in value.chars() {
+            match character {
+                '&' => self.push_str("&amp;")?,
+                '<' => self.push_str("&lt;")?,
+                '"' => self.push_str("&quot;")?,
+                '\t' => self.push_str("&#x9;")?,
+                '\n' => self.push_str("&#xA;")?,
+                '\r' => self.push_str("&#xD;")?,
+                other => self.push(other)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.output.into_bytes()
     }
 }
 
@@ -5809,14 +6224,16 @@ fn exclusive_canonicalize(
     }
 
     // Charge the subtree before walking it, so an over-budget request is
-    // refused without doing the work, then charge the complete emitted
-    // canonical representation. Both sides are needed: the source bounds the
-    // walk, while the output bounds the allocation and digest input. Charging
-    // only output expansion would account for max(source, output), not the
-    // documented source + output work.
+    // refused without doing the work; the emitted canonical bytes are then
+    // charged by the writer itself, one append at a time. Both sides are
+    // needed: the source bounds the walk, while the output bounds the
+    // allocation and digest input. Charging only output expansion would account
+    // for max(source, output), not the documented source + output work, and
+    // charging the output only once it exists would bound what is accepted
+    // rather than what is built (GHSA-hfpm-3pv7-h3jh).
     let source_len = root.range().len();
     budget.charge(source_len)?;
-    let mut output = String::with_capacity(source_len);
+    let mut output = BoundedCanonicalOutput::new(budget, source_len);
     let mut rendered_namespaces = HashMap::new();
     rendered_namespaces.insert(
         "xml".to_string(),
@@ -5831,14 +6248,57 @@ fn exclusive_canonicalize(
         &mut rendered_namespaces,
         &mut output,
     )?;
-    budget.charge(output.len())?;
     Ok(output.into_bytes())
 }
 
-// Reached only via the lib target's `_test_support` shim (external unit tests);
-// the bin target duplicates the module tree with no caller, so it sees this as
-// dead code.
+/// Canonicalize one element under an EXPLICIT budget, returning the outcome
+/// together with whatever budget is left.
+///
+/// The remaining budget is what makes charge-before-append observable
+/// (GHSA-hfpm-3pv7-h3jh): a writer that charged the finished string would leave
+/// the whole output allowance untouched on a refusal, while one that charges as
+/// it writes stops at the ceiling with that allowance spent.
+// Reached only via the lib target's `_test_support` shim; the bin target
+// duplicates the module tree with no caller.
 #[allow(dead_code)]
+pub(crate) fn exclusive_canonicalize_with_budget_for_test(
+    xml: &str,
+    local_name: &str,
+    budget_bytes: usize,
+) -> (Result<String, String>, usize) {
+    let document = match parse_bounded_xml(xml, "test fixture") {
+        Ok(document) => document,
+        Err(error) => return (Err(error), budget_bytes),
+    };
+    let root = document
+        .descendants()
+        .find(|node| node.has_tag_name(local_name));
+    let Some(root) = root else {
+        let error = format!("WS-Security: test fixture missing {}", local_name);
+        return (Err(error), budget_bytes);
+    };
+    let mut budget = WorkBudget {
+        remaining: budget_bytes,
+    };
+    let canonical = exclusive_canonicalize(xml, root, &[], None, &mut budget);
+    let outcome = canonical.and_then(|bytes| {
+        String::from_utf8(bytes).map_err(|_| "WS-Security: canonical XML was not UTF-8".to_string())
+    });
+    (outcome, budget.remaining)
+}
+
+/// Source-subtree byte length of the element `local_name`, i.e. the amount
+/// `exclusive_canonicalize` charges before it walks anything.
+// Same `_test_support`-only reachability as above.
+#[allow(dead_code)]
+pub(crate) fn canonicalization_source_len_for_test(xml: &str, local_name: &str) -> Option<usize> {
+    let document = parse_bounded_xml(xml, "test fixture").ok()?;
+    let root = document
+        .descendants()
+        .find(|node| node.has_tag_name(local_name))?;
+    Some(root.range().len())
+}
+
 pub(crate) fn exclusive_canonicalize_element_for_test(
     xml: &str,
     local_name: &str,
@@ -5871,7 +6331,7 @@ fn canonicalize_node(
     excluded_node: Option<NodeId>,
     depth: usize,
     rendered_namespaces: &mut HashMap<String, String>,
-    output: &mut String,
+    output: &mut BoundedCanonicalOutput<'_>,
 ) -> Result<(), String> {
     if depth > MAX_CANONICALIZATION_DEPTH {
         return Err(format!(
@@ -5885,7 +6345,7 @@ fn canonicalize_node(
 
     if node.is_text() {
         if let Some(text) = node.text() {
-            push_canonical_text(output, text);
+            output.push_text(text)?;
         }
         return Ok(());
     }
@@ -5893,13 +6353,13 @@ fn canonicalize_node(
         return Ok(());
     }
     if let Some(pi) = node.pi() {
-        output.push_str("<?");
-        output.push_str(pi.target);
+        output.push_str("<?")?;
+        output.push_str(pi.target)?;
         if let Some(value) = pi.value {
-            output.push(' ');
-            output.push_str(value);
+            output.push(' ')?;
+            output.push_str(value)?;
         }
-        output.push_str("?>");
+        output.push_str("?>")?;
         return Ok(());
     }
     if !node.is_element() {
@@ -5907,8 +6367,8 @@ fn canonicalize_node(
     }
 
     let qname = element_qname(xml, node)?;
-    output.push('<');
-    output.push_str(qname);
+    output.push('<')?;
+    output.push_str(qname)?;
 
     let mut required_prefixes: Vec<(&str, bool)> = inclusive_prefixes
         .iter()
@@ -5969,25 +6429,25 @@ fn canonicalize_node(
     for (prefix, uri) in namespace_declarations {
         namespace_history.push((prefix.clone(), rendered_namespaces.get(&prefix).cloned()));
         rendered_namespaces.insert(prefix.clone(), uri.clone());
-        output.push_str(" xmlns");
+        output.push_str(" xmlns")?;
         if !prefix.is_empty() {
-            output.push(':');
-            output.push_str(&prefix);
+            output.push(':')?;
+            output.push_str(&prefix)?;
         }
-        output.push_str("=\"");
-        push_canonical_attribute_value(output, &uri);
-        output.push('"');
+        output.push_str("=\"")?;
+        output.push_attribute_value(&uri)?;
+        output.push('"')?;
     }
 
     attributes.sort_by(|left, right| left.0.cmp(right.0).then_with(|| left.1.cmp(right.1)));
     for (_, _, qname, value) in attributes {
-        output.push(' ');
-        output.push_str(qname);
-        output.push_str("=\"");
-        push_canonical_attribute_value(output, value);
-        output.push('"');
+        output.push(' ')?;
+        output.push_str(qname)?;
+        output.push_str("=\"")?;
+        output.push_attribute_value(value)?;
+        output.push('"')?;
     }
-    output.push('>');
+    output.push('>')?;
 
     for child in node.children() {
         canonicalize_node(
@@ -6001,9 +6461,9 @@ fn canonicalize_node(
         )?;
     }
 
-    output.push_str("</");
-    output.push_str(qname);
-    output.push('>');
+    output.push_str("</")?;
+    output.push_str(qname)?;
+    output.push('>')?;
 
     for (prefix, previous) in namespace_history.into_iter().rev() {
         if let Some(uri) = previous {
@@ -6034,32 +6494,6 @@ fn element_qname<'a>(xml: &'a str, node: Node<'_, '_>) -> Result<&'a str, String
     let name = extract_full_tag_name_from_tag(source.strip_prefix('<').unwrap_or(source))
         .ok_or_else(|| "WS-Security: canonicalized element has no qualified name".to_string())?;
     Ok(name)
-}
-
-fn push_canonical_text(output: &mut String, text: &str) {
-    for character in text.chars() {
-        match character {
-            '&' => output.push_str("&amp;"),
-            '<' => output.push_str("&lt;"),
-            '>' => output.push_str("&gt;"),
-            '\r' => output.push_str("&#xD;"),
-            other => output.push(other),
-        }
-    }
-}
-
-fn push_canonical_attribute_value(output: &mut String, value: &str) {
-    for character in value.chars() {
-        match character {
-            '&' => output.push_str("&amp;"),
-            '<' => output.push_str("&lt;"),
-            '"' => output.push_str("&quot;"),
-            '\t' => output.push_str("&#x9;"),
-            '\n' => output.push_str("&#xA;"),
-            '\r' => output.push_str("&#xD;"),
-            other => output.push(other),
-        }
-    }
 }
 
 fn extract_full_tag_name_from_tag(tag: &str) -> Option<&str> {

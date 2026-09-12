@@ -166,7 +166,8 @@ values are rejected at admission using the same canonicalizer:
   validator is warn-only.
 - `request_termination` `trigger.path_prefix` — rejected by the plugin
   constructor, and therefore by Admin API validation, file-mode startup, and DB
-  admission.
+  admission. Prefixes that cannot appear in a parsed `Uri::path()` (`?`, `#`,
+  or a literal space) are also refused so the trigger cannot be a silent no-op.
 
 A `~regex` `listen_path` is a *pattern*, not a literal path, so only the escape
 half of the contract applies to it. `\` and `.` are regex syntax there —

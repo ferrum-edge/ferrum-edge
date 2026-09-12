@@ -1907,6 +1907,17 @@ async fn a_non_identity_trigger_removes_an_auth_plugin_from_the_effective_reques
     let plugins = published(&cfg, "api");
     let consumer_index = ConsumerIndex::new(&[]);
 
+    assert!(plugins.iter().all(|plugin| plugin.has_execution_trigger()));
+    let mut unconditional = cfg.clone();
+    unconditional.plugin_configs[0].trigger = None;
+    // A priority-only wrapper must not be diagnosed as trigger-gated.
+    unconditional.plugin_configs[0].priority_override = Some(1050);
+    assert!(
+        published(&unconditional, "api")
+            .iter()
+            .all(|plugin| !plugin.has_execution_trigger())
+    );
+
     let mut public = request("GET", "/api/public");
     for plugin in &plugins {
         plugin.on_request_received(&mut public).await;

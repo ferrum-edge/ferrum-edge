@@ -549,6 +549,50 @@ const fn lower_hex_value(byte: u8) -> Option<u8> {
     }
 }
 
+/// Whether the pinned projected generation has been unlinked from its mount.
+///
+/// An `ENOENT` from `openat` inside a pinned generation is only a retryable
+/// rotation race when the generation itself is gone. Linux answers that from
+/// the directory's own link count — a reclaimed directory reports `nlink == 0`
+/// through an already-open fd — but that is a Linux guarantee, not a Unix one.
+/// On Darwin/APFS an open directory still reports `nlink == 2` after `rmdir`,
+/// so a link-count test there reports every reclaimed generation as a live
+/// directory missing one entry and misclassifies the rotation race as a
+/// permanently unbound reference.
+///
+/// The portable question is identity, not link count: a live generation is
+/// still an entry of the projection mount, so the pinned `(dev, ino)` is found
+/// by enumerating `mount_dir`; a reclaimed one is not. The link count stays as
+/// an authoritative Linux fast path, and anything it does not settle falls to
+/// the scan. A pin whose identity cannot be established at all keeps the
+/// conservative classification the metadata-failure default already used:
+/// unstable, so the caller retries rather than permanently rejecting.
+#[cfg(unix)]
+fn projected_generation_reclaimed(dir: &std::fs::File, mount_dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(pinned) = dir.metadata() else {
+        return true;
+    };
+    // Linux fast path: a reclaimed directory reports no links through an
+    // already-open fd. Every other Unix falls straight to the identity scan.
+    #[cfg(target_os = "linux")]
+    {
+        if pinned.nlink() == 0 {
+            return true;
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(mount_dir) else {
+        return true;
+    };
+    !entries.flatten().any(|entry| {
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            return false;
+        };
+        meta.dev() == pinned.dev() && meta.ino() == pinned.ino()
+    })
+}
+
 /// Read one entry's material through the pinned generation, or `Ok(None)` when
 /// the reference does not live in it.
 #[cfg(unix)]
@@ -579,8 +623,6 @@ fn read_pinned_material(
     let file = match open_at_nofollow(dir, name) {
         Ok(file) => file,
         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
-            use std::os::unix::fs::MetadataExt;
-
             // ENOENT has two materially different meanings. If kubelet
             // reclaimed the directory behind our pinned fd, the generation is
             // transiently unstable. If the pinned directory still exists, the
@@ -589,10 +631,7 @@ fn read_pinned_material(
             // directory. This makes a typo fail permanently as unbound instead
             // of masquerading as a rotation race, and lets an explicit digest
             // bind a legitimate regular file beside the projected entries.
-            let generation_reclaimed = dir
-                .metadata()
-                .map_or(true, |metadata| metadata.nlink() == 0);
-            if !generation_reclaimed {
+            if !projected_generation_reclaimed(dir, mount_dir) {
                 return Ok(None);
             }
             return Err(TrustBundleLoadError::new(

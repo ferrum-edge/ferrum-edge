@@ -53,15 +53,19 @@
 //! fields will ignore them, so operators must upgrade DPs before relying on
 //! collapsed routes that clear inherited retry or timeout policy.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use std::collections::HashMap;
+use std::net::Ipv6Addr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
+use http::Method;
+use http::header::HeaderName;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::warn;
 
 use crate::config::types::{
     BackendTlsConfig, BackoffStrategy, MAX_BACKEND_HOST_LENGTH,
@@ -210,6 +214,7 @@ impl MeshRouteDispatchConfig {
                         "mesh_route_dispatch.rules[{idx}].destination.backend_host must not contain whitespace"
                     ));
                 }
+                validate_route_backend_host(idx, trimmed)?;
                 *host = trimmed.to_ascii_lowercase();
             }
             let has_backend_host = rule.destination.backend_host.is_some();
@@ -270,6 +275,57 @@ impl MeshRouteDispatchConfig {
         }
         Ok(())
     }
+}
+
+/// Reject a direct-backend host that is not a bare host.
+///
+/// `destination.backend_host` is published verbatim onto
+/// `RequestContext::route_override_backend_host`, and the dispatch path hands
+/// that straight to DNS resolution with `backend_port` supplied separately. A
+/// value that also carries an authority port (`svc:8080`), a path, a query, a
+/// fragment, or userinfo therefore resolves to nothing: admission accepts the
+/// contradictory endpoint and every matching request answers 502
+/// `connection_failure` instead. Catching it here turns a live route outage
+/// back into a config error the operator sees at `validate` time.
+///
+/// IPv6 literals stay legal in both the bare (`::1`) and bracketed (`[::1]`)
+/// spellings — this is a host-grammar check, not a colon ban.
+fn validate_route_backend_host(rule_idx: usize, host: &str) -> Result<(), String> {
+    let reject = |reason: &str| -> Result<(), String> {
+        Err(format!(
+            "mesh_route_dispatch.rules[{rule_idx}].destination.backend_host must be a bare \
+             host — a DNS name, an IPv4 literal, or an IPv6 literal written as `::1` or \
+             `[::1]` — with the port carried by backend_port: {reason}"
+        ))
+    };
+    if let Some(rest) = host.strip_prefix('[') {
+        let Some(inner) = rest.strip_suffix(']') else {
+            return reject("a bracketed IPv6 literal must not carry a port");
+        };
+        if inner.parse::<Ipv6Addr>().is_err() {
+            return reject("the bracketed value is not a valid IPv6 literal");
+        }
+        return Ok(());
+    }
+    if host.contains('/') {
+        return reject("it must not contain a path");
+    }
+    if host.contains('?') {
+        return reject("it must not contain a query");
+    }
+    if host.contains('#') {
+        return reject("it must not contain a fragment");
+    }
+    if host.contains('@') {
+        return reject("it must not contain userinfo");
+    }
+    if host.contains(']') {
+        return reject("a `]` must close a bracketed IPv6 literal");
+    }
+    if host.contains(':') && host.parse::<Ipv6Addr>().is_err() {
+        return reject("it must not contain a port");
+    }
+    Ok(())
 }
 
 fn validate_fault_action(rule_idx: usize, fault: &FaultActionConfig) -> Result<(), String> {
@@ -1521,8 +1577,12 @@ impl MeshRouteDispatch {
         })
     }
 
-    /// Public for tests.
-    #[cfg(test)]
+    /// The compiled rule list, in evaluation order.
+    ///
+    /// External test crates (`tests/unit/plugins/mesh_route_dispatch_tests.rs`)
+    /// read this to assert what admission normalized — header-match keys, for
+    /// one — so it must stay unconditionally public rather than `#[cfg(test)]`,
+    /// which is invisible outside this crate's own test build.
     pub fn rules(&self) -> &[RouteRule] {
         &self.config.rules
     }
@@ -1702,6 +1762,18 @@ fn compile_uri_matcher(
     Ok(Some(matcher))
 }
 
+/// Normalize `match.headers` keys to their canonical lowercase form, rejecting
+/// any name a well-formed request can never carry.
+///
+/// The hot path is one `HashMap::get` against the in-flight header map, whose
+/// keys are already parsed HTTP field names. A predicate keyed on `""` or
+/// `"x bad"` therefore compiles cleanly and then never fires: with the default
+/// soft fallback the traffic keeps reaching the proxy's default backend
+/// (hiding a broken canary rule), and under `reject_unmatched` the rule can
+/// serve no valid request at all. `HeaderName::from_bytes` is the same RFC
+/// 9110 token parser route header-transform destinations and the
+/// VirtualService translator already use, and it performs the ASCII-lowercase
+/// normalization this function used to do by hand.
 fn normalize_header_match_keys(
     rule_idx: usize,
     headers: &mut HashMap<String, HeaderMatchOp>,
@@ -1712,7 +1784,17 @@ fn normalize_header_match_keys(
 
     let mut normalized = HashMap::with_capacity(headers.len());
     for (name, expected) in std::mem::take(headers) {
-        let key = name.to_ascii_lowercase();
+        let key = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| {
+                format!(
+                    "mesh_route_dispatch.rules[{rule_idx}].match.headers contains `{}`, \
+                     which is not a valid HTTP header name (RFC 9110 token) and can \
+                     therefore never match a request",
+                    crate::modes::mesh::config::sanitize_mesh_ext_authz_diagnostic(&name)
+                )
+            })?
+            .as_str()
+            .to_string();
         if normalized.insert(key.clone(), expected).is_some() {
             return Err(format!(
                 "mesh_route_dispatch.rules[{rule_idx}].match.headers contains duplicate \
@@ -1721,6 +1803,37 @@ fn normalize_header_match_keys(
         }
     }
     *headers = normalized;
+    Ok(())
+}
+
+/// Reject a literal method predicate no well-formed request can satisfy.
+///
+/// RFC 9110 §9.1 defines the request method as a `token`, and the hot path
+/// compares it with `==` (exact) or `starts_with` (prefix). An empty operand,
+/// or one carrying a space (`"GET POST"`), a control byte, or a separator, is
+/// therefore unmatchable: the rule passes admission and then never fires —
+/// silently serving the proxy's default backend under the soft default, or
+/// serving nothing at all under `reject_unmatched`.
+///
+/// `Method::from_bytes` is the token parser the outbound H1/H2/H3 adapters
+/// already use. It preserves operator casing and admits extension methods
+/// (`PROPFIND`, `M-SEARCH`, a deliberately lowercase `get`), so this checks
+/// the grammar without narrowing the predicate to the standard-method enum.
+/// A nonempty prefix of a token is itself a token, so `prefix` uses the same
+/// parser. `regex` operands are unaffected — they are patterns, not tokens.
+fn validate_method_token(
+    rule_idx: usize,
+    op_idx: usize,
+    operator: &str,
+    value: &str,
+) -> Result<(), String> {
+    if Method::from_bytes(value.as_bytes()).is_err() {
+        return Err(format!(
+            "mesh_route_dispatch.rules[{rule_idx}].match.methods[{op_idx}].{operator} must be \
+             a non-empty HTTP method token (RFC 9110 §9.1); a value containing a space or any \
+             other non-token character can never match a request method"
+        ));
+    }
     Ok(())
 }
 
@@ -1746,8 +1859,9 @@ fn compile_method_matchers(
     let mut compiled = Vec::with_capacity(methods.len());
     for (op_idx, op) in methods.iter().enumerate() {
         let matcher = match op {
-            MethodMatchOp::Legacy(value) => MethodMatcher::Exact(value.clone()),
-            MethodMatchOp::Tagged(MethodStringMatch::Exact(value)) => {
+            MethodMatchOp::Legacy(value)
+            | MethodMatchOp::Tagged(MethodStringMatch::Exact(value)) => {
+                validate_method_token(rule_idx, op_idx, "exact", value)?;
                 MethodMatcher::Exact(value.clone())
             }
             MethodMatchOp::Tagged(MethodStringMatch::Prefix(prefix)) => {
@@ -1757,6 +1871,7 @@ fn compile_method_matchers(
                          must not be empty (every method would match — likely a misconfiguration)"
                     ));
                 }
+                validate_method_token(rule_idx, op_idx, "prefix", prefix)?;
                 MethodMatcher::Prefix(prefix.to_ascii_uppercase())
             }
             MethodMatchOp::Tagged(MethodStringMatch::Regex(pattern)) => {
@@ -1904,7 +2019,7 @@ impl Plugin for MeshRouteDispatch {
             if let Some(ambiguity) = query.first_ambiguity() {
                 // Fixed-cardinality reason only — the query is
                 // attacker-controlled and may carry credentials.
-                warn!(
+                warn_sampled!(
                     plugin = "mesh_route_dispatch",
                     reason = "ambiguous_query",
                     ambiguity = ambiguity.reason(),
@@ -2077,6 +2192,25 @@ fn is_false(value: &bool) -> bool {
 /// query string already lives in `ctx.query_params` / the dispatch
 /// `query_string`, so this operates on the path component only.
 ///
+/// Prefix replacement is literal: the unmatched suffix is appended verbatim,
+/// so a prefix that ends inside a path segment keeps that segment intact
+/// (`/prefix/old` → `/new` forwards `/prefix/oldtail` as `/newtail`, not
+/// `/new/tail`). Two boundary adjustments survive that:
+///
+/// - a doubled separator collapses when BOTH sides carry a `/` — Envoy's
+///   documented `prefix: /prefix` + `prefix_rewrite: /` case, where
+///   `/prefix/etc` must forward as `/etc` rather than `//etc`;
+/// - a suffix that opens with a `.` keeps its own segment boundary. Fusing it
+///   into the replacement's last segment would relabel the traversal operand
+///   the client wrote immediately after the matched prefix as ordinary segment
+///   text (`/api../admin` → `/v2../admin`), so the `canonicalize_policy_path`
+///   check the caller runs before publishing the override would no longer see
+///   the `..` and would forward what it must refuse. Synthesizing the
+///   separator keeps that composition `/v2/../admin`, which is rejected with
+///   400 exactly as it was before literal substitution. A dot-leading suffix
+///   that is not itself a dot segment (`..hidden`) still forwards — as its
+///   own segment, which is where the client wrote it.
+///
 /// When `match_prefix` is `None` (exact / regex match, or no `match.uri`)
 /// the whole path is replaced.
 fn rewrite_request_path(
@@ -2102,21 +2236,25 @@ fn rewrite_request_path(
             _ => return replacement.to_string(),
         },
     };
-    // Join `replacement` + `tail` without doubling or dropping a `/`.
+    // Join `replacement` + `tail` without doubling a `/` and — outside the
+    // dot-leading case above — without synthesizing one at a boundary that had
+    // none: inserting a separator would move the request into a different path
+    // segment than the literal prefix substitution Istio `HTTPRewrite` and
+    // Envoy `prefix_rewrite` specify.
     let mut out = String::with_capacity(replacement.len() + tail.len() + 1);
     out.push_str(replacement);
-    if tail.is_empty() {
-        return out;
-    }
-    let repl_slash = replacement.ends_with('/');
-    let tail_slash = tail.starts_with('/');
-    if repl_slash && tail_slash {
-        out.push_str(&tail[1..]);
-    } else if !repl_slash && !tail_slash {
-        out.push('/');
-        out.push_str(tail);
-    } else {
-        out.push_str(tail);
+    let replacement_slash = replacement.ends_with('/');
+    match tail.strip_prefix('/') {
+        // Both sides carry the separator — drop the duplicate.
+        Some(rest) if replacement_slash => out.push_str(rest),
+        // Neither side carries it and the suffix opens a dot-leading segment:
+        // preserve the boundary so the caller's canonical check still sees a
+        // whole `.` / `..` segment instead of a fused ordinary one.
+        None if !replacement_slash && tail.starts_with('.') => {
+            out.push('/');
+            out.push_str(tail);
+        }
+        _ => out.push_str(tail),
     }
     out
 }
@@ -5553,13 +5691,49 @@ mod tests {
 
     #[test]
     fn rewrite_request_path_joins_without_doubling_slash() {
+        // Envoy's documented `/prefix` + `/` pairing: the tail already carries
+        // the separator, so the replacement's trailing one is dropped.
         assert_eq!(
             rewrite_request_path("/api/users", "/v2/", Some("/api")),
             "/v2/users"
         );
+        // Istio HTTPRewrite / Envoy prefix_rewrite replace the matched prefix
+        // literally, so a prefix ending inside a segment must NOT gain a
+        // synthesized separator (that would forward a different path than
+        // literal substitution produces).
         assert_eq!(
             rewrite_request_path("/apiusers", "/v2", Some("/api")),
-            "/v2/users"
+            "/v2users"
+        );
+        assert_eq!(
+            rewrite_request_path("/prefix/oldtail", "/new", Some("/prefix/old")),
+            "/newtail"
+        );
+        // The ignoreUriCase length-strip path shares the same join.
+        assert_eq!(
+            rewrite_request_path("/apiusers", "/v2", Some("/Api")),
+            "/v2users"
+        );
+        // A dot-leading suffix is the exception: fusing it would relabel the
+        // client's `..` as ordinary segment text, so the boundary is kept and
+        // the caller's canonical check still refuses the composition.
+        assert_eq!(
+            rewrite_request_path("/api../admin", "/v2", Some("/api")),
+            "/v2/../admin"
+        );
+        assert_eq!(
+            rewrite_request_path("/api./users", "/v2", Some("/api")),
+            "/v2/./users"
+        );
+        assert_eq!(
+            rewrite_request_path("/api..hidden/users", "/v2", Some("/api")),
+            "/v2/..hidden/users"
+        );
+        // A trailing separator on the replacement already supplies the
+        // boundary, so nothing is synthesized on top of it.
+        assert_eq!(
+            rewrite_request_path("/api../admin", "/v2/", Some("/api")),
+            "/v2/../admin"
         );
         // Empty tail keeps the replacement verbatim.
         assert_eq!(rewrite_request_path("/api", "/v2", Some("/api")), "/v2");

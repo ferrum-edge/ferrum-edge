@@ -8852,6 +8852,92 @@ async fn test_stream_proxy_admin_persists_only_valid_shared_sni_listener_groups(
     );
 }
 
+#[tokio::test]
+async fn batch_rejects_stream_port_conflict_with_persisted_proxy() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let existing = json!({
+        "id": "batch-port-existing",
+        "backend_scheme": "tcp",
+        "backend_host": "existing.internal",
+        "backend_port": 5432,
+        "listen_port": 19014
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &existing).await;
+    assert_eq!(status, 201, "stream proxy seed failed: {body:?}");
+
+    let conflicting_batch = json!({
+        "proxies": [{
+            "id": "batch-port-conflict",
+            "backend_scheme": "tcp",
+            "backend_host": "conflict.internal",
+            "backend_port": 5432,
+            "listen_port": 19014
+        }]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &conflicting_batch).await;
+
+    assert_eq!(
+        status, 400,
+        "batch persisted a conflicting stream port: {body:?}"
+    );
+    assert!(
+        body.to_string().contains("Duplicate listen_port 19014"),
+        "expected the canonical listener-group conflict diagnostic: {body:?}"
+    );
+    let (status, _, _) = admin_get(&base_url, "/proxies/batch-port-conflict", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_FOUND,
+        "rejected stream proxy must not be persisted"
+    );
+}
+
+/// A batch that joins an existing, valid shared-SNI listener group must be
+/// admitted: the port-bucket candidate is re-projected (`resolve_upstream_tls`)
+/// and limited to the ports the batch touches, so neither a half-projected
+/// peer nor an unrelated legacy conflict elsewhere in the namespace can turn a
+/// valid group into a rejection.
+#[tokio::test]
+async fn batch_admits_stream_proxy_joining_valid_shared_sni_group() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let tenant_a = json!({
+        "id": "batch-sni-tenant-a",
+        "backend_scheme": "tcp",
+        "backend_host": "tenant-a.internal",
+        "backend_port": 443,
+        "listen_port": 19015,
+        "hosts": ["tenant-a.example.com"]
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &tenant_a).await;
+    assert_eq!(status, 201, "stream proxy seed failed: {body:?}");
+
+    let joining_batch = json!({
+        "proxies": [{
+            "id": "batch-sni-tenant-b",
+            "backend_scheme": "tcp",
+            "backend_host": "tenant-b.internal",
+            "backend_port": 443,
+            "listen_port": 19015,
+            "hosts": ["tenant-b.example.com"]
+        }]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &joining_batch).await;
+    assert_eq!(
+        status, 201,
+        "a valid shared-SNI group must survive batch admission: {body:?}"
+    );
+    let (status, _, _) = admin_get(&base_url, "/proxies/batch-sni-tenant-b", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+}
+
 /// An L4 `stream_match` group of `tcps` proxies is a shape the shared-port
 /// validator explicitly admits, so Admin admission must admit it too.
 ///
@@ -9332,6 +9418,53 @@ async fn test_cluster_endpoint_requires_auth() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn test_cluster_endpoint_reports_authenticated_configsync_subscription() {
+    use ferrum_edge::grpc::cp_server::{CpGrpcServer, DpNodeRegistry};
+    use ferrum_edge::grpc::dp_client::generate_dp_jwt;
+    use ferrum_edge::grpc::proto::SubscribeRequest;
+    use ferrum_edge::grpc::proto::config_sync_server::ConfigSync;
+
+    let tc = TestConfig::default();
+    let registry = Arc::new(DpNodeRegistry::new());
+    let mut state = create_pagination_admin_state(&tc);
+    state.mode = "cp".to_string();
+    state.dp_registry = Some(registry.clone());
+    let secret = "test-cluster-configsync-secret";
+    let (server, _tx) = CpGrpcServer::builder(
+        Arc::new(ArcSwap::from_pointee(GatewayConfig::default())),
+        secret.to_string(),
+    )
+    .registry(registry)
+    .build();
+    let mut request = tonic::Request::new(SubscribeRequest {
+        node_id: "cluster-dp".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "ferrum".to_string(),
+        real_ip_header: Some(String::new()),
+        supports_heartbeat: false,
+    });
+    let dp_token = generate_dp_jwt(secret, "cluster-dp").unwrap();
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {dp_token}").parse().unwrap(),
+    );
+    let stream = server.subscribe(request).await.unwrap();
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/cluster", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["connected_data_planes"], 1);
+    assert_eq!(body["data_planes"][0]["node_id"], "cluster-dp");
+    assert_eq!(body["data_planes"][0]["status"], "online");
+
+    drop(stream);
+    let (status, body, _) = admin_get(&base_url, "/cluster", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["connected_data_planes"], 0);
 }
 
 #[tokio::test]

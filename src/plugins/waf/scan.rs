@@ -393,6 +393,16 @@ impl Waf {
         }
     }
 
+    /// Match a byte rule set over one inspection view.
+    ///
+    /// False-positive filtering is defined over the COMPLETE inspected target,
+    /// so a body carrying a non-UTF-8 byte must be filtered exactly like a
+    /// valid-UTF-8 one: the byte path used to record hits without consulting
+    /// either per-rule `fp_filters` or global `fp_capture_filters`, so an
+    /// operator inspecting binary or legacy-encoded content got false blocks
+    /// their filter should have suppressed (issue #5118). The lossy view is
+    /// materialized once per matched view — never per hit, and never for a view
+    /// nothing matched — and borrows outright when the bytes are already UTF-8.
     fn scan_bytes_set(
         &self,
         outcome: &mut ScanOutcome,
@@ -403,13 +413,13 @@ impl Waf {
         let Some(set) = set else {
             return;
         };
-        for index in set.set.matches(value) {
-            let rule_ref = &set.refs[index];
-            if let Ok(text) = std::str::from_utf8(value) {
-                self.push_if_allowed(outcome, rule_ref, text, subject, None);
-            } else {
-                self.push_if_allowed_bytes(outcome, rule_ref, subject);
-            }
+        let matches = set.set.matches(value);
+        if !matches.matched_any() {
+            return;
+        }
+        let text = String::from_utf8_lossy(value);
+        for index in matches {
+            self.push_if_allowed(outcome, &set.refs[index], text.as_ref(), subject, None);
         }
     }
 
@@ -772,20 +782,6 @@ impl Waf {
             && !self.exemptions.suppresses_value(value)
             && !rule.suppresses_text(value)
         {
-            outcome.push(RuleHit {
-                rule_index: rule_ref.rule_index,
-                target_name: rule_ref.target_name,
-            });
-        }
-    }
-
-    fn push_if_allowed_bytes(
-        &self,
-        outcome: &mut ScanOutcome,
-        rule_ref: &RuleRef,
-        subject: ScanSubject<'_>,
-    ) {
-        if self.rule_applies(subject, rule_ref.rule_index) {
             outcome.push(RuleHit {
                 rule_index: rule_ref.rule_index,
                 target_name: rule_ref.target_name,

@@ -14,6 +14,8 @@ WebSocket requests are classified once by `detect_http_flavor()` and routed sepa
 
 The H3 frontend is gated by `FERRUM_HTTP3_WEBSOCKET_ENABLED` (default: `true`). When disabled, the H3 listener does not advertise Extended CONNECT support and returns `501` to WebSocket CONNECT requests. See [FEATURES.md](FEATURES.md) and [docs/http3.md](docs/http3.md).
 
+Client-to-server frame masking is RFC 6455 §5.1 on all three frontends. RFC 8441 §5 and RFC 9220 §3 bootstrap the session over a CONNECT stream and then hand it to RFC 6455 unchanged, so there is no HTTP/2 or HTTP/3 masking exemption: the gateway unmasks masked client frames before the frame plugins run, re-encodes them under the backend transport's own role, and closes a client that sends an unmasked frame with `1002`.
+
 Common path after classification:
 
 1. **Route matching** - Uses the same router cache as HTTP for O(1) lookups

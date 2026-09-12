@@ -28,11 +28,10 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::cell::RefCell;
 use std::fmt::Write;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 use tracing::debug;
 
@@ -40,6 +39,7 @@ use crate::config::PoolConfig;
 use crate::config::types::{Proxy, UpstreamTarget};
 use crate::dns::DnsCache;
 use crate::identity::{SharedSvidBundle, SpiffeId, SvidBundle, TrustDomain};
+use crate::pool::{SharedCreationRole, SharedCreationSlot};
 use crate::proxy::body::{ReplayableRequestBody, SizeLimitedIncoming};
 use crate::proxy::mesh_trust_registry::{
     MESH_TRUST_WITHDRAWN_MESSAGE, MeshTransportGate, MeshTransportKind, MeshTransportRegistration,
@@ -219,6 +219,46 @@ impl std::error::Error for MeshMtlsSenderError {
 pub struct MeshMtlsSender {
     inner: http2::SendRequest<MeshMtlsRequestBody>,
     gate: MeshTransportGate,
+    /// Requests dispatched on this physical connection whose response head has
+    /// not arrived yet, shared by every clone of the same transport. This is
+    /// the pool's load signal (issue #5043): hyper's H2 `SendRequest::ready()`
+    /// is always ready while the connection is open, so it carries no load
+    /// information at all.
+    pending: Arc<AtomicUsize>,
+}
+
+pin_project_lite::pin_project! {
+    /// Response-head future that keeps [`MeshMtlsSender::pending_requests`]
+    /// accurate: the count drops when the head arrives, when hyper fails the
+    /// request, or when the caller abandons the future (deadline, cancellation).
+    struct PendingResponse<F> {
+        #[pin]
+        inner: F,
+        pending: Option<Arc<AtomicUsize>>,
+    }
+
+    impl<F> PinnedDrop for PendingResponse<F> {
+        fn drop(this: Pin<&mut Self>) {
+            settle_pending(this.project().pending);
+        }
+    }
+}
+
+fn settle_pending(pending: &mut Option<Arc<AtomicUsize>>) {
+    if let Some(pending) = pending.take() {
+        pending.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl<F: std::future::Future> std::future::Future for PendingResponse<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let output = std::task::ready!(this.inner.poll(cx));
+        settle_pending(this.pending);
+        Poll::Ready(output)
+    }
 }
 
 /// Pool-internal name for one established mesh-mTLS HTTP/2 transport. The
@@ -248,6 +288,7 @@ impl MeshMtlsSender {
         Self {
             inner,
             gate: MeshTransportGate::new(),
+            pending: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -255,12 +296,23 @@ impl MeshMtlsSender {
         inner: http2::SendRequest<MeshMtlsRequestBody>,
         gate: MeshTransportGate,
     ) -> Self {
-        Self { inner, gate }
+        Self {
+            inner,
+            gate,
+            pending: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     #[inline]
     pub fn is_retired(&self) -> bool {
         self.gate.is_retired()
+    }
+
+    /// Requests sent on this physical connection (through any clone) that are
+    /// still waiting for their response head. One relaxed load.
+    #[inline]
+    pub fn pending_requests(&self) -> usize {
+        self.pending.load(Ordering::Relaxed)
     }
 
     /// True when the gate is retired or the underlying H2 client has closed.
@@ -298,13 +350,19 @@ impl MeshMtlsSender {
         &mut self,
         request: http::Request<MeshMtlsRequestBody>,
     ) -> Result<
-        impl std::future::Future<Output = Result<hyper::Response<hyper::body::Incoming>, hyper::Error>>,
+        impl std::future::Future<Output = Result<hyper::Response<hyper::body::Incoming>, hyper::Error>>
+        + use<>,
         HbonePoolError,
     > {
         if self.gate.is_retired() {
             return Err(HbonePoolError::TrustWithdrawn);
         }
-        Ok(self.inner.send_request(request))
+        let pending = Arc::clone(&self.pending);
+        pending.fetch_add(1, Ordering::Relaxed);
+        Ok(PendingResponse {
+            inner: self.inner.send_request(request),
+            pending: Some(pending),
+        })
     }
 }
 
@@ -586,9 +644,39 @@ const MAX_RETIRED_SVID_GENERATIONS: usize = 16;
 /// must not grow unbounded either.
 const MAX_RETIRED_FINGERPRINTS_PER_GENERATION: usize = 8;
 
+/// Per-key coalesced-creation slot for the sidecar mesh-mTLS pool (issue
+/// #5046). Same shape as the HBONE pool's slot: the serialization mutex the
+/// pool has always used, plus a generation-scoped broadcast of the creator's
+/// own typed [`HbonePoolError`] (shared behind an `Arc`, rebuilt per waiter
+/// with [`HbonePoolError::clone_for_broadcast`]).
+pub(crate) type MeshMtlsCreationSlot = SharedCreationSlot<Arc<HbonePoolError>>;
+
+/// Pending response heads on the least-loaded pooled connection at or above
+/// which a checkout tries to add one more physical connection for its key
+/// (issue #5043), never exceeding `http2_connections_per_host`.
+///
+/// One hyper H2 connection is one driver task: on a loopback mTLS bench its
+/// throughput sat flat at ~70k req/s / ~2.5 GB/s from 16 to 512 concurrent
+/// streams, while four connections gave 1.8-3.2x that with ~2x lower p50.
+/// The same bench showed widening costs CPU per request only for bulk bodies
+/// at low concurrency, so width follows measured pressure rather than being
+/// eager: sequential and lightly concurrent traffic keeps one connection.
+pub const MESH_MTLS_GROWTH_PENDING_PER_CONNECTION: usize = 8;
+
+/// After a growth dial fails (peer down, `maxConnections` reached, TLS/DNS
+/// error), growth for that key is not retried for this long. Requests keep
+/// flowing on the existing connections; only the widening pauses.
+const MESH_MTLS_GROWTH_BACKOFF_SECS: u64 = 10;
+
 pub struct MeshMtlsConnectionPool {
     entries: DashMap<String, Vec<MeshMtlsPoolEntry>>,
-    creation_locks: DashMap<String, Arc<Mutex<()>>>,
+    /// key -> unix seconds before which no growth dial is attempted for the
+    /// key. Written only when a growth dial fails; pruned with idle entries.
+    growth_backoff_until: DashMap<String, u64>,
+    /// Per-key creation slots: the serialization mutex plus the failure
+    /// broadcast that releases every caller queued behind a failed dial
+    /// instead of letting each repeat it (issue #5046).
+    creation_locks: DashMap<String, Arc<MeshMtlsCreationSlot>>,
     gateway_svid: SharedSvidBundle,
     crls: crate::tls::SharedCrlList,
     svid_identity_cache: ArcSwap<Option<MeshMtlsSvidIdentityCache>>,
@@ -687,6 +775,7 @@ impl MeshMtlsConnectionPool {
     ) -> Self {
         Self {
             entries: DashMap::with_shard_amount(shard_amount),
+            growth_backoff_until: DashMap::new(),
             creation_locks: DashMap::with_shard_amount(shard_amount),
             gateway_svid,
             crls,
@@ -962,6 +1051,7 @@ impl MeshMtlsConnectionPool {
     ) -> Result<MeshMtlsSender, HbonePoolError> {
         let fingerprint = self.current_svid_fingerprint_cached()?;
         let pool_config = self.pool_config.for_proxy(proxy);
+        let max_entries = pool_config.http2_connections_per_host.max(1);
 
         let fast_sender = with_mesh_mtls_pool_key(
             target_host,
@@ -975,7 +1065,45 @@ impl MeshMtlsConnectionPool {
             &pool_config,
             |key| self.try_cached_sender_read(key),
         );
-        if let Some(transport) = fast_sender {
+        if let Some((transport, live_connections)) = fast_sender {
+            // The least-loaded connection is still carrying at least the
+            // growth threshold of unanswered requests and the key has room:
+            // try to widen (issue #5043). Growth is opportunistic — a busy
+            // creation lock, a backoff, or a failed dial all leave this
+            // request on the connection it already has.
+            if live_connections < max_entries
+                && transport.pending_requests() >= MESH_MTLS_GROWTH_PENDING_PER_CONNECTION
+            {
+                let key = with_mesh_mtls_pool_key(
+                    target_host,
+                    app_port,
+                    mtls_port,
+                    proxy.dns_override.as_deref(),
+                    fingerprint.as_ref(),
+                    expected_peer,
+                    sni_override,
+                    expected_trust_domain,
+                    &pool_config,
+                    |key| key.to_string(),
+                );
+                if let Some(grown) = self
+                    .try_grow_sender(
+                        proxy,
+                        target_host,
+                        app_policy_port,
+                        mtls_port,
+                        expected_peer,
+                        expected_trust_domain,
+                        sni_override,
+                        &key,
+                        &pool_config,
+                        max_entries,
+                    )
+                    .await
+                {
+                    return Ok(grown);
+                }
+            }
             return Ok(transport);
         }
 
@@ -1366,35 +1494,190 @@ impl MeshMtlsConnectionPool {
     ) -> Result<MeshMtlsTransport, HbonePoolError> {
         self.maybe_prune_idle_entries();
         let max_entries = pool_config.http2_connections_per_host.max(1);
-        if let Some(transport) = self.cached_sender(key, max_entries) {
+        if let Some(transport) = self.cached_sender(key) {
             return Ok(transport);
         }
 
-        let effective_connect_timeout_ms = proxy
+        let effective_connect_timeout_ms =
+            self.effective_connect_timeout_ms(proxy, app_policy_port);
+        let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
+        let creation_started = Instant::now();
+        let creation_slot = self.creation_slot(key);
+        // Join the cohort BEFORE awaiting the lock: subscribing is what scopes
+        // this caller to the attempt that is in flight right now, so it can be
+        // released by that attempt's failure instead of repeating the dial
+        // (issue #5046). Every waiter keeps its OWN `connect_timeout` here.
+        let cohort = creation_slot.join();
+        let joined = tokio::time::timeout(connect_timeout, cohort.wait()).await;
+        let mut creation_lease = match joined {
+            Ok(SharedCreationRole::Creator(lease)) => lease,
+            Ok(SharedCreationRole::Failed(shared)) => return Err(shared.clone_for_broadcast()),
+            Err(_) => {
+                return Err(HbonePoolError::ConnectTimeout {
+                    addr: format!("{target_host}:{mtls_port}"),
+                    timeout_ms: effective_connect_timeout_ms,
+                });
+            }
+        };
+        // Double-check under the creation lock: a coalesced waiter may find the
+        // winner's connection already inserted.
+        if let Some(transport) = self.cached_sender(key) {
+            return Ok(transport);
+        }
+        // A concurrent creator for this key failed while this caller was queued
+        // for the creation lock: adopt that cohort's typed outcome instead of
+        // repeating the same dial (issue #5046). Checked AFTER the cache
+        // re-check so a usable connection always wins over a shared failure,
+        // and before any budget is spent on a dial.
+        if let Some(shared) = creation_lease.take_broadcast_failure() {
+            return Err(shared.clone_for_broadcast());
+        }
+
+        self.dial_and_publish(
+            Some(&creation_lease),
+            proxy,
+            target_host,
+            app_policy_port,
+            mtls_port,
+            expected_peer,
+            expected_trust_domain,
+            sni_override,
+            key,
+            pool_config,
+            max_entries,
+            creation_started,
+            connect_timeout,
+            effective_connect_timeout_ms,
+        )
+        .await
+    }
+
+    fn effective_connect_timeout_ms(&self, proxy: &Proxy, app_policy_port: u16) -> u64 {
+        proxy
             .dispatch_port_overrides
             .as_ref()
             .and_then(|m| m.get(&app_policy_port))
             .and_then(|o| o.connect_timeout_ms)
-            .unwrap_or(proxy.backend_connect_timeout_ms);
-        let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
-        let creation_started = Instant::now();
-        let creation_lock = self
-            .creation_locks
-            .entry(key.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
-        let _creation_guard = tokio::time::timeout(connect_timeout, creation_lock.lock())
-            .await
-            .map_err(|_| HbonePoolError::ConnectTimeout {
-                addr: format!("{target_host}:{mtls_port}"),
-                timeout_ms: effective_connect_timeout_ms,
-            })?;
-        // Double-check under the creation lock: a coalesced waiter may find the
-        // winner's connection already inserted.
-        if let Some(transport) = self.cached_sender(key, max_entries) {
-            return Ok(transport);
-        }
+            .unwrap_or(proxy.backend_connect_timeout_ms)
+    }
 
+    fn creation_slot(&self, key: &str) -> Arc<MeshMtlsCreationSlot> {
+        self.creation_locks
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(MeshMtlsCreationSlot::new()))
+            .clone()
+    }
+
+    /// Add one physical connection to a key that already has a usable one
+    /// (issue #5043). Returns the new transport, or `None` whenever growth is
+    /// not possible right now — the caller then serves on the connection it
+    /// already checked out. Never waits for the creation lock: a cold dial or
+    /// another grower in flight means "not now", not "queue".
+    #[allow(clippy::too_many_arguments)]
+    async fn try_grow_sender(
+        &self,
+        proxy: &Proxy,
+        target_host: &str,
+        app_policy_port: u16,
+        mtls_port: u16,
+        expected_peer: Option<&SpiffeId>,
+        expected_trust_domain: Option<&TrustDomain>,
+        sni_override: Option<&str>,
+        key: &str,
+        pool_config: &PoolConfig,
+        max_entries: usize,
+    ) -> Option<MeshMtlsTransport> {
+        let now = unix_secs();
+        if self
+            .growth_backoff_until
+            .get(key)
+            .is_some_and(|until| *until.value() > now)
+        {
+            return None;
+        }
+        let creation_slot = self.creation_slot(key);
+        let creation_lease = creation_slot.try_claim()?;
+        // Re-check under the lock: another grower may have widened the key
+        // (or a prune may have narrowed it) since the fast-path read.
+        let live_connections = self
+            .entries
+            .get(key)
+            .map(|entries| entries.value().len())
+            .unwrap_or(0);
+        if live_connections >= max_entries {
+            return None;
+        }
+        let effective_connect_timeout_ms =
+            self.effective_connect_timeout_ms(proxy, app_policy_port);
+        let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
+        let dialed = self
+            .dial_and_publish(
+                None,
+                proxy,
+                target_host,
+                app_policy_port,
+                mtls_port,
+                expected_peer,
+                expected_trust_domain,
+                sni_override,
+                key,
+                pool_config,
+                max_entries,
+                Instant::now(),
+                connect_timeout,
+                effective_connect_timeout_ms,
+            )
+            .await;
+        drop(creation_lease);
+        match dialed {
+            Ok(transport) => {
+                debug!(
+                    target_host,
+                    mtls_port,
+                    expected_peer = expected_peer_display(expected_peer),
+                    connections = live_connections + 1,
+                    max_connections = max_entries,
+                    "Widened sidecar SVID-mTLS HTTP/2 pool under load"
+                );
+                Some(transport)
+            }
+            Err(err) => {
+                self.growth_backoff_until
+                    .insert(key.to_string(), now + MESH_MTLS_GROWTH_BACKOFF_SECS);
+                debug!(
+                    target_host,
+                    mtls_port,
+                    expected_peer = expected_peer_display(expected_peer),
+                    error = %err,
+                    "Sidecar SVID-mTLS pool growth dial failed; continuing on existing connections"
+                );
+                None
+            }
+        }
+    }
+
+    /// Dial one physical connection for `key` while holding its creation lock,
+    /// then pool it if the TLS material it was built from is still current.
+    /// `cohort` is the cold path's lease, whose waiters receive a dial failure
+    /// (issue #5046); growth passes `None` because nobody is queued behind it.
+    #[allow(clippy::too_many_arguments)]
+    async fn dial_and_publish(
+        &self,
+        cohort: Option<&crate::pool::SharedCreationLease<'_, Arc<HbonePoolError>>>,
+        proxy: &Proxy,
+        target_host: &str,
+        app_policy_port: u16,
+        mtls_port: u16,
+        expected_peer: Option<&SpiffeId>,
+        expected_trust_domain: Option<&TrustDomain>,
+        sni_override: Option<&str>,
+        key: &str,
+        pool_config: &PoolConfig,
+        max_entries: usize,
+        creation_started: Instant,
+        connect_timeout: Duration,
+        effective_connect_timeout_ms: u64,
+    ) -> Result<MeshMtlsTransport, HbonePoolError> {
         let remaining = crate::pool::remaining_connect_timeout(creation_started, connect_timeout)
             .ok_or_else(|| HbonePoolError::ConnectTimeout {
             addr: format!("{target_host}:{mtls_port}"),
@@ -1443,11 +1726,28 @@ impl MeshMtlsConnectionPool {
             Ok(Err(err)) => {
                 crate::runtime_metrics::global_ref()
                     .record_pool_failure(crate::runtime_metrics::PoolKind::MeshMtls);
+                // Release the whole cohort on this one physical dial: every
+                // caller that joined while it was in flight gets the same typed
+                // outcome rather than taking the lock and repeating it (issue
+                // #5046). Published while the lock is still held, so no waiter
+                // can slip past the broadcast. `record_pool_failure` stays on
+                // the creator alone — one physical dial, one pool failure —
+                // while each waiter still reports its own logical outcome.
+                if let Some(cohort) = cohort {
+                    cohort.publish_failure(Arc::new(err.clone_for_broadcast()));
+                }
                 return Err(err);
             }
             Err(_) => {
                 crate::runtime_metrics::global_ref()
                     .record_pool_failure(crate::runtime_metrics::PoolKind::MeshMtls);
+                // Deliberately NOT broadcast: this is the CREATOR's own connect
+                // budget expiring, not evidence about the peer. A waiter may
+                // have a longer deadline (per-port `connect_timeout_ms`
+                // overrides are not part of the pool key), and #5046 requires
+                // each waiter's original deadline to survive — so the lease
+                // drops without publishing and the next waiter is elected as a
+                // fresh creator with its own remaining budget.
                 return Err(HbonePoolError::ConnectTimeout {
                     addr: format!("{target_host}:{mtls_port}"),
                     timeout_ms: effective_connect_timeout_ms,
@@ -1520,44 +1820,40 @@ impl MeshMtlsConnectionPool {
         Ok(transport)
     }
 
-    /// Exclusive-lock scan: prune dead/idle entries, return the first live
-    /// multiplexed sender. Unlike the HBONE pool there is no Ready/Pending
-    /// split — hyper's H2 sender accepts new streams as long as the connection
-    /// is open (`is_closed()`); per-stream backpressure is awaited at send.
-    fn cached_sender(&self, key: &str, _max_entries: usize) -> Option<MeshMtlsTransport> {
+    /// Exclusive-lock scan: prune dead/idle entries, return the least-loaded
+    /// live multiplexed sender. Unlike the HBONE pool there is no
+    /// Ready/Pending split — hyper's H2 sender accepts new streams as long as
+    /// the connection is open (`is_closed()`); per-stream backpressure is
+    /// awaited at send.
+    fn cached_sender(&self, key: &str) -> Option<MeshMtlsTransport> {
         let mut entries = self.entries.get_mut(key)?;
         record_mesh_mtls_evictions(prune_pool_entries(&mut entries));
-        for entry in entries.iter() {
-            // A retired transport is never handed out again, even before its
-            // socket has finished closing (issue #3859). One relaxed load.
-            if entry.transport.is_closed() {
-                continue;
-            }
-            entry.last_used_at.store(unix_secs(), Ordering::Relaxed);
-            return Some(entry.transport.clone());
-        }
-        None
+        let now = unix_secs();
+        let chosen = select_least_pending(&entries, now).chosen?;
+        let entry = &entries[chosen];
+        entry.last_used_at.store(now, Ordering::Relaxed);
+        Some(entry.transport.clone())
     }
 
-    /// Shared-lock fast path mirroring the HBONE pool: scan for a live sender
-    /// and refresh recency via a relaxed store, avoiding the exclusive shard
-    /// write lock. Expired entries are skipped (not removed); dead senders fall
-    /// through to the write path.
-    fn try_cached_sender_read(&self, key: &str) -> Option<MeshMtlsTransport> {
+    /// Shared-lock fast path mirroring the HBONE pool: pick the least-loaded
+    /// live sender and refresh its recency via a relaxed store, avoiding the
+    /// exclusive shard write lock. Returns the transport and how many
+    /// connections the key currently holds (the growth decision's input).
+    ///
+    /// Any closed or idle-expired entry makes this a miss so the write path
+    /// prunes it: that is what lets a key widened under load narrow again once
+    /// the load is gone — least-pending selection breaks ties toward the
+    /// lowest index, so the extra connections stop being used and expire.
+    fn try_cached_sender_read(&self, key: &str) -> Option<(MeshMtlsTransport, usize)> {
         let entries = self.entries.get(key)?;
         let now = unix_secs();
-        for entry in entries.value().iter() {
-            let last_used = entry.last_used_at.load(Ordering::Relaxed);
-            if entry_idle_expired(last_used, entry.idle_timeout_seconds, now) {
-                continue;
-            }
-            if entry.transport.is_closed() {
-                continue;
-            }
-            entry.last_used_at.store(now, Ordering::Relaxed);
-            return Some(entry.transport.clone());
+        let selection = select_least_pending(entries.value(), now);
+        if selection.stale {
+            return None;
         }
-        None
+        let entry = &entries.value()[selection.chosen?];
+        entry.last_used_at.store(now, Ordering::Relaxed);
+        Some((entry.transport.clone(), entries.value().len()))
     }
 
     fn maybe_prune_idle_entries(&self) {
@@ -1586,6 +1882,7 @@ impl MeshMtlsConnectionPool {
         self.creation_locks.retain(|key, lock| {
             self.entries.contains_key(key.as_str()) || Arc::strong_count(lock) > 1
         });
+        self.growth_backoff_until.retain(|_, until| *until > now);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1863,6 +2160,46 @@ fn expected_peer_display(expected_peer: Option<&SpiffeId>) -> &str {
     match expected_peer {
         Some(peer) => peer.as_str(),
         None => "td-only",
+    }
+}
+
+/// Outcome of scanning one key's connections for a checkout.
+struct LeastPendingSelection {
+    /// Index of the live, non-expired entry with the fewest pending response
+    /// heads; ties go to the lowest index.
+    chosen: Option<usize>,
+    /// Whether the scan saw a closed or idle-expired entry that the write
+    /// path should prune.
+    stale: bool,
+}
+
+/// Measured-load selection (issue #5043): fewest unanswered requests wins, and
+/// an exact tie prefers the earliest connection so light load concentrates on
+/// one connection while the ones added under pressure idle out.
+fn select_least_pending(entries: &[MeshMtlsPoolEntry], now: u64) -> LeastPendingSelection {
+    let mut chosen: Option<(usize, usize)> = None;
+    let mut stale = false;
+    for (index, entry) in entries.iter().enumerate() {
+        // A retired transport is never handed out again, even before its
+        // socket has finished closing (issue #3859). One relaxed load.
+        if entry.transport.is_closed()
+            || entry_idle_expired(
+                entry.last_used_at.load(Ordering::Relaxed),
+                entry.idle_timeout_seconds,
+                now,
+            )
+        {
+            stale = true;
+            continue;
+        }
+        let pending = entry.transport.pending_requests();
+        if chosen.is_none_or(|(_, best)| pending < best) {
+            chosen = Some((index, pending));
+        }
+    }
+    LeastPendingSelection {
+        chosen: chosen.map(|(index, _)| index),
+        stale,
     }
 }
 
@@ -2508,7 +2845,7 @@ mod tests {
     fn insert_empty_entry(pool: &MeshMtlsConnectionPool, key: &str) {
         pool.entries.insert(key.to_string(), Vec::new());
         pool.creation_locks
-            .insert(key.to_string(), Arc::new(Mutex::new(())));
+            .insert(key.to_string(), Arc::new(MeshMtlsCreationSlot::new()));
     }
 
     #[test]

@@ -629,8 +629,12 @@ async fn test_istio_omitted_policy_fields_and_unmatched_modes_are_preserved() {
         .after_proxy(&mut unmatched_preflight, 299, &mut upstream_headers)
         .await;
     assert_no_access_control_headers(&upstream_headers);
-    assert_eq!(upstream_headers.len(), 1);
+    assert_eq!(upstream_headers.len(), 2);
     assert_eq!(upstream_headers["x-backend"], "ok");
+    assert_eq!(
+        upstream_headers["vary"],
+        "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
+    );
 
     let mut unmatched_actual = make_cors_ctx("DELETE", "https://other.example");
     assert!(matches!(
@@ -707,8 +711,9 @@ async fn test_istio_forward_owns_access_control_headers_without_origin() {
         PluginResult::Continue
     ));
     assert_no_access_control_headers(&response_headers);
-    assert_eq!(response_headers.len(), 1);
+    assert_eq!(response_headers.len(), 2);
     assert_eq!(response_headers["x-backend"], "ok");
+    assert_eq!(response_headers["vary"], "Origin");
 }
 
 #[tokio::test]
@@ -2639,4 +2644,458 @@ async fn denied_preflight_method_has_fixed_json_error() {
             json!({"error": "CORS method not allowed"})
         );
     }
+}
+
+async fn composed_preflight(
+    policies: &[Value],
+    method: &str,
+    requested_headers: Option<&str>,
+) -> (u16, HashMap<String, String>) {
+    use ferrum_edge::plugins::ProxyProtocol;
+
+    let mut config = gateway_with_cors_proxy(json!(["https://app.example"]), vec![]);
+    config.plugin_configs = policies
+        .iter()
+        .enumerate()
+        .map(|(index, policy)| {
+            let mut plugin = cors_plugin_config(
+                &format!("cors-{index}"),
+                json!(["https://app.example"]),
+                PluginScope::Proxy,
+                Some("ws-api"),
+            );
+            plugin.config = policy.clone();
+            plugin
+        })
+        .collect();
+    config.proxies[0].plugins = config
+        .plugin_configs
+        .iter()
+        .map(|plugin| PluginAssociation {
+            plugin_config_id: plugin.id.clone(),
+        })
+        .collect();
+    let cache = PluginCache::new(&config).expect("CORS policies compose");
+    let mut response = None;
+    for protocol in [ProxyProtocol::Http, ProxyProtocol::Grpc] {
+        let plugins = cache.get_plugins_for_protocol("ferrum", "ws-api", protocol);
+        let mut ctx = make_preflight_ctx("https://app.example", method);
+        if let Some(requested) = requested_headers {
+            ctx.headers.insert(
+                "access-control-request-headers".to_string(),
+                requested.to_string(),
+            );
+        }
+        let mut status = 200;
+        let mut headers = HashMap::new();
+        for plugin in plugins.iter() {
+            if let PluginResult::Reject {
+                status_code,
+                headers: local_headers,
+                ..
+            } = plugin.on_request_received(&mut ctx).await
+            {
+                status = status_code;
+                headers = local_headers;
+                ctx.metadata
+                    .insert("ferrum:rejection_response".to_string(), "true".to_string());
+                break;
+            }
+        }
+        for plugin in plugins.iter() {
+            let result = plugin.after_proxy(&mut ctx, status, &mut headers).await;
+            assert!(matches!(result, PluginResult::Continue));
+        }
+        let current = (status, headers);
+        if let Some(previous) = &response {
+            assert_eq!(&current, previous, "HTTP and gRPC CORS parity");
+        }
+        response = Some(current);
+    }
+    response.expect("both protocol chains ran")
+}
+
+#[tokio::test]
+async fn method_wildcards_allow_native_preflights_and_intersect_in_both_orders() {
+    let wildcard = json!({
+        "allowed_origins": ["https://app.example"],
+        "allowed_methods": ["*"]
+    });
+    let specific = json!({
+        "allowed_origins": ["https://app.example"],
+        "allowed_methods": ["PUT"]
+    });
+    let (status, headers) = composed_preflight(std::slice::from_ref(&wildcard), "PUT", None).await;
+    assert_eq!(status, 204);
+    assert_eq!(headers["access-control-allow-methods"], "*");
+
+    for policies in [
+        vec![wildcard.clone(), specific.clone()],
+        vec![specific, wildcard.clone()],
+    ] {
+        let (status, headers) = composed_preflight(&policies, "PUT", None).await;
+        assert_eq!(status, 204);
+        assert_eq!(headers["access-control-allow-methods"], "PUT");
+        assert_eq!(composed_preflight(&policies, "PATCH", None).await.0, 403);
+    }
+    let (status, headers) = composed_preflight(&[wildcard.clone(), wildcard], "PUT", None).await;
+    assert_eq!(status, 204);
+    assert_eq!(headers["access-control-allow-methods"], "*");
+}
+
+#[tokio::test]
+async fn credentialed_method_wildcard_does_not_admit_ordinary_methods() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["https://app.example"],
+        "allowed_methods": ["*"],
+        "allow_credentials": true
+    }))
+    .unwrap();
+    let mut ctx = make_preflight_ctx("https://app.example", "PUT");
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn method_intersection_and_native_admission_preserve_case() {
+    let upper = json!({
+        "allowed_origins": ["https://app.example"],
+        "allowed_methods": ["GET", "REPORT"]
+    });
+    let lower = json!({
+        "allowed_origins": ["https://app.example"],
+        "allowed_methods": ["GET", "report"]
+    });
+    let (status, _) = composed_preflight(std::slice::from_ref(&upper), "report", None).await;
+    assert_eq!(status, 403);
+    for istio in [false, true] {
+        let mut policies = vec![upper.clone(), lower.clone()];
+        if istio {
+            for policy in &mut policies {
+                policy["unmatched_preflights"] = json!("forward");
+            }
+        }
+        for _ in 0..2 {
+            for method in ["REPORT", "report"] {
+                assert_eq!(composed_preflight(&policies, method, None).await.0, 403);
+            }
+            let (status, headers) = composed_preflight(&policies, "GET", None).await;
+            assert_eq!(status, if istio { 200 } else { 204 });
+            assert_eq!(headers["access-control-allow-methods"], "GET");
+            policies.reverse();
+        }
+    }
+}
+
+#[tokio::test]
+async fn header_wildcards_intersect_with_explicit_names_and_authorization() {
+    for (left, right, requested, expected) in [
+        (
+            json!(["*"]),
+            json!(["X-Custom"]),
+            "x-custom",
+            Some("X-Custom"),
+        ),
+        (
+            json!(["X-Custom"]),
+            json!(["x-custom"]),
+            "X-CUSTOM",
+            Some("x-custom"),
+        ),
+        (json!(["*"]), json!(["*"]), "x-custom", Some("*")),
+        (
+            json!(["*"]),
+            json!(["Authorization"]),
+            "authorization",
+            None,
+        ),
+        (
+            json!(["*", "Authorization"]),
+            json!(["AUTHORIZATION"]),
+            "authorization",
+            Some("authorization"),
+        ),
+        (
+            json!(["*", "Authorization"]),
+            json!(["*"]),
+            "authorization",
+            None,
+        ),
+    ] {
+        let mut policies = vec![
+            json!({"allowed_origins": ["https://app.example"], "allowed_headers": left}),
+            json!({"allowed_origins": ["https://app.example"], "allowed_headers": right}),
+        ];
+        for _ in 0..2 {
+            let (status, headers) = composed_preflight(&policies, "PUT", Some(requested)).await;
+            if let Some(expected) = expected {
+                assert_eq!(status, 204);
+                assert!(headers["access-control-allow-headers"].eq_ignore_ascii_case(expected));
+            } else {
+                assert_eq!(status, 403);
+            }
+            policies.reverse();
+        }
+    }
+}
+
+#[tokio::test]
+async fn wildcard_composition_preserves_empty_lists_and_credential_restrictions() {
+    for field in ["allowed_methods", "allowed_headers"] {
+        let mut wildcard = json!({"allowed_origins": ["https://app.example"]});
+        wildcard[field] = json!(["*"]);
+        let mut empty = json!({
+            "allowed_origins": ["https://app.example"],
+            "allowed_methods": ["PUT"],
+            "allowed_headers": ["X-Custom"],
+            "unmatched_preflights": "forward"
+        });
+        empty[field] = json!([]);
+        for policies in [
+            vec![wildcard.clone(), empty.clone()],
+            vec![empty, wildcard.clone()],
+        ] {
+            assert_eq!(
+                composed_preflight(&policies, "PUT", Some("x-custom"))
+                    .await
+                    .0,
+                403
+            );
+        }
+
+        let mut credentialed = wildcard.clone();
+        credentialed["allow_credentials"] = json!(true);
+        let mut policies = vec![wildcard, credentialed];
+        for _ in 0..2 {
+            assert_eq!(
+                composed_preflight(&policies, "PUT", Some("x-custom"))
+                    .await
+                    .0,
+                403
+            );
+            policies.reverse();
+        }
+    }
+}
+
+#[tokio::test]
+async fn mixed_credentials_do_not_promote_literal_star_in_response_lists() {
+    let wildcard = json!({
+        "allowed_origins": ["https://app.example"],
+        "allowed_methods": ["*"],
+        "allowed_headers": ["*"]
+    });
+    let credentialed = json!({
+        "allowed_origins": ["https://app.example"],
+        "allowed_methods": ["*", "PUT"],
+        "allowed_headers": ["*", "X-Custom"],
+        "allow_credentials": true
+    });
+    let mut policies = vec![wildcard, credentialed];
+    for _ in 0..2 {
+        let (status, headers) = composed_preflight(&policies, "PUT", Some("x-custom")).await;
+        assert_eq!(status, 204);
+        assert_eq!(headers["access-control-allow-methods"], "PUT");
+        assert_eq!(headers["access-control-allow-headers"], "X-Custom");
+        assert!(!headers.contains_key("access-control-allow-credentials"));
+        policies.reverse();
+    }
+}
+
+#[tokio::test]
+async fn wildcard_suffixes_normalize_idna_without_changing_literal_matchers() {
+    for suffix in [
+        "*.bücher.example",
+        "*.BÜCHER.EXAMPLE",
+        "*.xn--bcher-kva.example",
+    ] {
+        let plugin = CorsPlugin::new(&json!({"allowed_origins": [suffix]})).unwrap();
+        assert!(plugin_allows_origin(&plugin, "https://shop.xn--bcher-kva.example").await);
+        assert!(plugin_allows_origin(&plugin, "http://deep.shop.xn--bcher-kva.example:8080").await);
+        assert!(!plugin_allows_origin(&plugin, "https://xn--bcher-kva.example").await);
+        assert!(!plugin_allows_origin(&plugin, "https://shop.xn--bcher-kva.example.net").await);
+    }
+    let literal = CorsPlugin::new(&json!({
+        "allowed_origins": [{"exact": "*.bücher.example"}]
+    }))
+    .unwrap();
+    assert!(!plugin_allows_origin(&literal, "https://shop.xn--bcher-kva.example").await);
+    assert!(plugin_allows_origin(&literal, "*.bücher.example").await);
+}
+
+#[test]
+fn wildcard_suffixes_reject_invalid_hostnames() {
+    for suffix in [
+        "*.example.com?query",
+        "*.example.com#fragment",
+        "*.bad@host.example",
+        "*.foo..example",
+        "*..example",
+        "*.example..",
+        "*.foo_bar.example",
+        "*.-foo.example",
+        "*.foo-.example",
+        "*.127.0.0.1",
+        "*.[::1]",
+        "*.example%2ecom",
+        "*.example\\com",
+        "*.example\u{0000}.com",
+    ] {
+        assert!(CorsPlugin::new(&json!({"allowed_origins": [suffix]})).is_err());
+    }
+    for suffix in [
+        format!("*.{}.example", "a".repeat(64)),
+        format!("*.{}a", "aaa.".repeat(64)),
+    ] {
+        assert!(CorsPlugin::new(&json!({"allowed_origins": [suffix]})).is_err());
+    }
+}
+
+#[tokio::test]
+async fn originless_and_unmatched_cache_variants_remain_distinct_from_allowed_origins() {
+    for (istio, origin) in [
+        (false, None),
+        (true, None),
+        (true, Some("https://other.example")),
+    ] {
+        let mut config = json!({"allowed_origins": ["https://app.example"]});
+        if istio {
+            config["unmatched_preflights"] = json!("forward");
+        }
+        let plugin = CorsPlugin::new(&config).unwrap();
+        for vary in [
+            None,
+            Some("Accept-Encoding"),
+            Some("origin, Accept-Encoding"),
+            Some("*"),
+        ] {
+            let mut ctx = make_ctx();
+            if let Some(origin) = origin {
+                ctx.headers.insert("origin".to_string(), origin.to_string());
+            }
+            let result = plugin.on_request_received(&mut ctx).await;
+            assert!(matches!(result, PluginResult::Continue));
+            let mut headers = permissive_backend_cors_headers();
+            headers.insert(
+                "cache-control".to_string(),
+                "public, max-age=60".to_string(),
+            );
+            if let Some(vary) = vary {
+                headers.insert("vary".to_string(), vary.to_string());
+            }
+            plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+            assert_no_access_control_headers(&headers);
+            assert_eq!(headers["cache-control"], "public, max-age=60");
+
+            let mut allowed = make_cors_ctx("GET", "https://app.example");
+            plugin.on_request_received(&mut allowed).await;
+            let mut allowed_headers = HashMap::new();
+            plugin
+                .after_proxy(&mut allowed, 200, &mut allowed_headers)
+                .await;
+            assert_eq!(
+                allowed_headers["access-control-allow-origin"],
+                "https://app.example"
+            );
+
+            // A cache may reuse a stored response only when every named Vary
+            // request field matches, including absence as a distinct value.
+            let reusable = headers["vary"].split(',').all(|name| {
+                let name = name.trim().to_ascii_lowercase();
+                name != "*" && ctx.headers.get(&name) == allowed.headers.get(&name)
+            });
+            assert!(
+                !reusable,
+                "a non-authorized variant cannot serve an allowed origin"
+            );
+            if vary == Some("*") {
+                assert_eq!(headers["vary"], "*");
+            } else {
+                assert_eq!(
+                    headers["vary"]
+                        .split(',')
+                        .filter(|name| name.trim().eq_ignore_ascii_case("origin"))
+                        .count(),
+                    1
+                );
+                if vary.is_some() {
+                    assert!(headers["vary"].contains("Accept-Encoding"));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cors_schema_enforces_native_origin_and_max_age_bounds() {
+    let spec: Value = serde_yaml::from_str(include_str!("../../../openapi.yaml")).unwrap();
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/CorsConfig",
+        "components": spec["components"]
+    });
+    let validator = jsonschema::draft202012::options().build(&schema).unwrap();
+    let oversized_origin = format!("https://{}.example", "a".repeat(510));
+    let overflowing_age: Value = serde_json::from_str("18446744073709551616").unwrap();
+    for (config, valid) in [
+        (json!({"allowed_origins": ["https://app.example"]}), true),
+        (json!({"allowed_origins": [oversized_origin]}), false),
+        (json!({"allowed_origins": ["*"], "max_age": u64::MAX}), true),
+        (
+            json!({"allowed_origins": ["*"], "max_age": overflowing_age}),
+            false,
+        ),
+        (json!({"allowed_origins": ["*.bücher.example"]}), true),
+        (
+            json!({"allowed_origins": ["*.xn--bcher-kva.example"]}),
+            true,
+        ),
+        (json!({"allowed_origins": ["*.example.com?query"]}), false),
+        (
+            json!({"allowed_origins": ["*.example.com#fragment"]}),
+            false,
+        ),
+        (json!({"allowed_origins": ["*.bad@host.example"]}), false),
+        (json!({"allowed_origins": ["*.foo..example"]}), false),
+    ] {
+        assert_eq!(validator.is_valid(&config), valid, "schema: {config}");
+        assert_eq!(CorsPlugin::new(&config).is_ok(), valid, "runtime: {config}");
+    }
+
+    // JSON Schema counts characters; runtime also limits UTF-8 bytes.
+    let unicode = json!({"allowed_origins": [{"exact": "é".repeat(257)}]});
+    assert!(validator.is_valid(&unicode));
+    assert!(CorsPlugin::new(&unicode).is_err());
+}
+
+#[test]
+fn documented_per_proxy_cors_example_passes_file_admission() {
+    let docs = include_str!("../../../docs/cors_plugin.md");
+    let example = docs
+        .split_once("### Example 3: Per-Proxy CORS")
+        .unwrap()
+        .1
+        .split_once("```yaml\n")
+        .unwrap()
+        .1
+        .split_once("```")
+        .unwrap()
+        .0;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("cors-example.yaml");
+    std::fs::write(&path, example).unwrap();
+    let config = ferrum_edge::config::file_loader::load_config_from_file(
+        path.to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect("the complete documented example passes file-mode validation");
+    assert_eq!(config.proxies.len(), 2);
+    assert_eq!(config.plugin_configs.len(), 2);
 }

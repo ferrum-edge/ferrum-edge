@@ -8,7 +8,11 @@
 //! protobuf, the payload is decoded against a compiled `FileDescriptorSet` and every
 //! proto2 `required` field must be present, recursively.
 //!
-//! Request validation for JSON/XML runs in `before_proxy` (rejects with 400).
+//! Request validation for JSON/XML runs in `before_proxy` (rejects with 400) —
+//! except when the request declares a non-identity `Content-Encoding`, whose
+//! plaintext only the shared backend-visible representation gate can produce;
+//! that case is judged in the final request-body hook instead, still before
+//! backend egress (`GHSA-3973-47g5-4mcx`).
 //! Request validation for protobuf runs in `on_final_request_body` (rejects with 400).
 //! Response validation runs in `finalize_client_visible_response_body` (rejects
 //! with 502) and requires response body buffering when configured. That phase is
@@ -236,8 +240,9 @@ pub struct BodyValidator {
     /// traffic instead of silently disabling configured validation.
     protobuf_dependency_unavailable: bool,
     /// Whether the loaded descriptor pool contains any proto2 file. Only proto2
-    /// has `required` fields, so proto3-only pools skip the initialization walk
-    /// entirely and keep the gRPC hot path allocation-free.
+    /// has `required` fields, so a proto3-only pool skips the initialization
+    /// check; it enters the shared message walk only when
+    /// `protobuf_reject_unknown_fields` asks for one.
     protobuf_pool_has_proto2: bool,
     /// Whether to reject messages with unknown field numbers.
     protobuf_reject_unknown_fields: bool,
@@ -757,23 +762,24 @@ impl BodyValidator {
         // operator can act on.
         let msg = DynamicMessage::decode(descriptor.clone(), payload.as_ref())
             .map_err(|_| "Protobuf decode failed".to_string())?;
+        // Two independent message policies share one bounded descriptor walk.
+        //
         // Wire decoding does not enforce proto2 initialization, so a correctly
         // framed message that omits a `required` field decodes cleanly
-        // (GHSA-qvrp-m3v9-345m). Walk the descriptor and reject any missing
-        // required field, including inside nested/repeated/map/extension values.
-        // This is independent of the unknown-field policy below.
-        if self.protobuf_pool_has_proto2 {
+        // (GHSA-qvrp-m3v9-345m).
+        //
+        // `DynamicMessage::unknown_fields()` is message-LOCAL, so checking only
+        // the decoded outer message left unknown fields inside nested,
+        // repeated, map-value, oneof, and extension messages unexamined even
+        // though `protobuf_reject_unknown_fields` is documented as a strict
+        // schema policy (`GHSA-cqmm-vj3c-g8w8`).
+        let policy = ProtobufMessagePolicy {
+            check_required: self.protobuf_pool_has_proto2,
+            reject_unknown: self.protobuf_reject_unknown_fields,
+        };
+        if policy.is_active() {
             let mut budget = ProtobufWalkBudget::default();
-            check_proto2_required_fields(&msg, &mut budget)?;
-        }
-        if self.protobuf_reject_unknown_fields {
-            let unknown_count = msg.unknown_fields().count();
-            if unknown_count > 0 {
-                return Err(format!(
-                    "Message contains {} unknown field(s)",
-                    unknown_count
-                ));
-            }
+            check_protobuf_message(&msg, policy, &mut budget)?;
         }
         Ok(())
     }
@@ -992,6 +998,21 @@ const XML_MAX_NODES: u32 = 100_000;
 /// compiled-in constant; no body byte is ever interpolated
 /// (`GHSA-5p2h-fq6q-gwh9`).
 const XML_DEPTH_DETAIL: &str = "Invalid XML: document nesting exceeds the supported depth";
+
+/// Fixed diagnostic for an entity declaration whose replacement text references
+/// another entity — the billion-laughs expansion signature.
+const XML_NESTED_ENTITY_DETAIL: &str =
+    "XML entity definition references another entity (billion-laughs protection)";
+
+/// Fixed diagnostic for an `<!ENTITY ...>` declaration the nested-entity policy
+/// could not read a replacement text out of.
+///
+/// Failing to extract a value is not evidence that the declaration is harmless:
+/// the parser downstream still sees a declared, referenceable entity
+/// (`GHSA-j965-6vq5-v44f`). With `xml_reject_nested_entities` on, an
+/// unevaluable declaration is refused rather than silently counted as safe.
+const XML_UNEVALUABLE_ENTITY_DETAIL: &str =
+    "XML entity declaration could not be evaluated against the nested-entity policy";
 
 fn parse_schema_draft(raw: Option<&str>) -> Result<SchemaDraft, String> {
     match raw {
@@ -1514,9 +1535,17 @@ fn parse_required_xml_elements(
                 "body_validator: '{field}' entry at index {index} has an empty local element name"
             ));
         }
-        if local.contains('{') || local.contains('}') {
+        // The matcher compares against `roxmltree`'s parsed LOCAL name, so a
+        // spelling outside the XML `NCName` grammar can never equal one. Such
+        // an entry is admitted today and then rejects every governed request
+        // (400) and every governed response (502) forever, so refuse it here
+        // instead. The configured spelling is never echoed
+        // (`GHSA-5p2h-fq6q-gwh9`).
+        if !is_xml_ncname(&local) {
             return Err(format!(
-                "body_validator: '{field}' entry at index {index} has an invalid local element name"
+                "body_validator: '{field}' entry at index {index} has an invalid local element \
+                 name; it must be an XML NCName (no whitespace, markup, namespace prefix, or \
+                 braces)"
             ));
         }
         parsed.push(RequiredXmlElement { namespace, local });
@@ -1524,64 +1553,105 @@ fn parse_required_xml_elements(
     Ok(parsed)
 }
 
-/// Bounded budget for the recursive proto2 initialization walk.
+/// Bounded budget for the recursive protobuf message walk.
 #[derive(Default)]
 struct ProtobufWalkBudget {
     messages: usize,
 }
 
-/// Maximum message-nesting depth inspected while checking proto2 initialization.
+/// Maximum message-nesting depth inspected by the protobuf message walk.
 const MAX_PROTOBUF_MESSAGE_DEPTH: usize = 32;
 
-/// Maximum number of messages inspected while checking proto2 initialization.
+/// Maximum number of messages inspected by the protobuf message walk.
 const MAX_PROTOBUF_MESSAGES: usize = 50_000;
+
+/// Fixed diagnostic for exhausting the walk's message budget.
+const PROTOBUF_BUDGET_DETAIL: &str = "Protobuf message exceeds the inspection budget";
+
+/// Fixed diagnostic for exceeding the walk's message-nesting depth.
+const PROTOBUF_DEPTH_DETAIL: &str = "Protobuf message nests deeper than the inspection budget";
 
 impl ProtobufWalkBudget {
     fn charge(&mut self) -> Result<(), String> {
         self.messages += 1;
         if self.messages > MAX_PROTOBUF_MESSAGES {
-            return Err(
-                "Protobuf message exceeds the initialization inspection budget".to_string(),
-            );
+            return Err(PROTOBUF_BUDGET_DETAIL.to_string());
         }
         Ok(())
     }
 }
 
-/// Recursively verify that every proto2 `required` field is present.
-///
-/// Presence, not value, is what is checked: a required scalar carrying its
-/// type's default value is present because proto2 tracks it with a hasbit, and
-/// prost-reflect's `has_field` reflects exactly that. proto3 descriptors have
-/// no `Required` cardinality, so proto3 messages are unaffected. Extensions,
-/// oneof members, repeated values, and map values are all walked. The error
-/// names the offending field path (descriptor metadata, configured by the
-/// operator) and never any payload value.
-fn check_proto2_required_fields(
-    message: &DynamicMessage,
-    budget: &mut ProtobufWalkBudget,
-) -> Result<(), String> {
-    check_proto2_required_fields_at(message, budget, 0, &mut String::new())
+/// The per-message policies the bounded walk enforces.
+#[derive(Clone, Copy)]
+struct ProtobufMessagePolicy {
+    /// Enforce proto2 `required` field presence. Set only for pools that
+    /// actually contain a proto2 file, so a proto3-only deployment keeps the
+    /// gRPC hot path free of the walk.
+    check_required: bool,
+    /// Enforce `protobuf_reject_unknown_fields` at every nesting level.
+    reject_unknown: bool,
 }
 
-fn check_proto2_required_fields_at(
+impl ProtobufMessagePolicy {
+    fn is_active(&self) -> bool {
+        self.check_required || self.reject_unknown
+    }
+}
+
+/// Recursively apply the configured message policies to a decoded message.
+///
+/// **proto2 initialization.** Presence, not value, is what is checked: a
+/// required scalar carrying its type's default value is present because proto2
+/// tracks it with a hasbit, and prost-reflect's `has_field` reflects exactly
+/// that. proto3 descriptors have no `Required` cardinality, so proto3 messages
+/// are unaffected. The error names the offending field path (descriptor
+/// metadata, configured by the operator) and never any payload value.
+///
+/// **Unknown fields.** `DynamicMessage::unknown_fields()` reports only the
+/// fields the decoder could not place in THIS message; nested message values
+/// carry their own. Applying the configured strict policy at every level is
+/// what makes it mean what it is documented to mean (`GHSA-cqmm-vj3c-g8w8`).
+/// The diagnostic carries a count, never a field number or payload byte.
+///
+/// Extensions, oneof members, repeated values, and map values are all walked,
+/// under one shared depth and message budget.
+fn check_protobuf_message(
     message: &DynamicMessage,
+    policy: ProtobufMessagePolicy,
+    budget: &mut ProtobufWalkBudget,
+) -> Result<(), String> {
+    check_protobuf_message_at(message, policy, budget, 0, &mut String::new())
+}
+
+fn check_protobuf_message_at(
+    message: &DynamicMessage,
+    policy: ProtobufMessagePolicy,
     budget: &mut ProtobufWalkBudget,
     depth: usize,
     path: &mut String,
 ) -> Result<(), String> {
     if depth > MAX_PROTOBUF_MESSAGE_DEPTH {
-        return Err(
-            "Protobuf message nests deeper than the initialization inspection budget".to_string(),
-        );
+        return Err(PROTOBUF_DEPTH_DETAIL.to_string());
     }
     budget.charge()?;
 
-    let descriptor = message.descriptor();
-    for field in descriptor.fields() {
-        if field.cardinality() == Cardinality::Required && !message.has_field(&field) {
-            let name = field.name();
-            return Err(format!("Missing required protobuf field: {path}{name}"));
+    if policy.reject_unknown {
+        let unknown_count = message.unknown_fields().count();
+        if unknown_count > 0 {
+            return Err(format!(
+                "Message contains {} unknown field(s)",
+                unknown_count
+            ));
+        }
+    }
+
+    if policy.check_required {
+        let descriptor = message.descriptor();
+        for field in descriptor.fields() {
+            if field.cardinality() == Cardinality::Required && !message.has_field(&field) {
+                let name = field.name();
+                return Err(format!("Missing required protobuf field: {path}{name}"));
+            }
         }
     }
 
@@ -1592,42 +1662,44 @@ fn check_proto2_required_fields_at(
         let restore = path.len();
         path.push_str(field.name());
         path.push('.');
-        check_proto2_required_in_value(value, budget, depth + 1, path)?;
+        check_protobuf_message_in_value(value, policy, budget, depth + 1, path)?;
         path.truncate(restore);
     }
     // Only present extensions are iterable, and proto2 forbids `required`
     // extension fields, so there is no presence check to make here — but an
-    // extension's message value can still carry required fields of its own.
+    // extension's message value can still carry required fields, or unknown
+    // fields, of its own.
     for (extension, value) in message.extensions() {
         let restore = path.len();
         path.push('[');
         path.push_str(extension.full_name());
         path.push_str("].");
-        check_proto2_required_in_value(value, budget, depth + 1, path)?;
+        check_protobuf_message_in_value(value, policy, budget, depth + 1, path)?;
         path.truncate(restore);
     }
     Ok(())
 }
 
-fn check_proto2_required_in_value(
+fn check_protobuf_message_in_value(
     value: &ProtobufValue,
+    policy: ProtobufMessagePolicy,
     budget: &mut ProtobufWalkBudget,
     depth: usize,
     path: &mut String,
 ) -> Result<(), String> {
     match value {
         ProtobufValue::Message(nested) => {
-            check_proto2_required_fields_at(nested, budget, depth, path)
+            check_protobuf_message_at(nested, policy, budget, depth, path)
         }
         ProtobufValue::List(items) => {
             for item in items {
-                check_proto2_required_in_value(item, budget, depth, path)?;
+                check_protobuf_message_in_value(item, policy, budget, depth, path)?;
             }
             Ok(())
         }
         ProtobufValue::Map(entries) => {
             for entry in entries.values() {
-                check_proto2_required_in_value(entry, budget, depth, path)?;
+                check_protobuf_message_in_value(entry, policy, budget, depth, path)?;
             }
             Ok(())
         }
@@ -1808,6 +1880,20 @@ fn content_type_matches(configured: &[String], content_type: &str) -> bool {
         .any(|expected| actual.eq_ignore_ascii_case(expected))
 }
 
+/// Whether the request declares a `Content-Encoding` the shared representation
+/// gate must judge before a governed policy may claim to have inspected the
+/// body.
+///
+/// The grammar is the gate's own, so one request cannot be "encoded" to this
+/// hook and "identity" to the gate. A malformed or empty coding token counts as
+/// requiring judgment, which routes it to the gate's fail-closed rejection
+/// rather than to a scan of octets nobody proved were plaintext.
+fn request_declares_content_coding(headers: &HashMap<String, String>) -> bool {
+    headers
+        .get("content-encoding")
+        .is_some_and(|value| super::request_representation::requires_decode_judgment(value))
+}
+
 fn is_grpc_content_type(content_type: &str) -> bool {
     // gRPC media types use application/grpc or a registered representation
     // suffix such as application/grpc+proto. Parameters never participate.
@@ -1901,11 +1987,16 @@ fn check_xml_entity_expansion(
                         .to_string(),
                 );
             }
-            if reject_nested && entity_value_references_nested_entity(&body[i..decl_end]) {
-                return Err(
-                    "XML entity definition references another entity (billion-laughs protection)"
-                        .to_string(),
-                );
+            if reject_nested {
+                match scan_entity_declaration_nesting(&body[i..decl_end]) {
+                    EntityNestingScan::NestedReference => {
+                        return Err(XML_NESTED_ENTITY_DETAIL.to_string());
+                    }
+                    EntityNestingScan::Unevaluable => {
+                        return Err(XML_UNEVALUABLE_ENTITY_DETAIL.to_string());
+                    }
+                    EntityNestingScan::NoNestedReference => {}
+                }
             }
             if let Some((name, value)) = parameter_entity_declaration(&body[i..decl_end]) {
                 // Count nested entity declarations once, at declaration time, so
@@ -2101,6 +2192,88 @@ fn entity_declaration_is_external(decl: &str) -> bool {
         .is_some_and(|rest| rest.starts_with("SYSTEM") || rest.starts_with("PUBLIC"))
 }
 
+/// XML 1.0 (fifth edition) `NameStartChar`, production [4].
+///
+/// The pre-parse entity policy must recognize exactly the names the parser
+/// recognizes. `roxmltree` consumes entity declaration names and entity
+/// references through the XML `Name` production, so the previous ASCII-only
+/// scanners made an entity declared or referenced under a non-ASCII name
+/// invisible to the nested-entity restriction while the parser still saw a
+/// declared, referenced entity (`GHSA-j965-6vq5-v44f`).
+fn is_xml_name_start_char(ch: char) -> bool {
+    let cp = u32::from(ch);
+    ch == ':'
+        || ch == '_'
+        || ch.is_ascii_alphabetic()
+        || (0xC0..=0xD6).contains(&cp)
+        || (0xD8..=0xF6).contains(&cp)
+        || (0xF8..=0x2FF).contains(&cp)
+        || (0x370..=0x37D).contains(&cp)
+        || (0x37F..=0x1FFF).contains(&cp)
+        || (0x200C..=0x200D).contains(&cp)
+        || (0x2070..=0x218F).contains(&cp)
+        || (0x2C00..=0x2FEF).contains(&cp)
+        || (0x3001..=0xD7FF).contains(&cp)
+        || (0xF900..=0xFDCF).contains(&cp)
+        || (0xFDF0..=0xFFFD).contains(&cp)
+        || (0x10000..=0xEFFFF).contains(&cp)
+}
+
+/// XML 1.0 (fifth edition) `NameChar`, production [4a].
+fn is_xml_name_char(ch: char) -> bool {
+    let cp = u32::from(ch);
+    is_xml_name_start_char(ch)
+        || ch == '-'
+        || ch == '.'
+        || ch.is_ascii_digit()
+        || cp == 0xB7
+        || (0x300..=0x36F).contains(&cp)
+        || (0x203F..=0x2040).contains(&cp)
+}
+
+/// Byte offset one past the XML `Name` beginning at `start`, or `None` when no
+/// `Name` begins there.
+///
+/// `start` is always reached by skipping ASCII delimiters (`<!ENTITY`, XML
+/// whitespace, `%`, `&`), so it is a UTF-8 boundary; a non-boundary index is
+/// still handled — `str::get` returns `None` and the caller treats the position
+/// as "no name here".
+fn xml_name_end(text: &str, start: usize) -> Option<usize> {
+    let rest = text.get(start..)?;
+    let mut chars = rest.char_indices();
+    let (_, first) = chars.next()?;
+    if !is_xml_name_start_char(first) {
+        return None;
+    }
+    let mut end = start + first.len_utf8();
+    for (offset, ch) in chars {
+        if !is_xml_name_char(ch) {
+            break;
+        }
+        end = start + offset + ch.len_utf8();
+    }
+    Some(end)
+}
+
+/// True when `name` is an XML `NCName`: the `Name` production without `:`.
+///
+/// `roxmltree` reports an element's LOCAL name, with any namespace prefix
+/// already split off and resolved to an expanded URI, so a configured required
+/// element name can only ever equal an `NCName`. Admitting a spelling outside
+/// that grammar — `two words`, a leading digit, a `prefix:local` spelling —
+/// creates a rule no well-formed document can satisfy, so every governed
+/// request is rejected with 400 and every governed response with 502.
+fn is_xml_ncname(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if first == ':' || !is_xml_name_start_char(first) {
+        return false;
+    }
+    chars.all(|ch| ch != ':' && is_xml_name_char(ch))
+}
+
 fn parameter_entity_declaration(decl: &str) -> Option<(&str, &str)> {
     let bytes = decl.as_bytes();
     let needle = b"<!ENTITY";
@@ -2115,16 +2288,8 @@ fn parameter_entity_declaration(decl: &str) -> Option<(&str, &str)> {
     i += 1;
     i = skip_xml_space(bytes, i);
     let name_start = i;
-    while i < bytes.len()
-        && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'-' | b'.'))
-    {
-        i += 1;
-    }
-    if i == name_start {
-        return None;
-    }
-    let name_end = i;
-    i = skip_xml_space(bytes, i);
+    let name_end = xml_name_end(decl, name_start)?;
+    i = skip_xml_space(bytes, name_end);
     let quote = *bytes.get(i)?;
     if !matches!(quote, b'\'' | b'"') {
         return None;
@@ -2145,17 +2310,12 @@ fn parameter_entity_reference_at(body: &str, start: usize) -> Option<(&str, usiz
     if bytes.get(start) != Some(&b'%') {
         return None;
     }
-    let mut i = start + 1;
-    let name_start = i;
-    while i < bytes.len()
-        && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'-' | b'.'))
-    {
-        i += 1;
-    }
-    if i == name_start || bytes.get(i) != Some(&b';') {
+    let name_start = start + 1;
+    let name_end = xml_name_end(body, name_start)?;
+    if bytes.get(name_end) != Some(&b';') {
         return None;
     }
-    Some((&body[name_start..i], i + 1))
+    Some((&body[name_start..name_end], name_end + 1))
 }
 
 fn entity_declaration_count(text: &str) -> usize {
@@ -2177,16 +2337,36 @@ fn skip_xml_space(bytes: &[u8], mut i: usize) -> usize {
     i
 }
 
-/// True if an `<!ENTITY ...>` declaration's value references another entity.
-/// General entity refs (`&name;`) and parameter entity refs (`%name;`) can both
-/// create expansion chains. Numeric character refs are normalized first because
-/// XML resolves them inside entity replacement text before expansion.
-fn entity_value_references_nested_entity(decl: &str) -> bool {
+/// What the nested-entity policy could establish about one `<!ENTITY ...>`
+/// declaration.
+enum EntityNestingScan {
+    /// The declaration's replacement text references another entity. General
+    /// entity refs (`&name;`) and parameter entity refs (`%name;`) both create
+    /// expansion chains.
+    NestedReference,
+    /// The declaration parsed and its replacement text references nothing.
+    NoNestedReference,
+    /// No replacement text could be read out of the declaration, so the policy
+    /// has no evidence either way. The parser downstream still sees a declared,
+    /// referenceable entity, so absence of proof is not proof of absence
+    /// (`GHSA-j965-6vq5-v44f`).
+    Unevaluable,
+}
+
+/// Inspect one `<!ENTITY ...>` declaration for the nested-entity policy.
+///
+/// Numeric character refs are normalized first because XML resolves them
+/// inside entity replacement text before expansion.
+fn scan_entity_declaration_nesting(decl: &str) -> EntityNestingScan {
     let Some(value) = entity_declaration_value(decl) else {
-        return false;
+        return EntityNestingScan::Unevaluable;
     };
     let decoded = decode_xml_numeric_char_refs(value);
-    entity_replacement_text_references_entity(decoded.as_ref())
+    if entity_replacement_text_references_entity(decoded.as_ref()) {
+        EntityNestingScan::NestedReference
+    } else {
+        EntityNestingScan::NoNestedReference
+    }
 }
 
 fn entity_declaration_value(decl: &str) -> Option<&str> {
@@ -2201,16 +2381,8 @@ fn entity_declaration_value(decl: &str) -> Option<&str> {
         i += 1;
         i = skip_xml_space(bytes, i);
     }
-    let name_start = i;
-    while i < bytes.len()
-        && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'-' | b'.'))
-    {
-        i += 1;
-    }
-    if i == name_start {
-        return None;
-    }
-    i = skip_xml_space(bytes, i);
+    let name_end = xml_name_end(decl, i)?;
+    i = skip_xml_space(bytes, name_end);
     let quote = *bytes.get(i)?;
     if !matches!(quote, b'\'' | b'"') {
         return None;
@@ -2255,25 +2427,33 @@ fn decode_xml_numeric_char_refs(value: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// The five general entities XML predefines. A reference to one of them
+/// resolves to a single character, never to another declaration, so it is not
+/// an expansion chain.
+fn is_predefined_general_entity(name: &str) -> bool {
+    matches!(name, "lt" | "gt" | "amp" | "quot" | "apos")
+}
+
 fn entity_replacement_text_references_entity(value: &str) -> bool {
     let bytes = value.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
         if matches!(bytes[i], b'&' | b'%') {
             let marker = bytes[i];
-            let mut j = i + 1;
-            while j < bytes.len()
-                && (bytes[j].is_ascii_alphanumeric() || matches!(bytes[j], b'_' | b'-' | b'.'))
-            {
-                j += 1;
-            }
-            if j > i + 1 && bytes.get(j) == Some(&b';') {
-                let name = &value[i + 1..j];
-                if marker == b'%' || !matches!(name, "lt" | "gt" | "amp" | "quot" | "apos") {
-                    return true;
+            match xml_name_end(value, i + 1) {
+                Some(name_end) => {
+                    if bytes.get(name_end) == Some(&b';') {
+                        let name = &value[i + 1..name_end];
+                        if marker == b'%' || !is_predefined_general_entity(name) {
+                            return true;
+                        }
+                    }
+                    // `name_end > i + 1` whenever a name was found, so the scan
+                    // always advances and stays linear in the value length.
+                    i = name_end;
                 }
+                None => i += 1,
             }
-            i = j;
         } else {
             i += 1;
         }
@@ -2352,6 +2532,38 @@ fn ascii_ends_with_ignore_case(value: &str, suffix: &str) -> bool {
             .all(|(left, right)| left.eq_ignore_ascii_case(right))
 }
 
+/// Whether a `protobuf_method_messages` key can equal the gRPC method path the
+/// hooks look up.
+///
+/// Selection is an exact map lookup: the request hook keys on the `:path`
+/// pseudo-header the proxy injects, and the response hook on
+/// `grpc_full_method` (normalized to a leading `/`) or `ctx.path`. Both are
+/// gRPC method paths, so a key spelled any other way can never be selected —
+/// yet it still satisfies the constructor's rule-presence test, producing an
+/// enabled policy whose intended rule is silently inert (issue #5139).
+///
+/// The shape check is deliberately structural rather than a protobuf
+/// identifier grammar, so deployments that route custom service or method
+/// spellings keep working: one leading `/`, exactly two non-empty segments,
+/// and no character that could not appear in the looked-up path.
+fn is_grpc_method_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix('/') else {
+        return false;
+    };
+    let Some((service, method)) = rest.split_once('/') else {
+        return false;
+    };
+    if service.is_empty() || method.is_empty() || method.contains('/') {
+        return false;
+    }
+    for ch in path.chars() {
+        if ch.is_whitespace() || ch.is_control() || matches!(ch, '?' | '#') {
+            return false;
+        }
+    }
+    true
+}
+
 /// Parse protobuf configuration shape without touching the local filesystem.
 fn parse_protobuf_shape(config: &Value) -> Result<ProtobufShape, String> {
     let descriptor_path = optional_string(config, "protobuf_descriptor_path")?.map(str::to_string);
@@ -2376,9 +2588,10 @@ fn parse_protobuf_shape(config: &Value) -> Result<ProtobufShape, String> {
     let mut methods = HashMap::new();
     if let Some(method_configs) = optional_object(config, "protobuf_method_messages")? {
         for (method_path, method_config) in method_configs {
-            if method_path.is_empty() {
+            if !is_grpc_method_path(method_path) {
                 return Err(
-                    "body_validator: protobuf_method_messages method paths must not be empty"
+                    "body_validator: 'protobuf_method_messages' keys must be gRPC method paths \
+                     of the form '/package.Service/Method'"
                         .to_string(),
                 );
             }
@@ -2808,6 +3021,25 @@ impl Plugin for BodyValidator {
             return PluginResult::Continue;
         }
 
+        // A declared, non-identity `Content-Encoding` means the representation
+        // this early hook can see is a COMPRESSED encoding of the document the
+        // configured rules are about. `before_proxy` has no decoder — the
+        // shared backend-visible representation gate does, and it stages
+        // bounded, budget-charged plaintext for exactly the requests this
+        // plugin claims (`GHSA-3973-47g5-4mcx`). Running the UTF-8 conversion
+        // over the encoded octets here turned every legitimate gzip JSON/XML
+        // upload into a fixed 400 while the authoritative check was still ahead
+        // of it, so hand the decision to that check instead.
+        //
+        // The deferral is taken only when this instance's final request-body
+        // policy claims the request — precisely the condition under which the
+        // gate decodes it or fails it closed — and only for a representation
+        // that actually reached this hook. A missing representation still fails
+        // closed below, and an undecodable coding is still a rejection before
+        // backend egress.
+        let defer_encoded_representation = request_declares_content_coding(headers)
+            && self.final_request_body_policy_applies(headers);
+
         // The body views live on `ctx`, so the shared duplicate-key memo is
         // moved out for the duration of the borrow and moved back before this
         // hook returns. Taking it is not a reset: `JsonScanMemo` is keyed on
@@ -2839,6 +3071,9 @@ impl Plugin for BodyValidator {
 
         let result = match resolved {
             None => Err(REQUEST_BODY_REPRESENTATION_UNAVAILABLE.to_string()),
+            // Present but encoded: the governed decode and the authoritative
+            // verdict both belong to the final hook.
+            Some(_) if defer_encoded_representation => Ok(()),
             Some(body) => match std::str::from_utf8(body) {
                 Err(_) => Err(NON_UTF8_REQUEST_BODY.to_string()),
                 Ok(body_str) if validate_as_json => Self::validate_json_body(

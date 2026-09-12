@@ -209,6 +209,7 @@ struct ApplySnapshot {
     topology_epoch: u64,
     accepted: u64,
     rejected_through: u64,
+    issued_through: Option<u64>,
 }
 
 /// Process-local coordinator shared by the database-mode poll loop and admin
@@ -264,6 +265,7 @@ impl RuntimeConfigApply {
             topology_epoch,
             accepted: accepted_sequence,
             rejected_through: 0,
+            issued_through: None,
         });
         Self {
             namespace: namespace.into(),
@@ -297,6 +299,33 @@ impl RuntimeConfigApply {
         self.waiter_count.load(Ordering::Acquire)
     }
 
+    /// Record a cursor returned by an admin mutation in this process.
+    ///
+    /// The status endpoint only permits blocking waits at or below this
+    /// topology-local high-water mark. This prevents client-chosen future
+    /// sequences from continuously re-arming the database poll loop while
+    /// preserving the covering-cursor semantics for concurrent mutations.
+    pub fn record_issued_cursor(&self, cursor: LiveApplyCursor) {
+        self.snapshot.send_modify(|snap| {
+            if cursor.topology_epoch == snap.topology_epoch {
+                snap.issued_through = Some(
+                    snap.issued_through
+                        .map_or(cursor.sequence, |issued| issued.max(cursor.sequence)),
+                );
+            }
+        });
+    }
+
+    /// Whether `cursor` is covered by a cursor minted by this process in the
+    /// currently observed topology.
+    pub fn cursor_was_issued(&self, cursor: LiveApplyCursor) -> bool {
+        let snapshot = *self.snapshot.borrow();
+        snapshot.topology_epoch == cursor.topology_epoch
+            && snapshot
+                .issued_through
+                .is_some_and(|issued| cursor.sequence <= issued)
+    }
+
     /// Publish that the poll loop accepted a generation covering `sequence`.
     pub fn record_accepted(&self, sequence: u64) {
         let topology_epoch = self.snapshot.borrow().topology_epoch;
@@ -311,6 +340,7 @@ impl RuntimeConfigApply {
                 snap.topology_epoch = cursor.topology_epoch;
                 snap.accepted = cursor.sequence;
                 snap.rejected_through = 0;
+                snap.issued_through = None;
             } else if cursor.topology_epoch == snap.topology_epoch
                 && cursor.sequence > snap.accepted
             {
@@ -332,6 +362,7 @@ impl RuntimeConfigApply {
                 snap.topology_epoch = cursor.topology_epoch;
                 snap.accepted = 0;
                 snap.rejected_through = cursor.sequence;
+                snap.issued_through = None;
             } else if cursor.topology_epoch == snap.topology_epoch
                 && cursor.sequence > snap.rejected_through
             {
@@ -350,6 +381,7 @@ impl RuntimeConfigApply {
                 snap.topology_epoch = topology_epoch;
                 snap.accepted = 0;
                 snap.rejected_through = 0;
+                snap.issued_through = None;
             }
         });
     }

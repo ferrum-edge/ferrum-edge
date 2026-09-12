@@ -1697,7 +1697,7 @@ fn the_decoder_working_set_is_reserved_before_the_decoder_is_constructed() {
         .find("if !scratch.reserve_in(budget, coding.scratch_bytes())")
         .expect("the codec working set must be reserved against the aggregate budget");
     for decoder in [
-        "flate2::read::MultiGzDecoder::new(data)",
+        "flate2::bufread::GzDecoder::new(data)",
         "StrictBrotliReader::new(data)",
     ] {
         let constructed = decode
@@ -2411,6 +2411,13 @@ fn no_declared_producer_builds_a_complete_replacement_before_the_bound() {
             // protobuf is exactly the case the reserve-then-fill / count-then-
             // emit seam exists for; assembling it first is the build-then-copy
             // shape, however bounded the final copy is.
+            //
+            // The HTTP JSON Agent Card had the same shape in a different
+            // costume: `on_response_body` parsed the card, rewrote it, and
+            // serialized the whole tree with `Value::to_string()` straight into
+            // a `PluginResult::Reject` body — a complete replacement built
+            // before the core's producer window ever admitted it
+            // (`GHSA-r423-f5mr-83x2`).
             &[
                 "bounded_vec_from",
                 "fn rewrite_agent_card_protobuf(",
@@ -2418,6 +2425,7 @@ fn no_declared_producer_builds_a_complete_replacement_before_the_bound() {
                 "Vec::with_capacity(message.len()",
                 "sink.push(&message)",
                 "sink.push(&rewritten)",
+                "body: value.to_string()",
             ],
         ),
         ("ai_tool_governor", &["bounded_vec_from"]),
@@ -2455,6 +2463,11 @@ fn the_repaired_producers_construct_through_the_bound() {
             // allocation-free length counter and then straight into the sink,
             // so the gRPC frame prefix and every submessage length prefix are
             // known without ever materialising the message they describe.
+            //
+            // The HTTP JSON card is admitted without producing a byte
+            // (`agent_card_response_is_present`) and then serialized THROUGH
+            // the ceiling-bounded sink in the transform phase, so an amplifying
+            // rewrite is refused while it is written.
             &[
                 "trait ProtobufEmitter",
                 "struct ProtobufLengthCounter",
@@ -2462,6 +2475,9 @@ fn the_repaired_producers_construct_through_the_bound() {
                 "fn emit_rewritten_agent_card<E: ProtobufEmitter>(",
                 "fn emit_rewritten_agent_interface<E: ProtobufEmitter>(",
                 "fn emit_protobuf_len_header<E: ProtobufEmitter>(",
+                "fn agent_card_response_is_present(",
+                "fn produce_http_agent_card_body(",
+                "response_buffer_budget::bounded_json_vec(&value, ceiling)",
             ],
         ),
         (

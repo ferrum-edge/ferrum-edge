@@ -895,8 +895,7 @@ This means every WebSocket plugin works on H3 sessions unchanged:
   incomplete-message frame/duration bounds
   (`FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES` /
   `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS`), installed on both framers
-  by the shared relay. H3 client frames are unmasked per RFC 9220 §5; the
-  bridge validates that rule before bytes reach the framer, so fragment
+  by the shared relay. The bridge relays client bytes verbatim, so fragment
   accounting sees exactly the same frame sequence on H1, H2, and H3
 - `on_ws_disconnect` (end-of-session bookkeeping with success-only frame/byte
   counts, direction, and `io_side` attribution)
@@ -908,24 +907,36 @@ This means every WebSocket plugin works on H3 sessions unchanged:
 - Sticky-session cookies on the 200 response (same as H1/H2)
 - All logging plugins (the `TransactionSummary` emitted at upgrade time carries `http_method = "CONNECT"`, mirroring the H2 Extended CONNECT path)
 
-### Frame masking — RFC 9220 §5 vs RFC 6455
+### Frame masking — RFC 6455 §5.1 applies unchanged on HTTP/3
 
-RFC 6455 / RFC 8441 require client-to-server WebSocket frames to be
-masked. RFC 9220 §5 REVERSES this: WebSocket frames over HTTP/3 MUST
-be unmasked because QUIC already provides packet-level authentication.
-The gateway's H3 path:
+There is no HTTP/3 masking exemption. RFC 9220 §3 adopts RFC 8441's
+Extended CONNECT mechanism, and RFC 8441 §5 then says the peers
+"proceed with the WebSocket Protocol [RFC6455] using the ... stream
+from the CONNECT transaction as if it were the TCP connection".
+Neither document mentions masking, so RFC 6455 §5.1 governs on every
+frontend: client-to-server frames MUST be masked, server-to-client
+frames MUST NOT be, and a server MUST close the connection on an
+unmasked client frame. RFC 9220 §5 is IANA Considerations.
+
+The gateway's H3 path is therefore identical to H1 and H2:
 
 - **Emits unmasked frames to the client** — `tokio_tungstenite`'s
-  `Role::Server` doesn't mask outgoing frames, so this is correct
-  on default settings.
-- **Accepts unmasked frames from the client** —
-  `accept_unmasked_frames = true` is set on the H3 path's
-  WebSocketConfig (it's `false` on the H1/H2 path).
-- **Rejects masked client frames** — the H3 receive pump pre-validates
-  WebSocket frame headers before bytes reach tungstenite's permissive
-  `accept_unmasked_frames` mode. A non-compliant H3 client that sends a
-  masked frame receives a WebSocket close frame with code `1002`
-  (protocol error), and the frame is not bridged to the backend.
+  `Role::Server` doesn't mask outgoing frames, which is what RFC 6455
+  requires of a server.
+- **Accepts and unmasks masked client frames** — the pump tasks relay
+  QUIC DATA bytes verbatim without inspecting frame headers, and the
+  shared `run_websocket_proxy` framer unmasks the payload before the
+  frame plugins run. Frames are re-encoded for the backend under the
+  backend transport's own role, so backend-facing masking is unchanged.
+- **Rejects unmasked client frames** — `accept_unmasked_frames = false`
+  on every frontend, so an unmasked client frame is a tungstenite
+  protocol error and the client is closed with code `1002` by the same
+  shared close mapping H1/H2 use.
+
+Before issue #5011 this was inverted: the H3 bridge attributed an
+unmasked-frame mandate to "RFC 9220 §5" and closed masked client frames
+with `1002`, so no standards-compliant client could exchange data over an
+H3 WebSocket route.
 
 ### Tunnel mode
 
@@ -934,10 +945,6 @@ apply to H3 sessions. The H3 frontend has no raw TCP underneath QUIC to
 splice; bytes always pass through the pump tasks. Operators who set
 tunnel mode for H1/H2 throughput automatically get frame-parsing
 semantics on H3 — frame-level plugins continue to work regardless.
-The generic `run_websocket_proxy` carries a `debug_assert!` enforcing
-this invariant (`websocket_tunnel_mode` and `accept_unmasked_client_frames`
-are mutually exclusive) so a future refactor that wires a non-TCP
-transport into the raw-copy fast path fails loudly in debug builds.
 
 ### Circuit breaker, load balancer, graceful drain
 
@@ -1040,9 +1047,11 @@ End-to-end functional coverage lives in
 `tests/functional/functional_websocket_test.rs`. The tree ships a small
 h3-quinn-based RFC 9220 client because common off-the-shelf clients
 (curl 8.x, h2load, tungstenite) still focus on WebSocket over HTTP/1.1
-/ HTTP/2. The functional shard covers H3 text/binary frame relay,
-masked-frame permissiveness, subprotocol forwarding and the no-subprotocol
-case, backend retry target rotation, failed backend upgrade responses,
+/ HTTP/2. That client masks its frames per RFC 6455 §5.1, like every
+real WebSocket client. The functional shard covers H3 text/binary frame
+relay with a masking client, the `1002` refusal of an unmasked client
+frame, subprotocol forwarding and the no-subprotocol case, backend
+retry target rotation, failed backend upgrade responses,
 per-IP request-slot release after the 200 CONNECT response, and
 `FERRUM_HTTP3_WEBSOCKET_ENABLED=false` rejecting Extended CONNECT while
 plain H3 requests continue to route.

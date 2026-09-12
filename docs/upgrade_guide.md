@@ -28,6 +28,15 @@ baseline contract above.
 
 ## Breaking changes in 0.9.0
 
+### ConfigSync subscription identity binding
+
+`ConfigSync.Subscribe` now requires the request's trimmed `node_id` to equal
+the authenticated JWT's `sub`, matching native `MeshSubscribe`. Mismatches
+return `PERMISSION_DENIED` before stream allocation or cluster registration.
+Before upgrading, update external DP token issuers and custom subscribers to
+use the same node identity for both fields. Built-in DP token minting already
+does this. Enforcement is immediate; there is no compatibility mode.
+
 Every `BREAKING` changelog entry in the `[0.9.0]` release is listed here exactly once, with its issue number and the operator action that entry already states. Several of these fail **silently** at cutover (HMAC clients get `401`, WAF `literal` rules stop matching folded spellings, backends stop seeing client-supplied XFF hops) rather than refusing config load. Read this section before the per-mode procedures below.
 
 ### Backend mTLS handshake without a client certificate is pre-wire (issue [#4406](https://github.com/ferrum-edge/ferrum-edge/issues/4406))

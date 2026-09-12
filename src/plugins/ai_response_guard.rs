@@ -20,6 +20,7 @@
 //! closed for enforcing actions. Methods that were never enrolled are never
 //! inspected opportunistically and never forced onto the buffered path.
 
+use crate::fips::approved::Sha256;
 use async_trait::async_trait;
 use flate2::bufread::GzDecoder;
 use flate2::write::GzEncoder;
@@ -34,7 +35,9 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read as _, Write as _};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{debug, warn};
+use tracing::debug;
+
+use crate::plugins::utils::log_sampling::warn_sampled;
 
 use super::utils::body_transform::is_json_content_type;
 use super::utils::json_escape::escape_json_string;
@@ -935,6 +938,36 @@ impl AiResponseGuard {
         result
     }
 
+    /// Verify a whole-body text replacement using only the scratch room left
+    /// by its retained allocation. Sequential placeholder removal may keep two
+    /// scratch buffers live, so their capacities share that remaining room.
+    fn text_has_residual(&self, redacted: &[u8], scratch_ceiling: usize) -> Option<bool> {
+        use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
+
+        let mut current: Option<Vec<u8>> = None;
+        for pattern in self.pii_patterns.iter().chain(self.blocked_phrases.iter()) {
+            let input = std::str::from_utf8(current.as_deref().unwrap_or(redacted)).ok()?;
+            if pattern.placeholder.is_empty() || !input.contains(pattern.placeholder.as_str()) {
+                continue;
+            }
+            let room = scratch_ceiling.checked_sub(current.as_ref().map_or(0, Vec::capacity))?;
+            let mut sink = BoundedResponseBodySink::with_ceiling(room);
+            let mut last = 0;
+            for (start, matched) in input.match_indices(pattern.placeholder.as_str()) {
+                if !sink.push(&input.as_bytes()[last..start]) {
+                    return None;
+                }
+                last = start + matched.len();
+            }
+            if !sink.push(&input.as_bytes()[last..]) {
+                return None;
+            }
+            current = Some(sink.finish()?);
+        }
+        let cleaned = std::str::from_utf8(current.as_deref().unwrap_or(redacted)).ok()?;
+        Some(self.detection_set.is_match(cleaned))
+    }
+
     /// `ScanMode::All` redact mode: after applying the same redaction the
     /// response transform performs, decide whether any *unredactable* PII still
     /// remains, so the caller can fail closed (reject) instead of forwarding the
@@ -1407,7 +1440,7 @@ impl AiResponseGuard {
                 }
             }
             GuardAction::Warn => {
-                warn!(
+                warn_sampled!(
                     "ai_response_guard: content detected (types: {:?}), passing through (warn mode)",
                     detected
                 );
@@ -3269,7 +3302,7 @@ fn load_grpc_inspection(
     let pool = match load_grpc_descriptor_pool_inner(&shape.descriptor_path) {
         Ok(pool) => pool,
         Err((true, _)) => {
-            warn!(
+            warn_sampled!(
                 plugin = "ai_response_guard",
                 "Protobuf descriptor dependency is unavailable; enrolled gRPC methods fail closed"
             );
@@ -3414,6 +3447,20 @@ impl Plugin for AiResponseGuard {
             return self.inspect_grpc_response(ctx, response_status, response_headers, body);
         }
 
+        // The shared representation gate owns origin decoding and its retained
+        // budget. It runs before transforms, after this early inspection hook.
+        // Defer only a response this instance claims there; the final hook must
+        // inspect the installed plaintext even when no redaction was needed.
+        if !body.is_empty()
+            && self.enforces_response_body_policy(
+                ctx,
+                response_headers.get("content-type").map(String::as_str),
+                body,
+            )
+        {
+            return PluginResult::Continue;
+        }
+
         // Enforce the aggregate scan/work bound before the successful-response
         // content gate. Buffered non-2xx error bodies still reach the transform
         // phase, so returning before this check would let a large raw body evade
@@ -3541,6 +3588,9 @@ impl Plugin for AiResponseGuard {
                 }
             }
 
+            if self.has_verified_redaction(ctx, body, Some(content_type)) {
+                return PluginResult::Continue;
+            }
             let detected = if self.scan_mode == ScanMode::All {
                 self.detect_matches_in_decoded_sse_frames(
                     &frames,
@@ -3623,6 +3673,9 @@ impl Plugin for AiResponseGuard {
                         }
                     }
                 }
+                if self.has_verified_redaction(ctx, body, Some(content_type)) {
+                    return PluginResult::Continue;
+                }
                 let detected = self.detect_matches(&[text]);
                 return if detected.is_empty() {
                     PluginResult::Continue
@@ -3699,6 +3752,9 @@ impl Plugin for AiResponseGuard {
         }
 
         // Detect PII and blocked content
+        if self.has_verified_redaction(ctx, body, Some(content_type)) {
+            return PluginResult::Continue;
+        }
         let detected = if self.scan_mode == ScanMode::All {
             self.detect_matches_in_decoded_json(&json, std::str::from_utf8(body).ok())
         } else {
@@ -3805,7 +3861,28 @@ impl Plugin for AiResponseGuard {
         if ctx.is_native_grpc_request() || response_is_grpc_framed(ctx, content_type, body) {
             return None;
         }
-        let replacement = self.redacted_response_body(body, content_type, ceiling);
+        let mut detected = Vec::new();
+        let replacement = self.redacted_response_body(body, content_type, ceiling, &mut detected);
+        if let Some(redacted) = replacement.as_deref() {
+            self.record_verified_redaction(ctx, redacted, content_type);
+            if !detected.is_empty() {
+                ctx.metadata
+                    .insert("ai_response_guard_redacted".to_string(), detected.join(","));
+            }
+        } else if content_type.is_some_and(is_text_event_stream_media_type)
+            && body.len() <= self.max_scan_bytes
+            && ctx
+                .ai_response_guard_pending_redactions
+                .contains_key(&self.instance_id)
+            && !self.sse_body_has_residual(body)
+        {
+            // Structural-only SSE matches deliberately leave the exact event
+            // bytes untouched. A clean residual scan discharges that promise
+            // without pretending a replacement was installed.
+            self.record_verified_redaction(ctx, body, content_type);
+            ctx.ai_response_guard_pending_redactions
+                .remove(&self.instance_id);
+        }
         self.discharge_pending_redaction(ctx, replacement)
     }
 
@@ -3823,6 +3900,7 @@ impl Plugin for AiResponseGuard {
             body,
             content_type,
             crate::proxy::response_buffer_budget::buffered_response_body_ceiling(0),
+            &mut Vec::new(),
         )
     }
 
@@ -3907,16 +3985,17 @@ impl Plugin for AiResponseGuard {
     ///    field — `pending_choices` → `choices` — after the guard's only pass, and
     ///    add/update/remove rules can equally introduce blocked text, drop a
     ///    required field, or expand a completion past its length bound
-    ///    (`GHSA-62jg-v563-4q23`). Re-running detection over the published bytes
-    ///    is what makes the metadata a statement about the delivered
-    ///    representation instead of the pre-transform one.
+    ///    (`GHSA-62jg-v563-4q23`). A private digest recognizes this instance's
+    ///    residual-verified HTTP output. Only that exact output may reuse the
+    ///    placeholder and structural-scalar exemptions; any changed bytes or
+    ///    media type need a fresh detection pass.
     ///
     /// The re-run is a RESIDUAL scan, not a second redaction round: no transform
     /// remains to install a replacement, so a fresh `redact` detection becomes
     /// the same rejection as an undischarged promise. `warn` keeps passing
     /// through, so a monitoring deployment is not silently converted into a
-    /// blocking one. Detection is local pattern matching, so nothing is charged
-    /// twice by running it again.
+    /// blocking one. Size, structure, and length rules still run on verified
+    /// output, so placeholder expansion cannot bypass a completion limit.
     ///
     /// The gateway's own capacity terminal is not affected: when the transform
     /// phase installs it, the response is already replaced and this phase is not
@@ -3928,11 +4007,26 @@ impl Plugin for AiResponseGuard {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        // A final call cannot defer again: the representation gate must have
+        // installed plaintext and retired the origin-encoding marker first.
+        if !body.is_empty()
+            && self.enforces_response_body_policy(
+                ctx,
+                response_headers.get("content-type").map(String::as_str),
+                body,
+            )
+        {
+            return self.respond_to_uninspectable(
+                ctx,
+                "encoded_response_not_decoded",
+                "response content encoding was not decoded before final inspection",
+            );
+        }
         if let Some(detected) = ctx
             .ai_response_guard_pending_redactions
             .remove(&self.instance_id)
         {
-            warn!(
+            warn_sampled!(
                 "ai_response_guard: detected content was not redacted before delivery (types: {}), rejecting response",
                 detected
             );
@@ -3958,7 +4052,7 @@ impl Plugin for AiResponseGuard {
         else {
             return PluginResult::Continue;
         };
-        warn!(
+        warn_sampled!(
             "ai_response_guard: detected content is still present in the final client-visible response (types: {}), rejecting response",
             detected
         );
@@ -3997,6 +4091,39 @@ impl Plugin for AiResponseGuard {
 }
 
 impl AiResponseGuard {
+    /// Bind residual verification to this instance's exact output and media
+    /// type. Keep the digest private to the request; public redaction metadata
+    /// cannot authorize placeholder or structural-value exemptions.
+    fn redaction_digest(body: &[u8], content_type: Option<&str>) -> [u8; 32] {
+        let content_type = content_type.unwrap_or("");
+        let mut digest = Sha256::new();
+        digest.update((content_type.len() as u64).to_be_bytes());
+        digest.update(content_type.as_bytes());
+        digest.update(body);
+        digest.finalize()
+    }
+
+    fn record_verified_redaction(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+        content_type: Option<&str>,
+    ) {
+        ctx.ai_response_guard_verified_redactions
+            .insert(self.instance_id, Self::redaction_digest(body, content_type));
+    }
+
+    fn has_verified_redaction(
+        &self,
+        ctx: &RequestContext,
+        body: &[u8],
+        content_type: Option<&str>,
+    ) -> bool {
+        ctx.ai_response_guard_verified_redactions
+            .get(&self.instance_id)
+            .is_some_and(|digest| *digest == Self::redaction_digest(body, content_type))
+    }
+
     /// The shared terminal for detected content that is still in the bytes the
     /// client would receive — whether the promised redaction never ran or a later
     /// semantic transform reintroduced it.
@@ -4046,6 +4173,7 @@ impl AiResponseGuard {
         body: &[u8],
         content_type: Option<&str>,
         ceiling: usize,
+        detected: &mut Vec<String>,
     ) -> Option<Vec<u8>> {
         if !self.needs_body_transform {
             return None;
@@ -4075,8 +4203,12 @@ impl AiResponseGuard {
                     return None;
                 }
                 let text = std::str::from_utf8(body).ok()?;
+                *detected = self.detect_matches(&[text]);
                 let redacted = self.redact_text_bounded(text, ceiling)?;
                 if redacted == text.as_bytes() {
+                    return None;
+                }
+                if self.text_has_residual(&redacted, ceiling.checked_sub(redacted.capacity())?)? {
                     return None;
                 }
                 return Some(redacted);
@@ -4087,8 +4219,12 @@ impl AiResponseGuard {
             Ok(json) => json,
             Err(_) if self.scan_mode == ScanMode::All => {
                 let text = std::str::from_utf8(body).ok()?;
+                *detected = self.detect_matches(&[text]);
                 let redacted = self.redact_text_bounded(text, ceiling)?;
                 if redacted == text.as_bytes() {
+                    return None;
+                }
+                if self.text_has_residual(&redacted, ceiling.checked_sub(redacted.capacity())?)? {
                     return None;
                 }
                 return Some(redacted);
@@ -4097,10 +4233,8 @@ impl AiResponseGuard {
         };
 
         if self.scan_mode == ScanMode::All {
-            if self
-                .detect_matches_in_decoded_json(&json, std::str::from_utf8(body).ok())
-                .is_empty()
-            {
+            *detected = self.detect_matches_in_decoded_json(&json, std::str::from_utf8(body).ok());
+            if detected.is_empty() {
                 return None;
             }
             // `on_response_body` rejects this case in the normal pipeline.
@@ -4113,8 +4247,8 @@ impl AiResponseGuard {
             self.redact_all_strings_with_argument_shield(&mut json);
         } else {
             let texts = self.extract_completion_texts(&json);
-            let has_match = !self.detect_matches(&texts).is_empty();
-            if !has_match {
+            *detected = self.detect_matches(&texts);
+            if detected.is_empty() {
                 return None;
             }
             if self.content_redact_leaves_residual(&json) {

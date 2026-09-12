@@ -49,6 +49,9 @@
 //! configured and both trigger on the same request, the delay executes
 //! first, then the abort fires.
 //! `runtime_overlay_scope` may be omitted or null to disable RTDS scoping.
+//! `abort.body` may be omitted or null for an empty body. Non-gRPC abort
+//! responses are labeled `application/json` only when the body parses as JSON;
+//! otherwise they are `text/plain`.
 //!
 //! ## RTDS overlay
 //!
@@ -164,6 +167,10 @@ struct AbortFault {
     percentage: f64,
     grpc_status: Option<u32>,
     body: String,
+    /// Media type matching `body`. JSON only when the configured bytes parse as
+    /// JSON; otherwise `text/plain`. Set on the HTTP reject so the shared
+    /// finalizer does not label a non-JSON body `application/json`.
+    content_type: &'static str,
 }
 
 struct DelayFault {
@@ -195,12 +202,9 @@ impl FaultInjectionPlugin {
                     &["status_code", "percentage", "grpc_status", "body"],
                     "abort",
                 )?;
-                let status_code = abort_obj
-                    .get("status_code")
-                    .and_then(|v| v.as_u64())
-                    .ok_or(
-                        "fault_injection: abort.status_code is required and must be an integer",
-                    )?;
+                let status_code = abort_obj.get("status_code").and_then(json_u64).ok_or(
+                    "fault_injection: abort.status_code is required and must be an integer",
+                )?;
 
                 if !(200..=599).contains(&status_code) {
                     return Err(format!(
@@ -211,8 +215,7 @@ impl FaultInjectionPlugin {
                 let percentage = parse_percentage(abort_obj.get("percentage"), "abort.percentage")?;
 
                 let grpc_status = if let Some(grpc_val) = abort_obj.get("grpc_status") {
-                    let code = grpc_val
-                        .as_u64()
+                    let code = json_u64(grpc_val)
                         .ok_or("fault_injection: abort.grpc_status must be an integer")?;
                     if code > 16 {
                         return Err(format!(
@@ -231,12 +234,14 @@ impl FaultInjectionPlugin {
                         return Err("fault_injection: abort.body must be a string".to_string());
                     }
                 };
+                let content_type = abort_http_content_type(&body);
 
                 Some(AbortFault {
                     status_code: status_code as u16,
                     percentage,
                     grpc_status,
                     body,
+                    content_type,
                 })
             }
             Some(Value::Null) | None => None,
@@ -246,12 +251,9 @@ impl FaultInjectionPlugin {
         let delay = match obj.get("delay") {
             Some(Value::Object(delay_obj)) => {
                 reject_unknown_keys(delay_obj.keys(), &["duration_ms", "percentage"], "delay")?;
-                let duration_ms = delay_obj
-                    .get("duration_ms")
-                    .and_then(|v| v.as_u64())
-                    .ok_or(
-                        "fault_injection: delay.duration_ms is required and must be a positive integer",
-                    )?;
+                let duration_ms = delay_obj.get("duration_ms").and_then(json_u64).ok_or(
+                    "fault_injection: delay.duration_ms is required and must be a positive integer",
+                )?;
 
                 if duration_ms == 0 {
                     return Err(
@@ -319,6 +321,27 @@ fn reject_unknown_keys<'a>(
     Ok(())
 }
 
+/// Accept JSON integers and mathematically integral numbers (`503.0`, `5.03e2`).
+/// Fractional, negative, non-finite, and non-numeric values are rejected.
+fn json_u64(value: &Value) -> Option<u64> {
+    let Value::Number(n) = value else {
+        return None;
+    };
+    n.as_u64().or_else(|| {
+        let n = n.as_f64()?;
+        (n.is_finite() && n.fract() == 0.0 && n >= 0.0).then_some(n as u64)
+    })
+}
+
+/// Label an abort body with the media type that matches the bytes actually sent.
+fn abort_http_content_type(body: &str) -> &'static str {
+    if !body.is_empty() && serde_json::from_str::<Value>(body).is_ok() {
+        "application/json"
+    } else {
+        "text/plain"
+    }
+}
+
 fn parse_percentage(val: Option<&Value>, field_name: &str) -> Result<f64, String> {
     let pct = match val {
         Some(Value::Number(n)) => n
@@ -357,8 +380,12 @@ impl FaultInjectionPlugin {
 
     fn reject_for_abort(&self, abort: &AbortFault, is_grpc_request: bool) -> PluginResult {
         let mut headers = HashMap::new();
-        if is_grpc_request && let Some(grpc_status) = abort.grpc_status {
-            headers.insert("grpc-status".to_string(), grpc_status.to_string());
+        if is_grpc_request {
+            if let Some(grpc_status) = abort.grpc_status {
+                headers.insert("grpc-status".to_string(), grpc_status.to_string());
+            }
+        } else {
+            headers.insert("content-type".to_string(), abort.content_type.to_string());
         }
         PluginResult::Reject {
             status_code: abort.status_code,

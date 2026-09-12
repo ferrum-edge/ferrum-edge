@@ -143,7 +143,8 @@ impl TlsEventLog {
             return Ok(Self::new(capacity));
         };
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            crate::tls::store_dir::create_private_store_dir(parent)
+                .map_err(|error| error.to_string())?;
         }
         let max_document_bytes =
             crate::config::env_config::tls_store_max_document_bytes_from_env()?;
@@ -198,7 +199,8 @@ impl TlsEventLog {
             });
         };
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            crate::tls::store_dir::create_private_store_dir(parent)
+                .map_err(|error| error.to_string())?;
         }
         let mut events = load_event_log_events(&path, max_document_bytes)?;
         while events.len() > capacity {
@@ -626,7 +628,7 @@ fn write_private_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "TLS event log path has no parent directory".to_string())?;
-    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    crate::tls::store_dir::create_private_store_dir(parent).map_err(|error| error.to_string())?;
     crate::tls::private_file::replace_private_file(path, bytes).map_err(|error| error.to_string())
 }
 

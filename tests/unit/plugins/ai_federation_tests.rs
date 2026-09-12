@@ -3385,6 +3385,21 @@ fn tool_round_trip_request(stop: Value) -> Value {
     })
 }
 
+/// The shared tool fixture names a specific function. Every native adapter can
+/// represent that except Cohere v2, whose `tool_choice` is only `REQUIRED` /
+/// `NONE` (issue #5257), so the Cohere cases exercise the same fixture with the
+/// named selection dropped.
+fn request_for_provider(provider: &str, request: &Value) -> Value {
+    let mut request = request.clone();
+    if provider != "cohere" {
+        return request;
+    }
+    if let Some(object) = request.as_object_mut() {
+        object.remove("tool_choice");
+    }
+    request
+}
+
 #[test]
 fn native_adapters_preserve_tool_call_state_and_scalar_stop() {
     let request = tool_round_trip_request(json!("DONE"));
@@ -3455,8 +3470,18 @@ fn native_adapters_preserve_tool_call_state_and_scalar_stop() {
     );
     assert_eq!(bedrock["inferenceConfig"]["stopSequences"], json!(["DONE"]));
 
+    // Cohere v2 cannot represent a named tool choice, so the shared fixture's
+    // selection is refused before dispatch instead of being forwarded as an
+    // enum value the provider would reject (issue #5257).
+    let named_choice =
+        test_helpers::translate_request_test("cohere", &request, "command-r", &json!({}));
+    let named_error = named_choice.unwrap_err();
+    assert!(named_error.contains("named tool_choice"), "{named_error}");
+
+    let cohere_request = request_for_provider("cohere", &request);
     let (_, _, cohere_bytes) =
-        test_helpers::translate_request_test("cohere", &request, "command-r", &json!({})).unwrap();
+        test_helpers::translate_request_test("cohere", &cohere_request, "command-r", &json!({}))
+            .unwrap();
     let cohere: Value = serde_json::from_slice(&cohere_bytes).unwrap();
     assert_eq!(cohere["messages"][1]["tool_calls"][0]["id"], "call_weather");
     assert_eq!(cohere["stop_sequences"], json!(["DONE"]));
@@ -3587,7 +3612,7 @@ fn malformed_stop_and_tool_shapes_fail_explicitly() {
             json!(["ok", 3]),
             json!(""),
         ] {
-            let request = tool_round_trip_request(stop);
+            let request = request_for_provider(provider, &tool_round_trip_request(stop));
             let error = test_helpers::translate_request_test(provider, &request, "model", &config)
                 .unwrap_err();
             assert!(
@@ -3647,6 +3672,7 @@ fn openai_scalar_stop_stays_scalar_while_array_only_providers_wrap_it() {
         ),
         ("cohere", json!({}), "/stop_sequences"),
     ] {
+        let request = request_for_provider(provider, &request);
         let (_, _, body) =
             test_helpers::translate_request_test(provider, &request, "model", &config).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
@@ -3677,15 +3703,16 @@ fn native_stop_fields_preserve_arrays_and_omit_null_or_absent_values() {
     ];
 
     for (provider, config, pointer) in providers {
-        let request = tool_round_trip_request(json!(["ONE", "TWO"]));
+        let request =
+            request_for_provider(provider, &tool_round_trip_request(json!(["ONE", "TWO"])));
         let (_, _, body) =
             test_helpers::translate_request_test(provider, &request, "model", &config).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body.pointer(pointer), Some(&json!(["ONE", "TWO"])));
 
         for mut request in [
-            tool_round_trip_request(Value::Null),
-            tool_round_trip_request(json!("unused")),
+            request_for_provider(provider, &tool_round_trip_request(Value::Null)),
+            request_for_provider(provider, &tool_round_trip_request(json!("unused"))),
         ] {
             if request["stop"].as_str() == Some("unused") {
                 request.as_object_mut().unwrap().remove("stop");
@@ -8619,6 +8646,444 @@ fn test_multimodal_mode_rejects_unknown_value() {
         err.contains("unknown multimodal_mode 'bogus'"),
         "got: {err}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Anchored glob matching (issue #5255)
+//
+// The matcher used to consume the FIRST occurrence of each literal segment and
+// then demand that the final position had consumed the whole input, so a
+// suffix that also occurs earlier rejected an ordinary model name: with no
+// other provider the request became a 404, and with a catch-all fallback it
+// was routed to a different provider entirely.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_glob_suffix_that_also_occurs_earlier_still_matches() {
+    assert!(test_helpers::glob_match("*mini", "mini-mini"));
+    assert!(test_helpers::glob_match("*mini", "model-mini"));
+    assert!(test_helpers::glob_match("*mini", "mini"));
+    assert!(!test_helpers::glob_match("*mini", "mini-pro"));
+    assert!(!test_helpers::glob_match("*mini", "minim"));
+}
+
+#[test]
+fn test_glob_anchored_suffix_after_a_prefix_still_matches_a_repeat() {
+    assert!(test_helpers::glob_match("gpt-*-mini", "gpt-4o-mini-mini"));
+    assert!(!test_helpers::glob_match("gpt-*-mini", "gpt-4o-mini-x"));
+}
+
+#[test]
+fn test_glob_interior_literal_that_also_occurs_later_still_matches() {
+    assert!(test_helpers::glob_match(
+        "*claude*sonnet",
+        "claude-3-sonnet-sonnet"
+    ));
+    assert!(!test_helpers::glob_match(
+        "*claude*sonnet",
+        "claude-3-sonnet-x"
+    ));
+}
+
+#[test]
+fn test_glob_repeated_suffix_still_refuses_url_separators() {
+    // The repair must not weaken the security tightening: a `*` window still
+    // cannot consume a URL-structural separator, however the literals align.
+    assert!(!test_helpers::glob_match("*mini", "foo/mini"));
+    assert!(!test_helpers::glob_match(
+        "*claude*sonnet",
+        "claude/x-sonnet"
+    ));
+    assert!(!test_helpers::glob_match(
+        "gemini-*-pro",
+        "gemini-../foo-pro"
+    ));
+}
+
+/// The routing consequence of the matcher repair: the demonstrated model has
+/// to select its configured provider instead of failing closed as unmatched.
+#[tokio::test]
+async fn a_model_repeating_its_pattern_suffix_selects_the_configured_provider() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "model_patterns": ["*mini"]
+        }]
+    }));
+
+    let (_matched_ctx, _headers, matched) =
+        claim_stream(&plugin, &streaming_body("mini-mini")).await;
+    assert!(matches!(matched, PluginResult::Continue), "{matched:?}");
+
+    let (_unmatched_ctx, _headers, unmatched) =
+        claim_stream(&plugin, &streaming_body("mini-pro")).await;
+    let (status, text) = reject_status(&unmatched).expect("an unmatched model must fail closed");
+    assert_eq!(status, 404);
+    assert!(text.contains("model_not_found"), "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// Cohere native request-field translation (issues #5256, #5257, #5258)
+// ---------------------------------------------------------------------------
+
+fn cohere_request(extra: Value) -> Value {
+    let mut body = json!({
+        "model": "model-v1",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    if let (Some(base), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+    body
+}
+
+fn translated_cohere(body: &Value) -> Value {
+    let (_, _, bytes) =
+        test_helpers::translate_request_test("cohere", body, "command-r", &json!({})).unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+fn cohere_translation_error(body: &Value) -> String {
+    let translated = test_helpers::translate_request_test("cohere", body, "command-r", &json!({}));
+    translated.unwrap_err()
+}
+
+fn cohere_tools() -> Value {
+    json!([{
+        "type": "function",
+        "function": {"name": "weather", "parameters": {"type": "object"}}
+    }])
+}
+
+#[test]
+fn cohere_translates_max_completion_tokens_to_the_native_output_limit() {
+    let translated = translated_cohere(&cohere_request(json!({"max_completion_tokens": 7})));
+    assert_eq!(translated["max_tokens"], 7);
+    assert!(translated.get("max_completion_tokens").is_none());
+}
+
+#[test]
+fn cohere_prefers_max_tokens_when_both_output_limits_are_supplied() {
+    let both = cohere_request(json!({"max_tokens": 11, "max_completion_tokens": 7}));
+    let translated = translated_cohere(&both);
+    assert_eq!(translated["max_tokens"], 11);
+    assert!(translated.get("max_completion_tokens").is_none());
+}
+
+#[test]
+fn cohere_omits_the_output_limit_when_the_client_sent_none() {
+    let translated = translated_cohere(&cohere_request(json!({})));
+    assert!(translated.get("max_tokens").is_none());
+}
+
+#[test]
+fn cohere_translates_top_p_to_the_native_nucleus_parameter() {
+    let translated = translated_cohere(&cohere_request(json!({"top_p": 0.5})));
+    assert_eq!(translated["p"], 0.5);
+    assert!(translated.get("top_p").is_none());
+}
+
+#[test]
+fn cohere_translates_tool_choice_to_the_native_enum() {
+    let tools = cohere_tools();
+
+    let auto = cohere_request(json!({"tools": tools, "tool_choice": "auto"}));
+    assert!(translated_cohere(&auto).get("tool_choice").is_none());
+
+    let required = cohere_request(json!({"tools": tools, "tool_choice": "required"}));
+    assert_eq!(translated_cohere(&required)["tool_choice"], "REQUIRED");
+
+    let none = cohere_request(json!({"tools": tools, "tool_choice": "none"}));
+    assert_eq!(translated_cohere(&none)["tool_choice"], "NONE");
+
+    // Nothing to disable when the request declares no tools at all, so the
+    // field is omitted rather than sent on a toolless request.
+    let bare = cohere_request(json!({"tool_choice": "none"}));
+    assert!(translated_cohere(&bare).get("tool_choice").is_none());
+}
+
+#[test]
+fn cohere_refuses_a_tool_choice_it_cannot_represent() {
+    let named = json!({"type": "function", "function": {"name": "weather"}});
+    let body = cohere_request(json!({"tools": cohere_tools(), "tool_choice": named}));
+    let error = cohere_translation_error(&body);
+    assert!(error.contains("named tool_choice"), "{error}");
+}
+
+#[test]
+fn cohere_keeps_the_openai_tools_array_it_natively_accepts() {
+    let body = cohere_request(json!({"tools": cohere_tools()}));
+    let translated = translated_cohere(&body);
+    assert_eq!(translated["tools"][0]["function"]["name"], "weather");
+    assert!(translated.get("tool_choice").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Static credential admission (issue #5259)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn provider_api_key_that_cannot_be_sent_as_a_header_fails_admission() {
+    for provider_type in ["openai", "anthropic", "azure_openai", "google_gemini"] {
+        let mut provider = json!({
+            "name": "primary",
+            "provider_type": provider_type,
+            "api_key": "audit\nkey"
+        });
+        if provider_type == "azure_openai" {
+            provider["azure_resource"] = json!("resource");
+            provider["azure_deployment"] = json!("deployment");
+        }
+        let config = json!({"providers": [provider]});
+        let error = ai_federation::AiFederation::new(&config, create_test_http_client())
+            .err()
+            .expect("a credential that cannot be sent as a header must fail admission");
+        assert!(error.contains("'api_key'"), "{provider_type}: {error}");
+        assert!(
+            error.contains("not a valid HTTP header value"),
+            "{provider_type}: {error}"
+        );
+        assert!(
+            !error.contains("audit"),
+            "the credential must never be echoed: {error}"
+        );
+    }
+}
+
+#[test]
+fn provider_api_key_with_ordinary_characters_still_passes_admission() {
+    let config = json!({
+        "providers": [{
+            "name": "primary",
+            "provider_type": "openai",
+            "api_key": "sk-Abc123._-~+/=:"
+        }]
+    });
+    assert!(
+        ai_federation::AiFederation::new(&config, create_test_http_client()).is_ok(),
+        "an ordinary credential must still be accepted"
+    );
+}
+
+#[test]
+fn bedrock_signing_credentials_are_screened_as_header_values_too() {
+    for (field, value) in [
+        ("aws_access_key_id", "AKIA\nBAD"),
+        ("aws_session_token", "token\nbad"),
+    ] {
+        let mut provider = json!({
+            "name": "bedrock",
+            "provider_type": "aws_bedrock",
+            "aws_region": "us-east-1",
+            "aws_access_key_id": "AKIAEXAMPLE",
+            "aws_secret_access_key": "secret"
+        });
+        provider[field] = json!(value);
+        let config = json!({"providers": [provider]});
+        let error = ai_federation::AiFederation::new(&config, create_test_http_client())
+            .err()
+            .expect("a signing credential that cannot be sent as a header must fail admission");
+        assert!(error.contains(field), "{field}: {error}");
+        assert!(
+            error.contains("not a valid HTTP header value"),
+            "{field}: {error}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming multimodal policy (GHSA-h5r4-qw2q-f277)
+//
+// The buffered path consults `multimodal_mode` before provider I/O. The
+// streaming path validated generic OpenAI content structure and then committed
+// a provider without consulting it at all, so image and audio parts a provider
+// was configured to reject - or to strip - reached that provider unchanged.
+// ---------------------------------------------------------------------------
+
+fn image_stream_body(model: &str) -> Value {
+    let mut body = multimodal_image_request(model);
+    body["stream"] = json!(true);
+    body
+}
+
+#[tokio::test]
+async fn streaming_reject_mode_provider_refuses_non_text_content() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "max_concurrent_requests": 1,
+        "providers": [openai_provider(json!({"multimodal_mode": "reject"}))]
+    }));
+
+    let (ctx, _headers, result) = claim_stream(&plugin, &image_stream_body("gpt-4o")).await;
+    let (status, text) = reject_status(&result).expect("reject mode must fail closed");
+    assert_eq!(status, 400);
+    assert!(text.contains("multimodal_mode='reject'"), "{text}");
+    assert!(
+        !test_helpers::has_provider_claim_for_test(&ctx),
+        "a refused request must not commit a provider"
+    );
+    assert_eq!(
+        test_helpers::available_request_slots_for_test(&plugin),
+        1,
+        "a refused claim must return its permit"
+    );
+}
+
+#[tokio::test]
+async fn streaming_multimodal_refusal_falls_through_to_a_permissive_provider() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "providers": [
+            {
+                "name": "strict",
+                "provider_type": "openai",
+                "api_key": "sk-a",
+                "model_patterns": ["gpt-*"],
+                "multimodal_mode": "reject"
+            },
+            {
+                "name": "permissive",
+                "provider_type": "openai",
+                "api_key": "sk-b",
+                "model_patterns": ["gpt-*"],
+                "multimodal_mode": "translate"
+            }
+        ]
+    }));
+
+    let (ctx, _headers, result) = claim_stream(&plugin, &image_stream_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(ctx.metadata["ai_federation_provider"], "permissive");
+    assert_eq!(
+        ctx.metadata["ai_federation.streaming_provider_attempts"],
+        "2"
+    );
+}
+
+#[tokio::test]
+async fn streaming_text_only_provider_strips_non_text_content_before_dispatch() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "providers": [openai_provider(json!({
+            "multimodal_mode": "text_only_with_warning",
+            "model_mapping": {"gpt-4o": "gpt-4o-2024-11-20"}
+        }))]
+    }));
+    let body = image_stream_body("gpt-4o");
+    let original = serde_json::to_vec(&body).unwrap();
+
+    let (mut ctx, headers, result) = claim_stream(&plugin, &body).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    // The drop is attributed to the provider that was actually committed.
+    assert_eq!(ctx.metadata["ai_federation_multimodal_dropped_parts"], "1");
+    assert_eq!(ctx.metadata["ai_federation_multimodal_provider"], "openai");
+    assert_eq!(
+        ctx.metadata["ai_federation_multimodal_mode"],
+        "text_only_with_warning"
+    );
+
+    let rewritten = plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            &original,
+            Some("application/json"),
+            &headers,
+        )
+        .await
+        .expect("the text-only policy must rewrite the provider-visible body");
+    let value: Value = serde_json::from_slice(&rewritten).unwrap();
+    assert_eq!(value["messages"][0]["content"], "What is in this image?");
+    // The model rewrite still applies alongside the reduction.
+    assert_eq!(value["model"], "gpt-4o-2024-11-20");
+    assert_eq!(value["stream"], true);
+    assert!(
+        !String::from_utf8_lossy(&rewritten).contains("image_url"),
+        "no non-text part may survive the reduction"
+    );
+
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &rewritten)
+            .await,
+        PluginResult::Continue
+    ));
+
+    // With the resolved model already in place, the surviving image is the only
+    // policy violation left — and an un-reduced body is exactly what used to
+    // reach the provider.
+    let mut unreduced = body.clone();
+    unreduced["model"] = json!("gpt-4o-2024-11-20");
+    let unreduced = serde_json::to_vec(&unreduced).unwrap();
+    let refused = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &unreduced)
+        .await;
+    let (status, text) = reject_status(&refused).expect("residual content must fail closed");
+    assert_eq!(status, 400);
+    assert!(text.contains("multimodal_policy_violation"), "{text}");
+}
+
+#[tokio::test]
+async fn streaming_final_body_refuses_non_text_content_added_after_the_claim() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "max_concurrent_requests": 1,
+        "providers": [openai_provider(json!({"multimodal_mode": "reject"}))]
+    }));
+    let (mut ctx, headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+
+    let tampered = serde_json::to_vec(&image_stream_body("gpt-4o")).unwrap();
+    let refused = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &tampered)
+        .await;
+    let (status, text) = reject_status(&refused).expect("a later transform must fail closed");
+    assert_eq!(status, 400);
+    assert!(text.contains("multimodal_policy_violation"), "{text}");
+    assert!(
+        !text.contains("image_url"),
+        "no request byte may be echoed: {text}"
+    );
+    assert_eq!(
+        test_helpers::available_request_slots_for_test(&plugin),
+        1,
+        "a pre-dispatch rejection must release the permit immediately"
+    );
+}
+
+#[tokio::test]
+async fn streaming_translate_mode_provider_still_carries_non_text_content() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "providers": [openai_provider(json!({"multimodal_mode": "translate"}))]
+    }));
+    let body = image_stream_body("gpt-4o");
+    let original = serde_json::to_vec(&body).unwrap();
+
+    let (mut ctx, headers, result) = claim_stream(&plugin, &body).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert!(
+        plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                &original,
+                Some("application/json"),
+                &headers,
+            )
+            .await
+            .is_none(),
+        "translate mode preserves the client body verbatim"
+    );
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &original)
+            .await,
+        PluginResult::Continue
+    ));
 }
 
 // ---------------------------------------------------------------------------

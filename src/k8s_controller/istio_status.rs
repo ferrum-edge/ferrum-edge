@@ -96,7 +96,7 @@ use tracing::warn;
 use crate::config_sources::k8s::{
     K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions, SidecarOutboundPolicy,
     classify_sidecar_outbound_traffic_policy, route_local_fault_delay_for_rule,
-    service_entry_port_protocol_is_udp, service_entry_spec_has_unresolvable_wildcard_host,
+    service_entry_port_protocol_is_udp, service_entry_spec_has_unresolvable_stream_wildcard_host,
     sidecar_selector_from_istio, translate_k8s_objects_collecting_skips,
     workload_entry_service_key_from_host, workload_selector_from_istio,
 };
@@ -1509,13 +1509,15 @@ fn virtual_service_clamped_fields(spec: &Value) -> Vec<&'static str> {
 /// so the status report can never diverge from the translator's classification or
 /// the materializer's skip.
 ///
-/// A wildcard `spec.hosts[]` element is reported the same way (issue #4535):
-/// every egress materialization branch refuses a wildcard host unless the entry
-/// declares `resolution: STATIC` with a non-empty `endpoints[]`, because
-/// otherwise the wildcard string itself becomes the upstream dial target. That
-/// detection routes through the SHARED
-/// `service_entry_spec_has_unresolvable_wildcard_host` wrapper over the
-/// materializer's own predicate, so the report and the skip stay in lock-step.
+/// A wildcard `spec.hosts[]` element on a stream-family port is reported the
+/// same way (issue #4535): the stream materialization branch refuses a wildcard
+/// host unless the entry declares `resolution: STATIC` with a non-empty
+/// `endpoints[]`, because a raw stream has no request authority from which to
+/// concretize the dial target. HTTP-family ports are exempt — dispatch replaces
+/// the wildcard target with the matching request authority. That detection
+/// routes through the SHARED `service_entry_spec_has_unresolvable_stream_wildcard_host`
+/// wrapper over the materializer's own predicate, so the report and the skip
+/// stay in lock-step.
 fn service_entry_status(
     object: &K8sObject,
     result: Result<&K8sTranslation, &K8sTranslateError>,
@@ -1579,19 +1581,21 @@ fn service_entry_status(
         );
     }
 
-    // A wildcard `spec.hosts[]` element is only materializable when the operator
-    // declared concrete `endpoints[]` under `resolution: STATIC` — otherwise the
-    // wildcard host itself would become the upstream dial target and no resolver
-    // can answer it, so every egress branch skips the host. Report that through
-    // the SAME shared predicate the materializer uses, keeping
+    // A wildcard `spec.hosts[]` element is only materializable on the
+    // stream-family branch when the operator declared concrete `endpoints[]`
+    // under `resolution: STATIC` — a raw stream has no request authority from
+    // which to concretize the dial target, so the materializer skips the host.
+    // Report that through the SAME shared predicate, keeping
     // `FerrumAccepted=True` (the resource IS translated, just inert for that
-    // host) exactly as the UDP lane does.
-    if service_entry_spec_has_unresolvable_wildcard_host(&object.spec) {
+    // host on its stream ports) exactly as the UDP lane does. HTTP-family
+    // ports are exempt: dispatch replaces the wildcard target with the
+    // matching request authority before DNS, SNI, and pool selection.
+    if service_entry_spec_has_unresolvable_stream_wildcard_host(&object.spec) {
         deferred.push(
-            "spec.hosts[]: wildcard host — egress materialization deferred (a wildcard \
-             host is only materializable with resolution: STATIC and a non-empty \
-             endpoints[]; otherwise the wildcard itself would be the unresolvable \
-             upstream dial target)",
+            "spec.hosts[]: wildcard host on a stream-family port — egress materialization \
+             deferred (a stream-family wildcard host is only materializable with \
+             resolution: STATIC and a non-empty endpoints[]; a raw stream has no request \
+             authority from which to concretize the dial target)",
         );
     }
 

@@ -20,6 +20,53 @@ fn plugin(mut config: Value) -> std::sync::Arc<dyn ferrum_edge::plugins::Plugin>
         .expect("a2a_gateway should be registered")
 }
 
+/// Run the HTTP JSON Agent Card lifecycle the proxy runs: admission in
+/// `on_response_body`, then bounded production in the response transform phase.
+///
+/// The rewrite deliberately does not happen inside `on_response_body` any more:
+/// the replacement is built through the retained-response sink inside the
+/// producer window (`GHSA-r423-f5mr-83x2`). `Err` carries a terminal the
+/// admission phase selected; `Ok(None)` means the card needed no rewrite.
+async fn http_card_rewrite(
+    plugin: &Arc<dyn Plugin>,
+    ctx: &mut RequestContext,
+    response_headers: &mut HashMap<String, String>,
+    body: &str,
+) -> Result<Option<Value>, PluginResult> {
+    let admitted = plugin
+        .on_response_body(ctx, 200, response_headers, body.as_bytes())
+        .await;
+    if !matches!(admitted, PluginResult::Continue) {
+        return Err(admitted);
+    }
+    let content_type = response_headers.get("content-type").cloned();
+    let transformed = plugin
+        .transform_response_body_with_context(
+            ctx,
+            body.as_bytes(),
+            content_type.as_deref(),
+            response_headers,
+        )
+        .await;
+    Ok(transformed.map(|bytes| {
+        serde_json::from_slice(&bytes).expect("rewritten agent card should be valid JSON")
+    }))
+}
+
+/// The rewritten card, or a panic naming what went wrong instead.
+async fn expect_http_card_rewrite(
+    plugin: &Arc<dyn Plugin>,
+    ctx: &mut RequestContext,
+    response_headers: &mut HashMap<String, String>,
+    body: &str,
+) -> Value {
+    match http_card_rewrite(plugin, ctx, response_headers, body).await {
+        Ok(Some(rewritten)) => rewritten,
+        Ok(None) => panic!("agent card rewrite should replace the response body"),
+        Err(_) => panic!("agent card rewrite should not have been refused"),
+    }
+}
+
 fn jsonrpc_ctx(body: Value) -> (RequestContext, HashMap<String, String>) {
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
@@ -194,12 +241,17 @@ async fn jsonrpc_batch_policy_deny_rejects_denied_member() {
     };
     assert_eq!(status_code, 200);
     let body: Value = serde_json::from_str(&body).expect("body should be JSON");
-    let response = body
+    let responses = body
         .as_array()
-        .and_then(|responses| responses.first())
         .expect("batch denial should be wrapped in a JSON-RPC batch response");
-    assert_eq!(response["id"], "req-denied");
-    assert_eq!(response["error"]["data"]["method"], "message/send");
+    // The refusal dispatches no member, so every non-notification member needs a
+    // Response object it can be correlated against — not only the denied one.
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["id"], "req-allowed");
+    assert_eq!(responses[0]["error"]["code"], -32001);
+    assert!(responses[0]["error"]["data"]["method"].is_null());
+    assert_eq!(responses[1]["id"], "req-denied");
+    assert_eq!(responses[1]["error"]["data"]["method"], "message/send");
     assert_eq!(
         ctx.metadata.get("a2a.policy_decision").map(String::as_str),
         Some("deny")
@@ -233,12 +285,15 @@ async fn jsonrpc_batch_policy_deny_rejects_uninspectable_member() {
     };
     assert_eq!(status_code, 200);
     let body: Value = serde_json::from_str(&body).expect("body should be JSON");
-    let response = body
+    let responses = body
         .as_array()
-        .and_then(|responses| responses.first())
         .expect("uninspectable batch should be wrapped in a JSON-RPC batch response");
-    assert!(response["id"].is_null());
-    assert_eq!(response["error"]["data"]["method"], "unknown");
+    // The valid member is still a request the gateway refused without
+    // dispatching, so it gets its own Response object. The bare string member
+    // carries no id and is not answerable.
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["id"], "req-allowed");
+    assert_eq!(responses[0]["error"]["data"]["method"], "unknown");
     assert_eq!(
         ctx.metadata.get("a2a.error").map(String::as_str),
         Some("request_body_uninspectable")
@@ -391,17 +446,7 @@ async fn rest_agent_card_response_rewrites_gateway_urls() {
     })
     .to_string();
 
-    let result = plugin
-        .on_response_body(&mut ctx, 200, &mut response_headers, body.as_bytes())
-        .await;
-    let PluginResult::Reject {
-        status_code, body, ..
-    } = result
-    else {
-        panic!("agent card rewrite should replace response body");
-    };
-    assert_eq!(status_code, 200);
-    let body: Value = serde_json::from_str(&body).expect("body should be JSON");
+    let body = expect_http_card_rewrite(&plugin, &mut ctx, &mut response_headers, &body).await;
     assert_eq!(body["url"], "https://planner.internal/grpc");
     assert_eq!(
         body["additionalInterfaces"][0]["url"],
@@ -492,13 +537,7 @@ async fn jsonrpc_agent_card_response_rewrites_gateway_urls() {
     })
     .to_string();
 
-    let result = plugin
-        .on_response_body(&mut ctx, 200, &mut response_headers, body.as_bytes())
-        .await;
-    let PluginResult::Reject { body, .. } = result else {
-        panic!("JSON-RPC agent card rewrite should replace response body");
-    };
-    let body: Value = serde_json::from_str(&body).expect("body should be JSON");
+    let body = expect_http_card_rewrite(&plugin, &mut ctx, &mut response_headers, &body).await;
     let result = &body["result"];
     assert!(result.get("url").is_none());
     assert_eq!(
@@ -539,13 +578,7 @@ async fn agent_card_rewrite_still_runs_when_metadata_is_disabled() {
     })
     .to_string();
 
-    let result = plugin
-        .on_response_body(&mut ctx, 200, &mut response_headers, body.as_bytes())
-        .await;
-    let PluginResult::Reject { body, .. } = result else {
-        panic!("agent card rewrite should replace response body");
-    };
-    let body: Value = serde_json::from_str(&body).expect("body should be JSON");
+    let body = expect_http_card_rewrite(&plugin, &mut ctx, &mut response_headers, &body).await;
     assert_eq!(body["url"], "https://gateway.example.com/a2a");
     assert!(ctx.metadata.is_empty());
 }
@@ -588,10 +621,11 @@ async fn invalid_forwarded_origin_does_not_rewrite_agent_card() {
     }));
     let (mut ctx, mut request_headers) =
         rest_ctx("GET", "/agents/planner/.well-known/agent-card.json");
-    ctx.headers
-        .insert("x-forwarded-proto".to_string(), "javascript".to_string());
-    ctx.headers
-        .insert("host".to_string(), "gateway.example.com".to_string());
+    // The request hook's own header map is what the origin is resolved from —
+    // the core moves headers off the context when nothing mutates them.
+    request_headers.insert("x-forwarded-proto".to_string(), "javascript".to_string());
+    request_headers.insert("host".to_string(), "gateway.example.com".to_string());
+    ctx.headers.clone_from(&request_headers);
 
     let result = plugin.before_proxy(&mut ctx, &mut request_headers).await;
     assert!(matches!(
@@ -676,9 +710,8 @@ async fn trusted_forwarded_origin_rewrites_agent_card_url() {
     }));
     let (mut ctx, mut request_headers) =
         rest_ctx("GET", "/agents/planner/.well-known/agent-card.json");
-    ctx.headers
-        .insert("x-forwarded-proto".to_string(), "https".to_string());
-    ctx.headers.insert(
+    request_headers.insert("x-forwarded-proto".to_string(), "https".to_string());
+    request_headers.insert(
         "x-forwarded-host".to_string(),
         "gateway.example.com".to_string(),
     );
@@ -696,13 +729,7 @@ async fn trusted_forwarded_origin_rewrites_agent_card_url() {
     })
     .to_string();
 
-    let result = plugin
-        .on_response_body(&mut ctx, 200, &mut response_headers, body.as_bytes())
-        .await;
-    let PluginResult::Reject { body, .. } = result else {
-        panic!("trusted forwarded origin should rewrite the agent card");
-    };
-    let body: Value = serde_json::from_str(&body).expect("body should be JSON");
+    let body = expect_http_card_rewrite(&plugin, &mut ctx, &mut response_headers, &body).await;
     assert_eq!(body["url"], "https://gateway.example.com/a2a");
 }
 
@@ -716,10 +743,8 @@ async fn trusted_host_header_rewrites_agent_card_url_without_forwarded_host() {
     }));
     let (mut ctx, mut request_headers) =
         rest_ctx("GET", "/agents/planner/.well-known/agent-card.json");
-    ctx.headers
-        .insert("x-forwarded-proto".to_string(), "https".to_string());
-    ctx.headers
-        .insert("host".to_string(), "gateway.example.com".to_string());
+    request_headers.insert("x-forwarded-proto".to_string(), "https".to_string());
+    request_headers.insert("host".to_string(), "gateway.example.com".to_string());
 
     let result = plugin.before_proxy(&mut ctx, &mut request_headers).await;
     assert!(matches!(result, PluginResult::Continue));
@@ -733,13 +758,7 @@ async fn trusted_host_header_rewrites_agent_card_url_without_forwarded_host() {
     })
     .to_string();
 
-    let result = plugin
-        .on_response_body(&mut ctx, 200, &mut response_headers, body.as_bytes())
-        .await;
-    let PluginResult::Reject { body, .. } = result else {
-        panic!("trusted host header should rewrite the agent card");
-    };
-    let body: Value = serde_json::from_str(&body).expect("body should be JSON");
+    let body = expect_http_card_rewrite(&plugin, &mut ctx, &mut response_headers, &body).await;
     assert_eq!(body["url"], "https://gateway.example.com/a2a");
 }
 
@@ -779,14 +798,10 @@ async fn agent_card_rewrite_strips_stale_body_coupled_headers() {
     })
     .to_string();
 
-    let result = plugin
-        .on_response_body(&mut ctx, 200, &mut response_headers, body.as_bytes())
-        .await;
-    let PluginResult::Reject { headers, body, .. } = result else {
-        panic!("agent card rewrite should replace response body");
-    };
-    let rewritten: Value = serde_json::from_str(&body).expect("body should be JSON");
+    let rewritten = expect_http_card_rewrite(&plugin, &mut ctx, &mut response_headers, &body).await;
     assert_eq!(rewritten["url"], "https://gateway.example.com/a2a");
+    // The core runs this immediately after installing a transform's output.
+    plugin.on_response_body_transformed(&mut ctx, &mut response_headers);
 
     // Validators, integrity digests, and the content encoding describe the
     // backend body and no longer match the re-serialized (uncompressed) card,
@@ -799,18 +814,21 @@ async fn agent_card_rewrite_strips_stale_body_coupled_headers() {
         "content-digest",
     ] {
         assert!(
-            !headers.keys().any(|key| key.eq_ignore_ascii_case(stale)),
-            "expected {stale} to be stripped after rewrite, got {headers:?}"
+            !response_headers
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case(stale)),
+            "expected {stale} to be stripped after rewrite, got {response_headers:?}"
         );
     }
-    // Headers unrelated to the body are preserved, and content-type is normalized.
+    // Headers unrelated to the body are preserved, as is the backend's own JSON
+    // content type: the rewrite changes the document, not its media type.
     assert!(
-        headers
+        response_headers
             .keys()
             .any(|key| key.eq_ignore_ascii_case("cache-control"))
     );
     assert_eq!(
-        headers.get("content-type").map(String::as_str),
+        response_headers.get("content-type").map(String::as_str),
         Some("application/json")
     );
 }
@@ -5029,10 +5047,8 @@ async fn forwarded_card_origins_require_exact_allowlist_membership() {
         ("https", "user@gateway.example.com"),
     ] {
         let (mut ctx, mut headers) = rest_ctx("GET", "/.well-known/agent-card.json");
-        ctx.headers
-            .insert("x-forwarded-proto".to_string(), proto.to_string());
-        ctx.headers
-            .insert("x-forwarded-host".to_string(), host.to_string());
+        headers.insert("x-forwarded-proto".to_string(), proto.to_string());
+        headers.insert("x-forwarded-host".to_string(), host.to_string());
         assert!(matches!(
             gateway.before_proxy(&mut ctx, &mut headers).await,
             PluginResult::Reject {
@@ -5168,9 +5184,18 @@ async fn already_public_json_card_retains_signatures_and_body() {
         "signatures": [{"signature": "fixture"}]
     })
     .to_string();
+    let mut response_headers = HashMap::new();
+    // Every advertised URL already names the public origin, so the producing
+    // phase forwards the backend's original, still-signed bytes untouched.
+    assert!(
+        http_card_rewrite(&gateway, &mut ctx, &mut response_headers, &body)
+            .await
+            .expect("an already-public card must not select a terminal")
+            .is_none()
+    );
     assert!(matches!(
         gateway
-            .on_response_body(&mut ctx, 200, &mut HashMap::new(), body.as_bytes())
+            .on_final_response_body(&mut ctx, 200, &response_headers, body.as_bytes())
             .await,
         PluginResult::Continue
     ));
@@ -5204,9 +5229,8 @@ async fn grpc_card_schema_gate_precedes_missing_origin_response_backstop() {
     }}));
     let (mut ctx, mut headers) = grpc_ctx("GetAgentCard", "application/grpc");
     ctx.path = "/lf.a2a.v1.A2AService/GetAgentCard".to_string();
-    ctx.headers
-        .insert("x-forwarded-proto".to_string(), "https".to_string());
-    ctx.headers.insert(
+    headers.insert("x-forwarded-proto".to_string(), "https".to_string());
+    headers.insert(
         "x-forwarded-host".to_string(),
         "gateway.example.com".to_string(),
     );
@@ -5214,7 +5238,9 @@ async fn grpc_card_schema_gate_precedes_missing_origin_response_backstop() {
         gateway.before_proxy(&mut ctx, &mut headers).await,
         PluginResult::Continue
     ));
-    ctx.headers.remove("x-forwarded-host");
+    // The admitted origin is retained on the request claim, so the response
+    // phase cannot lose it; the service-schema gate is what refuses this card,
+    // and it does so before the origin is ever consulted.
     let frame = frame_grpc_message(&a2a_03_card_fixture());
     let result = gateway
         .on_response_body(&mut ctx, 200, &mut grpc_ok_response_headers(), &frame)
@@ -5224,4 +5250,770 @@ async fn grpc_card_schema_gate_precedes_missing_origin_response_backstop() {
         "agent_card_grpc_schema_unsupported",
         ctx.metadata.get("a2a.error").map(String::as_str),
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #5352 — Agent Card discovery must not depend on request-header mutability
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn forwarded_origin_card_rewrite_survives_disabled_accept_encoding_strip() {
+    // With `strip_accept_encoding: false` the plugin declares no request-header
+    // mutation, so the core moves the request headers out of the context. The
+    // admitted public origin has to come from the hook's own header map and be
+    // retained for the response phase, or a perfectly valid allowlisted card
+    // request fails with `agent_card_public_origin_unavailable`.
+    let plugin = plugin(json!({
+        "discovery": {
+            "trust_forwarded_headers": true,
+            "allowed_public_origins": ["https://agents.example.com"]
+        },
+        "detection": {"strip_accept_encoding": false}
+    }));
+    assert!(!plugin.modifies_request_headers());
+
+    let (mut ctx, mut request_headers) = rest_ctx("GET", "/.well-known/agent-card.json");
+    request_headers.insert(
+        "x-forwarded-host".to_string(),
+        "agents.example.com".to_string(),
+    );
+    request_headers.insert("x-forwarded-proto".to_string(), "https".to_string());
+    // Exactly what the core does when nothing on the proxy mutates headers.
+    ctx.headers.clear();
+
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut request_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(plugin.should_buffer_response_body(&ctx));
+    // Accept-Encoding is left alone: the option controls compression
+    // negotiation, not whether the card can be rewritten.
+    assert!(request_headers.contains_key("x-forwarded-host"));
+
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let body = json!({
+        "protocolVersion": "0.3.0",
+        "name": "planner",
+        "url": "https://planner.internal/a2a"
+    })
+    .to_string();
+    let rewritten = expect_http_card_rewrite(&plugin, &mut ctx, &mut response_headers, &body).await;
+    assert_eq!(rewritten["url"], "https://agents.example.com/a2a");
+}
+
+#[tokio::test]
+async fn unadmitted_forwarded_origin_still_fails_closed_before_dispatch() {
+    // The companion half of the fix: relaxing where the origin is READ must not
+    // relax which origins are ADMITTED.
+    let plugin = plugin(json!({
+        "discovery": {
+            "trust_forwarded_headers": true,
+            "allowed_public_origins": ["https://agents.example.com"]
+        },
+        "detection": {"strip_accept_encoding": false}
+    }));
+    let (mut ctx, mut request_headers) = rest_ctx("GET", "/.well-known/agent-card.json");
+    request_headers.insert(
+        "x-forwarded-host".to_string(),
+        "attacker.example.com".to_string(),
+    );
+    request_headers.insert("x-forwarded-proto".to_string(), "https".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut request_headers).await,
+        PluginResult::Reject {
+            status_code: 502,
+            ..
+        }
+    ));
+    assert_eq!(
+        ctx.metadata.get("a2a.error").map(String::as_str),
+        Some("agent_card_public_origin_unavailable")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #5353 — gRPC-Web framing must not run before the card rewrite
+// ---------------------------------------------------------------------------
+
+/// Mark the request the way `grpc_web` marks one it translated to native gRPC.
+fn mark_grpc_web_translated(ctx: &mut RequestContext) {
+    ctx.metadata
+        .insert("grpc_web_mode".to_string(), "binary".to_string());
+}
+
+#[tokio::test]
+async fn grpc_web_translated_agent_card_is_rewritten_before_framing() {
+    let plugin = plugin(json!({
+        "discovery": {"public_base_url": "https://gateway.example.com"}
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetAgentCard").await;
+    mark_grpc_web_translated(&mut ctx);
+
+    let card = encode_a2a_03_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal/a2a",
+        "JSONRPC",
+        &[("https://planner.internal/a2a", "JSONRPC")],
+        "0.3.0",
+        true,
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers = grpc_ok_response_headers();
+
+    // The normalize phase runs before `on_response_body` and before every
+    // transform, so this is the last point at which the body is still one
+    // native unary frame.
+    let normalized = plugin
+        .normalize_response_body_with_context(
+            &mut ctx,
+            200,
+            &body,
+            Some("application/grpc-web+proto"),
+            &response_headers,
+        )
+        .await
+        .expect("gRPC-Web translated Agent Card must be rewritten before framing");
+    let message = &normalized[5..];
+    assert_eq!(
+        proto_string_field(message, 3).as_deref(),
+        Some("https://gateway.example.com/a2a")
+    );
+    assert!(!proto_has_field(message, 17), "signatures must be dropped");
+
+    // The staged route must not run a second time over the same response.
+    response_headers.insert("content-length".to_string(), "128".to_string());
+    response_headers.insert("etag".to_string(), "\"abc123\"".to_string());
+    response_headers.insert("grpc-encoding".to_string(), "identity".to_string());
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &normalized)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &normalized,
+                Some("application/grpc-web+proto"),
+                &response_headers,
+            )
+            .await
+            .is_none(),
+        "the card was already produced; the transform phase must not re-run it"
+    );
+    // Validators describing the backend's original frame are invalidated.
+    for stale in ["content-length", "etag", "grpc-encoding"] {
+        assert!(!response_headers.contains_key(stale));
+    }
+    assert!(matches!(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &response_headers, &normalized)
+            .await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn native_grpc_agent_card_keeps_the_staged_transform_route() {
+    // Without the translator the normalize phase must stay inert, so the
+    // existing two-phase contract is unchanged.
+    let plugin = plugin(json!({
+        "discovery": {"public_base_url": "https://gateway.example.com"}
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetAgentCard").await;
+    let body = frame_grpc_message(&a2a_03_card_fixture());
+    let mut response_headers = grpc_ok_response_headers();
+    assert!(
+        plugin
+            .normalize_response_body_with_context(
+                &mut ctx,
+                200,
+                &body,
+                Some("application/grpc"),
+                &response_headers,
+            )
+            .await
+            .is_none(),
+        "native gRPC must not be rewritten in the normalize phase"
+    );
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/grpc"),
+                &response_headers,
+            )
+            .await
+            .is_some(),
+        "the native route still produces the rewritten frame in the transform phase"
+    );
+}
+
+#[tokio::test]
+async fn grpc_web_translated_unrewritable_card_still_fails_closed() {
+    let plugin = plugin(json!({
+        "endpoint": {"grpc_services": ["lf.a2a.v1.A2AService"]},
+        "discovery": {"public_base_url": "https://gateway.example.com"}
+    }));
+    let (mut ctx, mut headers) = grpc_ctx("GetAgentCard", "application/grpc");
+    ctx.path = "/lf.a2a.v1.A2AService/GetAgentCard".to_string();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    mark_grpc_web_translated(&mut ctx);
+
+    let body = frame_grpc_message(&a2a_03_card_fixture());
+    let response_headers = grpc_ok_response_headers();
+    assert!(
+        plugin
+            .normalize_response_body_with_context(
+                &mut ctx,
+                200,
+                &body,
+                Some("application/grpc-web+proto"),
+                &response_headers,
+            )
+            .await
+            .is_none()
+    );
+    let final_result = plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, &body)
+        .await;
+    assert_grpc_rewrite_reject(final_result, "agent_card_grpc_schema_unsupported", None);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #5354 — a refused batch answers every request member
+// ---------------------------------------------------------------------------
+
+async fn deny_batch(plugin: &Arc<dyn Plugin>, batch: Value) -> Vec<Value> {
+    let (mut ctx, mut headers) = jsonrpc_ctx(batch);
+    let PluginResult::Reject { body, .. } = plugin.before_proxy(&mut ctx, &mut headers).await
+    else {
+        panic!("a batch containing a denied member must be refused");
+    };
+    let body: Value = serde_json::from_str(&body).expect("batch refusal should be JSON");
+    body.as_array()
+        .expect("a batch refusal must answer with an array")
+        .clone()
+}
+
+fn deny_message_send_plugin() -> Arc<dyn Plugin> {
+    plugin(json!({
+        "policy": {"methods": {"message/send": {"action": "deny"}}}
+    }))
+}
+
+#[tokio::test]
+async fn batch_refusal_answers_every_request_id_in_wire_order() {
+    let plugin = deny_message_send_plugin();
+    let responses = deny_batch(
+        &plugin,
+        json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "tasks/get"},
+            {"jsonrpc": "2.0", "id": "deny-me", "method": "message/send"},
+            {"jsonrpc": "2.0", "id": 3, "method": "tasks/list"}
+        ]),
+    )
+    .await;
+    let ids: Vec<Value> = responses
+        .iter()
+        .map(|response| response["id"].clone())
+        .collect();
+    assert_eq!(ids, vec![json!(1), json!("deny-me"), json!(3)]);
+    for response in &responses {
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["error"]["code"], -32001);
+        assert_eq!(response["error"]["data"]["gateway"], "a2a_gateway");
+    }
+    // Only the member the policy named carries the operation it named.
+    assert_eq!(responses[1]["error"]["data"]["method"], "message/send");
+    assert!(responses[0]["error"]["data"]["method"].is_null());
+    assert!(responses[2]["error"]["data"]["method"].is_null());
+}
+
+#[tokio::test]
+async fn batch_refusal_preserves_id_types_and_omits_notifications() {
+    let plugin = deny_message_send_plugin();
+    let responses = deny_batch(
+        &plugin,
+        json!([
+            {"jsonrpc": "2.0", "method": "tasks/get"},
+            {"jsonrpc": "2.0", "id": null, "method": "tasks/list"},
+            {"jsonrpc": "2.0", "id": 7, "method": "message/send"},
+            {"jsonrpc": "2.0", "id": "seven", "method": "message/send"}
+        ]),
+    )
+    .await;
+    // The notification (no `id` member) is correctly unanswered; an explicit
+    // null id is a request and keeps its exact JSON type, as do the number and
+    // the string.
+    assert_eq!(responses.len(), 3);
+    assert!(responses[0]["id"].is_null());
+    assert_eq!(responses[1]["id"], json!(7));
+    assert!(responses[1]["id"].is_number());
+    assert_eq!(responses[2]["id"], json!("seven"));
+    assert!(responses[2]["id"].is_string());
+}
+
+#[tokio::test]
+async fn batch_refusal_covers_multiple_denied_members() {
+    let plugin = plugin(json!({
+        "policy": {
+            "default_action": "deny",
+            "methods": {"tasks/get": {"action": "allow"}}
+        }
+    }));
+    let responses = deny_batch(
+        &plugin,
+        json!([
+            {"jsonrpc": "2.0", "id": "a", "method": "message/send"},
+            {"jsonrpc": "2.0", "id": "b", "method": "tasks/cancel"},
+            {"jsonrpc": "2.0", "id": "c", "method": "tasks/get"}
+        ]),
+    )
+    .await;
+    let ids: Vec<Value> = responses
+        .iter()
+        .map(|response| response["id"].clone())
+        .collect();
+    assert_eq!(ids, vec![json!("a"), json!("b"), json!("c")]);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #5355 — the published base URL is the canonicalized, validated one
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ambiguous_public_base_url_spellings_are_refused() {
+    for base in [
+        "https://agents.example.com ",
+        " https://agents.example.com",
+        "https:agents.example.com",
+        "https:/agents.example.com",
+        "https://agents.example\t.com",
+        "https://agents.example.com\n",
+        "http:///a2a",
+    ] {
+        let error = create_plugin(
+            "a2a_gateway",
+            &json!({"discovery": {"public_base_url": base}}),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{base:?} must be refused"));
+        assert!(error.contains("discovery.public_base_url"), "{error}");
+    }
+}
+
+#[test]
+fn ambiguous_allowed_public_origin_spellings_are_refused() {
+    let error = create_plugin(
+        "a2a_gateway",
+        &json!({"discovery": {
+            "trust_forwarded_headers": true,
+            "allowed_public_origins": ["https://agents.example.com "]
+        }}),
+    )
+    .err()
+    .expect("a whitespace-bearing origin must be refused");
+    assert!(error.contains("allowed_public_origins"), "{error}");
+}
+
+#[tokio::test]
+async fn configured_public_base_is_published_in_canonical_form() {
+    // Case, default port, and a trailing slash are normalized once at admission
+    // so the published card URL cannot inherit the operator's raw spelling.
+    let plugin = plugin(json!({
+        "discovery": {"public_base_url": "HTTPS://Agents.Example.COM:443/"}
+    }));
+    let (mut ctx, mut request_headers) = rest_ctx("GET", "/.well-known/agent-card.json");
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut request_headers).await,
+        PluginResult::Continue
+    ));
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let body = json!({
+        "protocolVersion": "0.3.0",
+        "name": "planner",
+        "url": "https://planner.internal/a2a"
+    })
+    .to_string();
+    let rewritten = expect_http_card_rewrite(&plugin, &mut ctx, &mut response_headers, &body).await;
+    assert_eq!(rewritten["url"], "https://agents.example.com/a2a");
+}
+
+#[tokio::test]
+async fn configured_public_base_preserves_an_intended_base_path() {
+    let plugin = plugin(json!({
+        "discovery": {"public_base_url": "https://agents.example.com/tenant-a/"}
+    }));
+    let (mut ctx, mut request_headers) = rest_ctx("GET", "/.well-known/agent-card.json");
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut request_headers).await,
+        PluginResult::Continue
+    ));
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let body = json!({
+        "protocolVersion": "0.3.0",
+        "name": "planner",
+        "url": "https://planner.internal/a2a"
+    })
+    .to_string();
+    let rewritten = expect_http_card_rewrite(&plugin, &mut ctx, &mut response_headers, &body).await;
+    assert_eq!(rewritten["url"], "https://agents.example.com/tenant-a/a2a");
+}
+
+// ---------------------------------------------------------------------------
+// Per-instance detection ownership
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_second_instance_does_not_inherit_another_instances_detection() {
+    // Two instances with disjoint endpoint scopes on one proxy. Only the one
+    // whose scope matches may treat the response as A2A; the other must not
+    // apply ITS observability settings — here verbatim payload capture — to a
+    // response it never claimed.
+    let matching = plugin(json!({
+        "endpoint": {"path": "/a2a"},
+        "discovery": {"public_base_url": "https://gateway.example.com"},
+        "observability": {"log_payloads": false}
+    }));
+    let disjoint = plugin(json!({
+        "endpoint": {"path": "/other", "agent_card_path": "/.well-known/other-card.json"},
+        "discovery": {"public_base_url": "https://elsewhere.example.com"},
+        "observability": {"log_payloads": true, "max_payload_size": 65536}
+    }));
+
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-1",
+        "method": "tasks/get"
+    }));
+    assert!(matches!(
+        matching.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        disjoint.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    assert!(matching.should_buffer_response_body(&ctx));
+    assert!(
+        !disjoint.should_buffer_response_body(&ctx),
+        "an instance whose scope did not match must not pin the response"
+    );
+
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let body =
+        json!({"jsonrpc": "2.0", "id": "req-1", "result": {"id": "task-secret"}}).to_string();
+    assert!(matches!(
+        disjoint
+            .on_response_body(&mut ctx, 200, &mut response_headers, body.as_bytes())
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(
+        !ctx.metadata.contains_key("a2a.payload.response"),
+        "an unmatched instance must not copy response bytes into metadata"
+    );
+    assert!(!ctx.metadata.contains_key("a2a.response_body_size"));
+}
+
+#[tokio::test]
+async fn a_second_instance_does_not_rewrite_another_instances_agent_card() {
+    let matching = plugin(json!({
+        "endpoint": {"agent_card_path": "/.well-known/agent-card.json"},
+        "discovery": {"public_base_url": "https://gateway.example.com"}
+    }));
+    let disjoint = plugin(json!({
+        "endpoint": {"path": "/other", "agent_card_path": "/.well-known/other-card.json"},
+        "discovery": {"public_base_url": "https://elsewhere.example.com"}
+    }));
+
+    let (mut ctx, mut request_headers) = rest_ctx("GET", "/.well-known/agent-card.json");
+    assert!(matches!(
+        matching.before_proxy(&mut ctx, &mut request_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        disjoint.before_proxy(&mut ctx, &mut request_headers).await,
+        PluginResult::Continue
+    ));
+
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let body = json!({
+        "protocolVersion": "0.3.0",
+        "name": "planner",
+        "url": "https://planner.internal/a2a"
+    })
+    .to_string();
+    // The unmatched instance neither stages nor produces anything.
+    assert!(
+        http_card_rewrite(&disjoint, &mut ctx, &mut response_headers, &body)
+            .await
+            .expect("unmatched instance must not select a terminal")
+            .is_none()
+    );
+    // The owner still rewrites, and to ITS configured origin.
+    let rewritten =
+        expect_http_card_rewrite(&matching, &mut ctx, &mut response_headers, &body).await;
+    assert_eq!(rewritten["url"], "https://gateway.example.com/a2a");
+    // A fail-closed terminal belongs only to the owner, so the unmatched
+    // instance leaves the final phase alone.
+    assert!(matches!(
+        disjoint
+            .on_final_response_body(&mut ctx, 200, &response_headers, body.as_bytes())
+            .await,
+        PluginResult::Continue
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Bounded HTTP JSON Agent Card production
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn http_agent_card_rewrite_is_refused_by_the_retained_response_ceiling() {
+    use ferrum_edge::_test_support::take_buffered_response_capacity_refusal_pending_for_test;
+
+    let plugin = plugin(json!({
+        "discovery": {"public_base_url": "https://gateway.example.com"}
+    }));
+    let (mut ctx, mut request_headers) = rest_ctx("GET", "/.well-known/agent-card.json");
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut request_headers).await,
+        PluginResult::Continue
+    ));
+    // Far below any rewritten card.
+    ctx.max_response_body_size_bytes = 8;
+
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let body = json!({
+        "protocolVersion": "0.3.0",
+        "name": "planner",
+        "url": "https://planner.internal/a2a"
+    })
+    .to_string();
+    // Admission alone produces no bytes, so nothing over-budget was allocated
+    // before the window admitted the producer.
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, body.as_bytes())
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                body.as_bytes(),
+                Some("application/json"),
+                &response_headers,
+            )
+            .await
+            .is_none(),
+        "an over-ceiling HTTP card rewrite must return None, not an oversized body"
+    );
+    assert!(
+        take_buffered_response_capacity_refusal_pending_for_test(&mut ctx),
+        "the shared health-neutral capacity terminal owns this outcome"
+    );
+    // The capacity refusal is not additionally published as a gateway fault.
+    assert!(matches!(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &response_headers, body.as_bytes())
+            .await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn admitted_http_agent_card_that_is_never_produced_fails_closed() {
+    let plugin = plugin(json!({
+        "discovery": {"public_base_url": "https://gateway.example.com"}
+    }));
+    let (mut ctx, mut request_headers) = rest_ctx("GET", "/.well-known/agent-card.json");
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut request_headers).await,
+        PluginResult::Continue
+    ));
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let body = json!({
+        "protocolVersion": "0.3.0",
+        "name": "planner",
+        "url": "https://planner.internal/a2a"
+    })
+    .to_string();
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, body.as_bytes())
+            .await,
+        PluginResult::Continue
+    ));
+    // The producer window never invoked the transform. "Silently did not run"
+    // must not be indistinguishable from "no rewrite was needed".
+    let PluginResult::Reject {
+        status_code, body, ..
+    } = plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, body.as_bytes())
+        .await
+    else {
+        panic!("an admitted HTTP card that was never rewritten must fail closed");
+    };
+    assert_eq!(status_code, 502);
+    let body: Value = serde_json::from_str(&body).expect("terminal body should be JSON");
+    assert_eq!(body["error"], "agent_card_grpc_rewrite_not_applied");
+}
+
+// ---------------------------------------------------------------------------
+// Final backend-visible request-body policy
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn method_policy_is_re_decided_on_the_final_request_body() {
+    // A later request-body transformer can rewrite the JSON-RPC `method` after
+    // `before_proxy` admitted the request. The backend-visible representation is
+    // what the policy has to govern.
+    let plugin = deny_message_send_plugin();
+    assert!(plugin.needs_final_request_body_context());
+    assert!(plugin.enforces_finalized_request_policy());
+
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-1",
+        "method": "tasks/get"
+    }));
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata.get("a2a.policy_decision").map(String::as_str),
+        Some("allow")
+    );
+
+    let dispatched = json!({
+        "jsonrpc": "2.0",
+        "id": "req-1",
+        "method": "message/send"
+    })
+    .to_string();
+    let PluginResult::Reject {
+        status_code, body, ..
+    } = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, dispatched.as_bytes())
+        .await
+    else {
+        panic!("a method the policy denies must be refused on the dispatched body");
+    };
+    assert_eq!(status_code, 200);
+    let body: Value = serde_json::from_str(&body).expect("refusal should be JSON");
+    assert_eq!(body["id"], "req-1");
+    assert_eq!(body["error"]["data"]["method"], "message/send");
+    assert_eq!(
+        ctx.metadata.get("a2a.policy_decision").map(String::as_str),
+        Some("deny")
+    );
+}
+
+#[tokio::test]
+async fn final_request_body_recheck_admits_an_unchanged_allowed_body() {
+    let plugin = deny_message_send_plugin();
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-1",
+        "method": "tasks/get"
+    }));
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let dispatched = json!({
+        "jsonrpc": "2.0",
+        "id": "req-1",
+        "method": "tasks/get"
+    })
+    .to_string();
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, dispatched.as_bytes())
+            .await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn final_request_body_recheck_covers_batch_members() {
+    let plugin = deny_message_send_plugin();
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!([
+        {"jsonrpc": "2.0", "id": "a", "method": "tasks/get"}
+    ]));
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let dispatched = json!([
+        {"jsonrpc": "2.0", "id": "a", "method": "tasks/get"},
+        {"jsonrpc": "2.0", "id": "b", "method": "message/send"}
+    ])
+    .to_string();
+    let PluginResult::Reject { body, .. } = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, dispatched.as_bytes())
+        .await
+    else {
+        panic!("a denied member injected after admission must be refused");
+    };
+    let body: Value = serde_json::from_str(&body).expect("refusal should be JSON");
+    let responses = body
+        .as_array()
+        .expect("batch refusal answers with an array");
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["id"], "a");
+    assert_eq!(responses[1]["id"], "b");
+}
+
+#[tokio::test]
+async fn observability_only_configs_do_not_claim_the_final_request_representation() {
+    // No deny rule means no enforcement decision, so the composition gate must
+    // not refuse chains this plugin does not actually govern.
+    let plugin = plugin(json!({}));
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-1",
+        "method": "tasks/get"
+    }));
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(!plugin.enforces_finalized_request_policy());
+    let claims_representation = plugin.enforces_final_request_body_policy(&ctx, &headers, b"{}");
+    assert!(!claims_representation);
+
+    // A deny policy claims the representation, but only inside this instance's
+    // own JSON-RPC endpoint scope.
+    let enforcing = deny_message_send_plugin();
+    assert!(enforcing.enforces_final_request_body_policy(&ctx, &headers, b"{}"));
+    let (other_scope, other_headers) = rest_ctx("GET", "/somewhere-else");
+    let out_of_scope =
+        enforcing.enforces_final_request_body_policy(&other_scope, &other_headers, b"{}");
+    assert!(!out_of_scope);
 }

@@ -2064,26 +2064,82 @@ impl BoundedResponseBodyConstruction {
     }
 }
 
-/// Lifecycle of a unary gRPC Agent Card rewrite `a2a_gateway` claimed on the
-/// response path (issue #3297).
+/// One `a2a_gateway` instance's private claim over a request (`GHSA-593v-25wm-37mw`).
+///
+/// Endpoint, discovery, and gRPC-service scopes are per instance, but the
+/// detection facts a response hook needs are per request. Storing them as loose
+/// context fields made them shared: a second instance whose own scope did not
+/// match the request still saw an earlier instance's `detected` flag and applied
+/// ITS `observability` and `discovery` settings — including verbatim payload
+/// capture — to a response it never claimed.
+///
+/// So the claim carries the owning instance id and is handed out only to that
+/// owner ([`RequestContext::a2a_gateway_claim`] /
+/// [`RequestContext::a2a_gateway_claim_mut`]). Claiming is first-wins: at most
+/// one instance owns the A2A interpretation of a request, which is also the only
+/// coherent answer for Agent Card rewriting — two instances rewriting one card
+/// would fight over the published origin. Request-phase method policy is
+/// unaffected and still runs independently in every instance.
+#[derive(Debug, Clone)]
+pub(crate) struct A2aGatewayClaim {
+    /// Process-unique id of the `a2a_gateway` instance that detected this
+    /// request. Every response-phase read is gated on matching it.
+    pub(crate) owner: u64,
+    /// Detected binding (`jsonrpc`, `rest`, or `grpc`).
+    pub(crate) binding: &'static str,
+    pub(crate) is_agent_card: bool,
+    pub(crate) streaming: bool,
+    /// `AgentCard` wire layout the matched gRPC service is CONFIGURED to carry,
+    /// resolved once at detection so the response path never re-derives a
+    /// service identity from a `ctx.path` a route override may have rebased —
+    /// see [`A2aGrpcCardSchema`].
+    pub(crate) grpc_card_schema: Option<A2aGrpcCardSchema>,
+    /// Public origin admitted for this request in `before_proxy`, resolved from
+    /// the hook's own header map.
+    ///
+    /// Retaining the admitted RESULT is what makes Agent Card rewriting
+    /// independent of `detection.strip_accept_encoding`: a proxy on which no
+    /// plugin mutates request headers moves them out of the context entirely, so
+    /// a response hook that re-derived the origin from `ctx.headers` saw an empty
+    /// map and failed a request the allowlist had already admitted.
+    pub(crate) public_base: Option<String>,
+    /// Lifecycle of an Agent Card rewrite this instance admitted. Consumed by
+    /// `on_final_response_body`, which fails closed unless a completed outcome
+    /// was reported — see [`A2aGrpcCardRewriteState`].
+    pub(crate) card_rewrite: Option<A2aGrpcCardRewriteState>,
+    /// Set when the normalize phase actually installed replacement card bytes.
+    ///
+    /// That phase recomputes only `Content-Length`, so the plugin has to
+    /// invalidate the upstream validators itself in the next hook that holds a
+    /// mutable header map. The ordinary transform path needs no such flag: the
+    /// core already runs the shared invalidation for it.
+    pub(crate) card_body_replaced: bool,
+}
+
+/// Lifecycle of an Agent Card rewrite `a2a_gateway` claimed on the response path
+/// (issue #3297).
 ///
 /// The point of a typed state rather than a bare error slot is that "the
-/// transform reported success", "the transform refused", and "the transform
-/// never ran" are three different facts, and only the first may publish the
-/// backend's frame. `on_response_body` admits a card by setting `Staged`; the
-/// transform phase must replace it; `on_final_response_body` refuses anything
-/// still `Staged`.
+/// producing phase reported success", "it refused", and "it never ran" are three
+/// different facts, and only the first may publish the backend's bytes. An
+/// admission phase claims a card by setting `Staged`; the producing phase must
+/// replace it; `on_final_response_body` refuses anything still `Staged`.
+///
+/// Shared by both card representations. The unary gRPC frame and the HTTP JSON
+/// document are admitted and produced by the same two-phase contract, so a
+/// staged rewrite that silently fails to run fails closed the same way on either
+/// binding (`GHSA-r423-f5mr-83x2`).
 ///
 /// Kept private to the crate and out of metadata: a plugin-writable marker could
 /// otherwise suppress the fail-closed terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum A2aGrpcCardRewriteState {
-    /// Admitted in `on_response_body`; the transform phase has not reported.
+    /// Admitted by an earlier phase; the producing phase has not reported.
     Staged,
-    /// The transform phase completed — the frame was rewritten, or provably
+    /// The producing phase completed — the card was rewritten, or provably
     /// needed no rewrite.
     Applied,
-    /// The transform phase refused with this fixed diagnostic.
+    /// The producing phase refused with this fixed diagnostic.
     Failed(&'static str),
     /// The rewrite did not fit the per-response retained ceiling. The shared
     /// capacity terminal owns the client-visible outcome.
@@ -2606,6 +2662,10 @@ pub struct RequestContext {
     /// whether a redaction actually happened, so neither response content nor a
     /// custom plugin may clear it.
     pub(crate) ai_response_guard_pending_redactions: HashMap<u64, String>,
+    /// Per-instance digest of residual-verified HTTP redaction output, including
+    /// its media type. Only byte-identical output may reuse the verification;
+    /// later semantic changes still require a fresh detection pass. Never logged.
+    pub(crate) ai_response_guard_verified_redactions: HashMap<u64, [u8; 32]>,
     /// `ai_tool_governor` equivalent of
     /// `ai_response_guard_replay_redactions`. Instance scoping prevents one
     /// governor from consuming another instance's transform requirement.
@@ -2624,6 +2684,22 @@ pub struct RequestContext {
     /// Typed rather than `metadata`: a digest of a client query document must not
     /// enter a transaction log, and no plugin may forge one to skip the recheck.
     pub(crate) graphql_request_envelope_hashes: HashMap<u64, [u8; 32]>,
+    /// Rate-limit buckets one `graphql` instance already charged for this
+    /// request, as `(instance id, bucket key)`.
+    ///
+    /// The envelope digest above answers "is this the document already parsed?",
+    /// which is the right question for structural policy but the wrong one for
+    /// accounting: an unrelated `request_transformer` addition (an `extensions`
+    /// member, a JSON reserialization) changes the digest without changing the
+    /// operation, and re-running enforcement over it used to spend a second
+    /// token from the same budget — so `max_requests: 1` refused the very first
+    /// request. A bucket is charged at most once per request, while a transform
+    /// that actually selects a different operation type or name still reaches
+    /// its own uncharged bucket and is enforced there.
+    ///
+    /// Keyed by instance because two configured `graphql` instances build
+    /// identical key strings over separate budgets.
+    pub(crate) graphql_charged_rate_buckets: HashSet<(u64, String)>,
     /// Per-`waf`-instance digest of the response header map that instance
     /// actually scanned in `after_proxy` (priority 2930).
     ///
@@ -2832,6 +2908,18 @@ pub struct RequestContext {
     /// fails closed with 406 when identity is prohibited) instead of buffering
     /// for a compression it cannot run; `after_proxy` must not reacquire.
     compression_response_admission_declined: bool,
+    /// Effective `compression` instances that registered in `before_proxy` and
+    /// have not yet taken their `after_proxy` response decision.
+    ///
+    /// Content negotiation is a decision about the whole configured chain, not
+    /// about one instance: an instance whose `algorithms` or `content_types`
+    /// cannot serve this response says nothing about whether a later sibling
+    /// can. Counting the outstanding decisions is what lets the fixed `406`
+    /// terminal wait until every eligible instance has declined, instead of the
+    /// first one refusing on behalf of the rest (issue #5092). `0` — the
+    /// `before_proxy` chain never reached compression, as on a short-circuited
+    /// `response_caching` HIT — means this instance is the only decider left.
+    compression_response_decisions_pending: u32,
     /// Reserved response-buffer admission permit for gateway compression.
     /// Codec CPU admission is acquired separately, immediately before the
     /// blocking transform, and this permit is held across that transform so the
@@ -2861,23 +2949,15 @@ pub struct RequestContext {
     /// downstream body is dropped; terminal logging waits on this signal before
     /// draining plugin write-back state.
     response_stream_completion: Option<Arc<ResponseStreamCompletion>>,
-    /// A2A gateway detection state staged between request and response hooks.
+    /// A2A gateway detection state staged between request and response hooks,
+    /// owned by the one `a2a_gateway` instance that claimed the request.
+    ///
     /// Kept out of public metadata so Agent Card rewriting can work even when
-    /// `observability.emit_metadata` is disabled.
-    pub(crate) a2a_gateway_detected: bool,
-    pub(crate) a2a_gateway_binding: Option<&'static str>,
-    pub(crate) a2a_gateway_is_agent_card: bool,
-    pub(crate) a2a_gateway_streaming: bool,
-    /// `AgentCard` wire layout the matched gRPC service is CONFIGURED to carry,
-    /// resolved once at detection so the response path never re-derives a
-    /// service identity from a `ctx.path` a route override may have rebased —
-    /// see [`A2aGrpcCardSchema`].
-    pub(crate) a2a_gateway_grpc_card_schema: Option<A2aGrpcCardSchema>,
-    /// Lifecycle of a unary gRPC Agent Card rewrite `a2a_gateway` admitted in
-    /// `on_response_body`. Consumed by `on_final_response_body`, which fails
-    /// closed unless the transform phase reported a completed outcome — see
-    /// [`A2aGrpcCardRewriteState`].
-    pub(crate) a2a_gateway_grpc_card_rewrite: Option<A2aGrpcCardRewriteState>,
+    /// `observability.emit_metadata` is disabled, and instance-keyed so a
+    /// sibling instance with a disjoint endpoint scope cannot apply its own
+    /// payload-capture or rewrite policy to a response it never claimed
+    /// (`GHSA-593v-25wm-37mw`). Boxed because most requests never touch it.
+    pub(crate) a2a_gateway_claim: Option<Box<A2aGatewayClaim>>,
     /// Exact upstream/public resource URI pair used to route an MCP
     /// `resources/read` request. Kept out of public metadata so upstream URI
     /// details cannot enter transaction logs, while the response hook can
@@ -2890,6 +2970,37 @@ pub struct RequestContext {
     /// under the public name only when the final wire name exactly matches
     /// this trusted upstream alias.
     pub(crate) mcp_trusted_tool_name_rewrite: Option<(String, String)>,
+    /// Identity of the `mcp_gateway` instance that admitted this request in
+    /// `before_proxy`, and therefore the only instance whose response-phase
+    /// policies may act on it.
+    ///
+    /// Admission deliberately permits several `mcp_gateway` instances on one
+    /// proxy with disjoint `endpoint.path` scopes, but every configured
+    /// instance is invoked on EVERY response phase of every request. Without a
+    /// positive owner the private claims below read as "some mcp_gateway set
+    /// this", and a sibling — including one whose inner `config.enabled` is
+    /// `false` — would consume another instance's validator and apply its own
+    /// `validation.max_upstream_response_bytes` to traffic it never routed.
+    ///
+    /// The owner is recorded rather than re-derived from `ctx.path` because a
+    /// route rewrite can rebase that path before the response phases run;
+    /// re-deriving would silently DISABLE the owner's own fail-closed result
+    /// enforcement. Private for the same reason as the claims it guards: a
+    /// forgeable `mcp.*` metadata key must not be able to transfer ownership.
+    pub(crate) mcp_owner_instance: Option<u64>,
+    /// The exact JSON-RPC `id` wire token of the singleton MCP request this
+    /// context admitted, retained so a gateway-authored terminal answer can
+    /// name the call the client is still waiting on.
+    ///
+    /// Response-phase refusals (result validation, an unusable upstream
+    /// representation) are authored after the request body is gone, and an
+    /// error carrying `id: null` never resolves a pending call. Bounded at
+    /// admission by the same reflected-id byte limit the request path uses, so
+    /// retaining it cannot become an unbounded per-request allocation. Batch
+    /// bodies and genuinely unidentified requests leave this `None` and stay
+    /// eligible for `id: null`. Private so no forged key can redirect a
+    /// refusal onto another request's id.
+    pub(crate) mcp_request_json_rpc_id: Option<String>,
     /// When set, `mcp_gateway` must validate the buffered `tools/call` result
     /// against this exact compiled `outputSchema` validator before any
     /// caller-visible response or audit publication. The `Arc` is pinned from
@@ -2922,22 +3033,18 @@ pub struct RequestContext {
     /// rejection — dropping the last handle releases the session's
     /// single-listener slot instead of stranding it.
     pub(crate) mcp_aggregate_sse: Option<mcp_aggregate_sse::AggregateSseListener>,
-    /// Lease for the multiplexed request stream this request opened, before any
-    /// catalog refresh or upstream dispatch began. Private for the same reason
-    /// as the listener lease: a forgeable metadata key must not be able to open,
-    /// steal, or terminate another request's stream identity.
+    /// Lease for the JSON-RPC request stream identity this request opened,
+    /// before any catalog refresh or upstream dispatch began. It governs the
+    /// POST's own `text/event-stream` response, per-session concurrency, and
+    /// cancellation. Private for the same reason as the listener lease: a
+    /// forgeable metadata key must not be able to open, steal, or terminate
+    /// another request's stream identity.
     ///
     /// Dropping the context is the exact-once release path for every ending a
     /// request can have — inline answer, backend or body error, policy
     /// replacement, cancellation, transport disconnect — so no cleanup task is
     /// ever spawned and no identity can leak its per-session capacity.
     pub(crate) mcp_sse_stream: Option<mcp_aggregate_sse::AggregateSseStream>,
-    /// Aggregate-SSE event reserved after final body policy selected an empty
-    /// POST-side `202`, but not yet visible to the listener. The committed hook
-    /// publishes it only if that exact acknowledgement survives the remaining
-    /// response-header lifecycle; drop/abort returns the reservation and stream
-    /// capacity exactly once. Private so metadata cannot forge publication.
-    pub(crate) mcp_sse_publication: Option<mcp_aggregate_sse::AggregateSsePublication>,
     /// Whether reserved `waf.*` metadata has been cleared for this request.
     ///
     /// `metadata` is intentionally public plugin scratch space. WAF-owned log
@@ -2987,6 +3094,20 @@ pub struct RequestContext {
     /// Plugins downstream of `spiffe_identity` may read this for identity-aware
     /// authorization (e.g. mesh policy evaluation in Phase C).
     pub peer_spiffe_id: Option<crate::identity::SpiffeId>,
+    /// Set when `spiffe_identity` derived [`Self::peer_spiffe_id`] from the
+    /// peer's X.509 SVID on this connection (GHSA-qqg9-3r2g-fh44).
+    ///
+    /// Private and crate-set, through
+    /// [`Self::admit_certificate_spiffe_principal`] only, so a certificate-
+    /// derived principal is never conflated with a kernel-attested
+    /// (node-waypoint eBPF) or HBONE-asserted one: those carry no leaf validity
+    /// window, so bounding them by a certificate deadline would be a fiction.
+    /// The authorization-lifetime machinery treats a marked request as
+    /// authenticated, which is what makes the deadline admitted alongside it
+    /// actually enforceable on SPIFFE-only policy chains (`spiffe_identity` +
+    /// `mesh_authz`, no `mtls_auth`). Carries no certificate, DN, SAN, serial,
+    /// or absolute expiry.
+    peer_spiffe_certificate_principal: bool,
     /// Cumulative nanoseconds spent by plugins making external HTTP calls
     /// (via `PluginHttpClient::execute_tracked`). Shared across all plugin
     /// invocations for this request — clone-safe via Arc.
@@ -3481,8 +3602,10 @@ impl RequestContext {
             ai_tool_governor_response_hashes: HashMap::new(),
             ai_response_guard_replay_redactions: HashSet::new(),
             ai_response_guard_pending_redactions: HashMap::new(),
+            ai_response_guard_verified_redactions: HashMap::new(),
             ai_tool_governor_replay_redactions: HashSet::new(),
             graphql_request_envelope_hashes: HashMap::new(),
+            graphql_charged_rate_buckets: HashSet::new(),
             waf_response_header_digests: HashMap::new(),
             json_scan_memo: crate::util::json_dup_keys::JsonScanMemo::default(),
             governed_request_body_plaintext: None,
@@ -3510,24 +3633,21 @@ impl RequestContext {
             compression_response_encode_owner: None,
             compression_response_admission_owner: None,
             compression_response_admission_declined: false,
+            compression_response_decisions_pending: 0,
             compression_response_buffer_permit: HeldResponseBufferPermit::default(),
             compression_staged_request_plaintext: None,
             compression_response_encode_aborted: false,
             response_stream_id: None,
             response_stream_completion: None,
-            a2a_gateway_detected: false,
-            a2a_gateway_binding: None,
-            a2a_gateway_is_agent_card: false,
-            a2a_gateway_streaming: false,
-            a2a_gateway_grpc_card_schema: None,
-            a2a_gateway_grpc_card_rewrite: None,
+            a2a_gateway_claim: None,
             mcp_response_resource_binding: None,
             mcp_trusted_tool_name_rewrite: None,
+            mcp_owner_instance: None,
+            mcp_request_json_rpc_id: None,
             mcp_validate_tool_result: None,
             mcp_batch_forbids_upstream: false,
             mcp_aggregate_sse: None,
             mcp_sse_stream: None,
-            mcp_sse_publication: None,
             waf_metadata_initialized: false,
             waf_owned_metadata: HashMap::new(),
             waf_instance_scores: HashMap::new(),
@@ -3538,6 +3658,7 @@ impl RequestContext {
             mtls_auth_connection_cache: None,
             peer_spiffe_extraction_cache: None,
             peer_spiffe_id: None,
+            peer_spiffe_certificate_principal: false,
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reject_hook_execution_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             mirror_result_rxs: Vec::new(),
@@ -4030,6 +4151,37 @@ impl RequestContext {
         self.compression_response_admission_owner.is_some()
     }
 
+    /// Record `claim` as this request's A2A detection, unless a sibling
+    /// `a2a_gateway` instance already claimed it.
+    ///
+    /// First-wins, so at most one instance owns the A2A interpretation of a
+    /// request and its response. Returns whether the caller is now the owner —
+    /// including when it already was, so a deferred `before_proxy` pass that
+    /// re-detects the same request keeps its claim (`GHSA-593v-25wm-37mw`).
+    pub(crate) fn claim_a2a_gateway(&mut self, claim: A2aGatewayClaim) -> bool {
+        match self.a2a_gateway_claim.as_ref() {
+            Some(existing) if existing.owner != claim.owner => false,
+            _ => {
+                self.a2a_gateway_claim = Some(Box::new(claim));
+                true
+            }
+        }
+    }
+
+    /// This request's A2A claim, but only for the instance that owns it.
+    pub(crate) fn a2a_gateway_claim(&self, owner: u64) -> Option<&A2aGatewayClaim> {
+        self.a2a_gateway_claim
+            .as_deref()
+            .filter(|claim| claim.owner == owner)
+    }
+
+    /// Mutable view of this request's A2A claim, but only for its owner.
+    pub(crate) fn a2a_gateway_claim_mut(&mut self, owner: u64) -> Option<&mut A2aGatewayClaim> {
+        self.a2a_gateway_claim
+            .as_deref_mut()
+            .filter(|claim| claim.owner == owner)
+    }
+
     pub(crate) fn claim_compression_response_admission(&mut self, owner: u64) -> bool {
         if self.compression_response_admission_owner.is_some() {
             return false;
@@ -4053,6 +4205,34 @@ impl RequestContext {
 
     pub(crate) fn compression_response_admission_declined(&self) -> bool {
         self.compression_response_admission_declined
+    }
+
+    /// Register one effective `compression` instance as still owing an
+    /// `after_proxy` response decision for this request.
+    ///
+    /// Saturating: an implausible instance count must not wrap the tally down
+    /// into a smaller one, because a smaller tally is the fail-OPEN direction
+    /// for the negotiation terminal it gates.
+    pub(crate) fn register_compression_response_decision(&mut self) {
+        self.compression_response_decisions_pending = self
+            .compression_response_decisions_pending
+            .saturating_add(1);
+    }
+
+    /// Settle this instance's `after_proxy` response decision, reporting whether
+    /// it was the LAST one outstanding.
+    ///
+    /// `true` means no further `compression` instance is expected to decide, so
+    /// a refusal taken now is a refusal on behalf of the whole configured chain.
+    /// Saturating at zero: a tally that never registered (the `before_proxy`
+    /// chain did not reach compression) reports `true` immediately, which
+    /// preserves the fail-closed single-instance behavior instead of losing the
+    /// terminal.
+    pub(crate) fn settle_compression_response_decision(&mut self) -> bool {
+        self.compression_response_decisions_pending = self
+            .compression_response_decisions_pending
+            .saturating_sub(1);
+        self.compression_response_decisions_pending == 0
     }
 
     /// Drop this request's reserved response-buffer admission (permit + owner)
@@ -4752,10 +4932,16 @@ impl RequestContext {
             ai_tool_governor_response_hashes: self.ai_tool_governor_response_hashes.clone(),
             ai_response_guard_replay_redactions: self.ai_response_guard_replay_redactions.clone(),
             ai_response_guard_pending_redactions: self.ai_response_guard_pending_redactions.clone(),
+            ai_response_guard_verified_redactions: self
+                .ai_response_guard_verified_redactions
+                .clone(),
             ai_tool_governor_replay_redactions: self.ai_tool_governor_replay_redactions.clone(),
             // Carried into the final-request-body stage so every plugin in that
             // stage shares one duplicate-key screen of the same body.
             graphql_request_envelope_hashes: self.graphql_request_envelope_hashes.clone(),
+            // Carried so the final-request-body re-check can see which budgets
+            // `before_proxy` already charged for this request.
+            graphql_charged_rate_buckets: self.graphql_charged_rate_buckets.clone(),
             waf_response_header_digests: self.waf_response_header_digests.clone(),
             json_scan_memo: self.json_scan_memo.clone(),
             // Deliberately NOT carried: the shared request representation gate
@@ -4801,6 +4987,10 @@ impl RequestContext {
             compression_response_encode_owner: self.compression_response_encode_owner,
             compression_response_admission_owner: self.compression_response_admission_owner,
             compression_response_admission_declined: self.compression_response_admission_declined,
+            // The response decision happens on the real context, after this
+            // request-side clone is discarded; carrying the tally keeps the two
+            // views consistent without giving the clone a second vote.
+            compression_response_decisions_pending: self.compression_response_decisions_pending,
             // The reserved response-buffer permit stays on the donor (live)
             // context: this compatibility clone runs only the request-body hooks,
             // never the response-body transform that consumes the permit. Moving
@@ -4816,14 +5006,20 @@ impl RequestContext {
             ),
             response_stream_id: self.response_stream_id,
             response_stream_completion: self.response_stream_completion.clone(),
-            a2a_gateway_detected: self.a2a_gateway_detected,
-            a2a_gateway_binding: self.a2a_gateway_binding,
-            a2a_gateway_is_agent_card: self.a2a_gateway_is_agent_card,
-            a2a_gateway_streaming: self.a2a_gateway_streaming,
-            a2a_gateway_grpc_card_schema: self.a2a_gateway_grpc_card_schema,
-            a2a_gateway_grpc_card_rewrite: None,
+            // The card-rewrite lifecycle stays on the live context: this
+            // compatibility clone runs only request-body hooks and never
+            // reports a rewrite outcome, so carrying a `Staged` marker into it
+            // would strand the fail-closed decision on a context nobody reads.
+            a2a_gateway_claim: self.a2a_gateway_claim.as_ref().map(|claim| {
+                Box::new(A2aGatewayClaim {
+                    card_rewrite: None,
+                    ..(**claim).clone()
+                })
+            }),
             mcp_response_resource_binding: self.mcp_response_resource_binding.clone(),
             mcp_trusted_tool_name_rewrite: self.mcp_trusted_tool_name_rewrite.clone(),
+            mcp_owner_instance: self.mcp_owner_instance,
+            mcp_request_json_rpc_id: self.mcp_request_json_rpc_id.clone(),
             mcp_validate_tool_result: self.mcp_validate_tool_result.clone(),
             mcp_batch_forbids_upstream: self.mcp_batch_forbids_upstream,
             // A hook-context copy is never a transport, so it has no business
@@ -4835,9 +5031,6 @@ impl RequestContext {
             // state is copied back. Holding a lease here would terminalize the
             // live request's identity when the copy dropped.
             mcp_sse_stream: None,
-            // A pending response publication is likewise owned only by the live
-            // response lifecycle, never by a request-body compatibility clone.
-            mcp_sse_publication: None,
             waf_metadata_initialized: self.waf_metadata_initialized,
             waf_owned_metadata: self.waf_owned_metadata.clone(),
             waf_instance_scores: self.waf_instance_scores.clone(),
@@ -4848,6 +5041,7 @@ impl RequestContext {
             mtls_auth_connection_cache: self.mtls_auth_connection_cache.clone(),
             peer_spiffe_extraction_cache: self.peer_spiffe_extraction_cache.clone(),
             peer_spiffe_id: self.peer_spiffe_id.clone(),
+            peer_spiffe_certificate_principal: self.peer_spiffe_certificate_principal,
             plugin_http_call_ns: Arc::clone(&self.plugin_http_call_ns),
             reject_hook_execution_ns: Arc::clone(&self.reject_hook_execution_ns),
             // Watch receivers are clone-safe. Preserve them so the detached
@@ -5563,7 +5757,9 @@ impl RequestContext {
     /// Single hash lookup for call sites that only need one field-line value.
     /// Multiple `Host` headers are rejected earlier by `check_protocol_headers()`.
     /// For list-style headers that may span multiple field-lines (for example
-    /// `x-forwarded-for`), use `raw_header_values()` and fold them explicitly.
+    /// `x-forwarded-for`), use [`Self::header_field_lines`] and fold them
+    /// explicitly — `raw_header_values()` is text-only and drops a field-line
+    /// the client made unrepresentable.
     #[inline]
     pub fn raw_header_get(&self, name: &str) -> Option<&str> {
         self.raw_headers
@@ -5572,10 +5768,15 @@ impl RequestContext {
             .and_then(|v| v.to_str().ok())
     }
 
-    /// Iterate all UTF-8 values for a raw header without materializing the full
-    /// header map. Returns an empty iterator when raw headers were never set.
-    /// Non-UTF-8 field lines are skipped here; security decisions that must see
-    /// every field line should use [`Self::raw_header_value_bytes`].
+    /// Iterate all visible-ASCII values for a raw header without materializing
+    /// the full header map. Returns an empty iterator when raw headers were
+    /// never set.
+    ///
+    /// A field line that `HeaderValue::to_str()` cannot represent — any
+    /// obs-text byte, valid UTF-8 included — is skipped here, whole. Security
+    /// decisions must therefore use [`Self::raw_header_value_bytes`] or
+    /// [`Self::header_field_lines`]: the remote peer chooses whether a field
+    /// line is representable, so what this accessor yields is peer-controlled.
     #[inline]
     pub fn raw_header_values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
         self.raw_headers
@@ -5637,8 +5838,24 @@ impl RequestContext {
     /// Convert the raw `http::HeaderMap` into `self.headers` (`HashMap<String,
     /// String>`). This is a one-time operation — subsequent calls are no-ops.
     /// The raw map is retained so plugins can evaluate multi-value and
-    /// non-UTF-8 field lines. Non-UTF-8 header values are still omitted from
-    /// the materialized map (same as the previous eager path).
+    /// non-UTF-8 field lines.
+    ///
+    /// **Field values are decoded as UTF-8, not as visible ASCII.** RFC 9110
+    /// §5.5 field values may carry obs-text (`0x80`–`0xFF`), and
+    /// `HeaderValue::to_str()` refuses those bytes while
+    /// `HeaderValue::from_str()` accepts them — so decoding with `to_str()`
+    /// silently DELETED every obs-text field value from the backend request
+    /// (issue #5010: an explicitly preserved non-ASCII `key_auth` API key never
+    /// reached the upstream). A `String` holds those bytes losslessly and the
+    /// outbound builders reproduce them byte-for-byte, so valid UTF-8 is
+    /// materialized exactly as received. Values that are not valid UTF-8 are
+    /// still omitted: `String` cannot represent them.
+    ///
+    /// A UTF-8 decode never introduces `CR`, `LF`, or `NUL` that the wire
+    /// parser did not already accept, so this widens no injection surface.
+    /// Credential grammars that are RFC-bound to visible ASCII must keep using
+    /// [`crate::plugins::utils::header_extract::lookup_configured_header`],
+    /// which reads the retained raw map under the stricter policy.
     ///
     /// **This map is the authoritative removal set for outbound merges.**
     /// [`crate::proxy::headers::merge_proxy_headers_preserving_repeated`] drops
@@ -5656,7 +5873,7 @@ impl RequestContext {
         };
         self.headers.reserve(raw.keys_len());
         for (name, value) in raw.iter() {
-            if let Ok(v) = value.to_str() {
+            if let Ok(v) = std::str::from_utf8(value.as_bytes()) {
                 // http::HeaderName stores names in lowercase already (HTTP/2+3
                 // spec), and hyper normalizes HTTP/1.1 header names to
                 // lowercase at parse time. No `to_lowercase()` needed.
@@ -5932,6 +6149,57 @@ impl RequestContext {
             .as_ref()
             .map(|consumer| consumer.username.as_str())
             .or_else(|| meaningful_identity(self.authenticated_identity.as_deref()))
+    }
+
+    /// Contribute an authorization deadline observed by an admitting
+    /// authentication or identity mechanism (issue #3816, GHSA-qqg9-3r2g-fh44).
+    ///
+    /// Earliest wins and the bound is monotonic: a later hook can only tighten
+    /// it, never lengthen it, and `None` is a no-op rather than a reset. A
+    /// long-lived second credential presented alongside a short-lived one
+    /// therefore cannot widen the bound the short-lived one already
+    /// established.
+    pub fn observe_credential_deadline(&mut self, deadline: Option<tokio::time::Instant>) {
+        let Some(deadline) = deadline else {
+            return;
+        };
+        self.credential_deadline_at = Some(match self.credential_deadline_at {
+            Some(existing) => existing.min(deadline),
+            None => deadline,
+        });
+    }
+
+    /// Whether an X.509-derived SPIFFE principal was admitted for this request.
+    ///
+    /// True only for a [`Self::peer_spiffe_id`] that `spiffe_identity` derived
+    /// from the peer certificate, never for a pre-stamped kernel-attested or
+    /// HBONE-asserted identity. This is the SPIFFE half of the
+    /// authorization-lifetime authentication predicate.
+    pub fn has_certificate_spiffe_principal(&self) -> bool {
+        self.peer_spiffe_certificate_principal
+    }
+
+    /// Admit a certificate-derived peer SPIFFE principal together with the
+    /// leaf's authorization deadline (GHSA-qqg9-3r2g-fh44).
+    ///
+    /// The identity and its temporal bound are set together and only together,
+    /// so a SPIFFE-only policy chain can never hold an identity the lifetime
+    /// machinery does not bound. Crate-private: only the certificate-derived
+    /// extraction path may mark this provenance.
+    ///
+    /// `deadline` is `None` only when the leaf's own `notAfter` is further out
+    /// than a monotonic `Instant` can represent (issue #5396). That is not an
+    /// unbounded admission: the principal still marks the request
+    /// authenticated, so `proxy::auth_lifetime` bounds it by the finite
+    /// `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` fallback.
+    pub(crate) fn admit_certificate_spiffe_principal(
+        &mut self,
+        id: crate::identity::SpiffeId,
+        deadline: Option<tokio::time::Instant>,
+    ) {
+        self.peer_spiffe_id = Some(id);
+        self.peer_spiffe_certificate_principal = true;
+        self.observe_credential_deadline(deadline);
     }
 
     /// Return the identity value to forward to the backend in
@@ -7819,6 +8087,15 @@ pub async fn log_with_mirror(
     } else {
         None
     };
+    if plugins
+        .iter()
+        .any(|plugin| plugin.records_mesh_service_graph(summary))
+    {
+        crate::plugins::mesh::service_graph::record_transaction_with_mesh_key(
+            summary,
+            mesh_key.as_ref(),
+        );
+    }
     for plugin in plugins {
         // Transaction logging is gateway cleanup after the client-visible
         // outcome is final. A client RPC deadline must bound request handling,
@@ -8052,6 +8329,17 @@ pub struct StreamConnectionContext {
     /// [`Self::credential_deadline_at`] to read it. Contains no certificate,
     /// DN, SAN, serial, fingerprint, or absolute expiry.
     credential_deadline_at: Option<tokio::time::Instant>,
+    /// Set when `spiffe_identity` derived the `peer_spiffe_id` metadata on this
+    /// connection from the peer's X.509 SVID (GHSA-qqg9-3r2g-fh44).
+    ///
+    /// Mirrors `RequestContext::peer_spiffe_certificate_principal`, and is
+    /// private and crate-set for the same reason: a pre-stamped kernel-attested
+    /// (node-waypoint eBPF) or HBONE-asserted `peer_spiffe_id` carries no leaf
+    /// validity window and must not be treated as certificate-bounded. A marked
+    /// session counts as authenticated for [`Self::is_authenticated`], so the
+    /// TCP/TLS and UDP/DTLS relays bound it by the deadline admitted alongside
+    /// it. Carries no certificate, DN, SAN, serial, or absolute expiry.
+    peer_spiffe_certificate_principal: bool,
     /// Plugin metadata. Lazily allocated on first write to avoid a HashMap allocation
     /// for stream connections that have no metadata-writing plugins configured.
     pub metadata: Option<HashMap<String, String>>,
@@ -8172,6 +8460,7 @@ impl StreamConnectionContext {
             authenticated_identity: None,
             auth_method: None,
             credential_deadline_at: None,
+            peer_spiffe_certificate_principal: false,
             metadata: None,
             admission_permits: Vec::new(),
             tls_client_cert_der: None,
@@ -8293,7 +8582,37 @@ impl StreamConnectionContext {
     /// Whether this connection admitted an authenticated principal. Mirrors the
     /// HTTP-side predicate in `proxy::auth_lifetime::request_is_authenticated`.
     pub fn is_authenticated(&self) -> bool {
-        self.identified_consumer.is_some() || self.authenticated_identity.is_some()
+        self.identified_consumer.is_some()
+            || self.authenticated_identity.is_some()
+            || self.peer_spiffe_certificate_principal
+    }
+
+    /// Whether an X.509-derived SPIFFE principal was admitted for this session.
+    /// True only for a `peer_spiffe_id` `spiffe_identity` derived from the peer
+    /// certificate, never for a pre-stamped attested or asserted identity.
+    pub fn has_certificate_spiffe_principal(&self) -> bool {
+        self.peer_spiffe_certificate_principal
+    }
+
+    /// Admit a certificate-derived peer SPIFFE principal on this session
+    /// together with the leaf's authorization deadline (GHSA-qqg9-3r2g-fh44).
+    ///
+    /// The metadata identity and its temporal bound are written together and
+    /// only together, so a SPIFFE-only stream policy chain can never hold an
+    /// identity the lifetime machinery does not bound. Crate-private: only the
+    /// certificate-derived extraction path may mark this provenance.
+    ///
+    /// `deadline` is `None` only for a leaf whose `notAfter` outruns the
+    /// representable monotonic range (issue #5396); the session is then bounded
+    /// by the finite authenticated-stream maximum instead.
+    pub(crate) fn admit_certificate_spiffe_principal(
+        &mut self,
+        id: &crate::identity::SpiffeId,
+        deadline: Option<tokio::time::Instant>,
+    ) {
+        self.insert_metadata("peer_spiffe_id".to_string(), id.to_string());
+        self.peer_spiffe_certificate_principal = true;
+        self.observe_credential_deadline(deadline);
     }
 
     /// Insert a metadata value, lazily allocating the map on first write.
@@ -8867,6 +9186,17 @@ pub trait Plugin: Send + Sync {
     /// `FERRUM_REAL_IP_HEADER`, or ambiguous writers.
     #[doc(hidden)]
     fn correlation_id_header_name(&self) -> Option<&str> {
+        None
+    }
+
+    /// Whether this transaction contributes to the shared mesh service graph.
+    /// Wrappers must honor the same memoized decision as terminal logging.
+    fn records_mesh_service_graph(&self, _summary: &TransactionSummary) -> bool {
+        false
+    }
+
+    /// Cold-path custom trace tag names used to bound effective mesh chains.
+    fn workload_custom_trace_attributes(&self) -> Option<&str> {
         None
     }
 
@@ -10695,6 +11025,11 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Cache-build diagnostic: whether this instance has an execution trigger.
+    fn has_execution_trigger(&self) -> bool {
+        false
+    }
+
     /// Whether this authentication instance applies to the current request.
     ///
     /// Ordinary authentication plugins are always applicable. Instance
@@ -11702,6 +12037,14 @@ pub(crate) fn validate_plugin_config_with_http_client(
         // process-wide reload map. Graph validation and cache reloads construct
         // explicitly inside an open reload bracket.
         return transaction_log_schema::TransactionLogSchema::validate_config(config);
+    }
+    if name == "serverless_function" {
+        // Shape-only: CP/admin admission must not require the AWS / Azure / GCP
+        // credentials that intentionally resolve only from a data plane's
+        // environment or external secret backend. Every supplied field is still
+        // validated here; runtime cache construction on the serving node
+        // resolves and validates the credentials fail closed (issue #5179).
+        return serverless_function::ServerlessFunction::validate_config(config, http_client);
     }
     match create_plugin_with_http_client(name, config, http_client)? {
         Some(_) => Ok(()),

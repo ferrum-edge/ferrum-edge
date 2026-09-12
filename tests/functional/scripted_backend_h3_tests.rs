@@ -2416,6 +2416,16 @@ async fn h2_frontend_streaming_h3_recovers_graceful_goaway_after_complete_body()
 /// proxy-scoped `compression` plugin. compression buffers the response by
 /// default (when the client offers `accept-encoding`), forcing the buffered
 /// dispatch decision these tests need to exercise the downgrade.
+///
+/// The chain pins `min_content_length: 0` so that buffering decision depends
+/// only on what these protocol tests are about (the frontend/backend framing),
+/// never on how large a fixture body happens to be: compression declines to
+/// buffer a response whose declared `Content-Length` is under
+/// `min_content_length`, because it would decline to encode it in `after_proxy`
+/// too (issue #5094), and the plugin's default threshold is 256 bytes. The
+/// scripted bodies here are deliberately tiny (a few bytes, so a truncation or
+/// a mid-body stall is unambiguous), which is exactly the shape that exclusion
+/// releases.
 fn file_mode_yaml_for_h3_with_compression(port: u16) -> String {
     file_mode_yaml_for_h3_with_compression_and_read_timeout(port, 5000)
 }
@@ -2503,7 +2513,10 @@ fn file_mode_yaml_for_h3_with_compression_and_read_timeout(
                 "plugin_name": "compression",
                 "scope": "proxy",
                 "enabled": true,
-                "config": { "algorithms": ["gzip"] },
+                // `min_content_length: 0`: keep every scripted response on the
+                // buffered decision regardless of its declared Content-Length
+                // (see this helper's doc comment).
+                "config": { "algorithms": ["gzip"], "min_content_length": 0 },
             },
             {
                 "id": "h3-access-log",
@@ -2864,7 +2877,10 @@ async fn h3_native_pool_partial_data_read_timeout_returns_timeout_without_downgr
         // is disabled when the gateway limit is unlimited (0) or above the
         // 32 MiB compression ceiling, and only the buffered collect converts a
         // mid-body backend read timeout into a pre-commit 504 Backend timeout
-        // instead of a committed partial 200.
+        // instead of a committed partial 200. The declared `Content-Length: 64`
+        // stays on that path only because the harness config pins
+        // `min_content_length: 0`; at the plugin default (256) compression
+        // releases the body up front and this response would stream.
         &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "1048576")],
         200,
     )
@@ -2942,6 +2958,10 @@ async fn h3_frontend_refined_buffered_rejects_truncated_content_length_fin() {
         // above the 32 MiB compression ceiling, and only the buffered collect
         // (`collect_h3_open_response_body`) rejects a short Content-Length FIN
         // as a pre-commit 502 truncation instead of forwarding a committed 200.
+        // The 5-byte declared length stays on that path only because the
+        // harness config pins `min_content_length: 0`; at the plugin default
+        // (256) compression releases the body up front and the short body would
+        // stream out as a committed 200.
         &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "1048576")],
     )
     .await;
@@ -5341,6 +5361,161 @@ async fn h3_progressing_sse_survives_idle_read_timeout() {
     assert!(
         text.contains("data: a") && text.contains("data: c"),
         "progressing SSE body truncated: {text:?}"
+    );
+}
+
+/// Config for the H3→HTTP bridge carrying one `sse` instance.
+fn h3_sse_plugin_yaml(
+    port: u16,
+    read_timeout_ms: u64,
+    plugin: Value,
+    retry: Option<Value>,
+) -> String {
+    let mut proxy = json!({
+        "id": "scripted-h3",
+        "listen_path": "/api",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": port,
+        "strip_listen_path": true,
+        "backend_connect_timeout_ms": 2000,
+        "backend_read_timeout_ms": read_timeout_ms,
+        "backend_write_timeout_ms": 5_000,
+        "plugins": [{"plugin_config_id": "sse"}],
+    });
+    if let Some(retry) = retry {
+        proxy["retry"] = retry;
+    }
+    to_file_mode_yaml(&json!({
+        "version": "1",
+        "proxies": [proxy],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "sse",
+            "plugin_name": "sse",
+            "proxy_id": "scripted-h3",
+            "scope": "proxy",
+            "enabled": true,
+            "config": plugin,
+        }],
+    }))
+}
+
+/// #5097 — an H3 client must receive the SAME framed event an H1/H2 client
+/// receives for the same wrapped non-SSE origin response.
+///
+/// The bridge used to run `after_proxy` first, so the `sse` instance relabelled
+/// the response to `text/event-stream` and the buffer/stream refinement that
+/// followed then released the body — there is nothing left for a wrapper to do
+/// in an already-SSE response. The origin's plain text went out verbatim under
+/// the event-stream label the wrap was supposed to fill.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_bridge_frames_a_wrapped_non_sse_response() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Type".into(),
+            value: "text/plain".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: "12".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(b"hello\r\nworld".to_vec()))
+        .step(HttpStep::RespondBodyEnd)
+        .spawn()
+        .expect("spawn");
+
+    let yaml = h3_sse_plugin_yaml(
+        backend_port,
+        5_000,
+        json!({"wrap_non_sse_responses": true, "retry_ms": 2500}),
+        None,
+    );
+    let (_harness, _ca, https_port) =
+        spawn_h3_harness_with_explicit_https_port_and_config(yaml, false, None).await;
+    let client = Http3Client::insecure().expect("h3 client");
+    let resp = client
+        .get_with_options(
+            &format!("https://127.0.0.1:{https_port}/api/text"),
+            GetOptions::default().header("accept", "text/event-stream"),
+        )
+        .await
+        .expect("H3 wrapped response");
+
+    assert_eq!(resp.status.as_u16(), 200, "body={:?}", resp.body_text());
+    let content_type = resp.headers.get("content-type");
+    let content_type = content_type.and_then(|value| value.to_str().ok());
+    assert_eq!(content_type, Some("text/event-stream"));
+    assert_eq!(
+        resp.body_text(),
+        "retry: 2500\ndata: hello\ndata: world\n\n",
+        "the H3 bridge must frame a wrapped non-SSE body exactly as H1/H2 does"
+    );
+}
+
+/// #5099 — a default (non-wrapping) `sse` proxy streams to an H3 client even
+/// with retries configured.
+///
+/// The backend commits SSE headers plus one event and then stalls past the read
+/// watermark, so a streamed response delivers that event before the body
+/// aborts, while a buffered one collects until the timeout and delivers nothing.
+/// The bridge used to force buffering whenever `retry` was configured at all,
+/// even though every retry decision it makes is taken from the response status
+/// before a single body byte is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_bridge_streams_default_sse_with_retries_configured() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Type".into(),
+            value: "text/event-stream".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(H3_SSE_FIRST_EVENT.to_vec()))
+        .step(HttpStep::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn");
+
+    let read_timeout_ms: u64 = 800;
+    let yaml = h3_sse_plugin_yaml(
+        backend_port,
+        read_timeout_ms,
+        json!({}),
+        Some(json!({"max_retries": 1})),
+    );
+    let (_harness, _ca, https_port) =
+        spawn_h3_harness_with_explicit_https_port_and_config(yaml, false, None).await;
+    let client = Http3Client::insecure().expect("h3 client");
+    let resp = client
+        .get_with_options(
+            &format!("https://127.0.0.1:{https_port}/api/ssestall"),
+            GetOptions::default().header("accept", "text/event-stream"),
+        )
+        .await
+        .expect("H3 SSE headers");
+
+    assert_eq!(resp.status.as_u16(), 200, "body={:?}", resp.body_text());
+    assert!(
+        resp.body_text().contains("data: hello"),
+        "configuring retries must not buffer a default SSE response on the H3 \
+         bridge; body={:?} body_error={:?}",
+        resp.body_text(),
+        resp.body_error
     );
 }
 

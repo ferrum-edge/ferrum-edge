@@ -7,7 +7,8 @@
 //! classification for every proof-of-possession admission in the gateway.
 //!
 //! [`verify`] therefore performs signature, `typ`/`alg`, JWK thumbprint /
-//! `cnf.jkt` binding, `htm`, `htu`, `iat`, `exp`, and `ath` validation and then
+//! `cnf.jkt` binding, `htm`, `htu`, `iat`, `ath`, and — when a client sends the
+//! non-standard claim at all — `exp` validation, and then
 //! returns the [`ReplayMarker`] the caller must claim. Ordering is the point:
 //! an unauthenticated proof never reaches replay state, so garbage cannot
 //! consume capacity or a shared-backend round trip.
@@ -67,7 +68,14 @@ struct DpopClaims {
     htm: String,
     htu: String,
     iat: i64,
-    exp: i64,
+    /// RFC 9449 §4.2 does not define `exp` for a proof JWT, and conformant
+    /// client libraries do not emit one, so requiring it would make
+    /// `require_dpop` unusable with standards-compliant clients. Freshness is
+    /// bounded by `iat` ± the provider's clock skew, which is also what the
+    /// fixed marker retention horizon is derived from. A proof that does carry
+    /// `exp` is still held to it (see [`verify`]).
+    #[serde(default)]
+    exp: Option<i64>,
     jti: String,
     #[serde(default)]
     ath: Option<String>,
@@ -103,6 +111,12 @@ pub fn verify(input: DpopVerifyInput<'_>) -> Result<ReplayMarker, &'static str> 
     validation.validate_exp = true;
     validation.validate_nbf = false;
     validation.validate_aud = false;
+    // `validate_exp` rejects a PRESENT-and-past (or unparseable) `exp`;
+    // `required_spec_claims` is the separate mechanism that rejects an ABSENT
+    // one, and `Validation::new` seeds it with `exp`. RFC 9449 §4.2 defines no
+    // `exp` proof claim, so presence must not be required — but the value is
+    // still enforced whenever a client chooses to send it.
+    validation.required_spec_claims.clear();
     validation.leeway = input.clock_skew.as_secs();
     let token_data =
         decode::<DpopClaims>(input.proof, &key, &validation).map_err(|_| "Invalid DPoP proof")?;
@@ -125,7 +139,9 @@ pub fn verify(input: DpopVerifyInput<'_>) -> Result<ReplayMarker, &'static str> 
     if claims.iat < now.saturating_sub(skew) || claims.iat > now.saturating_add(skew) {
         return Err("DPoP iat outside clock skew");
     }
-    if claims.exp < now.saturating_sub(skew) {
+    if let Some(exp) = claims.exp
+        && exp < now.saturating_sub(skew)
+    {
         return Err("Invalid DPoP proof");
     }
     // RFC 9449 §4.3: when a DPoP proof is presented alongside an access token at

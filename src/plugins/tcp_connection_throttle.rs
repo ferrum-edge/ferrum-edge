@@ -196,13 +196,20 @@ impl TcpConnectionThrottle {
     }
 
     fn throttle_key(&self, ctx: &StreamConnectionContext) -> String {
+        let mut proxy_key =
+            String::with_capacity(ctx.proxy_namespace.len() + 1 + ctx.proxy_id.len());
+        crate::config::db_backend::write_namespaced_runtime_key(
+            &mut proxy_key,
+            ctx.proxy_namespace.as_str(),
+            ctx.proxy_id.as_str(),
+        );
         match ctx.effective_identity() {
             Some(identity) => {
                 let mut key = String::with_capacity(
-                    "proxy::consumer:".len() + ctx.proxy_id.len() + identity.len(),
+                    "proxy::consumer:".len() + proxy_key.len() + identity.len(),
                 );
                 key.push_str("proxy:");
-                key.push_str(&ctx.proxy_id);
+                key.push_str(&proxy_key);
                 key.push_str(":consumer:");
                 key.push_str(identity);
                 key
@@ -211,10 +218,10 @@ impl TcpConnectionThrottle {
                 let canonical_ip =
                     crate::util::client_identity::canonical_client_ip_text(&ctx.client_ip);
                 let mut key = String::with_capacity(
-                    "proxy::ip:".len() + ctx.proxy_id.len() + canonical_ip.len(),
+                    "proxy::ip:".len() + proxy_key.len() + canonical_ip.len(),
                 );
                 key.push_str("proxy:");
-                key.push_str(&ctx.proxy_id);
+                key.push_str(&proxy_key);
                 key.push_str(":ip:");
                 key.push_str(&canonical_ip);
                 key
@@ -325,8 +332,49 @@ impl Plugin for TcpConnectionThrottle {
 
 #[cfg(test)]
 mod tests {
-    use super::TcpConnectionThrottleState;
+    use super::{TcpConnectionThrottle, TcpConnectionThrottleState};
+    use crate::ConsumerIndex;
+    use crate::config::types::BackendScheme;
+    use crate::plugins::StreamConnectionContext;
     use dashmap::Map;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    #[test]
+    fn throttle_key_scopes_by_proxy_namespace() {
+        let plugin = TcpConnectionThrottle::new_with_pool_shard_amount(
+            &json!({"max_connections_per_key": 1}),
+            0,
+        )
+        .expect("throttle fixture must construct");
+        let consumer_index = Arc::new(ConsumerIndex::new(&[]));
+        let mut tenant_a = StreamConnectionContext::new(
+            "10.0.0.1".to_string(),
+            "10.0.0.1".to_string(),
+            "shared-proxy".to_string(),
+            Some("Shared Proxy".to_string()),
+            15432,
+            BackendScheme::Tcp,
+            Arc::clone(&consumer_index),
+        );
+        tenant_a.proxy_namespace = "tenant-a".to_string();
+        let mut tenant_b = StreamConnectionContext::new(
+            "10.0.0.1".to_string(),
+            "10.0.0.1".to_string(),
+            "shared-proxy".to_string(),
+            Some("Shared Proxy".to_string()),
+            15432,
+            BackendScheme::Tcp,
+            consumer_index,
+        );
+        tenant_b.proxy_namespace = "tenant-b".to_string();
+
+        assert_ne!(
+            plugin.throttle_key(&tenant_a),
+            plugin.throttle_key(&tenant_b),
+            "proxy_namespace must distinguish throttle keys for the same proxy id"
+        );
+    }
 
     #[test]
     fn state_normalizes_pool_shard_amount_for_the_actual_counter_map() {

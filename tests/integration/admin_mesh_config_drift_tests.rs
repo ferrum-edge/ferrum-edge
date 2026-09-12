@@ -199,7 +199,8 @@ fn populated_slice(namespace: &str, version: &str) -> MeshSlice {
 fn install_accepted_slice(runtime: &MeshRuntimeState, slice: MeshSlice) {
     let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
     runtime.install_slice(slice.clone());
-    runtime.record_applied_slice(&slice);
+    let token = runtime.begin_revision_apply(&slice);
+    runtime.record_applied_slice_with_token(&slice, token);
 }
 
 #[tokio::test]

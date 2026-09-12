@@ -388,6 +388,61 @@ fn mesh_outbound_registry_metric_contract_matches_docs_and_help() {
     );
 }
 
+#[tokio::test]
+async fn mesh_outbound_registry_metrics_classify_only_applicable_entries() {
+    let cases = [
+        (["api.example.com", "*.example.com:443"], true, false),
+        (["api.example.com", "*.example.com:*"], true, false),
+        (["api.example.com:8443", "*.example.com:443"], true, false),
+        (["api.example.com:8443", "*.example.com:*"], true, false),
+        (["api.example.com:443", "*.example.com:443"], true, true),
+        (["api.example.com:443", "*.example.com:*"], true, true),
+        (["api.example.com:*", "*.example.com:443"], true, true),
+        (["api.example.com:*", "*.example.com:*"], true, true),
+        (["api.example.com", "*.example.com"], false, true),
+        (["api.example.com:443", "*.example.com"], false, false),
+        (["api.example.com:*", "*.example.com"], false, false),
+    ];
+    for (index, (entries, explicit_port, exact_match)) in cases.into_iter().enumerate() {
+        let namespace = format!("outbound-registry-overlap-{index}");
+        let plugin = create_plugin(
+            "mesh_outbound_registry",
+            &json!({"registry": entries, "namespace": namespace}),
+        )
+        .unwrap()
+        .unwrap();
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+        let authority = if explicit_port {
+            "API.Example.Com.:443"
+        } else {
+            "API.Example.Com."
+        };
+        ctx.headers.insert("host".into(), authority.into());
+        assert!(matches!(
+            plugin.on_request_received(&mut ctx).await,
+            PluginResult::Continue
+        ));
+
+        let rendered =
+            ferrum_edge::plugins::prometheus_metrics::global_registry().render_uncached();
+        let prefix = format!(
+            "ferrum_mesh_outbound_registry_decisions_total{{mesh_namespace=\"{namespace}\","
+        );
+        let series: Vec<_> = rendered
+            .lines()
+            .filter(|line| line.starts_with(&prefix))
+            .collect();
+        assert_eq!(series.len(), 1, "{namespace}: {series:?}");
+        let bucket = if exact_match {
+            "<admit_explicit>"
+        } else {
+            "<admit_wildcard>"
+        };
+        assert!(series[0].starts_with(&format!("{prefix}host=\"{bucket}\",decision=\"admit\"")));
+        assert!(series[0].ends_with("} 1"));
+    }
+}
+
 #[test]
 fn mesh_authz_rejects_namespace_scoped_direct_policy_without_namespace() {
     let err = match MeshAuthz::new(&json!({
@@ -8308,6 +8363,261 @@ fn mesh_outbound_registry_accepts_every_documented_key() {
         }),
     );
     assert!(plugin.is_ok(), "{:?}", plugin.err());
+
+    let reference = include_str!("../../../docs/plugins.md")
+        .split_once("### `mesh_outbound_registry`")
+        .unwrap()
+        .1
+        .split("\n### ")
+        .next()
+        .unwrap();
+    let documented: std::collections::BTreeSet<_> = reference
+        .lines()
+        .filter_map(|line| line.strip_prefix("| `"))
+        .filter_map(|line| line.split_once('`').map(|(key, _)| key))
+        .collect();
+    assert_eq!(
+        documented,
+        std::collections::BTreeSet::from([
+            "namespace",
+            "outbound_listen_ports",
+            "registry",
+            "reject_status",
+        ])
+    );
+}
+
+#[test]
+fn mesh_outbound_registry_admission_matches_openapi() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).unwrap();
+    let validators = ["MeshOutboundRegistryConfig", "PluginConfig"].map(|component| {
+        let schema = json!({
+            "$ref": format!("#/components/schemas/{component}"),
+            "components": spec["components"].clone(),
+        });
+        jsonschema::draft202012::options().build(&schema).unwrap()
+    });
+    let check = |config: serde_json::Value, admitted: bool| {
+        let error =
+            ferrum_edge::plugins::validate_plugin_config("mesh_outbound_registry", &config).err();
+        assert_eq!(error.is_none(), admitted, "{config}: {error:?}");
+        assert_eq!(validators[0].is_valid(&config), admitted, "{config}");
+        let wrapped = json!({
+            "plugin_name": "mesh_outbound_registry",
+            "scope": "global",
+            "enabled": true,
+            "config": config,
+        });
+        assert_eq!(validators[1].is_valid(&wrapped), admitted, "{wrapped}");
+        error
+    };
+
+    for (entry, admitted) in [
+        ("", true),
+        (" \t\n", true),
+        ("\u{0085}\u{2003}", true),
+        ("reviews.default.svc.cluster.local", true),
+        (" Reviews.SVC... ", true),
+        ("\u{0085}reviews.svc\u{2003}", true),
+        ("reviews.svc:1", true),
+        ("reviews.svc:65535", true),
+        ("reviews.svc:0000443", true),
+        ("reviews.svc:*", true),
+        ("*.example.com", true),
+        ("*.Example.Com.:443", true),
+        ("*.example.com:*", true),
+        ("127.0.0.1", true),
+        ("127.0.0.1:443", true),
+        ("xn--bcher-kva.example", true),
+        ("::", true),
+        ("::1", true),
+        ("2001:0DB8:0:0:0:0:0:1", true),
+        ("2001:db8::1:*", true),
+        ("[2001:DB8::1]", true),
+        ("[2001:db8::1]:000443", true),
+        ("[2001:db8::1]:*", true),
+        ("::ffff:192.0.2.1", true),
+        ("[::ffff:192.0.2.1]:443", true),
+        ("1:2:3:4:5:6:192.0.2.1", true),
+        ("https://known.test/path", false),
+        ("known.test/path", false),
+        ("known.test?query", false),
+        ("known.test#fragment", false),
+        ("user@known.test", false),
+        ("known.test:65536", false),
+        ("known.test:0", false),
+        ("known.test:-1", false),
+        ("known.test:+443", false),
+        ("known.test:http", false),
+        ("known.test:", false),
+        (":443", false),
+        ("known.test :443", false),
+        ("known. test", false),
+        ("known.\t test", false),
+        ("known.\u{2003}test", false),
+        ("known.test\0", false),
+        ("bücher.example", false),
+        ("known..test", false),
+        ("-known.test", false),
+        ("known-.test", false),
+        ("_known.test", false),
+        (".", false),
+        ("*", false),
+        ("*.", false),
+        ("*known.test", false),
+        ("known.*.test", false),
+        ("*.*.test", false),
+        ("[not-an-ip]:443", false),
+        ("[127.0.0.1]:443", false),
+        ("[2001:db8::1", false),
+        ("2001:db8::1]", false),
+        ("[::1]extra:443", false),
+        ("[::1]:65536", false),
+        ("[::1]:0", false),
+        ("[::1]:+443", false),
+        ("[::1]:", false),
+        ("[::1].", false),
+        ("[::1%eth0]:443", false),
+        ("1:2:3:4:5:6:7:8:9", false),
+        ("1:2:3:4:5:6:7::8", false),
+        ("2001:db8::1::2", false),
+        ("2001:db8:::1", false),
+        ("::ffff:192.0.2.256", false),
+        ("::ffff:192.0.02.1", false),
+        ("1:2:3:4:5:6::192.0.2.1", false),
+    ] {
+        let error = check(json!({"registry": ["valid.example", entry]}), admitted);
+        if let Some(error) = error {
+            assert!(
+                error.contains("mesh_outbound_registry: registry[1]:"),
+                "{error}"
+            );
+        }
+    }
+    // Exercise every compression position, including the IPv4-tail forms,
+    // against the published authority patterns and the standard IP parser.
+    for left in 0..=8 {
+        for right in 0..=8 {
+            let prefix = vec!["abcd"; left].join(":");
+            let suffix = vec!["abcd"; right].join(":");
+            let entry = format!("{prefix}::{suffix}");
+            let _ = check(json!({"registry": [entry]}), left + right < 8);
+            let entry = format!("[{prefix}::{suffix}]:443");
+            let _ = check(json!({"registry": [entry]}), left + right < 8);
+            let entry = format!("{prefix}::{}192.0.2.1", "abcd:".repeat(right));
+            let _ = check(json!({"registry": [entry]}), left + right < 6);
+        }
+    }
+    for (port, admitted) in [
+        (-1, false),
+        (0, false),
+        (1, true),
+        (65535, true),
+        (65536, false),
+    ] {
+        let _ = check(json!({"outbound_listen_ports": [port]}), admitted);
+    }
+    for (status, admitted) in [
+        (399, false),
+        (400, true),
+        (502, true),
+        (599, true),
+        (600, false),
+    ] {
+        let _ = check(json!({"reject_status": status}), admitted);
+    }
+    let _ = check(json!({}), true);
+    let _ = check(json!({"registry": []}), true);
+}
+
+#[tokio::test]
+async fn mesh_outbound_registry_preserves_normalized_destination_matches() {
+    for (entry, authority) in [
+        (" Reviews.SVC... ", "REVIEWS.svc"),
+        ("reviews.svc.:0000443", "REVIEWS.SVC:443"),
+        ("*.Example.Com.:0443", "API.EXAMPLE.COM:443"),
+        ("reviews.svc:*", "REVIEWS.SVC:65535"),
+        ("xn--bcher-kva.example", "XN--BCHER-KVA.EXAMPLE"),
+        ("2001:0DB8:0:0:0:0:0:1", "[2001:db8::1]"),
+        ("[2001:DB8::1]:0443", "[2001:db8:0:0:0:0:0:1]:443"),
+        ("2001:db8::1:*", "[2001:DB8::1]:443"),
+        ("[::ffff:192.0.2.1]:443", "[::ffff:c000:201]:443"),
+    ] {
+        let plugin = create_plugin("mesh_outbound_registry", &json!({"registry": [entry]}))
+            .unwrap()
+            .unwrap();
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+        ctx.headers.insert("host".into(), authority.into());
+        assert!(matches!(
+            plugin.on_request_received(&mut ctx).await,
+            PluginResult::Continue
+        ));
+    }
+}
+
+#[tokio::test]
+async fn mesh_outbound_registry_empty_effective_registry_denies_destinations() {
+    for config in [
+        json!({}),
+        json!({"registry": []}),
+        json!({"registry": ["", " \t"]}),
+    ] {
+        let plugin = create_plugin("mesh_outbound_registry", &config)
+            .unwrap()
+            .unwrap();
+        for host in ["known.test", "known.test:443", "[::1]:443"] {
+            let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+            ctx.headers.insert("host".into(), host.into());
+            assert!(matches!(
+                plugin.on_request_received(&mut ctx).await,
+                PluginResult::Reject {
+                    status_code: 502,
+                    ..
+                }
+            ));
+        }
+    }
+}
+
+#[test]
+fn mesh_outbound_registry_invalid_slice_keeps_stream_and_route_miss_enforcement() {
+    use ferrum_edge::modes::mesh::outbound_enforcement::{Decision, MeshOutboundEnforcement};
+
+    let slice = MeshSlice {
+        namespace: "default".into(),
+        services: vec![MeshService {
+            name: "invalid/service".into(),
+            namespace: "default".into(),
+            cluster_ips: Vec::new(),
+            ports: Vec::new(),
+            workloads: Vec::new(),
+            protocol_overrides: HashMap::new(),
+            uid: None,
+        }],
+        ..MeshSlice::default()
+    };
+    let enforcement = MeshOutboundEnforcement::from_slice(
+        &slice,
+        "cluster.local",
+        "default".into(),
+        vec![15001],
+        404,
+    )
+    .expect("an invalid registry must keep the gate installed");
+    assert_eq!(enforcement.registry().registry_size(), 0);
+    assert_eq!(
+        enforcement.check_destination(15001, "known.test", 443),
+        Decision::Deny
+    );
+    assert_eq!(
+        enforcement.check_destination(15006, "known.test", 443),
+        Decision::Skip
+    );
+    assert_eq!(
+        enforcement.http_route_miss_reject_status(15001, Some("known.test"), Some(443)),
+        Some(404)
+    );
 }
 
 #[test]
@@ -8368,4 +8678,178 @@ async fn mesh_host_port_policy_uses_one_decimal_identity() {
             }
         }
     }
+}
+
+// ── Strict configuration admission (advisory GHSA-9x95-2xx8-xr37) ──────────
+//
+// Every case here is a MISSPELLING or a wrong-typed value that used to be
+// silently discarded. In an authorization grammar a discarded member is a
+// discarded RESTRICTION, so each of these widened the effective policy with no
+// diagnostic anywhere. They fail construction now, which fails the whole plugin
+// generation and keeps the previous valid one serving.
+
+#[test]
+fn mesh_authz_rejects_a_non_object_config_root() {
+    for root in [json!(7), json!("mesh_policies"), json!([]), json!(true)] {
+        let err = match MeshAuthz::new(&root) {
+            Ok(_) => panic!("a non-object mesh_authz config root must fail closed: {root}"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("must be a JSON object"),
+            "error should name the root shape: {err}"
+        );
+    }
+}
+
+#[test]
+fn mesh_authz_accepts_an_absent_config_as_a_policy_free_instance() {
+    // `PluginConfig.config` is `#[serde(default)]`, so an omitted `config:`
+    // block arrives as `null` for every plugin. That is absence, not a
+    // malformed policy document, and must keep working.
+    MeshAuthz::new(&json!(null)).expect("an absent config builds a policy-free instance");
+    MeshAuthz::new(&json!({})).expect("an explicit empty config is a supported scaffold");
+}
+
+#[test]
+fn mesh_authz_rejects_wrong_typed_scoping_flags() {
+    for key in ["per_pod_policy_scoping", "ambient_udp_source_scoping"] {
+        for value in [json!("true"), json!(1), json!({}), json!([])] {
+            let config = json!({ (key): value.clone() });
+            let err = match MeshAuthz::new(&config) {
+                Ok(_) => panic!("{key} = {value} must fail closed, not read as false"),
+                Err(err) => err,
+            };
+            assert!(err.contains(key), "error should name the field: {err}");
+            assert!(
+                err.contains("must be a boolean"),
+                "error should name the expected type: {err}"
+            );
+        }
+        // Absent and explicit null both mean "not supplied", matching how the
+        // alias / assertor lists treat null.
+        MeshAuthz::new(&json!({ (key): serde_json::Value::Null }))
+            .unwrap_or_else(|e| panic!("explicit null {key} is absence, not an error: {e}"));
+    }
+}
+
+#[test]
+fn mesh_authz_rejects_unknown_members_at_every_policy_nesting_level() {
+    let base = json!({
+        "name": "deny-admin",
+        "namespace": "default",
+        "scope": {"kind": "mesh_wide"},
+        "rules": [{"action": "deny", "to": [{"paths": ["/admin/*"]}]}]
+    });
+    let mut cases: Vec<(&str, serde_json::Value)> = Vec::new();
+
+    let mut policy_typo = base.clone();
+    policy_typo["ruless"] = json!([]);
+    cases.push(("ruless", policy_typo));
+
+    let mut rule_typo = base.clone();
+    rule_typo["rules"][0]["not_path"] = json!(["/public/*"]);
+    cases.push(("not_path", rule_typo));
+
+    let mut match_typo = base.clone();
+    match_typo["rules"][0]["to"][0]["not_hostz"] = json!(["admin.example.com"]);
+    cases.push(("not_hostz", match_typo));
+
+    let mut principal_typo = base.clone();
+    principal_typo["rules"][0]["from"] = json!([{"spiffe_id_patern": "spiffe://cluster.local/*"}]);
+    cases.push(("spiffe_id_patern", principal_typo));
+
+    let mut negation_typo = base.clone();
+    negation_typo["rules"][0]["source_negation"] = json!({"not_ip_block": ["10.0.0.0/8"]});
+    cases.push(("not_ip_block", negation_typo));
+
+    let mut condition_typo = base.clone();
+    condition_typo["rules"][0]["when"] = json!([{"key": "connection.sni", "valuez": ["admin"]}]);
+    cases.push(("valuez", condition_typo));
+
+    let mut selector_typo = base.clone();
+    selector_typo["scope"] = json!({"kind": "workload_selector", "selector": {"labelz": {}}});
+    cases.push(("labelz", selector_typo));
+
+    for (misspelling, policy) in cases {
+        let err = match MeshAuthz::new(&json!({ "mesh_policies": [policy] })) {
+            Ok(_) => panic!("misspelled '{misspelling}' must fail closed, not drop a restriction"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains(misspelling),
+            "error should name the unknown member '{misspelling}': {err}"
+        );
+    }
+}
+
+#[test]
+fn mesh_authz_requires_an_explicit_rule_action() {
+    // Without this, `action` fell back to its `Allow` default, so a rule whose
+    // action key was misspelled (or simply forgotten) became a GRANT.
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [{
+            "name": "deny-admin",
+            "namespace": "default",
+            "scope": {"kind": "mesh_wide"},
+            "rules": [{"to": [{"paths": ["/admin/*"]}]}]
+        }]
+    })) {
+        Ok(_) => panic!("a rule with no action must fail closed, not default to allow"),
+        Err(err) => err,
+    };
+    assert!(err.contains("action"), "error should name the field: {err}");
+}
+
+#[test]
+fn mesh_authz_keeps_omitted_optional_matchers_and_empty_scaffolds() {
+    // Strictness must not turn documented omissions into errors: an omitted
+    // `to` still means "any request", and an explicitly empty rule list is a
+    // valid scaffold.
+    MeshAuthz::new(&json!({
+        "mesh_policies": [{
+            "name": "deny-everything",
+            "namespace": "default",
+            "scope": {"kind": "mesh_wide"},
+            "rules": [{"action": "deny"}]
+        }]
+    }))
+    .expect("a rule carrying only its action is valid");
+
+    MeshAuthz::new(&json!({
+        "namespace": "default",
+        "mesh_policies": [{
+            "name": "scaffold",
+            "namespace": "default",
+            "scope": {"kind": "namespace", "namespace": "default"}
+        }]
+    }))
+    .expect("a policy with no rules is a valid scaffold");
+}
+
+#[test]
+fn mesh_authz_rejects_a_mesh_slice_carrying_a_misspelled_policy_member() {
+    // The slice path deserializes the same closed grammar, so an injected or
+    // control-plane-supplied slice cannot smuggle a dropped restriction past
+    // the admission the direct config enforces.
+    let err = match MeshAuthz::new(&json!({
+        "mesh_slice": {
+            "node_id": "node-a",
+            "namespace": "default",
+            "version": "test",
+            "mesh_policies": [{
+                "name": "deny-admin",
+                "namespace": "default",
+                "scope": {"kind": "mesh_wide"},
+                "rules": [{"action": "deny", "to": [{"not_path": ["/public/*"]}]}]
+            }]
+        }
+    })) {
+        Ok(_) => panic!("a misspelled matcher inside a mesh_slice must fail closed"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("not_path"),
+        "error should name the unknown member: {err}"
+    );
 }

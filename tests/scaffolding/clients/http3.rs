@@ -588,8 +588,9 @@ impl Http3Client {
     /// Open an RFC 9220 WebSocket-over-HTTP/3 Extended CONNECT stream.
     ///
     /// The returned stream works with raw WebSocket frames in HTTP/3 DATA
-    /// frames. Test helpers below encode client frames unmasked by default,
-    /// matching RFC 9220 §5.
+    /// frames. Test helpers below mask client frames per RFC 6455 §5.1, which
+    /// RFC 9220 / RFC 8441 Extended CONNECT leave in force; `send_unmasked_*`
+    /// builds the non-compliant shape the refusal tests need.
     pub async fn websocket(
         &self,
         url: &str,
@@ -652,6 +653,7 @@ impl Http3Client {
             _send_request: send_request,
             driver_task: Some(driver_task),
             read_buf: Vec::new(),
+            mask_counter: 0,
             status,
             headers,
         })
@@ -1092,6 +1094,7 @@ impl Http3Connection {
             _send_request: self.send_request.clone(),
             driver_task: None,
             read_buf: Vec::new(),
+            mask_counter: 0,
             status,
             headers,
         })
@@ -1588,6 +1591,9 @@ pub struct Http3WebSocket {
     _send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
     driver_task: Option<JoinHandle<()>>,
     read_buf: Vec<u8>,
+    /// Rotates the RFC 6455 §5.3 masking key per client frame so a gateway
+    /// that only unmasks against one hard-coded key cannot pass these tests.
+    mask_counter: u32,
     pub status: StatusCode,
     pub headers: HeaderMap,
 }
@@ -1597,25 +1603,28 @@ impl Http3WebSocket {
         &mut self,
         text: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.send_frame(0x1, text.as_bytes(), false).await
+        self.send_frame(0x1, text.as_bytes()).await
     }
 
-    pub async fn send_masked_text(
+    /// Send one RFC 6455 §5.1-violating UNMASKED client frame, which every
+    /// frontend must refuse with close code 1002 (issue #5011).
+    pub async fn send_unmasked_text(
         &mut self,
         text: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.send_frame(0x1, text.as_bytes(), true).await
+        self.send_raw_frame(encode_ws_frame(0x1, text.as_bytes(), None, true))
+            .await
     }
 
     pub async fn send_binary(
         &mut self,
         bytes: &[u8],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.send_frame(0x2, bytes, false).await
+        self.send_frame(0x2, bytes).await
     }
 
-    /// Send one unmasked RFC 9220 data/control frame with an explicit FIN bit.
-    /// Test callers use opcode `0x1`/`0x2` for the first fragment, `0x0` for a
+    /// Send one masked data/control frame with an explicit FIN bit. Test
+    /// callers use opcode `0x1`/`0x2` for the first fragment, `0x0` for a
     /// continuation, and `0x9`/`0xA` for interleaved Ping/Pong frames.
     pub async fn send_fragment(
         &mut self,
@@ -1623,12 +1632,11 @@ impl Http3WebSocket {
         payload: &[u8],
         is_final: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.send_frame_with_fin(opcode, payload, false, is_final)
-            .await
+        self.send_frame_with_fin(opcode, payload, is_final).await
     }
 
     pub async fn send_close(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.send_frame(0x8, &[], false).await?;
+        self.send_frame(0x8, &[]).await?;
         let _ = self.stream.finish().await;
         Ok(())
     }
@@ -1693,20 +1701,25 @@ impl Http3WebSocket {
         &mut self,
         opcode: u8,
         payload: &[u8],
-        masked: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.send_frame_with_fin(opcode, payload, masked, true)
-            .await
+        self.send_frame_with_fin(opcode, payload, true).await
     }
 
     async fn send_frame_with_fin(
         &mut self,
         opcode: u8,
         payload: &[u8],
-        masked: bool,
         is_final: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let frame = encode_ws_frame(opcode, payload, masked, is_final);
+        let mask = self.next_mask();
+        self.send_raw_frame(encode_ws_frame(opcode, payload, Some(mask), is_final))
+            .await
+    }
+
+    async fn send_raw_frame(
+        &mut self,
+        frame: Vec<u8>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tokio::time::timeout(
             Duration::from_secs(15),
             self.stream.send_data(Bytes::from(frame)),
@@ -1715,6 +1728,12 @@ impl Http3WebSocket {
         .map_err(|_| "websocket send_data timed out")?
         .map_err(|e| format!("websocket send_data: {e}"))?;
         Ok(())
+    }
+
+    fn next_mask(&mut self) -> [u8; 4] {
+        self.mask_counter = self.mask_counter.wrapping_add(1);
+        let key = 0x1234_5678u32 ^ self.mask_counter.wrapping_mul(0x9E37_79B9);
+        key.to_be_bytes()
     }
 }
 
@@ -1736,10 +1755,13 @@ pub enum H3WebSocketFrame {
     Other { opcode: u8, payload: Vec<u8> },
 }
 
-fn encode_ws_frame(opcode: u8, payload: &[u8], masked: bool, is_final: bool) -> Vec<u8> {
+/// Encode one client frame. `mask` is `Some(key)` for the RFC 6455 §5.1
+/// client-to-server shape every compliant client sends, and `None` only to
+/// build the non-compliant unmasked frame the 1002 refusal tests need.
+fn encode_ws_frame(opcode: u8, payload: &[u8], mask: Option<[u8; 4]>, is_final: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(14 + payload.len());
     out.push((if is_final { 0x80 } else { 0 }) | (opcode & 0x0f));
-    let mask_bit = if masked { 0x80 } else { 0 };
+    let mask_bit = if mask.is_some() { 0x80 } else { 0 };
     match payload.len() {
         len @ 0..=125 => out.push(mask_bit | len as u8),
         len @ 126..=65_535 => {
@@ -1751,8 +1773,7 @@ fn encode_ws_frame(opcode: u8, payload: &[u8], masked: bool, is_final: bool) -> 
             out.extend_from_slice(&(len as u64).to_be_bytes());
         }
     }
-    if masked {
-        let mask = [0x12, 0x34, 0x56, 0x78];
+    if let Some(mask) = mask {
         out.extend_from_slice(&mask);
         out.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
     } else {
@@ -1948,14 +1969,24 @@ mod tests {
     }
 
     #[test]
-    fn websocket_frame_encoder_uses_unmasked_h3_shape_by_default() {
-        let frame = encode_ws_frame(0x1, b"hi", false, true);
+    fn websocket_frame_encoder_emits_the_rfc6455_masked_client_shape() {
+        let mask = [0x12u8, 0x34, 0x56, 0x78];
+        let frame = encode_ws_frame(0x1, b"hi", Some(mask), true);
+        assert_eq!(
+            frame,
+            vec![0x81, 0x82, 0x12, 0x34, 0x56, 0x78, b'h' ^ 0x12, b'i' ^ 0x34]
+        );
+    }
+
+    #[test]
+    fn websocket_frame_encoder_emits_the_unmasked_shape_only_on_request() {
+        let frame = encode_ws_frame(0x1, b"hi", None, true);
         assert_eq!(frame, vec![0x81, 0x02, b'h', b'i']);
     }
 
     #[test]
     fn websocket_frame_parser_unmasks_client_frames_for_gap_test() {
-        let mut frame = encode_ws_frame(0x1, b"masked", true, true);
+        let mut frame = encode_ws_frame(0x1, b"masked", Some([1, 2, 3, 4]), true);
         let parsed = try_parse_ws_frame(&mut frame)
             .expect("parse")
             .expect("frame");

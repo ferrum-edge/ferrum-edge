@@ -40,6 +40,18 @@ fn make_post_headers() -> HashMap<String, String> {
     headers
 }
 
+/// Header map for the context-free `transform_request_body` compatibility API.
+///
+/// That variant has no `RequestContext`, so it proves the documented JSON
+/// `POST` scope from the `:method` pseudo-header the context-free body-transform
+/// callers synthesize. Without it the transform declines, exactly as it must for
+/// a caller that cannot establish the method.
+fn make_transform_headers() -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert(":method".to_string(), "POST".to_string());
+    headers
+}
+
 fn ai_request(content: &str) -> serde_json::Value {
     json!({
         "model": "gpt-4",
@@ -292,7 +304,7 @@ async fn test_redact_mode_ssn() {
     // transform_request_body should redact
     let body = serde_json::to_vec(&ai_request("My SSN is 123-45-6789")).unwrap();
     let result = plugin
-        .transform_request_body(&body, Some("application/json"), &HashMap::new())
+        .transform_request_body(&body, Some("application/json"), &make_transform_headers())
         .await;
     assert!(result.is_some());
     let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
@@ -376,7 +388,7 @@ async fn test_redact_multiple_types() {
     let body =
         serde_json::to_vec(&ai_request("SSN: 123-45-6789, email: test@example.com")).unwrap();
     let result = plugin
-        .transform_request_body(&body, Some("application/json"), &HashMap::new())
+        .transform_request_body(&body, Some("application/json"), &make_transform_headers())
         .await;
     assert!(result.is_some());
     let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
@@ -511,7 +523,7 @@ async fn test_scan_all_mode_redacts_json_escaped_pii() {
         .transform_request_body(
             raw_body.as_bytes(),
             Some("application/json"),
-            &HashMap::new(),
+            &make_transform_headers(),
         )
         .await
         .expect("escaped decoded email should trigger redaction");
@@ -1129,7 +1141,7 @@ async fn test_scan_all_redaction_handles_many_late_value_span_matches_linearly()
     assert!(body.len() < 1_048_576);
 
     let transformed = plugin
-        .transform_request_body(&body, Some("application/json"), &HashMap::new())
+        .transform_request_body(&body, Some("application/json"), &make_transform_headers())
         .await
         .expect("every numeric SSN-shaped scalar should be redacted");
     let parsed: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
@@ -1400,7 +1412,7 @@ async fn test_custom_redaction_placeholder() {
 
     let body = serde_json::to_vec(&ai_request("SSN: 123-45-6789")).unwrap();
     let result = plugin
-        .transform_request_body(&body, Some("application/json"), &HashMap::new())
+        .transform_request_body(&body, Some("application/json"), &make_transform_headers())
         .await;
     assert!(result.is_some());
     let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
@@ -1511,6 +1523,9 @@ async fn test_framed_grpc_json_media_types_are_explicitly_skipped() {
 
         let mut headers = ctx.headers.clone();
         assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        // Prove the framing skip, not the method gate: the compatibility
+        // transform is given the POST marker it needs to be in scope at all.
+        headers.insert(":method".to_string(), "POST".to_string());
         assert!(
             plugin
                 .transform_request_body(
@@ -1588,6 +1603,7 @@ async fn test_native_grpc_framed_inputs_are_not_buffered_or_inspected() {
 
         let mut headers = ctx.headers.clone();
         assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        headers.insert(":method".to_string(), "POST".to_string());
         assert!(
             plugin
                 .transform_request_body(body, Some(content_type), &headers)
@@ -1860,7 +1876,7 @@ async fn test_redaction_preserves_json_structure() {
     .unwrap();
 
     let result = plugin
-        .transform_request_body(&body, Some("application/json"), &HashMap::new())
+        .transform_request_body(&body, Some("application/json"), &make_transform_headers())
         .await;
     assert!(result.is_some());
     let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
@@ -1938,7 +1954,11 @@ async fn test_all_mode_redacts_nonstructural_and_sensitive_fields() {
     let body_bytes = serde_json::to_vec(&body).unwrap();
 
     let transformed = plugin
-        .transform_request_body(&body_bytes, Some("application/json"), &HashMap::new())
+        .transform_request_body(
+            &body_bytes,
+            Some("application/json"),
+            &make_transform_headers(),
+        )
         .await
         .expect("expected redacted body when match present");
 
@@ -1980,7 +2000,11 @@ async fn test_all_mode_uses_structured_redaction_when_messages_present() {
     let body_bytes = serde_json::to_vec(&body).unwrap();
 
     let transformed = plugin
-        .transform_request_body(&body_bytes, Some("application/json"), &HashMap::new())
+        .transform_request_body(
+            &body_bytes,
+            Some("application/json"),
+            &make_transform_headers(),
+        )
         .await
         .expect("expected redacted body when match present");
 
@@ -2022,7 +2046,11 @@ async fn test_all_mode_redacts_sibling_fields_when_messages_present() {
     let body_bytes = serde_json::to_vec(&body).unwrap();
 
     let transformed = plugin
-        .transform_request_body(&body_bytes, Some("application/json"), &HashMap::new())
+        .transform_request_body(
+            &body_bytes,
+            Some("application/json"),
+            &make_transform_headers(),
+        )
         .await
         .expect("expected redacted body when match present");
 
@@ -2093,7 +2121,11 @@ async fn test_all_mode_redacts_pii_nested_under_structural_key() {
     let body_bytes = serde_json::to_vec(&body).unwrap();
 
     let transformed = plugin
-        .transform_request_body(&body_bytes, Some("application/json"), &HashMap::new())
+        .transform_request_body(
+            &body_bytes,
+            Some("application/json"),
+            &make_transform_headers(),
+        )
         .await
         .expect("expected redacted body when nested PII present");
     let v: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
@@ -2140,7 +2172,11 @@ async fn test_all_mode_redacts_deeply_nested_pii_under_structural_key() {
     let body_bytes = serde_json::to_vec(&body).unwrap();
 
     let transformed = plugin
-        .transform_request_body(&body_bytes, Some("application/json"), &HashMap::new())
+        .transform_request_body(
+            &body_bytes,
+            Some("application/json"),
+            &make_transform_headers(),
+        )
         .await
         .expect("expected redacted body");
     let serialized = String::from_utf8(transformed).unwrap();
@@ -2343,7 +2379,7 @@ async fn test_content_mode_redacts_prompt_input_system_fields() {
     .unwrap();
 
     let result = plugin
-        .transform_request_body(&body, Some("application/json"), &HashMap::new())
+        .transform_request_body(&body, Some("application/json"), &make_transform_headers())
         .await
         .expect("expected redacted body");
     let v: serde_json::Value = serde_json::from_slice(&result).unwrap();
@@ -2389,7 +2425,7 @@ async fn test_content_mode_responses_input_redaction_honors_exclude_roles() {
     .unwrap();
 
     let result = plugin
-        .transform_request_body(&body, Some("application/json"), &HashMap::new())
+        .transform_request_body(&body, Some("application/json"), &make_transform_headers())
         .await
         .expect("expected redacted body");
     let v: serde_json::Value = serde_json::from_slice(&result).unwrap();
@@ -2549,7 +2585,7 @@ async fn test_content_mode_redacts_azure_role_information_both_casings() {
     .unwrap();
 
     let result = plugin
-        .transform_request_body(&body, Some("application/json"), &HashMap::new())
+        .transform_request_body(&body, Some("application/json"), &make_transform_headers())
         .await
         .expect("expected redacted body");
     let v: serde_json::Value = serde_json::from_slice(&result).unwrap();
@@ -2970,6 +3006,22 @@ async fn test_content_mode_detection_and_redaction_cover_the_same_fields() {
             "instructions",
             json!({"instructions": format!("ssn {PII}")}),
         ),
+        (
+            "input responses function_call_output string",
+            json!({"input": [{
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": format!("ssn {PII}")
+            }]}),
+        ),
+        (
+            "input responses function_call_output parts",
+            json!({"input": [{
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": [{"type": "output_text", "text": format!("ssn {PII}")}]
+            }]}),
+        ),
         ("system", json!({"system": format!("ssn {PII}")})),
         (
             "inputText (bedrock titan)",
@@ -3058,8 +3110,41 @@ async fn test_content_mode_detection_and_redaction_cover_the_same_fields() {
             }]}),
         ),
         (
+            "messages[].content[].toolUse.input (bedrock converse)",
+            json!({"messages": [{
+                "role": "assistant",
+                "content": [{"toolUse": {
+                    "toolUseId": "tooluse_1",
+                    "name": "lookup_account",
+                    "input": {"note": format!("ssn {PII}")}
+                }}]
+            }]}),
+        ),
+        (
+            "messages[].content[].toolUse.input nested leaf (bedrock converse)",
+            json!({"messages": [{
+                "role": "assistant",
+                "content": [{"toolUse": {
+                    "toolUseId": "tooluse_1",
+                    "name": "lookup_account",
+                    "input": {"filters": [{"value": format!("ssn {PII}")}]}
+                }}]
+            }]}),
+        ),
+        (
             "message (cohere v1 current turn)",
             json!({"message": format!("ssn {PII}")}),
+        ),
+        (
+            "documents[] arbitrary map member (cohere v1)",
+            json!({"documents": [
+                {"id": "doc-1", "title": "clean"},
+                {"id": "doc-2", "snippet": format!("ssn {PII}")}
+            ]}),
+        ),
+        (
+            "documents[] recognized text member (cohere v1)",
+            json!({"documents": [{"id": "doc-1", "text": format!("ssn {PII}")}]}),
         ),
         (
             "preamble (cohere v1 system prompt)",
@@ -3103,7 +3188,7 @@ async fn test_content_mode_detection_and_redaction_cover_the_same_fields() {
             AiPromptShield::new(&json!({"action": "redact", "patterns": ["ssn"]})).unwrap();
         let raw = serde_json::to_vec(&body).unwrap();
         let redacted = redactor
-            .transform_request_body(&raw, Some("application/json"), &HashMap::new())
+            .transform_request_body(&raw, Some("application/json"), &make_transform_headers())
             .await
             .unwrap_or_else(|| panic!("`{label}` was detected but never rewritten"));
         let redacted = String::from_utf8(redacted).unwrap();
@@ -3114,6 +3199,938 @@ async fn test_content_mode_detection_and_redaction_cover_the_same_fields() {
         assert!(
             redacted.contains("[REDACTED:ssn]"),
             "`{label}` produced no redaction placeholder: {redacted}"
+        );
+    }
+}
+
+// ─── Bedrock Converse tool arguments / Cohere document maps ─────────────
+
+#[tokio::test]
+async fn test_content_mode_tool_use_scan_is_scoped_to_the_arguments_object() {
+    // `toolUse` carries call plumbing beside its arguments. Only `input` is
+    // model-visible prose, so an identifier or a tool name that incidentally
+    // matches a pattern must survive redaction untouched — rewriting either
+    // would corrupt the call the provider receives.
+    let plugin =
+        AiPromptShield::new(&json!({"action": "redact", "patterns": ["credit_card"]})).unwrap();
+    let body = json!({"messages": [{
+        "role": "assistant",
+        "content": [{"toolUse": {
+            "toolUseId": "4111111111111111",
+            "name": "4012888888881881",
+            "input": {"card": "4111111111111111"}
+        }}]
+    }]});
+
+    let raw = serde_json::to_vec(&body).unwrap();
+    let redacted = plugin
+        .transform_request_body(&raw, Some("application/json"), &make_transform_headers())
+        .await
+        .expect("tool arguments carrying PII must be rewritten");
+    let redacted: serde_json::Value = serde_json::from_slice(&redacted).unwrap();
+    let tool_use = &redacted["messages"][0]["content"][0]["toolUse"];
+
+    assert_eq!(tool_use["input"]["card"], json!("[REDACTED:credit_card]"));
+    assert_eq!(tool_use["toolUseId"], json!("4111111111111111"));
+    assert_eq!(tool_use["name"], json!("4012888888881881"));
+}
+
+#[tokio::test]
+async fn test_content_mode_tool_use_arguments_are_depth_bounded() {
+    // Arguments follow the tool's own JSON Schema, so the walk is the one
+    // shape here that descends. It stops at a fixed ceiling: a value nested
+    // past it is neither scanned nor rewritten, which keeps a hostile body
+    // from driving unbounded request-path work. Detection and redaction share
+    // the ceiling, so neither can report what the other did not do.
+    let mut deep = json!("ssn 123-45-6789");
+    for _ in 0..24 {
+        deep = json!({"next": deep});
+    }
+    let body = json!({"messages": [{
+        "role": "assistant",
+        "content": [{"toolUse": {"toolUseId": "tooluse_1", "input": deep}}]
+    }]});
+
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+    let mut ctx = make_post_ctx(&body);
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "arguments nested past the ceiling must not be scanned, got {result:?}"
+    );
+
+    let redactor = AiPromptShield::new(&json!({"action": "redact", "patterns": ["ssn"]})).unwrap();
+    let raw = serde_json::to_vec(&body).unwrap();
+    assert!(
+        redactor
+            .transform_request_body(&raw, Some("application/json"), &make_transform_headers())
+            .await
+            .is_none(),
+        "redaction must visit exactly what detection visited"
+    );
+}
+
+#[tokio::test]
+async fn test_content_mode_cohere_documents_skip_provider_hidden_members() {
+    // Cohere keeps the citation `id`, the `_excludes` control, and every
+    // member that control names out of the model-visible rendering, so they
+    // are not prompt text: scanning them would reject on bookkeeping the model
+    // never reads, and redacting them would corrupt citation retrieval.
+    let body = json!({"documents": [{
+        "id": "123-45-6789",
+        "_excludes": ["internal"],
+        "internal": "ssn 123-45-6789",
+        "snippet": "clean"
+    }]});
+
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+    let mut ctx = make_post_ctx(&body);
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "provider-hidden document members must stay outside Content mode, got {result:?}"
+    );
+
+    let redactor = AiPromptShield::new(&json!({"action": "redact", "patterns": ["ssn"]})).unwrap();
+    let raw = serde_json::to_vec(&body).unwrap();
+    assert!(
+        redactor
+            .transform_request_body(&raw, Some("application/json"), &make_transform_headers())
+            .await
+            .is_none(),
+        "redaction must leave provider-hidden document members untouched"
+    );
+}
+
+#[tokio::test]
+async fn test_content_mode_cohere_document_excludes_accept_the_single_value_spelling() {
+    // The control is documented as a list, but the single-string spelling
+    // reaches the provider too, and the detector and the redactor have to
+    // agree on it or one of them would act on a member the other skipped.
+    let body = json!({"documents": [{"_excludes": "internal", "internal": "ssn 123-45-6789"}]});
+
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+    let mut ctx = make_post_ctx(&body);
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a single-value `_excludes` must hide its member, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_content_mode_cohere_document_content_part_keeps_the_text_gate() {
+    // An entry carrying a `type` discriminator is a content part, not a
+    // document map, so it keeps the ordinary text-part gate: a text part is
+    // scanned and a non-text one is not, instead of every sibling string in
+    // the part being read as document prose.
+    let text_part = json!({"documents": [{"type": "text", "text": "ssn 123-45-6789"}]});
+    let image_part = json!({"documents": [{"type": "image_url", "url": "ssn 123-45-6789"}]});
+
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+    let mut ctx = make_post_ctx(&text_part);
+    let mut headers = make_post_headers();
+    let scanned = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(scanned, PluginResult::Reject { .. }),
+        "a text content part must still be scanned, got {scanned:?}"
+    );
+
+    let mut ctx = make_post_ctx(&image_part);
+    let mut headers = make_post_headers();
+    let skipped = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(skipped, PluginResult::Continue),
+        "a non-text content part must stay outside Content mode, got {skipped:?}"
+    );
+}
+
+// ─── Closed nested configuration ────────────────────────────────────────
+
+#[test]
+fn test_custom_pattern_entries_reject_unknown_members() {
+    // Valid entries still construct.
+    assert!(
+        AiPromptShield::new(&json!({
+            "patterns": [],
+            "custom_patterns": [{"name": "account", "regex": "ACCT-\\d{8}"}]
+        }))
+        .is_ok()
+    );
+
+    for unknown in ["note", "action", "Name", "regexp"] {
+        let mut entry = serde_json::Map::new();
+        entry.insert("name".to_string(), json!("account"));
+        entry.insert("regex".to_string(), json!("ACCT-\\d{8}"));
+        entry.insert(unknown.to_string(), json!("x"));
+        let result = AiPromptShield::new(&json!({
+            "patterns": [],
+            "custom_patterns": [serde_json::Value::Object(entry)]
+        }));
+        let err = result
+            .err()
+            .unwrap_or_else(|| panic!("nested unknown member `{unknown}` must be fatal"));
+        assert!(
+            err.contains("unknown config field") && err.contains(unknown),
+            "error must name the offending field path, got: {err}"
+        );
+    }
+
+    // The reported path identifies which entry failed.
+    let err = AiPromptShield::new(&json!({
+        "patterns": [],
+        "custom_patterns": [
+            {"name": "first", "regex": "a"},
+            {"name": "second", "regex": "b", "note": "x"}
+        ]
+    }))
+    .err()
+    .unwrap_or_else(|| panic!("nested unknown member must be fatal"));
+    assert!(
+        err.contains("custom_patterns[1].note"),
+        "error must carry the entry index, got: {err}"
+    );
+
+    // A non-object entry is a configuration error, not a silently ignored one.
+    assert!(
+        AiPromptShield::new(&json!({
+            "patterns": [],
+            "custom_patterns": ["ACCT-\\d{8}"]
+        }))
+        .is_err()
+    );
+}
+
+// ─── Numeric admission matches the published integer contract ───────────
+
+#[test]
+fn test_max_scan_bytes_numeric_admission_matches_the_published_contract() {
+    // A mathematically integral number is the same published integer however it
+    // is spelled, so the decimal form is accepted exactly like the plain one.
+    for raw in [
+        r#"{"patterns":["ssn"],"max_scan_bytes":1024}"#,
+        r#"{"patterns":["ssn"],"max_scan_bytes":1024.0}"#,
+        r#"{"patterns":["ssn"],"max_scan_bytes":1}"#,
+        r#"{"patterns":["ssn"],"max_scan_bytes":9007199254740991}"#,
+    ] {
+        let config: serde_json::Value = serde_json::from_str(raw).expect("fixture parses");
+        assert!(
+            AiPromptShield::new(&config).is_ok(),
+            "must accept schema-valid numeric config: {raw}"
+        );
+    }
+
+    // Fractional, negative, zero, out-of-range, and non-numeric spellings are
+    // all outside the published `integer` / `minimum` / `maximum` contract.
+    for raw in [
+        r#"{"patterns":["ssn"],"max_scan_bytes":1024.5}"#,
+        r#"{"patterns":["ssn"],"max_scan_bytes":-1}"#,
+        r#"{"patterns":["ssn"],"max_scan_bytes":0}"#,
+        r#"{"patterns":["ssn"],"max_scan_bytes":9007199254740992}"#,
+        r#"{"patterns":["ssn"],"max_scan_bytes":18446744073709551616}"#,
+        r#"{"patterns":["ssn"],"max_scan_bytes":"1024"}"#,
+        r#"{"patterns":["ssn"],"max_scan_bytes":true}"#,
+    ] {
+        let config: serde_json::Value = serde_json::from_str(raw).expect("fixture parses");
+        assert!(
+            AiPromptShield::new(&config).is_err(),
+            "must reject out-of-contract numeric config: {raw}"
+        );
+    }
+
+    // Omission keeps the documented default.
+    assert!(AiPromptShield::new(&json!({"patterns": ["ssn"]})).is_ok());
+}
+
+// ─── exclude_roles scope ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_exclude_roles_is_scoped_to_content_mode() {
+    let request = json!({
+        "model": "gpt-4",
+        "messages": [{"role": "system", "content": "Contact alice@example.com"}]
+    });
+
+    for action in ["reject", "redact", "warn"] {
+        // Content mode honours the exemption: the system prompt is preserved.
+        let content_mode = AiPromptShield::new(&json!({
+            "action": action,
+            "patterns": ["email"],
+            "exclude_roles": ["system"]
+        }))
+        .unwrap();
+        let mut ctx = make_post_ctx(&request);
+        let mut headers = make_post_headers();
+        assert_continue(content_mode.before_proxy(&mut ctx, &mut headers).await);
+        assert!(!ctx.metadata.contains_key("ai_shield_rejected"));
+        assert!(!ctx.metadata.contains_key("ai_shield_warnings"));
+        assert!(!ctx.metadata.contains_key("ai_shield_redacted"));
+
+        // `scan_fields: all` scans every value in the body regardless of role,
+        // so the exemption does not apply there — the documented scope.
+        let all_mode = AiPromptShield::new(&json!({
+            "action": action,
+            "patterns": ["email"],
+            "exclude_roles": ["system"],
+            "scan_fields": "all"
+        }))
+        .unwrap();
+        let mut ctx = make_post_ctx(&request);
+        let mut headers = make_post_headers();
+        let result = all_mode.before_proxy(&mut ctx, &mut headers).await;
+        match action {
+            "warn" => {
+                assert_continue(result);
+                assert_eq!(
+                    ctx.metadata.get("ai_shield_warnings").map(String::as_str),
+                    Some("email")
+                );
+            }
+            "redact" => {
+                assert_continue(result);
+                assert_eq!(
+                    ctx.metadata.get("ai_shield_redacted").map(String::as_str),
+                    Some("email")
+                );
+            }
+            _ => assert_reject(result, Some(400)),
+        }
+    }
+}
+
+// ─── Request-method scope is one decision ───────────────────────────────
+
+#[tokio::test]
+async fn test_redaction_transform_keeps_the_post_scope_of_the_rest_of_the_plugin() {
+    let plugin = AiPromptShield::new(&json!({
+        "action": "redact",
+        "patterns": ["ssn"]
+    }))
+    .unwrap();
+    let request = ai_request("My SSN is 123-45-6789");
+    let body = serde_json::to_vec(&request).unwrap();
+    let headers = make_post_headers();
+
+    // POST is in scope on every entry point.
+    let mut post_ctx = make_post_ctx(&request);
+    assert!(plugin.should_buffer_request_body(&post_ctx));
+    let rewritten = plugin
+        .transform_request_body_with_context(
+            &mut post_ctx,
+            &body,
+            Some("application/json"),
+            &headers,
+        )
+        .await
+        .expect("POST bodies are in scope");
+    let rewritten = String::from_utf8(rewritten).unwrap();
+    assert!(rewritten.contains("[REDACTED:ssn]"));
+
+    // Another body plugin can force a non-POST request onto the buffered path;
+    // the shared transform loop then visits every body-modifying plugin. The
+    // shield must apply the same method scope there that it applies everywhere
+    // else, or an unrelated body rule would silently activate redaction.
+    for method in ["PUT", "PATCH", "GET", "DELETE"] {
+        let mut ctx = make_post_ctx(&request);
+        ctx.method = method.to_string();
+        assert!(!plugin.should_buffer_request_body(&ctx));
+        let mut hook_headers = make_post_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut hook_headers).await);
+        assert!(
+            plugin
+                .transform_request_body_with_context(
+                    &mut ctx,
+                    &body,
+                    Some("application/json"),
+                    &headers,
+                )
+                .await
+                .is_none(),
+            "{method} must not be rewritten by a POST-scoped shield"
+        );
+    }
+
+    // The context-free compatibility variant cannot prove the method without an
+    // explicit marker, and refuses a marker that is not POST.
+    assert!(
+        plugin
+            .transform_request_body(&body, Some("application/json"), &HashMap::new())
+            .await
+            .is_none()
+    );
+    let mut put_marker = HashMap::new();
+    put_marker.insert(":method".to_string(), "PUT".to_string());
+    assert!(
+        plugin
+            .transform_request_body(&body, Some("application/json"), &put_marker)
+            .await
+            .is_none()
+    );
+}
+
+// ─── The final backend-visible body is authoritative ────────────────────
+
+#[tokio::test]
+async fn test_final_request_body_revalidates_content_a_later_transform_introduced() {
+    // `before_proxy` admits a clean body; a later `transform_request_body` hook
+    // (a request transformer body rule, a header-to-body overlay) then puts
+    // policy-relevant content into the bytes the backend will actually receive.
+    for (action, expect_reject) in [("reject", true), ("redact", true), ("warn", false)] {
+        let plugin = AiPromptShield::new(&json!({
+            "action": action,
+            "patterns": ["email"]
+        }))
+        .unwrap();
+        let mut ctx = make_post_ctx(&ai_request("a clean prompt"));
+        let mut headers = make_post_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+        let mutated = serde_json::to_vec(&ai_request("Contact alice@example.com")).unwrap();
+        let result = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &mutated)
+            .await;
+        if expect_reject {
+            assert_reject(result, Some(400));
+            assert_eq!(
+                ctx.metadata.get("ai_shield_rejected").map(String::as_str),
+                Some("email")
+            );
+        } else {
+            assert_continue(result);
+            assert_eq!(
+                ctx.metadata.get("ai_shield_warnings").map(String::as_str),
+                Some("email")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_final_request_body_accepts_the_representation_the_shield_itself_produced() {
+    let plugin = AiPromptShield::new(&json!({
+        "action": "redact",
+        "patterns": ["ssn"]
+    }))
+    .unwrap();
+    let request = ai_request("My SSN is 123-45-6789");
+    let body = serde_json::to_vec(&request).unwrap();
+    let mut ctx = make_post_ctx(&request);
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let rewritten = plugin
+        .transform_request_body_with_context(&mut ctx, &body, Some("application/json"), &headers)
+        .await
+        .expect("redact mode rewrites the wire body");
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &rewritten)
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn test_final_request_body_ignores_requests_this_instance_never_admitted() {
+    let plugin = AiPromptShield::new(&json!({"patterns": ["email"]})).unwrap();
+    let body = serde_json::to_vec(&ai_request("Contact alice@example.com")).unwrap();
+
+    // Never admitted: the method is outside scope.
+    let mut ctx = make_post_ctx(&ai_request("Contact alice@example.com"));
+    ctx.method = "PUT".to_string();
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &body)
+            .await,
+    );
+
+    // Never admitted: the media type is outside scope.
+    let mut ctx = make_post_ctx(&ai_request("Contact alice@example.com"));
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &body)
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn test_final_request_body_revalidation_does_not_invent_rejections() {
+    // A body `before_proxy` waved through (unparseable JSON in Content mode)
+    // must reach the same verdict on revalidation. Only a DEFERRED compressed
+    // body — one that was never inspected at all — fails closed on that
+    // condition.
+    let plugin = AiPromptShield::new(&json!({"patterns": ["email"]})).unwrap();
+    let mut ctx = make_post_ctx_with_raw_body("{not-json");
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, b"{not-json")
+            .await,
+    );
+    assert!(!ctx.metadata.contains_key("ai_shield_rejected"));
+}
+
+#[tokio::test]
+async fn test_multiple_shield_instances_keep_independent_final_inspection_markers() {
+    let ssn_plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+    let email_plugin = AiPromptShield::new(&json!({"patterns": ["email"]})).unwrap();
+    let mut ctx = make_post_ctx(&ai_request("a clean prompt"));
+    let mut headers = make_post_headers();
+    assert_continue(ssn_plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_continue(email_plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let mutated = serde_json::to_vec(&ai_request("Contact alice@example.com")).unwrap();
+    assert_continue(
+        ssn_plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &mutated)
+            .await,
+    );
+    assert_reject(
+        email_plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &mutated)
+            .await,
+        Some(400),
+    );
+}
+
+#[test]
+fn test_enforcing_instances_claim_the_finalized_request_representation() {
+    let request = ai_request("a clean prompt");
+    let headers = make_post_headers();
+    let ctx = make_post_ctx(&request);
+
+    for action in ["reject", "redact"] {
+        let plugin = AiPromptShield::new(&json!({"action": action, "patterns": ["email"]}))
+            .expect("config is valid");
+        assert!(
+            plugin.enforces_final_request_body_policy(&ctx, &headers, b"{}"),
+            "{action} must claim the representation it enforces on"
+        );
+    }
+
+    // `warn` cannot refuse anything, so an unreadable body must not become a
+    // rejection on its behalf.
+    let warn = AiPromptShield::new(&json!({"action": "warn", "patterns": ["email"]})).unwrap();
+    assert!(!warn.enforces_final_request_body_policy(&ctx, &headers, b"{}"));
+
+    // Out-of-scope requests are not claimed.
+    let plugin = AiPromptShield::new(&json!({"patterns": ["email"]})).unwrap();
+    let mut other_method = make_post_ctx(&request);
+    other_method.method = "PUT".to_string();
+    assert!(!plugin.enforces_final_request_body_policy(&other_method, &headers, b"{}"));
+
+    let mut text_headers = HashMap::new();
+    text_headers.insert("content-type".to_string(), "text/plain".to_string());
+    assert!(!plugin.enforces_final_request_body_policy(&ctx, &text_headers, b"{}"));
+
+    let mut framed_headers = HashMap::new();
+    framed_headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web+json".to_string(),
+    );
+    assert!(!plugin.enforces_final_request_body_policy(&ctx, &framed_headers, b"{}"));
+}
+
+// ─── Bounded redaction output ───────────────────────────────────────────
+
+#[test]
+fn test_zero_width_and_oversized_redaction_policies_are_refused_at_construction() {
+    for regex in ["", "x*", "(?:)", "a?"] {
+        let err = AiPromptShield::new(&json!({
+            "patterns": [],
+            "custom_patterns": [{"name": "zero_width", "regex": regex}]
+        }))
+        .err()
+        .unwrap_or_else(|| panic!("a zero-width redaction policy must be refused"));
+        assert!(
+            err.contains("must not match the empty string"),
+            "unexpected error for {regex:?}: {err}"
+        );
+    }
+
+    // An operator-supplied name is bounded before it can be multiplied by the
+    // number of matches a request produces.
+    assert!(
+        AiPromptShield::new(&json!({
+            "patterns": [],
+            "custom_patterns": [{"name": "n".repeat(200), "regex": "ACCT-\\d{8}"}]
+        }))
+        .is_err()
+    );
+
+    // So is the rendered replacement itself.
+    assert!(
+        AiPromptShield::new(&json!({
+            "patterns": ["ssn"],
+            "redaction_placeholder": "P".repeat(600)
+        }))
+        .is_err()
+    );
+    // A template that repeats `{type}` is bounded by what it RENDERS, not by
+    // its own length.
+    assert!(
+        AiPromptShield::new(&json!({
+            "patterns": [],
+            "custom_patterns": [{"name": "n".repeat(100), "regex": "ACCT-\\d{8}"}],
+            "redaction_placeholder": "{type}{type}{type}{type}{type}{type}"
+        }))
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn test_expanding_redaction_policy_fails_closed_on_the_output_budget() {
+    let plugin = AiPromptShield::new(&json!({
+        "action": "redact",
+        "patterns": [],
+        "custom_patterns": [{"name": "single", "regex": "x"}],
+        "redaction_placeholder": "P".repeat(500)
+    }))
+    .unwrap();
+
+    // A modest expansion still redacts normally.
+    let small = json!({"prompt": "x".repeat(50)});
+    let mut ctx = make_post_ctx(&small);
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(ctx.metadata.contains_key("ai_shield_redacted"));
+
+    // An expansion beyond the aggregate allowance fails closed instead of
+    // materialising an unbounded rewrite.
+    let large = json!({"prompt": "x".repeat(400)});
+    let mut ctx = make_post_ctx(&large);
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(413));
+    assert_eq!(
+        ctx.metadata.get("ai_shield_rejected").map(String::as_str),
+        Some("redaction_budget_exceeded")
+    );
+    assert!(!ctx.metadata.contains_key("ai_shield_redacted"));
+
+    // No partially redacted body is ever forwarded: the wire transform declines
+    // rather than emitting a half-rewritten document.
+    let raw = serde_json::to_vec(&large).unwrap();
+    let untouched = plugin
+        .transform_request_body_with_context(&mut ctx, &raw, Some("application/json"), &headers)
+        .await;
+    assert!(untouched.is_none());
+}
+
+// ─── All-mode logical-message boundaries ────────────────────────────────
+
+#[tokio::test]
+async fn test_all_mode_scans_logical_message_boundaries() {
+    // Providers concatenate adjacent text parts into one prompt, so a value
+    // split across two of them reaches the model intact. All-mode's decoded
+    // token pass sees only halves and its raw pass carries JSON punctuation
+    // between them, so the boundary pass is what catches it.
+    let request = json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "alice@"},
+                {"type": "text", "text": "example.com"}
+            ]
+        }]
+    });
+
+    for action in ["reject", "redact"] {
+        let plugin = AiPromptShield::new(&json!({
+            "action": action,
+            "patterns": ["email"],
+            "scan_fields": "all"
+        }))
+        .unwrap();
+        let mut ctx = make_post_ctx(&request);
+        let mut headers = make_post_headers();
+        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+    }
+
+    let warn = AiPromptShield::new(&json!({
+        "action": "warn",
+        "patterns": ["email"],
+        "scan_fields": "all"
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&request);
+    let mut headers = make_post_headers();
+    assert_continue(warn.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        ctx.metadata.get("ai_shield_warnings").map(String::as_str),
+        Some("email")
+    );
+
+    // Independent messages are still never joined.
+    let separated = json!({
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "alice@"}]},
+            {"role": "user", "content": [{"type": "text", "text": "example.com"}]}
+        ]
+    });
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["email"],
+        "scan_fields": "all"
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&separated);
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+// ─── OpenAI Responses function-result input ─────────────────────────────
+
+#[tokio::test]
+async fn test_responses_function_call_output_text_is_scanned_and_redacted() {
+    let shapes: Vec<(&str, serde_json::Value)> = vec![
+        (
+            "string output",
+            json!({
+                "model": "gpt-4.1",
+                "input": [{
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "lookup returned ssn 123-45-6789"
+                }]
+            }),
+        ),
+        (
+            "structured output parts",
+            json!({
+                "model": "gpt-4.1",
+                "input": [{
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": [{"type": "output_text", "text": "ssn 123-45-6789"}]
+                }]
+            }),
+        ),
+        (
+            "structured output strings",
+            json!({
+                "model": "gpt-4.1",
+                "input": [{
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": ["clean", "ssn 123-45-6789"]
+                }]
+            }),
+        ),
+    ];
+
+    for (label, body) in &shapes {
+        for action in ["reject", "warn"] {
+            let plugin =
+                AiPromptShield::new(&json!({"action": action, "patterns": ["ssn"]})).unwrap();
+            let mut ctx = make_post_ctx(body);
+            let mut headers = make_post_headers();
+            let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+            if action == "reject" {
+                assert_reject(result, Some(400));
+            } else {
+                assert_continue(result);
+                assert_eq!(
+                    ctx.metadata.get("ai_shield_warnings").map(String::as_str),
+                    Some("ssn"),
+                    "`{label}` must be reported in warn mode"
+                );
+            }
+        }
+
+        let redactor =
+            AiPromptShield::new(&json!({"action": "redact", "patterns": ["ssn"]})).unwrap();
+        let raw = serde_json::to_vec(body).unwrap();
+        let rewritten = redactor
+            .transform_request_body(&raw, Some("application/json"), &make_transform_headers())
+            .await
+            .unwrap_or_else(|| panic!("`{label}` was detected but never rewritten"));
+        let rewritten = String::from_utf8(rewritten).unwrap();
+        assert!(
+            !rewritten.contains("123-45-6789"),
+            "`{label}` was forwarded unredacted: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("[REDACTED:ssn]"),
+            "`{label}` produced no redaction placeholder: {rewritten}"
+        );
+    }
+
+    // Clean control: a function result with no PII passes untouched, and an
+    // `output` shape carrying no text is left alone by both sides.
+    for clean in [
+        json!({"input": [{"type": "function_call_output", "output": "all clear"}]}),
+        json!({"input": [{"type": "function_call_output", "output": {"code": 200}}]}),
+    ] {
+        let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+        let mut ctx = make_post_ctx(&clean);
+        let mut headers = make_post_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    }
+}
+
+// ─── Composition with another request-body plugin ───────────────────────
+
+/// The composed route must reach the same method eligibility as the standalone
+/// one. An unrelated body rule forces buffering and pulls every
+/// `modifies_request_body` plugin into the shared transform loop, which is the
+/// path an isolated `before_proxy` test cannot reach.
+#[tokio::test]
+async fn test_composed_body_rule_does_not_extend_redaction_to_other_methods() {
+    use ferrum_edge::_test_support::run_request_body_stage_with_context_for_test;
+    use ferrum_edge::plugins::request_transformer::RequestTransformer;
+    use std::sync::Arc;
+
+    let shield = Arc::new(
+        AiPromptShield::new(&json!({
+            "action": "redact",
+            "patterns": [],
+            "custom_patterns": [{"name": "fixture", "regex": "audit-marker"}]
+        }))
+        .unwrap(),
+    ) as Arc<dyn Plugin>;
+    // Priority 3000, so its body rule runs after the shield's own transform.
+    let transformer = Arc::new(
+        RequestTransformer::new(&json!({
+            "rules": [
+                {"operation": "add", "target": "body", "key": "fixture", "value": "present"}
+            ]
+        }))
+        .unwrap(),
+    ) as Arc<dyn Plugin>;
+    let plugins = vec![Arc::clone(&shield), Arc::clone(&transformer)];
+
+    let body = br#"{"prompt":"audit-marker"}"#;
+    let raw = std::str::from_utf8(body).unwrap();
+    let headers = make_post_headers();
+
+    // POST is eligible: the shield redacts and the unrelated rule still applies.
+    let mut ctx = make_post_ctx_with_raw_body(raw);
+    let (post_body, post_result) =
+        run_request_body_stage_with_context_for_test(&plugins, &mut ctx, &headers, body).await;
+    assert_continue(post_result);
+    let post_body = String::from_utf8(post_body).unwrap();
+    assert!(post_body.contains("[REDACTED:fixture]"), "{post_body}");
+    assert!(post_body.contains(r#""fixture":"present""#), "{post_body}");
+
+    // PUT is not: the unrelated rule still executes, and the prompt is exactly
+    // what the same shield configuration leaves untouched standalone.
+    let mut ctx = make_post_ctx_with_raw_body(raw);
+    ctx.method = "PUT".to_string();
+    let (put_body, put_result) =
+        run_request_body_stage_with_context_for_test(&plugins, &mut ctx, &headers, body).await;
+    assert_continue(put_result);
+    let put_body = String::from_utf8(put_body).unwrap();
+    assert!(put_body.contains("audit-marker"), "{put_body}");
+    assert!(!put_body.contains("[REDACTED:fixture]"), "{put_body}");
+    assert!(put_body.contains(r#""fixture":"present""#), "{put_body}");
+}
+
+/// A later body rule cannot put policy-relevant content back into the request
+/// after the shield's `before_proxy` decision: the final hook re-decides over
+/// the exact backend-visible representation and refuses.
+#[tokio::test]
+async fn test_composed_later_body_rule_cannot_reintroduce_pii_past_the_shield() {
+    use ferrum_edge::_test_support::run_request_body_stage_with_context_for_test;
+    use ferrum_edge::plugins::request_transformer::RequestTransformer;
+    use std::sync::Arc;
+
+    let transformer = Arc::new(
+        RequestTransformer::new(&json!({
+            "rules": [{
+                "operation": "add",
+                "target": "body",
+                "key": "note",
+                "value": "Contact alice@example.com"
+            }]
+        }))
+        .unwrap(),
+    ) as Arc<dyn Plugin>;
+
+    for action in ["reject", "redact"] {
+        let shield = Arc::new(
+            AiPromptShield::new(&json!({
+                "action": action,
+                "patterns": ["email"],
+                "scan_fields": "all"
+            }))
+            .unwrap(),
+        ) as Arc<dyn Plugin>;
+        let plugins = vec![Arc::clone(&shield), Arc::clone(&transformer)];
+
+        let body = br#"{"prompt":"a clean prompt"}"#;
+        let raw = std::str::from_utf8(body).unwrap();
+        let mut ctx = make_post_ctx_with_raw_body(raw);
+        let mut hook_headers = make_post_headers();
+        assert_continue(shield.before_proxy(&mut ctx, &mut hook_headers).await);
+
+        let headers = make_post_headers();
+        let (_, result) =
+            run_request_body_stage_with_context_for_test(&plugins, &mut ctx, &headers, body).await;
+        assert_reject(result, Some(400));
+        assert_eq!(
+            ctx.metadata.get("ai_shield_rejected").map(String::as_str),
+            Some("email"),
+            "the refusal must name the pattern the final body carried"
+        );
+    }
+}
+
+/// Configured request decompression exposes plaintext BEFORE `before_proxy`, so
+/// a compressed redact request is rewritten and forwarded like any plaintext
+/// one. The documented final-hook refusal is reserved for a body that is still
+/// encoded when this plugin runs — which is a different request.
+#[tokio::test]
+async fn configured_decompression_redacts_compressed_requests_instead_of_refusing_them() {
+    let plugin = AiPromptShield::new(&json!({
+        "action": "redact",
+        "patterns": ["email"]
+    }))
+    .unwrap();
+    let plaintext = serde_json::to_vec(&ai_request("Contact private@example.com")).unwrap();
+
+    for encoding in ["gzip", "br"] {
+        let (mut ctx, mut headers, body) = normalize_compressed_request_for_plugin_test(
+            "application/json",
+            "/v1/chat/completions",
+            encoding,
+            &plaintext,
+        )
+        .await;
+
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(
+            ctx.metadata.get("ai_shield_redacted").map(String::as_str),
+            Some("email"),
+            "{encoding}: redaction must run on the normalized plaintext"
+        );
+
+        let rewritten = plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &headers,
+            )
+            .await
+            .expect("normalized plaintext must be rewritten on the wire path");
+        let rewritten = String::from_utf8(rewritten).unwrap();
+        assert!(!rewritten.contains("private@example.com"), "{rewritten}");
+        assert!(rewritten.contains("[REDACTED:email]"), "{rewritten}");
+
+        // The redacted representation is what the backend sees, so the final
+        // hook accepts it rather than refusing the request.
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, rewritten.as_bytes())
+                .await,
         );
     }
 }

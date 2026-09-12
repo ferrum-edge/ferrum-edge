@@ -100,69 +100,126 @@ fn item_body<'a>(text: &'a str, signature: &str, terminator: &str) -> &'a str {
     &text[start..start + end + terminator.len()]
 }
 
+#[test]
+fn mesh_apply_paths_carry_permission_from_preparation_to_commit() {
+    let mesh = source("src/modes/mesh/mod.rs");
+    let runtime = source("src/modes/mesh/runtime.rs");
+    // Startup, ordinary updates, content-no-op updates, and overlay fallback
+    // all need the same lifecycle. The behavioral gate tests cover admission
+    // races; this inventory catches a caller reintroducing late token minting.
+    for (signature, required) in [
+        (
+            "async fn wait_for_initial_mesh_config(",
+            "return Ok((config, Arc::new(slice.clone()), token))",
+        ),
+        (
+            "async fn serve_mesh_runtime(",
+            "initial_apply: Option<(Arc<MeshSlice>, revision::MeshRevisionApplyToken)>",
+        ),
+        (
+            "async fn arm_mesh_runtime_startup(",
+            "record_applied_slice_with_token(slice, initial_revision_apply_token)",
+        ),
+        (
+            "async fn apply_mesh_slice_generation(",
+            "let Some(revision_apply_token) = revision_apply_token else",
+        ),
+        (
+            "fn start_mesh_slice_apply_task(",
+            "let revision_apply_token = mesh_state.begin_revision_apply(slice)",
+        ),
+    ] {
+        assert!(
+            item_body(&mesh, signature, "\n}").contains(required),
+            "{signature} must carry an apply-begin capability"
+        );
+    }
+    let commit = item_body(
+        &runtime,
+        "    pub fn record_applied_slice_with_token(",
+        "\n    }",
+    );
+    assert!(!commit.contains("begin_revision_apply("));
+    assert!(!runtime.contains("pub fn record_applied_slice("));
+}
+
 // ---------------------------------------------------------------------------
 // (a) Circuit-breaker HALF_OPEN probe-slot release
 //
-// GHSA-4cq4-3f3f-mq76: a request admitted as a HALF_OPEN probe that is then
-// refused by the gateway must still release its probe slot, or the breaker
-// wedges. Every protocol path that can admit a probe carries the invariant.
+// GHSA-4cq4-3f3f-mq76: a request admitted as a HALF_OPEN probe must release its
+// probe slot on EVERY exit — a gateway-side refusal, a recorded backend outcome,
+// and (the reported defect) a dropped future when the client disconnects. The
+// slot is otherwise held forever: the state machine has no timer out of
+// HALF_OPEN, so one abandoned probe sheds every later request to that backend
+// for the rest of the process lifetime.
+//
+// The invariant is now carried by ONE RAII type, `HalfOpenProbeGuard`, rather
+// than a bare `bool` threaded through each path's `record_*` call sites. Every
+// protocol path that admits a probe owns a guard.
 // ---------------------------------------------------------------------------
 
 /// Files that call the shared circuit-breaker admission. Adding a protocol path
-/// here without a probe-release mechanism is exactly the #4792 shape.
+/// here without a probe guard is exactly the #4792 shape.
 const PROBE_ADMISSION_SITES: &[&str] = &[
     "src/http3/server.rs",
     "src/proxy/hbone_proxy.rs",
     "src/proxy/mod.rs",
 ];
 
-/// The delegating entry point every non-owning protocol path must call.
-const SHARED_PROBE_RELEASE: &str =
-    "crate::proxy::release_circuit_breaker_probe_on_admission_reject(";
+/// The one RAII type every admitting path must construct.
+const SHARED_PROBE_GUARD: &str = "HalfOpenProbeGuard::new(";
 
-/// Every named release mechanism: `(label, file, signature, terminator, marker)`.
-/// The marker is either the NEUTRAL release itself, for the paths that own an
-/// implementation, or the delegation to it.
-const PROBE_RELEASE_MECHANISMS: &[(&str, &str, &str, &str, &str)] = &[
+/// UDP and TCP bypass the shared admission helper. Count admissions per body,
+/// then check each admission arm independently (issue #4979).
+const DIRECT_PROBE_ADMISSION_SITES: &[(&str, &str, usize)] = &[
     (
-        "H1/H2/WebSocket/gRPC handler (shared implementation)",
-        "src/proxy/mod.rs",
-        "pub(crate) fn release_circuit_breaker_probe_on_admission_reject(",
-        "\n}\n",
-        "record_neutral(",
+        "src/proxy/udp_proxy.rs",
+        "async fn handle_dtls_client_inner(",
+        1,
+    ),
+    ("src/proxy/udp_proxy.rs", "async fn create_session(", 1),
+    (
+        "src/proxy/tcp_proxy.rs",
+        "async fn handle_tcp_connection_inner(",
+        2,
+    ),
+];
+
+/// Files that must own a guard rather than re-deriving the release: the
+/// admission sites plus every module they hand the guard to.
+const PROBE_GUARD_HOLDERS: &[&str] = &[
+    "src/http3/connect_udp.rs",
+    "src/http3/cross_protocol.rs",
+    "src/http3/server.rs",
+    "src/http3/websocket.rs",
+    "src/proxy/hbone_proxy.rs",
+    "src/proxy/mod.rs",
+    "src/proxy/tcp_proxy.rs",
+    "src/proxy/udp_proxy.rs",
+];
+
+/// Every settle path on the shared guard: `(label, signature, terminator)`.
+/// Each must reach the NEUTRAL release or explicitly hand the slot over.
+const PROBE_GUARD_SETTLE_PATHS: &[(&str, &str, &str)] = &[
+    (
+        "explicit gateway-side refusal",
+        "    pub fn release_neutral(&self) {",
+        "\n    }\n",
     ),
     (
-        "gRPC dispatch RAII guard",
-        "src/proxy/mod.rs",
-        "impl Drop for GrpcProbeReleaseGuard {",
+        "dropped future (client disconnect)",
+        "impl Drop for HalfOpenProbeGuard {",
         "\n}\n",
-        "record_neutral(",
     ),
     (
-        "HTTP/3 request path",
-        "src/http3/server.rs",
-        "fn release_h3_circuit_breaker_probe_on_admission_reject(",
+        "gRPC streaming recorder handoff",
+        "impl Drop for GrpcStreamingProbeRecorder {",
         "\n}\n",
-        SHARED_PROBE_RELEASE,
-    ),
-    (
-        "HTTP/3 WebSocket path",
-        "src/http3/websocket.rs",
-        "pub(crate) fn release_h3_ws_circuit_breaker_probe_on_admission_reject(",
-        "\n}\n",
-        SHARED_PROBE_RELEASE,
-    ),
-    (
-        "HBONE CONNECT relay",
-        "src/proxy/hbone_proxy.rs",
-        "pub(crate) fn settle_hbone_backend_connect_circuit_breaker_outcome(",
-        "\n}\n",
-        "record_neutral(",
     ),
 ];
 
 #[test]
-fn every_circuit_breaker_admission_site_carries_a_probe_release_mechanism() {
+fn every_circuit_breaker_admission_site_carries_a_probe_guard() {
     let admitting: BTreeSet<String> = production_sources()
         .into_iter()
         .filter(|(_, text)| text.contains("backend_dispatch::check_circuit_breaker("))
@@ -174,62 +231,116 @@ fn every_circuit_breaker_admission_site_carries_a_probe_release_mechanism() {
         .collect();
     assert_eq!(
         admitting, expected,
-        "a new protocol path admits HALF_OPEN circuit-breaker probes; give it a probe-release \
-         mechanism and add it to PROBE_RELEASE_MECHANISMS before listing it here"
+        "a new protocol path admits HALF_OPEN circuit-breaker probes; give it a \
+         `HalfOpenProbeGuard` and add it to PROBE_GUARD_HOLDERS before listing it here"
     );
 
-    let defining: BTreeSet<&str> = PROBE_RELEASE_MECHANISMS
-        .iter()
-        .map(|(_, file, _, _, _)| *file)
-        .collect();
     for &site in PROBE_ADMISSION_SITES {
         assert!(
-            defining.contains(site),
-            "{site} admits HALF_OPEN probes but defines no probe-release mechanism"
+            source(site).contains(SHARED_PROBE_GUARD),
+            "{site} admits HALF_OPEN probes but constructs no `{}`",
+            SHARED_PROBE_GUARD
         );
+    }
+
+    for &(file, signature, count) in DIRECT_PROBE_ADMISSION_SITES {
+        let text = source(file);
+        let expected_count: usize = DIRECT_PROBE_ADMISSION_SITES
+            .iter()
+            .filter(|(path, _, _)| *path == file)
+            .map(|(_, _, count)| count)
+            .sum();
+        assert_eq!(
+            text.matches("circuit_breaker_cache.can_execute(").count(),
+            expected_count,
+            "every direct-cache admission in {file} must be listed and own a probe guard"
+        );
+        let body = item_body(&text, signature, "\n}");
+        assert_eq!(
+            body.matches("circuit_breaker_cache.can_execute(").count(),
+            count,
+            "{signature} must retain its direct-cache admission checks"
+        );
+        for admission in body.split("circuit_breaker_cache.can_execute(").skip(1) {
+            let admitted = admission
+                .split_once("Err(_) =>")
+                .expect("cache admission must handle refusal")
+                .0;
+            assert!(
+                admitted
+                    .contains("HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe)"),
+                "{signature} must own each slot on the breaker returned by cache admission"
+            );
+            if file == "src/proxy/tcp_proxy.rs" {
+                assert!(
+                    admitted.contains("cb_probe.rearm(&cb, is_half_open_probe)"),
+                    "TCP retries must rearm the guard on the newly admitted breaker"
+                );
+            }
+        }
     }
 }
 
 #[test]
-fn every_probe_release_mechanism_settles_through_the_shared_neutral_release() {
-    for &(label, file, signature, terminator, marker) in PROBE_RELEASE_MECHANISMS {
+fn no_dispatch_path_carries_a_bare_probe_flag_beside_the_guard() {
+    // #4792 root cause 1: the same rule re-implemented per protocol path. The
+    // bare `bool` plumbing is what let a dropped future skip every release, so
+    // no holder may reintroduce a local copy of it.
+    for &file in PROBE_GUARD_HOLDERS {
         let text = source(file);
+        assert!(
+            text.contains("cb_probe"),
+            "{file} must carry the shared `HalfOpenProbeGuard` as `cb_probe`"
+        );
+        for banned in [
+            "let mut cb_is_half_open_probe",
+            "let release_half_open_probe =",
+            "ws_cb_probe_slot_available",
+            "grpc_cb_probe_slot",
+            "cb_retry_probe_slot_available",
+            "cb_info.is_half_open_probe",
+        ] {
+            assert!(
+                !text.contains(banned),
+                "{file} reintroduced the bare probe flag `{banned}`; thread the shared \
+                 `HalfOpenProbeGuard` instead so a dropped future still releases the slot"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_probe_guard_settle_path_releases_neutrally() {
+    let text = source("src/proxy/mod.rs");
+    for &(label, signature, terminator) in PROBE_GUARD_SETTLE_PATHS {
         let body = item_body(&text, signature, terminator);
         assert!(
-            body.contains(marker),
-            "{label} ({file}) must settle the probe slot through the shared NEUTRAL release \
-             (`{marker}`): a gateway-side refusal is neither a backend success nor a backend \
+            body.contains("record_neutral("),
+            "the {label} settle path must return the probe slot through the NEUTRAL \
+             release: a client disconnect is neither a backend success nor a backend \
              failure, and leaving the slot held wedges the breaker"
         );
     }
 }
 
 #[test]
-fn the_two_http3_probe_releases_delegate_to_the_shared_implementation() {
-    // #4792 root cause 1: the same rule implemented independently per protocol
-    // path. These two were byte-identical copies of the H1/H2 helper; they now
-    // delegate, so a change to the release semantics cannot reach one path only.
-    for (file, signature) in [
-        (
-            "src/http3/server.rs",
-            "fn release_h3_circuit_breaker_probe_on_admission_reject(",
-        ),
-        (
-            "src/http3/websocket.rs",
-            "pub(crate) fn release_h3_ws_circuit_breaker_probe_on_admission_reject(",
-        ),
-    ] {
-        let text = source(file);
-        let body = item_body(&text, signature, "\n}\n");
-        assert!(
-            body.contains(SHARED_PROBE_RELEASE),
-            "{file} must delegate to the shared probe release rather than re-implement it"
-        );
-        assert!(
-            !body.contains("circuit_breaker_cache.get_or_create("),
-            "{file} must not carry its own copy of the breaker lookup"
-        );
-    }
+fn taking_the_probe_slot_is_what_disarms_the_guard() {
+    // The exactly-once property the whole design rests on: every explicit
+    // `record_*` argument comes from `take_slot`, which atomically clears the
+    // armed flag, so no path can release the same slot twice (a double release
+    // decrements a DIFFERENT probe's slot and over-admits).
+    let text = source("src/proxy/mod.rs");
+    let take = item_body(&text, "    pub fn take_slot(&self) -> bool {", "\n    }\n");
+    assert!(
+        take.contains("self.armed.swap(false"),
+        "`take_slot` must atomically clear the armed flag as it hands the slot over"
+    );
+    let drop_body = item_body(&text, "impl Drop for HalfOpenProbeGuard {", "\n}\n");
+    assert!(
+        drop_body.contains("self.armed.swap(false"),
+        "the guard's `Drop` must claim the slot with the same atomic swap so it \
+         cannot race an explicit release"
+    );
 }
 
 fn probe_breaker_config() -> CircuitBreakerConfig {
@@ -240,6 +351,7 @@ fn probe_breaker_config() -> CircuitBreakerConfig {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     }
 }
 
@@ -834,5 +946,63 @@ async fn every_pool_family_key_is_drained_by_the_svid_generation_matcher() {
                 );
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Declared response Content-Length ceiling skips bodyless replies (issue #5116)
+//
+// A representation Content-Length on HEAD / 1xx / 204 / 205 / 304 is not a
+// transferable-body size. The shared helper is the single predicate; a sibling
+// that compares a parsed Content-Length against the response ceiling without
+// going through it reintroduces the 502.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn response_content_length_ceiling_skips_bodyless_semantics_on_every_path() {
+    let proxy = source("src/proxy/mod.rs");
+    let helper = item_body(
+        &proxy,
+        "pub(crate) fn declared_response_length_exceeds_limit(",
+        "\n}",
+    );
+    assert!(
+        helper.contains("synthetic_response_omits_body(method, status)"),
+        "the shared declared-length ceiling must skip HEAD/1xx/204/205/304"
+    );
+
+    for relative in [
+        "src/proxy/mod.rs",
+        "src/http3/server.rs",
+        "src/http3/cross_protocol.rs",
+    ] {
+        assert!(
+            source(relative).contains("declared_response_length_exceeds_limit("),
+            "{relative} must run the shared declared-length ceiling"
+        );
+    }
+
+    for (path, text) in production_sources() {
+        assert!(
+            !text.contains(
+                "&& let Some(len) = content_length\n                && len > effective_max_response_body_size_bytes"
+            ),
+            "{path} compared a parsed Content-Length against the response ceiling \
+             without the bodyless-aware helper"
+        );
+        assert!(
+            !text.contains(
+                "&& let Some(len) = content_length\n        && len > effective_max_response_body_size_bytes"
+            ),
+            "{path} compared a parsed Content-Length against the response ceiling \
+             without the bodyless-aware helper"
+        );
+        assert!(
+            !text.contains(
+                "content_length.is_some_and(|len| len > effective_max_response_body_size_bytes as u64)"
+            ),
+            "{path} compared a parsed Content-Length against the response ceiling \
+             without the bodyless-aware helper"
+        );
     }
 }

@@ -18,7 +18,8 @@ use ferrum_edge::plugins::api_chargeback_sink::{
 };
 use ferrum_edge::plugins::utils::log_schema::{
     CHARGE_EVENT_FIELDS, CHARGEBACK_REPORT_FIELDS, DEBUG_HTTP_FIELDS, DEBUG_STREAM_FIELDS,
-    DEBUG_WS_FIELDS, HTTP_FIELDS, STREAM_FIELDS, WS_DISCONNECT_FIELDS,
+    DEBUG_WS_FIELDS, HTTP_FIELDS, STREAM_FIELDS, SchemaCapabilities, SchemaView, SummarySchema,
+    WS_DISCONNECT_FIELDS,
 };
 use ferrum_edge::plugins::{
     Direction, DisconnectCause, StreamTransactionSummary, TransactionSummary,
@@ -60,8 +61,11 @@ fn fully_populated_http() -> TransactionSummary {
         body_completed: true,
         bytes_sent: 100,
         bytes_received: 200,
-        grpc_request_messages: 0,
-        grpc_response_messages: 0,
+        // Nonzero on purpose: both counters are skipped by the native
+        // serializer when zero, so a zero fixture cannot detect a registry or
+        // schema-projection gap for them.
+        grpc_request_messages: 3,
+        grpc_response_messages: 5,
         mirror: true,
         metadata: HashMap::from([
             ("trace_id".to_string(), "abc".to_string()),
@@ -542,5 +546,44 @@ fn debug_diagnostic_fields_registries_match_default_records() {
     assert_eq!(
         stream_ts,
         vec!["timestamp_connected", "timestamp_disconnected"]
+    );
+}
+
+/// An empty schema is the identity projection: every key the native
+/// serializer emits must appear, with the same value, through `SchemaView`.
+///
+/// This is the drift guard the registry test alone cannot give: a name can be
+/// present in `HTTP_FIELDS` / `STREAM_FIELDS` and still have no match arm in
+/// `SchemaSerializable::serialize_native`, in which case attaching any schema
+/// silently drops the field (issue #5170, `grpc_request_messages` /
+/// `grpc_response_messages`).
+#[test]
+fn empty_schema_projection_reproduces_the_native_summaries() {
+    let empty = serde_json::json!({});
+    let schema = SummarySchema::compile(&empty, "test", SchemaCapabilities::BASE)
+        .expect("empty schema compiles");
+
+    let http = fully_populated_http();
+    let projected = serde_json::to_value(SchemaView {
+        summary: &http,
+        schema: &schema,
+    })
+    .expect("http projection");
+    assert_eq!(
+        projected,
+        serde_json::to_value(&http).expect("native http"),
+        "empty-schema HTTP projection drifted from native serialization"
+    );
+
+    let stream = fully_populated_stream();
+    let projected = serde_json::to_value(SchemaView {
+        summary: &stream,
+        schema: &schema,
+    })
+    .expect("stream projection");
+    assert_eq!(
+        projected,
+        serde_json::to_value(&stream).expect("native stream"),
+        "empty-schema stream projection drifted from native serialization"
     );
 }

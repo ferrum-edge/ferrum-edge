@@ -94,6 +94,7 @@ fn ai_provider_label(value: &str) -> Option<&'static str> {
         "cohere" => Some("cohere"),
         "mistral" => Some("mistral"),
         "bedrock" | "aws_bedrock" => Some("bedrock"),
+        "tgi" => Some("tgi"),
         _ => None,
     }
 }
@@ -356,16 +357,30 @@ fn websocket_termination_reason_label(ctx: &WsDisconnectContext) -> &'static str
         .metadata
         .get(crate::proxy::WS_TERMINATION_METADATA_KEY)
         .map(String::as_str)
+        .and_then(ws_termination_reason_from_label)
     {
-        Some("credential_expired") => "credential_expired",
-        Some("max_lifetime") => "max_lifetime",
-        Some("idle_timeout") => "idle_timeout",
-        Some("drain") => "drain",
-        Some("normal_peer_close") => "normal_peer_close",
-        Some("relay_error") => "relay_error",
-        _ if ctx.error_class.is_some() => "relay_error",
-        _ => "normal_peer_close",
+        Some(reason) => reason.as_str(),
+        None if ctx.error_class.is_some() => crate::proxy::WsTerminationReason::RelayError.as_str(),
+        None => crate::proxy::WsTerminationReason::NormalPeerClose.as_str(),
     }
+}
+
+/// Map the relay's closed `websocket.termination_reason` token onto
+/// [`crate::proxy::WsTerminationReason`]. Unknown values fall through so a
+/// missing class cannot mint an unbounded label.
+fn ws_termination_reason_from_label(label: &str) -> Option<crate::proxy::WsTerminationReason> {
+    use crate::proxy::WsTerminationReason::*;
+    [
+        CredentialExpired,
+        TrustWithdrawn,
+        MaxLifetime,
+        IdleTimeout,
+        Drain,
+        NormalPeerClose,
+        RelayError,
+    ]
+    .into_iter()
+    .find(|reason| reason.as_str() == label)
 }
 
 /// Normalize request-controlled HTTP methods to a finite label set. HTTP
@@ -2419,6 +2434,29 @@ impl MetricsRegistry {
         self.mesh_series_budget_per_family.load(Ordering::Acquire)
     }
 
+    /// Live render-cache TTL in seconds (process-wide tunable).
+    #[doc(hidden)]
+    #[allow(dead_code)] // External unit tests call this through the library target.
+    pub fn render_cache_ttl_secs_for_test(&self) -> u64 {
+        self.render_cache_ttl_secs.load(Ordering::Relaxed)
+    }
+
+    /// Live stale-entry TTL in seconds (process-wide tunable).
+    #[doc(hidden)]
+    #[allow(dead_code)] // External unit tests call this through the library target.
+    pub fn stale_entry_ttl_secs_for_test(&self) -> u64 {
+        self.stale_entry_ttl_nanos.load(Ordering::Relaxed) / 1_000_000_000
+    }
+
+    /// Live cache-invalidation minimum age in milliseconds.
+    #[doc(hidden)]
+    #[allow(dead_code)] // External unit tests call this through the library target.
+    pub fn cache_invalidation_min_age_ms_for_test(&self) -> u64 {
+        self.cache_invalidation_min_age_nanos
+            .load(Ordering::Relaxed)
+            / 1_000_000
+    }
+
     /// Live admitted series for one mesh family (exact reservation count).
     #[doc(hidden)]
     #[allow(dead_code)] // External unit tests call this through the library target.
@@ -4400,18 +4438,10 @@ impl MetricsRegistry {
             "# HELP ferrum_mesh_dns_upstream_id_exhaustions_total Mesh DNS upstream transaction ID exhaustion events.\n",
         );
         output.push_str("# TYPE ferrum_mesh_dns_upstream_id_exhaustions_total counter\n");
-        if ns_label.is_empty() {
-            output.push_str(&format!(
-                "ferrum_mesh_dns_upstream_id_exhaustions_total {}\n",
-                mesh_dns_exhaustions
-            ));
-        } else {
-            output.push_str(&format!(
-                "ferrum_mesh_dns_upstream_id_exhaustions_total{{{}}} {}\n",
-                namespace_label_body(&ns_label),
-                mesh_dns_exhaustions
-            ));
-        }
+        output.push_str(&format!(
+            "ferrum_mesh_dns_upstream_id_exhaustions_total {}\n",
+            mesh_dns_exhaustions
+        ));
 
         if !self.hbone_relay_failure_counter.is_empty() {
             output.push_str(
@@ -5911,8 +5941,21 @@ fn render_tls_source_fetch_histogram(
     ));
 }
 
+/// Process-wide tunables parsed during admission and published only from
+/// [`Plugin::commit_background_tasks`] after the plugin-cache generation is
+/// atomically installed. Construction and shared validation must not write
+/// these into the live registry.
+struct PrometheusMetricsTunables {
+    render_cache_ttl_secs: u64,
+    stale_entry_ttl_secs: u64,
+    cache_invalidation_min_age_ms: u64,
+    mesh_series_budget_per_family: usize,
+    namespace: String,
+}
+
 pub struct PrometheusMetrics {
     registry: Arc<MetricsRegistry>,
+    tunables: PrometheusMetricsTunables,
 }
 
 fn optional_u64(config: &Value, key: &str, default: u64) -> Result<u64, String> {
@@ -5994,15 +6037,16 @@ impl PrometheusMetrics {
         )?;
         let mesh_series_budget_per_family = optional_mesh_series_budget_per_family(config)?;
 
-        registry.configure(
-            render_cache_ttl_secs,
-            stale_entry_ttl_secs,
-            cache_invalidation_min_age_ms,
-            mesh_series_budget_per_family,
-            namespace,
-        );
-
-        Ok(Self { registry })
+        Ok(Self {
+            registry,
+            tunables: PrometheusMetricsTunables {
+                render_cache_ttl_secs,
+                stale_entry_ttl_secs,
+                cache_invalidation_min_age_ms,
+                mesh_series_budget_per_family,
+                namespace: namespace.to_string(),
+            },
+        })
     }
 
     /// Construct against an isolated registry while exercising the production
@@ -6032,6 +6076,22 @@ impl Plugin for PrometheusMetrics {
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::ALL_PROTOCOLS
+    }
+
+    /// Publish this generation's process-wide registry tunables.
+    ///
+    /// Infallible and idempotent, and reached only after the plugin cache has
+    /// atomically installed the generation — so Admin/CP validation, file
+    /// admission, and a rejected candidate never mutate the live render-cache
+    /// policy, retained series, or namespace labels.
+    fn commit_background_tasks(&self) {
+        self.registry.configure(
+            self.tunables.render_cache_ttl_secs,
+            self.tunables.stale_entry_ttl_secs,
+            self.tunables.cache_invalidation_min_age_ms,
+            self.tunables.mesh_series_budget_per_family,
+            &self.tunables.namespace,
+        );
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {

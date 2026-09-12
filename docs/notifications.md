@@ -19,8 +19,9 @@ Reusable, plugin-agnostic notification infrastructure. Lives at `src/notificatio
 ### Common rules
 - Channel name matches `[A-Za-z0-9_-]+`.
 - Unknown properties on a selected channel variant are rejected (including fields that belong only to a different channel type). Generic webhook `headers` remain an open string map.
-- `webhook_url` (Slack/Teams/Discord) and `url` (generic webhook) MUST be `http://` or `https://` with a host and no `user:pass@` userinfo segment. The `email` channel takes a bare `smtp_host` instead — no scheme, port, path, or credentials in that field.
-- For each URL field there is a sibling `*_env` form (`webhook_url_env: "MY_ENV"`) that resolves via `std::env::var()` at construction. Combine with the gateway's secret resolver (`_FILE`, `_VAULT`, `_AWS`, `_AZURE`, `_GCP` env-var suffixes) to keep credentials out of config files.
+- `webhook_url` (Slack/Teams/Discord) and `url` (generic webhook) MUST be nonempty `http://` or `https://` with a host and no `user:pass@` userinfo segment. Empty strings, `ftp://`, and other schemes are rejected. The `email` channel takes a bare nonempty `smtp_host` instead — no scheme, port, path, or credentials in that field.
+- For each URL field there is a sibling `*_env` form (`webhook_url_env: "MY_ENV"`) that resolves via `std::env::var()` at construction. The env-var **name** must be nonempty; the named variable must be set and nonempty at construction. Combine with the gateway's secret resolver (`_FILE`, `_VAULT`, `_AWS`, `_AZURE`, `_GCP` env-var suffixes) to keep credentials out of config files.
+- OpenAPI `ProxyAlertsConfig` encodes those nonempty / HTTP(S) / no-userinfo constraints with `minLength` and a URL pattern. `format: uri` / `format: email` are Draft 2020-12 annotations and are not by themselves the constructor grammar.
 - Dispatch slow-call/error logs redact endpoint paths, query strings, and userinfo because incoming webhook credentials commonly live inside the URL.
 - Response bodies are discarded after successful dispatches with a 1 MiB cap: responses advertising `Content-Length > 1 MiB` are rejected before any bytes are read, and otherwise the body is streamed and aborted once the running total crosses 1 MiB. Either path fails the send without buffering the whole body.
 - Non-success responses are reported by status only, without surfacing or draining their bodies. Any drain bail-out (non-success status, advertised `Content-Length` over 1 MiB, streaming abort at 1 MiB, or transport error) drops the response without consuming the body; reqwest handles the protocol cleanup (HTTP/1.x closes the connection, HTTP/2 can reset the stream while keeping the connection reusable). This is acceptable for the typical alert cadence (up to a few notifications per second per channel) and avoids spending work on misbehaving endpoints.
@@ -68,7 +69,7 @@ Posts an `embeds` payload. `Notification.fields` become `embeds[0].fields` (`{na
 {
   "type": "webhook",
   "url": "https://events.pagerduty.com/v2/enqueue",
-  "method": "POST",                   // optional; one of POST | PUT | PATCH (default POST)
+  "method": "POST",                   // optional; POST | PUT | PATCH, case-insensitive (default POST)
   "headers": {                        // optional
     "Content-Type": "application/json",
     "X-Auth-Token": "..."
@@ -77,7 +78,7 @@ Posts an `embeds` payload. `Notification.fields` become `embeds[0].fields` (`{na
 }
 ```
 
-Renders `body_template` after `${var}` substitution and POSTs the result. The default `Content-Type: application/json` is added if the operator does not supply their own. For JSON content types (`application/json` or `*+json`), substituted values are escaped as JSON string content so quotes, backslashes, and control characters inside alert fields cannot break the body; place variables inside JSON strings unless the value is intentionally numeric/boolean text. Non-JSON content types keep raw substitution.
+Renders `body_template` after `${var}` substitution and POSTs the result. `method` is case-insensitive (`post`, `POST`, and `pAtCh` all work); the constructor normalizes to POST, PUT, or PATCH. `body_template` is required and may be empty; unbalanced `${` is rejected at construction (JSON Schema cannot express balanced-placeholder syntax). The default `Content-Type: application/json` is added if the operator does not supply their own. For JSON content types (`application/json` or `*+json`), substituted values are escaped as JSON string content so quotes, backslashes, and control characters inside alert fields cannot break the body; place variables inside JSON strings unless the value is intentionally numeric/boolean text. Non-JSON content types keep raw substitution.
 
 ### Email (SMTP)
 
@@ -88,8 +89,8 @@ Renders `body_template` after `${var}` substitution and POSTs the result. The de
   "smtp_port": 587,                    // optional; default 587 (starttls) / 465 (implicit_tls)
   "tls_mode": "starttls",              // optional; "starttls" | "implicit_tls" (default "starttls")
   "tls_server_name": "smtp.example.com", // optional; verified identity override, default smtp_host
-  "username_env": "FERRUM_ALERT_SMTP_USERNAME",  // optional (inline "username" also accepted)
-  "password_env": "FERRUM_ALERT_SMTP_PASSWORD",  // optional (inline "password" also accepted)
+  "username_env": "FERRUM_ALERT_SMTP_USERNAME",  // optional; must be paired with password / password_env
+  "password_env": "FERRUM_ALERT_SMTP_PASSWORD",  // optional; must be paired with username / username_env
   "from": "ferrum@example.com",
   "to": ["oncall@example.com"],
   "subject_template": "[${severity}] ${title}",  // optional
@@ -110,6 +111,7 @@ Sends a single-part `text/plain; charset=utf-8` message, base64 transfer-encoded
 - Certificate verification is **always** enforced. Unlike the log-shipping sinks, this channel deliberately ignores `FERRUM_TLS_NO_VERIFY`: skipping verification here would hand the SMTP password to whatever answered the connect. Private CAs go through `FERRUM_TLS_CA_BUNDLE_PATH`, and `FERRUM_TLS_CRL_FILE_PATH` revocation applies. The rustls config is built once per channel on a blocking thread and reused.
 - Plaintext SMTP is not offered at all; `tls_mode: "none"` is rejected at admission.
 - Supported AUTH mechanisms are `PLAIN` and `LOGIN`. If credentials are configured and the server advertises neither, the send fails rather than proceeding unauthenticated.
+- SMTP AUTH is optional, but when any username form (`username` / `username_env`) is set a password form (`password` / `password_env`) is required, and vice versa. Empty `smtp_host`, empty templates, and addresses such as `a..b@example.test` (repeated local-part dots) are rejected. `from` / `to` use a conservative ASCII addr-spec; JSON Schema `format: email` is an annotation and is not that grammar.
 
 Bounds (all enforced, all fail closed or truncate visibly):
 
@@ -117,7 +119,7 @@ Bounds (all enforced, all fail closed or truncate visibly):
 |-------|-------|
 | Recipients (`to`) | 1–32, duplicates collapsed |
 | Address length | 254 bytes; local part ≤ 64, domain ≤ 255, ASCII addr-spec only |
-| `subject_template` / `body_template` | 1 KiB / 64 KiB |
+| `subject_template` / `body_template` | 1 KiB / 64 KiB UTF-8 **bytes** (empty strings rejected). OpenAPI `maxLength` is a character ceiling for schema tooling, not this byte bound |
 | Rendered subject / body | 512 B / 32 KiB, enforced during template substitution; truncated with `...` / `[truncated]` |
 | `${fields}` block | 8 KiB hard ceiling (names, values, separators, truncation marker); 512 B per value |
 | SMTP reply | 1 KiB per line, 64 lines, 16 KiB total |
@@ -153,7 +155,7 @@ Callers can supply additional variables via `dispatch_with_vars`. The [`proxy_al
 Special characters:
 - `${name}` — variable substitution.
 - `$$` — literal `$`.
-- Unknown variables are passed through unmodified (`${typo}` stays as `${typo}` in the output) so misconfigured templates remain auditable. Unbalanced `${` is rejected at construction.
+- Unknown variables are passed through unmodified (`${typo}` stays as `${typo}` in the output) so misconfigured templates remain auditable. Unbalanced `${` is rejected at construction; JSON Schema cannot express that syntax check.
 - `${metadata}`-style raw map injection is NOT supported; this would bypass the gateway's metadata-redaction layer.
 
 ## Dispatch helper

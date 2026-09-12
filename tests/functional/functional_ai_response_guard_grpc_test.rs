@@ -11,6 +11,8 @@
 //! 3. Assert reject / redact / pass-through behavior end to end over the real
 //!    native gRPC data path.
 //!
+//! HTTP response coverage also checks origin gzip JSON over H1, H2, and H3.
+//!
 //! Run with:
 //! `cargo test --test functional_tests functional_ai_response_guard_grpc -- --ignored --nocapture`
 
@@ -31,6 +33,162 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
+
+#[tokio::test]
+#[ignore]
+async fn response_guard_inspects_gzip_json_over_h1_h2_and_h3() {
+    use crate::common::TestGateway;
+    use crate::scaffolding::clients::Http3Client;
+    use serde_json::json;
+    use std::convert::Infallible;
+
+    let reservation = reserve_port().await.expect("reserve response guard origin");
+    let backend_port = reservation.port;
+    let listener = reservation.into_listener();
+    let origin = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            connections.spawn(async move {
+                let service = service_fn(|request: Request<Incoming>| async move {
+                    let text = if request.uri().path().ends_with("/clean") {
+                        "Hello"
+                    } else {
+                        "mail review@example.test"
+                    };
+                    request.into_body().collect().await.expect("origin upload");
+                    let body = json!({"choices": [{"message": {"content": text}}]}).to_string();
+                    let mut encoder =
+                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                    encoder.write_all(body.as_bytes()).unwrap();
+                    let encoded = encoder.finish().unwrap();
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .header("content-type", "application/json")
+                            .header("content-encoding", "gzip")
+                            .body(Full::new(Bytes::from(encoded)))
+                            .unwrap(),
+                    )
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    let actions = ["reject", "redact", "warn"];
+    let proxies: Vec<_> = actions
+        .iter()
+        .map(|action| {
+            json!({
+                "id": action, "listen_path": format!("/{action}"),
+                "backend_scheme": "http", "backend_host": "127.0.0.1",
+                "backend_port": backend_port, "strip_listen_path": false,
+                "pool_enable_http2": false, "plugins": [{"plugin_config_id": action}]
+            })
+        })
+        .collect();
+    let plugins: Vec<_> = actions
+        .iter()
+        .map(|action| {
+            json!({
+                "id": action, "plugin_name": "ai_response_guard", "scope": "proxy",
+                "proxy_id": action, "enabled": true,
+                "config": {"action": action, "pii_patterns": ["email"]}
+            })
+        })
+        .collect();
+    let config = json!({
+        "version": "1", "proxies": proxies, "plugin_configs": plugins,
+        "consumers": [], "upstreams": []
+    });
+    let gateway = TestGateway::builder()
+        .mode_file(serde_yaml::to_string(&config).unwrap())
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .env("FERRUM_ENABLE_HTTP3", "true")
+        .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+        .spawn()
+        .await
+        .expect("start response guard gateway");
+    let h1 = reqwest::Client::builder()
+        .http1_only()
+        .no_gzip()
+        .build()
+        .unwrap();
+    let h2 = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .no_gzip()
+        .build()
+        .unwrap();
+    let h3 = Http3Client::insecure().unwrap();
+    let https_port = gateway.env_port("FERRUM_PROXY_HTTPS_PORT").unwrap();
+    for protocol in 1..=3 {
+        for action in actions {
+            for case in ["clean", "email"] {
+                let route = format!("/{action}/{case}");
+                let (status, encoding, body) = if protocol == 3 {
+                    let response = h3
+                        .get(&format!("https://127.0.0.1:{https_port}{route}"))
+                        .await
+                        .expect("H3 response guard request");
+                    assert_eq!(response.body_error, None);
+                    (
+                        response.status.as_u16(),
+                        response
+                            .headers
+                            .get("content-encoding")
+                            .map(|value| value.to_str().unwrap().to_string()),
+                        response.body_bytes.to_vec(),
+                    )
+                } else {
+                    let client = if protocol == 1 { &h1 } else { &h2 };
+                    let response = client.get(gateway.proxy_url(&route)).send().await.unwrap();
+                    assert_eq!(
+                        response.version(),
+                        if protocol == 1 {
+                            reqwest::Version::HTTP_11
+                        } else {
+                            reqwest::Version::HTTP_2
+                        }
+                    );
+                    let status = response.status().as_u16();
+                    let encoding = response
+                        .headers()
+                        .get("content-encoding")
+                        .map(|value| value.to_str().unwrap().to_string());
+                    (status, encoding, response.bytes().await.unwrap().to_vec())
+                };
+                if action == "reject" && case == "email" {
+                    assert_eq!(status, 502);
+                    continue;
+                }
+                assert_eq!(status, 200, "H{protocol} {route}");
+                let decoded = if action == "warn" {
+                    use std::io::Read;
+
+                    assert_eq!(encoding.as_deref(), Some("gzip"));
+                    let mut decoded = Vec::new();
+                    flate2::read::GzDecoder::new(body.as_slice())
+                        .read_to_end(&mut decoded)
+                        .unwrap();
+                    decoded
+                } else {
+                    assert_eq!(encoding, None);
+                    body
+                };
+                let delivered: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+                let expected = match (case, action) {
+                    ("clean", _) => "Hello",
+                    (_, "redact") => "mail [REDACTED:pii:email]",
+                    _ => "mail review@example.test",
+                };
+                assert_eq!(delivered["choices"][0]["message"]["content"], expected);
+            }
+        }
+    }
+    origin.abort();
+}
 
 // ============================================================================
 // Protobuf fixtures
@@ -166,6 +324,10 @@ async fn start_grpc_echo_backend() -> (u16, tokio::task::JoinHandle<()>) {
                     let _ = tx.send(Ok(Frame::data(body_bytes))).await;
                     let mut trailers = hyper::HeaderMap::new();
                     trailers.insert("grpc-status", hyper::header::HeaderValue::from_static("0"));
+                    trailers.insert(
+                        "x-guard-trailer",
+                        hyper::header::HeaderValue::from_static("original"),
+                    );
                     let _ = tx.send(Ok(Frame::trailers(trailers))).await;
                     drop(tx);
 
@@ -506,7 +668,7 @@ impl Harness {
 #[tokio::test]
 #[ignore]
 async fn grpc_guard_passes_clean_unary_response() {
-    let harness = Harness::start("reject", "").await;
+    let harness = Harness::start("redact", "").await;
     let body = grpc_frame(&encode_hello_response("nothing sensitive here"));
     let call = send_grpc_request(&harness.addr, "/test.Greeter/SayHello", &body, &[])
         .await
@@ -514,6 +676,10 @@ async fn grpc_guard_passes_clean_unary_response() {
 
     assert_eq!(call.status, 200);
     assert_ok_trailer_grpc_status(&call, "clean unary");
+    assert_eq!(
+        call.trailers.get("x-guard-trailer").map(String::as_str),
+        Some("original")
+    );
     assert_eq!(
         call.body, body,
         "a clean response must be forwarded verbatim"
@@ -660,6 +826,8 @@ async fn grpc_guard_redacts_and_reencodes_the_protobuf_response() {
 
     assert_eq!(call.status, 200);
     assert_ok_trailer_grpc_status(&call, "redacted unary");
+    assert!(!call.trailers.contains_key("x-guard-trailer"));
+    assert!(!call.headers.contains_key("x-guard-trailer"));
     let payloads = frame_payloads(&call.body);
     assert_eq!(payloads.len(), 1, "expected one re-encoded response frame");
     let message = decode_hello_message(&payloads[0]);

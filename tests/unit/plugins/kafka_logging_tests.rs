@@ -1,9 +1,11 @@
 //! Tests for kafka_logging plugin
 
 use ferrum_edge::_test_support::{
+    kafka_logging_parsed_sasl_credentials_for_test,
     kafka_logging_probe_byte_budget_before_serialize_for_test,
     kafka_logging_probe_downstream_lease_ownership_for_test,
     kafka_logging_probe_reserve_before_serialize_for_test,
+    kafka_logging_probe_terminal_loss_accounting_for_test,
     kafka_logging_serialize_http_with_config_for_test,
     kafka_logging_serialize_stream_with_config_for_test,
     kafka_logging_validate_producer_admission_for_test,
@@ -11,10 +13,12 @@ use ferrum_edge::_test_support::{
 use ferrum_edge::plugins::kafka_logging::{
     DEFAULT_BUFFER_MAX_BYTES, DEFAULT_MAX_ENTRY_BYTES, HARD_MAX_BUFFER_MAX_BYTES,
     HARD_MAX_ENTRY_BYTES, HARD_MAX_FLUSH_TIMEOUT_SECONDS, KafkaLogging,
+    MAX_KAFKA_TOPIC_NAME_LENGTH, MAX_MESSAGE_TIMEOUT_MS,
 };
 use ferrum_edge::plugins::utils::byte_budget::RetainedByteCeiling;
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
 use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, PluginFailurePolicy, plugin_failure_policy};
+use rdkafka::mocking::MockCluster;
 use serde_json::json;
 use tokio::time::{Duration, sleep};
 
@@ -283,6 +287,120 @@ async fn test_kafka_logging_with_producer_config() {
     )
     .unwrap();
     assert_eq!(plugin.name(), "kafka_logging");
+}
+
+#[tokio::test]
+async fn kafka_rejects_overrides_of_managed_delivery_reporting() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("OpenAPI parses");
+    let schema = spec
+        .pointer("/components/schemas/KafkaLoggingConfig/properties/producer_config")
+        .expect("producer_config schema exists");
+    let validator = jsonschema::draft202012::new(schema).expect("producer_config schema compiles");
+    let client = default_http_client();
+
+    for property in [
+        "delivery.report.only.error",
+        "DELIVERY.REPORT.ONLY.ERROR",
+        "Delivery.Report.Only.Error",
+    ] {
+        for value in ["true", "false", "operator-supplied-value"] {
+            let config = json!({
+                "broker_list": "localhost:9092",
+                "topic": "delivery-accounting",
+                "producer_config": {property: value}
+            });
+            let error = KafkaLogging::new(&config, &client)
+                .err()
+                .expect("delivery reporting overrides must be rejected at construction");
+            assert!(error.contains(&format!("producer_config.{property}")));
+            assert!(error.contains("delivery reporting is managed"));
+            assert!(!error.contains(value));
+            assert_eq!(
+                kafka_logging_validate_producer_admission_for_test(&config, &client),
+                Err(error)
+            );
+            assert!(!validator.is_valid(&config["producer_config"]));
+        }
+    }
+    assert!(validator.is_valid(&json!({})));
+    assert!(validator.is_valid(&json!({"linger.ms": "50"})));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kafka_successful_deliveries_release_leases_before_finalization() {
+    let cluster = MockCluster::new(1).expect("create Kafka mock cluster");
+    let topic = "delivery-accounting";
+    cluster
+        .create_topic(topic, 1, 1)
+        .expect("create mock topic");
+    let client = default_http_client();
+
+    for key_field in ["client_ip", "none"] {
+        for acks in ["all", "0"] {
+            let plugin = KafkaLogging::new(
+                &json!({
+                    "broker_list": cluster.bootstrap_servers(),
+                    "topic": topic,
+                    "key_field": key_field,
+                    "acks": acks,
+                    "compression": "none",
+                    "max_entry_bytes": 4096,
+                    "buffer_max_bytes": 8192,
+                    "message_timeout_ms": 10_000,
+                    "flush_timeout_seconds": 5,
+                    "producer_config": {
+                        "linger.ms": "0",
+                        "enabled_events": "0",
+                        "produce.offset.report": "false"
+                    }
+                }),
+                &client,
+            )
+            .expect("construct Kafka logger for successful delivery");
+            start_kafka_logging(&plugin);
+            let baseline = plugin.snapshot().retained_bytes;
+            assert_eq!(baseline, 0);
+
+            // Event selection remains owned by rust-rdkafka, and the deprecated
+            // offset-report option does not change terminal delivery accounting.
+            // Reuse the same budget for a second pair of HTTP/stream records.
+            for expected in [2, 4] {
+                plugin.log(&create_test_transaction_summary()).await;
+                plugin
+                    .on_stream_disconnect(&create_test_stream_transaction_summary())
+                    .await;
+                let delivered = tokio::time::timeout(Duration::from_secs(15), async {
+                    loop {
+                        let snapshot = plugin.snapshot();
+                        if snapshot.admitted_total == expected
+                            && snapshot.delivered_total == expected
+                            && snapshot.retained_bytes == baseline
+                            && snapshot.in_flight == 0
+                        {
+                            break snapshot;
+                        }
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("successful delivery must return every lease before finalization");
+                assert!(!delivered.finalized);
+                assert_eq!(delivered.delivery_failed_total, 0);
+                assert_eq!(delivered.queue_rejected_total, 0);
+                assert_eq!(delivered.ferrum_dropped_total, 0);
+            }
+
+            plugin.finalize().await;
+            let finalized = plugin.snapshot();
+            assert!(finalized.finalized);
+            assert_eq!(finalized.retained_bytes, baseline);
+            assert_eq!(finalized.delivered_total, 4);
+            assert_eq!(finalized.delivery_failed_total, 0);
+            assert_eq!(finalized.flush_failures_total, 0);
+            assert_eq!(finalized.shutdown_incomplete_total, 0);
+        }
+    }
 }
 
 #[tokio::test]
@@ -593,8 +711,8 @@ async fn test_kafka_logging_rejects_conflicting_crl_override() {
 async fn test_kafka_logging_allows_matching_crl_override() {
     let client =
         default_http_client().with_tls_crl_source(Some("/etc/ferrum/gateway.crl".to_string()));
-    // Matching CRL overrides are admitted without constructing a producer
-    // (CI librdkafka builds may lack OpenSSL).
+    // Pure admission checks matching overrides without requiring a producer
+    // or an actual CRL file at the fixture path.
     kafka_logging_validate_producer_admission_for_test(
         &json!({
             "broker_list": "localhost:9092",
@@ -640,7 +758,10 @@ async fn test_kafka_logging_rejects_non_file_gateway_crl_source_for_verified_tls
         }),
         &client,
     )
-    .expect_err("non-file CRL sources cannot be silently omitted for verified Kafka TLS");
+    .err()
+    .unwrap_or_else(|| {
+        panic!("non-file CRL sources cannot be silently omitted for verified Kafka TLS")
+    });
     assert!(error.contains("file-backed gateway CRL source"));
     assert!(
         !error.contains(source_reference),
@@ -937,7 +1058,8 @@ async fn test_kafka_logging_byte_budget_saturation_and_release() {
     for _ in 0..8 {
         plugin.log(&summary).await;
     }
-    // Allow the worker to attempt librdkafka admission (releases leases).
+    // Allow the worker to attempt librdkafka admission; leases stay charged
+    // through terminal delivery.
     sleep(Duration::from_millis(200)).await;
     let mid = plugin.snapshot();
     assert!(
@@ -1384,7 +1506,10 @@ fn kafka_bootstrap_grammar_accepts_protocol_prefixes_and_strips_url_paths() {
 fn kafka_bootstrap_grammar_rejects_entries_librdkafka_would_refuse() {
     for broker_list in ["://host:9092", "https://host:9092", "ftp://host"] {
         let error = parse_kafka_bootstrap_servers(broker_list, None)
-            .expect_err("librdkafka would refuse this entry and stop parsing the list");
+            .err()
+            .unwrap_or_else(|| {
+                panic!("librdkafka would refuse this entry and stop parsing the list")
+            });
         assert!(
             error.contains("protocol"),
             "unexpected error for {broker_list}: {error}"
@@ -1393,7 +1518,8 @@ fn kafka_bootstrap_grammar_rejects_entries_librdkafka_would_refuse() {
     // A protocol prefix that disagrees with security.protocol makes librdkafka
     // drop the entry (and the rest of the list) — reject instead.
     let error = parse_kafka_bootstrap_servers("ssl://broker:9093", Some("plaintext"))
-        .expect_err("protocol mismatch must be rejected");
+        .err()
+        .unwrap_or_else(|| panic!("protocol mismatch must be rejected"));
     assert!(
         error.contains("does not match security_protocol"),
         "{error}"
@@ -1410,7 +1536,8 @@ fn kafka_protocol_prefixed_denied_literal_is_rejected_under_restrictive_policy()
         &json!({ "broker_list": "PLAINTEXT://169.254.169.254:9092", "topic": "logs" }),
         &default_production_policy(),
     )
-    .expect_err("protocol-prefixed denied literal must be rejected");
+    .err()
+    .unwrap_or_else(|| panic!("protocol-prefixed denied literal must be rejected"));
     assert!(
         error.contains("169.254.169.254") && error.contains("denied by backend egress policy"),
         "{error}"
@@ -1423,7 +1550,8 @@ fn kafka_bracketed_ipv6_denied_literal_is_rejected() {
         &json!({ "broker_list": "ssl://[fd00:ec2::254]:9093", "security_protocol": "ssl" }),
         &default_production_policy(),
     )
-    .expect_err("denied IPv6 literal must be rejected");
+    .err()
+    .unwrap_or_else(|| panic!("denied IPv6 literal must be rejected"));
     assert!(error.contains("denied by backend egress policy"), "{error}");
 }
 
@@ -1443,7 +1571,8 @@ fn kafka_logging_fails_closed_under_any_restrictive_egress_policy() {
             &json!({ "broker_list": "broker.example.com:9092", "topic": "logs" }),
             &policy,
         )
-        .expect_err("kafka_logging must fail closed under a restrictive policy");
+        .err()
+        .unwrap_or_else(|| panic!("kafka_logging must fail closed under a restrictive policy"));
         assert!(
             error.contains("cannot be admitted"),
             "unexpected error: {error}"
@@ -1472,7 +1601,8 @@ async fn kafka_logging_registry_admission_fails_closed_under_default_policy() {
         &json!({ "broker_list": "broker.example.com:9092", "topic": "logs" }),
         &default_production_policy(),
     )
-    .expect_err("registry admission must apply the same gate");
+    .err()
+    .unwrap_or_else(|| panic!("registry admission must apply the same gate"));
     assert!(error.contains("cannot be admitted"), "{error}");
 }
 
@@ -1582,4 +1712,314 @@ fn kafka_downstream_leases_of_multiple_instances_share_one_ceiling() {
     );
     assert_eq!(second_after_destroy, 0);
     assert_eq!(ceiling.used(), 0);
+}
+
+// ── #5213: Kafka topic-name syntax is admitted, not discovered at runtime ────
+
+#[tokio::test]
+async fn kafka_rejects_topic_names_kafka_can_never_create() {
+    let too_long = "a".repeat(MAX_KAFKA_TOPIC_NAME_LENGTH + 1);
+    for topic in [
+        ".",
+        "..",
+        "bad/name",
+        "bad name",
+        "bad:name",
+        "bad,name",
+        "café-logs",
+        "logs\n",
+        too_long.as_str(),
+    ] {
+        let error = KafkaLogging::new(
+            &json!({"broker_list": "localhost:9092", "topic": topic}),
+            &default_http_client(),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("an invalid Kafka topic name must be refused at admission"));
+        assert!(
+            error.contains("topic"),
+            "topic rejection must name the field, got: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn kafka_admits_every_legal_topic_name_shape() {
+    let at_limit = "a".repeat(MAX_KAFKA_TOPIC_NAME_LENGTH);
+    for topic in [
+        "a",
+        "access-logs",
+        "access_logs",
+        "access.logs",
+        "...",
+        "0",
+        at_limit.as_str(),
+    ] {
+        KafkaLogging::new(
+            &json!({"broker_list": "localhost:9092", "topic": topic}),
+            &default_http_client(),
+        )
+        .unwrap_or_else(|error| panic!("legal Kafka topic '{topic}' must be admitted: {error}"));
+    }
+}
+
+// ── #5215: a transactional producer can never deliver from this sink ─────────
+
+#[tokio::test]
+async fn kafka_rejects_transactional_producer_configuration() {
+    // Both spellings: the constructor matches producer_config keys
+    // case-insensitively, so a re-cased property cannot slip past the refusal.
+    for config in [
+        json!({
+            "broker_list": "localhost:9092",
+            "topic": "audit-logs",
+            "producer_config": {"transactional.id": "audit-transaction"}
+        }),
+        json!({
+            "broker_list": "localhost:9092",
+            "topic": "audit-logs",
+            "producer_config": {"TRANSACTIONAL.ID": "audit-transaction"}
+        }),
+    ] {
+        let error = KafkaLogging::new(&config, &default_http_client())
+            .err()
+            .unwrap_or_else(|| {
+                panic!("transactional.id must be refused before a generation is published")
+            });
+        assert!(
+            error.contains("transactional.id") || error.contains("TRANSACTIONAL.ID"),
+            "rejection must name the property, got: {error}"
+        );
+        assert!(
+            !error.contains("audit-transaction"),
+            "rejection must not echo the configured value, got: {error}"
+        );
+        // The pure admission boundary refuses it too, so a reload candidate
+        // never reaches producer construction.
+        assert!(
+            kafka_logging_validate_producer_admission_for_test(&config, &default_http_client())
+                .is_err(),
+            "producer admission must refuse transactional.id"
+        );
+    }
+}
+
+// ── #5216: SASL credential bytes reach the broker unchanged ──────────────────
+
+#[tokio::test]
+async fn kafka_preserves_sasl_credential_bytes_verbatim() {
+    let config = json!({
+        "broker_list": "localhost:9092",
+        "topic": "audit-logs",
+        "security_protocol": "sasl_plaintext",
+        "sasl_mechanism": "PLAIN",
+        "sasl_username": " test ",
+        "sasl_password": "  pa ss  "
+    });
+    let (username, password) =
+        kafka_logging_parsed_sasl_credentials_for_test(&config, &default_http_client())
+            .expect("padded SASL credentials must be admitted");
+    assert_eq!(username.as_deref(), Some(" test "));
+    assert_eq!(password.as_deref(), Some("  pa ss  "));
+    KafkaLogging::new(&config, &default_http_client())
+        .expect("padded SASL credentials must construct");
+}
+
+#[tokio::test]
+async fn kafka_rejects_unsupported_sasl_credential_shapes_without_rewriting_them() {
+    for (username, password) in [
+        (json!("   "), json!("secret")),
+        (json!("alice"), json!(" \t ")),
+        (json!("al\u{0}ice"), json!("secret")),
+        (json!("alice"), json!("sec\u{0}ret")),
+    ] {
+        let config = json!({
+            "broker_list": "localhost:9092",
+            "topic": "audit-logs",
+            "security_protocol": "sasl_plaintext",
+            "sasl_username": username,
+            "sasl_password": password
+        });
+        let error = KafkaLogging::new(&config, &default_http_client())
+            .err()
+            .unwrap_or_else(|| {
+                panic!("an unsupported credential shape must be rejected, not rewritten")
+            });
+        assert!(
+            error.contains("sasl_username") || error.contains("sasl_password"),
+            "rejection must name the credential field, got: {error}"
+        );
+        assert!(
+            !error.contains("secret") && !error.contains("alice"),
+            "rejection must not echo credential material, got: {error}"
+        );
+    }
+}
+
+// ── #5214: terminal Kafka losses reach the process-cumulative loss family ────
+
+#[test]
+fn kafka_terminal_delivery_failures_charge_the_shared_loss_family() {
+    let (sink_error_delta, _queue_full_delta, delivery_failed, queue_rejected) =
+        kafka_logging_probe_terminal_loss_accounting_for_test(4, None)
+            .expect("librdkafka terminal-loss probe must run");
+
+    assert_eq!(
+        queue_rejected, 0,
+        "an uncapped producer queue must accept every probe record locally"
+    );
+    assert_eq!(
+        delivery_failed, 4,
+        "producer destruction must resolve every queued record terminally"
+    );
+    // The shared family is process-wide, so a concurrently running test can
+    // only add to it; the probe's own contribution is the lower bound.
+    assert!(
+        sink_error_delta >= 4,
+        "every terminal delivery failure must charge the shared loss family, saw {sink_error_delta}"
+    );
+}
+
+#[test]
+fn kafka_immediate_producer_rejections_charge_the_shared_loss_family() {
+    let (sink_error_delta, _queue_full_delta, delivery_failed, queue_rejected) =
+        kafka_logging_probe_terminal_loss_accounting_for_test(8, Some(1))
+            .expect("librdkafka terminal-loss probe must run");
+
+    assert!(
+        queue_rejected >= 1,
+        "a one-record librdkafka queue must reject the rest immediately"
+    );
+    assert_eq!(
+        queue_rejected + delivery_failed,
+        8,
+        "every record must be accounted for exactly once, as an immediate \
+         rejection or a terminal delivery outcome"
+    );
+    // Only 8 records exist and fewer than 8 of them reached the delivery
+    // callback, so 8 sink_error charges can only be met if the immediate
+    // rejections were charged too. `sink_error` — not the admission-time
+    // `queue_full` reason — is the correct label: these records were already
+    // counted as accepted when they entered Ferrum's channel, and the
+    // published accounting identity pairs `accepted` with admission-time
+    // refusals only.
+    assert!(
+        sink_error_delta >= 8,
+        "immediate rejections and purged records alike must charge the shared \
+         loss family as sink_error, saw {sink_error_delta}"
+    );
+}
+
+// ── #5217: the constructor and the OpenAPI component admit the same documents ─
+
+#[tokio::test]
+async fn kafka_enum_fields_accept_only_their_canonical_spelling() {
+    for (field, value) in [
+        ("security_protocol", "PLAINTEXT"),
+        ("security_protocol", "Ssl"),
+        ("security_protocol", " ssl "),
+        ("key_field", " none "),
+        ("key_field", "None"),
+        ("acks", " 1 "),
+        ("compression", " gzip "),
+        ("compression", "GZIP"),
+    ] {
+        let mut config = json!({"broker_list": "localhost:9092", "topic": "audit-logs"});
+        config[field] = json!(value);
+        assert!(
+            KafkaLogging::new(&config, &default_http_client()).is_err(),
+            "'{field}: {value}' must be rejected: the OpenAPI enum admits only the \
+             canonical lowercase spelling"
+        );
+    }
+
+    for (field, value) in [
+        ("security_protocol", "plaintext"),
+        ("security_protocol", "ssl"),
+        ("key_field", "none"),
+        ("key_field", "proxy_id"),
+        ("acks", "all"),
+        ("acks", "-1"),
+        ("compression", "zstd"),
+    ] {
+        let mut config = json!({"broker_list": "localhost:9092", "topic": "audit-logs"});
+        config[field] = json!(value);
+        KafkaLogging::new(&config, &default_http_client())
+            .unwrap_or_else(|error| panic!("'{field}: {value}' must be admitted: {error}"));
+    }
+}
+
+/// Native TLS/SCRAM are required in the default artifact (#5212). Validate
+/// through the real constructor, which calls librdkafka's native config API;
+/// a feature-list assertion or a capability skip would miss a broken build.
+#[tokio::test]
+async fn kafka_tls_protocols_pass_offline_native_validation() {
+    let native = rdkafka::ClientConfig::new()
+        .set("builtin.features", "ssl,sasl_scram")
+        .create_native_config();
+    assert!(
+        native.is_ok(),
+        "TLS and SCRAM must be compiled into librdkafka"
+    );
+    for mechanism in [
+        None,
+        Some("PLAIN"),
+        Some("SCRAM-SHA-256"),
+        Some("SCRAM-SHA-512"),
+    ] {
+        let mut config = json!({
+            "broker_list": "127.0.0.1:9092",
+            "topic": "audit-logs",
+            "security_protocol": "ssl"
+        });
+        if let Some(mechanism) = mechanism {
+            config["security_protocol"] = json!("sasl_ssl");
+            config["sasl_mechanism"] = json!(mechanism);
+            config["sasl_username"] = json!("ferrum-test");
+            config["sasl_password"] = json!("fixture-password");
+        }
+        let plugin = KafkaLogging::new(&config, &default_http_client())
+            .unwrap_or_else(|error| panic!("TLS/{mechanism:?} must validate offline: {error}"));
+        assert_eq!(plugin.snapshot().admitted_total, 0);
+
+        let restricted =
+            PluginHttpClient::default_with_backend_allow_ips(default_production_policy());
+        let error = KafkaLogging::new(&config, &restricted)
+            .err()
+            .expect("TLS support must not bypass restrictive egress policy");
+        assert!(
+            error.contains("denied by backend egress policy")
+                || error.contains("cannot be admitted"),
+            "{error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn kafka_message_timeout_ms_is_bounded_by_the_documented_range() {
+    KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "audit-logs",
+            "message_timeout_ms": MAX_MESSAGE_TIMEOUT_MS
+        }),
+        &default_http_client(),
+    )
+    .expect("librdkafka's own maximum must be admitted");
+
+    let error = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "audit-logs",
+            "message_timeout_ms": MAX_MESSAGE_TIMEOUT_MS + 1
+        }),
+        &default_http_client(),
+    )
+    .err()
+    .unwrap_or_else(|| panic!("a message_timeout_ms above librdkafka's range must be rejected"));
+    assert!(
+        error.contains("message_timeout_ms"),
+        "the diagnostic must name the field rather than report an opaque client \
+         config error, got: {error}"
+    );
 }

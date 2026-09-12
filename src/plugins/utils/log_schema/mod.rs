@@ -51,7 +51,7 @@ pub use fields::{
     WS_DISCONNECT_FIELDS,
 };
 #[allow(unused_imports)]
-pub use view::{SchemaSerializable, SchemaView};
+pub use view::{EmittedKeys, SchemaSerializable, SchemaView};
 
 /// Which summary struct(s) a schema applies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -98,6 +98,22 @@ pub struct SummarySchema {
     /// unconditionally, so non-`ws_logging` plugins are byte-identical to
     /// pre-capability behavior.
     pub capability_scoped: bool,
+    /// Output keys reserved for flatten-collision detection, precomputed here
+    /// because they are invariant across every record this schema shapes.
+    ///
+    /// Holds every `static_fields` output key plus — for a schema that is NOT
+    /// `capability_scoped` — every native output key, which is exactly the set
+    /// the old per-record `HashSet<String>` rebuilt (and cloned) on every
+    /// emitted line. Native keys are deliberately excluded under a capability
+    /// schema because there they are reserved per entry kind at serialize time
+    /// (`SchemaSerializable::owns_native`), and derived keys are excluded
+    /// because a derived value is reserved only when it is actually emitted
+    /// (`backend_host` yields nothing when the target carries no host). Both
+    /// of those cases are carried per record by `view::EmittedKeys`.
+    ///
+    /// Empty unless `metadata` is [`MetadataPolicy::Flatten`] — that is the
+    /// only policy that ever consults it.
+    pub flatten_reserved: HashSet<Box<str>>,
 }
 
 /// Compiled output-field spec.
@@ -463,12 +479,35 @@ impl SummarySchema {
             }
         };
 
+        let capability_scoped = caps != SchemaCapabilities::BASE;
+
+        // Precompute the invariant half of the flatten-collision reservation
+        // set. Only `flatten` reads it, so an unrelated schema pays nothing.
+        let flatten_reserved: HashSet<Box<str>> =
+            if matches!(metadata, MetadataPolicy::Flatten { .. }) {
+                fields
+                    .iter()
+                    .filter_map(|spec| match spec {
+                        FieldSpec::Static { out_key, .. } => Some(out_key.as_str().into()),
+                        FieldSpec::Native { out_key, .. } if !capability_scoped => {
+                            Some(out_key.as_str().into())
+                        }
+                        // Capability-scoped natives and every derived key are
+                        // reserved per record — see `flatten_reserved`.
+                        _ => None,
+                    })
+                    .collect()
+            } else {
+                HashSet::new()
+            };
+
         Ok(Arc::new(SummarySchema {
             summary_type,
             fields,
             metadata,
             timestamp_format,
-            capability_scoped: caps != SchemaCapabilities::BASE,
+            capability_scoped,
+            flatten_reserved,
         }))
     }
 
@@ -828,53 +867,65 @@ fn parse_metadata_policy(
             ));
         }
     };
-    match mode {
-        "nested" => Ok(MetadataPolicy::Nested),
-        "omit" => Ok(MetadataPolicy::Omit),
-        "flatten" => {
-            let prefix = match obj.get("prefix") {
-                Some(Value::String(s)) if s.is_empty() => None,
-                Some(Value::String(s)) => {
-                    if s.chars().any(|c| c.is_control()) {
-                        return Err(format!(
-                            "{plugin_name}: schema 'metadata.prefix' must not contain control characters"
-                        ));
-                    }
-                    Some(s.clone())
-                }
-                None => None,
-                Some(_) => {
-                    return Err(format!(
-                        "{plugin_name}: schema 'metadata.prefix' must be a string"
-                    ));
-                }
-            };
-            let on_collision = match obj.get("on_collision") {
-                Some(Value::String(s)) => match s.as_str() {
-                    "skip" => CollisionMode::Skip,
-                    "overwrite" => CollisionMode::Overwrite,
-                    other => {
-                        return Err(format!(
-                            "{plugin_name}: schema 'metadata.on_collision' must be 'skip' or 'overwrite' (got '{other}')"
-                        ));
-                    }
-                },
-                None => CollisionMode::default(),
-                Some(_) => {
-                    return Err(format!(
-                        "{plugin_name}: schema 'metadata.on_collision' must be a string"
-                    ));
-                }
-            };
-            Ok(MetadataPolicy::Flatten {
-                prefix,
-                on_collision,
-            })
-        }
-        other => Err(format!(
-            "{plugin_name}: schema 'metadata.mode' must be 'nested', 'omit', or 'flatten' (got '{other}')"
-        )),
+    // Reject an unknown mode before the option checks below so the diagnostic
+    // still names the offending mode rather than a value it would never read.
+    if !matches!(mode, "nested" | "omit" | "flatten") {
+        return Err(format!(
+            "{plugin_name}: schema 'metadata.mode' must be 'nested', 'omit', or 'flatten' (got '{mode}')"
+        ));
     }
+
+    // Every supplied known option is validated for EVERY mode, even though
+    // `prefix` / `on_collision` only affect `flatten`. Returning early for
+    // `nested` / `omit` would accept a numeric prefix or an unknown collision
+    // mode and silently discard it, so a config validated today would start
+    // failing the moment an operator flipped `mode: flatten` — and it would
+    // contradict the typed/enumerated OpenAPI shape that admits the keys in
+    // all three modes.
+    let prefix = match obj.get("prefix") {
+        Some(Value::String(s)) if s.is_empty() => None,
+        Some(Value::String(s)) => {
+            if s.chars().any(|c| c.is_control()) {
+                return Err(format!(
+                    "{plugin_name}: schema 'metadata.prefix' must not contain control characters"
+                ));
+            }
+            Some(s.clone())
+        }
+        None => None,
+        Some(_) => {
+            return Err(format!(
+                "{plugin_name}: schema 'metadata.prefix' must be a string"
+            ));
+        }
+    };
+    let on_collision = match obj.get("on_collision") {
+        Some(Value::String(s)) => match s.as_str() {
+            "skip" => CollisionMode::Skip,
+            "overwrite" => CollisionMode::Overwrite,
+            other => {
+                return Err(format!(
+                    "{plugin_name}: schema 'metadata.on_collision' must be 'skip' or 'overwrite' (got '{other}')"
+                ));
+            }
+        },
+        None => CollisionMode::default(),
+        Some(_) => {
+            return Err(format!(
+                "{plugin_name}: schema 'metadata.on_collision' must be a string"
+            ));
+        }
+    };
+
+    Ok(match mode {
+        "omit" => MetadataPolicy::Omit,
+        "flatten" => MetadataPolicy::Flatten {
+            prefix,
+            on_collision,
+        },
+        // `nested` — the only remaining admitted mode after the check above.
+        _ => MetadataPolicy::Nested,
+    })
 }
 
 /// Reorder the unordered field set according to operator-supplied `order`.

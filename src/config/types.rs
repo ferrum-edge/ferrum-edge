@@ -1066,7 +1066,21 @@ pub(crate) fn dispatch_port_overrides_for_selected_subset(
             let mut resolved =
                 ResolvedPortOverride::from_upstream_override(override_config).unwrap_or_default();
             if let Some(outlier) = override_config.outlier_detection_overlay.as_ref() {
-                let mut passive = inherited_passive.cloned().unwrap_or_default();
+                // Preserve native per-port controls which DestinationRule cannot
+                // express, while rebasing the fields it can express onto the
+                // selected subset (or upstream) before applying the port mask.
+                let inherited = inherited_passive.cloned().unwrap_or_default();
+                let mut passive = resolved
+                    .passive_health_check
+                    .take()
+                    .unwrap_or_else(|| inherited.clone());
+                passive.unhealthy_threshold = inherited.unhealthy_threshold;
+                passive.unhealthy_window_seconds = inherited.unhealthy_window_seconds;
+                passive.healthy_after_seconds = inherited.healthy_after_seconds;
+                passive.max_ejection_percent = inherited.max_ejection_percent;
+                passive.consecutive_error_mode = inherited.consecutive_error_mode;
+                passive.consecutive_5xx_ejection_disabled =
+                    inherited.consecutive_5xx_ejection_disabled;
                 crate::modes::mesh::apply_outlier_detection_to_passive(&mut passive, outlier);
                 resolved.passive_health_check = Some(passive);
             }
@@ -2193,6 +2207,18 @@ pub struct CircuitBreakerConfig {
     pub half_open_max_requests: u32,
     #[serde(default = "default_trip_on_connection_errors")]
     pub trip_on_connection_errors: bool,
+    /// Seconds a HALF_OPEN probe slot may stay unsettled before the breaker
+    /// reclaims it (defence in depth for a probe that is never released).
+    ///
+    /// Omitted derives `max(timeout_seconds * 2, 60)`. A configured value is
+    /// clamped to at least `timeout_seconds` and at least 1 second.
+    ///
+    /// The dwell MUST exceed the longest legitimate backend dispatch a probe
+    /// can take (backend connect + read timeouts): reclaiming a slot while a
+    /// real probe is still in flight lets a second probe reach a backend the
+    /// breaker is protecting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub half_open_probe_dwell_seconds: Option<u64>,
 }
 
 impl Default for CircuitBreakerConfig {
@@ -2204,6 +2230,7 @@ impl Default for CircuitBreakerConfig {
             failure_status_codes: default_failure_status_codes(),
             half_open_max_requests: default_half_open_max(),
             trip_on_connection_errors: default_trip_on_connection_errors(),
+            half_open_probe_dwell_seconds: None,
         }
     }
 }
@@ -5922,6 +5949,15 @@ pub(crate) fn validate_tls_material_source_field(
     if source.is_system_trust_roots() {
         return validate_system_trust_roots_source_field(field_name, value, kind);
     }
+    if let crate::tls::source::CertSource::Uri(uri) = &source
+        && uri.scheme == crate::tls::source::SourceScheme::Pkcs11
+    {
+        #[cfg(feature = "pkcs11")]
+        crate::tls::pkcs11::validate_module_source_uri(uri)
+            .map_err(|error| format!("{field_name}: {error}"))?;
+        #[cfg(not(feature = "pkcs11"))]
+        validate_pkcs11_key_source(field_name, uri)?;
+    }
     match source {
         crate::tls::source::CertSource::InlinePem(_) => {
             validate_string_field(field_name, value, MAX_TLS_INLINE_PEM_LENGTH)
@@ -5972,6 +6008,25 @@ pub(crate) fn validate_system_trust_roots_verify_pairing(
         return Some(format!(
             "{verify_field} cannot be false when {ca_field} is '{}' — the system trust-roots source requires server certificate verification",
             crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE
+        ));
+    }
+    None
+}
+
+/// Reject pairing a client-CA bundle with the admin listener no-verify opt-out.
+/// Configuring a client CA means the admin HTTPS listener requires client
+/// certificates; disabling verification contradicts that and would otherwise
+/// silently accept anonymous TLS connections while logs claim mTLS is available.
+pub(crate) fn validate_admin_tls_no_verify_client_ca_pairing(
+    client_ca_field: &str,
+    no_verify_field: &str,
+    client_ca_bundle_path: Option<&str>,
+    no_verify: bool,
+) -> Option<String> {
+    if client_ca_bundle_path.is_some() && no_verify {
+        return Some(format!(
+            "{no_verify_field} cannot be true when {client_ca_field} is set — a configured \
+             client CA bundle requires client certificate verification on the admin listener"
         ));
     }
     None
@@ -8328,6 +8383,19 @@ impl Consumer {
         if let Err(e) = validate_string_field("username", &self.username, MAX_USERNAME_LENGTH) {
             errors.push(e);
         }
+        // RFC 7617 §2 splits the decoded `user-id ":" password` at the FIRST
+        // colon, so a colon-bearing user-id has no representation on the wire.
+        // Such a consumer starts fine and then fails every Basic login, which
+        // reads as a credential problem rather than an unusable configuration —
+        // reject the combination at admission instead. Colons inside a password
+        // remain valid, and a consumer without Basic credentials is unaffected.
+        if self.username.contains(':') && self.has_credential("basicauth") {
+            errors.push(
+                "username must not contain ':' when the consumer has basicauth credentials \
+                 — RFC 7617 Basic authentication cannot represent a colon in the user-id"
+                    .to_string(),
+            );
+        }
 
         // Custom ID
         if let Some(ref cid) = self.custom_id
@@ -9762,6 +9830,16 @@ impl CircuitBreakerConfig {
         if let Err(e) = validate_status_codes("failure_status_codes", &self.failure_status_codes) {
             errors.push(e);
         }
+        if let Some(dwell) = self.half_open_probe_dwell_seconds
+            && let Err(e) = validate_u64_range(
+                "half_open_probe_dwell_seconds",
+                dwell,
+                1,
+                MAX_TIMEOUT_SECONDS,
+            )
+        {
+            errors.push(e);
+        }
 
         if errors.is_empty() {
             Ok(())
@@ -10185,6 +10263,22 @@ impl GatewayConfig {
         backend_allow_ips: &crate::config::BackendEgressPolicy,
     ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+
+        // Distributed frontend keys must pass this node's module policy even
+        // before a listener or material loader is constructed.
+        for key in self.frontend_tls_key_path.iter().chain(
+            self.frontend_tls_certificate_sources
+                .iter()
+                .map(|source| &source.key_path),
+        ) {
+            if let Err(error) = validate_tls_material_source_field(
+                "frontend_tls_key_path",
+                key,
+                crate::tls::source::MaterialKind::Key,
+            ) {
+                errors.push(error);
+            }
+        }
 
         let mut frontend_tls_sources_by_namespace = std::collections::HashMap::new();
         for source in &self.frontend_tls_certificate_sources {

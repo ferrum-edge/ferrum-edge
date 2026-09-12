@@ -1,6 +1,6 @@
 [package]
 name = "ferrum-edge"
-version = "0.9.3"
+version = "0.9.4"
 edition = "2024"
 description = "A high-performance edge proxy built in Rust"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -317,7 +317,9 @@ maxminddb = "0.28"
 redis = { version = "1", features = ["tokio-rustls-comp", "tls-rustls-insecure", "connection-manager"] }
 
 # Kafka (kafka_logging plugin)
-rdkafka = { version = "0.39", features = ["cmake-build", "zstd"] }
+# TLS must work in default/release artifacts, including distroless images with
+# no runtime libssl. FIPS enforcement rejects this OpenSSL-backed plugin.
+rdkafka = { version = "0.39", features = ["cmake-build", "zstd", "ssl-vendored"] }
 
 # MongoDB (NoSQL database backend). Its default `rustls-tls` feature selects
 # ring, so retain the non-crypto defaults explicitly and select the TLS provider
@@ -503,8 +505,13 @@ hmac = "0.13.0"
 wiremock = "0.6"
 # Functional secret-backend tests: Vault dev server + LocalStack run in Docker
 # via testcontainers; env-mutating tests serialize via serial_test. Only the
-# `secrets_functional` test target uses these. See tests/secrets_functional/.
+# `secrets_functional` test target uses testcontainers.
+# See tests/secrets_functional/.
 testcontainers = "0.27"
+# `serial_test` is also the reader/writer gate in
+# `tests/unit/plugins/serverless_function_tests.rs`: a test that publishes a
+# provider credential fixture is `#[serial(serverless_env)]` and every test that
+# constructs the plugin — an environment READ — is `#[parallel(serverless_env)]`.
 serial_test = "3"
 # Functional testing dependencies
 rand = "0.10"

@@ -7,6 +7,9 @@
 
 use crate::common::TestGateway;
 use crate::scaffolding::backends::{Http1Request, HttpStep, RequestMatcher, ScriptedHttp1Backend};
+use crate::scaffolding::certs::TestCa;
+use crate::scaffolding::clients::{GetOptions, Http3Client, Http3Response};
+use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::reserve_port;
 
 use std::time::Duration;
@@ -315,4 +318,156 @@ async fn functional_forwarded_via_reqwest_path_strips_spoofed_client_forwarded()
         forwarded.iter().all(|v| !v.contains("10.0.0.1")),
         "spoofed client Forwarded must not reach the reqwest-path backend: {forwarded:?}"
     );
+}
+
+// ── Byte-preserving X-Forwarded-For (advisory GHSA-73ff-frj6-cpmp) ──────────
+//
+// `Forwarded: for=` is the backend-visible read-out of `ctx.client_ip`, so it
+// is the discriminator for which chain element resolution selected. The inbound
+// `X-Forwarded-For` chain the gateway regenerates for backends is deliberately
+// NOT asserted here: rebuilding it from the materialized header map is a
+// separate, already-tracked concern.
+
+/// An `X-Forwarded-For` field-line carrying obs-text alongside the address the
+/// trusted proxy appended must still resolve to that appended address. `é` is a
+/// valid header value on the wire and valid UTF-8, yet `HeaderValue::to_str()`
+/// refuses it — so this is the end-to-end proof that resolution reads the
+/// field-line as bytes rather than through a text view.
+#[ignore]
+#[tokio::test]
+async fn functional_forwarded_obs_text_xff_still_resolves_the_appended_client() {
+    let harness = HeaderHarness::spawn(false, "ferrum-edge", true, Some("127.0.0.1")).await;
+    let client = http1_client();
+
+    // The leading element is `é` (bytes C3 A9): accepted by `HeaderValue`,
+    // accepted on the wire, and refused by `HeaderValue::to_str()`.
+    let response = client
+        .get(harness.proxy_url())
+        .header("host", "example.com")
+        .header("x-forwarded-for", "é, 203.0.113.50")
+        .send()
+        .await
+        .expect("gateway response");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().await.expect("body"), "ok");
+
+    let request = harness.assert_backend_ok().await;
+    assert_eq!(
+        only_header(&request, "forwarded"),
+        "for=203.0.113.50;proto=http;host=example.com",
+        "the appended boundary address must survive an unrepresentable field-line"
+    );
+}
+
+/// Native HTTP/3 parity for the same advisory: the H3 ingress reads the chain
+/// through the same byte-preserving accessor and must resolve the same
+/// identity. `TestGateway` has no HTTPS port, so the H3 frontend is started
+/// through `GatewayHarness` the way `functional_h3_soap_utf16_test` does.
+#[ignore]
+#[tokio::test]
+async fn functional_forwarded_h3_obs_text_xff_still_resolves_the_appended_client() {
+    let reservation = reserve_port().await.expect("reserve backend port");
+    let backend_port = reservation.port;
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: "2".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(b"ok".to_vec()))
+        .step(HttpStep::RespondBodyEnd)
+        .spawn()
+        .expect("spawn backend");
+
+    let (_gateway, https_port, _scratch) = spawn_h3_gateway(backend_port).await;
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/metadata");
+    let response = h3_request_with_retry(
+        &client,
+        &url,
+        GetOptions::default().header("x-forwarded-for", "é, 203.0.113.50"),
+    )
+    .await;
+
+    assert_eq!(response.status, http::StatusCode::OK);
+    assert_eq!(response.body_bytes.as_ref(), b"ok");
+
+    let request = backend
+        .received_requests()
+        .await
+        .into_iter()
+        .find(|request| request.method == "GET" && request.path == "/metadata")
+        .expect("backend received the H3-bridged request");
+    let forwarded = only_header(&request, "forwarded");
+    assert!(
+        forwarded.starts_with("for=203.0.113.50;"),
+        "H3 must resolve the appended boundary address, got {forwarded:?}"
+    );
+}
+
+fn write_frontend_certs(scratch: &std::path::Path) -> (String, String) {
+    let ca = TestCa::new("forwarded-h3-gateway").expect("gateway CA");
+    let (cert, key) = ca.valid().expect("gateway leaf");
+    let cert_path = scratch.join("gateway.cert.pem");
+    let key_path = scratch.join("gateway.key.pem");
+    std::fs::write(&cert_path, cert).expect("write gateway cert");
+    std::fs::write(&key_path, key).expect("write gateway key");
+    (
+        cert_path.to_string_lossy().into_owned(),
+        key_path.to_string_lossy().into_owned(),
+    )
+}
+
+async fn spawn_h3_gateway(backend_port: u16) -> (GatewayHarness, u16, tempfile::TempDir) {
+    let yaml = build_config(backend_port);
+    let mut last_error = String::new();
+    for _ in 0..5 {
+        let reservation = reserve_port().await.expect("reserve H3 port");
+        let https_port = reservation.port;
+        drop(reservation);
+        let scratch = tempfile::tempdir().expect("gateway scratch dir");
+        let (cert_path, key_path) = write_frontend_certs(scratch.path());
+        match GatewayHarness::builder()
+            .file_config(yaml.clone())
+            .log_level("warn")
+            .capture_output()
+            .max_attempts(1)
+            .env("FERRUM_ENABLE_HTTP3", "true")
+            .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+            .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
+            .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
+            .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+            .env("FERRUM_TRUSTED_PROXIES", "127.0.0.1")
+            .env("FERRUM_ADD_VIA_HEADER", "false")
+            .env("FERRUM_ADD_FORWARDED_HEADER", "true")
+            .spawn()
+            .await
+        {
+            Ok(gateway) => return (gateway, https_port, scratch),
+            Err(error) => last_error = error.to_string(),
+        }
+    }
+    panic!("failed to spawn H3 forwarded-metadata gateway: {last_error}");
+}
+
+async fn h3_request_with_retry(
+    client: &Http3Client,
+    url: &str,
+    options: GetOptions,
+) -> Http3Response {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match client.get_with_options(url, options.clone()).await {
+            Ok(response) => return response,
+            Err(_) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            Err(error) => panic!("H3 forwarded-metadata request never completed: {error}"),
+        }
+    }
 }

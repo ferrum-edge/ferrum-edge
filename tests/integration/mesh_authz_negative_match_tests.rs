@@ -12,14 +12,32 @@
 //! surface (`MeshAuthz::authorize`) so the wiring between the JSON
 //! plugin-config schema, the policy evaluator, and the plugin's reject
 //! semantics is validated together.
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use ferrum_edge::ConsumerIndex;
+use ferrum_edge::config::types::BackendScheme;
 use ferrum_edge::identity::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
     ConditionMatch, MeshPolicy, MeshRule, ParsedCidr, PolicyAction, PolicyScope, PrincipalMatch,
     RequestMatch, SourceNegationMatch, WorkloadSelector,
 };
 use ferrum_edge::plugins::mesh::authz::MeshAuthz;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, StreamConnectionContext};
 use serde_json::json;
+
+/// A raw Layer-4 session: no HTTP request, and therefore no header map at all.
+fn stream_context() -> StreamConnectionContext {
+    StreamConnectionContext::new(
+        "127.0.0.1".to_string(),
+        "127.0.0.1".to_string(),
+        "tcp-proxy".to_string(),
+        None,
+        15443,
+        BackendScheme::Tcps,
+        Arc::new(ConsumerIndex::new(&[])),
+    )
+}
 
 fn policy_allow_get_except_admin() -> MeshPolicy {
     MeshPolicy {
@@ -544,5 +562,186 @@ async fn allow_with_ports_and_not_port_patterns_stays_conjunctive() {
             PluginResult::Reject { .. }
         ),
         "8080 is outside positive ports → implicit deny"
+    );
+}
+
+// ── `to.headers` present / non-matching / absent parity (issue #5067) ──────
+//
+// Istio's "an HTTP-only field is always matched" rule is about an attribute the
+// path cannot SOURCE, not one it read and found absent. On an HTTP-family
+// request Ferrum has parsed the header map, so a header the client did not send
+// is genuinely absent and must fail a positive predicate for EVERY action —
+// exactly what the sibling `when: request.headers[...]` condition has always
+// done, and what Envoy's `HeaderMatcher` specifies. On an L4 session there is
+// no header map at all, so the fail-closed DENY/CUSTOM behaviour is preserved.
+
+fn header_scoped_policy(name: &str, action: PolicyAction) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: "default".to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            to: vec![RequestMatch {
+                headers: HashMap::from([("x-mode".to_string(), "blocked".to_string())]),
+                ..RequestMatch::default()
+            }],
+            action,
+            ..MeshRule::default()
+        }],
+    }
+}
+
+fn header_condition_policy(name: &str, action: PolicyAction) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: "default".to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            when: vec![ConditionMatch {
+                key: "request.headers[x-mode]".to_string(),
+                values: vec!["blocked".to_string()],
+                not_values: Vec::new(),
+            }],
+            action,
+            ..MeshRule::default()
+        }],
+    }
+}
+
+fn header_ctx(value: Option<&str>) -> RequestContext {
+    let mut ctx = request_context("GET", "/ordinary");
+    if let Some(value) = value {
+        ctx.headers.insert("x-mode".to_string(), value.to_string());
+    }
+    ctx
+}
+
+fn custom_action() -> PolicyAction {
+    PolicyAction::Custom {
+        provider: "ext-authz".to_string(),
+    }
+}
+
+/// A DENY scoped by `to.headers` refuses only requests that CARRY the header
+/// with a matching value. `to.headers` and the equivalent `when` condition
+/// agree on all three inputs.
+#[tokio::test]
+async fn http_deny_header_predicate_matches_only_a_present_matching_header() {
+    let deny = PolicyAction::Deny;
+    for (label, policy) in [
+        ("to.headers", header_scoped_policy("header", deny.clone())),
+        ("when", header_condition_policy("header", deny.clone())),
+    ] {
+        let plugin = MeshAuthz::new(&json!({ "mesh_policies": [policy] })).expect("plugin config");
+
+        let mut matching = header_ctx(Some("blocked"));
+        let result = plugin.authorize(&mut matching).await;
+        assert!(
+            matches!(result, PluginResult::Reject { .. }),
+            "{label}: a present, matching header must be denied, got {result:?}"
+        );
+
+        let mut non_matching = header_ctx(Some("normal"));
+        let result = plugin.authorize(&mut non_matching).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "{label}: a present, non-matching header must not be denied, got {result:?}"
+        );
+
+        let mut absent = header_ctx(None);
+        let result = plugin.authorize(&mut absent).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "{label}: an ABSENT header on HTTP is not unsourceable and must not satisfy a \
+             positive DENY predicate, got {result:?}"
+        );
+    }
+}
+
+/// The ALLOW side is unchanged: an absent header still fails the predicate, and
+/// the implicit-deny floor then refuses the request.
+#[tokio::test]
+async fn http_allow_header_predicate_still_fails_closed_on_an_absent_header() {
+    let allow = PolicyAction::Allow;
+    for (label, policy) in [
+        ("to.headers", header_scoped_policy("header", allow.clone())),
+        ("when", header_condition_policy("header", allow.clone())),
+    ] {
+        let plugin = MeshAuthz::new(&json!({ "mesh_policies": [policy] })).expect("plugin config");
+
+        let mut matching = header_ctx(Some("blocked"));
+        let result = plugin.authorize(&mut matching).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "{label}: a present, matching header must be allowed, got {result:?}"
+        );
+
+        for (case, value) in [("non-matching", Some("normal")), ("absent", None)] {
+            let mut ctx = header_ctx(value);
+            let result = plugin.authorize(&mut ctx).await;
+            assert!(
+                matches!(result, PluginResult::Reject { .. }),
+                "{label}: a {case} header must not satisfy an ALLOW, so implicit deny applies"
+            );
+        }
+    }
+}
+
+/// A CUSTOM rule shares the same request matcher. Its delegation is
+/// unexecutable in a direct `mesh_policies` config (no provider source), so a
+/// matched rule DENIES — which makes it an exact probe for whether the header
+/// predicate matched.
+#[tokio::test]
+async fn http_custom_header_predicate_is_not_delegated_on_an_absent_header() {
+    let policy = header_scoped_policy("delegate", custom_action());
+    let plugin = MeshAuthz::new(&json!({ "mesh_policies": [policy] })).expect("plugin config");
+
+    let mut matching = header_ctx(Some("blocked"));
+    let result = plugin.authorize(&mut matching).await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "a matched CUSTOM delegation with no executor denies, got {result:?}"
+    );
+
+    for (case, value) in [("non-matching", Some("normal")), ("absent", None)] {
+        let mut ctx = header_ctx(value);
+        let result = plugin.authorize(&mut ctx).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "a {case} header must not select the CUSTOM rule on HTTP, got {result:?}"
+        );
+    }
+}
+
+/// The L4 side is UNCHANGED and still fails closed: a raw stream has no header
+/// map, so the predicate is unsourceable and Istio's non-HTTP-port model
+/// applies — DENY (and CUSTOM) ignore it and still match.
+#[tokio::test]
+async fn l4_deny_header_predicate_still_matches_a_session_with_no_header_map() {
+    for action in [PolicyAction::Deny, custom_action()] {
+        let policy = header_scoped_policy("header", action.clone());
+        let plugin = MeshAuthz::new(&json!({ "mesh_policies": [policy] })).expect("plugin config");
+
+        let mut ctx = stream_context();
+        let result = plugin.on_stream_connect(&mut ctx).await;
+        assert!(
+            matches!(result, PluginResult::Reject { .. }),
+            "{action:?}: an unsourceable header predicate must not disarm an L4 refusal"
+        );
+    }
+}
+
+/// An L4 ALLOW carrying a header predicate can never match, so the implicit
+/// deny floor still refuses the session.
+#[tokio::test]
+async fn l4_allow_header_predicate_can_never_match_a_session_with_no_header_map() {
+    let policy = header_scoped_policy("header", PolicyAction::Allow);
+    let plugin = MeshAuthz::new(&json!({ "mesh_policies": [policy] })).expect("plugin config");
+
+    let mut ctx = stream_context();
+    let result = plugin.on_stream_connect(&mut ctx).await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "an ALLOW is never granted on an attribute the L4 path cannot read"
     );
 }

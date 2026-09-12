@@ -24,6 +24,7 @@ use ferrum_edge::plugins::ai_transcript_audit::{
 };
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
 use ferrum_edge::plugins::utils::ai_pii::PiiRedactor;
+use ferrum_edge::plugins::utils::sink_loss::{SinkLossReason, dropped_total};
 use ferrum_edge::plugins::{
     HTTP_GRPC_PROTOCOLS, HTTP_ONLY_PROTOCOLS, Plugin, PluginFailurePolicy, PluginHttpClient,
     PluginResult, ProxyProtocol, RequestContext, ResponseStreamAction, ResponseStreamInspector,
@@ -1462,6 +1463,151 @@ async fn redacted_body_redacts_sensitive_parent_keys_and_json_encoded_tool_argum
         assert!(!captured.contains(secret), "secret leaked: {captured}");
     }
     assert!(captured.contains("[REDACTED]"));
+}
+
+#[tokio::test]
+async fn redacted_body_redacts_exact_sensitive_json_field_names() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, json!({ "mode": "redacted_body" })),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    // Prefix-free 32-character Azure Cognitive Search admin key shape.
+    const AZURE_SEARCH_KEY: &str = "AbCdEfGhIjKlMnOpQrStUvWxYz123456";
+    let request = format!(
+        r#"{{
+        "model":"gpt-4o",
+        "messages":[],
+        "key":"{AZURE_SEARCH_KEY}",
+        "passphrase":"passphrase-secret-value",
+        "access_key":"access-key-secret-value",
+        "signature":"signature-secret-value",
+        "assertion":"assertion-secret-value",
+        "jwt":"jwt-secret-value",
+        "embeddingKey":"{AZURE_SEARCH_KEY}",
+        "keyword":"benign-keyword-value",
+        "monkey":"benign-monkey-value",
+        "data_sources":[{{
+            "parameters":{{
+                "key":"{AZURE_SEARCH_KEY}",
+                "endpoint":"https://search.example.com",
+                "embeddingKey":"{AZURE_SEARCH_KEY}"
+            }}
+        }}],
+        "dataSources":[{{
+            "parameters":{{
+                "key":"{AZURE_SEARCH_KEY}",
+                "endpoint":"https://search.example.com",
+                "embeddingKey":"{AZURE_SEARCH_KEY}"
+            }}
+        }}]
+    }}"#
+    );
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, request.as_bytes())
+        .await;
+    plugin
+        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    plugin
+        .on_response_committed(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    let captured = records[0]["request_body"].as_str().unwrap();
+    for secret in [
+        AZURE_SEARCH_KEY,
+        "passphrase-secret-value",
+        "access-key-secret-value",
+        "signature-secret-value",
+        "assertion-secret-value",
+        "jwt-secret-value",
+        "https://search.example.com",
+    ] {
+        assert!(!captured.contains(secret), "secret leaked: {captured}");
+    }
+    assert!(
+        captured.contains("benign-keyword-value"),
+        "keyword must not be redacted: {captured}"
+    );
+    assert!(
+        captured.contains("benign-monkey-value"),
+        "monkey must not be redacted: {captured}"
+    );
+    assert!(captured.contains("[REDACTED]"), "{captured}");
+}
+
+/// The recognized data-source container name must never bypass the ordinary
+/// visitor, whatever JSON shape it holds.
+///
+/// The provider's conventional payload puts an array under this name, but a
+/// captured transcript is arbitrary JSON, so the name proves no type invariant.
+/// `api_key` and `endpoint` values here are deliberately not PII-pattern
+/// shaped: only member-name redaction and the wholesale `parameters` rule can
+/// remove them, so their absence proves the container was actually traversed.
+#[tokio::test]
+async fn redacted_body_redacts_non_array_data_source_containers() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, json!({ "mode": "redacted_body" })),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    const AZURE_SEARCH_KEY: &str = "AbCdEfGhIjKlMnOpQrStUvWxYz123456";
+    let request = format!(
+        r#"{{
+        "model":"gpt-4o",
+        "messages":[],
+        "data_sources":{{
+            "parameters":{{
+                "key":"{AZURE_SEARCH_KEY}",
+                "endpoint":"https://search.example.com"
+            }},
+            "api_key":"nested-object-secret-value",
+            "sources":[{{"parameters":{{"embeddingKey":"{AZURE_SEARCH_KEY}"}}}}],
+            "note":"benign-object-note"
+        }},
+        "dataSources":"my ssn is 123-45-6789",
+        "data-sources":7,
+        "note":"benign-top-note"
+    }}"#
+    );
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, request.as_bytes())
+        .await;
+    plugin
+        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    plugin
+        .on_response_committed(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    let captured = records[0]["request_body"].as_str().unwrap();
+    for secret in [
+        AZURE_SEARCH_KEY,
+        "https://search.example.com",
+        "nested-object-secret-value",
+        "123-45-6789",
+    ] {
+        assert!(!captured.contains(secret), "secret leaked: {captured}");
+    }
+    for benign in ["benign-object-note", "benign-top-note"] {
+        assert!(
+            captured.contains(benign),
+            "benign value must survive: {captured}"
+        );
+    }
+    assert!(captured.contains("[REDACTED]"), "{captured}");
 }
 
 #[tokio::test]
@@ -5410,6 +5556,145 @@ async fn non_candidate_json_is_not_re_pinned_by_content_type_hook() {
     );
 }
 
+/// Drive one plugin through `count` audited transactions against a live sink.
+async fn emit_audited_transactions(plugin: &AiTranscriptAudit, count: usize) {
+    let headers = json_headers();
+    for _ in 0..count {
+        let mut ctx = make_ctx();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+            .await;
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .await;
+        plugin
+            .on_response_committed(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .await;
+    }
+}
+
+/// Poll until the published `batch_discard` loss for this plugin has grown by
+/// at least `expected`, then return the observed growth.
+async fn wait_for_batch_discard_growth(before: u64, expected: u64) -> u64 {
+    let mut grown = 0;
+    for _ in 0..60 {
+        let total = dropped_total("ai_transcript_audit", SinkLossReason::BatchDiscard);
+        grown = total.saturating_sub(before);
+        if grown >= expected {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    grown
+}
+
+/// A permanent 4xx discards the batch WITHOUT retrying, so the shared retry
+/// loop returns success and never sees the loss. The plugin must publish it
+/// itself, once per lost RECORD rather than once per discard event, or the
+/// documented `ferrum_plugin_log_sink_records_dropped_total` stays at zero
+/// while the collector is silently throwing audit records away.
+#[tokio::test]
+async fn permanent_4xx_discard_counts_every_lost_record() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": endpoint,
+                "allow_insecure_loopback": true,
+                "batch_size": 2,
+                "flush_interval_ms": 100,
+                "max_retries": 0
+            }
+        }),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let before = dropped_total("ai_transcript_audit", SinkLossReason::BatchDiscard);
+    emit_audited_transactions(&plugin, 2).await;
+    let grown = wait_for_batch_discard_growth(before, 2).await;
+    assert!(
+        grown >= 2,
+        "both records lost to the permanent 400 must be published as batch_discard (grew by \
+         {grown})"
+    );
+}
+
+/// The terminal outcomes that DO return an error to the shared retry loop must
+/// keep reaching the same counter: an exhausted retryable status, and a 2xx
+/// whose acknowledgement fails validation (which is not a delivery).
+#[tokio::test]
+async fn exhausted_retry_and_failed_acknowledgement_count_lost_records() {
+    let unavailable = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&unavailable)
+        .await;
+    let plugin = AiTranscriptAudit::new(
+        &json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": format!("{}/ingest", unavailable.uri()),
+                "allow_insecure_loopback": true,
+                "batch_size": 1,
+                "flush_interval_ms": 100,
+                "max_retries": 0
+            }
+        }),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let before = dropped_total("ai_transcript_audit", SinkLossReason::BatchDiscard);
+    emit_audited_transactions(&plugin, 1).await;
+    let grown = wait_for_batch_discard_growth(before, 1).await;
+    assert!(
+        grown >= 1,
+        "a record lost after the retry budget is exhausted must be published (grew by {grown})"
+    );
+
+    // A 2xx whose acknowledgement body reports failure is an ambiguous
+    // delivery: the batch is returned for retry and, once exhausted, lost.
+    let bad_ack = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"status":"rejected"}"#))
+        .mount(&bad_ack)
+        .await;
+    let ack_plugin = AiTranscriptAudit::new(
+        &json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": format!("{}/ingest", bad_ack.uri()),
+                "allow_insecure_loopback": true,
+                "batch_size": 1,
+                "flush_interval_ms": 100,
+                "max_retries": 0,
+                "ack_policy": "json"
+            }
+        }),
+        loopback_http_client(),
+    )
+    .unwrap();
+    ack_plugin.start_background_tasks().expect("live start");
+    ack_plugin.commit_background_tasks();
+    let before = dropped_total("ai_transcript_audit", SinkLossReason::BatchDiscard);
+    emit_audited_transactions(&ack_plugin, 1).await;
+    let grown = wait_for_batch_discard_growth(before, 1).await;
+    assert!(
+        grown >= 1,
+        "a record whose acknowledgement failed validation must be published (grew by {grown})"
+    );
+}
+
 #[tokio::test]
 async fn non_retryable_sink_4xx_marks_sink_unhealthy_under_reject() {
     // A collector returning a non-retryable non-2xx (e.g. 401 from an expired
@@ -5468,6 +5753,166 @@ async fn non_retryable_sink_4xx_marks_sink_unhealthy_under_reject() {
     assert!(
         saw_reject,
         "a 401-discarding collector must flip the sink unhealthy and reject audited traffic"
+    );
+}
+
+/// The published phase list must name `after_proxy`, and that name must be
+/// backed by an implemented hook rather than by prose.
+///
+/// `plugin_doc_parity_tests` already proves the execution-order table and the
+/// parity registry agree with EACH OTHER — and both omitted the same
+/// implemented hook, so mutual agreement is not evidence. This binds the
+/// metadata to observable behaviour instead: the reject-path opt-ins, and an
+/// `after_proxy` call that performs the short-circuit request capture no other
+/// hook in the sequence performed.
+#[tokio::test]
+async fn active_phases_metadata_names_the_implemented_after_proxy_hook() {
+    use ferrum_edge::plugins::builtin_plugin_parity_meta;
+
+    let meta = builtin_plugin_parity_meta("ai_transcript_audit").expect("parity meta");
+    assert!(
+        meta.active_phases
+            .split(',')
+            .map(str::trim)
+            .any(|phase| phase == "after_proxy"),
+        "the parity registry must name the implemented after_proxy hook: {}",
+        meta.active_phases
+    );
+
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, json!({})),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    assert!(plugin.applies_after_proxy_on_reject());
+    assert!(plugin.may_replace_rejection_response());
+
+    // A `before_proxy` short circuit never runs the final request-body hook, so
+    // `after_proxy` is the only place the staged request is captured. The
+    // published request hash is that capture's observable output.
+    const REQUEST_HASH: &str = "ai_transcript_audit.request_hash";
+    let mut ctx = make_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        std::str::from_utf8(ai_request_body()).unwrap().to_string(),
+    );
+    let mut proxy_headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
+    assert!(
+        !ctx.metadata.contains_key(REQUEST_HASH),
+        "provisional staging must not hash the request"
+    );
+
+    let mut response_headers = HashMap::new();
+    plugin
+        .after_proxy(&mut ctx, 503, &mut response_headers)
+        .await;
+    assert!(
+        ctx.metadata.contains_key(REQUEST_HASH),
+        "after_proxy must capture the staged request on a short-circuited transaction"
+    );
+}
+
+/// `sampling.max_records_per_minute` is documented as a volume cap that drops
+/// records and NEVER rejects traffic. Once the window is exhausted the record
+/// can no longer be exported, so a fail-closed sink policy must not select a
+/// `503` on its behalf: that denies traffic for an audit record which could not
+/// have been written either way, and (with `on_buffer_full: reject`) burns a
+/// queue permit and a retained-byte reservation a still-exportable record could
+/// use.
+#[tokio::test]
+async fn exhausted_sampling_cap_never_rejects_under_fail_closed_sink() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &json!({
+            "sampling": { "max_records_per_minute": 1 },
+            "sink": {
+                "type": "http",
+                "endpoint_url": endpoint,
+                "allow_insecure_loopback": true,
+                "batch_size": 1,
+                "flush_interval_ms": 100,
+                "max_retries": 0,
+                "on_buffer_full": "reject",
+                "on_sink_error": "reject"
+            }
+        }),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let headers = json_headers();
+
+    // The one record this window allows is captured, exported, and refused by
+    // the collector, which flips the sink unhealthy.
+    emit_audited_transactions(&plugin, 1).await;
+    let mut unhealthy = false;
+    for _ in 0..60 {
+        if !plugin.status_snapshot().sink_healthy {
+            unhealthy = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        unhealthy,
+        "the 400-discarding collector must publish an unhealthy sink, or this test proves nothing"
+    );
+
+    // Every later transaction in the same window is over the cap, so no record
+    // can be produced for it. Fail-closed admission must stand down on all
+    // three gates instead of returning 503.
+    for attempt in 0..3 {
+        let mut ctx = make_ctx();
+        let mut response_headers = headers.clone();
+        let request_gate = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+            .await;
+        assert!(
+            matches!(request_gate, PluginResult::Continue),
+            "attempt {attempt}: an over-cap request must not be rejected on the request path"
+        );
+        let after_proxy_gate = plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await;
+        assert!(
+            matches!(after_proxy_gate, PluginResult::Continue),
+            "attempt {attempt}: an over-cap request must not be rejected in after_proxy"
+        );
+        let commit_gate = plugin
+            .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .await;
+        assert!(
+            matches!(commit_gate, PluginResult::Continue),
+            "attempt {attempt}: an over-cap request must not be rejected at buffered commit"
+        );
+        plugin
+            .on_response_committed(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .await;
+        assert_ne!(
+            ctx.metadata
+                .get("ai_transcript_audit.sink_status")
+                .map(String::as_str),
+            Some("rejected"),
+            "attempt {attempt}: an over-cap transaction must never report a sink rejection"
+        );
+    }
+
+    // The sink is still unhealthy — the cap suppressed export, it did not
+    // silently repair the collector.
+    assert!(
+        !plugin.status_snapshot().sink_healthy,
+        "suppressing export must not fabricate sink health"
     );
 }
 
@@ -12151,4 +12596,193 @@ async fn grpc_map_ordinals_are_deterministic_and_key_ordered() {
             "literal map key {key} must never be exported: {first}"
         );
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Native gRPC terminal status drives `always_capture_on_error`
+// ══════════════════════════════════════════════════════════════════════
+
+/// `grpc_audit_overrides` with the caller's `sampling` block merged over it.
+fn grpc_audit_overrides_with_sampling(sampling: Value) -> Value {
+    let mut overrides = grpc_audit_overrides();
+    overrides["sampling"] = sampling;
+    overrides
+}
+
+/// A live gRPC-enrolled instance whose only route to a record is the error
+/// override: at `rate: 0` the sampling roll always loses.
+fn grpc_error_override_plugin(endpoint: &str) -> AiTranscriptAudit {
+    let sampling = json!({ "rate": 0.0, "always_capture_on_error": true });
+    let overrides = grpc_audit_overrides_with_sampling(sampling);
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(endpoint, overrides),
+        loopback_http_client(),
+    )
+    .expect("valid grpc audit config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    plugin
+}
+
+/// Stand in for the proxy core, which normalizes the final client-visible gRPC
+/// status — from the terminal TRAILERS frame or a Trailers-Only header block —
+/// into `metadata["grpc_status"]` before the committed and stream-termination
+/// hooks run.
+fn set_final_grpc_status(ctx: &mut RequestContext, status: u32) {
+    let status = status.to_string();
+    ctx.metadata.insert("grpc_status".to_string(), status);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_failure_under_http_200_overrides_a_lost_sampling_roll() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = grpc_error_override_plugin(&endpoint);
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let headers = grpc_headers();
+    let request = grpc_frame(&hello_request_bytes("ada"));
+    let response = grpc_frame(&hello_response_bytes("upstream failed"));
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &request)
+        .await;
+    // The RPC fails the way native gRPC normally does: the transport status
+    // stays 200 and only the terminal `grpc-status` reports the failure.
+    set_final_grpc_status(&mut ctx, 13);
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &response)
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "a failed RPC must be retained by always_capture_on_error, got {records:?}"
+    );
+    assert_eq!(records[0]["capture_reason"], "error");
+    assert_eq!(records[0]["status_code"], 200);
+    assert_eq!(records[0]["grpc_status"], 13);
+    assert_eq!(records[0]["sampled"], false);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_ok_status_stays_subject_to_ordinary_sampling() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = grpc_error_override_plugin(&endpoint);
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let headers = grpc_headers();
+    let request = grpc_frame(&hello_request_bytes("ada"));
+    let response = grpc_frame(&hello_response_bytes("hello ada"));
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &request)
+        .await;
+    set_final_grpc_status(&mut ctx, 0);
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &response)
+        .await;
+
+    assert_eq!(audit_meta(&ctx, SINK_KEY).as_deref(), Some("skipped"));
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert!(
+        requests.is_empty(),
+        "grpc-status 0 is a success and must not fire the error override"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_trailers_only_error_is_retained_from_the_initial_headers() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = grpc_error_override_plugin(&endpoint);
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let request = grpc_frame(&hello_request_bytes("ada"));
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &grpc_headers(), &request)
+        .await;
+    // Trailers-Only: no DATA frame at all, and the terminal status rides in the
+    // initial HEADERS block this hook is handed. `request_protocol` is what the
+    // proxy core stamps for every native gRPC request.
+    ctx.metadata
+        .insert("request_protocol".to_string(), "grpc".to_string());
+    let mut headers = grpc_headers();
+    headers.insert("grpc-status".to_string(), "5".to_string());
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, b"")
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "a Trailers-Only error must be retained, got {records:?}"
+    );
+    assert_eq!(records[0]["capture_reason"], "error");
+    assert_eq!(records[0]["status_code"], 200);
+    assert_eq!(records[0]["grpc_status"], 5);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_failure_reaches_the_transaction_log_fallback() {
+    // A streamed gRPC response never reaches a buffered response hook, so the
+    // transaction-log fallback is the only emission point left. It reads the
+    // same normalized terminal status the transaction summary reports.
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = grpc_error_override_plugin(&endpoint);
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let request = grpc_frame(&hello_request_bytes("ada"));
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &grpc_headers(), &request)
+        .await;
+    let mut metadata = ctx.metadata.clone();
+    metadata.insert("grpc_status".to_string(), "14".to_string());
+    let mut summary = create_test_transaction_summary();
+    summary.metadata = metadata;
+    // The transport status of a completed-but-failed RPC is still 200.
+    summary.response_status_code = 200;
+    plugin.log(&summary).await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "the log fallback must retain a failed RPC, got {records:?}"
+    );
+    assert_eq!(records[0]["capture_reason"], "error");
+    assert_eq!(records[0]["grpc_status"], 14);
+}
+
+#[tokio::test]
+async fn http_records_never_carry_a_grpc_status() {
+    // The gRPC error override must not change HTTP behaviour: an ordinary HTTP
+    // transaction has no gRPC application status to report.
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let config = config_with_sink(&endpoint, json!({ "sampling": { "rate": 1.0 } }));
+    let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["capture_reason"], "sampled");
+    let record = &records[0];
+    assert!(
+        record.get("grpc_status").is_none(),
+        "an HTTP record must not carry a gRPC application status: {record:?}"
+    );
 }

@@ -233,7 +233,13 @@ pub struct WorkloadPort {
 }
 
 /// Selector for workload matching. Empty `labels` matches any workload.
+///
+/// Closed grammar: an empty selector matches EVERY workload, so a misspelled
+/// `labels` key inside a [`PolicyScope::WorkloadSelector`] would silently
+/// widen a targeted authorization policy onto the whole mesh. Rejecting the
+/// unknown member is the only way that spelling stays visible.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkloadSelector {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub labels: HashMap<String, String>,
@@ -344,7 +350,18 @@ pub struct WorkloadRef {
 // ── MeshPolicy ────────────────────────────────────────────────────────────
 
 /// Identity-based authorization policy. Mirrors Istio AuthorizationPolicy.
+///
+/// The whole authorization grammar below is CLOSED (`deny_unknown_fields` on
+/// every nested matcher). An unrecognized member is a misspelling, and every
+/// misspelling here removes a restriction the operator wrote: `not_paths`
+/// typed `not_path` deserializes as an unconstrained rule, `action` typed
+/// `actoin` used to fall back to the `Allow` default. Silently discarding a
+/// restriction widens the effective policy, so it fails admission instead —
+/// the same contract the plugin's root key set has carried since #4525.
+/// Kubernetes/xDS translation builds these values programmatically and is
+/// unaffected.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshPolicy {
     pub name: String,
     pub namespace: String,
@@ -430,6 +447,7 @@ pub enum PolicyTargetAttachment {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshRule {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub from: Vec<PrincipalMatch>,
@@ -471,7 +489,14 @@ pub struct MeshRule {
     /// never match traffic, e.g. Istio ALLOW-without-rules allow-nothing.
     #[serde(default, skip_serializing_if = "is_false")]
     pub never_matches: bool,
-    #[serde(default)]
+    /// Istio `AuthorizationPolicy.spec.action`, applied to this rule.
+    ///
+    /// REQUIRED on the wire. It carries no `#[serde(default)]` on purpose: a
+    /// rule whose action failed to deserialize used to become
+    /// [`PolicyAction::Allow`], turning an operator's DENY into a grant with
+    /// no diagnostic. `Default` (used by programmatic construction and
+    /// `..MeshRule::default()`) still yields `Allow`; the serialized form
+    /// always carries the field, so Ferrum's own round trips are unaffected.
     pub action: PolicyAction,
 }
 
@@ -552,10 +577,14 @@ pub const MESH_EXT_AUTHZ_MAX_TIMEOUT_MS: u64 = 30_000;
 pub const MESH_EXT_AUTHZ_MAX_RESPONSE_BYTES: usize = 64 * 1024;
 /// Hard ceiling on `includeRequestBodyInCheck.maxRequestBytes`.
 pub const MESH_EXT_AUTHZ_MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
-/// Hard ceiling on concurrent in-flight provider checks per gateway process.
-pub const MESH_EXT_AUTHZ_MAX_CONCURRENT_CALLS: usize = 512;
-/// Default concurrent in-flight provider checks per gateway process.
-pub const MESH_EXT_AUTHZ_DEFAULT_CONCURRENT_CALLS: usize = 128;
+/// Concurrent in-flight provider checks per gateway PROCESS.
+///
+/// One fixed budget, shared by every `mesh_authz` instance and every reload
+/// generation (`MESH_EXT_AUTHZ_PERMITS` in `crate::plugins::mesh::ext_authz`).
+/// There is no per-provider or per-instance knob, so there is no separate
+/// "default" to raise and no hard ceiling to clamp it against — this constant
+/// IS the implemented contract, and `docs/mesh.md` documents it as such.
+pub const MESH_EXT_AUTHZ_PROCESS_CONCURRENT_CALLS: usize = 128;
 
 /// One admitted Istio `meshConfig.extensionProviders[]` external authorization
 /// provider.
@@ -1164,6 +1193,7 @@ pub fn validate_mesh_ext_authz_providers(providers: &[MeshExtAuthzProvider]) -> 
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrincipalMatch {
     /// Glob pattern over Istio source principals (`prod/ns/foo/sa/*`).
     /// Full `spiffe://...` patterns are also accepted for direct configs.
@@ -1324,6 +1354,7 @@ impl<'de> Deserialize<'de> for ParsedCidr {
 /// namespace fields preserve Istio semantics for anonymous traffic, so
 /// `notPrincipals: ["*"]` can be used in a DENY policy to require mTLS.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceNegationMatch {
     /// Istio `notPrincipals` — globs over the source principal
     /// (`<trust-domain>/ns/<namespace>/sa/<service-account>`). Full
@@ -1372,6 +1403,7 @@ fn source_negation_is_empty(value: &SourceNegationMatch) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestMatch {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub methods: Vec<String>,
@@ -1413,6 +1445,7 @@ pub struct RequestMatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConditionMatch {
     pub key: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2902,8 +2935,8 @@ pub enum Resolution {
     None,
 }
 
-/// Whether an egress `ServiceEntry` host is a wildcard that cannot be
-/// materialized into a dialable upstream target.
+/// Whether a stream-family egress `ServiceEntry` host is a wildcard that cannot
+/// be materialized into a dialable upstream target.
 ///
 /// **Invariant: a wildcard host is only materializable when the operator
 /// declared concrete endpoints.** Under `resolution: STATIC` with a non-empty
@@ -2912,18 +2945,16 @@ pub enum Resolution {
 /// perfectly serviceable route selector. Under `DNS`/`NONE` (or `STATIC` with no
 /// endpoints) there is no declared endpoint set, so the ServiceEntry host ITSELF
 /// becomes the upstream target host — and the literal string `*.example.com` is
-/// not resolvable by any resolver, which means every matching request routes and
-/// then fails at dial time with a 502 the operator was never warned about.
+/// not resolvable by any resolver. HTTP-family DNS/NONE requests are exempt:
+/// dispatch replaces a matching wildcard target with the concrete request
+/// authority before DNS, SNI, and pool selection. HTTP-family STATIC entries
+/// without endpoints still fail closed rather than resolving their route host.
 ///
 /// Returns `true` for the unresolvable case, i.e. the host must be refused with
 /// a field-named warning rather than materialized.
 ///
-/// Shared (in the style of `service_entry_port_protocol_is_udp`) by the
-/// HTTP-family, stream-family, and datagram egress materialization branches and
-/// by the Istio CRD status writer's `deferred_fields` report, so the three
-/// branches and the status report can never drift about one input. The datagram
-/// branch applies this predicate AND additionally refuses every wildcard — see
-/// `build_udp_egress_destinations_for_entry`.
+/// The datagram branch applies this predicate AND additionally refuses every
+/// wildcard — see `build_udp_egress_destinations_for_entry`.
 pub fn egress_host_is_unresolvable_wildcard(
     host: &str,
     resolution: Resolution,

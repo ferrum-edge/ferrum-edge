@@ -3901,13 +3901,20 @@ enum SidecarPortAdmission {
 /// service-account identity, not pod-unique, so when the sidecar's labels are
 /// known also require a **non-vacuous** selector-label match (an empty selector
 /// matches "any" and would reintroduce a shared-service-account leak). Remote
-/// multi-cluster endpoints (tagged with a foreign `cluster`) are never local.
+/// multi-cluster endpoints (marked by trusted ingestion provenance, or tagged
+/// with a foreign `cluster`) are never local.
 pub(crate) fn workload_is_local(
     workload: &Workload,
     local_spiffe: &str,
     sidecar_labels: &BTreeMap<String, String>,
     local_cluster: Option<&str>,
 ) -> bool {
+    // Remote discovery stamps this non-serialized marker at ingestion. Check it
+    // before the payload-controlled cluster name: a remote endpoint may claim
+    // the local cluster name and must never become a loopback inbound route.
+    if workload.remote_provenance {
+        return false;
+    }
     if workload.spiffe_id.as_str() != local_spiffe {
         return false;
     }

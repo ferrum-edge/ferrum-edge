@@ -3169,7 +3169,10 @@ async fn test_hmac_auth_non_ascii_digest_returns_invalid_not_missing() {
     );
     ctx.set_raw_headers(raw);
     ctx.materialize_headers();
-    assert!(!ctx.headers.contains_key("digest"));
+    // Valid UTF-8 obs-text is materialized byte-for-byte (issue #5010); the
+    // digest grammar is still visible-ASCII only, so the value is malformed
+    // rather than missing.
+    assert!(ctx.headers.contains_key("digest"));
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject_body(result, r#"{"error":"Malformed digest header"}"#);
@@ -3189,4 +3192,194 @@ async fn test_hmac_auth_invalid_utf8_authorization_returns_invalid_not_missing()
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject_body(result, r#"{"error":"Invalid Authorization header"}"#);
     assert!(ctx.identified_consumer.is_none());
+}
+
+// ── Issue #5000: a signed WebSocket handshake must authenticate ─────────────
+//
+// WebSocket streams are categorically excluded from request-body collection —
+// after the upgrade, DATA is tunnel payload, not an HTTP request body — so the
+// digest snapshots were absent on every WebSocket route. Absent snapshots MUST
+// fail closed, so every correctly signed handshake was answered 401 with a
+// digest mismatch even though the plugin declares WebSocket support.
+//
+// The handshake itself declares no body on the wire, so the transport publishes
+// exactly that proof before the authenticate phase. These tests drive the same
+// helper the H1/H2 and H3 ladders call.
+
+/// Drive the transport-owned handshake proof the dispatchers publish.
+fn publish_handshake_proof(plugins: &[Arc<dyn Plugin>], ctx: &mut RequestContext) {
+    ferrum_edge::_test_support::publish_websocket_handshake_body_digests_for_test(plugins, ctx);
+}
+
+fn ws_plugins(config_id: &str) -> Vec<Arc<dyn Plugin>> {
+    vec![Arc::new(v2_plugin_named(config_id))]
+}
+
+/// A `ferrum-hmac-v2` handshake signed over the empty body.
+fn v2_websocket_request(nonce: &str) -> V2Request {
+    let method = "GET".to_string();
+    let path = "/socket".to_string();
+    let date = current_date();
+    let digest = sha256_digest_header(b"");
+    let signature = sign_v2(
+        TEST_SECRET,
+        HmacSigningInput {
+            namespace: ferrum_edge::config::types::DEFAULT_NAMESPACE,
+            username: TEST_USERNAME,
+            authority: TEST_AUTHORITY,
+            method: &method,
+            path: &path,
+            query: "",
+            date: &date,
+            digest_header: &digest,
+        },
+        nonce,
+    );
+    V2Request {
+        method,
+        path,
+        date,
+        digest,
+        nonce: nonce.to_string(),
+        signature,
+    }
+}
+
+/// A handshake context with the digest snapshots absent, as the WebSocket
+/// dispatchers leave them.
+fn websocket_handshake_context(request: &V2Request) -> RequestContext {
+    let mut ctx = request.context();
+    ctx.request_body_sha256 = None;
+    ctx.request_body_sha512 = None;
+    ctx
+}
+
+#[tokio::test]
+async fn websocket_handshake_without_the_transport_proof_still_fails_closed() {
+    // Non-vacuity for the test below: absent snapshots are a refusal, and the
+    // fix is the transport publishing the proof — not the plugin relaxing.
+    let plugin = v2_plugin_named("v2-ws-no-proof");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let mut ctx = websocket_handshake_context(&v2_websocket_request(&test_nonce(0x5000)));
+
+    assert_reject_error(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        401,
+        "Digest header does not match request body",
+    );
+    assert!(ctx.identified_consumer.is_none());
+}
+
+#[tokio::test]
+async fn websocket_handshake_authenticates_with_the_transport_empty_body_proof() {
+    let plugins = ws_plugins("v2-ws-proof");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let mut ctx = websocket_handshake_context(&v2_websocket_request(&test_nonce(0x5001)));
+
+    publish_handshake_proof(&plugins, &mut ctx);
+    assert!(ctx.request_body_sha256.is_some());
+    assert!(ctx.request_body_sha512.is_some());
+
+    assert_continue(plugins[0].authenticate(&mut ctx, &consumer_index).await);
+    assert_eq!(
+        ctx.identified_consumer.as_ref().unwrap().username,
+        TEST_USERNAME
+    );
+    assert_eq!(ctx.auth_method, Some("hmac_auth"));
+}
+
+#[tokio::test]
+async fn websocket_handshake_replay_is_still_rejected_before_the_backend() {
+    let plugins = ws_plugins("v2-ws-replay");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let request = v2_websocket_request(&test_nonce(0x5002));
+
+    let mut first = websocket_handshake_context(&request);
+    publish_handshake_proof(&plugins, &mut first);
+    assert_continue(plugins[0].authenticate(&mut first, &consumer_index).await);
+
+    let mut replay = websocket_handshake_context(&request);
+    publish_handshake_proof(&plugins, &mut replay);
+    let result = plugins[0].authenticate(&mut replay, &consumer_index).await;
+    assert_reject(result, Some(401));
+    assert!(replay.identified_consumer.is_none());
+}
+
+#[tokio::test]
+async fn websocket_handshake_with_an_altered_digest_is_rejected() {
+    let plugins = ws_plugins("v2-ws-altered");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let mut ctx = websocket_handshake_context(&v2_websocket_request(&test_nonce(0x5003)));
+    ctx.headers
+        .insert("digest".to_string(), sha256_digest_header(b"not-the-body"));
+
+    publish_handshake_proof(&plugins, &mut ctx);
+    let result = plugins[0].authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+    assert!(ctx.identified_consumer.is_none());
+}
+
+#[tokio::test]
+async fn websocket_handshake_with_an_invalid_signature_is_rejected() {
+    let plugins = ws_plugins("v2-ws-bad-sig");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let mut request = v2_websocket_request(&test_nonce(0x5004));
+    request.signature = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string();
+    let mut ctx = websocket_handshake_context(&request);
+
+    publish_handshake_proof(&plugins, &mut ctx);
+    assert_reject_error(
+        plugins[0].authenticate(&mut ctx, &consumer_index).await,
+        401,
+        "Invalid credentials",
+    );
+    assert!(ctx.identified_consumer.is_none());
+}
+
+#[tokio::test]
+async fn the_handshake_proof_is_withheld_when_the_request_declares_a_body() {
+    // Fails closed on anything that is not provably an empty handshake body.
+    let plugins = ws_plugins("v2-ws-declared-body");
+
+    for (name, value) in [("content-length", "5"), ("transfer-encoding", "chunked")] {
+        let mut ctx = websocket_handshake_context(&v2_websocket_request(&test_nonce(0x5005)));
+        ctx.headers.insert(name.to_string(), value.to_string());
+        publish_handshake_proof(&plugins, &mut ctx);
+        assert!(
+            ctx.request_body_sha256.is_none() && ctx.request_body_sha512.is_none(),
+            "a declared body must keep the snapshots absent: {name}: {value}"
+        );
+    }
+
+    // `Content-Length: 0` is provably empty and still gets the proof.
+    let mut zero = websocket_handshake_context(&v2_websocket_request(&test_nonce(0x5006)));
+    zero.headers
+        .insert("content-length".to_string(), "0".to_string());
+    publish_handshake_proof(&plugins, &mut zero);
+    assert!(zero.request_body_sha256.is_some());
+}
+
+#[test]
+fn the_handshake_proof_is_not_published_without_a_digest_consuming_plugin() {
+    let plugins: Vec<Arc<dyn Plugin>> = Vec::new();
+    let mut ctx = websocket_handshake_context(&v2_websocket_request(&test_nonce(0x5007)));
+
+    publish_handshake_proof(&plugins, &mut ctx);
+
+    assert!(ctx.request_body_sha256.is_none());
+    assert!(ctx.request_body_sha512.is_none());
+}
+
+#[tokio::test]
+async fn the_handshake_proof_never_overwrites_collected_body_hashes() {
+    let plugins = ws_plugins("v2-ws-collected");
+    let body = br#"{"ping":1}"#;
+    let expected: [u8; 32] = Sha256::digest(body).into();
+    let mut ctx = v2_websocket_request(&test_nonce(0x5008)).context();
+    ctx.request_body_sha256 = Some(expected);
+    ctx.request_body_sha512 = Some(Sha512::digest(body).into());
+
+    publish_handshake_proof(&plugins, &mut ctx);
+
+    assert_eq!(ctx.request_body_sha256, Some(expected));
 }

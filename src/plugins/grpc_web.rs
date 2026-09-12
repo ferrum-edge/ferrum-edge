@@ -47,6 +47,10 @@
 //! - Lists, parameters, quality values (`q=`), and wildcards (`*/*`,
 //!   `application/*`) are honored with specificity and explicit-over-wildcard
 //!   rules matching RFC 9110 content negotiation.
+//! - Non-`q` media-range parameters still match when type, subtype, and suffix
+//!   match, but they are ignored for precedence/quality and cannot veto an
+//!   unparameterized representation. A range whose type or suffix does not
+//!   match still fails closed with HTTP `406`.
 //! - A present `Accept` that is structurally malformed, or that refuses every
 //!   gRPC-Web representation the gateway can produce, fails closed with HTTP
 //!   `406 Not Acceptable`.
@@ -231,6 +235,10 @@ const META_GRPC_WEB_REQUEST_TRAILER_ERROR: &str = "grpc_web.request_trailer_erro
 /// Set after the owner appends the trailer frame (and base64-encodes in text
 /// mode) once. Prevents sibling instances from re-framing the body.
 const META_GRPC_WEB_RESPONSE_TRANSLATED: &str = "grpc_web.response_translated";
+/// Set by the translation owner in `after_proxy` when the backend (or an
+/// intermediary) answered with an HTTP error whose entity is not a gRPC message
+/// stream. See [`unframed_backend_error_entity`].
+const META_GRPC_WEB_UNFRAMED_ERROR_ENTITY: &str = "grpc_web.unframed_error_entity";
 /// Prefix for per-instance namespaced staging keys:
 /// `grpc_web.instance.{id}.mode`.
 const INSTANCE_META_PREFIX: &str = "grpc_web.instance.";
@@ -727,11 +735,30 @@ fn is_forbidden_grpc_web_request_trailer_name(name: &str) -> bool {
 /// The gRPC wire spec permits producers to omit padding on binary metadata, so
 /// both dialects are accepted; anything else is refused rather than forwarded
 /// as an unreadable binary field.
+///
+/// A repeated binary metadata field may also arrive comma-COALESCED
+/// (`x-bin: YQ==,Yg==`), which PROTOCOL-HTTP2 defines as equivalent to the
+/// repeated form: a receiver splits on `,` before base64-decoding each member.
+/// Validating the joined string as ONE base64 blob rejected that legal shape,
+/// so each member is checked independently — with optional surrounding OWS,
+/// which the same grammar allows around a list member. An empty member is still
+/// refused: it decodes to nothing and only exists as a trailing/duplicated
+/// separator.
 pub(crate) fn is_base64_metadata_value(value: &str) -> bool {
-    !value.is_empty()
-        && (BASE64.decode(value).is_ok()
+    if value.is_empty() {
+        return false;
+    }
+    value.split(',').all(|member| {
+        base64_metadata_member_is_valid(member.trim_matches(|ch| ch == ' ' || ch == '\t'))
+    })
+}
+
+/// One member of a (possibly comma-coalesced) binary metadata value.
+fn base64_metadata_member_is_valid(member: &str) -> bool {
+    !member.is_empty()
+        && (BASE64.decode(member).is_ok()
             || base64::engine::general_purpose::STANDARD_NO_PAD
-                .decode(value)
+                .decode(member)
                 .is_ok())
 }
 
@@ -740,6 +767,24 @@ fn encode_request_trailers(trailers: &[(String, String)]) -> Result<String, &'st
     serde_json::to_vec(trailers)
         .map(|raw| BASE64.encode(raw))
         .map_err(|_| ERR_TRAILER_STAGING_FAILED)
+}
+
+/// Remove request-private gRPC-Web staging from a transaction-log metadata
+/// projection.
+///
+/// [`META_GRPC_WEB_REQUEST_TRAILERS`] holds the client's COMPLETE trailing
+/// metadata block. It is transport state consumed at dispatch, not
+/// observability metadata, and application trailing metadata may carry
+/// credentials — so it is OMITTED from every summary rather than redacted by
+/// outer-key name matching, which cannot see the names embedded in the encoded
+/// value. Base64 is an encoding, not confidentiality.
+///
+/// This runs on the log CLONE only; `ctx.metadata` keeps the entry so
+/// [`staged_request_trailers`] can still emit the backend's native trailers.
+/// `metadata_redaction::is_internal_only_metadata_key` classifies the same key
+/// so a custom log schema cannot project it back either.
+pub(crate) fn redact_internal_log_metadata(metadata: &mut HashMap<String, String>) {
+    metadata.remove(META_GRPC_WEB_REQUEST_TRAILERS);
 }
 
 /// Decode the staged request trailer block into a native HTTP/2 trailer map.
@@ -894,6 +939,10 @@ pub struct GrpcWebPlugin {
     instance_id_str: String,
     /// `grpc_web.instance.{id}.mode` — per-instance copy of the claimed mode.
     instance_mode_key: String,
+    /// `grpc_web.instance.{id}.native_ct` — per-instance copy of the native
+    /// gRPC `Content-Type` this instance rewrote the request to, including the
+    /// preserved message-format suffix.
+    instance_native_ct_key: String,
     expose_headers: Vec<String>,
     expose_headers_value: String,
 }
@@ -917,10 +966,12 @@ impl GrpcWebPlugin {
         let instance_id = INSTANCE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
         let instance_id_str = instance_id.to_string();
         let instance_mode_key = format!("{INSTANCE_META_PREFIX}{instance_id}.mode");
+        let instance_native_ct_key = format!("{INSTANCE_META_PREFIX}{instance_id}.native_ct");
 
         Ok(Self {
             instance_id_str,
             instance_mode_key,
+            instance_native_ct_key,
             expose_headers,
             expose_headers_value,
         })
@@ -945,6 +996,19 @@ impl GrpcWebPlugin {
             "text" | "binary" => Some(owned),
             _ => None,
         }
+    }
+
+    /// Native gRPC `Content-Type` this instance staged for its owned
+    /// translation, re-validated before use.
+    ///
+    /// `ctx.metadata` is plugin-writable, so the staged string is accepted only
+    /// when it still parses as a native gRPC media type. Anything else falls
+    /// back to the bare `application/grpc` the request was already rewritten to
+    /// rather than planting an arbitrary value on the backend request.
+    fn owned_native_content_type<'a>(&self, ctx: &'a RequestContext) -> Option<&'a str> {
+        let staged = ctx.metadata.get(&self.instance_native_ct_key)?.as_str();
+        crate::proxy::backend_dispatch::is_native_grpc_content_type(staged.as_bytes())
+            .then_some(staged)
     }
 
     fn merge_expose_headers(&self, response_headers: &mut HashMap<String, String>) {
@@ -1132,6 +1196,20 @@ impl GrpcWebPlugin {
     }
 }
 
+/// Parse the `expose_headers` list.
+///
+/// The admission rules here are the authoritative contract the OpenAPI
+/// component and `docs/plugins.md` model:
+///
+/// * absent or explicit `null` means the empty list — `null` is accepted at the
+///   FIELD level even though the plugin config object itself rejects `null`;
+/// * each item is a string, trimmed of ASCII OWS (space / tab) only — HTTP's
+///   own definition of surrounding whitespace, and the one a JSON-Schema
+///   `pattern` can model without depending on how a regex dialect spells `\s`;
+/// * an empty or whitespace-only item is rejected, as is anything that is not a
+///   valid HTTP field name (token characters only);
+/// * accepted names are lowercased and de-duplicated, preserving first-seen
+///   order.
 fn parse_expose_headers(config: &Value) -> Result<Vec<String>, String> {
     let Some(value) = config.get("expose_headers") else {
         return Ok(Vec::new());
@@ -1150,7 +1228,7 @@ fn parse_expose_headers(config: &Value) -> Result<Vec<String>, String> {
         let header = raw.as_str().ok_or_else(|| {
             format!("grpc_web: 'expose_headers[{idx}]' must be a string, got: {raw}")
         })?;
-        let header = header.trim();
+        let header = header.trim_matches(|ch| ch == ' ' || ch == '\t');
         if header.is_empty() {
             return Err(format!(
                 "grpc_web: 'expose_headers[{idx}]' must not be empty"
@@ -1355,9 +1433,26 @@ fn parse_q_weight(raw: &[u8]) -> Option<u16> {
     Some(thousandths)
 }
 
-fn parameter_q_weight(parameters: &[u8]) -> Result<u16, GrpcWebAcceptError> {
+/// Parsed media-range parameters: the effective quality weight, plus whether the
+/// range carried any parameter OTHER than `q`.
+///
+/// RFC 9110 §12.5.1 makes non-`q` parameters part of the media range. Ferrum
+/// never emits parameterized gRPC-Web types, so those parameters are not
+/// used for precedence or quality selection and cannot veto a matching
+/// type/subtype/suffix; they are still reported so negotiation can apply that
+/// narrower matching rule.
+#[derive(Clone, Copy, Debug)]
+struct MediaRangeParameters {
+    quality: u16,
+    has_media_parameters: bool,
+}
+
+fn parse_media_range_parameters(
+    parameters: &[u8],
+) -> Result<MediaRangeParameters, GrpcWebAcceptError> {
     let mut value = parameters;
     let mut quality: Option<u16> = None;
+    let mut has_media_parameters = false;
     while !value.is_empty() {
         while value.first().is_some_and(|byte| is_ows(*byte)) {
             value = &value[1..];
@@ -1425,6 +1520,12 @@ fn parameter_q_weight(parameters: &[u8]) -> Result<u16, GrpcWebAcceptError> {
                 return Err(GrpcWebAcceptError::Malformed);
             }
             quality = Some(parse_q_weight(param_value).ok_or(GrpcWebAcceptError::Malformed)?);
+        } else if quality.is_none() {
+            // RFC 9110 §12.5.1: `q` separates media-range parameters from
+            // Accept extension parameters. Only what precedes `q` is part of
+            // the range; everything after it is an accept-ext and does not
+            // constrain which representation the range applies to.
+            has_media_parameters = true;
         }
 
         while value.first().is_some_and(|byte| is_ows(*byte)) {
@@ -1434,7 +1535,10 @@ fn parameter_q_weight(parameters: &[u8]) -> Result<u16, GrpcWebAcceptError> {
             return Err(GrpcWebAcceptError::Malformed);
         }
     }
-    Ok(quality.unwrap_or(1000))
+    Ok(MediaRangeParameters {
+        quality: quality.unwrap_or(1000),
+        has_media_parameters,
+    })
 }
 
 fn grpc_web_media_type(ct: &str) -> Option<GrpcWebMediaType> {
@@ -1475,6 +1579,26 @@ fn grpc_web_media_type(ct: &str) -> Option<GrpcWebMediaType> {
 
     classify(APPLICATION_GRPC_WEB_TEXT.as_bytes(), GrpcWebMode::Text)
         .or_else(|| classify(APPLICATION_GRPC_WEB.as_bytes(), GrpcWebMode::Binary))
+}
+
+/// The native gRPC `Content-Type` a gRPC-Web request translates INTO.
+///
+/// PROTOCOL-HTTP2 defines the native type as
+/// `"application/grpc" [("+proto" / "+json" / {custom})]`, and the gRPC-Web
+/// format suffix names the very same message serialization. Translation
+/// re-frames the transport, never the message payload, so dropping the suffix
+/// mislabels the bytes: a backend that dispatches its codec from the native
+/// content-type answers a `+json` upload as if it were protobuf.
+///
+/// A bare `application/grpc-web` and an explicit `+proto` collapse to the bare
+/// native type, which the wire format defines as the same (implicit `proto`)
+/// serialization — the canonical spelling every native gRPC implementation
+/// already accepts. Any other suffix is carried through verbatim.
+fn native_grpc_content_type(media: &GrpcWebMediaType) -> String {
+    match media.format_suffix.as_deref() {
+        None | Some("proto") => "application/grpc".to_string(),
+        Some(suffix) => format!("application/grpc+{suffix}"),
+    }
 }
 
 fn canonical_grpc_web_content_type(media: &GrpcWebMediaType) -> String {
@@ -1531,6 +1655,14 @@ struct AcceptRange {
     format_suffix: Option<String>,
     quality: u16,
     specificity: AcceptSpecificity,
+    /// The range carried at least one media-range parameter other than `q`
+    /// (`application/grpc-web+proto;version=2`, `charset=utf-8`, …).
+    ///
+    /// Type, subtype, and suffix still match the bare canonical media type
+    /// Ferrum emits, so a parameterized range can accept a candidate. It is
+    /// ignored for precedence/quality selection and, at `q=0`, cannot veto an
+    /// unparameterized representation the same list already accepted.
+    has_media_parameters: bool,
 }
 
 fn parse_accept_range(entry: &str) -> Result<Option<AcceptRange>, GrpcWebAcceptError> {
@@ -1546,7 +1678,10 @@ fn parse_accept_range(entry: &str) -> Result<Option<AcceptRange>, GrpcWebAcceptE
     if essence.is_empty() {
         return Err(GrpcWebAcceptError::Malformed);
     }
-    let quality = parameter_q_weight(parameters)?;
+    let MediaRangeParameters {
+        quality,
+        has_media_parameters,
+    } = parse_media_range_parameters(parameters)?;
 
     if essence == b"*/*" {
         return Ok(Some(AcceptRange {
@@ -1554,6 +1689,7 @@ fn parse_accept_range(entry: &str) -> Result<Option<AcceptRange>, GrpcWebAcceptE
             format_suffix: None,
             quality,
             specificity: AcceptSpecificity::FullWildcard,
+            has_media_parameters,
         }));
     }
     if essence.eq_ignore_ascii_case(b"application/*") {
@@ -1562,6 +1698,7 @@ fn parse_accept_range(entry: &str) -> Result<Option<AcceptRange>, GrpcWebAcceptE
             format_suffix: None,
             quality,
             specificity: AcceptSpecificity::TypeWildcard,
+            has_media_parameters,
         }));
     }
 
@@ -1581,6 +1718,7 @@ fn parse_accept_range(entry: &str) -> Result<Option<AcceptRange>, GrpcWebAcceptE
         format_suffix: media.format_suffix,
         quality,
         specificity: AcceptSpecificity::Exact,
+        has_media_parameters,
     }))
 }
 
@@ -1664,6 +1802,12 @@ pub fn negotiate_response_media_type(
         },
     ];
     for range in &ranges {
+        // A parameterized `q=0` range cannot veto, so it also must not add a
+        // candidate that a wildcard could then select. `q>0` parameterized
+        // ranges still name a type/suffix Ferrum can produce.
+        if range.has_media_parameters && range.quality == 0 {
+            continue;
+        }
         if let AcceptRangeKind::Exact(mode) = range.kind {
             let candidate_suffix = range
                 .format_suffix
@@ -1703,11 +1847,24 @@ pub fn negotiate_response_media_type(
             if !matches {
                 continue;
             }
+            // Non-`q` parameters still match type/subtype/suffix (so
+            // `charset=utf-8` cannot 406 a client on its own). They keep their
+            // specificity against wildcards, but they cannot veto (`q=0`)
+            // and cannot overwrite an unparameterized range at equal
+            // specificity — that overwrite is what turned
+            // `application/grpc-web+proto;q=1, application/grpc-web+proto;version=2;q=0`
+            // into a 406 and would let an unrelated range win on stolen quality.
+            if range.has_media_parameters && range.quality == 0 {
+                continue;
+            }
             if controlling
                 .as_ref()
                 .is_none_or(|(specificity, previous_index, _)| {
                     range.specificity > *specificity
-                        || (range.specificity == *specificity && index > *previous_index)
+                        || (range.specificity == *specificity
+                            && index > *previous_index
+                            && (!range.has_media_parameters
+                                || ranges[*previous_index].has_media_parameters))
                 })
             {
                 controlling = Some((range.specificity, index, range.quality));
@@ -1751,6 +1908,46 @@ pub(crate) fn is_grpc_web_content_type(ct: &str) -> bool {
 /// Check if a gRPC-Web content-type uses text (base64) encoding.
 pub(crate) fn is_grpc_web_text(ct: &str) -> bool {
     grpc_web_media_type(ct).is_some_and(|media_type| media_type.mode == GrpcWebMode::Text)
+}
+
+/// Whether the PRISTINE backend response is an HTTP error carrying an entity
+/// that is not a gRPC message stream.
+///
+/// A gRPC response is always HTTP `200` with an `application/grpc*` type, so a
+/// non-`200` answer labelled `text/plain`, `text/html`, or nothing at all is an
+/// HTTP error document written by the origin or an intermediary — not frames.
+/// gRPC-Web response bodies are a frame SEQUENCE: prepending that document to
+/// the synthesized terminal frame produces bytes no client can parse, so the
+/// mapped status the client is supposed to read becomes unreachable at byte 0.
+/// Such an entity is dropped and only the terminal frame is emitted.
+///
+/// Both conjuncts are load-bearing. Requiring a non-`200` status keeps every
+/// ordinary RPC reply — including a backend that answers `200` with an unusual
+/// or absent content-type — on the pass-through path, so no message bytes are
+/// ever discarded on a successful call. Requiring a non-gRPC media type keeps a
+/// backend that genuinely framed its error (`grpc-status` in trailers under
+/// `application/grpc`) forwarding those frames.
+///
+/// Decided once, from the backend's own headers, before `after_proxy` relabels
+/// the representation as gRPC-Web — never re-derived from the rewritten type
+/// and never sniffed from body bytes.
+fn unframed_backend_error_entity(status: u16, headers: &HashMap<String, String>) -> bool {
+    if status == 200 {
+        return false;
+    }
+    let Some(content_type) = headers.get("content-type") else {
+        return true;
+    };
+    !crate::proxy::backend_dispatch::is_native_grpc_content_type(content_type.as_bytes())
+        && !is_grpc_web_content_type(content_type)
+}
+
+/// True when the translation owner recorded a non-gRPC HTTP error entity for
+/// this request. Both the streaming adapter and the buffered transform drop the
+/// entity so the client receives a valid terminal-only gRPC-Web body.
+pub(crate) fn response_entity_is_unframed_backend_error(ctx: &RequestContext) -> bool {
+    ctx.metadata
+        .contains_key(META_GRPC_WEB_UNFRAMED_ERROR_ENTITY)
 }
 
 /// True when the `grpc_web` plugin translated this request from gRPC-Web to
@@ -3603,9 +3800,9 @@ impl Plugin for GrpcWebPlugin {
             None => return PluginResult::Continue,
         };
 
-        if !is_grpc_web_content_type(&content_type) {
+        let Some(request_media) = grpc_web_media_type(&content_type) else {
             return PluginResult::Continue;
-        }
+        };
 
         // First effective instance in configured order owns translation. A
         // later instance must not overwrite shared staging or re-claim when the
@@ -3621,11 +3818,15 @@ impl Plugin for GrpcWebPlugin {
         }
 
         // Request decoding mode follows Content-Type only.
-        let mode = if is_grpc_web_text(&content_type) {
+        let mode = if request_media.mode == GrpcWebMode::Text {
             "text"
         } else {
             "binary"
         };
+        // Native gRPC label for the backend-bound request. The wire MODE is
+        // translated; the message serialization named by the format suffix is
+        // not, so the suffix has to survive onto `application/grpc`.
+        let native_ct = native_grpc_content_type(&request_media);
 
         // Response encoding follows Accept negotiation (default: request CT).
         // Negotiate before claiming ownership so a 406 does not leave a
@@ -3681,12 +3882,13 @@ impl Plugin for GrpcWebPlugin {
             .insert(META_GRPC_WEB_ORIGINAL_CT.to_string(), response_ct);
         ctx.metadata
             .insert(self.instance_mode_key.clone(), mode.to_string());
+        ctx.metadata
+            .insert(self.instance_native_ct_key.clone(), native_ct.clone());
 
         // Rewrite content-type so downstream plugins and the gRPC proxy
         // treat this as a native gRPC request. Sibling instances then see
-        // `application/grpc` and do not attempt a second claim.
-        ctx.headers
-            .insert("content-type".to_string(), "application/grpc".to_string());
+        // `application/grpc*` and do not attempt a second claim.
+        ctx.headers.insert("content-type".to_string(), native_ct);
 
         PluginResult::Continue
     }
@@ -3712,8 +3914,14 @@ impl Plugin for GrpcWebPlugin {
             return PluginResult::Continue;
         };
 
-        // Ensure outgoing content-type is native gRPC
-        headers.insert("content-type".to_string(), "application/grpc".to_string());
+        // Ensure outgoing content-type is native gRPC, keeping the request's
+        // message-format suffix (`+json`, a custom codec) that
+        // `on_request_received` already translated onto it.
+        let native_ct = self
+            .owned_native_content_type(ctx)
+            .unwrap_or("application/grpc")
+            .to_string();
+        headers.insert("content-type".to_string(), native_ct);
 
         // Compatibility marker for the legacy no-context transform path.
         // Production uses `transform_request_body_with_context` + metadata.
@@ -4040,6 +4248,22 @@ impl Plugin for GrpcWebPlugin {
                 response_status.to_string(),
             );
 
+            // Judge the entity against the PRISTINE backend labelling, before
+            // the rewrite below relabels it gRPC-Web. A non-gRPC HTTP error
+            // document is not a frame sequence and must not be framed as one.
+            if unframed_backend_error_entity(response_status, response_headers) {
+                debug!(
+                    plugin = "grpc_web",
+                    instance = %self.instance_id_str,
+                    status = response_status,
+                    "Dropping non-gRPC backend error entity from the translated gRPC-Web body"
+                );
+                ctx.metadata.insert(
+                    META_GRPC_WEB_UNFRAMED_ERROR_ENTITY.to_string(),
+                    "1".to_string(),
+                );
+            }
+
             // Rewrite response content-type to the negotiated gRPC-Web variant
             // (already canonical in metadata from Accept negotiation).
             let resp_ct = original_ct;
@@ -4162,6 +4386,13 @@ impl Plugin for GrpcWebPlugin {
             // state. Retain only reserved terminal metadata.
             allowlist = Some(HashSet::new());
         }
+        // A non-gRPC HTTP error document never becomes gRPC-Web message frames:
+        // frame only the terminal status. See `unframed_backend_error_entity`.
+        let body: &[u8] = if response_entity_is_unframed_backend_error(ctx) {
+            &[]
+        } else {
+            body
+        };
         let translated = match self.transform_grpc_web_response_body(
             body,
             content_type,

@@ -914,7 +914,10 @@ async fn grpc_web_accept_negotiates_h1_h2_success_and_rejection_paths() {
                 Method::POST,
                 "/grpc-accept/my.Service/Unary",
                 "application/grpc-web+json",
-                Some("text/html, Application/Grpc-Web-Text+Json; charset=utf-8; Q=0.8"),
+                // Non-`q` parameters still match type/subtype/suffix (issue #5137
+                // narrower rule). charset after `q` is accept-ext and is also
+                // ignored for selection; either placement must negotiate text+json.
+                Some("text/html, Application/Grpc-Web-Text+Json; Q=0.8; charset=utf-8"),
             )
             .await
             .unwrap_or_else(|error| panic!("{version:?} text-negotiated request failed: {error}"));
@@ -943,6 +946,51 @@ async fn grpc_web_accept_negotiates_h1_h2_success_and_rejection_paths() {
              (last status={last_text_status}, content-type={last_text_ct:?}, \
              vary={last_text_vary:?}, {} body bytes)",
             last_text_body_len
+        );
+
+        // Issue #5137: a `q=0` refusal aimed at a parameterized variant must
+        // not suppress the unparameterized representation the same list
+        // explicitly accepted.
+        let (status, headers, _body) = send_http_request_with_accept(
+            gateway_addr,
+            version,
+            Method::POST,
+            "/grpc-accept/my.Service/Unary",
+            "application/grpc-web+proto",
+            Some("application/grpc-web+proto;q=1, application/grpc-web+proto;version=2;q=0"),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("{version:?} parameterized-refusal request failed: {error}")
+        });
+        assert_ne!(
+            status, 406,
+            "{version:?} a parameterized refusal must not veto an accepted representation"
+        );
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("application/grpc-web+proto")
+        );
+
+        // A parameterized-only Accept still matches on type/subtype/suffix
+        // (the H3 functional client and browsers send charset=utf-8 this way).
+        let (status, headers, _body) = send_http_request_with_accept(
+            gateway_addr,
+            version,
+            Method::POST,
+            "/grpc-accept/my.Service/Unary",
+            "application/grpc-web+proto",
+            Some("application/grpc-web+proto;version=2"),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{version:?} parameterized-only request failed: {error}"));
+        assert_ne!(
+            status, 406,
+            "{version:?} a parameterized type match must not 406 on its own"
+        );
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("application/grpc-web+proto")
         );
 
         let text_request = BASE64.encode([0u8, 0, 0, 0, 0]);
@@ -986,7 +1034,13 @@ async fn grpc_web_accept_negotiates_h1_h2_success_and_rejection_paths() {
             last_binary_body_len
         );
 
-        for accept in ["text/html", "application/grpc-web;q=broken"] {
+        for accept in [
+            "text/html",
+            "application/grpc-web;q=broken",
+            // A parameterized range whose type/suffix does not match is still
+            // Not Acceptable — parameters must not make an unrelated range win.
+            "application/grpc-web-text+thrift;charset=utf-8",
+        ] {
             let (status, headers, body) = send_http_request_with_accept(
                 gateway_addr,
                 version,
@@ -5051,6 +5105,7 @@ async fn grpc_streaming_late_upload_overflow_during_response_records_neutral() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     });
     let cb_config = proxy.circuit_breaker.clone().unwrap();
     let backend_host = proxy.backend_host.clone();
@@ -5190,6 +5245,7 @@ async fn grpc_streaming_clean_probe_heals_breaker_at_body_completion() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     });
     let cb_config = proxy.circuit_breaker.clone().unwrap();
     let backend_host = proxy.backend_host.clone();
@@ -5282,6 +5338,7 @@ async fn grpc_streaming_closed_state_backend_failure_trips_breaker_at_header_tim
         failure_status_codes: vec![503],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
+        half_open_probe_dwell_seconds: None,
     });
     let cb_config = proxy.circuit_breaker.clone().unwrap();
     let backend_host = proxy.backend_host.clone();

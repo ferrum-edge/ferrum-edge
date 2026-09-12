@@ -1705,8 +1705,10 @@ pub(crate) struct ConnectUdpRequest {
     /// Canonicalized client-requested path — the RFC 9298 template expansion.
     pub(crate) request_path: String,
     pub(crate) proxy_headers: HashMap<String, String>,
-    pub(crate) cb_target_key: Option<String>,
-    pub(crate) cb_is_half_open_probe: bool,
+    /// Ownership of any HALF_OPEN circuit-breaker probe slot admitted for this
+    /// request. CONNECT-UDP is exempt from the breaker gate, so this is normally
+    /// an empty guard; it is moved in — and released below — as defence in depth.
+    pub(crate) cb_probe: crate::proxy::HalfOpenProbeGuard,
     /// Whether plugin/policy route overrides shaped the proxy this request was
     /// admitted against.
     ///
@@ -1779,22 +1781,16 @@ pub(crate) async fn handle_h3_connect_udp(
         start_time,
         request_path,
         proxy_headers,
-        cb_target_key,
-        cb_is_half_open_probe,
+        cb_probe,
         route_overrides_applied,
     } = request;
 
     // A CONNECT-UDP tunnel dials no HTTP backend, so it can neither confirm nor
     // refute a half-open circuit-breaker probe. The dispatcher therefore does
-    // not consult the breaker for CONNECT-UDP at all and these arrive as
-    // `(None, false)`; this stays as defense in depth, because a claimed slot
-    // held for the session lifetime would wedge the breaker closed.
-    crate::http3::websocket::release_h3_ws_circuit_breaker_probe_on_admission_reject(
-        &state,
-        &proxy,
-        cb_target_key.as_deref(),
-        cb_is_half_open_probe,
-    );
+    // not consult the breaker for CONNECT-UDP at all and this guard arrives
+    // empty; releasing it stays as defense in depth, because a claimed slot held
+    // for the session lifetime would wedge the breaker closed.
+    cb_probe.release_neutral();
 
     // Defense in depth: the dispatcher already gated this. The predicate covers
     // both halves of availability — the operator's switch and this target's

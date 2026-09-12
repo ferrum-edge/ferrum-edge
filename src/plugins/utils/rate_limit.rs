@@ -1,5 +1,7 @@
 //! Shared rate-limit algorithms plus local/Redis/failover storage adapters.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde_json::Value;
@@ -2228,11 +2230,38 @@ impl RateLimitAlgorithm for DynamicHttpRateLimitAlgorithm {
 /// uniquely identifies a `reserve()` so that a later out-of-order
 /// reconciliation can release *its own* reservation instead of whichever entry
 /// happens to be newest.
+///
+/// `id == 0` is the "no identity" sentinel: `allocate_id` never hands it out and
+/// `adjust_usage` filters it out of reservation lookups.
 #[derive(Debug, Clone, Copy)]
 struct TokenEntry {
     at: Instant,
     id: u64,
     tokens: u64,
+}
+
+/// Hard ceiling on the number of `TokenEntry` records ONE identity's window may
+/// retain (`GHSA-q2hx-w52w-c6r3`).
+///
+/// Before this bound the only limit on per-key history was the configured
+/// `token_limit` itself — every retained record carries at least one token — so
+/// an admitted budget of `u64::MAX` over a 31-day window (both accepted at
+/// construction) let a single identity grow one deque without any practical
+/// resource ceiling, and made the reconciliation scan linear in that history.
+/// The hard cardinality cap (`MAX_STATE_ENTRIES`) bounds identities, not
+/// records per identity.
+///
+/// 1,024 is far above any realistic in-flight concurrency for one consumer or
+/// client IP, so ordinary traffic never coalesces at all, while the worst-case
+/// retention per key becomes a small constant instead of a configuration
+/// parameter.
+const MAX_TOKEN_WINDOW_ENTRIES: usize = 1_024;
+
+/// [`MAX_TOKEN_WINDOW_ENTRIES`] for external bounded-history tests.
+#[doc(hidden)]
+#[allow(dead_code)] // used only by external tests; dead in binary test target
+pub const fn max_token_window_entries_for_test() -> usize {
+    MAX_TOKEN_WINDOW_ENTRIES
 }
 
 #[derive(Debug)]
@@ -2294,7 +2323,49 @@ impl TokenUsageWindow {
         self.last_activity = Some(at);
         self.entries.push_back(TokenEntry { at, id, tokens });
         self.total = self.total.saturating_add(tokens);
+        self.coalesce_oldest_entries();
         id
+    }
+
+    /// Keep retained history within [`MAX_TOKEN_WINDOW_ENTRIES`] by AGGREGATING
+    /// the two oldest records, never by dropping usage.
+    ///
+    /// The merged record keeps the sum of both token counts and the NEWER of
+    /// the two timestamps, so the window's running total is unchanged and the
+    /// merged tokens expire no EARLIER than either constituent would have —
+    /// the conservative direction, and the reason this is an accounting
+    /// approximation rather than an eviction. A live budget is never reduced to
+    /// meet the bound.
+    ///
+    /// Exactly ONE identity is lost per merge — the OLDEST record's. The
+    /// surviving record keeps its own `id`, so its reconciliation still applies
+    /// to it normally: a correction is bounded by what THAT reservation
+    /// reserved, and the absorbed tokens simply remain as retained usage. A
+    /// reconciliation that still targets the absorbed reservation finds no
+    /// entry and takes the existing "reservation already gone" path — a
+    /// negative correction is dropped (releasing from an unrelated entry would
+    /// UNDER-count the budget), a positive one is recorded as new usage.
+    ///
+    /// Merging from the oldest end is what makes that loss theoretical for real
+    /// traffic: in-flight reservations are the NEWEST records, so an identity
+    /// would have to hold more than [`MAX_TOKEN_WINDOW_ENTRIES`] unreconciled
+    /// requests at once before any of them could lose its release.
+    ///
+    /// Each insert adds at most one record, so at most one merge runs per
+    /// insert and the loop is amortised O(1).
+    fn coalesce_oldest_entries(&mut self) {
+        while self.entries.len() > MAX_TOKEN_WINDOW_ENTRIES {
+            let Some(oldest) = self.entries.pop_front() else {
+                return;
+            };
+            let Some(next) = self.entries.front_mut() else {
+                // Cannot happen while the length exceeds a cap of at least 1,
+                // but restoring the record keeps the total honest either way.
+                self.entries.push_front(oldest);
+                return;
+            };
+            next.tokens = next.tokens.saturating_add(oldest.tokens);
+        }
     }
 
     fn allocate_id(&mut self) -> u64 {
@@ -2367,14 +2438,13 @@ impl TokenUsageWindow {
         if let Some(id) = reservation_id.filter(|id| *id != 0) {
             // PERF: linear scan (and the `retain` below on full release) over the
             // window's entries while the caller holds the per-key shard
-            // write-lock. O(n) in live entries for this key (n ≈
-            // window_seconds × RPS for a hot consumer/IP). This runs at most once
-            // per request (reconciliation is idempotent) and off the
-            // request-admission hot path, so it is acceptable today; if a single
-            // hot key with a long window makes this scan dominate, replace the
-            // VecDeque + scan with an id→index map (kept consistent across
-            // record_usage / retain / pop_back / window eviction) for O(1)
-            // lookup. Documented in docs/plugins.md (Local-mode performance).
+            // write-lock. Bounded by MAX_TOKEN_WINDOW_ENTRIES rather than by the
+            // key's history, so it no longer grows with `window_seconds × RPS`
+            // (GHSA-q2hx-w52w-c6r3): a hot key's completed charges coalesce into
+            // a fixed number of records instead of accumulating one per request.
+            // This runs at most once per request (reconciliation is idempotent)
+            // and off the request-admission hot path. Documented in
+            // docs/plugins.md (Local-mode performance).
             if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
                 let new_tokens = if delta >= 0 {
                     entry.tokens.saturating_add(delta as u64)
@@ -2432,6 +2502,21 @@ impl TokenUsageWindow {
 
     fn remaining(&mut self, now: Instant) -> u64 {
         self.limit.saturating_sub(self.current_usage(now))
+    }
+
+    /// Records this window currently retains, and the bytes they occupy.
+    ///
+    /// Test/diagnostic accessor for the bounded-history guarantee
+    /// (`GHSA-q2hx-w52w-c6r3`): it is what lets a deterministic test assert that
+    /// records stop growing as completed requests increase, without standing up
+    /// a live workload.
+    #[doc(hidden)]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub fn retained_records_for_test(&self) -> (usize, usize) {
+        (
+            self.entries.len(),
+            self.entries.len() * std::mem::size_of::<TokenEntry>(),
+        )
     }
 
     fn has_recent_activity(&self, now: Instant) -> bool {
@@ -2664,7 +2749,7 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                     {
                         // `curr_key` embeds the caller-supplied identity
                         // dimension, so it is not logged.
-                        warn!(
+                        warn_sampled!(
                             "ai_rate_limiter: failed to roll back denied Redis token reservation; \
                              estimate stays charged until the window TTL expires"
                         );

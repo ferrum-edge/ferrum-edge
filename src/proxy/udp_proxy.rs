@@ -46,13 +46,13 @@ use crate::plugins::{
     StreamConnectionContext, StreamTransactionSummary, UdpDatagramContext, UdpDatagramDirection,
     UdpDatagramVerdict, UdpMetadataSink,
 };
-use crate::proxy::LoadBalancerConnectionGuard;
 use crate::proxy::datagram_client_address::{
     DatagramClientAddressGate, DatagramClientIdentity, DatagramMetadataError,
 };
 use crate::proxy::stream_error::{
     StreamSetupError, StreamSetupKind, find_stream_setup_error, stream_dns_setup_error,
 };
+use crate::proxy::{HalfOpenProbeGuard, LoadBalancerConnectionGuard};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 
 /// Maximum datagram size for UDP forwarding.
@@ -170,6 +170,21 @@ pub struct UdpProxyMetrics {
     /// in-flight hook awaits for this listener. Used as a listener-wide
     /// admission budget.
     hook_ingress_queued_bytes: AtomicUsize,
+    /// Client→backend datagrams dropped because a session's bounded
+    /// backend-send writer was full or already closing (issue #5045). This is
+    /// gateway backpressure, never a policy refusal.
+    pub egress_queue_drops: AtomicU64,
+    /// Client→backend sends handed to a per-session writer because the
+    /// connected backend socket was not immediately writable, or because the
+    /// backend leg terminates DTLS. Separates real local socket pressure from
+    /// queue drops.
+    pub egress_handoffs: AtomicU64,
+    /// Backend send failures observed by a per-session egress writer. The
+    /// inline fast path reports its own errors to the receive loop instead.
+    pub egress_send_errors: AtomicU64,
+    /// Payload bytes retained across all per-session egress writers on this
+    /// listener. Used as a listener-wide admission budget.
+    egress_queued_bytes: AtomicUsize,
     /// Datagrams dropped by the client-address metadata gate: untrusted peer,
     /// missing/failed authentication, malformed envelope, a binding that names
     /// another listener, a duplicate/stale/malformed freshness record, replay
@@ -395,6 +410,23 @@ struct UdpSession {
     /// Dedicated cancellation wake for an in-flight datagram hook. Unlike
     /// `stop_notify`, this is not shared with the backend reply task.
     hook_ingress_stop_notify: Arc<tokio::sync::Notify>,
+    /// Bounded client→backend backend-send writer (issue #5045). `None` until
+    /// this session first has to hand a send off — a `WouldBlock` on the
+    /// connected backend socket, or DTLS origination — so an uncongested plain
+    /// UDP session never allocates the channel and never spawns the task.
+    /// Taken by teardown so the worker observes channel close promptly.
+    egress_tx: std::sync::Mutex<Option<mpsc::Sender<UdpEgressDatagram>>>,
+    /// Datagrams this session's egress writer owns: queued in the channel plus
+    /// the one whose send is in flight. NON-ZERO IS THE FIFO FENCE — while the
+    /// writer owns anything, the listener's `try_send` fast path must queue
+    /// behind it, or a later datagram would overtake an earlier one on the wire.
+    egress_inflight: AtomicUsize,
+    /// Payload bytes this session's egress writer owns, charged at admission
+    /// and released when the datagram leaves the writer.
+    egress_queued_bytes: AtomicUsize,
+    /// Set by teardown so a late datagram cannot respawn an egress writer for a
+    /// session that is already being retired.
+    egress_closed: std::sync::atomic::AtomicBool,
     /// Absolute authorization lifetime of the credential that admitted this
     /// plain-UDP session, plus the once-only settlement latch shared with the
     /// post-admission setup stages (issue #3816).
@@ -644,6 +676,12 @@ impl UdpSession {
     /// `recv` and exits without waiting for further client datagrams. This is
     /// the worker's cancellation / idle-wake path (paired with reply-task stop
     /// and session expiry). It must not share [`Self::stop_notify`].
+    ///
+    /// Also closes the bounded backend-send writer: both are per-session
+    /// client→backend workers, neither may outlive the session, and routing
+    /// both through this ONE call is what keeps every existing teardown site
+    /// (idle cleanup, reply-task exit, expiry, listener shutdown) exactly-once
+    /// correct for the writer without a second closing contract to keep in step.
     fn close_hook_ingress(&self) {
         let mut guard = self
             .hook_ingress_tx
@@ -653,6 +691,34 @@ impl UdpSession {
         // `notify_one` stores a permit if the worker is between its stop-flag
         // check and registering the hook-cancellation waiter.
         self.hook_ingress_stop_notify.notify_one();
+        drop(guard);
+        self.close_egress_writer();
+    }
+
+    /// Drop the egress-writer sender so an idle per-session backend-send worker
+    /// wakes from `recv` and exits, and fence off any respawn for this
+    /// generation. Idempotent, and also reached from the worker's own exit.
+    fn close_egress_writer(&self) {
+        self.egress_closed.store(true, Ordering::Release);
+        let mut guard = self
+            .egress_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.take();
+    }
+
+    /// `true` while this session's egress writer still owns at least one
+    /// datagram (queued or in flight).
+    ///
+    /// One atomic load on the datagram fast path. When it is set, the listener
+    /// MUST queue rather than `try_send`: a socket that became writable again
+    /// would otherwise let a newly arrived datagram overtake the ones already
+    /// waiting in this session's FIFO. The count is released only after a
+    /// dequeued datagram's send has settled, so it stays set across the
+    /// in-flight send too.
+    #[inline]
+    fn egress_writer_engaged(&self) -> bool {
+        self.egress_inflight.load(Ordering::Acquire) > 0
     }
 }
 
@@ -938,6 +1004,22 @@ const SESSION_HOOK_INGRESS_MAX_QUEUED_BYTES: usize = 256 * 1024;
 /// listener. This keeps the aggregate bound independent of the session cap.
 const LISTENER_HOOK_INGRESS_MAX_QUEUED_BYTES: usize = 16 * 1024 * 1024;
 
+/// Per-session client→backend egress writer depth: datagrams queued in the
+/// channel PLUS the one whose send is in flight (issue #5045). The shared
+/// listener only reaches this queue when the connected backend socket answered
+/// `WouldBlock`, or when the backend leg is DTLS, so it is sized for a
+/// transient local socket-buffer stall rather than for steady traffic.
+const SESSION_EGRESS_MAX_QUEUED_DATAGRAMS: usize = 64;
+
+/// Maximum payload bytes one session may retain in its egress writer (queue
+/// plus the in-flight datagram). Paired with the item budget above so a
+/// small-datagram burst and a jumbo-datagram burst are both bounded.
+const SESSION_EGRESS_MAX_QUEUED_BYTES: usize = 256 * 1024;
+
+/// Maximum payload retained by egress writers across one listener, so the
+/// per-session allowance above cannot scale retained memory with session count.
+const LISTENER_EGRESS_MAX_QUEUED_BYTES: usize = 16 * 1024 * 1024;
+
 /// Emit a rate-limited warning for hook-ingress drops (first drop, then every
 /// 100th). Omits client addresses so labels/log fields stay bounded.
 fn record_hook_ingress_drop(metrics: &UdpProxyMetrics, proxy_id: &str, listen_port: u16) {
@@ -1174,6 +1256,319 @@ fn spawn_session_hook_ingress_worker(
         // already be closed). Never run hooks or forward after stop.
         while let Ok(data) = rx.try_recv() {
             release_hook_ingress_retained_bytes(&session, &metrics, data.len());
+        }
+    });
+}
+
+/// One client→backend datagram owned by a session's bounded egress writer.
+struct UdpEgressDatagram {
+    data: Bytes,
+    /// `true` when a fast-path attempt already accrued this datagram's
+    /// amplification response budget before the connected socket answered
+    /// `WouldBlock`. The writer must not accrue it a second time — one client
+    /// datagram earns exactly one response budget.
+    budget_published: bool,
+}
+
+/// Outcome of admitting one client→backend datagram without blocking the
+/// shared listener receive loop.
+enum UdpEgressAdmission {
+    /// The connected backend socket accepted the datagram immediately, from the
+    /// borrowed receive buffer: one `sendto(2)`, no allocation, no task handoff.
+    Sent,
+    /// Handed to this session's bounded writer. NOT a wire commit — the writer
+    /// accounts `datagrams_out` / `bytes_out` only after the send settles, so a
+    /// DTLS enqueue is never reported as delivered ciphertext.
+    Queued,
+    /// Refused by the writer's item or byte budget, or by a session already
+    /// being retired. Gateway backpressure, never a policy refusal.
+    Dropped,
+    /// A terminal per-datagram error for the receive loop to log.
+    Failed(anyhow::Error),
+}
+
+/// Emit a rate-limited warning for egress-writer drops (first drop, then every
+/// 100th). Omits client addresses so labels/log fields stay bounded.
+fn record_egress_queue_drop(metrics: &UdpProxyMetrics, proxy_id: &str, listen_port: u16) {
+    let n = metrics.egress_queue_drops.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(100) {
+        warn!(
+            proxy_id = %proxy_id,
+            listen_port,
+            drops = n,
+            "UDP backend-send queue full or closed; dropping client datagram"
+        );
+    }
+}
+
+fn release_egress_retained_bytes(session: &UdpSession, metrics: &UdpProxyMetrics, len: usize) {
+    session
+        .egress_queued_bytes
+        .fetch_sub(len, Ordering::Relaxed);
+    metrics
+        .egress_queued_bytes
+        .fetch_sub(len, Ordering::Relaxed);
+}
+
+/// Undo whatever an admission attempt charged before it was refused. The item
+/// slot is always charged first, so it is always released here.
+fn rollback_egress_charge(
+    session: &UdpSession,
+    metrics: &UdpProxyMetrics,
+    len: usize,
+    session_bytes_charged: bool,
+    listener_bytes_charged: bool,
+) {
+    if listener_bytes_charged {
+        metrics
+            .egress_queued_bytes
+            .fetch_sub(len, Ordering::Relaxed);
+    }
+    if session_bytes_charged {
+        session
+            .egress_queued_bytes
+            .fetch_sub(len, Ordering::Relaxed);
+    }
+    session.egress_inflight.fetch_sub(1, Ordering::AcqRel);
+}
+
+/// Keeps one admitted datagram charged against the item AND byte budgets until
+/// its send has settled.
+///
+/// Releasing the ITEM only after the send settles is what keeps the FIFO fence
+/// closed over the in-flight datagram, so a later fast-path packet cannot
+/// overtake it. Drop-based release covers every exit — commit, refusal, worker
+/// stop, task drop — without duplicated decrements.
+struct EgressRetainedGuard<'a> {
+    session: &'a UdpSession,
+    metrics: &'a UdpProxyMetrics,
+    len: usize,
+}
+
+impl Drop for EgressRetainedGuard<'_> {
+    fn drop(&mut self) {
+        release_egress_retained_bytes(self.session, self.metrics, self.len);
+        self.session.egress_inflight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Admit one client→backend datagram onto a session's bounded egress writer,
+/// spawning that per-session worker on first use.
+///
+/// The item slot is reserved BEFORE the payload reaches the channel so the FIFO
+/// fence ([`UdpSession::egress_writer_engaged`]) closes before any producer can
+/// observe an empty queue and take the immediate path past it. Over-budget
+/// datagrams are tail-dropped and counted; nothing blocks.
+///
+/// The only production producer is the listener's own receive task, through
+/// [`forward_client_datagram_without_blocking`]. Sessions that run
+/// `on_udp_datagram` hooks never reach here (they are already isolated by their
+/// per-session ingress worker), and the setup task's pending drain completes
+/// every forward before it releases the pending gate, so the listener cannot be
+/// forwarding for the same session at the same time.
+fn enqueue_egress_datagram(
+    session: &Arc<UdpSession>,
+    data: &[u8],
+    budget_published: bool,
+    metrics: &Arc<UdpProxyMetrics>,
+    client_addr: SocketAddr,
+) -> UdpEgressAdmission {
+    let len = data.len();
+    let inflight_prev = session.egress_inflight.fetch_add(1, Ordering::AcqRel);
+    if inflight_prev >= SESSION_EGRESS_MAX_QUEUED_DATAGRAMS {
+        session.egress_inflight.fetch_sub(1, Ordering::AcqRel);
+        record_egress_queue_drop(metrics, &session.proxy_id, session.listen_port);
+        return UdpEgressAdmission::Dropped;
+    }
+
+    let session_queued = &session.egress_queued_bytes;
+    let session_prev = session_queued.fetch_add(len, Ordering::Relaxed);
+    if session_prev.saturating_add(len) > SESSION_EGRESS_MAX_QUEUED_BYTES {
+        rollback_egress_charge(session, metrics, len, true, false);
+        record_egress_queue_drop(metrics, &session.proxy_id, session.listen_port);
+        return UdpEgressAdmission::Dropped;
+    }
+
+    let listener_queued = &metrics.egress_queued_bytes;
+    let listener_prev = listener_queued.fetch_add(len, Ordering::Relaxed);
+    if listener_prev.saturating_add(len) > LISTENER_EGRESS_MAX_QUEUED_BYTES {
+        rollback_egress_charge(session, metrics, len, true, true);
+        record_egress_queue_drop(metrics, &session.proxy_id, session.listen_port);
+        return UdpEgressAdmission::Dropped;
+    }
+
+    let queued = UdpEgressDatagram {
+        data: Bytes::copy_from_slice(data),
+        budget_published,
+    };
+    let admitted = match ensure_egress_writer(session, metrics, client_addr) {
+        Some(tx) => tx.try_send(queued).is_ok(),
+        None => false,
+    };
+    if !admitted {
+        rollback_egress_charge(session, metrics, len, true, true);
+        record_egress_queue_drop(metrics, &session.proxy_id, session.listen_port);
+        return UdpEgressAdmission::Dropped;
+    }
+
+    metrics.egress_handoffs.fetch_add(1, Ordering::Relaxed);
+    UdpEgressAdmission::Queued
+}
+
+/// Resolve this session's egress writer, spawning the ONE per-session worker on
+/// first use (never one task per datagram).
+///
+/// Returns `None` for a session whose writer teardown has already run or whose
+/// generation is retired, so a late datagram cannot resurrect a worker — and
+/// therefore a backend side effect — for a dead session.
+fn ensure_egress_writer(
+    session: &Arc<UdpSession>,
+    metrics: &Arc<UdpProxyMetrics>,
+    client_addr: SocketAddr,
+) -> Option<mpsc::Sender<UdpEgressDatagram>> {
+    let mut guard = session
+        .egress_tx
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(tx) = guard.as_ref() {
+        return Some(tx.clone());
+    }
+    if session.egress_closed.load(Ordering::Acquire)
+        || session.expired.load(Ordering::Acquire)
+        || session.stop_reply_task.load(Ordering::Acquire)
+    {
+        return None;
+    }
+    let (tx, rx) = mpsc::channel(SESSION_EGRESS_MAX_QUEUED_DATAGRAMS);
+    *guard = Some(tx.clone());
+    drop(guard);
+    spawn_session_egress_writer(
+        Arc::clone(session),
+        rx,
+        Arc::clone(metrics),
+        client_addr,
+        session_backend_send,
+    );
+    Some(tx)
+}
+
+/// The production client→backend send for one queued datagram: the DTLS tunnel
+/// when the backend leg terminates DTLS, otherwise the connected UDP socket.
+///
+/// Owned arguments keep the writer's future `'static`. `Send` is not restated
+/// on the return type: [`spawn_session_egress_writer`] requires `Fut: Send +
+/// 'static` at the call site, so an accidentally non-`Send` body still fails to
+/// compile there.
+async fn session_backend_send(
+    session: Arc<UdpSession>,
+    data: Bytes,
+) -> Result<usize, std::io::Error> {
+    if let Some(dtls) = session.dtls_conn.as_ref() {
+        dtls.send(&data)
+            .await
+            .map(|()| data.len())
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    } else if let Some(socket) = session.backend_socket.as_ref() {
+        socket.send(&data).await
+    } else {
+        Err(std::io::Error::other("no backend socket available"))
+    }
+}
+
+/// Per-session client→backend writer: drain the bounded egress FIFO in arrival
+/// order and commit each datagram through the SAME authorization-aware commit
+/// the inline path uses. One task per session, spawned only once a session
+/// actually needs it, so a parked backend send is scoped to its own client
+/// instead of to every client on the shared listener.
+///
+/// `send` is the backend-send factory. Production passes
+/// [`session_backend_send`]; the external coverage substitutes a parked future
+/// so "a blocked session does not stall a healthy one" is decided by the
+/// scheduler rather than by a sleep.
+fn spawn_session_egress_writer<F, Fut>(
+    session: Arc<UdpSession>,
+    mut rx: mpsc::Receiver<UdpEgressDatagram>,
+    metrics: Arc<UdpProxyMetrics>,
+    client_addr: SocketAddr,
+    send: F,
+) where
+    F: Fn(Arc<UdpSession>, Bytes) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<usize, std::io::Error>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        while let Some(queued) = rx.recv().await {
+            let len = queued.data.len();
+            // Charged at admission; released when this datagram leaves the
+            // writer, whatever ends it.
+            let _retained = EgressRetainedGuard {
+                session: session.as_ref(),
+                metrics: metrics.as_ref(),
+                len,
+            };
+
+            // Cleanup/expiry may have raced the receive: never produce a
+            // backend datagram for a session that is already being retired.
+            if session
+                .stop_reply_task
+                .load(std::sync::atomic::Ordering::Acquire)
+                || session.expired.load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
+
+            // This datagram waited in a bounded queue after the listener's own
+            // checks, so destination ownership and source attribution are
+            // revalidated at the ACTUAL commit. A route republication or a
+            // recycled interface in the meantime must not produce a late
+            // backend side effect under evidence that is no longer vouched for.
+            if session.revalidate_destination().is_err() {
+                break;
+            }
+            if let Some(source) = session.node_waypoint_source.as_ref()
+                && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
+            {
+                source.scoping.index.warn_refusal(
+                    session.proxy_id.as_str(),
+                    session.datagram_client_ip.as_ref(),
+                    refusal,
+                );
+                session.expired.store(true, Ordering::Release);
+                signal_udp_reply_task_stop(&session.stop_reply_task, session.stop_notify.as_ref());
+                session.close_hook_ingress();
+                break;
+            }
+
+            // A fast-path attempt that hit `WouldBlock` already accrued this
+            // datagram's response budget; the commit below must not do it twice.
+            let publish = !queued.budget_published;
+            let data = queued.data;
+            let backend = send(Arc::clone(&session), data.clone());
+            let sent = forward_client_datagram_commit(&session, &data, backend, publish).await;
+            match sent {
+                Ok(()) => {
+                    metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
+                    metrics.bytes_out.fetch_add(len as u64, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    metrics.egress_send_errors.fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        proxy_id = %session.datagram_proxy_id,
+                        client = %udp_client_log_addr(client_addr),
+                        listen_port = session.listen_port,
+                        error = %e,
+                        "UDP backend-send queue forward error"
+                    );
+                }
+            }
+        }
+
+        // Fence off any respawn, then drain residuals so the item and byte
+        // budgets cannot leak when the worker exits with payloads still queued.
+        // Nothing is sent after stop.
+        session.close_egress_writer();
+        while let Ok(queued) = rx.try_recv() {
+            release_egress_retained_bytes(&session, &metrics, queued.data.len());
+            session.egress_inflight.fetch_sub(1, Ordering::AcqRel);
         }
     });
 }
@@ -2949,6 +3344,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             node_waypoint_udp_source_scoping,
             node_waypoint_udp_owner,
             datagram_client_address,
+            mesh_outbound_enforcement,
         )
         .await;
     }
@@ -4033,10 +4429,22 @@ async fn process_datagram(
     // Update cache for next datagram.
     *last_client = Some((session_key, session.clone()));
 
-    forward_client_datagram_to_backend(&session, data).await?;
-    *batch_dgrams_out += 1;
-    *batch_bytes_out += data.len() as u64;
-    Ok(())
+    // The shared receive/drain loop never awaits a backend send (issue #5045):
+    // an uncongested plain-UDP datagram is written straight from the borrowed
+    // receive buffer, and a stalled one is handed to this session's bounded
+    // writer so the stall is scoped to its own client.
+    match forward_client_datagram_without_blocking(&session, data, metrics, client_addr) {
+        UdpEgressAdmission::Sent => {
+            *batch_dgrams_out += 1;
+            *batch_bytes_out += data.len() as u64;
+            Ok(())
+        }
+        // A handoff is not a wire commit: the writer accounts the datagram when
+        // its send settles. A budget/teardown drop is already counted as
+        // gateway backpressure by `egress_queue_drops`.
+        UdpEgressAdmission::Queued | UdpEgressAdmission::Dropped => Ok(()),
+        UdpEgressAdmission::Failed(error) => Err(error),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4669,7 +5077,82 @@ async fn forward_client_datagram_to_backend(
             Err(std::io::Error::other("no backend socket available"))
         }
     };
-    forward_client_datagram_commit(session, data, send).await
+    forward_client_datagram_commit(session, data, send, true).await
+}
+
+/// Admit one client→backend datagram WITHOUT awaiting the backend send
+/// (issue #5045).
+///
+/// This is the shared listener's client→backend path for an established session
+/// with no `on_udp_datagram` hooks. Plain connected UDP keeps its borrowed,
+/// allocation-free fast path: one `sendto(2)` straight out of the receive
+/// buffer, no `Bytes`, no channel, no task handoff. Only when that socket
+/// answers `WouldBlock` — a full LOCAL socket buffer, which is the condition
+/// tokio documents for `try_send`, not remote application backpressure — is the
+/// datagram handed to this session's bounded writer, and every later datagram
+/// then queues behind it until the writer drains so arrival order is preserved.
+///
+/// DTLS origination always goes to the writer: `DtlsConnection::send` completes
+/// only after the driver task has encrypted the plaintext and the socket has
+/// accepted every resulting ciphertext datagram, so leaving it inline makes one
+/// session's driver scheduling a listener-wide dependency. Enqueue is
+/// deliberately NOT a wire commit — the writer accounts the send afterwards.
+fn forward_client_datagram_without_blocking(
+    session: &Arc<UdpSession>,
+    data: &[u8],
+    metrics: &Arc<UdpProxyMetrics>,
+    client_addr: SocketAddr,
+) -> UdpEgressAdmission {
+    // A shared listener stays bound while its Service routes republish. The
+    // admission-time route is not a lifetime capability: fail closed before
+    // every backend side effect if this destination was removed or reowned.
+    if let Err(error) = session.revalidate_destination() {
+        return UdpEgressAdmission::Failed(error);
+    }
+
+    // Authorization-lifetime gate for the client→backend direction (issue
+    // #3816), ahead of the amplification-budget publish AND of any queueing, so
+    // an expired credential moves no gateway state and retains no payload.
+    if session.refuse_if_authorization_expired().is_some() {
+        return UdpEgressAdmission::Failed(udp_authorization_expired_error());
+    }
+
+    // FIFO fence first, then the DTLS leg. While the writer still owns
+    // datagrams for this session a later one must not overtake them.
+    if session.egress_writer_engaged() || session.dtls_conn.is_some() {
+        return enqueue_egress_datagram(session, data, false, metrics, client_addr);
+    }
+
+    let Some(socket) = session.backend_socket.as_ref() else {
+        return UdpEgressAdmission::Failed(anyhow::anyhow!("no backend socket available"));
+    };
+
+    // Publish the response budget before the send. A loopback backend can
+    // receive and answer between the send syscall and this task being polled
+    // again; publishing only after completion lets that first response bypass
+    // the amplification guard. A refused or queued datagram still leaves a
+    // conservative budget based on bytes accepted from the client.
+    publish_session_request_budget(session, data.len() as u64);
+
+    match socket.try_send(data) {
+        Ok(_) => {
+            session
+                .last_activity
+                .store(coarse_epoch_millis(), Ordering::Relaxed);
+            session
+                .bytes_sent
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
+            UdpEgressAdmission::Sent
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            // The LOCAL socket buffer is full. Hand this datagram to the
+            // session's writer instead of parking the shared receive loop on
+            // writability; its response budget was already published above, so
+            // the writer must not publish it again.
+            enqueue_egress_datagram(session, data, true, metrics, client_addr)
+        }
+        Err(e) => UdpEgressAdmission::Failed(anyhow::anyhow!("send to backend failed: {}", e)),
+    }
 }
 
 /// Authorization-aware client→backend datagram commit (issue #3816 / #3820).
@@ -4689,10 +5172,17 @@ async fn forward_client_datagram_to_backend(
 ///
 /// `send` is the production backend send, or a parked test future that stands
 /// in for a socket waiting on writability.
+///
+/// `publish_budget` is `false` for exactly one case: a datagram whose inline
+/// fast-path attempt already accrued its amplification response budget before
+/// the connected socket answered `WouldBlock` and it was handed to the
+/// per-session writer. Accruing again on the queued commit would grant one
+/// client datagram two response budgets.
 async fn forward_client_datagram_commit<F>(
     session: &Arc<UdpSession>,
     data: &[u8],
     send: F,
+    publish_budget: bool,
 ) -> Result<(), anyhow::Error>
 where
     F: std::future::Future<Output = Result<usize, std::io::Error>>,
@@ -4716,7 +5206,9 @@ where
     // being polled again; publishing only after send completion lets that first
     // response bypass the amplification guard. A failed send still leaves a
     // conservative budget based on bytes accepted from the client.
-    publish_session_request_budget(session, data.len() as u64);
+    if publish_budget {
+        publish_session_request_budget(session, data.len() as u64);
+    }
 
     let plan = session
         .authorization
@@ -4964,6 +5456,8 @@ async fn start_dtls_frontend_listener(
     >,
     node_waypoint_udp_owner: bool,
     datagram_client_address: Option<Arc<DatagramClientAddressGate>>,
+    mesh_outbound_enforcement:
+        crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
 ) -> Result<(), anyhow::Error> {
     let addr = SocketAddr::new(bind_addr, port);
     let admission_overload = overload.clone();
@@ -5045,6 +5539,16 @@ async fn start_dtls_frontend_listener(
         // NodeWaypoint would otherwise leave the operator domain and survive
         // the CRL edit meant to retire it.
         client_trust_scope: crate::dtls::dtls_client_trust_scope_for_owner(node_waypoint_udp_owner),
+        // Per-effective-source-IP bound on the PRE-HANDSHAKE demux table
+        // (`FERRUM_UDP_MAX_SESSIONS_PER_IP`, issue #4544). `max_sessions` above
+        // is listener-wide, so without this one source address can fill the
+        // demux table with unauthenticated ClientHellos and deny DTLS service
+        // to every other client. The accept path below reserves the session
+        // slot from the SAME gateway-wide counter map, and the demux releases
+        // its pre-handshake slot at accept handoff, so TCP, plain UDP and DTLS
+        // share one accounting and one configuration surface without charging
+        // an established DTLS session twice.
+        per_source_ip_admission: metrics.per_ip_admission.clone(),
     };
     let server =
         Arc::new(crate::dtls::DtlsServer::bind_with_limits(addr, dtls_config, dtls_limits).await?);
@@ -5148,6 +5652,8 @@ async fn start_dtls_frontend_listener(
                 let handler_ca_bundle = tls_ca_bundle_path.clone();
                 let handler_dtls_cache = backend_dtls_config_cache.clone();
                 let handler_overload = overload.clone();
+                let handler_mesh_outbound_enforcement =
+                    Arc::clone(&mesh_outbound_enforcement);
                 // NodeWaypoint per-datagram source attribution for this DTLS
                 // session (issue #3286); `None` for every other listener.
                 let handler_node_waypoint_source = node_waypoint_udp_source_scoping.clone();
@@ -5413,6 +5919,7 @@ async fn start_dtls_frontend_listener(
                         handler_node_waypoint_session_source,
                         handler_auth_deadline,
                         &client_trust,
+                        &handler_mesh_outbound_enforcement,
                     )
                     .await;
                     let (err_msg, error_class, disconnect_cause, disconnect_direction) =
@@ -5583,6 +6090,8 @@ async fn handle_dtls_client(
     node_waypoint_source: Option<NodeWaypointUdpSessionSource>,
     auth_deadline: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
     client_trust: &DtlsClientTrustFence,
+    mesh_outbound_enforcement:
+        &crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
 ) -> DtlsHandlerResult {
     let mut backend_info = DtlsBackendInfo {
         backend_target: String::new(),
@@ -5622,6 +6131,7 @@ async fn handle_dtls_client(
         node_waypoint_source,
         auth_deadline,
         client_trust,
+        mesh_outbound_enforcement,
     )
     .await;
     DtlsHandlerResult {
@@ -6712,6 +7222,8 @@ async fn handle_dtls_client_inner(
     node_waypoint_source: Option<NodeWaypointUdpSessionSource>,
     auth_deadline: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
     client_trust: &DtlsClientTrustFence,
+    mesh_outbound_enforcement:
+        &crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
 ) -> Result<(), anyhow::Error> {
     // Frontend client-trust fence, before any post-admission work (issue
     // #3857). A withdrawal can land between the driver's accept handoff and
@@ -6769,6 +7281,42 @@ async fn handle_dtls_client_inner(
     // Populate backend target as soon as it's known — even if DNS or connect fails.
     backend_info.backend_target = format!("{}:{}", backend_host, backend_port);
 
+    // A terminating DTLS frontend bypasses the plain-UDP session path, so it
+    // must apply the mesh egress decision here, after selecting the concrete
+    // backend but before circuit-breaker admission, DNS, or socket creation.
+    let mesh_enforcement_snapshot = mesh_outbound_enforcement.load_full();
+    if let Some(enforcement) = mesh_enforcement_snapshot.as_ref() {
+        use crate::modes::mesh::outbound_enforcement::{Decision, PROTOCOL_UDP, PROTOCOL_UDP_DTLS};
+        let protocol_label = if matches!(proxy.effective_scheme(), BackendScheme::Dtls) {
+            PROTOCOL_UDP_DTLS
+        } else {
+            PROTOCOL_UDP
+        };
+        match enforcement.check_destination(listen_port, &backend_host, backend_port) {
+            Decision::Admit => {
+                enforcement.record_stream_decision(protocol_label, Decision::Admit);
+            }
+            Decision::Deny => {
+                enforcement.record_stream_decision(protocol_label, Decision::Deny);
+                warn!(
+                    proxy_id = %proxy_id,
+                    client = %udp_client_log_addr(identity.resolved()),
+                    listen_port,
+                    backend_host = %backend_host,
+                    backend_port,
+                    protocol = protocol_label,
+                    "Mesh REGISTRY_ONLY: rejecting DTLS frontend session to unadmitted destination"
+                );
+                return Err(StreamSetupError::new(
+                    StreamSetupKind::RejectedByPlugin,
+                    "(mesh REGISTRY_ONLY)",
+                )
+                .into());
+            }
+            Decision::Skip => {}
+        }
+    }
+
     // Least-connection accounting for the DTLS session's lifetime (issue
     // #4514). Unlike plain UDP, a DTLS session has no `UdpSession` record: this
     // task IS the session, so the guard is a local held to the end of the
@@ -6806,14 +7354,13 @@ async fn handle_dtls_client_inner(
     );
 
     // Circuit breaker check — reject before creating backend connection if open.
-    // When admitted, capture whether this is a half-open probe so downstream
-    // record_failure/record_success calls only decrement the in-flight counter
-    // for actual probe requests.
+    // Own an admitted HALF_OPEN slot through setup so early returns and dropped
+    // session futures release it neutrally (GHSA-4cq4-3f3f-mq76).
     let cb_target_key = proxy
         .upstream_id
         .as_ref()
         .map(|_| crate::circuit_breaker::target_key(&backend_host, backend_port));
-    let mut cb_is_half_open_probe = false;
+    let mut cb_probe = HalfOpenProbeGuard::none();
     if let Some(ref cb_config) = proxy.circuit_breaker {
         match circuit_breaker_cache.can_execute(
             &proxy.namespace,
@@ -6821,8 +7368,8 @@ async fn handle_dtls_client_inner(
             cb_target_key.as_deref(),
             cb_config,
         ) {
-            Ok((_cb, is_half_open_probe)) => {
-                cb_is_half_open_probe = is_half_open_probe;
+            Ok((cb, is_half_open_probe)) => {
+                cb_probe = HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe);
             }
             Err(_) => {
                 warn!(
@@ -6844,28 +7391,13 @@ async fn handle_dtls_client_inner(
     // session is counted and stamped exactly once no matter which phase ended
     // it (issue #3816).
     let auth_termination_latch = crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default();
-    // Release a claimed HALF_OPEN probe slot NEUTRALLY on an authorization
-    // expiry: the gateway dialed nothing on behalf of this credential, so the
-    // breaker must record neither success nor failure, and the slot must not
-    // leak or the breaker could never recover.
-    let release_half_open_probe = || {
-        if let Some(ref cb_config) = proxy.circuit_breaker {
-            let cb = circuit_breaker_cache.get_or_create(
-                &proxy.namespace,
-                proxy_id,
-                cb_target_key.as_deref(),
-                cb_config,
-            );
-            cb.record_neutral(cb_is_half_open_probe);
-        }
-    };
 
     let candidates = match dtls_setup_stage_under_bounds(
         auth_deadline,
         &auth_termination_latch,
         &datagram_metadata,
         client_trust,
-        &release_half_open_probe,
+        || cb_probe.release_neutral(),
         || {
             dns_cache.resolve_candidates(
                 &backend_host,
@@ -6891,9 +7423,9 @@ async fn handle_dtls_client_inner(
                     cb_config,
                 );
                 if crate::dns::is_egress_policy_denial(&e) {
-                    cb.record_neutral(cb_is_half_open_probe);
+                    cb.record_neutral(cb_probe.take_slot());
                 } else {
-                    cb.record_failure(502, true, cb_is_half_open_probe);
+                    cb.record_failure(502, true, cb_probe.take_slot());
                 }
             }
             return Err(stream_dns_setup_error(&backend_host, e));
@@ -6917,7 +7449,7 @@ async fn handle_dtls_client_inner(
         &auth_termination_latch,
         &datagram_metadata,
         client_trust,
-        &release_half_open_probe,
+        || cb_probe.release_neutral(),
         || {
             connect_udp_backend_candidates(
                 &candidates,
@@ -6941,7 +7473,7 @@ async fn handle_dtls_client_inner(
                     cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(502, true, cb_is_half_open_probe);
+                cb.record_failure(502, true, cb_probe.take_slot());
             }
             return Err(error);
         }
@@ -6967,13 +7499,13 @@ async fn handle_dtls_client_inner(
     // released NEUTRALLY — the operator's authorization decision is not evidence
     // about this upstream.
     if client_trust.is_retired() {
-        release_half_open_probe();
+        cb_probe.release_neutral();
         return Err(client_trust.settle_withdrawal());
     }
     if let Some(termination) =
         dtls_authorization_expired_before_relay(auth_deadline, tokio::time::Instant::now())
     {
-        release_half_open_probe();
+        cb_probe.release_neutral();
         settle_dtls_auth_expiry(termination, &auth_termination_latch, &datagram_metadata);
         return Err(dtls_authorization_setup_error());
     }
@@ -6986,7 +7518,7 @@ async fn handle_dtls_client_inner(
             cb_target_key.as_deref(),
             cb_config,
         );
-        cb.record_success(cb_is_half_open_probe);
+        cb.record_success(cb_probe.take_slot());
     }
 
     debug!(
@@ -7748,14 +8280,13 @@ async fn create_session(
     );
 
     // Circuit breaker check — reject before creating backend socket if open.
-    // When admitted, capture whether this is a half-open probe so downstream
-    // record_failure/record_success calls only decrement the in-flight counter
-    // for actual probe requests.
+    // Own an admitted HALF_OPEN slot through setup so early returns and dropped
+    // session futures release it neutrally (GHSA-4cq4-3f3f-mq76).
     let cb_target_key = proxy
         .upstream_id
         .as_ref()
         .map(|_| crate::circuit_breaker::target_key(&backend_host, backend_port));
-    let mut cb_is_half_open_probe = false;
+    let mut cb_probe = HalfOpenProbeGuard::none();
     if let Some(ref cb_config) = proxy.circuit_breaker {
         match circuit_breaker_cache.can_execute(
             &proxy.namespace,
@@ -7763,8 +8294,8 @@ async fn create_session(
             cb_target_key.as_deref(),
             cb_config,
         ) {
-            Ok((_cb, is_half_open_probe)) => {
-                cb_is_half_open_probe = is_half_open_probe;
+            Ok((cb, is_half_open_probe)) => {
+                cb_probe = HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe);
             }
             Err(_) => {
                 warn!(
@@ -7781,22 +8312,6 @@ async fn create_session(
         }
     }
 
-    // Release a claimed HALF_OPEN probe slot NEUTRALLY on an authorization
-    // expiry: the gateway dialed nothing on behalf of this credential, so the
-    // breaker must record neither success nor failure, and the slot must not
-    // leak or the breaker could never recover.
-    let release_half_open_probe = || {
-        if let Some(ref cb_config) = proxy.circuit_breaker {
-            let cb = circuit_breaker_cache.get_or_create(
-                &proxy.namespace,
-                proxy_id,
-                cb_target_key.as_deref(),
-                cb_config,
-            );
-            cb.record_neutral(cb_is_half_open_probe);
-        }
-    };
-
     // DNS resolve, bounded by the admitted credential's absolute authorization
     // deadline (issue #3816). An already-elapsed plan resolves no name at all.
     let candidates = match stream_udp_setup_stage_under_authorization(
@@ -7804,7 +8319,7 @@ async fn create_session(
         auth_latch,
         setup_metadata,
         UDP_SESSION_SETUP_CONTEXT,
-        &release_half_open_probe,
+        || cb_probe.release_neutral(),
         || {
             dns_cache.resolve_candidates(
                 &backend_host,
@@ -7830,9 +8345,9 @@ async fn create_session(
                     cb_config,
                 );
                 if crate::dns::is_egress_policy_denial(&e) {
-                    cb.record_neutral(cb_is_half_open_probe);
+                    cb.record_neutral(cb_probe.take_slot());
                 } else {
-                    cb.record_failure(502, true, cb_is_half_open_probe);
+                    cb.record_failure(502, true, cb_probe.take_slot());
                 }
             }
             return Err(stream_dns_setup_error(&backend_host, e));
@@ -7849,7 +8364,7 @@ async fn create_session(
                         cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, true, cb_is_half_open_probe);
+                    cb.record_failure(502, true, cb_probe.take_slot());
                 }
                 return Err(StreamSetupError::new(
                     StreamSetupKind::NoHealthyTargets,
@@ -7884,7 +8399,7 @@ async fn create_session(
         auth_latch,
         setup_metadata,
         UDP_SESSION_SETUP_CONTEXT,
-        &release_half_open_probe,
+        || cb_probe.release_neutral(),
         || {
             connect_udp_backend_candidates(
                 &candidates,
@@ -7908,7 +8423,7 @@ async fn create_session(
                     cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(502, true, cb_is_half_open_probe);
+                cb.record_failure(502, true, cb_probe.take_slot());
             }
             return Err(error);
         }
@@ -7933,7 +8448,7 @@ async fn create_session(
     if let Some(termination) =
         udp_authorization_expired_before_commit(auth_deadline, tokio::time::Instant::now())
     {
-        release_half_open_probe();
+        cb_probe.release_neutral();
         settle_stream_udp_auth_expiry(termination, auth_latch, setup_metadata);
         if let Some(ref dtls) = dtls_conn {
             dtls.close().await;
@@ -7949,7 +8464,7 @@ async fn create_session(
             cb_target_key.as_deref(),
             cb_config,
         );
-        cb.record_success(cb_is_half_open_probe);
+        cb.record_success(cb_probe.take_slot());
     }
 
     // Admission preceded DNS and backend setup. Re-check immediately before
@@ -8053,6 +8568,10 @@ async fn create_session(
         hook_ingress_tx: std::sync::Mutex::new(hook_ingress_tx),
         hook_ingress_queued_bytes,
         hook_ingress_stop_notify: Arc::new(tokio::sync::Notify::new()),
+        egress_tx: std::sync::Mutex::new(None),
+        egress_inflight: AtomicUsize::new(0),
+        egress_queued_bytes: AtomicUsize::new(0),
+        egress_closed: std::sync::atomic::AtomicBool::new(false),
         // The SAME latch the setup stages above used, so the setup phase, the
         // client→backend direction, and the backend reply task settle exactly
         // one termination between them.
@@ -9472,6 +9991,10 @@ impl UdpAuthorizationSessionProbe {
             hook_ingress_tx: std::sync::Mutex::new(hook_ingress_tx),
             hook_ingress_queued_bytes: Arc::new(AtomicUsize::new(0)),
             hook_ingress_stop_notify: Arc::new(tokio::sync::Notify::new()),
+            egress_tx: std::sync::Mutex::new(None),
+            egress_inflight: AtomicUsize::new(0),
+            egress_queued_bytes: AtomicUsize::new(0),
+            egress_closed: std::sync::atomic::AtomicBool::new(false),
             authorization: plan().map(|plan| UdpSessionAuthorization { plan, latch }),
         });
         let sessions: SessionMap = Arc::new(DashMap::with_hasher_and_shard_amount(
@@ -9508,7 +10031,7 @@ impl UdpAuthorizationSessionProbe {
     where
         F: std::future::Future<Output = Result<usize, std::io::Error>>,
     {
-        forward_client_datagram_commit(&self.session, data, send)
+        forward_client_datagram_commit(&self.session, data, send, true)
             .await
             .map_err(|e| e.to_string())
     }
@@ -9700,6 +10223,389 @@ impl UdpAuthorizationSessionProbe {
     }
 }
 
+/// The verdict [`UdpEgressWriterProbe`] observed for one client→backend
+/// datagram, mirroring the private [`UdpEgressAdmission`].
+#[allow(dead_code)] // Library test seam; the separately compiled binary never builds one.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UdpEgressAdmissionForTest {
+    /// Written straight from the borrowed receive buffer.
+    Sent,
+    /// Handed to the session's bounded writer. Not a wire commit.
+    Queued,
+    /// Refused by an item/byte budget or by a session being retired.
+    Dropped,
+    /// A terminal per-datagram error, carrying its message.
+    Failed(String),
+}
+
+/// Controls the injected backend send used by [`UdpEgressWriterProbe`].
+///
+/// Parking is a flag plus a `Notify`, never a sleep, so "the healthy session
+/// progressed while the other was blocked" is a scheduling fact the test
+/// decides rather than a timing race.
+#[allow(dead_code)] // Library test seam; the separately compiled binary never builds one.
+struct UdpEgressSendGate {
+    /// Payloads the writer actually committed, in the order it sent them.
+    committed: std::sync::Mutex<Vec<Vec<u8>>>,
+    /// Sends that have been polled at least once.
+    started: AtomicUsize,
+    /// While set, the injected send parks instead of completing.
+    parked: std::sync::atomic::AtomicBool,
+    release: tokio::sync::Notify,
+    /// When set, a released send fails instead of succeeding.
+    fail: std::sync::atomic::AtomicBool,
+}
+
+#[allow(dead_code)] // Library test seam; see the type-level note.
+impl UdpEgressSendGate {
+    fn new() -> Self {
+        Self {
+            committed: std::sync::Mutex::new(Vec::new()),
+            started: AtomicUsize::new(0),
+            parked: std::sync::atomic::AtomicBool::new(false),
+            release: tokio::sync::Notify::new(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    async fn send(gate: Arc<Self>, data: Bytes) -> Result<usize, std::io::Error> {
+        gate.started.fetch_add(1, Ordering::SeqCst);
+        loop {
+            // Register before the flag load so a concurrent store + wake cannot
+            // land between the check and the await.
+            let notified = gate.release.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !gate.parked.load(Ordering::Acquire) {
+                break;
+            }
+            notified.await;
+        }
+        if gate.fail.load(Ordering::Acquire) {
+            return Err(std::io::Error::other("injected backend send failure"));
+        }
+        gate.committed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(data.to_vec());
+        Ok(data.len())
+    }
+}
+
+/// External-test seam for the per-session backend-send writer (issue #5045).
+///
+/// Builds a REAL [`UdpSession`] with a real connected backend socket and drives
+/// the production admission ([`forward_client_datagram_without_blocking`]), the
+/// production bounded handoff ([`enqueue_egress_datagram`]) and the production
+/// writer ([`spawn_session_egress_writer`]) — never a restatement of them. Only
+/// the backend send itself is injectable, so a parked send stands in for a
+/// socket waiting on writability or a DTLS driver round trip without a sleep.
+#[allow(dead_code)] // Library test seam; the separately compiled binary never builds one.
+pub struct UdpEgressWriterProbe {
+    session: Arc<UdpSession>,
+    metrics: Arc<UdpProxyMetrics>,
+    client_addr: SocketAddr,
+    /// The peer the session's backend socket is connected to, so "the fast path
+    /// really wrote to the socket" is observable rather than inferred.
+    backend_peer: Arc<UdpSocket>,
+    gate: Arc<UdpEgressSendGate>,
+}
+
+#[allow(dead_code)] // Library test seam; see the type-level note.
+impl UdpEgressWriterProbe {
+    /// Build one probe session with its writer already installed against the
+    /// injected send. Production `ensure_egress_writer` then reuses that
+    /// installed sender instead of spawning a second worker.
+    pub async fn new() -> Result<Self, String> {
+        Self::build(None, Arc::new(UdpProxyMetrics::default())).await
+    }
+
+    /// As [`Self::new`], with an amplification guard so the response budget the
+    /// datagram path publishes is observable.
+    pub async fn with_amplification_factor(factor: Option<f32>) -> Result<Self, String> {
+        Self::build(factor, Arc::new(UdpProxyMetrics::default())).await
+    }
+
+    /// A second session on the SAME listener, sharing one [`UdpProxyMetrics`],
+    /// so "one session parked while another progresses" is observable on one
+    /// listener's counters rather than on two unrelated ones.
+    pub async fn joining_listener_of(other: &Self) -> Result<Self, String> {
+        Self::build(None, Arc::clone(&other.metrics)).await
+    }
+
+    async fn build(factor: Option<f32>, metrics: Arc<UdpProxyMetrics>) -> Result<Self, String> {
+        let backend_peer = Arc::new(
+            UdpSocket::bind("127.0.0.1:0")
+                .await
+                .map_err(|e| format!("probe backend bind failed: {e}"))?,
+        );
+        let backend_addr = backend_peer
+            .local_addr()
+            .map_err(|e| format!("probe backend addr failed: {e}"))?;
+        let backend_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| format!("probe session socket bind failed: {e}"))?;
+        backend_socket
+            .connect(backend_addr)
+            .await
+            .map_err(|e| format!("probe session socket connect failed: {e}"))?;
+        // Reproduce the state the production fast path always meets. A session
+        // socket is created during setup, whose FIRST client datagram goes out
+        // through the AWAITED `forward_client_datagram_to_backend`; only later
+        // datagrams reach `forward_client_datagram_without_blocking`. That
+        // awaited send leaves tokio's cached readiness for this socket
+        // writable, and `try_send` answers `WouldBlock` WITHOUT a syscall while
+        // that cache is empty (`Registration::try_io` refuses to attempt an
+        // operation on a resource the I/O driver has not yet reported ready).
+        // A probe socket that was never driven would therefore report gateway
+        // congestion that the kernel never signalled.
+        backend_socket
+            .writable()
+            .await
+            .map_err(|e| format!("probe session socket writability failed: {e}"))?;
+
+        let client_addr: SocketAddr = "127.0.0.1:34567"
+            .parse()
+            .map_err(|e| format!("probe client addr: {e}"))?;
+        let now = coarse_epoch_millis();
+        let session = Arc::new(UdpSession {
+            backend_socket: Some(Arc::new(backend_socket)),
+            dtls_conn: None,
+            last_activity: AtomicU64::new(now),
+            created_at: AtomicU64::new(now),
+            connected_wall_at: chrono::Utc::now(),
+            expired: std::sync::atomic::AtomicBool::new(false),
+            bytes_sent: AtomicU64::new(0),
+            bytes_received: AtomicU64::new(0),
+            last_request_size: AtomicU64::new(0),
+            response_budget_remaining: AtomicU64::new(0),
+            amplification_factor: factor,
+            backend_target: backend_addr.to_string(),
+            backend_resolved_ip: backend_addr.ip().to_string(),
+            sni_hostname: None,
+            consumer_username: None,
+            auth_method: None,
+            metadata: std::sync::Mutex::new(std::collections::HashMap::new()),
+            plugin_trigger_decisions: Default::default(),
+            correlation_ids: Default::default(),
+            local_addr: std::sync::OnceLock::new(),
+            node_waypoint_destination: None,
+            node_waypoint_source: None,
+            plugins: Arc::new(Vec::new()),
+            datagram_plugins: Arc::from([]),
+            datagram_client_ip: Arc::from("127.0.0.1"),
+            forwarded_client: None,
+            datagram_proxy_id: Arc::from("udp-proxy"),
+            datagram_proxy_name: Some(Arc::from("UDP Proxy")),
+            datagram_payload_kind: StreamBytesKind::PlaintextWire,
+            proxy_id: "udp-proxy".to_string(),
+            proxy_name: Some("UDP Proxy".to_string()),
+            proxy_lifecycle_generation: None,
+            proxy_namespace: "ferrum".to_string(),
+            backend_scheme: BackendScheme::Udp,
+            listen_port: 5300,
+            idle_timeout_ms: 60_000,
+            stop_reply_task: std::sync::atomic::AtomicBool::new(false),
+            stop_notify: Arc::new(tokio::sync::Notify::new()),
+            overload_guard: std::sync::Mutex::new(None),
+            lb_guard: std::sync::Mutex::new(None),
+            per_ip_guard: std::sync::Mutex::new(None),
+            hook_ingress_tx: std::sync::Mutex::new(None),
+            hook_ingress_queued_bytes: Arc::new(AtomicUsize::new(0)),
+            hook_ingress_stop_notify: Arc::new(tokio::sync::Notify::new()),
+            egress_tx: std::sync::Mutex::new(None),
+            egress_inflight: AtomicUsize::new(0),
+            egress_queued_bytes: AtomicUsize::new(0),
+            egress_closed: std::sync::atomic::AtomicBool::new(false),
+            authorization: None,
+        });
+
+        let gate = Arc::new(UdpEgressSendGate::new());
+        let (tx, rx) = mpsc::channel(SESSION_EGRESS_MAX_QUEUED_DATAGRAMS);
+        let mut installed = session
+            .egress_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *installed = Some(tx);
+        drop(installed);
+        let send_gate = Arc::clone(&gate);
+        spawn_session_egress_writer(
+            Arc::clone(&session),
+            rx,
+            Arc::clone(&metrics),
+            client_addr,
+            move |_session, data| UdpEgressSendGate::send(Arc::clone(&send_gate), data),
+        );
+
+        Ok(Self {
+            session,
+            metrics,
+            client_addr,
+            backend_peer,
+            gate,
+        })
+    }
+
+    /// Park every injected backend send until [`Self::release_backend_sends`].
+    pub fn park_backend_sends(&self) {
+        self.gate.parked.store(true, Ordering::Release);
+    }
+
+    /// Release parked sends and let every later one complete immediately.
+    pub fn release_backend_sends(&self) {
+        self.gate.parked.store(false, Ordering::Release);
+        self.gate.release.notify_waiters();
+    }
+
+    /// Make released sends fail, so writer error accounting is observable.
+    pub fn fail_backend_sends(&self) {
+        self.gate.fail.store(true, Ordering::Release);
+    }
+
+    /// Drive the production non-blocking admission for one datagram — the exact
+    /// call the shared listener's no-hook branch makes.
+    pub fn forward_without_blocking(&self, data: &[u8]) -> UdpEgressAdmissionForTest {
+        Self::map(forward_client_datagram_without_blocking(
+            &self.session,
+            data,
+            &self.metrics,
+            self.client_addr,
+        ))
+    }
+
+    /// Drive the production bounded handoff for one datagram — the exact path a
+    /// `WouldBlock` on the connected socket, or DTLS origination, takes.
+    pub fn hand_off_to_writer(&self, data: &[u8]) -> UdpEgressAdmissionForTest {
+        Self::map(enqueue_egress_datagram(
+            &self.session,
+            data,
+            false,
+            &self.metrics,
+            self.client_addr,
+        ))
+    }
+
+    fn map(admission: UdpEgressAdmission) -> UdpEgressAdmissionForTest {
+        match admission {
+            UdpEgressAdmission::Sent => UdpEgressAdmissionForTest::Sent,
+            UdpEgressAdmission::Queued => UdpEgressAdmissionForTest::Queued,
+            UdpEgressAdmission::Dropped => UdpEgressAdmissionForTest::Dropped,
+            UdpEgressAdmission::Failed(error) => {
+                UdpEgressAdmissionForTest::Failed(error.to_string())
+            }
+        }
+    }
+
+    /// Datagrams the writer currently owns (queued plus in flight) — the FIFO
+    /// fence the fast path reads.
+    pub fn queued_datagrams(&self) -> usize {
+        self.session.egress_inflight.load(Ordering::Acquire)
+    }
+
+    /// Payload bytes charged to this session's writer.
+    pub fn queued_bytes(&self) -> usize {
+        self.session.egress_queued_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Payload bytes charged to the listener-wide writer budget.
+    pub fn listener_queued_bytes(&self) -> usize {
+        self.metrics.egress_queued_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Datagrams refused by the writer's budgets (gateway backpressure).
+    pub fn queue_drops(&self) -> u64 {
+        self.metrics.egress_queue_drops.load(Ordering::Relaxed)
+    }
+
+    /// Sends handed off to the writer rather than written inline.
+    pub fn handoffs(&self) -> u64 {
+        self.metrics.egress_handoffs.load(Ordering::Relaxed)
+    }
+
+    /// Backend send failures the writer observed.
+    pub fn send_errors(&self) -> u64 {
+        self.metrics.egress_send_errors.load(Ordering::Relaxed)
+    }
+
+    /// Listener `datagrams_out`, moved only by a settled send.
+    pub fn datagrams_out(&self) -> u64 {
+        self.metrics.datagrams_out.load(Ordering::Relaxed)
+    }
+
+    /// Listener `bytes_out`, moved only by a settled send.
+    pub fn bytes_out(&self) -> u64 {
+        self.metrics.bytes_out.load(Ordering::Relaxed)
+    }
+
+    /// Client→backend bytes accounted to this session.
+    pub fn bytes_sent(&self) -> u64 {
+        self.session.bytes_sent.load(Ordering::Relaxed)
+    }
+
+    /// Remaining backend→client amplification budget.
+    pub fn response_budget(&self) -> u64 {
+        self.session
+            .response_budget_remaining
+            .load(Ordering::Relaxed)
+    }
+
+    /// Payloads the injected backend send committed, in wire order.
+    pub fn committed_sends(&self) -> Vec<Vec<u8>> {
+        self.gate
+            .committed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Injected sends that have been polled at least once.
+    pub fn started_sends(&self) -> usize {
+        self.gate.started.load(Ordering::SeqCst)
+    }
+
+    /// Await one datagram at the backend peer. Used only where the caller has
+    /// already established that the inline fast path accepted a send.
+    pub async fn backend_peer_recv(&self) -> Result<Vec<u8>, String> {
+        let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
+        let n = self
+            .backend_peer
+            .recv(&mut buf)
+            .await
+            .map_err(|e| format!("probe backend recv failed: {e}"))?;
+        Ok(buf[..n].to_vec())
+    }
+
+    /// Whatever actually reached the connected backend peer, if anything. Only
+    /// the inline fast path writes to that socket; the injected writer send
+    /// does not, which is what makes overtaking observable.
+    pub fn backend_peer_received(&self) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
+        match self.backend_peer.try_recv(&mut buf) {
+            Ok(n) => Some(buf[..n].to_vec()),
+            Err(_) => None,
+        }
+    }
+
+    /// Whether the egress-writer sender is still installed. Teardown takes it.
+    pub fn writer_installed(&self) -> bool {
+        self.session
+            .egress_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    /// Run the production teardown the idle-cleanup task performs: mark this
+    /// generation expired, wake the reply task, and close the per-session
+    /// client→backend workers through the ONE production call.
+    pub fn retire_session(&self) {
+        let session = self.session.as_ref();
+        session.expired.store(true, Ordering::Release);
+        signal_udp_reply_task_stop(&session.stop_reply_task, session.stop_notify.as_ref());
+        session.close_hook_ingress();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -9780,6 +10686,10 @@ mod tests {
             hook_ingress_tx: std::sync::Mutex::new(None),
             hook_ingress_queued_bytes: Arc::new(AtomicUsize::new(0)),
             hook_ingress_stop_notify: Arc::new(tokio::sync::Notify::new()),
+            egress_tx: std::sync::Mutex::new(None),
+            egress_inflight: AtomicUsize::new(0),
+            egress_queued_bytes: AtomicUsize::new(0),
+            egress_closed: std::sync::atomic::AtomicBool::new(false),
             // Unauthenticated by default: the authorization contract does not
             // bound a session that admitted no principal.
             authorization: None,
@@ -11108,6 +12018,10 @@ backend_tls_verify_server_cert: false
             hook_ingress_tx: std::sync::Mutex::new(None),
             hook_ingress_queued_bytes: Arc::new(AtomicUsize::new(0)),
             hook_ingress_stop_notify: Arc::new(tokio::sync::Notify::new()),
+            egress_tx: std::sync::Mutex::new(None),
+            egress_inflight: AtomicUsize::new(0),
+            egress_queued_bytes: AtomicUsize::new(0),
+            egress_closed: std::sync::atomic::AtomicBool::new(false),
             // Unauthenticated by default: the authorization contract does not
             // bound a session that admitted no principal.
             authorization: None,

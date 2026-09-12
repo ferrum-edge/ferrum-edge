@@ -183,6 +183,9 @@ so treat it as operational telemetry rather than an admission-control source.
 Mitigation knobs:
 - `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` bounds how long a peer can hold DTLS demux state before completing the handshake.
 - `FERRUM_UDP_MAX_SESSIONS` caps total UDP/DTLS sessions per proxy, including DTLS peers still in handshake.
+- `FERRUM_UDP_MAX_SESSIONS_PER_IP` caps how much of that table any one effective source IP may hold. The bound is taken on the ClientHello admission path, before any per-peer allocation, so a single spoofed-source or many-source-port client cannot fill the pre-handshake table and deny DTLS service to everyone else. It is the same gateway-wide counter the plain-UDP and TCP listeners use, and the demuxer releases its slot at accept handoff, so an established DTLS session is charged once rather than twice.
+
+Refused ClientHellos and abandoned handshakes are both reported through rate-limited, fixed-cardinality warnings that carry the count they withheld, so a spray shows up as a bounded number of records rather than one line per peer.
 
 ## Stream-Listener Bind Failures
 

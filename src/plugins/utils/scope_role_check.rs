@@ -1,6 +1,7 @@
 use serde_json::Value;
 
-use super::claim_resolver::{extract_claim_values, html_escape};
+use super::claim_resolver::extract_claim_values;
+use super::json_escape::escape_json_string;
 
 pub struct ScopeRoleRequirements<'a> {
     pub required_scopes: &'a [String],
@@ -20,11 +21,18 @@ pub fn check(claims: &Value, req: &ScopeRoleRequirements<'_>) -> Result<(), (u16
                     required_scope = %required,
                     "token missing required scope"
                 );
+                // The required scope is operator-configured text embedded in a
+                // JSON body, so it must be JSON-escaped, not merely
+                // HTML-escaped: a configured value carrying a newline, tab, or
+                // any other byte below 0x20 would otherwise emit a body no JSON
+                // parser accepts. `escape_json_string` also keeps the `<`/`>`
+                // `\u003c`/`\u003e` escaping the previous helper provided, so
+                // the body stays safe in a browser context.
                 return Err((
                     403,
                     format!(
                         r#"{{"error":"Insufficient scope","required":"{}"}}"#,
-                        html_escape(required)
+                        escape_json_string(required)
                     ),
                 ));
             }

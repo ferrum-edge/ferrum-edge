@@ -901,13 +901,13 @@ pub async fn run(
             "Invalid admin TLS configuration",
         ) {
             Ok(candidate) => {
-                if env_config.admin_tls_client_ca_bundle_path.is_some() {
-                    info!(
-                        "Admin TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"
-                    );
-                } else if env_config.admin_tls_no_verify {
+                if env_config.admin_tls_no_verify {
                     warn!(
                         "Admin TLS configuration loaded with certificate verification DISABLED (testing mode)"
+                    );
+                } else if env_config.admin_tls_client_ca_bundle_path.is_some() {
+                    info!(
+                        "Admin TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"
                     );
                 } else {
                     info!(

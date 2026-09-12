@@ -66,7 +66,7 @@ This means the client sees the first byte of the response as soon as the backend
 
 ### Small Response Buffering
 
-When a backend response has a known `Content-Length ≤ 64 KiB` (configurable), the gateway collects the entire body into a single allocation via `response.bytes().await` instead of streaming through the async coalescing adapter. For typical JSON API payloads, this single allocation is cheaper than spinning up `CoalescingBody` with its `BytesMut` buffer and poll loop. Responses without `Content-Length` or with `Content-Length` above the cutoff always stream.
+When a backend response has a known `Content-Length ≤ 64 KiB` (configurable), the gateway collects the entire body into a single allocation via `response.bytes().await` instead of streaming through the async coalescing adapter. For typical JSON API payloads, this single allocation is cheaper than driving the coalescing adapter's poll loop and frame accounting at all. Responses without `Content-Length` or with `Content-Length` above the cutoff always stream.
 
 Body-bearing SSE responses (`Content-Type: text/event-stream`) **always stream** regardless of `Content-Length`, since they represent inherently unbounded or latency-sensitive streams.
 
@@ -96,6 +96,8 @@ For `ProxyBody`-backed responses that stream (either below the adaptive buffer m
 | `H3FrameSource` | native H3 backend pool | `coalescing_h3_body` |
 
 For those `ProxyBody` builders, the coalescing logic — buffer accumulation, large-frame pass-through, opportunistic flush on `Pending`, optional time-based flush, trailer/error stashing — lives entirely in the generic adapter. There is no separate H1/H2/H3 `ProxyBody` coalescer to keep in sync. The H2/H3 adapters are trailer-safe: gRPC trailers (`grpc-status`, `grpc-message`) and h3 trailers are stashed while buffered data is flushed, then returned on the next poll.
+
+**The accumulator is lazy.** Construction reserves nothing: the adapter holds the first DATA frame's `Bytes` directly and allocates the aggregation `BytesMut` — at the configured capacity — only when a second frame actually has to be merged into it. A response that yields one frame, an idle body that yields none, and a frame at or above the flush target (the large-frame pass-through) therefore reach the client on the backend's own payload storage, with no aggregation allocation and no copy. Merging is where the copy is paid for, once per flushed batch, which is the point of coalescing. Everything else is unchanged: the flush target, the flush on `Pending`, the H3 timed flush, trailer/error stashing, and `size_hint`.
 
 An already-ended backend body also preserves its terminal state before the first
 poll. For a gRPC Trailers-Only response, this lets the HTTP/2 writer set
@@ -371,7 +373,12 @@ Three properties are load-bearing:
   `Pending` poll to drive an idle check) is still bounded.
 - **There is no unbounded configuration.** A credential admitted without an
   authoritative expiry — `key_auth`, `basic_auth`, `hmac_auth`, LDAP — is
-  bounded by the fallback maximum alone. `0` is rejected in every mode.
+  bounded by the fallback maximum alone. A validated `exp` further out than the
+  host's monotonic clock can represent lands in the same place: whether that
+  conversion overflows is a property of the platform clock, never of the
+  credential, so the credential stays admitted and simply publishes no bound of
+  its own instead of being treated as already expired. `0` is rejected in every
+  mode.
 - **Unauthenticated streams are untouched.** No principal was admitted, so
   there is no authorization lifetime to enforce. A public SSE endpoint behaves
   exactly as before.

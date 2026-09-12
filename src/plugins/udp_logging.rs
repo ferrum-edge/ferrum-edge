@@ -41,6 +41,7 @@ use tokio::net::UdpSocket;
 use tokio::time::{Instant, timeout};
 use tracing::warn;
 
+use super::utils::byte_budget::AdmittedByteLimits;
 use super::utils::log_schema::{SchemaCapabilities, SummarySchema, resolve_schema};
 use super::utils::sink_loss::{self, SinkLossReason};
 use super::utils::{
@@ -165,6 +166,7 @@ impl UdpLogging {
             dtls_material,
             batch_defaults,
             schema,
+            limits,
         } = parse_udp_logging_config(config, &http_client, DtlsMaterialMode::Materialize)?;
 
         let next_resolve_addr = Arc::new(Mutex::new(None));
@@ -187,7 +189,6 @@ impl UdpLogging {
             sender_generation: 0,
         }));
 
-        let limits = admit_byte_limits(config, "udp_logging")?;
         Ok(Self {
             batch_config: build_batch_config(config, "udp_logging", batch_defaults)?,
             flush_config,
@@ -239,6 +240,7 @@ struct ParsedUdpLogging {
     dtls_material: Option<Arc<CachedDtlsMaterial>>,
     batch_defaults: BatchConfigDefaults,
     schema: Option<Arc<SummarySchema>>,
+    limits: AdmittedByteLimits,
 }
 
 fn parse_udp_logging_config(
@@ -300,6 +302,10 @@ fn parse_udp_logging_config(
         min_retry_delay_ms: 0,
     };
     validate_batch_config(config, "udp_logging", batch_defaults)?;
+    // Shared Admin / file / CP validation uses this parser. Byte-limit
+    // admission must run here — not only in `new` — so an invalid pair
+    // produces the OptionalFailOpen warning instead of a silent omit.
+    let limits = admit_byte_limits(config, "udp_logging")?;
     let schema = resolve_schema(config, "udp_logging", SchemaCapabilities::BASE)?;
 
     let dtls_material = if dtls_enabled && matches!(material_mode, DtlsMaterialMode::Materialize) {
@@ -323,6 +329,7 @@ fn parse_udp_logging_config(
         dtls_material,
         batch_defaults,
         schema,
+        limits,
     })
 }
 
@@ -1090,21 +1097,81 @@ async fn deliver_batch(
         )),
         BatchSizeDecision::SplitPerEntry => {
             // Fixed one-level fan-out into the non-recursive single-entry helper
-            // so one oversized record cannot erase co-batched siblings. Oversized
-            // singles are discarded with an explicit warning; other local delivery
-            // failures still propagate into retry/final-loss.
+            // so one oversized record cannot erase co-batched siblings. Count a
+            // deterministic local reject only when this attempt completes: a later
+            // transport error retries the original immutable batch, and counting
+            // here would publish the same lost record on every attempt (and again
+            // as `batch_discard` if retries exhaust).
+            let mut local_rejects = Vec::new();
             for entry in batch {
                 match deliver_one_entry(sender, entry, max_datagram_bytes).await {
                     Ok(()) => {}
                     Err(error) if !error.requires_sender_reset() => {
-                        record_local_record_drop(&error);
+                        local_rejects.push(error);
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => return finish_split_attempt(local_rejects, Some(error)),
                 }
             }
-            Ok(())
+            finish_split_attempt(local_rejects, None)
         }
     }
+}
+
+/// Publish locally rejected records only when the split attempt completed
+/// without a transport error. A transport failure returns immediately so the
+/// shared worker can retry or `batch_discard` the original batch exactly once.
+fn finish_split_attempt(
+    local_rejects: Vec<UdpDeliveryError>,
+    transport: Option<UdpDeliveryError>,
+) -> Result<(), UdpDeliveryError> {
+    if let Some(error) = transport {
+        return Err(error);
+    }
+    for error in &local_rejects {
+        record_local_record_drop(error);
+    }
+    Ok(())
+}
+
+/// Injected per-entry outcome for split-batch retry accounting tests.
+#[allow(dead_code)] // used via library `_test_support`; dead in the bin target
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SplitEntryOutcome {
+    LocalReject,
+    Delivered,
+    TransportError,
+}
+
+/// Lost-record total for a sequence of split-batch attempts.
+///
+/// Deterministic local rejects are counted only when an attempt completes
+/// without a transport error. Exhausting retries then counts the original
+/// batch once as `batch_discard`, matching [`finish_split_attempt`] plus the
+/// shared worker's terminal path.
+#[allow(dead_code)] // used via library `_test_support`; dead in the bin target
+pub(crate) fn split_retry_lost_record_count(attempts: &[&[SplitEntryOutcome]]) -> u64 {
+    let batch_len = attempts
+        .first()
+        .map(|attempt| attempt.len() as u64)
+        .unwrap_or(0);
+    for attempt in attempts {
+        let mut local = 0u64;
+        let mut transport = false;
+        for outcome in *attempt {
+            match outcome {
+                SplitEntryOutcome::LocalReject => local = local.saturating_add(1),
+                SplitEntryOutcome::Delivered => {}
+                SplitEntryOutcome::TransportError => {
+                    transport = true;
+                    break;
+                }
+            }
+        }
+        if !transport {
+            return local;
+        }
+    }
+    batch_len
 }
 
 /// Deliver a single log entry as its own datagram. Never calls [`deliver_batch`],

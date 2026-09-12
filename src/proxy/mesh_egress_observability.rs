@@ -164,10 +164,17 @@ impl CapturedMeshEgressLifecycle {
         })
     }
 
+    /// Wired only by the captured-UDP relay in `mesh_udp_capture`, which is
+    /// Linux-only (`IP_TRANSPARENT` + recvmsg cmsg). The lifecycle struct is
+    /// shared with the captured-TCP path on every host, so the setters stay
+    /// compiled — and stay covered by the in-crate tests below — rather than
+    /// being conditionally removed from the type.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn set_udp_outcome_signal(&mut self, outcome_signal: Arc<CapturedUdpOutcomeSignal>) {
         self.udp_outcome_signal = Some(outcome_signal);
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn set_udp_byte_counters(
         &mut self,
         bytes_sent: Arc<AtomicU64>,

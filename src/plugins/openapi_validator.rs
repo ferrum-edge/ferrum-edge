@@ -87,6 +87,8 @@ const XML_NAMESPACE_CONFLICT_DETAIL: &str =
     "XML elements sharing a local name across namespaces cannot be represented unambiguously";
 const XML_COMMENT_IN_VALUE_DETAIL: &str =
     "XML element contains a comment inside its character data";
+const XML_PI_IN_VALUE_DETAIL: &str =
+    "XML processing instruction inside a scalar value cannot be represented by the schema";
 const XML_DEPTH_DETAIL: &str = "XML document nesting exceeds the supported depth";
 /// XML document bounds, split across three layers because no single one is
 /// sufficient:
@@ -477,7 +479,9 @@ struct PropertyEncoding {
 
 struct EncodingHeaderValidator {
     required: bool,
-    schema: Value,
+    schema: Arc<Value>,
+    /// Header-location simple serialization defaults to explode=false.
+    explode: bool,
     /// Precomputed at admission so header scalar conversion never re-walks.
     schema_types: SchemaTypeSet,
     validator: jsonschema::Validator,
@@ -807,6 +811,16 @@ impl OpenapiValidator {
                         cached_nodes.saturating_add(media.conversion.cached_schema_type_nodes());
                     fallback_computes =
                         fallback_computes.saturating_add(media.conversion.fallback_type_computes());
+                    for header in media
+                        .encoding
+                        .values()
+                        .flat_map(|encoding| encoding.headers.values())
+                    {
+                        cached_nodes = cached_nodes
+                            .saturating_add(header.conversion.cached_schema_type_nodes());
+                        fallback_computes = fallback_computes
+                            .saturating_add(header.conversion.fallback_type_computes());
+                    }
                 }
                 for media in entry
                     .response_validators
@@ -1758,6 +1772,11 @@ fn parse_response_validators(
         let mut validators = AHashMap::new();
         for (content_type, media_value) in content {
             if content_type == "description" {
+                if response_object.contains_key("content") {
+                    return Err(format!(
+                        "openapi_validator: {response_path}.content must contain only media types; put description on the response object"
+                    ));
+                }
                 continue;
             }
             validate_media_type_key(content_type, &response_path)?;
@@ -2247,7 +2266,7 @@ fn parse_property_encoding(
             let is_header_object = header_object.is_some_and(|object| {
                 object.contains_key("schema") || object.contains_key("content")
             });
-            let (schema_value, content_media_type, required) = if is_header_object {
+            let (schema_value, content_media_type, required, explode) = if is_header_object {
                 let header_object = header_object.ok_or_else(|| {
                     format!(
                         "encoding['{property}'].headers['{header_name}'] must be a Header Object"
@@ -2352,7 +2371,7 @@ fn parse_property_encoding(
                     let schema = media_object
                         .get("schema")
                         .ok_or_else(|| format!("{media_path} must contain schema"))?;
-                    (schema, Some(media_base), required)
+                    (schema, Some(media_base), required, false)
                 } else {
                     if let Some(style) = header_object.get("style")
                         && style.as_str() != Some("simple")
@@ -2372,19 +2391,24 @@ fn parse_property_encoding(
                     let schema = header_object
                         .get("schema")
                         .ok_or_else(|| format!("{header_path} must contain schema or content"))?;
-                    (schema, None, required)
+                    let explode = header_object
+                        .get("explode")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    (schema, None, required, explode)
                 }
             } else {
-                (header_schema, None, true)
+                (header_schema, None, true, false)
             };
             let validator = compile_schema(schema_value, schema_draft).map_err(|error| {
                 format!(
                     "encoding['{property}'].headers['{header_name}'] schema is invalid: {error}"
                 )
             })?;
-            let schema_types = collect_schema_types(schema_value);
+            let schema = Arc::new(schema_value.clone());
+            let schema_types = collect_schema_types(schema.as_ref());
             let conversion =
-                ConversionPlan::compile(schema_value, schema_draft).map_err(|error| {
+                ConversionPlan::compile(schema.as_ref(), schema_draft).map_err(|error| {
                     format!(
                         "encoding['{property}'].headers['{header_name}'] schema is invalid: {error}"
                     )
@@ -2393,7 +2417,8 @@ fn parse_property_encoding(
                 name,
                 EncodingHeaderValidator {
                     required,
-                    schema: schema_value.clone(),
+                    schema,
+                    explode,
                     schema_types,
                     validator,
                     content_media_type,
@@ -2468,7 +2493,7 @@ fn decode_body<'a>(
 
 enum SchemaInstance {
     Value(Value),
-    BinaryLengthOnly,
+    ValidatedBinary,
 }
 
 /// Duplicate-object-member screen for a governed JSON document, reusing the
@@ -2521,7 +2546,7 @@ fn validate_media_body(
             .validator
             .validate(&instance)
             .map_err(|error| format_schema_error(&error, side, &validator.safe_names)),
-        SchemaInstance::BinaryLengthOnly => Ok(()),
+        SchemaInstance::ValidatedBinary => Ok(()),
     }
 }
 
@@ -2626,6 +2651,7 @@ fn xml_node_to_value(
         return Err(XML_DEPTH_DETAIL.to_string());
     }
     if conversion.accepts_array(schema) {
+        validate_xml_array_container(node)?;
         let item_schema = array_item_schema_for_conversion(schema, conversion);
         let values = node
             .children()
@@ -2662,9 +2688,9 @@ fn xml_node_to_value(
                     conversion,
                     &mut modeled_names,
                 );
-                let values =
-                    xml_array_values(node, property_name, property_schema, conversion, depth)?;
-                if !values.is_empty() {
+                if let Some(values) =
+                    xml_array_values(node, property_name, property_schema, conversion, depth)?
+                {
                     out.insert(property_name.clone(), Value::Array(values));
                 }
                 continue;
@@ -2771,7 +2797,7 @@ fn xml_array_values(
     property_schema: &Value,
     conversion: &ConversionPlan,
     depth: usize,
-) -> Result<Vec<Value>, String> {
+) -> Result<Option<Vec<Value>>, String> {
     if depth > XML_MAX_DEPTH {
         return Err(XML_DEPTH_DETAIL.to_string());
     }
@@ -2788,16 +2814,15 @@ fn xml_array_values(
                 "XML wrapped array '{property_name}' must not repeat its wrapper element"
             ));
         }
+        if wrappers.is_empty() {
+            return Ok(None);
+        }
         for wrapper in wrappers {
-            // Fail closed inside the wrapper: same-local wrong-namespace children
-            // must not be filtered away (an optional wrapped array would otherwise
-            // silently become empty and pass).
-            for child in child_elements_matching_fail_closed(
-                wrapper,
-                item_namespace,
-                item_local,
-                "array item",
-            )? {
+            validate_xml_array_container(wrapper)?;
+            for child in wrapper.children().filter(roxmltree::Node::is_element) {
+                if !xml_expanded_name_matches(child.tag_name(), item_namespace, item_local) {
+                    return Err("XML array wrapper contains an unmodeled element".to_string());
+                }
                 values.push(xml_node_to_value(
                     child,
                     item_schema,
@@ -2806,19 +2831,26 @@ fn xml_array_values(
                 )?);
             }
         }
-    } else {
-        for child in
-            child_elements_matching_fail_closed(node, item_namespace, item_local, "array item")?
-        {
-            values.push(xml_node_to_value(
-                child,
-                item_schema,
-                conversion,
-                depth + 1,
-            )?);
-        }
+        return Ok(Some(values));
     }
-    Ok(values)
+    for child in
+        child_elements_matching_fail_closed(node, item_namespace, item_local, "array item")?
+    {
+        values.push(xml_node_to_value(
+            child,
+            item_schema,
+            conversion,
+            depth + 1,
+        )?);
+    }
+    Ok((!values.is_empty()).then_some(values))
+}
+
+fn validate_xml_array_container(node: roxmltree::Node<'_, '_>) -> Result<(), String> {
+    if node.attributes().next().is_some() || xml_mixed_content_text(node)?.is_some() {
+        return Err("XML array container has unmodeled attributes or text".to_string());
+    }
+    Ok(())
 }
 
 fn mark_xml_array_modeled_names(
@@ -2888,6 +2920,7 @@ fn xml_array_item_name<'a>(
 fn xml_direct_text_children(node: roxmltree::Node<'_, '_>) -> Result<String, String> {
     let mut text = String::new();
     let mut saw_comment = false;
+    let mut saw_pi = false;
     for child in node.children() {
         if child.is_text() {
             if let Some(chunk) = child.text() {
@@ -2898,15 +2931,30 @@ fn xml_direct_text_children(node: roxmltree::Node<'_, '_>) -> Result<String, Str
         if child.is_comment() {
             saw_comment = true;
         }
+        // A processing instruction carries no application data, so it is
+        // ignored at structural positions exactly like a comment; inside a
+        // scalar value it could hide content the backend still parses, so it
+        // is refused there for the same reason a comment is.
+        if child.is_pi() {
+            saw_pi = true;
+        }
     }
-    if saw_comment && !text.trim().is_empty() {
-        return Err(XML_COMMENT_IN_VALUE_DETAIL.to_string());
+    if !text.trim().is_empty() {
+        if saw_comment {
+            return Err(XML_COMMENT_IN_VALUE_DETAIL.to_string());
+        }
+        if saw_pi {
+            return Err(XML_PI_IN_VALUE_DETAIL.to_string());
+        }
     }
     Ok(text)
 }
 
-/// Trimmed character data of a pure-scalar XML element (no child elements).
+/// Trimmed character data of a scalar element with no structural members.
 fn xml_scalar_element_text(node: roxmltree::Node<'_, '_>) -> Result<String, String> {
+    if node.attributes().next().is_some() || node.children().any(|child| child.is_element()) {
+        return Err("XML scalar element has unmodeled attributes or child elements".to_string());
+    }
     Ok(xml_direct_text_children(node)?.trim().to_string())
 }
 
@@ -2939,7 +2987,7 @@ fn generic_xml_node_to_value(node: roxmltree::Node<'_, '_>, depth: usize) -> Res
         .filter(roxmltree::Node::is_element)
         .collect();
     if children.is_empty() {
-        let text = xml_scalar_element_text(node)?;
+        let text = xml_direct_text_children(node)?.trim().to_string();
         if out.is_empty() {
             return Ok(Value::String(text));
         }
@@ -3514,6 +3562,7 @@ fn object_tokens_to_value(
             "Serialized object property must contain alternating key/value items".to_string(),
         );
     }
+    let schema = object_schema_for_conversion(schema, conversion);
     let empty_properties = serde_json::Map::new();
     let properties = merged_object_properties(schema, conversion).unwrap_or(&empty_properties);
     let mut out = serde_json::Map::new();
@@ -3525,7 +3574,11 @@ fn object_tokens_to_value(
         if out.contains_key(&key) {
             return Err("Serialized object property contains a duplicate key".to_string());
         }
-        let child_schema = properties.get(&key).unwrap_or(&Value::Null);
+        let child_schema = properties
+            .get(&key)
+            .or_else(|| conversion.pattern_property_schema(schema, &key))
+            .or_else(|| additional_property_schema_for_conversion(schema).flatten())
+            .unwrap_or(&Value::Null);
         out.insert(
             key,
             scalar_to_schema_value(pair[1].as_str(), child_schema, conversion)?,
@@ -3788,7 +3841,7 @@ fn multipart_parts_to_schema_object(
                         serialized_multipart_object_to_value(
                             values,
                             property_schema,
-                            property_encoding.style,
+                            property_encoding,
                             conversion,
                         )?,
                     );
@@ -3800,40 +3853,15 @@ fn multipart_parts_to_schema_object(
             continue;
         };
         consumed_keys.insert(property.clone());
-        let explode = property_encoding.map(|enc| enc.explode).unwrap_or(true);
-        if conversion.accepts_array(property_schema) && explode {
-            let item_schema = array_item_schema_for_conversion(property_schema, conversion);
-            let array = values
-                .iter()
-                .map(|part| {
-                    multipart_part_to_schema_value(part, item_schema, property_encoding, conversion)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            out.insert(property.clone(), Value::Array(array));
-            continue;
-        }
-        if conversion.accepts_array(property_schema) && !explode {
-            if values.len() != 1 {
-                return Err(
-                    "Serialized multipart array property must occur exactly once when explode=false"
-                        .to_string(),
-                );
-            }
-            let joined = values
-                .iter()
-                .map(|part| {
-                    std::str::from_utf8(&part.body)
-                        .map_err(|_| MULTIPART_FIELD_NOT_UTF8_DETAIL.to_string())
-                })
-                .collect::<Result<Vec<_>, _>>()?
-                .join(match property_encoding.map(|enc| enc.style) {
-                    Some(EncodingStyle::SpaceDelimited) => " ",
-                    Some(EncodingStyle::PipeDelimited) => "|",
-                    _ => ",",
-                });
+        if conversion.accepts_array(property_schema) {
             out.insert(
                 property.clone(),
-                values_to_schema_value(&[joined], property_schema, property_encoding, conversion)?,
+                multipart_values_to_schema_value(
+                    values,
+                    property_schema,
+                    property_encoding,
+                    conversion,
+                )?,
             );
             continue;
         }
@@ -3964,7 +3992,7 @@ fn deep_object_parts_to_value(
 fn serialized_multipart_object_to_value(
     values: &[MultipartPart],
     schema: &Value,
-    style: EncodingStyle,
+    encoding: &PropertyEncoding,
     conversion: &ConversionPlan,
 ) -> Result<Value, String> {
     if values.len() != 1 {
@@ -3973,9 +4001,14 @@ fn serialized_multipart_object_to_value(
                 .to_string(),
         );
     }
+    validate_multipart_part_headers(&values[0], Some(encoding))?;
     let text = std::str::from_utf8(&values[0].body)
         .map_err(|_| MULTIPART_FIELD_NOT_UTF8_DETAIL.to_string())?;
-    object_tokens_to_value(split_decoded_style_value(text, style), schema, conversion)
+    object_tokens_to_value(
+        split_decoded_style_value(text, encoding.style),
+        schema,
+        conversion,
+    )
 }
 
 fn multipart_values_to_schema_value(
@@ -4003,6 +4036,7 @@ fn multipart_values_to_schema_value(
         let joined = values
             .iter()
             .map(|part| {
+                validate_multipart_part_headers(part, encoding)?;
                 std::str::from_utf8(&part.body)
                     .map_err(|_| MULTIPART_FIELD_NOT_UTF8_DETAIL.to_string())
             })
@@ -4064,36 +4098,18 @@ fn header_content_to_schema_value(
     if is_text_media_type(&media_type) {
         return scalar_to_schema_value(value, schema, conversion);
     }
-    match binary_body_to_schema_instance(value.as_bytes(), schema)? {
-        SchemaInstance::Value(instance) => Ok(instance),
-        SchemaInstance::BinaryLengthOnly => Ok(Value::String(value.to_string())),
-    }
+    Ok(Value::String(value.to_string()))
 }
 
-fn multipart_part_to_schema_value(
+fn validate_multipart_part_headers(
     part: &MultipartPart,
-    schema: &Value,
     encoding: Option<&PropertyEncoding>,
-    conversion: &ConversionPlan,
-) -> Result<Value, String> {
+) -> Result<(), String> {
     // Every diagnostic below names the *declared* encoding header, which is
     // operator-controlled, and never `part.name` — a multipart `name` parameter
     // is chosen by whoever produced the body (`GHSA-5p2h-fq6q-gwh9`). The
     // enclosing property is already reported by the caller's own location.
     if let Some(encoding) = encoding {
-        if let Some(expected) = &encoding.content_type {
-            let actual = part
-                .content_type
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("text/plain");
-            if !content_type_matches_encoding(actual, expected) {
-                return Err(format!(
-                    "Multipart field content type does not match encoding contentType '{expected}'"
-                ));
-            }
-        }
         for (header_name, header_validator) in &encoding.headers {
             let Some(header_value) = part.headers.get(header_name) else {
                 if header_validator.required {
@@ -4121,13 +4137,7 @@ fn multipart_part_to_schema_value(
                     )
                 })?
             } else {
-                scalar_to_schema_value_with_types(
-                    header_value,
-                    &header_validator.schema,
-                    header_validator.schema_types,
-                    schema_is_composed(&header_validator.schema)
-                        .then_some(&header_validator.validator),
-                )?
+                simple_header_to_schema_value(header_value, header_validator)?
             };
             header_validator
                 .validator
@@ -4140,6 +4150,73 @@ fn multipart_part_to_schema_value(
                         "Multipart field header '{header_name}' failed validation at {location} (keyword '{keyword}')"
                     )
                 })?;
+        }
+    }
+    Ok(())
+}
+
+fn simple_header_to_schema_value(
+    value: &str,
+    header: &EncodingHeaderValidator,
+) -> Result<Value, String> {
+    let schema = header.schema.as_ref();
+    let conversion = &header.conversion;
+    if header.schema_types.contains(ScalarType::Array) {
+        if value.is_empty() {
+            return Ok(Value::Array(Vec::new()));
+        }
+        let items = array_item_schema_for_conversion(schema, conversion);
+        return value
+            .split(',')
+            .map(|item| scalar_to_schema_value(item.trim(), items, conversion))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array);
+    }
+    if header.schema_types.contains(ScalarType::Object) {
+        if value.is_empty() {
+            return Ok(Value::Object(serde_json::Map::new()));
+        }
+        let tokens = if header.explode {
+            let mut tokens = Vec::new();
+            for member in value.split(',') {
+                let (name, value) = member.split_once('=').ok_or_else(|| {
+                    "Exploded simple header object requires name=value members".to_string()
+                })?;
+                tokens.push(name.trim().to_string());
+                tokens.push(value.trim().to_string());
+            }
+            tokens
+        } else {
+            split_decoded_style_value(value, EncodingStyle::Form)
+        };
+        return object_tokens_to_value(tokens, schema, conversion);
+    }
+    scalar_to_schema_value_with_types(
+        value,
+        schema,
+        header.schema_types,
+        schema_is_composed(schema).then_some(&header.validator),
+    )
+}
+
+fn multipart_part_to_schema_value(
+    part: &MultipartPart,
+    schema: &Value,
+    encoding: Option<&PropertyEncoding>,
+    conversion: &ConversionPlan,
+) -> Result<Value, String> {
+    validate_multipart_part_headers(part, encoding)?;
+    if let Some(expected) = encoding.and_then(|encoding| encoding.content_type.as_ref()) {
+        let actual = part
+            .content_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("text/plain");
+        if !content_type_matches_encoding(actual, expected) {
+            return Err(format!(
+                "Multipart field content type does not match encoding contentType '{expected}'"
+            ));
         }
     }
 
@@ -4196,7 +4273,7 @@ fn multipart_part_to_schema_value(
         return Ok(Value::Object(out));
     }
     if schema_format(schema) == Some("binary") || part.filename.is_some() {
-        return binary_to_schema_value(&part.body, schema);
+        return binary_to_schema_value(&part.body);
     }
     let text =
         std::str::from_utf8(&part.body).map_err(|_| MULTIPART_FIELD_NOT_UTF8_DETAIL.to_string())?;
@@ -4711,26 +4788,51 @@ fn binary_body_to_schema_instance(body: &[u8], schema: &Value) -> Result<SchemaI
     match std::str::from_utf8(body) {
         Ok(value) => Ok(SchemaInstance::Value(Value::String(value.to_string()))),
         Err(_) => {
-            validate_binary_length(body.len(), schema)?;
-            Ok(SchemaInstance::BinaryLengthOnly)
+            validate_binary_schema(body.len(), schema)?;
+            Ok(SchemaInstance::ValidatedBinary)
         }
     }
 }
 
-fn binary_to_schema_value(body: &[u8], schema: &Value) -> Result<Value, String> {
+fn binary_to_schema_value(body: &[u8]) -> Result<Value, String> {
     match std::str::from_utf8(body) {
         Ok(value) => Ok(Value::String(value.to_string())),
-        Err(_) => {
-            validate_binary_length(body.len(), schema)?;
-            Err(
-                "Non-UTF-8 multipart binary fields require an object schema to validate metadata"
-                    .to_string(),
-            )
-        }
+        Err(_) => Err(
+            "Non-UTF-8 multipart binary fields require an object schema to validate metadata"
+                .to_string(),
+        ),
     }
 }
 
-fn validate_binary_length(len: usize, schema: &Value) -> Result<(), String> {
+fn validate_binary_schema(len: usize, schema: &Value) -> Result<(), String> {
+    if let Some(allowed) = schema.as_bool() {
+        return if allowed {
+            Ok(())
+        } else {
+            Err("Binary body does not satisfy the schema".to_string())
+        };
+    }
+    let unsupported = || {
+        "Non-UTF-8 binary body schema contains assertions requiring a text representation"
+            .to_string()
+    };
+    let object = schema.as_object().ok_or_else(unsupported)?;
+    // This subset has byte semantics. All other keywords require the ordinary
+    // JSON string representation, including references and compositions.
+    for (keyword, value) in object {
+        match keyword.as_str() {
+            "type" | "minLength" | "maxLength" | "$schema" | "$id" | "$anchor" | "$comment"
+            | "$defs" | "definitions" | "title" | "description" | "default" | "example"
+            | "examples" | "deprecated" | "readOnly" | "writeOnly" | "xml" => {}
+            "format" if value.as_str() == Some("binary") => {}
+            _ => return Err(unsupported()),
+        }
+    }
+    for keyword in ["minLength", "maxLength"] {
+        if object.contains_key(keyword) && schema_usize(schema, keyword).is_none() {
+            return Err(unsupported());
+        }
+    }
     let types = collect_schema_types(schema);
     if schema.get("type").is_some() && !types.contains(ScalarType::String) {
         return Err(

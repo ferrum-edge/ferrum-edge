@@ -399,7 +399,8 @@ async fn test_plugin_creation_all_plugins() {
             }),
             "ldap_auth" => json!({
                 "ldap_url": "ldaps://ldap.example.com:636",
-                "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+                "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+                "canonical_identity_attribute": "uid"
             }),
             "cors" => json!({"allowed_origins": ["*"]}),
             "response_caching" => json!({"ttl_seconds": 60}),

@@ -6,7 +6,14 @@
 //! - full Proxy/Consumer/PluginConfig/Upstream CRUD on SQLite, PostgreSQL,
 //!   MySQL, and MongoDB
 //! - upstream field variants, including health-check settings
-//! - all available plugin config CRUD through the admin API
+//! - plugin config CRUD through the admin API for every plugin compiled into
+//!   the build under test: the built-in registry exactly, plus whichever
+//!   `custom_plugins/examples/` plugins `FERRUM_CUSTOM_PLUGINS` selected. An
+//!   ordinary default build compiles no custom plugins and runs the built-in
+//!   matrix; the hosted lane that sets
+//!   `FERRUM_CUSTOM_PLUGINS=example_plugin,example_audit_plugin` also covers
+//!   those two. Build the gateway binary and this test target with the same
+//!   selection, or the `/plugins` parity assertion reports the mismatch.
 //! - OpenAPI spec CRUD and extracted runtime resources
 //! - concurrent admin mutations (representative transactional contention)
 //! - file-mode reload updates and deletes resource-backed runtime state while
@@ -21,7 +28,7 @@ use crate::common::{
     host_port_from_db_url, mysql_test_url, postgres_test_url, provision_isolated_sql_database,
     spawn_http_identifying, tcp_endpoint_reachable,
 };
-use ferrum_edge::plugins::available_plugins;
+use ferrum_edge::plugins::{available_plugins, is_builtin_plugin_name};
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
@@ -29,7 +36,12 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 const DEFAULT_MONGO_URL: &str = "mongodb://localhost:27017/ferrum_test";
-const PLUGIN_NAMES_UNDER_TEST: &[&str] = &[
+/// Every built-in plugin, pinned exactly.
+///
+/// The built-in registry is a fixed inventory of the build, so adding or
+/// removing one here is mandatory: the guard below refuses to run a CRUD matrix
+/// that silently skips a plugin.
+const BUILTIN_PLUGIN_NAMES_UNDER_TEST: &[&str] = &[
     "transaction_log_schema",
     "stdout_logging",
     "http_logging",
@@ -112,9 +124,18 @@ const PLUGIN_NAMES_UNDER_TEST: &[&str] = &[
     "workload_metrics",
     "__mesh_bpf_metrics",
     "fault_injection",
-    "example_audit_plugin",
-    "example_plugin",
 ];
+
+/// Custom plugins this file carries a CRUD fixture for.
+///
+/// Custom plugins are a *build selection*, not a fixed inventory: `build.rs`
+/// compiles `custom_plugins/examples/{name}.rs` only when `FERRUM_CUSTOM_PLUGINS`
+/// names it, so an ordinary default build registers none of these and the hosted
+/// lane that sets `FERRUM_CUSTOM_PLUGINS=example_plugin,example_audit_plugin`
+/// registers both. The matrix therefore exercises whichever of these the build
+/// under test actually compiled in, rather than requiring all of them (issue
+/// #4986).
+const CUSTOM_PLUGIN_NAMES_UNDER_TEST: &[&str] = &["example_audit_plugin", "example_plugin"];
 
 struct MongoDatabaseCleanup {
     url: String,
@@ -1537,17 +1558,38 @@ async fn run_available_plugin_config_crud(gateway: &TestGateway, backend_port: u
     let base = format!("{prefix}-{suffix}-plugins");
     let dispatch_upstream_id = format!("{base}-dispatch-upstream");
 
+    // Validate the plugins this build actually compiled in. The built-in half is
+    // a fixed inventory and stays pinned exactly; the custom half is a build
+    // selection, so it is checked for fixture coverage rather than for presence.
+    let plugin_names_under_test = available_plugins();
+    let (builtin_names, custom_names): (Vec<&str>, Vec<&str>) = plugin_names_under_test
+        .iter()
+        .copied()
+        .partition(|name: &&str| is_builtin_plugin_name(name));
+
     assert_eq!(
-        sorted_strings(available_plugins()),
-        sorted_strings(PLUGIN_NAMES_UNDER_TEST.to_vec()),
-        "functional plugin CRUD fixtures must be updated when available plugins change"
+        sorted_strings(builtin_names),
+        sorted_strings(BUILTIN_PLUGIN_NAMES_UNDER_TEST.to_vec()),
+        "functional plugin CRUD fixtures must be updated when built-in plugins change"
+    );
+
+    let unfixtured: Vec<&str> = custom_names
+        .iter()
+        .copied()
+        .filter(|name| !CUSTOM_PLUGIN_NAMES_UNDER_TEST.contains(name))
+        .collect();
+    assert!(
+        unfixtured.is_empty(),
+        "custom plugins compiled into this build have no CRUD fixture: {unfixtured:?}. \
+         Add each to CUSTOM_PLUGIN_NAMES_UNDER_TEST and plugin_config_fixture"
     );
 
     let runtime_plugins = admin_get_json(&client, gateway, "/plugins", &auth).await;
     assert_eq!(
         sorted_json_strings(&runtime_plugins),
-        sorted_strings(PLUGIN_NAMES_UNDER_TEST.to_vec()),
-        "runtime /plugins response should match plugin CRUD fixture list"
+        sorted_strings(plugin_names_under_test.clone()),
+        "the gateway binary under test registers a different plugin set than this test library \
+         does; build the binary and the test target with the same FERRUM_CUSTOM_PLUGINS selection"
     );
 
     admin_post_json(
@@ -1588,7 +1630,7 @@ async fn run_available_plugin_config_crud(gateway: &TestGateway, backend_port: u
         .to_string();
 
     let mut plugin_ids = Vec::new();
-    for (idx, plugin_name) in PLUGIN_NAMES_UNDER_TEST.iter().enumerate() {
+    for (idx, plugin_name) in plugin_names_under_test.iter().enumerate() {
         let plugin_id = format!("{base}-p{idx}");
         let config = plugin_config_fixture(plugin_name, &dispatch_upstream_id);
         let (scope, proxy_id) = match *plugin_name {
@@ -1619,7 +1661,7 @@ async fn run_available_plugin_config_crud(gateway: &TestGateway, backend_port: u
         // metadata-advertised brokers, and the pinned rdkafka exposes no
         // connect/resolve callback, so those addresses cannot be screened.
         // Assert the fail-closed admission contract instead of the CRUD
-        // round-trip. (It stays in PLUGIN_NAMES_UNDER_TEST because the registry
+        // round-trip. (It stays in BUILTIN_PLUGIN_NAMES_UNDER_TEST because the
         // parity assertion above must still cover it.)
         if *plugin_name == "kafka_logging" {
             let response = send_retrying_db_unavailable(
@@ -2061,7 +2103,8 @@ fn plugin_config_fixture(plugin_name: &str, dispatch_upstream_id: &str) -> Value
         }),
         "ldap_auth" => json!({
             "ldap_url": "ldaps://ldap.example.com:636",
-            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         "hmac_auth" => json!({
             "clock_skew_seconds": 300,

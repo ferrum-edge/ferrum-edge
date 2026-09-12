@@ -112,6 +112,20 @@ impl StreamWafConfig {
     pub(super) fn needs_udp_datagrams(&self) -> bool {
         self.inspect_udp && !self.signatures.is_empty()
     }
+
+    /// Whether an enforce-action signature can actually be applied by some
+    /// runtime hook — the admission-side mirror of the two capability
+    /// predicates above.
+    ///
+    /// `inspect_response` is NOT an independent inspection surface. It is a
+    /// direction switch read INSIDE the datagram hook, after `inspect_udp` has
+    /// already admitted that hook, so a response-only policy with `inspect_tcp`
+    /// and `inspect_udp` both false has no hook to fire from. Counting it on
+    /// its own admitted a stream policy that could never block anything, while
+    /// telling the operator stream inspection was active (issue #5121).
+    pub(super) fn enforcing_signature_is_reachable(&self) -> bool {
+        self.signatures.has_enforce_action() && (self.inspect_tcp || self.inspect_udp)
+    }
 }
 
 /// Parse the optional `stream` config block. Returns `Ok(None)` when absent or

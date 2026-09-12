@@ -27,6 +27,7 @@ mod unit {
         mod key_auth_tests;
         mod ldap_auth_tests;
         mod load_testing_tests;
+        mod log_sampling_tests;
         mod logging_sink_lifecycle_tests;
         mod loki_logging_tests;
         mod mcp_aggregate_sse_tests;
@@ -99,6 +100,7 @@ mod unit {
         mod waf_body_charset_parity_tests;
         mod waf_tests;
         mod workload_metrics_custom_env_tags_tests;
+        mod workload_metrics_tests;
         mod ws_frame_logging_tests;
         mod ws_logging_tests;
         mod ws_message_size_limiting_tests;

@@ -767,7 +767,17 @@ fn request_match(
     for (name, pattern) in &match_.headers {
         match request_header_value(&request.headers, name) {
             Some(value) if wildcard_match(pattern, value) => {}
-            None if deny_missing_http_attribute_matches(action) => {}
+            // Istio's "always matched" rule for `DENY`/`CUSTOM` covers an
+            // attribute this path cannot SOURCE, not one it read and found
+            // absent (issue #5067). An HTTP-family request carries a parsed
+            // header map, so a header the client did not send is a genuine
+            // absence and must fail a positive predicate for every action —
+            // matching Envoy's `HeaderMatcher`, where a missing field never
+            // satisfies an exact non-empty value. Only an L4 session, which
+            // has no header map at all, takes the unobservable-attribute
+            // branch and stays fail-closed there.
+            None if request.protocol != MeshAuthzProtocol::Http
+                && deny_missing_http_attribute_matches(action) => {}
             _ => return false,
         }
     }

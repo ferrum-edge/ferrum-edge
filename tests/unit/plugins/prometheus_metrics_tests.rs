@@ -1,5 +1,9 @@
 //! Tests for prometheus_metrics plugin
 
+use chrono::Utc;
+use ferrum_edge::PluginCache;
+use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
+use ferrum_edge::config_delta::ConfigDelta;
 use ferrum_edge::ebpf::NodeAgentMetrics;
 use ferrum_edge::k8s_controller::metrics::ControllerMetrics;
 use ferrum_edge::plugins::mesh::prometheus_helpers;
@@ -11,7 +15,7 @@ use ferrum_edge::plugins::prometheus_metrics::{
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, AiCost, AiUsageExport, Direction, Plugin, RequestContext,
     StreamTransactionSummary, TransactionSummary, WsDisconnectContext,
-    ai_token_metrics::AiTokenMetrics,
+    ai_token_metrics::AiTokenMetrics, builtin_plugin_parity_meta, validate_plugin_config,
 };
 use ferrum_edge::proxy::tcp_proxy::StreamIoSide;
 use ferrum_edge::retry::{
@@ -21,6 +25,7 @@ use ferrum_edge::retry::{
     intern_http_observability_error_class,
 };
 use serde_json::json;
+use serial_test::serial;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -187,6 +192,10 @@ async fn test_prometheus_plugin_rejects_invalid_config_shapes() {
         json!({"mesh_series_budget_per_family": 1_000_001}),
         json!({"mesh_series_budget_per_family": -1}),
         json!({"mesh_series_budget_per_family": "10000"}),
+        json!({"schema": {}}),
+        json!({"schema_ref": "x"}),
+        json!({"render_cache_ttl_seconds": -1}),
+        json!({"cache_invalidation_min_age_ms": -1}),
     ];
 
     for config in cases {
@@ -216,7 +225,7 @@ fn test_prometheus_plugin_rejects_unknown_render_cache_ttl_secnds_key() {
         "ferrum",
     )
     .err()
-    .expect("typo render_cache_ttl_secnds must fail construction");
+    .unwrap_or_else(|| panic!("typo render_cache_ttl_secnds must fail construction"));
     assert!(err.contains("unknown configuration key"), "{err}");
     assert!(err.contains("render_cache_ttl_secnds"), "{err}");
     assert!(
@@ -342,32 +351,106 @@ fn test_registry_records_websocket_completion_metrics() {
     ));
 }
 
-/// A gateway-initiated policy close (credential expiry, absolute lifetime,
-/// graceful drain) is not a relay fault: it must stay on `result="success"` /
-/// `error_class="none"` and be identified only by `termination_reason`, so
-/// `result="error"` keeps meaning a real transport or hook failure.
+/// Every closed `WsTerminationReason` must appear as its own
+/// `termination_reason` label on both the session counter and duration
+/// histogram. Gateway-initiated policy closes stay on `result="success"` /
+/// `error_class="none"` so `result="error"` still means a transport/hook
+/// failure. `trust_withdrawn` is distinct from ordinary peer close.
+const WS_TERMINATION_REASON_LABELS: &[&str] = &[
+    "credential_expired",
+    "trust_withdrawn",
+    "max_lifetime",
+    "idle_timeout",
+    "drain",
+    "normal_peer_close",
+    "relay_error",
+];
+
+const WS_POLICY_SUCCESS_REASONS: &[&str] = &[
+    "credential_expired",
+    "trust_withdrawn",
+    "max_lifetime",
+    "drain",
+];
+
 #[test]
-fn test_registry_records_policy_websocket_closes_as_non_error_sessions() {
+fn test_registry_records_every_websocket_termination_reason() {
     let registry = MetricsRegistry::new();
-    for reason in ["credential_expired", "max_lifetime", "drain"] {
-        let mut policy_close = make_ws_summary("ws-policy");
-        policy_close.metadata.insert(
+    for reason in WS_TERMINATION_REASON_LABELS {
+        let mut session = make_ws_summary("ws-reason");
+        session.metadata.insert(
             "websocket.termination_reason".to_string(),
             reason.to_string(),
         );
-        registry.record_ws_session(&policy_close);
+        if *reason == "relay_error" {
+            session.error_class = Some(ErrorClass::ConnectionReset);
+            session.direction = Some(Direction::BackendToClient);
+            session.io_side = Some(StreamIoSide::Read);
+        }
+        registry.record_ws_session(&session);
     }
 
     let output = registry.render_uncached();
-    for reason in ["credential_expired", "max_lifetime", "drain"] {
+    for reason in WS_POLICY_SUCCESS_REASONS {
+        let counter = format!(
+            r#"ferrum_websocket_sessions_total{{proxy_id="ws-reason",result="success",direction="unknown",io_side="unknown",error_class="none",termination_reason="{reason}"}} 1"#
+        );
+        let histogram = format!(
+            r#"ferrum_websocket_session_duration_ms_count{{proxy_id="ws-reason",result="success",direction="unknown",io_side="unknown",error_class="none",termination_reason="{reason}"}} 1"#
+        );
         assert!(
-            output.contains(&format!(
-                r#"ferrum_websocket_sessions_total{{proxy_id="ws-policy",result="success",direction="unknown",io_side="unknown",error_class="none",termination_reason="{reason}"}} 1"#
-            )),
-            "policy close {reason} must not be counted as a failed session"
+            output.contains(&counter),
+            "missing success counter for {reason}"
+        );
+        assert!(
+            output.contains(&histogram),
+            "missing success histogram for {reason}"
         );
     }
-    assert!(!output.contains(r#"proxy_id="ws-policy",result="error""#));
+    assert!(output.contains(
+        r#"ferrum_websocket_sessions_total{proxy_id="ws-reason",result="success",direction="unknown",io_side="unknown",error_class="none",termination_reason="idle_timeout"} 1"#
+    ));
+    assert!(output.contains(
+        r#"ferrum_websocket_session_duration_ms_count{proxy_id="ws-reason",result="success",direction="unknown",io_side="unknown",error_class="none",termination_reason="idle_timeout"} 1"#
+    ));
+    assert!(output.contains(
+        r#"ferrum_websocket_sessions_total{proxy_id="ws-reason",result="success",direction="unknown",io_side="unknown",error_class="none",termination_reason="normal_peer_close"} 1"#
+    ));
+    assert!(output.contains(
+        r#"ferrum_websocket_session_duration_ms_count{proxy_id="ws-reason",result="success",direction="unknown",io_side="unknown",error_class="none",termination_reason="normal_peer_close"} 1"#
+    ));
+    assert!(output.contains(
+        r#"ferrum_websocket_sessions_total{proxy_id="ws-reason",result="error",direction="backend_to_client",io_side="read",error_class="connection_reset",termination_reason="relay_error"} 1"#
+    ));
+    assert!(output.contains(
+        r#"ferrum_websocket_session_duration_ms_count{proxy_id="ws-reason",result="error",direction="backend_to_client",io_side="read",error_class="connection_reset",termination_reason="relay_error"} 1"#
+    ));
+}
+
+#[test]
+fn test_registry_does_not_label_trust_withdrawal_as_normal_peer_close() {
+    let registry = MetricsRegistry::new();
+    let mut trust_withdrawn = make_ws_summary("ws-trust");
+    trust_withdrawn.metadata.insert(
+        "websocket.termination_reason".to_string(),
+        "trust_withdrawn".to_string(),
+    );
+    registry.record_ws_session(&trust_withdrawn);
+
+    let output = registry.render_uncached();
+    assert!(output.contains(
+        r#"ferrum_websocket_sessions_total{proxy_id="ws-trust",result="success",direction="unknown",io_side="unknown",error_class="none",termination_reason="trust_withdrawn"} 1"#
+    ));
+    assert!(output.contains(
+        r#"ferrum_websocket_session_duration_ms_count{proxy_id="ws-trust",result="success",direction="unknown",io_side="unknown",error_class="none",termination_reason="trust_withdrawn"} 1"#
+    ));
+    assert!(
+        !output.contains(
+            r#"proxy_id="ws-trust",result="success",direction="unknown",io_side="unknown",error_class="none",termination_reason="normal_peer_close""#
+        ),
+        "trust withdrawal must not increment the ordinary peer-close series"
+    );
+    assert!(!output.contains(r#"proxy_id="ws-trust",result="error""#));
 }
 
 #[tokio::test]
@@ -1416,9 +1499,11 @@ fn udp_amplification_metrics_are_unlabeled_process_counters() {
 #[tokio::test]
 async fn test_registry_records_mesh_dns_upstream_id_exhaustion() {
     let registry = MetricsRegistry::new();
+    registry.configure(5, 3600, 0, 10_000, "ferrum");
 
     let initial_output = registry.render_uncached();
     assert!(initial_output.contains("ferrum_mesh_dns_upstream_id_exhaustions_total 0"));
+    assert!(!initial_output.contains("ferrum_mesh_dns_upstream_id_exhaustions_total{"));
 
     registry.record_mesh_dns_upstream_id_exhaustion();
     registry.record_mesh_dns_upstream_id_exhaustion();
@@ -1432,6 +1517,7 @@ async fn test_registry_records_mesh_dns_upstream_id_exhaustion() {
     let output = registry.render_uncached();
     assert!(output.contains("# TYPE ferrum_mesh_dns_upstream_id_exhaustions_total counter"));
     assert!(output.contains("ferrum_mesh_dns_upstream_id_exhaustions_total 2"));
+    assert!(!output.contains("ferrum_mesh_dns_upstream_id_exhaustions_total{"));
 }
 
 #[tokio::test]
@@ -1461,6 +1547,7 @@ async fn test_histogram_multiple_observations() {
 }
 
 #[tokio::test]
+#[serial(prometheus_global_registry)]
 async fn test_plugin_log_hook_records_metrics() {
     // Use a fresh registry via the plugin's log hook
     let config = json!({});
@@ -1793,10 +1880,17 @@ async fn test_plugin_config_sets_registry_tunables() {
         PrometheusMetrics::new_with_registry_for_test(&config, "ferrum", Arc::clone(&registry))
             .unwrap();
     assert_eq!(plugin.name(), "prometheus_metrics");
+    assert_eq!(
+        registry.mesh_series_budget_per_family_for_test(),
+        10_000,
+        "construction must not publish tunables before commit"
+    );
 
-    // Exercise the same constructor wire-through as production without
-    // mutating the process-global registry shared by parallel tests.
+    plugin.commit_background_tasks();
     assert_eq!(registry.mesh_series_budget_per_family_for_test(), 2500);
+    assert_eq!(registry.render_cache_ttl_secs_for_test(), 10);
+    assert_eq!(registry.stale_entry_ttl_secs_for_test(), 7200);
+    assert_eq!(registry.cache_invalidation_min_age_ms_for_test(), 1000);
 }
 
 #[tokio::test]
@@ -1806,7 +1900,7 @@ async fn test_plugin_config_rejects_unbounded_mesh_series_budget() {
         "ferrum",
     )
     .err()
-    .expect("0 must be rejected — no unlimited mesh series mode");
+    .unwrap_or_else(|| panic!("0 must be rejected — no unlimited mesh series mode"));
     assert!(
         err.contains("mesh_series_budget_per_family"),
         "error should name the field: {err}"
@@ -2873,4 +2967,361 @@ async fn stream_disconnects_label_error_class_when_present() {
     assert!(output.contains(
         r#"ferrum_stream_disconnects_total{proxy_id="obs-stream",protocol="tcp",cause="unknown",direction="unknown",error_class="dns_lookup_error"} 1"#
     ));
+}
+
+#[test]
+fn test_prometheus_plugin_rejects_schema_customization() {
+    for config in [json!({"schema": {}}), json!({"schema_ref": "common"})] {
+        let err = PrometheusMetrics::new(&config, "ferrum")
+            .err()
+            .unwrap_or_else(|| panic!("expected schema customization to fail: {config}"));
+        assert!(
+            err.contains("'schema' / 'schema_ref' is not supported"),
+            "unexpected diagnostic for {config}: {err}"
+        );
+        assert!(
+            validate_plugin_config("prometheus_metrics", &config).is_err(),
+            "shared admission must reject {config}"
+        );
+    }
+}
+
+#[test]
+fn test_prometheus_plugin_accepts_documented_timing_bounds() {
+    for config in [
+        json!({}),
+        json!({"render_cache_ttl_seconds": 0}),
+        json!({
+            "render_cache_ttl_seconds": u64::MAX,
+            "stale_entry_ttl_seconds": u64::MAX,
+            "cache_invalidation_min_age_ms": u64::MAX
+        }),
+        json!({"mesh_series_budget_per_family": 1}),
+        json!({"mesh_series_budget_per_family": 1_000_000}),
+    ] {
+        PrometheusMetrics::new(&config, "ferrum")
+            .unwrap_or_else(|err| panic!("constructor must accept {config}: {err}"));
+        validate_plugin_config("prometheus_metrics", &config)
+            .unwrap_or_else(|err| panic!("shared admission must accept {config}: {err}"));
+    }
+}
+
+#[test]
+fn test_construction_does_not_mutate_live_registry_policy() {
+    let registry = Arc::new(MetricsRegistry::new());
+    registry.configure(0, 3600, 0, 10_000, "ferrum");
+    registry.record(&make_summary("cache-policy", "GET", 200, 10.0, 5.0));
+    let first = registry.render();
+    assert!(first.contains(
+        r#"ferrum_requests_total{proxy_id="cache-policy",method="GET",status_code="200",namespace="ferrum"} 1"#
+    ));
+
+    let candidate = json!({
+        "render_cache_ttl_seconds": 60,
+        "stale_entry_ttl_seconds": 7200,
+        "cache_invalidation_min_age_ms": 60_000,
+        "mesh_series_budget_per_family": 2500
+    });
+    let plugin = PrometheusMetrics::new_with_registry_for_test(
+        &candidate,
+        "other-ns",
+        Arc::clone(&registry),
+    )
+    .expect("valid candidate must construct");
+    assert_eq!(registry.render_cache_ttl_secs_for_test(), 0);
+    assert_eq!(registry.stale_entry_ttl_secs_for_test(), 3600);
+    assert_eq!(registry.cache_invalidation_min_age_ms_for_test(), 0);
+    assert_eq!(registry.mesh_series_budget_per_family_for_test(), 10_000);
+    assert_eq!(registry.namespace_label_fragment(), ",namespace=\"ferrum\"");
+
+    registry.record(&make_summary("cache-policy", "GET", 200, 10.0, 5.0));
+    let second = registry.render();
+    assert!(
+        second.contains(
+            r#"ferrum_requests_total{proxy_id="cache-policy",method="GET",status_code="200",namespace="ferrum"} 2"#
+        ),
+        "abandoned TTL-60 candidate must not freeze scrapes at the prior count"
+    );
+
+    plugin.commit_background_tasks();
+    assert_eq!(registry.render_cache_ttl_secs_for_test(), 60);
+    assert_eq!(registry.stale_entry_ttl_secs_for_test(), 7200);
+    assert_eq!(registry.cache_invalidation_min_age_ms_for_test(), 60_000);
+    assert_eq!(registry.mesh_series_budget_per_family_for_test(), 2500);
+    assert_eq!(
+        registry.namespace_label_fragment(),
+        ",namespace=\"other-ns\""
+    );
+}
+
+#[test]
+#[serial(prometheus_global_registry)]
+fn test_validate_plugin_config_does_not_publish_registry_tunables() {
+    let registry = global_registry();
+    let snapshot = snapshot_global_registry_policy();
+    registry.configure(0, 3600, 0, 10_000, "ferrum");
+
+    validate_plugin_config(
+        "prometheus_metrics",
+        &json!({
+            "render_cache_ttl_seconds": 60,
+            "cache_invalidation_min_age_ms": 60_000,
+            "mesh_series_budget_per_family": 4321
+        }),
+    )
+    .expect("Admin/CP validation must accept a well-formed candidate");
+    assert_eq!(registry.render_cache_ttl_secs_for_test(), 0);
+    assert_eq!(registry.cache_invalidation_min_age_ms_for_test(), 0);
+    assert_eq!(registry.mesh_series_budget_per_family_for_test(), 10_000);
+
+    restore_global_registry_policy(&snapshot);
+}
+
+fn prometheus_gateway_config(plugin_configs: Vec<PluginConfig>) -> GatewayConfig {
+    GatewayConfig {
+        version: "1".to_string(),
+        proxies: vec![super::plugin_utils::make_proxy("p1", "/api", vec![])],
+        consumers: vec![],
+        plugin_configs,
+        upstreams: vec![],
+        loaded_at: Utc::now(),
+        known_namespaces: Vec::new(),
+        ..Default::default()
+    }
+}
+
+struct RegistryPolicySnapshot {
+    render_cache_ttl_secs: u64,
+    stale_entry_ttl_secs: u64,
+    cache_invalidation_min_age_ms: u64,
+    mesh_series_budget_per_family: usize,
+    namespace: String,
+}
+
+fn snapshot_global_registry_policy() -> RegistryPolicySnapshot {
+    let registry = global_registry();
+    RegistryPolicySnapshot {
+        render_cache_ttl_secs: registry.render_cache_ttl_secs_for_test(),
+        stale_entry_ttl_secs: registry.stale_entry_ttl_secs_for_test(),
+        cache_invalidation_min_age_ms: registry.cache_invalidation_min_age_ms_for_test(),
+        mesh_series_budget_per_family: registry.mesh_series_budget_per_family_for_test(),
+        namespace: namespace_from_label_fragment(&registry.namespace_label_fragment()),
+    }
+}
+
+fn restore_global_registry_policy(snapshot: &RegistryPolicySnapshot) {
+    global_registry().configure(
+        snapshot.render_cache_ttl_secs,
+        snapshot.stale_entry_ttl_secs,
+        snapshot.cache_invalidation_min_age_ms,
+        snapshot.mesh_series_budget_per_family,
+        &snapshot.namespace,
+    );
+}
+
+fn namespace_from_label_fragment(fragment: &str) -> String {
+    fragment
+        .strip_prefix(",namespace=\"")
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or("")
+        .to_string()
+}
+
+fn prometheus_plugin_config(ttl_secs: u64, min_age_ms: u64, budget: u64) -> PluginConfig {
+    super::plugin_utils::make_plugin_config_with_json(
+        "prom",
+        "prometheus_metrics",
+        json!({
+            "render_cache_ttl_seconds": ttl_secs,
+            "cache_invalidation_min_age_ms": min_age_ms,
+            "mesh_series_budget_per_family": budget
+        }),
+        PluginScope::Global,
+        None,
+    )
+}
+
+fn invalid_key_auth_plugin_config() -> PluginConfig {
+    super::plugin_utils::make_plugin_config_with_json(
+        "invalid-auth",
+        "key_auth",
+        json!({"unknown_key": 1}),
+        PluginScope::Global,
+        None,
+    )
+}
+
+#[test]
+#[serial(prometheus_global_registry)]
+fn test_rejected_plugin_cache_rebuild_leaves_registry_policy_untouched() {
+    let registry = global_registry();
+    let snapshot = snapshot_global_registry_policy();
+    registry.configure(0, 3600, 0, 10_000, "ferrum");
+
+    let valid = prometheus_gateway_config(vec![prometheus_plugin_config(0, 0, 10_000)]);
+    let cache = PluginCache::new(&valid).expect("initial prometheus_metrics cache");
+    assert_eq!(registry.render_cache_ttl_secs_for_test(), 0);
+    assert_eq!(registry.cache_invalidation_min_age_ms_for_test(), 0);
+    assert_eq!(registry.mesh_series_budget_per_family_for_test(), 10_000);
+
+    let mut rejected = valid.clone();
+    rejected.plugin_configs = vec![
+        prometheus_plugin_config(60, 60_000, 2500),
+        invalid_key_auth_plugin_config(),
+    ];
+    rejected.plugin_configs[0].updated_at = Utc::now();
+    let err = cache
+        .rebuild(&rejected)
+        .err()
+        .unwrap_or_else(|| panic!("FailClosed sibling must reject the generation"));
+    assert!(
+        err.contains("key_auth"),
+        "rejected rebuild must name the FailClosed sibling: {err}"
+    );
+    assert_eq!(registry.render_cache_ttl_secs_for_test(), 0);
+    assert_eq!(registry.cache_invalidation_min_age_ms_for_test(), 0);
+    assert_eq!(registry.mesh_series_budget_per_family_for_test(), 10_000);
+    assert_eq!(registry.namespace_label_fragment(), ",namespace=\"ferrum\"");
+
+    let accepted = prometheus_gateway_config(vec![prometheus_plugin_config(60, 500, 2500)]);
+    cache
+        .rebuild(&accepted)
+        .expect("accepted reload must still publish new tunables");
+    assert_eq!(registry.render_cache_ttl_secs_for_test(), 60);
+    assert_eq!(registry.cache_invalidation_min_age_ms_for_test(), 500);
+    assert_eq!(registry.mesh_series_budget_per_family_for_test(), 2500);
+
+    restore_global_registry_policy(&snapshot);
+}
+
+#[test]
+#[serial(prometheus_global_registry)]
+fn test_rejected_plugin_cache_delta_leaves_registry_policy_untouched() {
+    let registry = global_registry();
+    let snapshot = snapshot_global_registry_policy();
+    registry.configure(0, 3600, 0, 10_000, "ferrum");
+
+    let valid = prometheus_gateway_config(vec![prometheus_plugin_config(0, 0, 10_000)]);
+    let cache = PluginCache::new(&valid).expect("initial prometheus_metrics cache");
+
+    let mut rejected = valid.clone();
+    rejected.plugin_configs = vec![
+        prometheus_plugin_config(60, 60_000, 2500),
+        invalid_key_auth_plugin_config(),
+    ];
+    rejected.plugin_configs[0].updated_at = Utc::now();
+    let delta = ConfigDelta::compute(&valid, &rejected);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&valid, &rejected);
+    let err = cache
+        .apply_delta(
+            &rejected,
+            &proxy_ids,
+            &delta.removed_proxy_ids,
+            delta.global_plugin_configs_changed,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("incremental reload must reject the FailClosed sibling"));
+    assert!(
+        err.contains("key_auth"),
+        "rejected delta must name the FailClosed sibling: {err}"
+    );
+    assert_eq!(registry.render_cache_ttl_secs_for_test(), 0);
+    assert_eq!(registry.cache_invalidation_min_age_ms_for_test(), 0);
+    assert_eq!(registry.mesh_series_budget_per_family_for_test(), 10_000);
+
+    let accepted = prometheus_gateway_config(vec![prometheus_plugin_config(30, 500, 2500)]);
+    let accepted_delta = ConfigDelta::compute(&valid, &accepted);
+    let accepted_ids = accepted_delta.proxy_ids_needing_plugin_rebuild(&valid, &accepted);
+    cache
+        .apply_delta(
+            &accepted,
+            &accepted_ids,
+            &accepted_delta.removed_proxy_ids,
+            accepted_delta.global_plugin_configs_changed,
+        )
+        .expect("accepted incremental reload must publish new tunables");
+    assert_eq!(registry.render_cache_ttl_secs_for_test(), 30);
+    assert_eq!(registry.cache_invalidation_min_age_ms_for_test(), 500);
+    assert_eq!(registry.mesh_series_budget_per_family_for_test(), 2500);
+
+    restore_global_registry_policy(&snapshot);
+}
+
+#[test]
+fn prometheus_metrics_parity_lists_implemented_observation_hooks() {
+    const SRC: &str = include_str!("../../../src/plugins/prometheus_metrics.rs");
+    const EXECUTION_ORDER: &str = include_str!("../../../docs/plugin_execution_order.md");
+
+    for hook in [
+        "async fn on_request_received",
+        "async fn on_stream_connect",
+        "async fn on_stream_disconnect",
+        "async fn on_ws_disconnect",
+        "async fn log(",
+    ] {
+        assert!(
+            SRC.contains(hook),
+            "prometheus_metrics.rs must implement {hook}"
+        );
+    }
+
+    let meta =
+        builtin_plugin_parity_meta("prometheus_metrics").expect("prometheus_metrics parity meta");
+    for phase in [
+        "on_request_received",
+        "on_stream_connect",
+        "log",
+        "on_stream_disconnect",
+        "on_ws_disconnect",
+    ] {
+        assert!(
+            meta.active_phases.split(", ").any(|listed| listed == phase),
+            "parity meta omitted implemented observation hook {phase}: {}",
+            meta.active_phases
+        );
+    }
+
+    let complete_row = EXECUTION_ORDER
+        .lines()
+        .find(|line| line.contains("| `prometheus_metrics` | 9300 |"))
+        .expect("complete-order prometheus_metrics row");
+    for phase in [
+        "on_request_received",
+        "on_stream_connect",
+        "log",
+        "on_stream_disconnect",
+        "on_ws_disconnect",
+    ] {
+        assert!(
+            complete_row.contains(phase),
+            "complete-order row omitted {phase}: {complete_row}"
+        );
+    }
+
+    let stream_section = EXECUTION_ORDER
+        .split("| Plugin | `on_stream_connect` | `on_stream_disconnect` | Behavior |")
+        .nth(1)
+        .expect("stream-hook table");
+    let stream_row = stream_section
+        .lines()
+        .find(|line| line.contains("`prometheus_metrics`"))
+        .expect("stream-hook prometheus_metrics row");
+    let cols: Vec<_> = stream_row
+        .trim()
+        .trim_matches('|')
+        .split('|')
+        .map(str::trim)
+        .collect();
+    assert!(
+        cols.len() >= 3,
+        "stream-hook row must have connect/disconnect columns: {stream_row}"
+    );
+    assert_eq!(
+        cols[1], "✓",
+        "stream-hook table must mark on_stream_connect: {stream_row}"
+    );
+    assert_eq!(
+        cols[2], "✓",
+        "stream-hook table must keep on_stream_disconnect: {stream_row}"
+    );
 }

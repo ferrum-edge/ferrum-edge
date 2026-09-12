@@ -95,6 +95,10 @@ impl StdoutLogging {
                 let expression = match filter_config.get("expression") {
                     None => None,
                     Some(value) => {
+                        reject_unknown_errors_only_fields(
+                            value,
+                            "stdout_logging.filter.expression",
+                        )?;
                         let expression = serde_json::from_value(value.clone()).map_err(|err| {
                             format!("stdout_logging: filter.expression is invalid: {err}")
                         })?;
@@ -269,6 +273,43 @@ fn reject_unknown_keys(
         "stdout_logging: unknown configuration key(s): {}",
         unknown.join(", ")
     ))
+}
+
+/// `errors_only` is a serde unit-like node (`{"op":"errors_only"}`). Internally
+/// tagged unit variants ignore `deny_unknown_fields`, so extra keys such as
+/// `value: false` would otherwise be dropped before tree validation. Walk the
+/// JSON and reject them with the same full-path diagnostic as other keys.
+fn reject_unknown_errors_only_fields(value: &Value, path: &str) -> Result<(), String> {
+    let Some(obj) = value.as_object() else {
+        return Ok(());
+    };
+    match obj.get("op").and_then(Value::as_str) {
+        Some("errors_only") => {
+            let mut unknown: Vec<String> = obj
+                .keys()
+                .filter(|key| key.as_str() != "op")
+                .map(|key| format!("{path}.{key}"))
+                .collect();
+            if unknown.is_empty() {
+                return Ok(());
+            }
+            unknown.sort_unstable();
+            Err(format!(
+                "stdout_logging: unknown configuration key(s): {}",
+                unknown.join(", ")
+            ))
+        }
+        Some("and") | Some("or") => {
+            if let Some(left) = obj.get("left") {
+                reject_unknown_errors_only_fields(left, &format!("{path}.left"))?;
+            }
+            if let Some(right) = obj.get("right") {
+                reject_unknown_errors_only_fields(right, &format!("{path}.right"))?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn parse_optional_u16(config: &Map<String, Value>, key: &str) -> Result<Option<u16>, String> {

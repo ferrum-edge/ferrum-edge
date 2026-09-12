@@ -380,7 +380,7 @@ async fn handle_http_batch_response_classifies_retryable_and_discarded_statuses(
             .unwrap()
             .into();
         assert!(
-            handle_http_batch_response("batching_logger_http", 3, Ok(response))
+            handle_http_batch_response("batching_logger_http", "", 3, Ok(response))
                 .await
                 .is_ok(),
             "expected status {status} to be accepted or discarded without retry"
@@ -398,7 +398,7 @@ async fn handle_http_batch_response_classifies_retryable_and_discarded_statuses(
             .body("")
             .unwrap()
             .into();
-        let err = handle_http_batch_response("batching_logger_http", 3, Ok(response))
+        let err = handle_http_batch_response("batching_logger_http", "", 3, Ok(response))
             .await
             .expect_err("expected retryable status to be returned as an error");
         assert!(
@@ -1111,6 +1111,7 @@ async fn terminal_failure_with_fallback_receives_shared_batch_without_clones() {
                 *fallback_ptr_hook.lock().unwrap() = Some(Arc::as_ptr(&batch) as usize);
                 assert_eq!(clone_count_hook.load(Ordering::Relaxed), 0);
                 notify_hook.notify_one();
+                true
             })),
             ..LoggerHooks::default()
         },

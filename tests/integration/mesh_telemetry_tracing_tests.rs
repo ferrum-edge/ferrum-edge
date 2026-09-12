@@ -12,7 +12,9 @@ use ferrum_edge::modes::mesh::{
     MESH_WORKLOAD_METRICS_PLUGIN_ID, MeshConfigProtocol, MeshRuntimeConfig, MeshTopology,
     MeshTrafficDirection, prepare_gateway_config_for_mesh,
 };
-use ferrum_edge::plugins::{TransactionSummary, create_plugin};
+use ferrum_edge::plugins::{
+    TransactionSummary, create_plugin, mesh::workload_metrics::WorkloadMetrics,
+};
 use serde_json::{Value, json};
 
 fn test_addr(s: &str) -> SocketAddr {
@@ -153,6 +155,34 @@ fn workload_metrics_plugin_config(tracing: MeshTracingConfig) -> Value {
     plugin_config.config["flush_interval_ms"] = json!(100);
     plugin_config.config["service_name"] = json!("reviews");
     plugin_config.config
+}
+
+#[test]
+fn injected_workload_metrics_admits_present_and_absent_spiffe_identity() {
+    for spiffe_id in [None, Some("spiffe://cluster.local/ns/default/sa/api")] {
+        let mut runtime = test_runtime();
+        runtime.workload_spiffe_id = spiffe_id.map(str::to_string);
+        let config = GatewayConfig {
+            mesh: Some(Box::default()),
+            ..GatewayConfig::default()
+        };
+        let prepared =
+            prepare_gateway_config_for_mesh(config, &runtime).expect("mesh prepare succeeds");
+        let injected = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_WORKLOAD_METRICS_PLUGIN_ID)
+            .expect("workload_metrics injected");
+        assert_eq!(
+            injected.config.get("workload_spiffe_id"),
+            spiffe_id.map(Value::from).as_ref()
+        );
+        // No Telemetry or ProxyConfig supplies optional tracing fields here.
+        // The generated object must construct without relaxing null admission.
+        let object = injected.config.as_object().expect("plugin config object");
+        assert!(object.values().all(|value| !value.is_null()));
+        WorkloadMetrics::new(&injected.config).expect("injected workload metrics constructs");
+    }
 }
 
 fn otlp_resource_string_attr<'a>(payload: &'a Value, key: &str) -> Option<&'a str> {

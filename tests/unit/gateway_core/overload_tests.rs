@@ -3,7 +3,7 @@ use ferrum_edge::overload::{
     RED_PROBABILITY_SCALE, RequestGuard,
 };
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 // ── OverloadState basics ──────────────────────────────────────────────
@@ -665,7 +665,8 @@ async fn overload_fd_sample_runs_on_blocking_pool() {
     // the runtime worker rather than the blocking pool.
     let worker = std::thread::current().id();
     let (sampled_on_tx, sampled_on_rx) = std::sync::mpsc::channel();
-    let sample = sample_open_fd_count(Duration::from_secs(5), 7, move || {
+    let mut in_flight = None;
+    let sample = sample_open_fd_count(&mut in_flight, Duration::from_secs(5), 7, move || {
         let _ = sampled_on_tx.send(std::thread::current().id());
         42
     })
@@ -682,7 +683,7 @@ async fn overload_fd_sample_runs_on_blocking_pool() {
 
     let src = include_str!("../../../src/overload.rs");
     assert!(
-        src.contains("sample_open_fd_count(interval, previous_fd_current, count_open_fds)"),
+        src.contains("&mut fd_count_in_flight"),
         "the monitor must take its FD sample through the bounded blocking-pool helper"
     );
     assert!(
@@ -831,7 +832,8 @@ fn disabled_fd_tier_reports_enforced_false_in_the_snapshot() {
 
 #[tokio::test]
 async fn fd_count_sample_returns_the_measured_count_when_it_completes() {
-    let sample = sample_open_fd_count(Duration::from_secs(5), 7, || 42);
+    let mut in_flight = None;
+    let sample = sample_open_fd_count(&mut in_flight, Duration::from_secs(5), 7, || 42);
     let sample = sample.await;
     assert_eq!(sample.current, 42);
     assert!(!sample.timed_out);
@@ -845,10 +847,50 @@ async fn fd_count_sample_keeps_the_previous_count_when_the_blocking_pool_is_satu
         std::thread::sleep(Duration::from_secs(3));
         99
     };
-    let sample = sample_open_fd_count(Duration::from_millis(20), 1234, stalled);
+    let mut in_flight = None;
+    let sample = sample_open_fd_count(&mut in_flight, Duration::from_millis(20), 1234, stalled);
     let sample = sample.await;
     assert_eq!(sample.current, 1234);
     assert!(sample.timed_out);
+}
+
+#[tokio::test]
+async fn fd_count_sample_is_single_flight_after_timeout() {
+    let submissions = Arc::new(AtomicU64::new(0));
+    let first_submissions = Arc::clone(&submissions);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut in_flight = None;
+
+    let first = sample_open_fd_count(&mut in_flight, Duration::from_millis(10), 7, move || {
+        first_submissions.fetch_add(1, Ordering::Relaxed);
+        release_rx
+            .recv()
+            .expect("the test must release the retained blocking task");
+        42
+    })
+    .await;
+    assert!(first.timed_out);
+
+    let duplicate_submissions = Arc::clone(&submissions);
+    let second = sample_open_fd_count(
+        &mut in_flight,
+        Duration::from_millis(10),
+        first.current,
+        move || {
+            duplicate_submissions.fetch_add(1, Ordering::Relaxed);
+            99
+        },
+    )
+    .await;
+    assert!(second.timed_out);
+    assert_eq!(submissions.load(Ordering::Relaxed), 1);
+
+    release_tx
+        .send(())
+        .expect("the retained blocking task must still be running");
+    let completed = sample_open_fd_count(&mut in_flight, Duration::from_secs(1), 7, || 99).await;
+    assert_eq!(completed.current, 42);
+    assert!(!completed.timed_out);
 }
 
 #[test]

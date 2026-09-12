@@ -3,6 +3,7 @@
 //! This module contains infrastructure that plugins share, keeping plugin
 //! implementation files focused on their core logic.
 
+pub mod ai_model_glob;
 pub mod ai_pii;
 pub mod ai_providers;
 pub mod ai_usage_stream;
@@ -14,6 +15,7 @@ pub mod body_transform;
 pub mod byte_budget;
 pub mod cache_headers;
 pub mod cert_hash;
+pub mod cert_validity;
 pub mod claim_header_fanout;
 pub mod claim_resolver;
 pub mod content_encoding;
@@ -28,6 +30,7 @@ pub mod jwks_cache;
 pub mod jwks_store;
 pub mod jwt_verifier;
 pub mod log_helpers;
+pub mod log_sampling;
 pub mod log_schema;
 pub mod metadata_redaction;
 pub mod openai_error;

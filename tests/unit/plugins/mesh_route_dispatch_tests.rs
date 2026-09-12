@@ -2234,6 +2234,12 @@ fn rewrite_paths_require_canonical_config_admission() {
 
 #[tokio::test]
 async fn rewrite_composition_refuses_new_dot_segments_before_publication() {
+    // A suffix that opens with a `.` keeps its own segment boundary, so the
+    // composition the canonical check sees is the same whether or not the
+    // replacement already ends in `/`. Both replacements therefore share one
+    // table: `..` / `.` compose a dot segment and are refused before the
+    // override is published, `..hidden` is an ordinary segment and forwards as
+    // one, and `/other` is the control whose prefix simply does not match.
     for replacement in ["/v2", "/v2/"] {
         let plugin = MeshRouteDispatch::new(&json!({"rules": [{
             "match": {"uri": {"prefix": "/api"}},
@@ -2270,5 +2276,253 @@ async fn rewrite_composition_refuses_new_dot_segments_before_publication() {
             }
             assert_eq!(ctx.path, path, "client path provenance must survive");
         }
+    }
+}
+
+// ── admission: predicates and endpoints that cannot serve traffic ─────────
+
+/// One rule with the supplied match criteria and a valid direct destination.
+fn config_with_match(criteria: serde_json::Value) -> serde_json::Value {
+    json!({"rules": [{
+        "match": criteria,
+        "destination": {"backend_host": "127.0.0.1", "backend_port": 8080}
+    }]})
+}
+
+/// One rule with a direct-backend destination and a valid method predicate.
+fn config_with_direct_backend(host: &str, port: u16) -> serde_json::Value {
+    json!({"rules": [{
+        "match": {"methods": ["GET"]},
+        "destination": {"backend_host": host, "backend_port": port}
+    }]})
+}
+
+/// Both admission entry points must agree: `MeshRouteDispatch::new` is what the
+/// runtime cache calls, `validate_plugin_config` is what the Admin API and
+/// `ferrum-edge validate` route through.
+fn assert_admission(config: &serde_json::Value, accepted: bool, label: &str) {
+    assert_eq!(
+        MeshRouteDispatch::new(config).is_ok(),
+        accepted,
+        "constructor: {label}"
+    );
+    let shared = ferrum_edge::plugins::validate_plugin_config("mesh_route_dispatch", config);
+    assert_eq!(shared.is_ok(), accepted, "shared admission: {label}");
+}
+
+#[test]
+fn header_match_names_must_be_http_tokens() {
+    // The hot path is one lookup against a parsed request header map, so a
+    // name outside the RFC 9110 token grammar can never match. Admitting it
+    // hides a broken rule behind the default soft fallback.
+    for name in ["", "x bad", "x:bad", "x\nbad", "(canary)", "x/canary"] {
+        let config = config_with_match(json!({"headers": {name: "v2"}}));
+        assert_admission(&config, false, name);
+    }
+    for name in ["x-canary", "authorization", "x_canary", "x.canary"] {
+        let config = config_with_match(json!({"headers": {name: "v2"}}));
+        assert_admission(&config, true, name);
+    }
+}
+
+#[test]
+fn header_match_names_still_normalize_to_lowercase() {
+    let config = config_with_match(json!({"headers": {"X-Canary": {"prefix": "v"}}}));
+    let plugin = MeshRouteDispatch::new(&config).expect("mixed-case name is admitted");
+    let headers = &plugin.rules()[0].match_.headers;
+    assert!(headers.contains_key("x-canary"));
+}
+
+#[test]
+fn exact_and_prefix_method_predicates_must_be_http_tokens() {
+    // RFC 9110 §9.1 makes the method a token, and the hot path compares it
+    // with `==` / `starts_with`. An empty operand or one carrying a space can
+    // never match, so it is a config error rather than a silent no-op rule.
+    for methods in [
+        json!([""]),
+        json!(["GET POST"]),
+        json!(["GET\n"]),
+        json!([{"exact": ""}]),
+        json!([{"exact": "GET POST"}]),
+        json!([{"prefix": "G ET"}]),
+        json!([{"prefix": "GET,"}]),
+    ] {
+        let label = methods.to_string();
+        let config = config_with_match(json!({"methods": methods}));
+        assert_admission(&config, false, &label);
+    }
+    // Casing is preserved, extension methods stay legal, and `regex` operands
+    // are patterns rather than tokens — none of this narrows the predicate to
+    // the standard-method enum.
+    for methods in [
+        json!(["GET"]),
+        json!(["get"]),
+        json!([{"exact": "M-SEARCH"}]),
+        json!([{"exact": "PROPFIND"}]),
+        json!([{"prefix": "PO"}]),
+        json!([{"regex": "^(GET|POST)$"}]),
+        json!([{"regex": "^GET POST$"}]),
+    ] {
+        let label = methods.to_string();
+        let config = config_with_match(json!({"methods": methods}));
+        assert_admission(&config, true, &label);
+    }
+}
+
+#[test]
+fn direct_backend_host_must_be_a_bare_host() {
+    // A port-bearing host is handed to DNS resolution as a name that does not
+    // exist, so the route answers 502 on every match instead of failing at
+    // admission where an operator would see it.
+    for host in [
+        "localhost:32002",
+        "127.0.0.1:61589",
+        "svc.default.svc.cluster.local:8080",
+        "[::1]:8080",
+        "[::1",
+        "::1]",
+        "[not-an-ipv6]",
+        "svc/path",
+        "svc?query=1",
+        "svc#fragment",
+        "user@svc",
+    ] {
+        let config = config_with_direct_backend(host, 8080);
+        assert_admission(&config, false, host);
+    }
+    // Legitimate host forms — including both IPv6 spellings — stay accepted.
+    for host in [
+        "127.0.0.1",
+        "stable.default.svc.cluster.local",
+        "canary",
+        "::1",
+        "[::1]",
+        "[2001:db8::1]",
+    ] {
+        let config = config_with_direct_backend(host, 8080);
+        assert_admission(&config, true, host);
+    }
+}
+
+// ── prefix rewrite / redirect join (Istio HTTPRewrite semantics) ──────────
+
+#[tokio::test]
+async fn prefix_rewrite_preserves_a_suffix_that_starts_inside_a_segment() {
+    // Istio HTTPRewrite and Envoy `prefix_rewrite` swap the matched prefix
+    // literally: `/prefix/old` -> `/new` forwards `/prefix/oldtail` as
+    // `/newtail`. Synthesizing a separator would forward `/new/tail`, which
+    // is a different resource. The ignoreUriCase length-strip shares the join.
+    for (ignore_case, match_prefix) in [(false, "/prefix/old"), (true, "/Prefix/Old")] {
+        let config = json!({"rules": [{
+            "match": {"uri": {"prefix": match_prefix}, "ignore_uri_case": ignore_case},
+            "destination": {"backend_host": "127.0.0.1", "backend_port": 8080},
+            "rewrite": {"uri": "/new", "match_prefix": match_prefix}
+        }]});
+        let plugin = MeshRouteDispatch::new(&config).expect("prefix rewrite is admitted");
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/prefix/oldtail".to_string(),
+        );
+        let result = plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
+        assert!(matches!(result, PluginResult::Continue), "{result:?}");
+        assert_eq!(
+            ctx.route_override_path.as_deref(),
+            Some("/newtail"),
+            "ignore_uri_case={ignore_case}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn prefix_rewrite_refuses_a_dot_segment_that_opens_the_suffix() {
+    // Literal substitution must not launder the traversal operand a client
+    // wrote immediately after the matched prefix. Fusing it would compose
+    // `/new../admin` — an ordinary segment `canonicalize_policy_path` accepts —
+    // so the request would reach the backend instead of being refused. The
+    // suffix keeps its own segment boundary, the composition stays
+    // `/new/../admin`, and it is rejected with 400 before any override is
+    // published, exactly as it was before the mid-segment join changed.
+    // `..hidden` is not a dot segment and still forwards, in its own segment,
+    // and an ordinary mid-segment tail still substitutes literally.
+    for (ignore_case, match_prefix) in [(false, "/prefix/old"), (true, "/Prefix/Old")] {
+        let config = json!({"rules": [{
+            "match": {"uri": {"prefix": match_prefix}, "ignore_uri_case": ignore_case},
+            "destination": {"backend_host": "127.0.0.1", "backend_port": 8080},
+            "rewrite": {"uri": "/new", "match_prefix": match_prefix}
+        }]});
+        let plugin = MeshRouteDispatch::new(&config).expect("prefix rewrite is admitted");
+        for (path, expected) in [
+            ("/prefix/old../admin", None),
+            ("/prefix/old..", None),
+            ("/prefix/old./users", None),
+            ("/prefix/old..hidden", Some("/new/..hidden")),
+            ("/prefix/oldtail", Some("/newtail")),
+        ] {
+            let mut ctx =
+                RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), path.to_string());
+            let result = plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
+            let label = format!("{path} ignore_uri_case={ignore_case}");
+            if expected.is_some() {
+                assert!(
+                    matches!(result, PluginResult::Continue),
+                    "{label}: {result:?}"
+                );
+                assert_eq!(ctx.route_override_path.as_deref(), expected, "{label}");
+            } else {
+                assert!(matches!(
+                    result,
+                    PluginResult::Reject {
+                        status_code: 400,
+                        ..
+                    }
+                ));
+                assert!(ctx.route_override_path.is_none(), "{label}");
+            }
+            assert_eq!(ctx.path, path, "{label}: client path provenance");
+        }
+    }
+}
+
+#[tokio::test]
+async fn prefix_rewrite_still_collapses_a_doubled_separator() {
+    // Envoy's documented `prefix: /prefix` + `prefix_rewrite: /` pairing must
+    // still forward `/prefix/etc` as `/etc`, not `//etc`.
+    let config = json!({"rules": [{
+        "match": {"uri": {"prefix": "/prefix"}},
+        "destination": {"backend_host": "127.0.0.1", "backend_port": 8080},
+        "rewrite": {"uri": "/", "match_prefix": "/prefix"}
+    }]});
+    let plugin = MeshRouteDispatch::new(&config).expect("prefix rewrite is admitted");
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/prefix/etc".to_string(),
+    );
+    let result = plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(ctx.route_override_path.as_deref(), Some("/etc"));
+}
+
+#[tokio::test]
+async fn redirect_prefix_rewrite_preserves_a_suffix_inside_a_segment() {
+    // Redirects reuse the same join helper, so the Location path follows
+    // literal prefix substitution too.
+    let config = json!({"rules": [{
+        "match": {"methods": ["GET"]},
+        "redirect": {"uri": "/new", "match_prefix": "/prefix/old", "redirect_code": 302}
+    }]});
+    let plugin = MeshRouteDispatch::new(&config).expect("redirect is admitted");
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/prefix/oldtail".to_string(),
+    );
+    match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+        PluginResult::Reject { headers, .. } => {
+            let location = headers.get("location").map(String::as_str);
+            assert_eq!(location, Some("/newtail"));
+        }
+        other => panic!("expected redirect Reject, got {other:?}"),
     }
 }

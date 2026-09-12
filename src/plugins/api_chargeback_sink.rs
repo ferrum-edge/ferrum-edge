@@ -21,6 +21,8 @@
 //! generation for every stable plugin-config ID — never a process-wide
 //! last-constructor-wins singleton.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use chrono::{SecondsFormat, TimeZone, Utc};
@@ -64,8 +66,8 @@ use crate::dns::DnsCacheResolver;
 use crate::observability_delivery::DeliveryWorkerControl;
 use crate::plugins::utils::log_schema::view::status_class;
 use crate::plugins::utils::log_schema::{
-    DerivedKind, FieldSpec, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView,
-    SummarySchema, TimestampFormat, resolve_schema,
+    DerivedKind, EmittedKeys, FieldSpec, MetadataPolicy, SchemaCapabilities, SchemaSerializable,
+    SchemaView, SummarySchema, TimestampFormat, resolve_schema,
 };
 use tokio::sync::mpsc;
 
@@ -79,6 +81,14 @@ const SNAPSHOT_FINALIZE_TIMEOUT: Duration = Duration::from_secs(5);
 const SNAPSHOT_FINALIZE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_FIELD_LEN: usize = 512;
 const MAX_METADATA_FIELD_LEN: usize = 256;
+/// Byte ceiling for the operator-configured `currency` and `pricing_version`
+/// labels.
+///
+/// Unlike request-derived fields these are copied into every `ChargeEvent`
+/// without bounding, so they are admitted at the same per-field ceiling the
+/// event budget reserves rather than truncated (truncation would merge two
+/// distinct pricing or currency identities into one exported row).
+const MAX_LABEL_LEN: usize = MAX_FIELD_LEN;
 /// Conservative ceiling for one owned [`ChargeEvent`] after field bounding.
 const MAX_CHARGE_EVENT_BYTES: usize = 224 + (MAX_FIELD_LEN * 16) + (MAX_METADATA_FIELD_LEN * 4);
 const SPOOL_WARN_INTERVAL_SECS: i64 = 60;
@@ -419,11 +429,17 @@ impl BorrowedPendingDeltas<'_> {
         &self.events
     }
 
-    /// Give up ownership after a durable write: nothing is restored.
-    fn commit(mut self) -> usize {
-        let count = self.events.len();
-        self.events = Vec::new();
-        count
+    /// Give up ownership of the rows a durable write actually covered.
+    ///
+    /// A snapshot larger than one artifact is spooled as several bounded
+    /// artifacts, so a retry can land a prefix and then fail. Only that prefix
+    /// is released; the remainder is restored on drop and retried with its
+    /// event identity unchanged, so nothing is lost and nothing is charged
+    /// twice.
+    fn commit_prefix(&mut self, written: usize) -> usize {
+        let written = written.min(self.events.len());
+        self.events.drain(..written);
+        written
     }
 }
 
@@ -465,7 +481,7 @@ impl CompactSnapshotRecovery {
         // filesystem work begins. `attempt_lock` remains held until the
         // borrowed set commits or is restored, so another retry cannot mistake
         // the temporary empty vector for durable success.
-        let borrowed = self.borrow_pending();
+        let mut borrowed = self.borrow_pending();
         if borrowed.events().is_empty() {
             return true;
         }
@@ -476,7 +492,14 @@ impl CompactSnapshotRecovery {
             );
             return false;
         };
-        if let Err(error) = spool.write_events(borrowed.events()) {
+        let outcome = spool_snapshot_chunks(spool, borrowed.events());
+        let delivered = borrowed.commit_prefix(outcome.written);
+        if delivered > 0 {
+            self.metrics
+                .snapshot_emits_total
+                .fetch_add(delivered as u64, Ordering::Relaxed);
+        }
+        if let Some(error) = outcome.error {
             self.metrics.spool_available.store(false, Ordering::Release);
             self.metrics.record_failure(
                 FailureReason::Serialize,
@@ -486,16 +509,13 @@ impl CompactSnapshotRecovery {
                 plugin = PLUGIN_NAME,
                 generation = self.generation,
                 plugin_config_id = %self.plugin_config_id,
+                durable_rows = delivered,
                 error = %error,
-                "Chargeback sink compact snapshot recovery could not spool pending deltas"
+                "Chargeback sink compact snapshot recovery could not spool every pending delta"
             );
-            // `borrowed` drops here and restores the pending set.
+            // `borrowed` drops here and restores the undelivered remainder.
             return false;
         }
-        let delivered = borrowed.commit();
-        self.metrics
-            .snapshot_emits_total
-            .fetch_add(delivered as u64, Ordering::Relaxed);
         true
     }
 }
@@ -1576,7 +1596,7 @@ impl SchemaSerializable for ChargeEvent {
     fn serialize_metadata<S>(
         &self,
         _policy: &MetadataPolicy,
-        _emitted: &mut std::collections::HashSet<String>,
+        _emitted: &EmittedKeys<'_>,
         _map: &mut S,
     ) -> Result<(), S::Error>
     where
@@ -1593,6 +1613,11 @@ impl SchemaSerializable for ChargeEvent {
 struct SinkSummary {
     mode: SinkMode,
     pricing_version: String,
+    /// Structurally redacted ClickHouse endpoint (`scheme://host:port/redacted`).
+    ///
+    /// Never the spool owner's `sanitized_endpoint`: that value keeps the URL
+    /// path so durable ownership stays stable, and a path can carry a
+    /// credential the admin config projection redacts for non-admin readers.
     endpoint: String,
     database: String,
     table: String,
@@ -1692,6 +1717,27 @@ impl PendingCharge {
         Self {
             metrics,
             persisted: AtomicBool::new(false),
+        }
+    }
+
+    /// Owner for a row whose durable copy already exists.
+    ///
+    /// Snapshot mode writes the spool artifact *before* enqueueing the same
+    /// events for low-latency ClickHouse delivery, and the spool write is a
+    /// documented settlement point. The delivery attempt therefore must not be
+    /// able to report billing loss for a row that is durable and replayable:
+    /// the settled ledger records it as persisted at creation, and a later
+    /// `persist` after an acknowledged export is the usual idempotent no-op.
+    fn already_persisted(metrics: Arc<SinkMetrics>) -> Self {
+        metrics
+            .per_event_received_total
+            .fetch_add(1, Ordering::Relaxed);
+        metrics
+            .per_event_persisted_total
+            .fetch_add(1, Ordering::Relaxed);
+        Self {
+            metrics,
+            persisted: AtomicBool::new(true),
         }
     }
 
@@ -2066,7 +2112,7 @@ fn start_spool_delivery_with_clone_ceiling(
                                     invalidate_status_cache();
                                 }
                                 Ok(Err(error)) => {
-                                    warn!(
+                                    warn_sampled!(
                                         plugin = PLUGIN_NAME,
                                         error = %error,
                                         "Chargeback sink async spool write failed"
@@ -2077,7 +2123,7 @@ fn start_spool_delivery_with_clone_ceiling(
                                     );
                                 }
                                 Err(error) => {
-                                    warn!(
+                                    warn_sampled!(
                                         plugin = PLUGIN_NAME,
                                         error = %error,
                                         "Chargeback sink async spool write task failed"
@@ -2124,7 +2170,7 @@ fn start_spool_delivery_with_clone_ceiling(
                                 }
                                 Ok(Err(error)) => {
                                     metrics.spool_available.store(false, Ordering::Release);
-                                    warn!(
+                                    warn_sampled!(
                                         plugin = PLUGIN_NAME,
                                         generation,
                                         error = %error,
@@ -2133,7 +2179,7 @@ fn start_spool_delivery_with_clone_ceiling(
                                     job.restage();
                                 }
                                 Err(error) => {
-                                    warn!(
+                                    warn_sampled!(
                                         plugin = PLUGIN_NAME,
                                         generation,
                                         error = %error,
@@ -2996,6 +3042,15 @@ impl ApiChargebackSink {
         // dormant until commit_background_tasks; ACTIVE_SINKS stays unpublished.
         let parsed_url = parse_clickhouse_url(&self.config.clickhouse.url)?;
         let endpoint = sanitized_endpoint(&parsed_url);
+        // Diagnostic rendering for the JWT-authenticated status surface.
+        // `endpoint` keeps the URL path because the spool owner digest is a
+        // stable durable identity, but a ClickHouse URL path can itself carry a
+        // reusable credential and the admin plugin-config projection already
+        // withholds it from non-admin readers. Status therefore renders the
+        // structural `scheme://host:port/redacted` form every other
+        // HTTP-backed sink uses, so no reader recovers a path token the config
+        // read path redacts (GHSA-wq9r-g773-7c4q).
+        let status_endpoint = redacted_endpoint_url(&parsed_url);
         let insert_url = build_insert_url(&parsed_url, &self.config.clickhouse);
         // Structural, not substring: nothing from the INSERT query string is
         // copied into the diagnostic rendering.
@@ -3080,6 +3135,8 @@ impl ApiChargebackSink {
                 if snapshot_events_are_pre_spooled {
                     // Snapshot charges are already durably owned; acknowledge
                     // ownership without counting a fresh high-water diversion.
+                    // Their `PendingCharge` was created already settled, so
+                    // dropping it here cannot report billing loss either.
                     invalidate_status_cache();
                     return true;
                 }
@@ -3097,19 +3154,23 @@ impl ApiChargebackSink {
             on_failed_batch: Some(Arc::new(
                 move |batch: Arc<Vec<QueuedChargeEvent>>, error| {
                     if snapshot_events_are_pre_spooled {
-                        return;
+                        // The spool already owns every row in this batch, and
+                        // each carries an already-settled `PendingCharge`, so
+                        // a failed delivery is not a loss to re-own or report.
+                        return true;
                     }
                     if let Some(enqueue) = failed_enqueue.as_ref() {
                         // Terminal failure receives the shared batch handle; spool
                         // ownership continues under the same Arc without cloning
                         // ChargeEvent records.
-                        let _ = enqueue.try_enqueue(batch, "export failure");
+                        enqueue.try_enqueue(batch, "export failure")
                     } else {
-                        warn!(
+                        warn_sampled!(
                             plugin = PLUGIN_NAME,
                             error = %error,
                             "Chargeback sink export failed and spool is disabled; batch was lost"
                         );
+                        false
                     }
                 },
             )),
@@ -3164,7 +3225,7 @@ impl ApiChargebackSink {
             summary: SinkSummary {
                 mode: self.config.mode,
                 pricing_version: self.config.pricing_version.clone(),
-                endpoint,
+                endpoint: status_endpoint,
                 database: self.config.clickhouse.database.clone(),
                 table: self.config.clickhouse.table.clone(),
                 batch_size: self.config.batch.size,
@@ -5305,11 +5366,39 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
             "{PLUGIN_NAME}: clickhouse.password_ref must reference a FERRUM_* environment variable"
         ));
     }
+    // Pair completeness is a pure Option shape, so it belongs in cold
+    // admission rather than in client construction alone. Reading or parsing
+    // the PEM files stays in `build_clickhouse_http_client`, which keeps
+    // `validate` free of filesystem side effects while refusing a
+    // configuration that could only ever abort serving startup.
+    if config.clickhouse.tls.client_cert_file.is_some()
+        != config.clickhouse.tls.client_key_file.is_some()
+    {
+        return Err(format!(
+            "{PLUGIN_NAME}: clickhouse.tls.client_cert_file and client_key_file must be set together"
+        ));
+    }
     if config.pricing_version.trim().is_empty() {
         return Err(format!("{PLUGIN_NAME}: pricing_version must not be empty"));
     }
     if config.currency.trim().is_empty() {
         return Err(format!("{PLUGIN_NAME}: currency must not be empty"));
+    }
+    // Both labels are copied verbatim into every exported row and count
+    // against `MAX_CHARGE_EVENT_BYTES`. An unbounded label therefore admits a
+    // configuration in which every per-event charge is refused after the
+    // request already succeeded, silently disabling billing export. Reject the
+    // label instead of truncating it: a truncated currency or pricing
+    // generation would merge two distinct billing identities in ClickHouse.
+    if config.currency.len() > MAX_LABEL_LEN {
+        return Err(format!(
+            "{PLUGIN_NAME}: currency must be at most {MAX_LABEL_LEN} UTF-8 bytes"
+        ));
+    }
+    if config.pricing_version.len() > MAX_LABEL_LEN {
+        return Err(format!(
+            "{PLUGIN_NAME}: pricing_version must be at most {MAX_LABEL_LEN} UTF-8 bytes"
+        ));
     }
     Ok(())
 }
@@ -15386,8 +15475,34 @@ fn emit_periodic_snapshot(
     };
     // Bind the result first so the borrow of `events` ends before the failure
     // arm needs to move them back into bounded staging.
-    let write_result = spool.write_events(&events);
-    if let Err(error) = write_result {
+    let outcome = spool_snapshot_chunks(spool, &events);
+    let written = outcome.written;
+    // Snapshot mode requires the spool. It is the durable commit point before
+    // the accumulator baseline advances; the same event IDs are then enqueued as
+    // a low-latency delivery attempt. A reload racing this point can abort the
+    // queue worker without losing or double-charging the snapshot: replay is
+    // idempotent on event_id. The staged overflow was already taken above, so
+    // durable success simply keeps the durable prefix taken.
+    let durable = settle_snapshot_emission(
+        accumulator,
+        events,
+        written,
+        overflow_count,
+        overflow_retained_bytes,
+        &emitted_totals,
+    );
+    if written > 0 {
+        runtime
+            .metrics
+            .snapshot_emits_total
+            .fetch_add(written as u64, Ordering::Relaxed);
+        for event in durable {
+            // Already durable: the delivery attempt below must never be able
+            // to report billing loss for a spooled, replayable row.
+            enqueue_pre_spooled_charge_event(runtime, event);
+        }
+    }
+    if let Some(error) = outcome.error {
         runtime
             .metrics
             .spool_available
@@ -15399,29 +15514,16 @@ fn emit_periodic_snapshot(
         warn!(
             plugin = PLUGIN_NAME,
             generation = runtime.generation,
+            durable_rows = written,
             error = %error,
-            "Chargeback sink could not durably spool its periodic snapshot; no baseline was advanced"
+            "Chargeback sink could not durably spool its whole periodic snapshot; only the durable prefix advanced a baseline"
         );
-        restage_borrowed_overflow(accumulator, events, overflow_count, overflow_retained_bytes);
+        invalidate_status_cache();
         return Err(error);
     }
-    // Snapshot mode requires the spool. It is the durable commit point before
-    // the accumulator baseline advances; the same event IDs are then enqueued as
-    // a low-latency delivery attempt. A reload racing this point can abort the
-    // queue worker without losing or double-charging the snapshot: replay is
-    // idempotent on event_id. The staged overflow was already taken above, so
-    // durable success simply keeps it taken.
-    accumulator.commit_taken_overflow(overflow_retained_bytes);
-    accumulator.commit_emitted_totals(&emitted_totals);
-    runtime
-        .metrics
-        .snapshot_emits_total
-        .fetch_add(event_count as u64, Ordering::Relaxed);
-    for event in events {
-        enqueue_charge_event(runtime, event);
-    }
+    debug_assert_eq!(written, event_count);
     invalidate_status_cache();
-    Ok(event_count)
+    Ok(written)
 }
 
 async fn wait_for_snapshot_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
@@ -15498,8 +15600,23 @@ fn emit_final_snapshot_to_spool(
     };
     // Bind the result first so the borrow of `events` ends before the failure
     // arm needs to move them back into bounded staging.
-    let write_result = spool.write_events(&events);
-    if let Err(error) = write_result {
+    let outcome = spool_snapshot_chunks(spool, &events);
+    let written = outcome.written;
+    drop(settle_snapshot_emission(
+        accumulator,
+        events,
+        written,
+        overflow_count,
+        overflow_retained_bytes,
+        &emitted_totals,
+    ));
+    if written > 0 {
+        runtime
+            .metrics
+            .snapshot_emits_total
+            .fetch_add(written as u64, Ordering::Relaxed);
+    }
+    if let Some(error) = outcome.error {
         runtime
             .metrics
             .spool_available
@@ -15511,18 +15628,13 @@ fn emit_final_snapshot_to_spool(
         warn!(
             plugin = PLUGIN_NAME,
             generation = runtime.generation,
+            durable_rows = written,
             error = %error,
-            "Chargeback sink could not durably spool its final snapshot; generation state retained"
+            "Chargeback sink could not durably spool its whole final snapshot; generation state retained"
         );
-        restage_borrowed_overflow(accumulator, events, overflow_count, overflow_retained_bytes);
+        invalidate_status_cache();
         return false;
     }
-    accumulator.commit_taken_overflow(overflow_retained_bytes);
-    accumulator.commit_emitted_totals(&emitted_totals);
-    runtime
-        .metrics
-        .snapshot_emits_total
-        .fetch_add(events.len() as u64, Ordering::Relaxed);
     invalidate_status_cache();
     true
 }
@@ -15878,14 +15990,118 @@ fn reserve_delta_projection(
     Ok(reservation)
 }
 
+/// Outcome of a chunked snapshot spool handoff.
+struct ChunkedSpoolOutcome {
+    /// Rows durably written, counted from the front of the batch.
+    written: usize,
+    /// First chunk failure. `None` means every chunk landed.
+    error: Option<String>,
+}
+
+/// Write a snapshot batch as a sequence of bounded, independently replayable
+/// spool artifacts.
+///
+/// `snapshot.max_entries` admits up to `MAX_BUFFER_CAPACITY` identities while
+/// one artifact may hold at most `SPOOL_MAX_ROWS_PER_ARTIFACT` rows, so a
+/// single-artifact handoff makes every emission from a large accumulator fail
+/// permanently — periodic ticks, finalization, and compact recovery alike
+/// (issue #5264). Chunks are written in order and the caller advances exactly
+/// the baselines the durable prefix covers, so an interrupted emission retries
+/// only what never landed and keeps each row's `event_id`, which
+/// `ReplacingMergeTree` deduplicates. A full chunk cannot exceed the encoded
+/// artifact ceiling either: `SPOOL_MAX_ROWS_PER_ARTIFACT` rows conservatively
+/// bounded at `MAX_CHARGE_EVENT_BYTES` stay well inside
+/// `SPOOL_MAX_ARTIFACT_BYTES`.
+fn spool_snapshot_chunks(spool: &SpoolManager, events: &[ChargeEvent]) -> ChunkedSpoolOutcome {
+    let mut written = 0usize;
+    for chunk in events.chunks(SPOOL_MAX_ROWS_PER_ARTIFACT) {
+        if let Err(error) = spool.write_events(chunk) {
+            return ChunkedSpoolOutcome {
+                written,
+                error: Some(error),
+            };
+        }
+        written = written.saturating_add(chunk.len());
+    }
+    ChunkedSpoolOutcome {
+        written,
+        error: None,
+    }
+}
+
+/// Split the taken overflow reservation at the durable prefix.
+///
+/// `stage_overflow_event` reserves exactly `charge_event_retained_bytes` per
+/// event and `take_overflow_pending` moves that aggregate out under the same
+/// lock, so the take divides exactly. The whole-prefix and empty-prefix cases
+/// return the recorded aggregate verbatim rather than a recomputed sum, and the
+/// partial case is clamped: releasing more than was reserved would under-count
+/// the accumulator's retained bytes.
+fn split_overflow_reservation(
+    events: &[ChargeEvent],
+    overflow_written: usize,
+    overflow_count: usize,
+    overflow_retained_bytes: usize,
+) -> (usize, usize) {
+    if overflow_written >= overflow_count {
+        return (overflow_retained_bytes, 0);
+    }
+    if overflow_written == 0 {
+        return (0, overflow_retained_bytes);
+    }
+    let written_bytes = events[..overflow_written]
+        .iter()
+        .map(charge_event_retained_bytes)
+        .fold(0usize, usize::saturating_add)
+        .min(overflow_retained_bytes);
+    (written_bytes, overflow_retained_bytes - written_bytes)
+}
+
+/// Settle a snapshot emission that may only have been partially durable.
+///
+/// `events` is the taken overflow prefix followed by the prepared deltas, which
+/// are index-aligned with `emitted_totals`. Everything below `written` is
+/// durable: its share of the overflow reservation is released and its delta
+/// baselines advance. Everything above is restaged (overflow) or left to be
+/// recomputed from the unchanged accumulator baseline on the next tick
+/// (deltas). The durable prefix is returned so the caller can attempt
+/// low-latency delivery for exactly those rows.
+fn settle_snapshot_emission(
+    accumulator: &SnapshotAccumulator,
+    mut events: Vec<ChargeEvent>,
+    written: usize,
+    overflow_count: usize,
+    overflow_retained_bytes: usize,
+    emitted_totals: &[(SnapshotMetadata, u64, SnapshotTotals)],
+) -> Vec<ChargeEvent> {
+    let written = written.min(events.len());
+    let overflow_written = written.min(overflow_count);
+    let (commit_bytes, restage_bytes) = split_overflow_reservation(
+        &events,
+        overflow_written,
+        overflow_count,
+        overflow_retained_bytes,
+    );
+    let retryable = events.split_off(written);
+    restage_borrowed_overflow(
+        accumulator,
+        retryable,
+        overflow_count - overflow_written,
+        restage_bytes,
+    );
+    accumulator.commit_taken_overflow(commit_bytes);
+    accumulator.commit_emitted_totals(&emitted_totals[..written.saturating_sub(overflow_count)]);
+    events
+}
+
 /// Return the leading `overflow_count` events of a borrowed emission set to
 /// bounded overflow staging.
 ///
 /// The emission paths take staged overflow rather than cloning it. Every path
 /// that does not reach the durable commit point must give it back, or a pending
 /// billing delta would be silently lost. Prepared deltas beyond `overflow_count`
-/// are intentionally dropped: no baseline was advanced, so they are still held
-/// by the accumulator.
+/// are intentionally dropped: their baseline was not advanced, so they are
+/// still held by the accumulator and are recomputed on the next emission.
 fn restage_borrowed_overflow(
     accumulator: &SnapshotAccumulator,
     mut events: Vec<ChargeEvent>,
@@ -15953,7 +16169,29 @@ fn charge_event_retained_bytes(event: &ChargeEvent) -> usize {
 }
 
 fn enqueue_charge_event(runtime: &SinkRuntime, event: ChargeEvent) {
-    let accounting = PendingCharge::new(Arc::clone(&runtime.metrics));
+    enqueue_charge_event_with_durability(runtime, event, false);
+}
+
+/// Enqueue a row whose durable spool copy already exists.
+///
+/// Used only by snapshot emission, which commits its artifact before the
+/// low-latency delivery attempt. Every refusal and every failed delivery below
+/// must leave the settled ledger reporting the row as persisted rather than
+/// dropped (issue #5266).
+fn enqueue_pre_spooled_charge_event(runtime: &SinkRuntime, event: ChargeEvent) {
+    enqueue_charge_event_with_durability(runtime, event, true);
+}
+
+fn enqueue_charge_event_with_durability(
+    runtime: &SinkRuntime,
+    event: ChargeEvent,
+    already_durable: bool,
+) {
+    let accounting = if already_durable {
+        PendingCharge::already_persisted(Arc::clone(&runtime.metrics))
+    } else {
+        PendingCharge::new(Arc::clone(&runtime.metrics))
+    };
     // Charge the Arc allocation and lifetime bookkeeping to the existing budget.
     let retained = charge_event_retained_bytes(&event).saturating_add(128);
     if retained > MAX_CHARGE_EVENT_BYTES {

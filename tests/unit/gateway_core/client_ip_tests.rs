@@ -40,23 +40,42 @@ fn real_ip_outcome(
     real_ip_outcome_bytes(socket_ip, &bytes, trusted_proxies)
 }
 
-/// Resolve through the same entry point the H1/H2/H3 request paths use.
+/// Resolve through the same entry point the H1/H2/H3 request paths use, from
+/// the raw field-line bytes of both forwarded sources.
+fn forwarded_client_ip_bytes(
+    socket_ip: &str,
+    real_ip_lines: &[&[u8]],
+    xff_lines: &[&[u8]],
+    trusted_proxies: &TrustedProxies,
+) -> Option<String> {
+    let socket_addr = socket_ip.parse().expect("valid socket IP");
+    resolve_forwarded_client_ip(
+        socket_ip,
+        &socket_addr,
+        real_ip_lines.iter().copied(),
+        xff_lines.iter().copied(),
+        trusted_proxies,
+    )
+}
+
+/// UTF-8 convenience wrapper over [`forwarded_client_ip_bytes`]: the real-IP
+/// header as text field-lines and at most one `X-Forwarded-For` field-line.
 fn forwarded_client_ip(
     socket_ip: &str,
     real_ip_lines: &[&str],
     xff: Option<&str>,
     trusted_proxies: &TrustedProxies,
 ) -> Option<String> {
-    let socket_addr = socket_ip.parse().expect("valid socket IP");
-    let bytes: Vec<&[u8]> = real_ip_lines.iter().map(|line| line.as_bytes()).collect();
-    resolve_forwarded_client_ip(
-        socket_ip,
-        &socket_addr,
-        bytes.iter().copied(),
-        xff,
-        trusted_proxies,
-    )
+    let real: Vec<&[u8]> = real_ip_lines.iter().map(|line| line.as_bytes()).collect();
+    let xff: Vec<&[u8]> = xff.map(str::as_bytes).into_iter().collect();
+    forwarded_client_ip_bytes(socket_ip, &real, &xff, trusted_proxies)
 }
+
+/// Field-line bytes that `HeaderValue::to_str()` refuses: valid-UTF-8 obs-text
+/// (`é`), a non-UTF-8 pair, and ordinary unparseable text for contrast. A
+/// remote peer picks these bytes, so a text-filtered view of the header is a
+/// view the peer decides the contents of.
+const OPAQUE_XFF_PREFIXES: [&[u8]; 3] = [b"\xc3\xa9", b"\xff\xfe", b"unknown"];
 
 // ── TrustedProxies parsing ───────────────────────────────────────────
 
@@ -796,7 +815,7 @@ fn resolve_via_context(ctx: &RequestContext, tp: &TrustedProxies) -> Option<Stri
         "10.0.0.1",
         &socket_addr,
         ctx.header_field_lines("x-real-ip"),
-        Some("192.0.2.9"),
+        Some(b"192.0.2.9".as_slice()),
         tp,
     )
 }
@@ -976,4 +995,187 @@ fn forwarded_true_ipv6_identity_is_not_folded() {
         forwarded_client_ip("10.0.0.1", &["::192.0.2.10"], None, &tp),
         forwarded_client_ip("10.0.0.1", &["::ffff:192.0.2.10"], None, &tp)
     );
+}
+
+// ── Byte-preserving X-Forwarded-For (advisory GHSA-73ff-frj6-cpmp) ──────────
+
+/// An `X-Forwarded-For` field-line carrying obs-text is not a reason to
+/// discard the whole line. An appending proxy (nginx
+/// `$proxy_add_x_forwarded_for`, Envoy's default `use_remote_address`, most
+/// cloud load balancers) writes the address it vouches for onto the SAME line
+/// it received, so keeping the line is what keeps the trust boundary.
+#[test]
+fn opaque_xff_field_line_still_yields_the_appended_client_address() {
+    let tp = trusted("10.0.0.0/8");
+
+    for opaque in OPAQUE_XFF_PREFIXES {
+        let mut line = opaque.to_vec();
+        line.extend_from_slice(b", 203.0.113.50");
+        let lines: [&[u8]; 1] = [line.as_slice()];
+        assert_eq!(
+            forwarded_client_ip_bytes("10.0.0.1", &[], &lines, &tp).as_deref(),
+            Some("203.0.113.50"),
+            "opaque prefix {opaque:?} must not erase the appended client address"
+        );
+    }
+}
+
+/// Repeated `X-Forwarded-For` field-lines are ONE chain in wire order. An
+/// opaque line to the LEFT of the boundary must not erase the address a later
+/// line carries; an opaque line that IS the rightmost hop still fails closed.
+#[test]
+fn one_opaque_xff_field_line_does_not_erase_the_appended_boundary() {
+    let tp = trusted("10.0.0.0/8");
+
+    let opaque_first: [&[u8]; 2] = [b"\xff\xfe", b"203.0.113.50, 10.0.0.2"];
+    assert_eq!(
+        forwarded_client_ip_bytes("10.0.0.1", &[], &opaque_first, &tp).as_deref(),
+        Some("203.0.113.50")
+    );
+
+    let opaque_last: [&[u8]; 2] = [b"203.0.113.50, 10.0.0.2", b"\xff\xfe"];
+    assert_eq!(
+        forwarded_client_ip_bytes("10.0.0.1", &[], &opaque_last, &tp),
+        None,
+        "an unparseable rightmost hop must keep the socket identity"
+    );
+}
+
+/// Ordinary repeated field-lines, no opaque bytes: the walk reads across the
+/// lines in wire order, so repeated lines and the equivalent folded single line
+/// resolve to one identity.
+#[test]
+fn repeated_xff_field_lines_are_walked_as_one_chain() {
+    let tp = trusted("10.0.0.0/8, 172.16.0.0/12");
+
+    let split: [&[u8]; 2] = [b"198.51.100.23", b"172.16.0.1, 10.0.0.2"];
+    let folded: [&[u8]; 1] = [b"198.51.100.23, 172.16.0.1, 10.0.0.2"];
+    assert_eq!(
+        forwarded_client_ip_bytes("10.0.0.1", &[], &split, &tp).as_deref(),
+        Some("198.51.100.23")
+    );
+    assert_eq!(
+        forwarded_client_ip_bytes("10.0.0.1", &[], &split, &tp),
+        forwarded_client_ip_bytes("10.0.0.1", &[], &folded, &tp)
+    );
+}
+
+/// The configured real-IP header still supersedes `X-Forwarded-For`, and a
+/// rejected one still refuses to fall through to it. Seeing more XFF bytes
+/// changes neither precedence rule.
+#[test]
+fn configured_real_ip_header_still_precedes_an_opaque_xff_chain() {
+    let tp = trusted("10.0.0.0/8");
+    let opaque: [&[u8]; 1] = [b"\xff\xfe, 203.0.113.50"];
+
+    let accepted: [&[u8]; 1] = [b"198.51.100.23"];
+    assert_eq!(
+        forwarded_client_ip_bytes("10.0.0.1", &accepted, &opaque, &tp).as_deref(),
+        Some("198.51.100.23")
+    );
+
+    let duplicated: [&[u8]; 2] = [b"198.51.100.23", b"198.51.100.24"];
+    assert_eq!(
+        forwarded_client_ip_bytes("10.0.0.1", &duplicated, &opaque, &tp),
+        None
+    );
+}
+
+/// Byte preservation widens what the walk can SEE, never who it trusts: an
+/// untrusted direct peer's chain is ignored whatever bytes it holds.
+#[test]
+fn opaque_xff_from_an_untrusted_peer_is_still_ignored() {
+    let tp = trusted("10.0.0.0/8");
+    let opaque: [&[u8]; 1] = [b"\xff\xfe, 203.0.113.50"];
+
+    assert_eq!(
+        forwarded_client_ip_bytes("198.51.100.2", &[], &opaque, &tp),
+        None
+    );
+}
+
+/// Build a context holding raw `X-Forwarded-For` field-lines, including bytes
+/// the text accessor cannot represent. `HeaderValue::from_bytes` accepts
+/// obs-text, which is exactly why it reaches this code on the wire.
+fn context_with_xff_lines(values: &[&[u8]]) -> RequestContext {
+    let mut headers = hyper::HeaderMap::new();
+    for value in values {
+        headers.append(
+            hyper::header::HeaderName::from_static("x-forwarded-for"),
+            hyper::header::HeaderValue::from_bytes(value).expect("valid header value"),
+        );
+    }
+    let mut ctx = RequestContext::new("10.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+    ctx.set_raw_headers(headers);
+    ctx
+}
+
+fn resolve_xff_via_context(ctx: &RequestContext, tp: &TrustedProxies) -> Option<String> {
+    let socket_addr = "10.0.0.1".parse().expect("valid socket IP");
+    resolve_forwarded_client_ip(
+        "10.0.0.1",
+        &socket_addr,
+        std::iter::empty::<&[u8]>(),
+        ctx.header_field_lines("x-forwarded-for"),
+        tp,
+    )
+}
+
+/// Both frontends resolve the chain from `RequestContext::header_field_lines`,
+/// so one context must produce one identity in the raw-wire state and after
+/// materialization. Materialization drops the obs-text line from the
+/// plugin-visible map, but the pristine wire map is retained and stays
+/// authoritative for this decision.
+#[test]
+fn context_xff_field_lines_survive_obs_text_raw_and_materialized() {
+    let tp = trusted("10.0.0.0/8");
+    let lines: [&[u8]; 1] = [b"\xc3\xa9, 203.0.113.50"];
+
+    let raw_ctx = context_with_xff_lines(&lines);
+    assert_eq!(
+        resolve_xff_via_context(&raw_ctx, &tp).as_deref(),
+        Some("203.0.113.50")
+    );
+
+    let mut materialized_ctx = context_with_xff_lines(&lines);
+    materialized_ctx.materialize_headers();
+    assert_eq!(
+        resolve_xff_via_context(&materialized_ctx, &tp).as_deref(),
+        Some("203.0.113.50")
+    );
+
+    // Non-vacuity: the text accessor the advisory named still cannot see this
+    // field-line at all, which is precisely why resolution must not use it.
+    assert_eq!(raw_ctx.raw_header_values("x-forwarded-for").count(), 0);
+}
+
+/// Ingress parity by source contract, the way
+/// `allowed_methods_logging_tests.rs` holds the two frontends together: both
+/// the H1/H2 frontend and the native H3 frontend must hand
+/// `resolve_forwarded_client_ip` the byte-preserving field-line iterator, and
+/// neither may read the chain through the text accessor that drops a whole
+/// field-line the client made unrepresentable.
+#[test]
+fn both_ingress_paths_collect_x_forwarded_for_as_field_line_bytes() {
+    const XFF_FIELD_LINES: &str = "ctx.header_field_lines(\"x-forwarded-for\")";
+    const XFF_TEXT_VALUES: &str = "raw_header_values(\"x-forwarded-for\")";
+
+    for (path, source) in [
+        ("H1/H2", include_str!("../../../src/proxy/mod.rs")),
+        ("native H3", include_str!("../../../src/http3/server.rs")),
+    ] {
+        let call = source
+            .find("resolve_forwarded_client_ip(")
+            .expect("ingress must resolve through resolve_forwarded_client_ip");
+        // Char-bounded so a multi-byte comment cannot split the slice.
+        let arguments: String = source[call..].chars().take(800).collect();
+        assert!(
+            arguments.contains(XFF_FIELD_LINES),
+            "{path} ingress must pass X-Forwarded-For as raw field-line bytes: {arguments}"
+        );
+        assert!(
+            !source.contains(XFF_TEXT_VALUES),
+            "{path} ingress must not read X-Forwarded-For through the text accessor"
+        );
+    }
 }

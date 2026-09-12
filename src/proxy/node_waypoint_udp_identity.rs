@@ -858,6 +858,11 @@ pub trait NodeWaypointUdpInterfaceResolver: Send + Sync + 'static {
 /// both families. Identical to the Ambient host-capture resolution, so the two
 /// paths agree on which interface belongs to a pod.
 pub struct VethInterfaceResolver {
+    /// Only the Linux `resolve_interface` reads this; the non-Linux impl
+    /// refuses outright. The field is still initialized on every host so the
+    /// resolver keeps one shape, so the non-Linux build allows it explicitly
+    /// rather than dropping it from the struct.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     sysfs_net: std::path::PathBuf,
 }
 

@@ -93,6 +93,8 @@
 //! federation token accounting works even though normal backend dispatch is
 //! skipped.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -111,6 +113,7 @@ use super::ai_stream_router::{
     next_provider_claim_owner_id, remove_header_ci, strip_client_credentials,
     strip_gateway_identity_assertions,
 };
+use super::utils::ai_model_glob::matches_model_glob;
 use super::utils::aws_sigv4;
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::openai_error::openai_error_body;
@@ -1762,6 +1765,41 @@ fn optional_status_code_set(
     Ok(Some(out))
 }
 
+/// Reject a static provider credential that cannot become an HTTP header value.
+///
+/// `build_auth_headers` and `apply_stream_boundary_headers` hand these strings
+/// straight to the request builder, so a credential carrying a newline or a
+/// control character was only discovered at dispatch: every request to that
+/// provider failed with a `502` the operator could not diagnose, and `validate`
+/// reported the configuration as good (issue #5259). Screening the FINAL header
+/// value here — after secret/environment resolution and with the `Bearer `
+/// prefix already applied — turns an operator typo into a configuration error.
+/// The credential itself is never echoed.
+fn validate_static_credential_header(
+    provider: &str,
+    field: &str,
+    value: &str,
+) -> Result<(), String> {
+    if reqwest::header::HeaderValue::from_str(value).is_err() {
+        return Err(format!(
+            "ai_federation: provider '{provider}' '{field}' is not a valid HTTP header value"
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve a required static API key and prove it can be sent as a header value.
+fn required_api_key(config: &Value, name: &str) -> Result<String, String> {
+    let api_key = config_or_env_str(config, "api_key", None).ok_or(format!(
+        "ai_federation: provider '{name}' missing 'api_key'"
+    ))?;
+    // Header-value validity is a per-byte property, so proving the key itself
+    // is sendable also proves the `Bearer {api_key}` form the bearer providers
+    // build is sendable.
+    validate_static_credential_header(name, "api_key", &api_key)?;
+    Ok(api_key)
+}
+
 /// Build the authentication method for a provider.
 fn build_auth(
     provider_type: ProviderType,
@@ -1776,42 +1814,24 @@ fn build_auth(
         | ProviderType::DeepSeek
         | ProviderType::MetaLlama
         | ProviderType::HuggingFace
-        | ProviderType::Cohere => {
-            let api_key = config_or_env_str(config, "api_key", None).ok_or(format!(
-                "ai_federation: provider '{name}' missing 'api_key'"
-            ))?;
-            Ok(AuthMethod::BearerToken { api_key })
-        }
+        | ProviderType::Cohere => Ok(AuthMethod::BearerToken {
+            api_key: required_api_key(config, name)?,
+        }),
 
-        ProviderType::Anthropic => {
-            let api_key = config_or_env_str(config, "api_key", None).ok_or(format!(
-                "ai_federation: provider '{name}' missing 'api_key'"
-            ))?;
-            Ok(AuthMethod::CustomHeader {
-                header_name: "x-api-key".to_string(),
-                api_key,
-            })
-        }
+        ProviderType::Anthropic => Ok(AuthMethod::CustomHeader {
+            header_name: "x-api-key".to_string(),
+            api_key: required_api_key(config, name)?,
+        }),
 
-        ProviderType::AzureOpenAi => {
-            let api_key = config_or_env_str(config, "api_key", None).ok_or(format!(
-                "ai_federation: provider '{name}' missing 'api_key'"
-            ))?;
-            Ok(AuthMethod::CustomHeader {
-                header_name: "api-key".to_string(),
-                api_key,
-            })
-        }
+        ProviderType::AzureOpenAi => Ok(AuthMethod::CustomHeader {
+            header_name: "api-key".to_string(),
+            api_key: required_api_key(config, name)?,
+        }),
 
-        ProviderType::GoogleGemini => {
-            let api_key = config_or_env_str(config, "api_key", None).ok_or(format!(
-                "ai_federation: provider '{name}' missing 'api_key'"
-            ))?;
-            Ok(AuthMethod::CustomHeader {
-                header_name: "x-goog-api-key".to_string(),
-                api_key,
-            })
-        }
+        ProviderType::GoogleGemini => Ok(AuthMethod::CustomHeader {
+            header_name: "x-goog-api-key".to_string(),
+            api_key: required_api_key(config, name)?,
+        }),
 
         ProviderType::GoogleVertex => {
             let sa_json = config_or_env_str(config, "google_service_account_json", None).ok_or(
@@ -1848,6 +1868,13 @@ fn build_auth(
             ))?;
             let session_token =
                 config_or_env_str(config, "aws_session_token", Some(&["AWS_SESSION_TOKEN"]));
+            // SigV4 embeds the access key id in the `Authorization` value and
+            // sends the session token as `x-amz-security-token`, so both are
+            // static header values and fail the same way at dispatch.
+            validate_static_credential_header(name, "aws_access_key_id", &access_key_id)?;
+            if let Some(token) = session_token.as_deref() {
+                validate_static_credential_header(name, "aws_session_token", token)?;
+            }
 
             Ok(AuthMethod::AwsSigV4 {
                 config: aws_sigv4::AwsSigV4Config {
@@ -1920,72 +1947,13 @@ fn validate_provider_config(
 // Model routing
 // ---------------------------------------------------------------------------
 
-/// Characters a `*` wildcard in a `model_patterns` glob is NOT allowed to
-/// consume.
-///
-/// This is the security tightening for `simple_glob_match`. Without this,
-/// an operator pattern like `gemini-*` would match a malicious user input
-/// such as `gemini-../foo:streamGenerateContent?key=stolen` and let
-/// `find_providers_for_model` route the request to a Gemini provider that
-/// then concatenates the user-controlled string into the URL path. The
-/// charset below covers every URL-structural separator (path traversal,
-/// query/fragment introducers, alternate path separators) plus
-/// whitespace and control-style characters that have no business in a
-/// model identifier. Compare with fnmatch(3) where `*` does not cross `/`.
-const GLOB_WILDCARD_FORBIDDEN_CHARS: &[char] = &['/', '?', '#', '&', '\\', ' ', '\t', '\n', '\r'];
-
-/// Simple glob match supporting only `*` as a wildcard.
-///
-/// `*` matches any sequence of characters EXCEPT those listed in
-/// [`GLOB_WILDCARD_FORBIDDEN_CHARS`]. The pattern is implicitly anchored to
-/// the start and end of the input — there is no "starts-with" mode. The
-/// literal segments between `*` markers must appear in order without
-/// overlapping the forbidden character set inside any `*` window.
-fn simple_glob_match(pattern: &str, input: &str) -> bool {
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.len() == 1 {
-        // No wildcard — exact match
-        return pattern == input;
-    }
-
-    let mut pos = 0;
-
-    for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-        if let Some(found) = input[pos..].find(part) {
-            // First segment must be at the start if pattern doesn't start with *
-            if i == 0 && found != 0 {
-                return false;
-            }
-            // The substring `*` consumed (between the previous match end
-            // and the next literal) must not contain any URL-structural
-            // separator. Without this, `gemini-*` would match
-            // `gemini-../foo:streamGenerateContent` and let the dispatcher
-            // route a path-traversing model to a real Gemini provider.
-            let gap = &input[pos..pos + found];
-            if gap.contains(GLOB_WILDCARD_FORBIDDEN_CHARS) {
-                return false;
-            }
-            pos += found + part.len();
-        } else {
-            return false;
-        }
-    }
-
-    // If the pattern doesn't end with *, input must be consumed
-    if !pattern.ends_with('*') && pos != input.len() {
-        return false;
-    }
-
-    // Trailing `*` window — the remainder must also not contain URL separators.
-    if pattern.ends_with('*') && input[pos..].contains(GLOB_WILDCARD_FORBIDDEN_CHARS) {
-        return false;
-    }
-
-    true
-}
+// Model globs are matched by the shared `utils::ai_model_glob` helper: the
+// pattern is anchored to both ends of the model name and a `*` window may not
+// consume a URL-structural separator or whitespace. The matcher lives in
+// `plugins::utils` rather than here because `ai_stream_router` carries the same
+// contract, and the two private copies drifted into the same defect twice
+// (issue #5255 here, issues #5297 / #5392 there). Identifier admission still
+// caps client model names and operator patterns at `MAX_MODEL_IDENTIFIER_BYTES`.
 
 /// Validate that a resolved model name is safe to substitute into a URL
 /// path component.
@@ -2061,7 +2029,7 @@ impl AiFederation {
                 } else {
                     p.model_patterns
                         .iter()
-                        .any(|pat| simple_glob_match(pat, model))
+                        .any(|pat| matches_model_glob(pat, model))
                 }
             })
             .collect()
@@ -3998,6 +3966,43 @@ fn bedrock_tool_choice(openai_body: &Value) -> Result<BedrockToolChoice, String>
     Ok(BedrockToolChoice::Enabled(Some(translated)))
 }
 
+/// Translate an OpenAI `tool_choice` to the Cohere v2 representation.
+///
+/// Cohere v2 accepts only `REQUIRED` and `NONE`; automatic selection is
+/// represented by OMITTING the field, and there is no native named-function
+/// choice. Forwarding OpenAI's lowercase strings unchanged made every explicit
+/// selection fail the provider's own validation (issue #5257), so the enum is
+/// translated here and a choice Cohere cannot represent is refused before
+/// dispatch instead of being silently downgraded to a different selection.
+fn cohere_tool_choice(openai_body: &Value) -> Result<Option<Value>, String> {
+    let Some(choice) = openai_body.get("tool_choice") else {
+        return Ok(None);
+    };
+    match choice {
+        // Cohere's own default is automatic selection.
+        Value::String(value) if value == "auto" => Ok(None),
+        Value::String(value) if value == "required" => Ok(Some(json!("REQUIRED"))),
+        Value::String(value) if value == "none" => {
+            // `none` with no tools declared is already the native shape:
+            // there is nothing for `NONE` to disable, and Cohere rejects the
+            // field on a request that declares no tools.
+            let has_tools = openai_body
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|tools| !tools.is_empty());
+            if has_tools {
+                Ok(Some(json!("NONE")))
+            } else {
+                Ok(None)
+            }
+        }
+        Value::Object(_) => {
+            Err("ai_federation: Cohere cannot represent a named tool_choice".to_string())
+        }
+        _ => Err("ai_federation: unsupported Cohere tool_choice".to_string()),
+    }
+}
+
 fn translate_to_cohere(
     provider: &ResolvedProvider,
     openai_body: &Value,
@@ -4011,10 +4016,36 @@ fn translate_to_cohere(
     };
     body["model"] = Value::String(resolved_model.to_string());
 
-    // Remove fields Cohere doesn't support
+    // Remove the OpenAI spellings of every field Cohere names differently or
+    // does not accept. Each one is re-added below under its native name; a
+    // removal with no re-add would silently discard the client's setting.
     if let Some(obj) = body.as_object_mut() {
         obj.remove("max_completion_tokens");
         obj.remove("stop");
+        obj.remove("top_p");
+        obj.remove("tool_choice");
+    }
+    // Cohere's output bound is `max_tokens`. `max_completion_tokens` is the
+    // same bound under OpenAI's newer name, so it must be translated rather
+    // than dropped (issue #5256) — dropping it silently handed the request to
+    // the provider's model-specific default generation length. When a client
+    // supplies both, `max_tokens` wins, exactly as the Bedrock adapter
+    // resolves the same pair.
+    if let Some(limit) = openai_body
+        .get("max_tokens")
+        .or_else(|| openai_body.get("max_completion_tokens"))
+    {
+        body["max_tokens"] = limit.clone();
+    }
+    // Cohere spells nucleus sampling `p` (issue #5258). The value is forwarded
+    // unchanged — clamping it into Cohere's accepted range would substitute a
+    // setting the client never asked for, so an out-of-range value is the
+    // provider's own validation error.
+    if let Some(top_p) = openai_body.get("top_p") {
+        body["p"] = top_p.clone();
+    }
+    if let Some(choice) = cohere_tool_choice(openai_body)? {
+        body["tool_choice"] = choice;
     }
     if let Some(stop) = normalized_stop_sequences(openai_body)? {
         body["stop_sequences"] = stop;
@@ -5488,6 +5519,22 @@ fn stream_target_for(
     })
 }
 
+/// Whether the FINAL provider-visible body of a claimed stream may still carry
+/// non-text content.
+///
+/// `reject` forbids it outright and `text_only_with_warning` promised to remove
+/// it, so for both modes any surviving non-text part is a policy violation.
+/// `translate` keeps the parts, but only the ones this provider can actually
+/// represent — the same support check the buffered path applies before it
+/// builds a provider request.
+fn stream_multimodal_content_allowed(provider: &ResolvedProvider, body: &Value) -> bool {
+    if provider.multimodal_mode != MultimodalMode::Translate {
+        return false;
+    }
+    let supported = validate_multimodal_translate_support(provider, body);
+    supported.is_ok()
+}
+
 /// Whether the model still satisfies this provider's configured pattern policy.
 ///
 /// Same rule as [`AiFederation::find_providers_for_model`] (empty patterns are a
@@ -5498,7 +5545,7 @@ fn provider_matches_model(provider: &ResolvedProvider, model: &str) -> bool {
         || provider
             .model_patterns
             .iter()
-            .any(|pattern| simple_glob_match(pattern, model))
+            .any(|pattern| matches_model_glob(pattern, model))
 }
 
 /// The complete set of request headers a streaming claim owns at the provider
@@ -6259,6 +6306,16 @@ impl AiFederation {
             );
         }
 
+        // `multimodal_mode` is a PROVIDER-boundary policy, not a
+        // client-representation rule, so the buffered path's gate has to be
+        // applied here too: without it a `stream: true` request carried the
+        // image and audio parts a `reject` provider refuses — and a
+        // `text_only_with_warning` provider promises to strip — straight to that
+        // provider (GHSA-h5r4-qw2q-f277). Analyzed once and reused for every
+        // candidate; the reduction itself belongs to the body transform, which
+        // owns the provider-visible bytes.
+        let multimodal_usage = analyze_multimodal_usage(openai_body);
+
         // `max_concurrent_requests` is documented as the maximum number of
         // simultaneous federation provider chains, so a stream must hold a slot
         // exactly like a buffered call does. Acquired BEFORE any provider is
@@ -6281,6 +6338,10 @@ impl AiFederation {
 
         let mut attempts: u32 = 0;
         let mut last_ineligibility: Option<StreamIneligibility> = None;
+        // A provider-specific multimodal refusal, kept separately from
+        // streaming ineligibility: it is a client-fixable 400 about the request
+        // content, not a 501 about the provider's streaming shape.
+        let mut last_multimodal_rejection: Option<String> = None;
         let mut skipped_open_circuit = false;
         // A half-open probe RESERVED for a candidate that then turned out to be
         // ineligible. Released before moving on so one ineligible provider
@@ -6365,6 +6426,30 @@ impl AiFederation {
                 }
             };
             attempts = attempts.saturating_add(1);
+
+            // Applied to a provider that could otherwise stream, so a provider
+            // that cannot stream at all still reports its own 501. Same rule
+            // and same fallback semantics as the buffered path: a provider that
+            // cannot serve this content declines and the next matching provider
+            // is considered, so a mixed list can still serve an image from a
+            // later `translate` provider.
+            if let Err(message) =
+                validate_multimodal_policy(provider, openai_body, &multimodal_usage)
+            {
+                warn_sampled!(
+                    provider = %provider.name,
+                    provider_type = %provider.provider_type.as_str(),
+                    multimodal_mode = %provider.multimodal_mode.as_str(),
+                    non_text_parts = multimodal_usage.non_text_parts,
+                    "ai_federation: provider cannot stream this multimodal request, trying fallback"
+                );
+                last_multimodal_rejection = Some(message);
+                if self.fallback_enabled {
+                    continue;
+                }
+                break;
+            }
+
             selected = Some((provider_index, target, admission));
             break;
         }
@@ -6374,6 +6459,17 @@ impl AiFederation {
             // probe are released by their own drops on the way out.
             ctx.metadata
                 .insert(META_STREAM_ATTEMPTS.to_string(), attempts.to_string());
+            // A content policy the caller can act on outranks a provider-shape
+            // 501, exactly as the buffered path prefers its client rejection.
+            if let Some(message) = last_multimodal_rejection {
+                return self.openai_error_response(
+                    400,
+                    &message,
+                    "invalid_request_error",
+                    None,
+                    Some("provider_translation_failed"),
+                );
+            }
             if let Some(reason) = last_ineligibility {
                 return self.openai_error_response(
                     501,
@@ -6510,6 +6606,21 @@ impl AiFederation {
                 SUPPRESS_CONSUMER_IDENTITY_HEADERS_KEY.to_string(),
                 "true".to_string(),
             );
+            // The provider is committed here, so unlike the buffered path
+            // (which waits for a successful call because it may still fail
+            // over) this IS the point at which the drop can be attributed to
+            // the serving provider.
+            if provider.multimodal_mode == MultimodalMode::TextOnlyWithWarning
+                && !multimodal_usage.is_empty()
+            {
+                warn_sampled!(
+                    provider = %provider.name,
+                    provider_type = %provider.provider_type.as_str(),
+                    non_text_parts = multimodal_usage.non_text_parts,
+                    "ai_federation: dropping non-text multimodal content from a claimed stream by explicit text_only_with_warning policy"
+                );
+                self.write_multimodal_text_only_metadata(ctx, provider, &multimodal_usage);
+            }
 
             debug!(
                 provider = %provider.name,
@@ -6869,12 +6980,25 @@ impl Plugin for AiFederation {
         let resolved_model = Self::resolve_model(provider, &committed_model);
 
         let mut value: Value = serde_json::from_slice(body).ok()?;
-        let object = value.as_object_mut()?;
-        // Only rewrite when the provider-visible generation actually differs, so
-        // the ordinary no-mapping case costs no serialization at all.
-        if object.get("model").and_then(Value::as_str) == Some(resolved_model.as_str()) {
+        // `text_only_with_warning` promises the provider never sees the
+        // non-text parts. The buffered path keeps that promise while building
+        // its own provider request; this path forwards the CLIENT's body, so
+        // the reduction has to happen here (GHSA-h5r4-qw2q-f277). The
+        // final-body hook re-checks the result, so a transform running after
+        // this one cannot put the content back.
+        let strip_non_text = provider.multimodal_mode == MultimodalMode::TextOnlyWithWarning
+            && !analyze_multimodal_usage(&value).is_empty();
+        let generation_matches =
+            value.get("model").and_then(Value::as_str) == Some(resolved_model.as_str());
+        // Only rewrite when the provider-visible body actually differs, so the
+        // ordinary case costs no serialization at all.
+        if generation_matches && !strip_non_text {
             return None;
         }
+        if strip_non_text {
+            value = text_only_openai_body(&value);
+        }
+        let object = value.as_object_mut()?;
         object.insert("model".to_string(), Value::String(resolved_model));
         // `stream: true` is the reason this request was claimed; the response
         // pipeline is already shaped for an event stream, so it is re-asserted
@@ -7023,6 +7147,25 @@ impl Plugin for AiFederation {
                 Some("stream"),
                 "model_policy_violation",
             );
+        }
+        // The multimodal policy that admitted this provider must still hold
+        // over the FINAL provider-visible body: a later transform could put
+        // non-text content back, and for `text_only_with_warning` this is also
+        // the proof that the reduction actually happened
+        // (GHSA-h5r4-qw2q-f277).
+        let final_usage = analyze_multimodal_usage(&final_body);
+        if !final_usage.is_empty() {
+            let allowed = stream_multimodal_content_allowed(provider, &final_body);
+            if !allowed {
+                return self.reject_claimed_stream(
+                    ctx,
+                    400,
+                    "The final AI provider request body carries non-text content the routed provider's multimodal policy forbids",
+                    "invalid_request_error",
+                    None,
+                    "multimodal_policy_violation",
+                );
+            }
         }
 
         PluginResult::Continue
@@ -7592,7 +7735,7 @@ impl Plugin for AiFederation {
                 if let Some(guard) = half_open_probe_guard.as_mut() {
                     guard.release();
                 }
-                warn!(
+                warn_sampled!(
                     provider = %provider.name,
                     provider_type = %provider.provider_type.as_str(),
                     "ai_federation: rejected request — resolved model contains characters not permitted in URL path"
@@ -7609,7 +7752,7 @@ impl Plugin for AiFederation {
             if let Err(message) =
                 validate_multimodal_policy(provider, &openai_body, &multimodal_usage)
             {
-                warn!(
+                warn_sampled!(
                     provider = %provider.name,
                     provider_type = %provider.provider_type.as_str(),
                     multimodal_mode = %provider.multimodal_mode.as_str(),
@@ -7635,7 +7778,7 @@ impl Plugin for AiFederation {
                 // request) — not here. If this provider later fails over to a
                 // `translate`-mode provider that preserves the image, writing the
                 // "dropped" metadata now would misreport the serving provider.
-                warn!(
+                warn_sampled!(
                     provider = %provider.name,
                     provider_type = %provider.provider_type.as_str(),
                     non_text_parts = multimodal_usage.non_text_parts,
@@ -7646,7 +7789,7 @@ impl Plugin for AiFederation {
             let translated = match translate_request(provider, &openai_body, &resolved_model) {
                 Ok(t) => t,
                 Err(e) => {
-                    warn!(
+                    warn_sampled!(
                         provider = %provider.name,
                         "ai_federation: request translation failed"
                     );
@@ -7719,7 +7862,7 @@ impl Plugin for AiFederation {
                             guard.release();
                         }
                     }
-                    warn!(
+                    warn_sampled!(
                         provider = %provider.name,
                         error_class = failure.error_class.as_str(),
                         failure_kind = ?failure.kind,
@@ -7805,7 +7948,7 @@ impl Plugin for AiFederation {
                     }
                 }
                 if self.fallback_enabled && has_later_provider {
-                    warn!(
+                    warn_sampled!(
                         provider = %provider.name,
                         status,
                         "ai_federation: provider returned fallback-eligible status"
@@ -7894,7 +8037,7 @@ impl Plugin for AiFederation {
                     ) {
                         Ok(b) => b,
                         Err(BoundedJsonSerializationError::LimitExceeded) => {
-                            warn!(
+                            warn_sampled!(
                                 provider = %provider.name,
                                 "ai_federation: normalized provider response exceeded configured size limit"
                             );
@@ -7908,7 +8051,7 @@ impl Plugin for AiFederation {
                             );
                         }
                         Err(BoundedJsonSerializationError::Serialization) => {
-                            warn!(
+                            warn_sampled!(
                                 provider = %provider.name,
                                 error_class = "serialization_error",
                                 "ai_federation: failed to serialize normalized response"
@@ -7939,7 +8082,7 @@ impl Plugin for AiFederation {
                             guard.resolve();
                         }
                     }
-                    warn!(
+                    warn_sampled!(
                         provider = %provider.name,
                         error = %e,
                         "ai_federation: response normalization failed"
@@ -8432,7 +8575,7 @@ pub mod test_helpers {
 
     /// Expose glob matching for tests.
     pub fn glob_match(pattern: &str, input: &str) -> bool {
-        simple_glob_match(pattern, input)
+        matches_model_glob(pattern, input)
     }
 
     /// Expose the URL-path-component validator for tests.

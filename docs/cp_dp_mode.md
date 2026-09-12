@@ -74,6 +74,13 @@ All gRPC calls are authenticated with JWT HS256 tokens:
 - The DP sends its auth token in the gRPC metadata on every request
 - Both CP and DP use the same shared secret for JWT signing/verification
 
+For `ConfigSync.Subscribe`, the bearer token's `sub` must equal the request's
+`node_id` after trimming surrounding whitespace from `node_id`, as for native
+`MeshSubscribe`. Built-in DP token minting already sets `sub` to the DP node ID.
+Externally issued tokens must use that same identity. A mismatch returns
+`PERMISSION_DENIED` and emits a failed tenant-subscription audit record before
+allocating a stream or registering the node for `GET /cluster`.
+
 ### Transport Security (TLS/mTLS)
 
 The gRPC channel between CP and DP carries **Data Plane authentication JWTs and

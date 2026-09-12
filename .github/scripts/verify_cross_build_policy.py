@@ -39,7 +39,13 @@ EXPECTED_PRE_BUILD_COMMANDS = (
     "https://github.com/protocolbuffers/protobuf/releases/download/v25.1/"
     "protoc-25.1-linux-x86_64.zip && unzip -o /tmp/protoc.zip -d /usr/local "
     "bin/protoc && chmod +x /usr/local/bin/protoc && rm /tmp/protoc.zip",
-    "wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | apt-key add -",
+    # Retry the key download and refuse an empty or non-PGP response: `apt-key`
+    # accepts an empty stream, which turns a momentary apt.llvm.org outage into
+    # an unauthenticated-package failure one step later (issue #4978).
+    "wget --tries=5 --waitretry=5 -qO /tmp/llvm-snapshot.gpg.key "
+    "https://apt.llvm.org/llvm-snapshot.gpg.key && "
+    "grep -q -- '-----BEGIN PGP PUBLIC KEY BLOCK-----' /tmp/llvm-snapshot.gpg.key && "
+    "apt-key add /tmp/llvm-snapshot.gpg.key && rm /tmp/llvm-snapshot.gpg.key",
     "add-apt-repository "
     "'deb http://apt.llvm.org/xenial/ llvm-toolchain-xenial-6.0 main'",
     "apt-get update && apt-get install --assume-yes clang-6.0 libclang-6.0-dev",
@@ -1038,9 +1044,16 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
           all(.[]; .critical.image["docker-manifest-digest"] == $digest)
           JQ
 
+          # `cosign verify-attestation` prints one DSSE envelope per line
+          # (`{"payloadType","payload","signatures"}`), not a JSON array. Both
+          # attestation filters therefore run over a slurped (`jq -s`) document,
+          # flatten it so a future array-shaped output still verifies, and decode
+          # the envelope payload into the in-toto statement they check.
           cat > "$work/require_provenance.jq" <<'JQ'
           [
-            .[].payload
+            flatten[]
+            | (.payload // .dsseEnvelope.payload)
+            | select(type == "string")
             | @base64d
             | fromjson
             | select(.predicateType == "https://slsa.dev/provenance/v1")
@@ -1056,7 +1069,9 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
 
           cat > "$work/require_sbom_attest.jq" <<'JQ'
           [
-            .[].payload
+            flatten[]
+            | (.payload // .dsseEnvelope.payload)
+            | select(type == "string")
             | @base64d
             | fromjson
             | select(any(.subject[]?; .digest.sha256 == $digest))
@@ -1097,7 +1112,7 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
               "${verify_common_args[@]}" \
               --type slsaprovenance1 \
               "$image_ref" > "${prefix}-provenance.json"
-            jq -e --arg digest "$expected_digest" --arg source_sha "$GITHUB_SHA" \
+            jq -e -s --arg digest "$expected_digest" --arg source_sha "$GITHUB_SHA" \
               -f "$work/require_provenance.jq" \
               "${prefix}-provenance.json" >/dev/null
 
@@ -1105,7 +1120,7 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
               "${verify_common_args[@]}" \
               --type spdxjson \
               "$image_ref" > "${prefix}-sbom.json"
-            jq -e --arg digest "$expected_digest" \
+            jq -e -s --arg digest "$expected_digest" \
               -f "$work/require_sbom_attest.jq" \
               "${prefix}-sbom.json" >/dev/null
           }

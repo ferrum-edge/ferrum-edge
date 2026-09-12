@@ -42,6 +42,12 @@ pub enum BoundedReadError {
         read_so_far: usize,
     },
     /// A transport-level error surfaced from the underlying byte stream.
+    ///
+    /// `reqwest::Error`'s own `Display` prints the complete request URL, which
+    /// for a plugin endpoint may embed a credential in its userinfo, path, or
+    /// query. [`BoundedReadError`]'s `Display` therefore renders only the
+    /// error CLASS; callers that need the typed error still match on this
+    /// variant (GHSA-4ghp-v85j-5hvq).
     Stream(reqwest::Error),
 }
 
@@ -58,7 +64,9 @@ impl std::fmt::Display for BoundedReadError {
                     read_so_far, max_bytes
                 )
             }
-            BoundedReadError::Stream(e) => write!(f, "{}", e),
+            BoundedReadError::Stream(e) => {
+                write!(f, "{}", crate::retry::classify_reqwest_error(e))
+            }
         }
     }
 }

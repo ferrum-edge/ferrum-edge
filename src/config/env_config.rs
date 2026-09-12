@@ -7738,6 +7738,15 @@ impl EnvConfig {
             );
         }
 
+        if let Some(error) = crate::config::types::validate_admin_tls_no_verify_client_ca_pairing(
+            "FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH",
+            "FERRUM_ADMIN_TLS_NO_VERIFY",
+            self.admin_tls_client_ca_bundle_path.as_deref(),
+            self.admin_tls_no_verify,
+        ) {
+            return Err(error);
+        }
+
         // Non-fatal security warnings
         if self.tls_no_verify {
             tracing::warn!(
@@ -7746,7 +7755,7 @@ impl EnvConfig {
         }
         if self.admin_tls_no_verify {
             tracing::warn!(
-                "WARNING: FERRUM_ADMIN_TLS_NO_VERIFY=true — admin TLS certificate verification is DISABLED. Do not use in production."
+                "WARNING: FERRUM_ADMIN_TLS_NO_VERIFY=true — the admin listener does not require or verify client certificates. Do not use in production."
             );
         }
 

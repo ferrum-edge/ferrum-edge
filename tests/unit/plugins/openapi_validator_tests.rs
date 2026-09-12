@@ -2121,8 +2121,8 @@ async fn xml_wrong_namespace_cannot_rebind_modeled_json_key() {
                 .await,
             Some(400),
         );
-        // Correct URI under an arbitrary prefix accepted; unrelated non-colliding
-        // children (object-level and under the wrapper) remain non-fatal.
+        // Correct URI under an arbitrary prefix accepted; unrelated object-level
+        // children remain representable alongside the array.
         let mut ctx = post_ctx("/wrapped-rebind");
         ctx.headers = headers.clone();
         assert_continue(
@@ -2130,7 +2130,7 @@ async fn xml_wrong_namespace_cannot_rebind_modeled_json_key() {
                 .on_final_request_body_with_context(
                     &mut ctx,
                     &headers,
-                    br#"<root xmlns:x="https://trusted.example/schema"><x:items><x:item>a</x:item><note>ignored</note></x:items><note>ok</note></root>"#,
+                    br#"<root xmlns:x="https://trusted.example/schema"><x:items><x:item>a</x:item></x:items><note>ok</note></root>"#,
                 )
                 .await,
         );
@@ -3486,6 +3486,225 @@ async fn text_and_binary_response_validation_use_matching_schema_rules() {
     );
 }
 
+async fn assert_request_and_response_media_result(
+    schema: &Value,
+    media: &str,
+    body: &[u8],
+    accepted: bool,
+) {
+    let plugin = OpenapiValidator::new(&json!({
+        "schema_draft": "draft2020-12",
+        "operations": [{
+            "method": "POST", "path_template": "/media", "path_regex": "/media",
+            "request_body": {"content": {(media): schema}},
+            "responses": {"200": {(media): schema}}
+        }]
+    }))
+    .unwrap();
+    let headers = content_type_headers(media);
+    for client_phase in [true, false] {
+        let mut ctx = post_ctx("/media");
+        ctx.headers = headers.clone();
+        let result = if client_phase {
+            plugin
+                .validate_client_request_body_contract(&mut ctx, &headers, body)
+                .await
+        } else {
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, body)
+                .await
+        };
+        if accepted {
+            assert_continue(result);
+        } else {
+            assert_reject(result, Some(400));
+        }
+    }
+    let mut ctx = post_ctx("/media");
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &headers, body)
+        .await;
+    if accepted {
+        assert_continue(result);
+    } else {
+        assert_reject(result, Some(502));
+    }
+}
+
+#[tokio::test]
+async fn xml_scalar_shapes_are_consistent_on_requests_and_responses() {
+    for (schema, values) in [
+        (
+            json!({"type": "string", "xml": {"name": "value"}}),
+            vec![
+                ("<value>text</value>", true),
+                ("<value xmlns=\"urn:sample\">text</value>", true),
+                ("<value><child/></value>", false),
+                ("<value label=\"sample\">text</value>", false),
+                ("<value><?note sample?>text</value>", false),
+            ],
+        ),
+        (
+            json!({
+                "type": "object", "required": ["count"],
+                "properties": {"count": {"type": "integer"}}
+            }),
+            vec![
+                ("<record><!-- note --><count>3</count></record>", true),
+                ("<record><count>3<child/></count></record>", false),
+                ("<record><count unit=\"items\">3</count></record>", false),
+                ("<record><count>3<!-- note -->0</count></record>", false),
+            ],
+        ),
+    ] {
+        for (body, accepted) in values {
+            assert_request_and_response_media_result(
+                &schema,
+                "application/xml",
+                body.as_bytes(),
+                accepted,
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn xml_wrapped_array_presence_is_preserved_on_requests_and_responses() {
+    let base = json!({
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array", "xml": {"wrapped": true},
+                "items": {"type": "string", "xml": {"name": "item"}}
+            },
+            "label": {"type": "string"}
+        }
+    });
+    for (constraint, absent, empty, nonempty) in [
+        (json!({"required": ["items"]}), false, true, true),
+        (
+            json!({"properties": {"items": {"minItems": 1}}}),
+            true,
+            false,
+            true,
+        ),
+        (
+            json!({"properties": {"items": {"maxItems": 0}}}),
+            true,
+            true,
+            false,
+        ),
+        (
+            json!({"dependentRequired": {"items": ["label"]}}),
+            true,
+            false,
+            false,
+        ),
+    ] {
+        let mut schema = base.clone();
+        if let Some(items) = constraint
+            .pointer("/properties/items")
+            .and_then(Value::as_object)
+        {
+            schema["properties"]["items"]
+                .as_object_mut()
+                .unwrap()
+                .extend(items.clone());
+        } else {
+            schema
+                .as_object_mut()
+                .unwrap()
+                .extend(constraint.as_object().unwrap().clone());
+        }
+        for (body, accepted) in [
+            ("<record/>", absent),
+            ("<record><items/></record>", empty),
+            ("<record><items><item>one</item></items></record>", nonempty),
+        ] {
+            assert_request_and_response_media_result(
+                &schema,
+                "application/xml",
+                body.as_bytes(),
+                accepted,
+            )
+            .await;
+        }
+    }
+    for body in [
+        "<record><items label=\"sample\"/></record>",
+        "<record><items>text</items></record>",
+        "<record><items><other/></items></record>",
+        "<record><items/><items/></record>",
+    ] {
+        assert_request_and_response_media_result(&base, "application/xml", body.as_bytes(), false)
+            .await;
+    }
+    let mut dependent = base;
+    dependent["dependentRequired"] = json!({"items": ["label"]});
+    assert_request_and_response_media_result(
+        &dependent,
+        "application/xml",
+        b"<record><items/><label>sample</label></record>",
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn binary_schema_representation_rules_apply_in_both_directions() {
+    for (schema, utf8_allowed, binary_allowed) in [
+        (json!(true), true, true),
+        (json!(false), false, false),
+        (
+            json!({"type": "string", "format": "binary", "minLength": 2, "maxLength": 2}),
+            true,
+            true,
+        ),
+        (json!({"type": "string", "minLength": 3}), false, false),
+        (json!({"type": "string", "maxLength": 1}), false, false),
+        (json!({"type": "integer"}), false, false),
+        (json!({"allOf": [{"type": "string"}]}), true, false),
+        (
+            json!({"anyOf": [{"type": "string"}, {"type": "integer"}]}),
+            true,
+            false,
+        ),
+        (
+            json!({"oneOf": [{"type": "string"}, {"type": "integer"}]}),
+            true,
+            false,
+        ),
+        (json!({"not": {"type": "string"}}), false, false),
+        (
+            json!({"if": {"type": "string"}, "then": false}),
+            false,
+            false,
+        ),
+        (json!({"const": "ok"}), true, false),
+        (json!({"enum": ["ok"]}), true, false),
+        (json!({"pattern": "^ok$"}), true, false),
+        (
+            json!({"$defs": {"text": {"type": "string"}}, "$ref": "#/$defs/text"}),
+            true,
+            false,
+        ),
+    ] {
+        for (body, accepted) in [
+            (b"ok".as_slice(), utf8_allowed),
+            (&[0xff, 0xfe], binary_allowed),
+        ] {
+            assert_request_and_response_media_result(
+                &schema,
+                "application/octet-stream",
+                body,
+                accepted,
+            )
+            .await;
+        }
+    }
+}
+
 // Finding #17: two openapi_validator instances on the same request share
 // ctx.metadata. Before the per-instance cache keys, the instance that marks its
 // matched operation FIRST would have its (method, index) overwritten by a
@@ -3981,6 +4200,28 @@ async fn content_encoding_malformed_unsupported_and_corrupt_fail_closed() {
             .await,
         Some(502),
     );
+}
+
+#[test]
+fn generic_content_decoder_rejects_large_window_brotli() {
+    // The Large Window marker makes a permissive Brotli state read six more
+    // header bits and request a stream-selected ring buffer. HTTP `br` only
+    // negotiates RFC 7932, whose window is capped at 24 bits, so reject the
+    // extension before any such allocation.
+    const LWB_MARKER_BODY: [u8; 8] = [0x11, 0x1e, 0, 0, 0, 0, 0, 0];
+    let error = decode_content_encoding(
+        Some("br"),
+        &LWB_MARKER_BODY,
+        DecodeLimits {
+            max_decoded_bytes: 1024,
+            max_cumulative_bytes: 1024,
+            max_codings: 2,
+            max_amplification_ratio: 100,
+        },
+    )
+    .expect_err("Large Window Brotli must be rejected by the generic decoder");
+
+    assert_eq!(error, "brotli decompression failed");
 }
 
 #[tokio::test]
@@ -4991,6 +5232,244 @@ fn multipart_header_content_plugin(header_object: Value) -> OpenapiValidator {
 }
 
 #[tokio::test]
+async fn multipart_simple_header_collections_preserve_types_and_explode() {
+    for explode in [false, true] {
+        for (schema, valid, invalid) in [
+            (
+                json!({"type": "array", "items": {"type": "integer"}, "minItems": 2}),
+                "1,2",
+                "1,word",
+            ),
+            (
+                json!({
+                    "type": "object",
+                    "properties": {"count": {"type": "integer", "minimum": 1}},
+                    "required": ["count"],
+                    "additionalProperties": false
+                }),
+                if explode { "count=3" } else { "count,3" },
+                if explode { "count=0" } else { "count,0" },
+            ),
+            (
+                json!({"type": "object", "additionalProperties": {"type": "integer", "minimum": 1}}),
+                if explode { "count=3" } else { "count,3" },
+                if explode { "count=0" } else { "count,0" },
+            ),
+            (
+                json!({"type": "array", "items": {"type": "integer"}, "maxItems": 0}),
+                "",
+                "1",
+            ),
+            (
+                json!({"type": "object", "maxProperties": 0}),
+                "",
+                if explode { "count=3" } else { "count,3" },
+            ),
+        ] {
+            let plugin = multipart_header_content_plugin(json!({
+                "style": "simple", "explode": explode, "schema": schema
+            }));
+            for (value, accepted) in [(Some(valid), true), (Some(invalid), false), (None, true)] {
+                let header = value
+                    .map(|value| format!("X-Part-Meta: {value}\r\n"))
+                    .unwrap_or_default();
+                let body = format!(
+                    "--abc\r\nContent-Disposition: form-data; name=\"title\"\r\n{header}\r\nhello\r\n--abc--\r\n"
+                );
+                let headers = content_type_headers("multipart/form-data; boundary=abc");
+                let mut ctx = post_ctx("/header-content");
+                ctx.headers = headers.clone();
+                let result = plugin
+                    .validate_client_request_body_contract(&mut ctx, &headers, body.as_bytes())
+                    .await;
+                if accepted {
+                    assert_continue(result);
+                } else {
+                    assert_reject(result, Some(400));
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn multipart_header_conversion_plans_own_composed_schema_nodes() {
+    use ferrum_edge::_test_support::openapi_validator_schema_type_cache_stats_for_test;
+
+    let scalar = json!({"allOf": [{"oneOf": [{"type": "integer"}, {"type": "boolean"}]}]});
+    let object = json!({
+        "type": "object",
+        "required": ["count", "items"],
+        "properties": {
+            "count": scalar,
+            "items": {"type": "array", "items": {"anyOf": [{"type": "integer"}, {"type": "boolean"}]}}
+        }
+    });
+    let cases = [
+        (
+            "application/xml",
+            object.clone(),
+            "<meta><count>3</count><items>1</items><items>2</items></meta>",
+        ),
+        (
+            "application/x-www-form-urlencoded",
+            object,
+            "count=3&items=1&items=2",
+        ),
+        ("text/plain", scalar, "3"),
+    ];
+    let plugins: Vec<_> = cases
+        .iter()
+        .map(|(media, schema, _)| {
+            Arc::new(multipart_header_content_plugin(json!({
+                "content": {(*media): {"schema": schema}}
+            })))
+        })
+        .collect();
+    for (plugin, (_, _, value)) in plugins.iter().zip(&cases) {
+        let body = format!(
+            "--abc\r\nContent-Disposition: form-data; name=\"title\"\r\nX-Part-Meta: {value}\r\n\r\nhello\r\n--abc--\r\n"
+        );
+        let headers = content_type_headers("multipart/form-data; boundary=abc");
+        let mut ctx = post_ctx("/header-content");
+        ctx.headers = headers.clone();
+        assert_continue(
+            plugin
+                .validate_client_request_body_contract(&mut ctx, &headers, body.as_bytes())
+                .await,
+        );
+        let (nodes, fallbacks) = openapi_validator_schema_type_cache_stats_for_test(plugin);
+        assert!(nodes > 2);
+        assert_eq!(fallbacks, 0);
+    }
+}
+
+#[tokio::test]
+async fn multipart_collection_encodings_share_header_validation() {
+    let array = json!({"type": "array", "items": {"type": "integer"}});
+    let object = json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["count"], "properties": {"count": {"type": "integer"}}
+    });
+    let nested = json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["items"], "properties": {"items": array}
+    });
+    for (schema, style, explode, parts) in [
+        (
+            array.clone(),
+            "form",
+            false,
+            vec![("data", "1,2", "text/plain")],
+        ),
+        (
+            array.clone(),
+            "spaceDelimited",
+            false,
+            vec![("data", "1 2", "text/plain")],
+        ),
+        (
+            array.clone(),
+            "pipeDelimited",
+            false,
+            vec![("data", "1|2", "text/plain")],
+        ),
+        (
+            array,
+            "form",
+            true,
+            vec![("data", "1", "text/plain"), ("data", "2", "text/plain")],
+        ),
+        (
+            object.clone(),
+            "form",
+            false,
+            vec![("data", "count,3", "text/plain")],
+        ),
+        (
+            object.clone(),
+            "form",
+            true,
+            vec![("count", "3", "text/plain")],
+        ),
+        (
+            object.clone(),
+            "deepObject",
+            true,
+            vec![("data[count]", "3", "text/plain")],
+        ),
+        (
+            object,
+            "form",
+            false,
+            vec![("data", r#"{"count":3}"#, "application/json")],
+        ),
+        (
+            nested.clone(),
+            "form",
+            true,
+            vec![("items", "1", "text/plain"), ("items", "2", "text/plain")],
+        ),
+        (
+            nested,
+            "deepObject",
+            true,
+            vec![
+                ("data[items]", "1", "text/plain"),
+                ("data[items]", "2", "text/plain"),
+            ],
+        ),
+    ] {
+        for required in [false, true] {
+            let plugin = OpenapiValidator::new(&json!({
+                "operations": [{
+                    "method": "POST", "path_template": "/collection", "path_regex": "/collection",
+                    "request_body": {"content": {"multipart/form-data": {
+                        "schema": {"type": "object", "required": ["data"], "properties": {"data": schema}},
+                        "encoding": {"data": {
+                            "style": style, "explode": explode,
+                            "headers": {"X-Part-Count": {"required": required, "schema": {"type": "integer", "minimum": 1}}}
+                        }}
+                    }}}
+                }]
+            }))
+            .unwrap();
+            for (last_header, accepted) in
+                [(Some("1"), true), (Some("0"), false), (None, !required)]
+            {
+                let mut body = String::new();
+                for (index, (name, value, media)) in parts.iter().enumerate() {
+                    body.push_str(&format!(
+                        "--abc\r\nContent-Disposition: form-data; name=\"{name}\"\r\nContent-Type: {media}\r\n"
+                    ));
+                    let header = if index + 1 == parts.len() {
+                        last_header
+                    } else {
+                        Some("1")
+                    };
+                    if let Some(header) = header {
+                        body.push_str(&format!("X-Part-Count: {header}\r\n"));
+                    }
+                    body.push_str(&format!("\r\n{value}\r\n"));
+                }
+                body.push_str("--abc--\r\n");
+                let headers = content_type_headers("multipart/form-data; boundary=abc");
+                let mut ctx = post_ctx("/collection");
+                ctx.headers = headers.clone();
+                let result = plugin
+                    .validate_client_request_body_contract(&mut ctx, &headers, body.as_bytes())
+                    .await;
+                if accepted {
+                    assert_continue(result);
+                } else {
+                    assert_reject(result, Some(400));
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn multipart_encoding_header_content_json_validates_on_live_path() {
     let plugin = multipart_header_content_plugin(json!({
         "required": true,
@@ -5429,6 +5908,28 @@ async fn multipart_encoding_header_content_plugin_cache_rebuild_replaces_and_del
         .expect("schema-form replacement must rebuild");
     assert_continue(run(&cache, &headers, scalar_body.as_bytes()).await);
     assert_reject(run(&cache, &headers, json_body.as_bytes()).await, Some(400));
+
+    let xml_config = header_content_config(json!({
+        "required": true,
+        "content": {"application/xml": {"schema": {
+            "type": "object", "required": ["count"],
+            "properties": {"count": {"allOf": [{"anyOf": [{"type": "integer"}, {"type": "boolean"}]}]}}
+        }}}
+    }));
+    cache
+        .rebuild(&gateway_with_validator(xml_config))
+        .expect("composed XML header replacement must rebuild");
+    let xml_body = concat!(
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"title\"\r\n",
+        "X-Part-Meta: <meta><count>3</count></meta>\r\n\r\n",
+        "hello\r\n--abc--\r\n"
+    );
+    assert_continue(run(&cache, &headers, xml_body.as_bytes()).await);
+    assert_reject(
+        run(&cache, &headers, scalar_body.as_bytes()).await,
+        Some(400),
+    );
 
     cache
         .rebuild(&gateway_with_validator(deleted_config))

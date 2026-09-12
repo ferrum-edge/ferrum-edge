@@ -24,13 +24,14 @@ mod scan;
 mod stream;
 mod websocket;
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tracing::warn;
 
 use self::defaults::default_rules;
 use self::exemptions::CompiledExemptions;
@@ -48,8 +49,8 @@ use super::utils::synthetic_response::{
 };
 use super::{
     ALL_PROTOCOLS, HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext,
-    ResponseTrailerPolicy, StreamBytesKind, StreamConnectionContext, UdpDatagramContext,
-    UdpDatagramDirection, UdpDatagramVerdict, WebSocketFrameDirection,
+    ResponseTrailerPolicy, StreamBytesKind, StreamConnectionContext, StreamFrontendTransport,
+    UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict, WebSocketFrameDirection,
 };
 use crate::config::types::BackendScheme;
 use crate::util::unknown_keys::reject_unknown_keys;
@@ -750,7 +751,7 @@ impl Waf {
         }
         let globally_enforcing = self.config.mode == GlobalMode::Enforce;
         for hit in hits {
-            warn!(
+            warn_sampled!(
                 target: "waf",
                 proxy = %proxy_id,
                 rule = %hit.id,
@@ -814,7 +815,7 @@ impl Waf {
                 ctx.set_waf_metadata_if_absent("waf.block_reason", "body_too_large");
             }
             if self.config.log_to_stdout {
-                warn!(
+                warn_sampled!(
                     target: "waf",
                     proxy = %proxy_id(ctx),
                     client_ip = %ctx.client_ip,
@@ -959,7 +960,7 @@ impl Waf {
             }
         }
         if !matches!(self.config.on_scan_timeout, TimeoutAction::Allow) {
-            warn!(
+            warn_sampled!(
                 target: "waf",
                 proxy = %proxy_id(ctx),
                 client_ip = %ctx.client_ip,
@@ -981,7 +982,7 @@ impl Waf {
         }
         let rule = &self.compiled.rules[hit.rule_index];
         let globally_enforcing = self.config.mode == GlobalMode::Enforce;
-        warn!(
+        warn_sampled!(
             target: "waf",
             proxy = %proxy_id(ctx),
             rule = %rule.id,
@@ -1097,7 +1098,24 @@ impl Waf {
         content_type: Option<&str>,
     ) -> bool {
         self.response_body_policy_applies(ctx, content_type)
-            && self.has_enforcing_response_body_policy(ctx)
+            && self.response_body_disposition_can_refuse(ctx)
+    }
+
+    /// Whether ANY response-body disposition of this instance can refuse the
+    /// response — the request side's `(enforcing rule || strict size cap)`
+    /// term, mirrored.
+    ///
+    /// `on_body_too_large: block` rejects every oversize governed body while
+    /// globally enforcing, independent of per-rule `action`, so a posture whose
+    /// only blocking disposition is the strict size cap must still claim the
+    /// decoded representation: otherwise `clamp_body` measures the ENCODED
+    /// origin bytes and a compressed body slips under a cap its plaintext
+    /// exceeds. Decided from configuration and request state alone, so the
+    /// pre-content-type over-approximation can reuse it verbatim.
+    fn response_body_disposition_can_refuse(&self, ctx: &RequestContext) -> bool {
+        self.has_enforcing_response_body_policy(ctx)
+            || (self.config.mode == GlobalMode::Enforce
+                && self.config.on_body_too_large == TooLargeAction::Block)
     }
 
     /// Whether response-header policy is configured and applies to this request.
@@ -1245,7 +1263,7 @@ impl Plugin for Waf {
                     "tcp_require_tls",
                 );
                 if self.config.log_to_stdout {
-                    warn!(
+                    warn_sampled!(
                         target: "waf",
                         proxy = %ctx.proxy_id,
                         client_ip = %ctx.client_ip,
@@ -1261,14 +1279,23 @@ impl Plugin for Waf {
             }
         }
 
-        // L7 signature scan over plaintext / decrypted opening bytes only.
-        // If an inspectable stream produced no bytes before the bounded capture
-        // deadline (idle client / EOF / read timeout), fail closed in enforce
-        // mode. Otherwise a client could wait out the peek/read window and send
-        // malicious first bytes after the backend relay starts. Encrypted
-        // passthrough remains fail-open for signatures because the gateway never
-        // has L7 plaintext to scan there.
-        if stream.inspect_tcp && !stream.signatures.is_empty() {
+        // L7 signature scan over the opening bytes of a TCP stream. This is a
+        // TCP-only surface: `inspect_tcp` governs the FIRST-BYTES capture, which
+        // only a TCP frontend performs. A UDP/DTLS session reaches this hook to
+        // be admitted and carries no first bytes at all, so evaluating the
+        // branch there would fail every clean datagram session closed before its
+        // own per-datagram policy (`on_udp_datagram`) ever ran (issue #5117).
+        //
+        // If an inspectable TCP stream produced no bytes before the bounded
+        // capture deadline (idle client / EOF / read timeout), fail closed in
+        // enforce mode. Otherwise a client could wait out the peek/read window
+        // and send malicious first bytes after the backend relay starts.
+        // Encrypted passthrough remains fail-open for signatures because the
+        // gateway never has L7 plaintext to scan there.
+        if ctx.frontend_transport == StreamFrontendTransport::Tcp
+            && stream.inspect_tcp
+            && !stream.signatures.is_empty()
+        {
             let kind = ctx
                 .first_bytes_kind
                 .unwrap_or(StreamBytesKind::PlaintextWire);
@@ -1296,7 +1323,7 @@ impl Plugin for Waf {
                         "first_bytes_unavailable",
                     );
                     if self.config.log_to_stdout {
-                        warn!(
+                        warn_sampled!(
                             target: "waf",
                             proxy = %ctx.proxy_id,
                             client_ip = %ctx.client_ip,
@@ -1446,7 +1473,7 @@ impl Plugin for Waf {
         if is_control || !self.requires_ws_frame_hooks() {
             return None;
         }
-        warn!(
+        warn_sampled!(
             target: "waf",
             plugin = "waf",
             proxy = %proxy_id,
@@ -1711,9 +1738,12 @@ impl Plugin for Waf {
     /// free: it converts an uninspectable representation into a `502`.
     ///
     /// * the configured response-body rules must actually scan this media type
-    ///   on this request, AND their verdict must be able to refuse it. A
-    ///   `monitor`-mode instance never blocks, so an undecodable origin coding
-    ///   there costs an observation, not the response;
+    ///   on this request, AND some disposition must be able to refuse it —
+    ///   an enforcing rule, or a globally enforcing `on_body_too_large: block`
+    ///   whose cap must be measured against plaintext rather than the encoded
+    ///   origin bytes. A `monitor`-mode instance never blocks, so an
+    ///   undecodable origin coding there costs an observation, not the
+    ///   response;
     /// * the ORIGIN must have declared a content coding
     ///   ([`crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY`], the pristine
     ///   pre-`after_proxy` stamp). An identity-coded response is already the
@@ -1744,7 +1774,7 @@ impl Plugin for Waf {
     /// — including the enforcing-disposition term, which is itself decided from
     /// configuration and the request alone.
     fn may_enforce_response_body_policy(&self, ctx: &RequestContext) -> bool {
-        self.should_buffer_response_body(ctx) && self.has_enforcing_response_body_policy(ctx)
+        self.should_buffer_response_body(ctx) && self.response_body_disposition_can_refuse(ctx)
     }
 
     fn enforces_final_client_visible_response_body(&self, ctx: &RequestContext) -> bool {
@@ -1994,11 +2024,7 @@ fn validate_enforce_mode_has_enforcing_rules(
     }) {
         return Ok(());
     }
-    if stream.is_some_and(|cfg| {
-        cfg.tcp_require_tls
-            || (cfg.signatures.has_enforce_action()
-                && (cfg.inspect_tcp || cfg.inspect_udp || cfg.inspect_response))
-    }) {
+    if stream.is_some_and(|cfg| cfg.tcp_require_tls || cfg.enforcing_signature_is_reachable()) {
         return Ok(());
     }
     if oversize_body_block_is_reachable(on_body_too_large, compiled, surfaces) {

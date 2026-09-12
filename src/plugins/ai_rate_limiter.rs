@@ -31,6 +31,8 @@
 //! response side. They are classified as non-AI traffic and left untouched
 //! rather than being charged zero tokens against a budget.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -46,6 +48,7 @@ use super::utils::ai_usage_stream::{
     UsageAccumulator, UsageStreamExtractor, UsageStreamFormat, is_aws_event_stream_content_type,
 };
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
+use super::utils::content_encoding::{DecodeLimits, parse_content_codings};
 use super::utils::rate_limit::{
     AiRateLimitOp, AiTokenRateAlgorithm, ENFORCEMENT_UNAVAILABLE_BODY,
     ENFORCEMENT_UNAVAILABLE_STATUS, LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS,
@@ -155,7 +158,31 @@ mod meta {
     /// AI-shape check to `on_final_request_body_with_context`.
     pub const DEFERRED_COMPRESSED_CLASSIFICATION: &str =
         "ai_ratelimit_deferred_compressed_classify";
+    /// The response this instance is about to release to the streaming path
+    /// carries a non-identity `Content-Encoding`. Written by `after_proxy`,
+    /// which is the last hook that sees the response header map before the body
+    /// commits; read by the stream-inspector factory, which is handed only the
+    /// content TYPE. The incremental parsers decode SSE/event-stream framing,
+    /// not content codings, so an encoded stream is declined outright and
+    /// resolved by `on_unmetered_response` rather than being parsed as if the
+    /// compressed octets were frames.
+    pub const ENCODED_STREAM: &str = "ai_ratelimit_encoded_stream";
 }
+
+/// Largest encoded buffered response this limiter will decode to look for a
+/// usage document, and the largest plaintext one decode may materialize.
+/// Matched to the sibling `ai_token_metrics` inspection ceiling so the two
+/// plugins agree about which representations are readable at all.
+const MAX_USAGE_DECODE_BYTES: usize = 4 * 1024 * 1024;
+/// Aggregate plaintext one stacked `Content-Encoding` chain may produce.
+const MAX_USAGE_DECODE_CUMULATIVE_BYTES: usize = 8 * 1024 * 1024;
+/// Largest `#content-coding` list this limiter will undo.
+const MAX_USAGE_DECODE_CODINGS: usize = 4;
+/// Largest decoded/encoded size ratio, per layer and end to end. A usage
+/// document is small and ordinary model JSON compresses well under 20:1, so
+/// this bounds the amplification a hostile upstream can buy while leaving real
+/// provider responses far inside the limit.
+const MAX_USAGE_DECODE_AMPLIFICATION_RATIO: u32 = 500;
 
 /// Process-wide ceiling on concurrently inspected AI response streams.
 ///
@@ -211,6 +238,7 @@ struct InstanceKeys {
     ai_request: String,
     compressed_ai_request: String,
     deferred_compressed_classification: String,
+    encoded_stream: String,
     /// `(base name, instance-scoped metadata key, response header name)` for
     /// `expose_headers`. The header NAMES are fixed by the public contract, but
     /// the metadata each instance stages them from is instance-owned, so a
@@ -234,6 +262,7 @@ impl InstanceKeys {
             ai_request: scoped(meta::AI_REQUEST),
             compressed_ai_request: scoped(meta::COMPRESSED_AI_REQUEST),
             deferred_compressed_classification: scoped(meta::DEFERRED_COMPRESSED_CLASSIFICATION),
+            encoded_stream: scoped(meta::ENCODED_STREAM),
             exposed_headers: EXPOSED_RATELIMIT_HEADERS
                 .iter()
                 .map(|(base, header_name)| (*base, scoped(base), *header_name))
@@ -1202,7 +1231,7 @@ impl AiRateLimiter {
                     OnUnmeteredResponse::ChargeEstimate.as_str().to_string(),
                 );
                 if reserved_tokens == 0 && self.request_was_compressed_ai_candidate(ctx) {
-                    warn!(
+                    warn_sampled!(
                         provider = %self.provider,
                         count_mode = %self.count_mode,
                         detail = %unmetered_detail,
@@ -1210,7 +1239,7 @@ impl AiRateLimiter {
                     );
                     return self.reject_unmetered();
                 }
-                warn!(
+                warn_sampled!(
                     provider = %self.provider,
                     count_mode = %self.count_mode,
                     reserved_tokens,
@@ -1237,7 +1266,7 @@ impl AiRateLimiter {
                 {
                     self.store_metadata(ctx, &outcome);
                 }
-                warn!(
+                warn_sampled!(
                     provider = %self.provider,
                     count_mode = %self.count_mode,
                     reserved_tokens,
@@ -1251,7 +1280,7 @@ impl AiRateLimiter {
                     self.keys.unmetered_action.clone(),
                     OnUnmeteredResponse::Reject.as_str().to_string(),
                 );
-                warn!(
+                warn_sampled!(
                     provider = %self.provider,
                     count_mode = %self.count_mode,
                     reserved_tokens,
@@ -1298,6 +1327,63 @@ impl AiRateLimiter {
         })
     }
 
+    /// Bounded, budget-charged plaintext view of a buffered response body.
+    ///
+    /// Returns the body untouched when no content coding was applied, an owned
+    /// plaintext buffer when one was, and a fixed unmetered reason when the
+    /// representation cannot be reduced safely. A refusal never falls back to
+    /// parsing the encoded bytes: the caller then applies `on_unmetered_response`,
+    /// which is fail-closed by default.
+    ///
+    /// The decode goes through [`crate::plugins::charged_decode`], the strict,
+    /// Large-Window-refusing codec pair whose decoder heap and every output
+    /// growth are reserved against the shared retained-response budget BEFORE
+    /// they are allocated (`GHSA-q76p-952x-7c3v`). The reservation is released
+    /// when this returns, so a usage inspection cannot leave a residual charge.
+    /// Only a request this instance classified as an AI call reaches here, so
+    /// ordinary traffic on a shared proxy never pays for a decode.
+    fn decoded_inspection_body<'a>(
+        &self,
+        response_headers: &HashMap<String, String>,
+        body: &'a [u8],
+    ) -> Result<std::borrow::Cow<'a, [u8]>, &'static str> {
+        let Some(header) = response_headers.get("content-encoding") else {
+            return Ok(std::borrow::Cow::Borrowed(body));
+        };
+        let Ok(codings) = parse_content_codings(header) else {
+            return Err("undecodable_content_encoding");
+        };
+        if codings.iter().all(|coding| coding == "identity") {
+            return Ok(std::borrow::Cow::Borrowed(body));
+        }
+        if codings.iter().any(|coding| coding == "identity") {
+            return Err("undecodable_content_encoding");
+        }
+        if codings.len() > MAX_USAGE_DECODE_CODINGS || body.len() > MAX_USAGE_DECODE_BYTES {
+            return Err("undecodable_content_encoding");
+        }
+        match super::charged_decode::decode_charged_content_coding_chain(
+            &codings,
+            body,
+            DecodeLimits {
+                max_decoded_bytes: MAX_USAGE_DECODE_BYTES,
+                max_cumulative_bytes: MAX_USAGE_DECODE_CUMULATIVE_BYTES,
+                max_codings: MAX_USAGE_DECODE_CODINGS,
+                max_amplification_ratio: MAX_USAGE_DECODE_AMPLIFICATION_RATIO,
+            },
+            crate::proxy::response_buffer_budget::BudgetRef::global(),
+        ) {
+            Ok(plaintext) => Ok(std::borrow::Cow::Owned(plaintext)),
+            Err(error) => {
+                debug!(
+                    limiter_instance = self.instance_id,
+                    "ai_rate_limiter: response content decoding skipped: {error:?}"
+                );
+                Err("undecodable_content_encoding")
+            }
+        }
+    }
+
     fn extract_token_count(&self, ctx: &RequestContext, body: &[u8]) -> Option<u64> {
         let json: Value = serde_json::from_slice(body).ok()?;
         let provider = match self.configured_provider {
@@ -1314,25 +1400,26 @@ impl AiRateLimiter {
 
     /// Buffered-SSE usage extraction.
     ///
-    /// Shares [`UsageAccumulator`] with the streaming inspector, so a provider
-    /// event is interpreted identically whether the response was streamed past
-    /// the gateway or collected first. Only reachable when some other plugin
-    /// pinned an event stream onto the buffered path; this limiter no longer
-    /// does (GHSA-q2r2-6r7h-f69x).
+    /// Runs the SAME [`UsageStreamExtractor`] the streaming inspector uses, so
+    /// a provider event is interpreted identically whether the response was
+    /// streamed past the gateway or collected first. Sharing the extractor —
+    /// rather than repeating a per-line loop here — is what keeps the two
+    /// halves from disagreeing about event assembly: an SSE event may carry
+    /// several `data:` fields whose values the standard joins with newlines
+    /// before dispatch, and parsing each field on its own silently discarded a
+    /// legal usage document split across two of them
+    /// (`GHSA-pqjf-4jcj-34rp`). Only reachable when some other plugin pinned an
+    /// event stream onto the buffered path; this limiter no longer does
+    /// (GHSA-q2r2-6r7h-f69x).
     fn extract_token_count_from_sse(&self, ctx: &RequestContext, body: &[u8]) -> Option<u64> {
-        let body = std::str::from_utf8(body).ok()?;
-        let mut usage = UsageAccumulator::default();
-        for line in body.lines() {
-            // SSE field names are case-sensitive; the optional single space
-            // after the colon is not part of the value.
-            if let Some(data) = line.strip_prefix("data:") {
-                usage.apply_sse_data(data, self.configured_provider);
-            }
-        }
+        let mut extractor =
+            UsageStreamExtractor::new(UsageStreamFormat::Sse, self.configured_provider);
+        extractor.push(body);
+        extractor.finish();
         self.reconciliation_tokens(
             ctx,
-            usage.total_for_mode(&self.count_mode),
-            usage.is_complete_for_mode(&self.count_mode),
+            extractor.usage().total_for_mode(&self.count_mode),
+            extractor.usage().is_complete_for_mode(&self.count_mode),
         )
     }
 
@@ -1387,7 +1474,7 @@ impl AiRateLimiter {
                 self.keys.unmetered_action.clone(),
                 self.on_unmetered_response.as_str().to_string(),
             );
-            warn!(
+            warn_sampled!(
                 limiter_instance = self.instance_id,
                 provider = %self.provider,
                 count_mode = %self.count_mode,
@@ -2113,8 +2200,20 @@ impl Plugin for AiRateLimiter {
         super::HTTP_ONLY_PROTOCOLS
     }
 
+    /// This limiter never mutates a backend-visible request header.
+    ///
+    /// `expose_headers` writes the four `x-ai-ratelimit-*` values into the
+    /// RESPONSE map (see [`Self::apply_exposed_headers`]), so declaring a
+    /// request-header mutation here described a capability the plugin does not
+    /// have — and that declaration is load-bearing for composition admission.
+    /// `PluginCache` refuses a `request_deduplication` (3010) or
+    /// `response_caching` (3500) instance that would fingerprint headers before
+    /// a later request-header mutator at 4200, so merely turning response
+    /// telemetry on made an otherwise valid limiter-plus-cache/dedup proxy fail
+    /// validation (issue #5318). `before_proxy` only READS the header map it is
+    /// handed, which is exactly what the default `false` promises.
     fn modifies_request_headers(&self) -> bool {
-        self.expose_headers
+        false
     }
 
     fn requires_request_body_before_before_proxy(&self) -> bool {
@@ -2443,7 +2542,7 @@ impl Plugin for AiRateLimiter {
             // The rate-limit key embeds the identity dimension (consumer,
             // authenticated identity, SPIFFE ID, or client IP) and is never
             // logged; the bounded counters below stay.
-            warn!(
+            warn_sampled!(
                 current_tokens = usage,
                 limit = self.token_limit,
                 plugin = "ai_rate_limiter",
@@ -2709,6 +2808,17 @@ impl Plugin for AiRateLimiter {
         let response_will_stream = !response_content_type.is_some_and(|content_type| {
             is_json_content_type(content_type) && !is_framed_grpc_content_type(content_type)
         });
+        // Last hook that sees the response header map before a streamed body
+        // commits. The stream-inspector factory is handed only the content
+        // TYPE, and the incremental parsers understand SSE / AWS event-stream
+        // FRAMING, not content codings — feeding them compressed octets would
+        // find no usage while pretending the stream was metered. Record the
+        // coding here so the factory can decline and let the terminal hook
+        // apply `on_unmetered_response` (fail-closed by default) instead.
+        if response_will_stream && has_non_identity_content_encoding(response_headers) {
+            ctx.metadata
+                .insert(self.keys.encoded_stream.clone(), "true".to_string());
+        }
         if !in_rejection_context
             && (200..300).contains(&response_status)
             && response_will_stream
@@ -2720,7 +2830,7 @@ impl Plugin for AiRateLimiter {
                 self.keys.unmetered_action.clone(),
                 self.on_unmetered_response.as_str().to_string(),
             );
-            warn!(
+            warn_sampled!(
                 limiter_instance = self.instance_id,
                 provider = %self.provider,
                 count_mode = %self.count_mode,
@@ -2809,6 +2919,11 @@ impl Plugin for AiRateLimiter {
         // Only a request THIS instance classified as an AI call. An unrelated
         // SSE route on a shared proxy is never parsed or accounted.
         if !self.response_accounting_candidate(ctx) {
+            return None;
+        }
+        // A content-coded stream is not a framing this parser can read; see
+        // [`meta::ENCODED_STREAM`].
+        if ctx.metadata.contains_key(&self.keys.encoded_stream) {
             return None;
         }
         let content_type = content_type?;
@@ -2975,6 +3090,21 @@ impl Plugin for AiRateLimiter {
             return PluginResult::Continue;
         }
 
+        // Classify the REQUEST before touching the response, exactly as the
+        // streamed halves already do (`response_stream_inspector` and
+        // `on_response_stream_terminated` both gate on this predicate). This
+        // hook runs for every response some other plugin pinned onto the
+        // buffered path, so without the gate an ordinary non-AI reply whose
+        // JSON happens to carry a usage-shaped object — a stored transcript, a
+        // usage-reporting endpoint, an `ai_token_metrics` metadata write for a
+        // sibling route — was charged against the budget, and the same GET was
+        // billed over H1/H2 while the streamed H3 path left it alone (issue
+        // #5319). A non-candidate holds no reservation of this instance's, so
+        // there is nothing to release either: skipping is the whole lifecycle.
+        if !self.response_accounting_candidate(ctx) {
+            return PluginResult::Continue;
+        }
+
         if !(200..300).contains(&response_status) {
             debug!(
                 "ai_rate_limiter: skipping non-2xx response (status {})",
@@ -3018,22 +3148,48 @@ impl Plugin for AiRateLimiter {
                 return None;
             }
 
-            if is_event_stream_content_type(content_type) {
-                unmetered_detail = "sse_without_usage";
-                return self.extract_token_count_from_sse(ctx, body);
-            }
-
+            let is_sse = is_event_stream_content_type(content_type);
             // A Bedrock event stream normally reaches the incremental
             // inspector; it can still land here when an unrelated plugin pins
             // the response onto the buffered path. Decode it with the same
             // bounded framing parser so both paths charge identically.
-            if is_aws_event_stream_content_type(content_type) {
+            let is_aws_event_stream = is_aws_event_stream_content_type(content_type);
+            if !is_sse && !is_aws_event_stream && !is_json_content_type(content_type) {
+                unmetered_detail = "unsupported_content_type";
+                return None;
+            }
+
+            // Inspect the DECODED representation. A provider (or an
+            // intermediary) may ship a perfectly ordinary usage document under
+            // `Content-Encoding: gzip`/`br`; parsing the wire bytes classified
+            // it as unmetered, so the budget silently followed the heuristic
+            // estimate and `on_unmetered_response: reject` refused a response
+            // that had reported its usage. The original bytes are forwarded
+            // untouched — this plaintext is a local, transient view whose whole
+            // working set is reserved against the shared retained-response
+            // budget BEFORE it is allocated, so the fix cannot become an
+            // uncharged decompression path.
+            let decoded = match self.decoded_inspection_body(response_headers, body) {
+                Ok(decoded) => decoded,
+                Err(detail) => {
+                    unmetered_detail = detail;
+                    return None;
+                }
+            };
+            let inspected: &[u8] = &decoded;
+
+            if is_sse {
+                unmetered_detail = "sse_without_usage";
+                return self.extract_token_count_from_sse(ctx, inspected);
+            }
+
+            if is_aws_event_stream {
                 unmetered_detail = "event_stream_without_usage";
                 let mut extractor = UsageStreamExtractor::new(
                     UsageStreamFormat::AwsEventStream,
                     self.configured_provider,
                 );
-                extractor.push(body);
+                extractor.push(inspected);
                 extractor.finish();
                 return self.reconciliation_tokens(
                     ctx,
@@ -3042,13 +3198,8 @@ impl Plugin for AiRateLimiter {
                 );
             }
 
-            if !is_json_content_type(content_type) {
-                unmetered_detail = "unsupported_content_type";
-                return None;
-            }
-
             unmetered_detail = "json_without_usage";
-            self.extract_token_count(ctx, body)
+            self.extract_token_count(ctx, inspected)
         });
 
         let result = self
@@ -3164,8 +3315,12 @@ impl ResponseStreamInspector for UsageStreamInspector {
 
     /// A later inspector cut the stream: the bytes this one already parsed are
     /// still the bytes the provider generated and billed, so the accumulated
-    /// usage stays. Publish it now because `on_end` will not run.
+    /// usage stays. Publish it now because `on_end` will not run. `finish`
+    /// first, so a terminal usage event that arrived without its trailing blank
+    /// line is still dispatched by the SSE event assembler; it is idempotent
+    /// and only ever applies bytes already received.
     fn on_downstream_terminated(&mut self) {
+        self.extractor.finish();
         self.publish();
     }
 
@@ -3173,6 +3328,7 @@ impl ResponseStreamInspector for UsageStreamInspector {
     /// ends by client disconnect (no `on_end`) still hands back whatever usage
     /// the provider had already reported.
     fn on_before_drop(&mut self) {
+        self.extractor.finish();
         self.publish();
     }
 }

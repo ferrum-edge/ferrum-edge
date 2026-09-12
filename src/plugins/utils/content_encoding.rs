@@ -2,8 +2,16 @@
 //!
 //! This utility never mutates the caller's body or headers. It is intended for
 //! observability/security inspection paths that need a plaintext view while the
-//! encoded representation must remain client-visible. The compression plugin
-//! reuses the same parser/decoder for opt-in request decompression.
+//! encoded representation must remain client-visible.
+//!
+//! It shares the strict, Large-Window-refusing `br` primitive with
+//! [`crate::plugins::charged_decode`], but NOT that module's aggregate budget:
+//! nothing here reserves the decoder's own heap or the output allocation before
+//! asking for them. Callers that decode attacker-supplied bytes and REWRITE the
+//! request — the `compression` plugin's opt-in `decompress_request` normalizer —
+//! must use [`crate::plugins::charged_decode::decode_charged_content_coding_chain`]
+//! instead (`GHSA-q76p-952x-7c3v`); only [`parse_content_codings`] is shared with
+//! them.
 
 use std::borrow::Cow;
 use std::io::Read;
@@ -205,59 +213,19 @@ fn decode_brotli_stream(
     max_bytes: usize,
     max_amplification_ratio: u32,
 ) -> Result<Vec<u8>, String> {
-    use brotli::{BrotliDecompressStream, BrotliResult, BrotliState, HeapAlloc, HuffmanCode};
-
-    let mut state = BrotliState::new(
-        HeapAlloc::<u8>::new(0),
-        HeapAlloc::<u32>::new(0),
-        HeapAlloc::<HuffmanCode>::new(HuffmanCode::default()),
-    );
-    let mut available_in = input.len();
-    let mut input_offset = 0usize;
-    let mut decoded = Vec::with_capacity(input.len().min(max_bytes));
-    let mut chunk = [0u8; 8192];
-
-    loop {
-        let mut available_out = chunk.len();
-        let mut output_offset = 0usize;
-        let mut total_out = 0usize;
-        let result = BrotliDecompressStream(
-            &mut available_in,
-            &mut input_offset,
-            input,
-            &mut available_out,
-            &mut output_offset,
-            &mut chunk,
-            &mut total_out,
-            &mut state,
-        );
-
-        if decoded
-            .len()
-            .checked_add(output_offset)
-            .is_none_or(|size| size > max_bytes)
-        {
-            return Err(format!("brotli decoded content exceeds {max_bytes} bytes"));
-        }
-        decoded.extend_from_slice(&chunk[..output_offset]);
-        enforce_amplification(input.len(), decoded.len(), max_amplification_ratio)?;
-
-        match result {
-            BrotliResult::ResultSuccess => {
-                if available_in != 0 || input_offset != input.len() {
-                    return Err("brotli content contains trailing or concatenated data".to_string());
-                }
-                return Ok(decoded);
-            }
-            BrotliResult::NeedsMoreOutput => continue,
-            BrotliResult::NeedsMoreInput => {
-                return Err("brotli content is truncated".to_string());
-            }
-            BrotliResult::ResultFailure => {
-                return Err("brotli decompression failed".to_string());
-            }
-        }
-    }
+    // `StrictBrotliReader` constructs `BrotliState::new_strict`, which rejects
+    // Large Window Brotli before a stream-selected ring buffer can be
+    // allocated. `Content-Encoding: br` is RFC 7932 Brotli and therefore never
+    // negotiates the Large Window extension (whose window can reach 1 GiB).
+    // Keep the generic inspection decoder on the same strict codec primitive
+    // as the aggregate-budgeted representation gates.
+    read_bounded(
+        &mut crate::plugins::charged_decode::StrictBrotliReader::new(input),
+        max_bytes,
+        input.len(),
+        max_amplification_ratio,
+        "brotli",
+    )
 }
 
 fn read_bounded(

@@ -1702,9 +1702,16 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
 
     impl IdpBundle {
         pub fn new() -> Self {
+            Self::with_trusted_cert(TEST_IDP_CERT_PEM)
+        }
+
+        /// A bundle whose on-disk trust list holds `cert_pem`. Constructing a
+        /// plugin from one of these is exactly what a configuration reload
+        /// does, so it is how trust rotation is exercised without a restart.
+        pub fn with_trusted_cert(cert_pem: &str) -> Self {
             let dir = tempfile::tempdir().expect("create tempdir");
             let trusted = dir.path().join("trusted-idp.pem");
-            std::fs::write(&trusted, TEST_IDP_CERT_PEM).expect("write trusted PEM");
+            std::fs::write(&trusted, cert_pem).expect("write trusted PEM");
             IdpBundle {
                 _tempdir: dir,
                 trusted_cert_path: trusted,
@@ -8635,6 +8642,763 @@ async fn malformed_soap_returns_fixed_parser_categories() {
         assert_eq!(
             error["error"],
             format!("WS-Security: malformed or overly complex SOAP XML: {category}")
+        );
+    }
+}
+
+// ── Scalar reader: the concatenated value is used unchanged (issue #5057) ────
+//
+// Surrounding whitespace decides only whether an otherwise-required element is
+// blank. Returning a trimmed copy handed verification and consumption two
+// different byte strings, and it made a configured PasswordText credential with
+// significant surrounding spaces impossible to present.
+
+const PASSWORD_TEXT_TYPE_ATTR: &str = concat!(
+    "http://docs.oasis-open.org/wss/2004/01/",
+    "oasis-200401-wss-username-token-profile-1.0#PasswordText"
+);
+
+fn padded_credential_config(username: &str, password: &str) -> serde_json::Value {
+    json!({
+        "timestamp": { "require": false },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordText",
+            "credentials": [{"username": username, "password": password}]
+        },
+        "reject_missing_security_header": true
+    })
+}
+
+fn username_token_block(username: &str, password: &str) -> String {
+    format!(
+        r#"<wsse:UsernameToken>
+        <wsse:Username>{}</wsse:Username>
+        <wsse:Password Type="{}">{}</wsse:Password>
+    </wsse:UsernameToken>"#,
+        username, PASSWORD_TEXT_TYPE_ATTR, password
+    )
+}
+
+#[tokio::test]
+async fn test_password_text_with_significant_spaces_authenticates() {
+    let config = padded_credential_config("alice", "  spaced secret  ");
+    let plugin = SoapWsSecurity::new(&config).unwrap();
+    let body = wrap_soap(&username_token_block("alice", "  spaced secret  "));
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "an admitted password whose spaces are significant must authenticate: {result:?}"
+    );
+    assert_eq!(ctx.metadata.get("soap_ws_username").unwrap(), "alice");
+}
+
+#[tokio::test]
+async fn test_password_text_trimmed_variant_does_not_authenticate() {
+    let config = padded_credential_config("alice", "  spaced secret  ");
+    let plugin = SoapWsSecurity::new(&config).unwrap();
+    let body = wrap_soap(&username_token_block("alice", "spaced secret"));
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+    assert_username_token_invalid_credentials(&result, &["alice"]);
+}
+
+#[tokio::test]
+async fn test_username_is_matched_including_its_surrounding_spaces() {
+    let config = padded_credential_config(" padded-user ", "secret123");
+    let plugin = SoapWsSecurity::new(&config).unwrap();
+
+    let exact = wrap_soap(&username_token_block(" padded-user ", "secret123"));
+    let mut ctx = make_ctx_with_soap_body(&exact);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue), "got {result:?}");
+    let published = ctx.metadata.get("soap_ws_username").map(String::as_str);
+    assert_eq!(published, Some(" padded-user "));
+
+    let trimmed = wrap_soap(&username_token_block("padded-user", "secret123"));
+    let mut ctx = make_ctx_with_soap_body(&trimmed);
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+    assert_username_token_invalid_credentials(&result, &["padded-user"]);
+}
+
+/// `xsd:dateTime` really does collapse surrounding whitespace, so a
+/// pretty-printed Timestamp must still parse. This is the control that keeps
+/// the untrimmed reader from being applied where the datatype forbids it.
+#[tokio::test]
+async fn test_timestamp_instants_still_collapse_surrounding_whitespace() {
+    let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+    let now = chrono::Utc::now();
+    let created = now.format("%Y-%m-%dT%H:%M:%S%.3fZ");
+    let expires = (now + chrono::Duration::minutes(5)).format("%Y-%m-%dT%H:%M:%S%.3fZ");
+    let timestamp = format!(
+        r#"<wsu:Timestamp wsu:Id="TS-1">
+        <wsu:Created>
+          {}
+        </wsu:Created>
+        <wsu:Expires>
+          {}
+        </wsu:Expires>
+      </wsu:Timestamp>"#,
+        created, expires
+    );
+    let body = wrap_soap(&timestamp);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a whitespace-padded xsd:dateTime is still a valid instant: {result:?}"
+    );
+}
+
+/// The signed NameID reaches consumer lookup byte for byte. Signature
+/// verification covers the character data as written, so a trimmed principal is
+/// a value the IdP never asserted.
+#[tokio::test]
+async fn test_saml_name_id_keeps_its_surrounding_whitespace() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    let mut builder = saml_fixtures::AssertionBuilder::new(
+        "_assertion-padded-nameid",
+        "https://idp.example.com/metadata",
+        "unused",
+    );
+    let fragment = "<saml:NameID> alice@example.com </saml:NameID>";
+    builder.name_id_fragment = Some(fragment.to_string());
+    let assertion = builder.build();
+
+    let body = wrap_saml_assertion(&assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a signed assertion whose NameID carries spaces is still valid: {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata.get("soap_ws_saml_subject").map(String::as_str),
+        Some(" alice@example.com "),
+        "the principal must be the signed character data, not a trimmed copy"
+    );
+}
+
+// ── Bounded canonical writer (GHSA-hfpm-3pv7-h3jh) ──────────────────────────
+//
+// The writer charges the per-message work budget BEFORE each run it appends, so
+// a refused canonicalization stops at the ceiling instead of allocating the
+// complete over-budget representation and charging for it afterwards. What is
+// left of the budget is what makes the two orderings distinguishable.
+
+const C14N_BUDGET_FIXTURE: &str = concat!(
+    r#"<root xmlns:a="urn:example:a"><a:child attr="value">"#,
+    "text &amp; more text &lt; here",
+    r#"</a:child></root>"#
+);
+
+fn c14n_with_budget(budget_bytes: usize) -> (Result<String, String>, usize) {
+    ferrum_edge::_test_support::soap_exclusive_canonicalize_with_budget_for_test(
+        C14N_BUDGET_FIXTURE,
+        "root",
+        budget_bytes,
+    )
+}
+
+fn c14n_source_len() -> usize {
+    let source_len = ferrum_edge::_test_support::soap_canonicalization_source_len_for_test(
+        C14N_BUDGET_FIXTURE,
+        "root",
+    );
+    source_len.expect("fixture has a root element")
+}
+
+#[test]
+fn canonical_writer_charges_the_budget_as_it_writes() {
+    let source_len = c14n_source_len();
+
+    let (outcome, remaining) = c14n_with_budget(4096);
+    let canonical = outcome.expect("a well-funded canonicalization succeeds");
+    assert!(canonical.contains("&amp;"), "got: {canonical}");
+    let output_len = canonical.len();
+    assert_eq!(
+        remaining,
+        4096 - source_len - output_len,
+        "a successful canonicalization charges exactly source + output"
+    );
+
+    // One byte of output allowance. A writer that charged the finished string
+    // would leave that byte untouched; one that charges as it writes spends it
+    // on the first append and then stops.
+    let (outcome, remaining) = c14n_with_budget(source_len + 1);
+    let error = outcome.expect_err("one byte of output allowance is not enough");
+    assert!(
+        error.contains("canonicalization work budget"),
+        "got: {error}"
+    );
+    assert_eq!(
+        remaining, 0,
+        "the writer must stop at the ceiling with the output allowance spent, not build the \
+         whole over-budget result and charge for it afterwards"
+    );
+}
+
+#[test]
+fn canonical_writer_refuses_an_over_budget_subtree_before_walking_it() {
+    let source_len = c14n_source_len();
+    let (outcome, remaining) = c14n_with_budget(source_len - 1);
+    assert!(outcome.is_err(), "an over-budget subtree is refused");
+    assert_eq!(
+        remaining,
+        source_len - 1,
+        "refusing before the walk charges nothing"
+    );
+}
+
+// ── Credential removal (GHSA-xg9v-wc29-fc29) ────────────────────────────────
+
+fn remove_credential_config() -> serde_json::Value {
+    json!({
+        "timestamp": { "require": false },
+        "content_type": { "allow_mtom": false },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordText",
+            "remove_credential": true,
+            "credentials": [{"username": "alice", "password": "secret123"}]
+        },
+        "reject_missing_security_header": true
+    })
+}
+
+async fn strip_credential(
+    plugin: &SoapWsSecurity,
+    ctx: &mut RequestContext,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> Option<Vec<u8>> {
+    plugin
+        .transform_request_body_with_context(ctx, body, Some("text/xml"), headers)
+        .await
+}
+
+async fn final_body_decision(
+    plugin: &SoapWsSecurity,
+    ctx: &mut RequestContext,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> PluginResult {
+    plugin
+        .on_final_request_body_with_context(ctx, headers, body)
+        .await
+}
+
+#[test]
+fn test_remove_credential_requires_an_enabled_password_text_policy() {
+    let cases: &[(&str, serde_json::Value, &str)] = &[
+        (
+            "disabled username_token",
+            json!({
+                "timestamp": { "require": true },
+                "username_token": { "remove_credential": true }
+            }),
+            "requires",
+        ),
+        (
+            "password digest",
+            json!({
+                "timestamp": { "require": false },
+                "username_token": {
+                    "enabled": true,
+                    "remove_credential": true,
+                    "credentials": [{"username": "alice", "password": "secret123"}]
+                },
+                "nonce": { "replay_scope": "process" }
+            }),
+            "PasswordText",
+        ),
+        (
+            "explicit allow_mtom",
+            json!({
+                "timestamp": { "require": false },
+                "content_type": { "allow_mtom": true },
+                "username_token": {
+                    "enabled": true,
+                    "password_type": "PasswordText",
+                    "remove_credential": true,
+                    "credentials": [{"username": "alice", "password": "secret123"}]
+                }
+            }),
+            "allow_mtom",
+        ),
+    ];
+    for (name, config, fragment) in cases {
+        let err = SoapWsSecurity::new(config)
+            .err()
+            .unwrap_or_else(|| panic!("{name} must be refused at admission"));
+        assert!(err.contains(fragment), "{name}: got {err}");
+    }
+}
+
+#[test]
+fn test_remove_credential_is_refused_alongside_a_signature_mechanism() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let cert_path = bundle.trusted_cert_path.to_str().unwrap();
+    let config = json!({
+        "timestamp": { "require": false },
+        "content_type": { "allow_mtom": false },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordText",
+            "remove_credential": true,
+            "credentials": [{"username": "alice", "password": "secret123"}]
+        },
+        "saml": {
+            "enabled": true,
+            "trusted_issuers": ["https://idp.example.com/metadata"],
+            "trusted_signing_certs": [cert_path],
+            "audience": saml_fixtures::TEST_AUDIENCE,
+            "recipient": saml_fixtures::TEST_RECIPIENT
+        },
+        "nonce": { "replay_scope": "process" }
+    });
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("removal alongside SAML must be refused");
+    assert!(err.contains("remove_credential"), "got {err}");
+}
+
+#[test]
+fn test_credential_removal_is_opt_in() {
+    let default_policy = SoapWsSecurity::new(&username_token_config()).unwrap();
+    assert!(
+        !default_policy.modifies_request_body(),
+        "an ordinary SOAP policy must not declare a request-body transform"
+    );
+    let removing = SoapWsSecurity::new(&remove_credential_config()).unwrap();
+    assert!(removing.modifies_request_body());
+}
+
+#[tokio::test]
+async fn test_remove_credential_strips_a_security_header_that_holds_only_the_token() {
+    let plugin = SoapWsSecurity::new(&remove_credential_config()).unwrap();
+    let body = wrap_soap(&username_token_block("alice", "secret123"));
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue), "got {result:?}");
+    assert_eq!(ctx.metadata.get("soap_ws_username").unwrap(), "alice");
+
+    let removal = strip_credential(&plugin, &mut ctx, &headers, body.as_bytes()).await;
+    let transformed = removal.expect("credential removal must rewrite the body");
+    let sanitized = String::from_utf8(transformed.clone()).expect("sanitized body is UTF-8");
+    assert!(!sanitized.contains("secret123"), "got: {sanitized}");
+    assert!(!sanitized.contains("UsernameToken"), "got: {sanitized}");
+    assert!(
+        !sanitized.contains("wsse:Security"),
+        "a Security header holding only the credential is removed whole: {sanitized}"
+    );
+    assert!(
+        sanitized.contains("<GetPrice") && sanitized.contains("Widget"),
+        "the application body must survive: {sanitized}"
+    );
+
+    // The final-body proof binds the sanitized representation: it admits the
+    // rewritten bytes and still refuses the ones that were validated.
+    let accepted = final_body_decision(&plugin, &mut ctx, &headers, &transformed).await;
+    assert!(
+        matches!(accepted, PluginResult::Continue),
+        "got {accepted:?}"
+    );
+    let refused = final_body_decision(&plugin, &mut ctx, &headers, body.as_bytes()).await;
+    assert_eq!(reject_status(&refused), 500);
+}
+
+#[tokio::test]
+async fn test_remove_credential_keeps_a_security_header_that_also_carries_a_timestamp() {
+    let mut config = remove_credential_config();
+    config["timestamp"]["require"] = json!(true);
+    let plugin = SoapWsSecurity::new(&config).unwrap();
+
+    let credential = username_token_block("alice", "secret123");
+    let body = wrap_soap(&format!("{}{}", fresh_timestamp(), credential));
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue), "got {result:?}");
+
+    let removal = strip_credential(&plugin, &mut ctx, &headers, body.as_bytes()).await;
+    let transformed = removal.expect("credential removal must rewrite the body");
+    let sanitized = String::from_utf8(transformed).expect("sanitized body is UTF-8");
+    assert!(!sanitized.contains("secret123"), "got: {sanitized}");
+    assert!(!sanitized.contains("UsernameToken"), "got: {sanitized}");
+    assert!(
+        sanitized.contains("wsse:Security") && sanitized.contains("wsu:Timestamp"),
+        "a header carrying more than the credential keeps its other content: {sanitized}"
+    );
+}
+
+#[tokio::test]
+async fn test_remove_credential_refuses_a_signed_envelope() {
+    let plugin = SoapWsSecurity::new(&remove_credential_config()).unwrap();
+    let signature = concat!(
+        r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
+        "<ds:SignatureValue>AAAA</ds:SignatureValue></ds:Signature>"
+    );
+    let credential = username_token_block("alice", "secret123");
+    let body = wrap_soap(&format!("{}{}", credential, signature));
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+    assert_eq!(reject_status(&result), 400);
+    assert!(
+        reject_body(&result).contains("signed SOAP envelope"),
+        "expected the signed-envelope rejection, got: {}",
+        reject_body(&result)
+    );
+    let strip_key = "soap_ws_security.credential_strip_range";
+    assert!(
+        !ctx.metadata.contains_key(strip_key),
+        "no removal is recorded"
+    );
+}
+
+#[tokio::test]
+async fn test_remove_credential_refuses_a_representation_it_cannot_splice() {
+    let plugin = SoapWsSecurity::new(&remove_credential_config()).unwrap();
+    let body = wrap_soap(&username_token_block("alice", "secret123"));
+    let content_type = "application/soap+xml; charset=utf-16";
+    let mut ctx = make_ctx_with_soap_bytes(encode_utf16_le(&body), content_type);
+    let mut headers = soap_headers_with_content_type(content_type);
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+    assert_eq!(
+        reject_status(&result),
+        415,
+        "a transcoded body cannot be spliced and must not be forwarded with the credential"
+    );
+    assert!(
+        reject_body(&result).contains("cannot have its UsernameToken removed"),
+        "got: {}",
+        reject_body(&result)
+    );
+}
+
+#[tokio::test]
+async fn test_credential_removal_declines_when_something_else_rewrote_the_body_first() {
+    let plugin = SoapWsSecurity::new(&remove_credential_config()).unwrap();
+    let body = wrap_soap(&username_token_block("alice", "secret123"));
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue), "got {result:?}");
+
+    let mutated = body.replace("Widget", "Sprocket");
+    let declined = strip_credential(&plugin, &mut ctx, &headers, mutated.as_bytes()).await;
+    assert!(
+        declined.is_none(),
+        "the splice must never be applied to bytes this policy did not itself accept"
+    );
+    let refused = final_body_decision(&plugin, &mut ctx, &headers, mutated.as_bytes()).await;
+    assert_eq!(
+        reject_status(&refused),
+        500,
+        "an inapplicable removal fails closed rather than forwarding the credential"
+    );
+}
+
+/// Rotating a SAML IdP signing certificate does not require a restart
+/// (issue #5054): the trust list is read when the plugin generation is
+/// constructed, and a configuration reload constructs a new generation.
+#[tokio::test]
+async fn test_saml_signing_cert_rotation_takes_effect_in_a_new_generation() {
+    let rotated_pem = saml_fixtures::UNTRUSTED_IDP_CERT_PEM;
+    let before = saml_fixtures::IdpBundle::new();
+    let after = saml_fixtures::IdpBundle::with_trusted_cert(rotated_pem);
+    let generation_before = SoapWsSecurity::new(&saml_config(&before, None)).unwrap();
+    let generation_after = SoapWsSecurity::new(&saml_config(&after, None)).unwrap();
+
+    let assertion = |id: &str, rotated_signer: bool| {
+        let issuer = "https://idp.example.com/metadata";
+        let mut builder = saml_fixtures::AssertionBuilder::new(id, issuer, "alice@example.com");
+        builder.sign_with_untrusted_key = rotated_signer;
+        wrap_saml_assertion(&builder.build())
+    };
+
+    let accepted = run_saml_generation(&generation_before, &assertion("_rot-1", false)).await;
+    assert!(
+        matches!(accepted, PluginResult::Continue),
+        "got {accepted:?}"
+    );
+    let refused = run_saml_generation(&generation_before, &assertion("_rot-2", true)).await;
+    assert_eq!(reject_status(&refused), 401);
+
+    // Same process, same fixtures — only the constructed generation changed.
+    let accepted = run_saml_generation(&generation_after, &assertion("_rot-3", true)).await;
+    assert!(
+        matches!(accepted, PluginResult::Continue),
+        "got {accepted:?}"
+    );
+    let refused = run_saml_generation(&generation_after, &assertion("_rot-4", false)).await;
+    assert_eq!(
+        reject_status(&refused),
+        401,
+        "the retired signer must be refused by the generation the reload installed"
+    );
+}
+
+async fn run_saml_generation(plugin: &SoapWsSecurity, body: &str) -> PluginResult {
+    let mut ctx = make_ctx_with_soap_body(body);
+    let mut headers = soap_headers();
+    run_soap_request_policy(plugin, &mut ctx, &mut headers).await
+}
+
+// ── OpenAPI component / constructor admission parity (issue #5053) ───────────
+//
+// Generated tooling and schema-based preflight validate against the component,
+// so a schema that admits configurations the constructor refuses reports
+// success for policies that cannot be installed. This compares the two
+// verdicts directly instead of asserting on description strings.
+
+#[test]
+fn openapi_soap_ws_security_component_matches_constructor_admission() {
+    let spec: Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/SoapWsSecurityConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("SoapWsSecurityConfig schema compiles");
+
+    let bundle = saml_fixtures::IdpBundle::new();
+    let cert = bundle.trusted_cert_path.to_str().unwrap();
+    let issuer = "https://idp.example.com/metadata";
+    let audience = saml_fixtures::TEST_AUDIENCE;
+    let recipient = saml_fixtures::TEST_RECIPIENT;
+    let holder_of_key = "urn:oasis:names:tc:SAML:2.0:cm:holder-of-key";
+    let bearer = "urn:oasis:names:tc:SAML:2.0:cm:bearer";
+
+    let cases: Vec<(&str, serde_json::Value)> = vec![
+        ("empty object", json!({})),
+        ("timestamp only", json!({"timestamp": {"require": true}})),
+        (
+            "no active feature",
+            json!({"timestamp": {"require": false}}),
+        ),
+        (
+            "username_token without credentials",
+            json!({"username_token": {"enabled": true, "password_type": "PasswordText"}}),
+        ),
+        (
+            "username_token with an empty credential list",
+            json!({"username_token": {
+                "enabled": true,
+                "password_type": "PasswordText",
+                "credentials": []
+            }}),
+        ),
+        (
+            "username_token with a blank username",
+            json!({"username_token": {
+                "enabled": true,
+                "password_type": "PasswordText",
+                "credentials": [{"username": "   ", "password": "secret123"}]
+            }}),
+        ),
+        (
+            "username_token password with significant spaces",
+            json!({"username_token": {
+                "enabled": true,
+                "password_type": "PasswordText",
+                "credentials": [{"username": "alice", "password": "  secret123  "}]
+            }}),
+        ),
+        (
+            "password digest with a declared replay scope",
+            json!({
+                "username_token": {
+                    "enabled": true,
+                    "credentials": [{"username": "alice", "password": "secret123"}]
+                },
+                "nonce": {"replay_scope": "process"}
+            }),
+        ),
+        (
+            "empty arrays on inactive features",
+            json!({
+                "timestamp": {"require": true},
+                "username_token": {"credentials": []},
+                "x509_signature": {"trusted_certs": []},
+                "saml": {"trusted_issuers": []}
+            }),
+        ),
+        (
+            "x509 without trust material",
+            json!({"x509_signature": {"enabled": true}}),
+        ),
+        (
+            "x509 with an empty trust list",
+            json!({"x509_signature": {"enabled": true, "trusted_certs": []}}),
+        ),
+        (
+            "x509 with a blank trust entry",
+            json!({"x509_signature": {"enabled": true, "trusted_certs": ["   "]}}),
+        ),
+        (
+            "x509 with trust material",
+            json!({"x509_signature": {"enabled": true, "trusted_certs": [cert]}}),
+        ),
+        (
+            "x509 alongside an explicit allow_mtom",
+            json!({
+                "content_type": {"allow_mtom": true},
+                "x509_signature": {"enabled": true, "trusted_certs": [cert]}
+            }),
+        ),
+        (
+            "x509 alongside allow_mtom false",
+            json!({
+                "content_type": {"allow_mtom": false},
+                "x509_signature": {"enabled": true, "trusted_certs": [cert]}
+            }),
+        ),
+        (
+            "saml fully bound",
+            json!({
+                "saml": {
+                    "enabled": true,
+                    "trusted_issuers": [issuer],
+                    "trusted_signing_certs": [cert],
+                    "audience": audience,
+                    "recipient": recipient
+                },
+                "nonce": {"replay_scope": "process"}
+            }),
+        ),
+        (
+            "saml with an empty issuer list",
+            json!({
+                "saml": {
+                    "enabled": true,
+                    "trusted_issuers": [],
+                    "trusted_signing_certs": [cert],
+                    "audience": audience,
+                    "recipient": recipient
+                },
+                "nonce": {"replay_scope": "process"}
+            }),
+        ),
+        (
+            "saml with an empty signing-cert list",
+            json!({
+                "saml": {
+                    "enabled": true,
+                    "trusted_issuers": [issuer],
+                    "trusted_signing_certs": [],
+                    "audience": audience,
+                    "recipient": recipient
+                },
+                "nonce": {"replay_scope": "process"}
+            }),
+        ),
+        (
+            "saml with a blank audience",
+            json!({
+                "saml": {
+                    "enabled": true,
+                    "trusted_issuers": [issuer],
+                    "trusted_signing_certs": [cert],
+                    "audience": "   ",
+                    "recipient": recipient
+                },
+                "nonce": {"replay_scope": "process"}
+            }),
+        ),
+        (
+            "unsupported subject confirmation method",
+            json!({"saml": {"allowed_subject_confirmation_methods": [holder_of_key]}}),
+        ),
+        (
+            "bearer subject confirmation method",
+            json!({
+                "timestamp": {"require": true},
+                "saml": {"allowed_subject_confirmation_methods": [bearer]}
+            }),
+        ),
+        (
+            "credential removal on an unsigned PasswordText policy",
+            json!({
+                "content_type": {"allow_mtom": false},
+                "username_token": {
+                    "enabled": true,
+                    "password_type": "PasswordText",
+                    "remove_credential": true,
+                    "credentials": [{"username": "alice", "password": "secret123"}]
+                }
+            }),
+        ),
+        (
+            "credential removal without an enabled username_token",
+            json!({
+                "timestamp": {"require": true},
+                "username_token": {"remove_credential": true}
+            }),
+        ),
+        (
+            "credential removal on a PasswordDigest policy",
+            json!({
+                "username_token": {
+                    "enabled": true,
+                    "remove_credential": true,
+                    "credentials": [{"username": "alice", "password": "secret123"}]
+                },
+                "nonce": {"replay_scope": "process"}
+            }),
+        ),
+        (
+            "credential removal alongside x509",
+            json!({
+                "content_type": {"allow_mtom": false},
+                "username_token": {
+                    "enabled": true,
+                    "password_type": "PasswordText",
+                    "remove_credential": true,
+                    "credentials": [{"username": "alice", "password": "secret123"}]
+                },
+                "x509_signature": {"enabled": true, "trusted_certs": [cert]}
+            }),
+        ),
+        (
+            "credential removal alongside an explicit allow_mtom",
+            json!({
+                "content_type": {"allow_mtom": true},
+                "username_token": {
+                    "enabled": true,
+                    "password_type": "PasswordText",
+                    "remove_credential": true,
+                    "credentials": [{"username": "alice", "password": "secret123"}]
+                }
+            }),
+        ),
+    ];
+
+    for (name, config) in cases {
+        let runtime = SoapWsSecurity::new(&config);
+        let runtime_admits = runtime.is_ok();
+        let schema_admits = validator.validate(&config).is_ok();
+        assert_eq!(
+            schema_admits,
+            runtime_admits,
+            "{name}: schema admits={schema_admits}, constructor admits={runtime_admits} \
+             (constructor said {:?})",
+            runtime.err()
         );
     }
 }

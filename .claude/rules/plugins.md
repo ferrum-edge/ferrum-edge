@@ -97,7 +97,11 @@ paths:
   `Proxy-Authorization`, and `Cookie` remain mandatory Vary names even for
   anonymous entries because downstream shared caches cannot observe Ferrum's
   private caller partition; present values are hashed and absence is a distinct
-  keyed state. The RFC shared-cache authorization admission checks both pristine
+  keyed state. That merged `Vary` list is emitted on the `MISS` response too,
+  not only on the retained entry: the first publicly cacheable response is the
+  one a downstream cache stores, so publishing the contract only from the
+  second request onwards leaves it unpartitioned (advisory
+  `GHSA-vf55-2vfh-48j8`). An origin `Vary: *` is left untouched. The RFC shared-cache authorization admission checks both pristine
   inbound and live backend-visible `Authorization`, so request transforms cannot
   erase it.
 - Exception: `api_chargeback_sink` admits at most one effective instance per
@@ -243,11 +247,15 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     request representation phase, run once by
     `run_final_request_body_hooks_with_provenance` immediately before step 6 on
     every dispatch ladder (`GHSA-3973-47g5-4mcx`). A plugin claims a request with
-    `enforces_final_request_body_policy` (`waf`, `body_validator`, `graphql`)
+    `enforces_final_request_body_policy` (`waf`, `body_validator`, `graphql`,
+    and deny-policy `a2a_gateway` configurations)
     only when its configured policy would BOTH inspect this representation and
     be able to REFUSE it — a `monitor`-mode WAF, a body rule set that only logs,
     and an `on_body_too_large: skip` body outside the scan window all lose an
-    observation rather than fail closed, and must not claim;
+    observation rather than fail closed, and must not claim. The broader
+    `enforces_finalized_request_policy` composition capability also includes
+    `ai_prompt_shield`: it rejects a final representation it cannot inspect,
+    but does not currently claim the staged plaintext inspection view;
     for a claimed request whose finalized `Content-Encoding` names a transforming
     coding, the ordered `#content-coding` list is parsed and decoded in reverse
     application order into a staged PLAINTEXT INSPECTION VIEW, and anything
@@ -263,9 +271,11 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     body. This phase is independent of `compression`: an enforcing
     policy may not silently depend on a separately configured decompressor.
     Codec strictness and charge ordering come from `plugins::charged_decode`,
-    shared with the response gate — the permissive
-    `utils::content_encoding` decoder (`BrotliState::new`, `large_window = true`)
-    is deliberately unreachable from this security gate. The complete decode
+    shared with the response gate. The generic `utils::content_encoding`
+    inspection decoder also uses its strict `StrictBrotliReader` primitive
+    (`BrotliState::new_strict`, Large Window refused), but does not reserve the
+    aggregate working-set budget; this security gate uses the charged decoder.
+    The complete decode
     working set (output capacity, stacked-pass concurrency window, and the ACTIVE
     decoder's own heap, reserved before the decoder is CONSTRUCTED) is charged to
     a process-wide `FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES` budget before
@@ -519,7 +529,13 @@ on a native-gRPC request.
   `ai_prompt_shield`), falls back to `ctx.request_body_bytes` when no text view
   exists (retained via `needs_request_body_bytes()` so non-UTF-8 cannot look
   like "no body"), treats `ctx.replay_request_body_empty_proven()` as the
-  transport's own empty proof, and fails closed otherwise. The final
+  transport's own empty proof, and fails closed otherwise. A representation
+  that reached the early hook but carries a non-identity `Content-Encoding` is
+  the one case the early hook does NOT judge: it has no decoder, so the verdict
+  belongs to step 5c's staged plaintext and the final hook, which still run
+  before backend egress. That deferral is taken only when the instance's own
+  final request-body policy claims the request; a MISSING representation still
+  fails closed early. The final
   request-body hook still validates the exact backend-visible bytes. Native
   gRPC always runs `parse_grpc_frame`. The only exemptions are protocol-defined:
   empty terminal gRPC *error* replies (a single valid non-zero `grpc-status`),

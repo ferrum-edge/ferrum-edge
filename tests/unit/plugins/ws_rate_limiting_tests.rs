@@ -851,7 +851,11 @@ fn test_public_docs_retain_instance_scoped_redis_semantics() {
     let sync_mode_description = ws_schema["properties"]["sync_mode"]["description"]
         .as_str()
         .expect("WsRateLimitingConfig.sync_mode description");
-    let openapi_descriptions = format!("{schema_description}\n{sync_mode_description}");
+    let prefix_description = ws_schema["properties"]["redis_key_prefix"]["description"]
+        .as_str()
+        .expect("WsRateLimitingConfig.redis_key_prefix description");
+    let openapi_descriptions =
+        format!("{schema_description}\n{sync_mode_description}\n{prefix_description}");
     let normalized_openapi = openapi_descriptions
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -867,10 +871,19 @@ fn test_public_docs_retain_instance_scoped_redis_semantics() {
             && normalized_openapi.contains("not a portable cross-instance budget"),
         "OpenAPI WsRateLimitingConfig/sync_mode must describe instance-scoped Redis semantics"
     );
+    assert!(
+        normalized_openapi.contains("per-instance UUID"),
+        "OpenAPI redis_key_prefix must describe the instance UUID that partitions keys"
+    );
+    assert!(
+        !normalized_openapi.contains("every instance configured with the same prefix increments"),
+        "OpenAPI redis_key_prefix must not promise shared per-connection budgets"
+    );
 
     assert!(
         plugins.contains("does not make per-connection limits portable across reconnects")
             && plugins.contains("Unknown top-level keys are rejected")
+            && plugins.contains("per-instance UUID")
             && order.contains("rather than sharing a portable connection budget across reconnects"),
         "detailed plugin docs must keep the non-portable Redis semantics that public surfaces mirror"
     );

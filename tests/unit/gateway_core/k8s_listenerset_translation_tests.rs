@@ -237,6 +237,55 @@ fn listenerset_default_not_allowed() {
 }
 
 #[test]
+fn mixed_route_rejects_disallowed_listenerset_parent_status() {
+    let objects = vec![
+        gateway_class(),
+        http_gateway("edge", None),
+        listenerset(
+            "extra",
+            "edge",
+            json!([{
+                "name": "extra-http",
+                "port": 80,
+                "protocol": "HTTP",
+                "hostname": "extra.example.com",
+                "allowedRoutes": { "namespaces": { "from": "Same" } }
+            }]),
+        ),
+        service("backend"),
+        http_route(
+            "mixed-parents",
+            json!([
+                {"kind": "Gateway", "name": "edge"},
+                {"kind": "ListenerSet", "name": "extra"}
+            ]),
+            "extra.example.com",
+            "/mixed",
+        ),
+    ];
+
+    let updates = plan_gateway_api_status_updates(&objects, options(), &[]);
+    let route = updates
+        .iter()
+        .find(|update| update.kind == "HTTPRoute" && update.name == "mixed-parents")
+        .expect("HTTPRoute status update");
+    let listenerset_parent = route.status["parents"]
+        .as_array()
+        .expect("route parents")
+        .iter()
+        .find(|parent| parent["parentRef"]["kind"] == "ListenerSet")
+        .expect("ListenerSet parent status");
+    let accepted = listenerset_parent["conditions"]
+        .as_array()
+        .expect("parent conditions")
+        .iter()
+        .find(|condition| condition["type"] == "Accepted")
+        .expect("Accepted condition");
+    assert_eq!(accepted["status"], "False");
+    assert_eq!(accepted["reason"], "NotAllowedByListeners");
+}
+
+#[test]
 fn listenerset_namespace_selector_reuses_strict_gateway_validation() {
     let mut namespace = object("Namespace", "extension-ns", json!({}));
     namespace.api_version = "v1".to_string();

@@ -3115,6 +3115,44 @@ async fn streaming_response_inspect_cuts_on_gemini_leak() {
 }
 
 #[tokio::test]
+async fn streaming_response_inspect_fails_closed_on_multiple_gemini_candidates() {
+    // Candidate 1 must not be able to consume the aggregate overlap and evict
+    // candidate 0's partial prohibited phrase before its continuation arrives.
+    // Windowed inspection cannot retain independent candidate overlap yet, so
+    // the safe behavior is to reject a multi-candidate Gemini stream.
+    let mut config = inspect_config();
+    config["on_error"] = json!("reject");
+    let plugin = plugin(&config);
+    let ctx = inspect_marked_ctx();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+    let opening = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"parts\":[",
+        "{\"text\":\"My sys\"}]}}]}\n\n",
+    );
+    assert!(matches!(
+        inspector.on_chunk(opening.as_bytes()).await,
+        ResponseStreamAction::Forward(_)
+    ));
+
+    let padding = format!("{}.", "benign ".repeat(48));
+    let padded_candidate = format!(
+        "data: {{\"candidates\":[{{\"index\":1,\"content\":{{\"parts\":[\
+         {{\"text\":{}}}]}}}}]}}\n\n",
+        serde_json::to_string(&padding).expect("serialize test padding")
+    );
+
+    assert!(
+        matches!(
+            inspector.on_chunk(padded_candidate.as_bytes()).await,
+            ResponseStreamAction::Terminate(_)
+        ),
+        "multi-candidate Gemini must fail closed before aggregate overlap can discard continuity"
+    );
+}
+
+#[tokio::test]
 async fn streaming_response_inspect_cuts_on_anthropic_leak() {
     // Windowed `inspect` mode: the leak is split across Anthropic `text_delta`
     // fragments and completes a sentence, so the window flushes, the
@@ -5765,13 +5803,7 @@ async fn excessive_embedding_dimensions_and_response_bytes_fail_closed() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn detect_mode_logs_sanitized_provider_failure_once_per_response() {
-    let writer = SharedWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .without_time()
-        .with_writer(writer.clone())
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
+    let (writer, guard) = super::plugin_utils::capture_debug_logs();
 
     let config = json!({
         "inspect": {"request": false, "response": true},
@@ -5818,14 +5850,21 @@ async fn detect_mode_logs_sanitized_provider_failure_once_per_response() {
     drop(guard);
 
     let logs = writer.contents();
+    // Count per-event DEBUG records; WARN is shared and sampled across responses.
+    let failures: Vec<_> = logs
+        .lines()
+        .filter(|line| {
+            line.contains("DEBUG")
+                && line.contains("streaming detect: embedding provider evaluation failed")
+        })
+        .collect();
     assert_eq!(
-        logs.matches("streaming detect: embedding provider evaluation failed")
-            .count(),
+        failures.len(),
         1,
         "provider failures must be bounded once per response: {logs}"
     );
-    assert!(logs.contains("enforcement=\"detect\""));
-    assert!(logs.contains("provider_error=\"embedding request failed\""));
+    assert!(failures[0].contains("enforcement=\"detect\""));
+    assert!(failures[0].contains("provider_error=\"embedding request failed\""));
     assert!(!logs.contains("/private/secret/embeddings"));
 }
 
@@ -5838,13 +5877,7 @@ async fn detect_mode_sanitizes_malformed_provider_response() {
         .mount(&server)
         .await;
 
-    let writer = SharedWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .without_time()
-        .with_writer(writer.clone())
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
+    let (writer, guard) = super::plugin_utils::capture_debug_logs();
     let config = json!({
         "inspect": {"request": false, "response": true},
         "streaming_response": "inspect",
@@ -5879,7 +5912,14 @@ async fn detect_mode_sanitizes_malformed_provider_response() {
     }
     drop(guard);
     let logs = writer.contents();
-    assert!(logs.contains("provider_error=\"embedding response parse failed\""));
+    let failure = logs
+        .lines()
+        .find(|line| {
+            line.contains("DEBUG")
+                && line.contains("streaming detect: embedding provider evaluation failed")
+        })
+        .expect("each provider failure retains its debug diagnostic");
+    assert!(failure.contains("provider_error=\"embedding response parse failed\""));
     assert!(!logs.contains("provider raw secret payload"));
 }
 
@@ -7708,6 +7748,174 @@ async fn cohere_chat_request_shapes_are_inspected() {
 }
 
 #[tokio::test]
+async fn bedrock_converse_tool_use_input_is_inspected() {
+    // The untyped Converse spelling of a tool call. It matches neither the
+    // typed `tool_use` arm nor a `content[].text` reader, and exposes no
+    // `text`/`content` member of its own, so its arguments — replayed to the
+    // model on the next turn — used to reach it uninspected.
+    assert_request_shape_inspected(
+        "converse toolUse.input",
+        json!({
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "toolUse": {
+                        "toolUseId": "tooluse_1",
+                        "name": "lookup_account",
+                        "input": {"query": PROVIDER_SHAPE_INJECTION}
+                    }
+                }]
+            }]
+        }),
+        "$.messages[0].content[0].toolUse.input",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn bedrock_converse_tool_use_input_is_attributed_as_tool_arguments() {
+    // The block rides inside an assistant message, so without a kind override
+    // it would be scored as the assistant's own prose. Attributing it
+    // `tool_arguments` matches the Anthropic `$.content[*].input` path and is
+    // what lets a tool-scoped rule reach it.
+    let plugin = plugin(&request_shape_config());
+    let mut ctx = make_post_ctx(&json!({
+        "messages": [{
+            "role": "assistant",
+            "content": [{"toolUse": {
+                "toolUseId": "tooluse_1",
+                "input": {"query": PROVIDER_SHAPE_INJECTION}
+            }}]
+        }]
+    }));
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_reject(result, Some(403));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.segment_kinds")
+            .map(String::as_str),
+        Some("tool_arguments")
+    );
+}
+
+#[tokio::test]
+async fn bedrock_converse_tool_use_scan_is_scoped_to_the_arguments() {
+    // Only `input` is model-visible: the sibling `toolUseId` / `name` fields
+    // are call plumbing, and reading them would make an operator's tool naming
+    // an inspection surface. A block carrying only those yields no segment at
+    // all, so the body is refused as uninspectable rather than scored on
+    // plumbing.
+    let mut config = request_shape_config();
+    config["on_error"] = json!("reject");
+    let plugin = plugin(&config);
+    let mut ctx = make_post_ctx(&json!({
+        "messages": [{
+            "role": "assistant",
+            "content": [{"toolUse": {
+                "toolUseId": "tooluse_1",
+                "name": PROVIDER_SHAPE_INJECTION
+            }}]
+        }]
+    }));
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_reject(result, Some(400));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.uninspectable_body")
+            .map(String::as_str),
+        Some("no_extractable_content")
+    );
+}
+
+#[tokio::test]
+async fn cohere_document_map_members_are_inspected() {
+    // A Cohere v1 document is an arbitrary string-to-string map and the
+    // provider serializes every eligible member into the prompt, so an
+    // injection in `snippet` reaches the model exactly like one in `text`
+    // while a reader that stops at `text` never sees it.
+    assert_request_shape_inspected(
+        "cohere documents[] map member",
+        json!({"documents": [{"id": "doc-1", "snippet": PROVIDER_SHAPE_INJECTION}]}),
+        "$.documents[0].snippet",
+    )
+    .await;
+    assert_request_shape_inspected(
+        "cohere documents[].text",
+        json!({"documents": [{"id": "doc-1", "text": PROVIDER_SHAPE_INJECTION}]}),
+        "$.documents[0].text",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn cohere_document_provider_hidden_members_are_not_inspected() {
+    // `id` (the citation identifier), the `_excludes` control, and every
+    // member it names stay out of the model-visible rendering, so they are not
+    // prompt text. A document carrying only those yields no segment, which is
+    // the fail-closed `no_extractable_content` route rather than a silent
+    // allow.
+    let mut config = request_shape_config();
+    config["on_error"] = json!("reject");
+    let plugin = plugin(&config);
+    let mut ctx = make_post_ctx(&json!({
+        "documents": [{
+            "id": PROVIDER_SHAPE_INJECTION,
+            "_excludes": ["internal"],
+            "internal": PROVIDER_SHAPE_INJECTION
+        }]
+    }));
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_reject(result, Some(400));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.uninspectable_body")
+            .map(String::as_str),
+        Some("no_extractable_content")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.rule_ids")
+            .map(String::as_str),
+        Some(""),
+        "a refusal for want of content must not report a rule match"
+    );
+}
+
+#[tokio::test]
+async fn cohere_document_object_member_is_not_stringified_into_a_segment() {
+    // `documents` is an ordinary word in unrelated JSON, so an object member
+    // must not be stringified into one segment and shipped to the embedding
+    // provider. It yields nothing, and the body is refused as uninspectable
+    // instead of being embedded.
+    let mut config = request_shape_config();
+    config["on_error"] = json!("reject");
+    let plugin = plugin(&config);
+    let mut ctx = make_post_ctx(&json!({
+        "documents": [{"id": "doc-1", "meta": {"tenant": "acme", "api_key": "sk-secret"}}]
+    }));
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_reject(result, Some(400));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.uninspectable_body")
+            .map(String::as_str),
+        Some("no_extractable_content")
+    );
+}
+
+#[tokio::test]
 async fn huggingface_tgi_inputs_request_is_inspected() {
     assert_request_shape_inspected(
         "tgi inputs string",
@@ -8229,4 +8437,286 @@ async fn every_review_round_extraction_path_is_configurable() {
             "response path {path} must be configurable"
         );
     }
+}
+
+/// One clean chat-completion content event: 77 wire bytes of benign prose
+/// ending on a sentence boundary.
+const GARDEN_EVENT: &[u8] =
+    b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The garden is green. \"}}]}\n\n";
+
+/// Mount an embedding mock whose vectors are orthogonal to the rule example
+/// used by the streaming regressions below: `zeta` inputs map to `[1, 0]` and
+/// anything else to `[0, 1]`, so a clean completion always scores 0.
+async fn mount_orthogonal_embedding_mock(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(|req: &Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            let inputs = body["input"].as_array().unwrap();
+            let data: Vec<Value> = inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| {
+                    let text = input.as_str().unwrap_or("").to_ascii_lowercase();
+                    let embedding = if text.contains("zeta") {
+                        vec![1.0, 0.0]
+                    } else {
+                        vec![0.0, 1.0]
+                    };
+                    json!({"index": index, "embedding": embedding})
+                })
+                .collect();
+            ResponseTemplate::new(200).set_body_json(json!({"data": data}))
+        })
+        .mount(server)
+        .await;
+}
+
+/// A clean SSE completion: `events` content deltas plus the `[DONE]` sentinel.
+fn clean_sse_body(events: usize) -> Vec<u8> {
+    let mut body = Vec::new();
+    for _ in 0..events {
+        body.extend_from_slice(GARDEN_EVENT);
+    }
+    body.extend_from_slice(b"data: [DONE]\n\n");
+    body
+}
+
+/// A response-only config with one ordinary custom rule the clean completion
+/// never matches, so any cut comes from a disposition bug and not from policy.
+fn ordinary_response_rule_config(endpoint: &str) -> Value {
+    json!({
+        "inspect": {"request": false, "response": true},
+        "on_error": "reject",
+        "provider": provider(endpoint),
+        "builtins": {},
+        "custom_rules": [{
+            "id": "ordinary-rule",
+            "examples": ["policy reference zeta"],
+            "threshold": 0.9
+        }]
+    })
+}
+
+/// Drive a windowed inspector over `body` split into `chunk_size`-byte writes
+/// (`None` = one coalesced write) and return every byte forwarded downstream,
+/// or `None` if the stream was cut.
+async fn drive_inspector(
+    plugin: &AiSemanticFirewall,
+    body: &[u8],
+    chunk_size: Option<usize>,
+) -> Option<Vec<u8>> {
+    let ctx = inspect_marked_ctx();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+    let mut forwarded = Vec::new();
+    let step = chunk_size.unwrap_or(body.len()).max(1);
+    for chunk in body.chunks(step) {
+        match inspector.on_chunk(chunk).await {
+            ResponseStreamAction::Forward(bytes) => forwarded.extend_from_slice(&bytes),
+            ResponseStreamAction::Terminate(_) => return None,
+        }
+    }
+    match inspector.on_end().await {
+        ResponseStreamAction::Forward(bytes) => forwarded.extend_from_slice(&bytes),
+        ResponseStreamAction::Terminate(_) => return None,
+    }
+    Some(forwarded)
+}
+
+#[tokio::test]
+async fn coalesced_clean_sse_events_are_inspected_and_delivered() {
+    // A clean completion whose events arrive in ONE backend write must be
+    // delivered exactly like the same events arriving separately: transport
+    // batching must not spend the aggregate window budget on LATER events and
+    // leave an ordinary small event uninspectable, which `on_error: reject`
+    // then cuts. The body deliberately exceeds `streaming.max_window_bytes`.
+    let server = MockServer::start().await;
+    mount_orthogonal_embedding_mock(&server).await;
+
+    let mut config = ordinary_response_rule_config(&format!("{}/v1/embeddings", server.uri()));
+    config["streaming_response"] = json!("inspect");
+    config["streaming"] = json!({
+        "max_window_bytes": 512,
+        "overlap_bytes": 64,
+        "max_inspections": 256
+    });
+    let plugin = plugin(&config);
+    let body = clean_sse_body(12);
+    assert!(body.len() > 512, "body must exceed the window budget");
+
+    for chunk_size in [None, Some(GARDEN_EVENT.len()), Some(37), Some(1)] {
+        let Some(forwarded) = drive_inspector(&plugin, &body, chunk_size).await else {
+            panic!("a clean stream was cut with chunk_size {chunk_size:?}");
+        };
+        assert_eq!(forwarded, body, "bytes differ for {chunk_size:?}");
+    }
+}
+
+#[tokio::test]
+async fn dry_run_stream_inspection_never_cuts_on_a_provider_error() {
+    // `dry_run` never rejects or cuts traffic. The buffered path already honors
+    // that for a provider outage; the windowed path must too, or an
+    // observational rollout truncates production responses.
+    let server = MockServer::start().await;
+    let error_body = json!({"error": {"message": "mock unavailable"}});
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(error_body))
+        .mount(&server)
+        .await;
+
+    let base = ordinary_response_rule_config(&format!("{}/v1/embeddings", server.uri()));
+    let body = clean_sse_body(2);
+
+    let mut inspect_config = base.clone();
+    inspect_config["mode"] = json!("dry_run");
+    inspect_config["streaming_response"] = json!("inspect");
+    let forwarded = drive_inspector(&plugin(&inspect_config), &body, None)
+        .await
+        .expect("dry_run must never cut a stream on a provider error");
+    assert_eq!(forwarded, body, "dry_run delivers the whole completion");
+
+    // Same response, same provider failure, buffered dry-run: already allowed.
+    let mut buffer_config = base;
+    buffer_config["mode"] = json!("dry_run");
+    buffer_config["streaming_response"] = json!("buffer");
+    let buffered = plugin(&buffer_config);
+    let mut ctx = create_test_context();
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let result = buffered
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
+        .await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn dry_run_stream_inspection_never_cuts_on_an_expired_hold() {
+    // `streaming.on_hold_timeout: cut` is a fail-closed ENFORCEMENT choice. In
+    // `dry_run` it must degrade to the fail-open release rather than cutting a
+    // clean response an observational rollout was only meant to watch.
+    let server = MockServer::start().await;
+    let slow_ok = ResponseTemplate::new(200)
+        .set_body_json(json!({"data": [{"index": 0, "embedding": [0.0, 1.0]}]}))
+        .set_delay(Duration::from_millis(400));
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(slow_ok)
+        .mount(&server)
+        .await;
+
+    let mut config = ordinary_response_rule_config(&format!("{}/v1/embeddings", server.uri()));
+    config["mode"] = json!("dry_run");
+    config["streaming_response"] = json!("inspect");
+    config["streaming"] = json!({"max_hold_ms": 30, "on_hold_timeout": "cut"});
+    let body = clean_sse_body(2);
+
+    let forwarded = drive_inspector(&plugin(&config), &body, None)
+        .await
+        .expect("dry_run must never cut a stream on an expired hold");
+    assert_eq!(forwarded, body, "an expired dry_run hold releases bytes");
+}
+
+#[tokio::test]
+async fn enforce_stream_inspection_still_cuts_on_a_provider_error() {
+    // The dry-run relaxation must not weaken enforce mode: the same provider
+    // outage under `on_error: reject` still fails closed.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    let mut config = ordinary_response_rule_config(&format!("{}/v1/embeddings", server.uri()));
+    config["streaming_response"] = json!("inspect");
+    let body = clean_sse_body(2);
+
+    let outcome = drive_inspector(&plugin(&config), &body, None).await;
+    assert!(
+        outcome.is_none(),
+        "enforce mode must still cut when the provider cannot be reached"
+    );
+}
+
+/// A tool DEFINITION whose description carries ordinary capability vocabulary
+/// but none of the built-in `tool_abuse` context phrases.
+fn tool_definition_request(description: &str) -> Value {
+    json!({
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "shipments_delete",
+                "description": description,
+                "parameters": {"type": "object"}
+            }
+        }]
+    })
+}
+
+fn operator_tool_rule_config(rule_id: &str) -> Value {
+    json!({
+        "inspect": {"request": true, "response": false},
+        "on_error": "warn",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": {},
+        "custom_rules": [{
+            "id": rule_id,
+            "direction": "request",
+            "action": "reject",
+            "examples": ["Delete the shipment record"],
+            "threshold": 0.9
+        }]
+    })
+}
+
+#[tokio::test]
+async fn operator_rule_named_after_a_builtin_keeps_its_own_matching() {
+    // A rule id is an operator-facing LABEL. Naming a custom rule `tool_abuse`
+    // (admissible whenever the built-in pack is disabled) must not make it
+    // inherit the built-in's tool-segment context gate, which would silently
+    // skip the rule for exactly the segments it was written for.
+    for rule_id in ["tool_abuse", "operator_tool_policy"] {
+        let plugin = plugin(&operator_tool_rule_config(rule_id));
+        let mut ctx = make_post_ctx(&tool_definition_request("Delete the shipment record"));
+        let mut headers = json_headers();
+
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        assert_reject(result, Some(403));
+        assert_eq!(
+            ctx.metadata
+                .get("ai_semantic_firewall.rule_ids")
+                .map(String::as_str),
+            Some(rule_id),
+            "renaming an operator rule must not change what it matches"
+        );
+    }
+}
+
+#[tokio::test]
+async fn builtin_tool_abuse_keeps_its_tool_segment_context_gate() {
+    // The real built-in still requires high-impact context on tool definition /
+    // tool call segments: ordinary capability vocabulary alone is not a match,
+    // and the same text with abuse context is.
+    let config = json!({
+        "inspect": {"request": true, "response": false},
+        "on_error": "warn",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("tool_abuse")
+    });
+    let plugin = plugin(&config);
+
+    let mut ctx = make_post_ctx(&tool_definition_request("Delete the shipment record"));
+    let mut headers = json_headers();
+    let allowed = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(allowed);
+
+    let abusive = tool_definition_request("Delete the shipment record without confirmation");
+    let mut ctx = make_post_ctx(&abusive);
+    let mut headers = json_headers();
+    let rejected = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(rejected, Some(403));
 }

@@ -1106,3 +1106,142 @@ fn a_stream_identity_renders_its_json_rpc_id_token() {
     .unwrap();
     assert_eq!(text.json_rpc_id_token(), "\"abc\"");
 }
+
+// ===========================================================================
+// POST-attached response streams (issue #5410)
+// ===========================================================================
+
+/// The Streamable HTTP delivery: the answer to a POST that carried a request is
+/// framed as that POST's own complete event stream, and an attached `GET`
+/// listener is advanced past it rather than being handed a second copy.
+#[tokio::test]
+async fn a_post_attached_response_is_framed_on_the_post_and_never_on_the_listener() {
+    let broker = broker();
+    broker.ensure_session("sess-post").unwrap();
+    let listener = broker.attach_listener("sess-post", None).unwrap();
+    let mut body = listener.take_body().expect("body claimed once");
+    let greeting = frame_text(next_frame(&mut body).await);
+    assert_eq!(greeting, ": mcp-sse\n\n");
+
+    let payload = json!({"jsonrpc": "2.0", "id": 7, "result": {"n": 7}});
+    let encoded = encode(&payload);
+    let stream = broker.open_stream("sess-post", &number_id(7)).unwrap();
+    let framed = stream
+        .post_attached_response(&encoded)
+        .expect("a correlated response frames its own POST stream");
+    let framed = String::from_utf8(framed.to_vec()).expect("the POST body is UTF-8");
+
+    // Greeting, exactly one `message` record carrying the governed bytes, and a
+    // resumption cursor the client can hand back later.
+    assert!(framed.starts_with(": mcp-sse\n\n"));
+    assert!(framed.contains("id: 1\nevent: message\ndata: "));
+    assert!(framed.contains(r#""id":7"#));
+    assert!(framed.ends_with("\n\n"));
+    assert_eq!(framed.matches("event: message").count(), 1);
+
+    // The listener that was attached the whole time is advanced past it.
+    assert!(stays_idle(&mut body).await);
+
+    // The identity is terminal, so a duplicate answer for it is refused rather
+    // than framed a second time.
+    let duplicate = broker.open_stream("sess-post", &number_id(7));
+    assert_eq!(duplicate.unwrap_err(), SseError::StreamCompleted);
+}
+
+/// A cancelled request refuses its own response, and a mismatched envelope is
+/// never framed under the requesting identity. Both terminalize exactly once.
+#[tokio::test]
+async fn post_attached_delivery_refuses_a_cancelled_or_mismatched_response() {
+    let broker = broker();
+    broker.ensure_session("sess-refuse").unwrap();
+
+    let cancelled = broker.open_stream("sess-refuse", &number_id(1)).unwrap();
+    broker.cancel_stream("sess-refuse", &number_id(1)).unwrap();
+    let payload = encode(&json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
+    assert_eq!(
+        cancelled.post_attached_response(&payload).unwrap_err(),
+        SseError::StreamCancelled
+    );
+
+    let mismatched = broker.open_stream("sess-refuse", &number_id(2)).unwrap();
+    let wrong = encode(&json!({"jsonrpc": "2.0", "id": 3, "result": {}}));
+    assert_eq!(
+        mismatched.post_attached_response(&wrong).unwrap_err(),
+        SseError::ResponseEnvelopeInvalid
+    );
+    // Capacity came back: the same identity can be opened again only because a
+    // refusal terminalized it exactly once, and the terminal record refuses it.
+    assert_eq!(
+        broker
+            .open_stream("sess-refuse", &number_id(2))
+            .unwrap_err(),
+        SseError::StreamCompleted
+    );
+
+    // A cancellation that lands while the gateway is still producing the answer
+    // outranks a payload the gateway would have refused anyway.
+    let both = broker.open_stream("sess-refuse", &number_id(4)).unwrap();
+    broker.cancel_stream("sess-refuse", &number_id(4)).unwrap();
+    assert_eq!(
+        both.post_attached_response(&wrong).unwrap_err(),
+        SseError::StreamCancelled
+    );
+}
+
+/// A POST-attached event enters the ring already delivered, so only an explicit
+/// `Last-Event-ID` replays it: a fresh listener starts past it.
+#[tokio::test]
+async fn a_post_attached_event_replays_only_for_an_explicit_cursor() {
+    let broker = broker();
+    broker.ensure_session("sess-resume").unwrap();
+
+    // Event ids come from the one per-session counter, so the two POST streams
+    // publish cursors 1 and 2.
+    for id in [1_i64, 2] {
+        let payload = encode(&json!({"jsonrpc": "2.0", "id": id, "result": {}}));
+        let stream = broker.open_stream("sess-resume", &number_id(id)).unwrap();
+        let framed = stream.post_attached_response(&payload).unwrap();
+        let framed = String::from_utf8(framed.to_vec()).expect("the POST body is UTF-8");
+        assert!(framed.contains(&format!("id: {id}\nevent: message")));
+    }
+
+    // No cursor: the listener attaches at the delivery watermark and sees
+    // nothing, because both answers already went out on their own POSTs.
+    let fresh = broker.attach_listener("sess-resume", None).unwrap();
+    let mut fresh_body = fresh.take_body().expect("body claimed once");
+    let greeting = frame_text(next_frame(&mut fresh_body).await);
+    assert_eq!(greeting, ": mcp-sse\n\n");
+    assert!(stays_idle(&mut fresh_body).await);
+    drop(fresh_body);
+
+    // An explicit cursor resumes the stream an earlier POST began.
+    let resumed = broker.attach_listener("sess-resume", Some("1")).unwrap();
+    let mut resumed_body = resumed.take_body().expect("body claimed once");
+    let seen = drain_until(&mut resumed_body, &[r#""id":2"#], 4).await;
+    assert!(seen.contains(r#""id":2"#), "resumption replays: {seen:?}");
+    assert!(!seen.contains(r#""id":1"#));
+}
+
+/// Settling for an inline JSON answer reports a cancellation the caller has to
+/// honour, and stays idempotent across the lease's other exits.
+#[tokio::test]
+async fn settling_for_an_inline_response_reports_a_cancellation() {
+    let broker = broker();
+    broker.ensure_session("sess-inline").unwrap();
+
+    let ready = open(&broker, "sess-inline", "ready");
+    assert_eq!(ready.settle_for_inline_response(), Ok(()));
+    assert_eq!(
+        ready.settle_for_inline_response().unwrap_err(),
+        SseError::StreamCompleted
+    );
+
+    let withdrawn = open(&broker, "sess-inline", "withdrawn");
+    broker
+        .cancel_stream("sess-inline", &text_id("withdrawn"))
+        .unwrap();
+    assert_eq!(
+        withdrawn.settle_for_inline_response().unwrap_err(),
+        SseError::StreamCancelled
+    );
+}

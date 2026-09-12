@@ -64,6 +64,21 @@
 //! `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` enforced by the WebSocket
 //! framer, not the bridge buffers.
 //!
+//! ## Frame masking
+//!
+//! RFC 9220 §3 adopts RFC 8441's Extended CONNECT mechanism unchanged, and
+//! RFC 8441 §5 says the peers "proceed with the WebSocket Protocol [RFC6455]
+//! using the ... stream from the CONNECT transaction as if it were the TCP
+//! connection". Neither document mentions masking, so RFC 6455 §5.1 still
+//! governs: client-to-server frames MUST be masked and a server MUST close on
+//! an unmasked one. H3 is therefore identical to H1 and H2 here — the pumps
+//! relay bytes verbatim and the shared framer in `run_websocket_proxy` unmasks
+//! compliant frames and rejects unmasked ones with close code 1002.
+//!
+//! There is no HTTP/3 masking exemption. Earlier revisions attributed one to
+//! "RFC 9220 §5" (which is IANA Considerations) and rejected masked client
+//! frames outright, breaking every standards-compliant client (issue #5011).
+//!
 //! ## Tunnel mode
 //!
 //! `FERRUM_WEBSOCKET_TUNNEL_MODE` does not apply to H3 — there is no raw
@@ -154,95 +169,6 @@ const H3_WS_DUPLEX_BUFFER_BYTES: usize = 64 * 1024;
 /// while still batching small frames.
 const H3_WS_SEND_PUMP_READ_BUFFER_BYTES: usize = 16 * 1024;
 const H3_WS_PUMP_DRAIN_GRACE: Duration = Duration::from_secs(30);
-const H3_WS_PROTOCOL_ERROR_CLOSE_CODE: u16 = 1002;
-const H3_WS_MASKED_FRAME_CLOSE_REASON: &str = "masked frame over HTTP/3";
-
-struct H3WsMaskValidator {
-    header: Vec<u8>,
-    remaining_payload: u64,
-}
-
-impl H3WsMaskValidator {
-    fn new() -> Self {
-        Self {
-            header: Vec::with_capacity(10),
-            remaining_payload: 0,
-        }
-    }
-
-    fn validate(&mut self, mut bytes: &[u8]) -> Result<(), ()> {
-        while !bytes.is_empty() {
-            if self.remaining_payload > 0 {
-                let skipped = bytes
-                    .len()
-                    .min(usize::try_from(self.remaining_payload).unwrap_or(usize::MAX));
-                self.remaining_payload -= skipped as u64;
-                bytes = &bytes[skipped..];
-                continue;
-            }
-
-            let needed = self.needed_header_bytes();
-            let take = bytes.len().min(needed);
-            self.header.extend_from_slice(&bytes[..take]);
-            bytes = &bytes[take..];
-
-            if self.header.len() >= 2 && (self.header[1] & 0x80) != 0 {
-                return Err(());
-            }
-
-            if self.header_complete() {
-                self.remaining_payload = self.payload_len();
-                self.header.clear();
-            }
-        }
-
-        Ok(())
-    }
-
-    fn needed_header_bytes(&self) -> usize {
-        let target: usize = match self.header.get(1).map(|byte| byte & 0x7f) {
-            Some(126) => 4,
-            Some(127) => 10,
-            Some(_) => 2,
-            None => 2,
-        };
-        target.saturating_sub(self.header.len())
-    }
-
-    fn header_complete(&self) -> bool {
-        self.needed_header_bytes() == 0 && self.header.len() >= 2
-    }
-
-    fn payload_len(&self) -> u64 {
-        match self.header[1] & 0x7f {
-            len @ 0..=125 => u64::from(len),
-            126 => u64::from(u16::from_be_bytes([self.header[2], self.header[3]])),
-            127 => u64::from_be_bytes([
-                self.header[2],
-                self.header[3],
-                self.header[4],
-                self.header[5],
-                self.header[6],
-                self.header[7],
-                self.header[8],
-                self.header[9],
-            ]),
-            _ => 0,
-        }
-    }
-}
-
-fn h3_ws_close_frame(code: u16, reason: &str) -> Bytes {
-    let reason_bytes = reason.as_bytes();
-    let reason_len = reason_bytes.len().min(123);
-    let payload_len = 2 + reason_len;
-    let mut frame = Vec::with_capacity(2 + payload_len);
-    frame.push(0x88);
-    frame.push(payload_len as u8);
-    frame.extend_from_slice(&code.to_be_bytes());
-    frame.extend_from_slice(&reason_bytes[..reason_len]);
-    Bytes::from(frame)
-}
 
 struct AbortOnDropJoinHandle {
     handle: Option<tokio::task::JoinHandle<()>>,
@@ -357,11 +283,8 @@ fn collect_forwardable_h3_headers(
         ":path",
         ":protocol",
         ":status",
-        // Reserved gateway assertion headers. Strip the mutable map so the
-        // authenticated principal and private GeoIP value can be re-injected
-        // below with single-value override semantics.
-        "x-consumer-username",
-        "x-consumer-custom-id",
+        // Reserved gateway assertion header. Consumer assertions are matched
+        // by prefix below; GeoIP remains an exact-name assertion.
         "x-geo-country",
     ];
 
@@ -369,7 +292,9 @@ fn collect_forwardable_h3_headers(
         .iter()
         .filter_map(|(name, value)| {
             let lower = name.to_ascii_lowercase();
-            if SKIP_HEADERS.contains(&lower.as_str()) {
+            if SKIP_HEADERS.contains(&lower.as_str())
+                || crate::proxy::headers::is_consumer_assertion_header(&lower)
+            {
                 return None;
             }
             Some((lower, value.clone()))
@@ -543,26 +468,6 @@ async fn send_h3_backend_admission_rejection<S>(
     write_h3_finalized_reject_body(stream, status, rejection.body, headers).await;
 }
 
-/// H3 WebSocket entry point for the shared HALF_OPEN probe release (issue
-/// #4792).
-///
-/// Delegates to [`crate::proxy::release_circuit_breaker_probe_on_admission_reject`]
-/// so the H1/H2/WebSocket/gRPC handler, the H3 request path, and this path
-/// cannot drift into three separately-maintained copies of one invariant.
-pub(crate) fn release_h3_ws_circuit_breaker_probe_on_admission_reject(
-    state: &ProxyState,
-    proxy: &Proxy,
-    target_key: Option<&str>,
-    is_half_open_probe: bool,
-) {
-    crate::proxy::release_circuit_breaker_probe_on_admission_reject(
-        state,
-        proxy,
-        target_key,
-        is_half_open_probe,
-    );
-}
-
 /// Status, body, and transaction-log rejection phase for an H3 WebSocket
 /// upgrade refused because its session deadline already elapsed. Mirrors the
 /// H1/H2 mapping in `handle_websocket_request_authenticated` exactly so the
@@ -615,7 +520,10 @@ pub(crate) async fn handle_h3_websocket(
     sticky_cookie_needed: bool,
     start_time: Instant,
     cb_target_key: Option<String>,
-    cb_is_half_open_probe: bool,
+    // Ownership of the HALF_OPEN circuit-breaker probe slot admitted for this
+    // upgrade, moved in from the H3 dispatcher. Dropping it releases the slot
+    // NEUTRALLY (GHSA-4cq4-3f3f-mq76).
+    mut cb_probe: crate::proxy::HalfOpenProbeGuard,
     backend_url: String,
     query_string: String,
     proxy_headers: HashMap<String, String>,
@@ -649,12 +557,7 @@ pub(crate) async fn handle_h3_websocket(
         crate::proxy::record_request(&state, 501);
         // Gateway-side reject after the caller's CB check — release a claimed
         // HALF_OPEN probe slot so the breaker doesn't wedge.
-        release_h3_ws_circuit_breaker_probe_on_admission_reject(
-            &state,
-            &proxy,
-            cb_target_key.as_deref(),
-            cb_is_half_open_probe,
-        );
+        cb_probe.release_neutral();
         return Ok(());
     }
 
@@ -701,12 +604,7 @@ pub(crate) async fn handle_h3_websocket(
         )
         .await;
         crate::proxy::record_request(&state, status.as_u16());
-        release_h3_ws_circuit_breaker_probe_on_admission_reject(
-            &state,
-            &proxy,
-            cb_target_key.as_deref(),
-            cb_is_half_open_probe,
-        );
+        cb_probe.release_neutral();
         return Ok(());
     }
 
@@ -748,12 +646,7 @@ pub(crate) async fn handle_h3_websocket(
             .await;
             // Gateway-side reject after the caller's CB check — release a
             // claimed HALF_OPEN probe slot so the breaker doesn't wedge.
-            release_h3_ws_circuit_breaker_probe_on_admission_reject(
-                &state,
-                &proxy,
-                cb_target_key.as_deref(),
-                cb_is_half_open_probe,
-            );
+            cb_probe.release_neutral();
             return Ok(());
         }
     };
@@ -792,12 +685,7 @@ pub(crate) async fn handle_h3_websocket(
                 &initial_response_header_policy_plugins,
             )
             .await;
-            release_h3_ws_circuit_breaker_probe_on_admission_reject(
-                &state,
-                &proxy,
-                cb_target_key.as_deref(),
-                cb_is_half_open_probe,
-            );
+            cb_probe.release_neutral();
             return Ok(());
         }
     };
@@ -870,7 +758,6 @@ pub(crate) async fn handle_h3_websocket(
     let mut current_cb_target_key = cb_target_key;
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet>;
     let mut backend_admission_start: Instant;
-    let mut ws_cb_probe_slot_available = cb_is_half_open_probe;
     let mut ws_attempt = 0u32;
 
     // Connection-wide idle tracker created BEFORE the backend dial so the
@@ -930,7 +817,7 @@ pub(crate) async fn handle_h3_websocket(
                 502,
                 false,
                 Some(retry::ErrorClass::DispatchPolicyRejected),
-                ws_cb_probe_slot_available,
+                cb_probe.take_slot(),
                 false,
                 start_time.elapsed(),
             );
@@ -1017,12 +904,7 @@ pub(crate) async fn handle_h3_websocket(
                 .await;
                 // Gateway-side reject after the CB check — release a claimed
                 // HALF_OPEN probe slot so the breaker doesn't wedge.
-                release_h3_ws_circuit_breaker_probe_on_admission_reject(
-                    &state,
-                    &proxy,
-                    current_cb_target_key.as_deref(),
-                    ws_cb_probe_slot_available,
-                );
+                cb_probe.release_neutral();
                 drop(ws_connection_permit);
                 return Ok(());
             }
@@ -1041,12 +923,7 @@ pub(crate) async fn handle_h3_websocket(
                 Ok(permits) => permits,
                 Err(rejection) => {
                     drop(conn_slot);
-                    release_h3_ws_circuit_breaker_probe_on_admission_reject(
-                        &state,
-                        &proxy,
-                        current_cb_target_key.as_deref(),
-                        ws_cb_probe_slot_available,
-                    );
+                    cb_probe.release_neutral();
                     send_h3_backend_admission_rejection(
                         &mut stream,
                         rejection,
@@ -1216,8 +1093,7 @@ pub(crate) async fn handle_h3_websocket(
                             current_cb_target_key.as_deref(),
                             cb_config,
                         );
-                        cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
-                        ws_cb_probe_slot_available = false;
+                        cb.record_failure(502, ws_is_pre_wire, cb_probe.take_slot());
                         cb_failure_already_recorded = true;
                     }
 
@@ -1318,8 +1194,11 @@ pub(crate) async fn handle_h3_websocket(
                             retry_cb_target_key.as_deref(),
                             cb_config,
                         ) {
-                            Ok((_cb, is_half_open_probe)) => {
-                                ws_cb_probe_slot_available = is_half_open_probe;
+                            Ok((cb, is_half_open_probe)) => {
+                                // Re-point the probe guard at the rotated target's
+                                // breaker: the prior target's slot was taken by the
+                                // intermediate failure record above.
+                                cb_probe.rearm(&cb, is_half_open_probe);
                             }
                             Err(_) => {
                                 retry_admitted_by_cb = false;
@@ -1379,9 +1258,9 @@ pub(crate) async fn handle_h3_websocket(
                         // Gateway-side egress denial dialed no backend: release any
                         // admitted HALF_OPEN probe slot NEUTRALLY so the breaker can
                         // recover, rather than leaking it by skipping the record.
-                        cb.record_neutral(ws_cb_probe_slot_available);
+                        cb.record_neutral(cb_probe.take_slot());
                     } else {
-                        cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
+                        cb.record_failure(502, ws_is_pre_wire, cb_probe.take_slot());
                     }
                 }
 
@@ -1437,7 +1316,7 @@ pub(crate) async fn handle_h3_websocket(
             current_cb_target_key.as_deref(),
             cb_config,
         );
-        cb.record_success(ws_cb_probe_slot_available);
+        cb.record_success(cb_probe.take_slot());
     }
 
     if ws_session_deadline.at <= tokio::time::Instant::now() {
@@ -1581,31 +1460,26 @@ pub(crate) async fn handle_h3_websocket(
     let (mut h3_send, mut h3_recv) = stream.split();
     let (client_io, pump_io) = tokio::io::duplex(H3_WS_DUPLEX_BUFFER_BYTES);
     let (mut pump_read, mut pump_write) = tokio::io::split(pump_io);
-    let (forced_close_tx, mut forced_close_rx) = tokio::sync::mpsc::channel::<Bytes>(1);
 
     let proxy_id_for_pumps = proxy.id.clone();
 
     // h3_recv → pump_write : client-frame bytes flow to the WS parser
+    //
+    // The bridge is byte-transparent: it never inspects WebSocket frame
+    // headers. RFC 9220 §3 adopts RFC 8441's Extended CONNECT mechanism and
+    // RFC 8441 §5 then proceeds with RFC 6455 on the stream "as if it were the
+    // TCP connection", so RFC 6455 §5.1 masking applies to H3 client frames
+    // exactly as it does on H1/H2. Enforcement therefore belongs to the one
+    // shared tungstenite framer inside `run_websocket_proxy`, which unmasks
+    // compliant frames and rejects unmasked ones with the same 1002 close every
+    // frontend emits.
     let recv_pump = AbortOnDropJoinHandle::new(tokio::spawn(async move {
-        let mut mask_validator = H3WsMaskValidator::new();
         loop {
             match h3_recv.recv_data().await {
                 Ok(Some(chunk)) => {
                     let bytes = buf_into_bytes(chunk);
                     if bytes.is_empty() {
                         continue;
-                    }
-                    if mask_validator.validate(&bytes).is_err() {
-                        warn!(
-                            proxy_id = %proxy_id_for_pumps,
-                            close_code = H3_WS_PROTOCOL_ERROR_CLOSE_CODE,
-                            "H3 WS recv pump: rejecting masked client frame"
-                        );
-                        let _ = forced_close_tx.try_send(h3_ws_close_frame(
-                            H3_WS_PROTOCOL_ERROR_CLOSE_CODE,
-                            H3_WS_MASKED_FRAME_CLOSE_REASON,
-                        ));
-                        break;
                     }
                     if let Err(e) = pump_write.write_all(&bytes).await {
                         debug!(
@@ -1642,41 +1516,21 @@ pub(crate) async fn handle_h3_websocket(
     // pump_read → h3_send : WS framer's encoded bytes flow back over QUIC
     let send_pump = AbortOnDropJoinHandle::new(tokio::spawn(async move {
         let mut buf = vec![0u8; H3_WS_SEND_PUMP_READ_BUFFER_BYTES];
-        let mut forced_close_open = true;
         loop {
-            let n = tokio::select! {
-                biased;
-                forced_close = forced_close_rx.recv(), if forced_close_open => {
-                    match forced_close {
-                        Some(close_frame) => {
-                            if let Err(e) = h3_send.send_data(close_frame).await {
-                                debug!(
-                                    proxy_id = %proxy_id_for_send_pump,
-                                    "H3 WS send pump: h3 forced close send_data error: {}",
-                                    e
-                                );
-                            }
-                            break;
-                        }
-                        None => {
-                            forced_close_open = false;
-                            continue;
-                        }
-                    }
-                }
-                read_result = pump_read.read(&mut buf) => {
-                    match read_result {
-                        Ok(0) => break, // EOF — WS framer dropped its sink half
-                        Ok(n) => n,
-                        Err(e) => {
-                            debug!(
-                                proxy_id = %proxy_id_for_send_pump,
-                                "H3 WS send pump: duplex read error: {}",
-                                e
-                            );
-                            break;
-                        }
-                    }
+            // Every server-bound close — including the 1002 a client protocol
+            // violation earns — is encoded by the shared relay's framer and
+            // arrives here as ordinary duplex bytes, so the pump needs no
+            // out-of-band close channel of its own.
+            let n = match pump_read.read(&mut buf).await {
+                Ok(0) => break, // EOF — WS framer dropped its sink half
+                Ok(n) => n,
+                Err(e) => {
+                    debug!(
+                        proxy_id = %proxy_id_for_send_pump,
+                        "H3 WS send pump: duplex read error: {}",
+                        e
+                    );
+                    break;
                 }
             };
             let chunk = Bytes::copy_from_slice(&buf[..n]);
@@ -1760,10 +1614,6 @@ pub(crate) async fn handle_h3_websocket(
                 ws_write_buf,
                 false, // H3 always frame-parses; tunnel mode is H1-only
                 crate::proxy::WS_DRAIN_GRACE,
-                // RFC 9220 §5: WebSocket frames over HTTP/3 are NOT masked. The H3
-                // receive pump rejects masked client frames with close code 1002 before
-                // tungstenite's permissive accept-unmasked mode can normalize them.
-                true,
                 ws_idle_tracker,
                 ws_session_deadline,
                 ws_shutdown_rx.clone(),
@@ -1790,7 +1640,6 @@ pub(crate) async fn handle_h3_websocket(
                 ws_write_buf,
                 false,
                 crate::proxy::WS_DRAIN_GRACE,
-                true,
                 ws_idle_tracker,
                 ws_session_deadline,
                 ws_shutdown_rx.clone(),
@@ -2315,6 +2164,7 @@ mod tests {
         let headers = make_headers(&[
             ("X-Consumer-Username", "spoofed-or-injected"),
             ("X-Consumer-Custom-Id", "spoofed-or-injected-id"),
+            ("X-Consumer-Role", "admin"),
             ("X-Geo-Country", "ATTACKER"),
             ("x-trace-id", "keepme"),
         ]);
@@ -2326,6 +2176,10 @@ mod tests {
         assert!(
             !has_key(&out, "x-consumer-custom-id"),
             "reserved x-consumer-custom-id must be stripped from the forwarded map"
+        );
+        assert!(
+            !has_key(&out, "x-consumer-role"),
+            "the complete consumer assertion namespace must be stripped"
         );
         assert!(
             !has_key(&out, "x-geo-country"),

@@ -142,6 +142,24 @@ fn single_gzip_coding_is_decoded_for_a_claiming_policy() {
 }
 
 #[test]
+fn concatenated_gzip_members_are_rejected_for_a_claiming_policy() {
+    let plugins = vec![approving_body_validator()];
+    let ctx = ctx_with_json_post();
+    let mut encoded = gzip(br#"{"approved":true}"#);
+    // Even a second member that adds no plaintext is outside the single-member
+    // contract, so rejection cannot depend on the decoded document's contents.
+    encoded.extend_from_slice(&gzip(b""));
+
+    let outcome =
+        evaluate_final_request_representation(&plugins, &ctx, &headers(Some("gzip")), &encoded);
+
+    assert_eq!(
+        outcome,
+        FinalRequestRepresentationOutcome::Rejected("undecodable_content_coding")
+    );
+}
+
+#[test]
 fn single_brotli_coding_is_decoded_for_a_claiming_policy() {
     let plugins = vec![approving_body_validator()];
     let ctx = ctx_with_json_post();

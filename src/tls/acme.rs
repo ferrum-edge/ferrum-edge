@@ -846,7 +846,8 @@ fn acme_store_path(dir: impl Into<PathBuf>, file_name: &str) -> Result<PathBuf, 
             "store directory must not be empty".to_string(),
         ));
     }
-    std::fs::create_dir_all(&dir).map_err(|error| AcmeError::Write(error.to_string()))?;
+    crate::tls::store_dir::create_private_store_dir(&dir)
+        .map_err(|error| AcmeError::Write(error.to_string()))?;
     Ok(dir.join(file_name))
 }
 

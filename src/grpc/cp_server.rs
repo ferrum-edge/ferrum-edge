@@ -2162,6 +2162,20 @@ impl ConfigSync for CpGrpcServer {
         let allowed = &identity.allowed_namespaces;
 
         let inner = request.into_inner();
+        // Match MeshSubscribe: only the authenticated subject may claim this
+        // registry key. Reject before allocating any subscription state.
+        if inner.node_id.trim() != identity.subject {
+            Self::audit_tenant_subscription(
+                "ConfigSync.Subscribe",
+                &identity.subject,
+                &inner.namespace,
+                "failure",
+                "node_id does not match authenticated subject",
+            );
+            return Err(Status::permission_denied(
+                "Subscribe node_id must match the authenticated JWT subject",
+            ));
+        }
         let node_id = inner.node_id;
         let dp_version = inner.ferrum_version;
         let dp_namespace = inner.namespace;

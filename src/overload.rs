@@ -1051,14 +1051,32 @@ pub struct FdCountSample {
 ///   1.0 and latch the gateway into permanent rejection — the very outage this
 ///   timeout exists to prevent.
 ///
-/// Dropping the timed-out `JoinHandle` detaches the blocking task rather than
-/// cancelling it; it finishes on its own and its result is discarded, so a slow
-/// `/proc` walk cannot accumulate duplicate work beyond one in-flight call.
-pub async fn sample_open_fd_count<F>(budget: Duration, previous: u64, count: F) -> FdCountSample
+/// The in-flight handle is retained after a timeout. Subsequent calls poll that
+/// same task instead of adding more work to Tokio's unbounded blocking queue.
+pub async fn sample_open_fd_count<F>(
+    in_flight: &mut Option<tokio::task::JoinHandle<u64>>,
+    budget: Duration,
+    previous: u64,
+    count: F,
+) -> FdCountSample
 where
     F: FnOnce() -> u64 + Send + 'static,
 {
-    match tokio::time::timeout(budget, tokio::task::spawn_blocking(count)).await {
+    if in_flight.is_none() {
+        *in_flight = Some(tokio::task::spawn_blocking(count));
+    }
+
+    let outcome = match in_flight.as_mut() {
+        Some(task) => tokio::time::timeout(budget, task).await,
+        None => {
+            return FdCountSample {
+                current: previous,
+                timed_out: true,
+            };
+        }
+    };
+
+    let sample = match outcome {
         Ok(Ok(current)) => FdCountSample {
             current,
             timed_out: false,
@@ -1071,7 +1089,11 @@ where
             current: previous,
             timed_out: true,
         },
+    };
+    if !sample.timed_out {
+        *in_flight = None;
     }
+    sample
 }
 
 // ── Background monitor task ─────────────────────────────────────────────
@@ -1103,6 +1125,9 @@ pub fn start_monitor(
         // persistently saturated blocking pool logs at a bounded rate instead
         // of once per tick (issue #4786).
         let mut fd_count_timeout_warn_tick: Option<u64> = None;
+        // Retain a timed-out blocking task so each tick polls the same sample
+        // rather than submitting unbounded duplicate work to the blocking pool.
+        let mut fd_count_in_flight = None;
 
         // Store limits (max_connections / max_requests don't change during
         // runtime; fd_max is updated each refresh below).
@@ -1178,8 +1203,13 @@ pub fn start_monitor(
             // lifetime) cannot park the monitor and freeze every shedding
             // flag at its last computed value.
             let previous_fd_current = state.fd_current.load(Ordering::Relaxed);
-            let fd_sample =
-                sample_open_fd_count(interval, previous_fd_current, count_open_fds).await;
+            let fd_sample = sample_open_fd_count(
+                &mut fd_count_in_flight,
+                interval,
+                previous_fd_current,
+                count_open_fds,
+            )
+            .await;
             if fd_sample.timed_out
                 && fd_count_timeout_warn_should_fire(tick, fd_count_timeout_warn_tick)
             {

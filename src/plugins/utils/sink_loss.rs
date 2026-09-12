@@ -61,8 +61,9 @@ pub enum SinkLossReason {
     /// The bounded in-memory queue was full and no overflow handoff accepted
     /// ownership of the record.
     QueueFull,
-    /// A whole batch was discarded after its retry budget was exhausted with
-    /// no durable fallback to hand it to.
+    /// A whole batch was discarded after its retry budget was exhausted, or a
+    /// non-retryable HTTP 4xx permanently rejected it, with no durable fallback
+    /// to hand it to.
     BatchDiscard,
     /// The flush worker was closed or not yet started, so the record could not
     /// be admitted.

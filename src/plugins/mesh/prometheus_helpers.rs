@@ -843,14 +843,12 @@ pub fn increment_mesh_config_update_rejection(consumer: &'static str, reason: &'
         .fetch_add(1, Ordering::Relaxed);
 }
 
-/// Count a mesh slice the DP freshness gate quarantined before replacing live
-/// state (issue #2473): an older revision from the accepted authority, a
-/// revision from a foreign ordering domain, or a slice carrying no usable
-/// revision at all while a revisioned one is accepted.
+/// Count a mesh freshness admission or apply-token rejection. A missing apply
+/// token refuses commit publication while retaining the last committed state.
 ///
 /// `reason` is a compile-time constant
-/// (`MeshRevisionRejectReason::as_metric_label`), so the series' cardinality is
-/// fixed and no control-plane-supplied authority string or sequence number can
+/// (`MeshRevisionRejectReason::as_metric_label` or `missing_apply_token`), so
+/// cardinality is fixed and no control-plane-supplied authority or sequence can
 /// reach `/metrics`. Local-slice detail rides the JWT-authenticated
 /// `GET /mesh/config-drift` `revision` block; local and remote-discovery gates
 /// both emit sanitized, bounded structured warnings instead of dynamic labels.
@@ -1329,7 +1327,7 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
 
     if !MESH_CONFIG_REVISION_REJECTIONS.is_empty() {
         output.push_str(
-            "# HELP ferrum_mesh_config_revision_rejections_total Mesh slices quarantined by the config-revision freshness gate before replacing live state, by reason.\n",
+            "# HELP ferrum_mesh_config_revision_rejections_total Mesh config revision admission or apply-token rejections, by reason.\n",
         );
         output.push_str("# TYPE ferrum_mesh_config_revision_rejections_total counter\n");
         for entry in MESH_CONFIG_REVISION_REJECTIONS.iter() {

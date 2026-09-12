@@ -51,7 +51,7 @@ export FERRUM_FRONTEND_TLS_CERT_SOURCE="file:///etc/ferrum/certs/frontend.crt"
 export FERRUM_FRONTEND_TLS_KEY_SOURCE="pkcs11://edge-rsa?pin_env=FERRUM_PKCS11_PIN"
 ```
 
-Use `?module=/path/to/pkcs11.so` or `?module_env=FERRUM_PKCS11_MODULE_PATH` to override the default module path per source, `?slot=` to pin a slot id, `?label=` to override the URI path selector, and `?id_hex=` to refine selection by key id. PKCS#11 support is currently RSA-only and available for frontend/Admin API server TLS keys plus backend mTLS client keys. See [pkcs11_tls.md](pkcs11_tls.md) for HSM deployment notes and the token-backed smoke test.
+Set `FERRUM_PKCS11_MODULE_ALLOWED_PATHS` to a comma-separated list of absolute existing module files or directories before using any URI module override. Unset permits only the operator default `FERRUM_PKCS11_MODULE_PATH` with all module options omitted. Admission and runtime loading enforce canonical paths, including the DP’s own policy for CP-distributed references. Use `?module=/path/to/pkcs11.so` or `?module_env=FERRUM_PKCS11_MODULE_PATH` to override the default module path per source, `?slot=` to pin a slot id, `?label=` to override the URI path selector, and `?id_hex=` to refine selection by key id. PKCS#11 support is currently RSA-only and available for frontend/Admin API server TLS keys plus backend mTLS client keys. See [pkcs11_tls.md](pkcs11_tls.md) for HSM deployment notes and the token-backed smoke test.
 
 ### Handshake Timeout
 
@@ -381,7 +381,7 @@ export FERRUM_ADMIN_TLS_NO_VERIFY="true"
 ### No-Verify Mode (Testing Only)
 
 #### **Purpose**
-The no-verify mode is designed for development, testing, and isolated environments where certificate verification is not practical. Outside production it remains an explicit opt-in that logs a loud warning. Under `FERRUM_MESH_PRODUCTION_MODE=true`, both `FERRUM_TLS_NO_VERIFY` and `FERRUM_ADMIN_TLS_NO_VERIFY` are **refused** by the shared `EnvConfig` validation path used by `ferrum-edge validate` and runtime startup (every mesh topology). FIPS enforce independently refuses them as well.
+The no-verify mode is designed for development, testing, and isolated environments where certificate verification is not practical. `FERRUM_TLS_NO_VERIFY` disables verification of backend server certificates; `FERRUM_ADMIN_TLS_NO_VERIFY` makes the admin HTTPS listener neither require nor verify client certificates, and cannot be combined with `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`. Outside production each remains an explicit opt-in that logs a loud warning. Under `FERRUM_MESH_PRODUCTION_MODE=true`, both `FERRUM_TLS_NO_VERIFY` and `FERRUM_ADMIN_TLS_NO_VERIFY` are **refused** by the shared `EnvConfig` validation path used by `ferrum-edge validate` and runtime startup (every mesh topology). FIPS enforce independently refuses them as well.
 
 #### **Risks**
 - **Security Risk**: Disables ALL certificate verification
@@ -1186,6 +1186,14 @@ continuously. Issue #3816 tracks that gap.
 - **Boundaries are inclusive.** `notBefore` and `notAfter` themselves are inside
   the window, matching RFC 5280 "valid at" semantics. One second past `notAfter`
   is outside it.
+- **A far-future expiry is not an unusable time.** A leaf carrying RFC 5280's
+  "no well-defined expiration" value `99991231235959Z`, or any `notAfter`
+  further out than the host's monotonic clock can represent, is a valid
+  certificate and authenticates. It simply carries no credential deadline of its
+  own, and the finite `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` bounds
+  the admitted stream instead. Where that boundary sits is platform dependent —
+  a nanosecond-based `Instant` saturates centuries before a `timespec`-based one
+  — so this can never be allowed to decide whether a credential is valid.
 - **The connection cache stays, but never caches a time-dependent decision.**
   HTTP/3 memoizes the expensive X.509 parse, path verification, and identity
   extraction once per plugin instance and transport connection. What is cached
@@ -1202,6 +1210,19 @@ continuously. Issue #3816 tracks that gap.
   `notAfter`, the observed time, the subject, the SAN, the serial, the
   fingerprint, and the DER are never echoed to the client and never logged or
   exported as a metric label.
+- **The accepted issuer path bounds the decision too.** A pinned CA and the
+  presented issuing CAs are themselves valid only for a finite time, and the
+  connection cache retains the accepted `allowed_issuers` /
+  `allowed_ca_fingerprints_sha256` decision. The **earliest `notAfter` on the
+  path that actually satisfied the constraint** is therefore composed into the
+  retained window, so an issuer expiring before the leaf ends the authorization
+  at its own expiry. Within one path every certificate must still be valid
+  (earliest wins); across alternatives — several filters, or several verified
+  paths through cross-signed intermediates — the longest-lived matching path
+  wins, since refusing it would shorten an authorization the configuration
+  allows. With both constraint kinds configured, both must pass and the earlier
+  of their two bounds applies. An issuing CA already outside its own validity
+  window contributes no verified path, and the certificate is refused.
 
 A successful `mtls_auth` verification also publishes the leaf's `notAfter` as
 the request's authoritative **credential deadline** on the shared,
@@ -1231,8 +1252,9 @@ conversion back to a userspace rustls session.
 
 Eligibility is therefore decided **before the frontend handshake starts**, while
 the socket is still pristine. A TLS-terminating TCP listener whose plugin chain
-can admit an authenticated stream principal — today that means `mtls_auth` —
-does not take the kTLS handoff at all. Such a connection stays on the ordinary
+can admit an authenticated stream principal — today `mtls_auth` and
+`spiffe_identity`, which admits a certificate-derived SPIFFE principal with the
+leaf's `notAfter` as its deadline — does not take the kTLS handoff at all. Such a connection stays on the ordinary
 buffered rustls path, is relayed normally, and is bounded by the certificate
 deadline exactly as described above. Nothing is refused and no authentication is
 skipped; only the optional fast path is declined.

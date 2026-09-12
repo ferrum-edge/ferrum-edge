@@ -2526,7 +2526,7 @@ fn retry_loop_settles_health_neutral_intermediate_attempts_neutrally() {
 
     assert!(
         loop_body.contains("client_side_no_backend_signal(result.error_class)")
-            && loop_body.contains("cb.record_neutral(cb_retry_probe_slot_available)"),
+            && loop_body.contains("cb.record_neutral(retry_probe_slot)"),
         "an intermediate attempt whose class carries no backend signal must \
          settle the breaker neutrally rather than as a failure"
     );

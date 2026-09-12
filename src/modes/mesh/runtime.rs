@@ -591,7 +591,7 @@ impl MeshRuntimeState {
     /// installer share exactly one ordering decision.
     ///
     /// Admission is PROVISIONAL: it only makes the candidate the received
-    /// slice. The watermark is finalized by [`Self::record_applied_slice`] when
+    /// slice. The watermark is finalized by [`Self::record_applied_slice_with_token`] when
     /// the proxy runtime accepts it, or returned to the last applied generation
     /// by [`Self::record_rejected_slice`] when the runtime refuses it.
     ///
@@ -625,39 +625,36 @@ impl MeshRuntimeState {
         MeshSliceInstall::Installed
     }
 
-    /// Publish a slice after the mesh proxy runtime accepts it.
-    ///
-    /// This is the COMMIT half of the config-revision lifecycle (issue #2473):
-    /// the freshness gate's authoritative last-good watermark advances here,
-    /// when the generation actually became live, not when it was received.
-    /// Committing first means any observer woken by the applied-slice watcher
-    /// already sees a watermark consistent with the slice it is about to read.
-    pub fn record_applied_slice(&self, slice: &MeshSlice) {
-        let token = self.begin_revision_apply(slice);
-        self.record_applied_slice_with_token(slice, token);
-    }
-
     /// Capture the config-revision apply capability before asynchronous proxy
     /// preparation begins. A concurrent operator reset invalidates the token,
     /// so completion of pre-reset work cannot restore the cleared watermark.
-    pub(crate) fn begin_revision_apply(&self, slice: &MeshSlice) -> Option<MeshRevisionApplyToken> {
+    pub fn begin_revision_apply(&self, slice: &MeshSlice) -> Option<MeshRevisionApplyToken> {
         self.revision_gate
             .begin_apply(slice.revision.as_ref(), slice_content_identity(slice))
     }
 
     /// Commit a runtime-accepted slice with the capability captured before its
     /// asynchronous apply began.
-    pub(crate) fn record_applied_slice_with_token(
+    ///
+    /// A missing token refuses publication and preserves the last committed
+    /// snapshot and watermark. Callers must obtain a token before preparing or
+    /// publishing a generation. An explicit reset may invalidate a token that
+    /// was captured correctly; its cleared watermarks remain cleared while the
+    /// snapshot still reflects the proxy's completed apply.
+    pub fn record_applied_slice_with_token(
         &self,
         slice: &MeshSlice,
         token: Option<MeshRevisionApplyToken>,
-    ) {
-        if let Some(token) = token {
-            let content = slice_content_identity(slice);
-            let _ = self
-                .revision_gate
-                .commit_applied(slice.revision.as_ref(), content, token);
-        }
+    ) -> bool {
+        let Some(token) = token else {
+            self.revision_gate
+                .reject_missing_apply_token(slice.revision.as_ref());
+            return false;
+        };
+        let content = slice_content_identity(slice);
+        let _ = self
+            .revision_gate
+            .commit_applied(slice.revision.as_ref(), content, token);
         // GAP-3E: refresh RTDS-driven consumers only after proxy config
         // acceptance. Rejected slices must not mutate live log/transformer
         // state while the proxy keeps serving the previous accepted config.
@@ -676,6 +673,7 @@ impl MeshRuntimeState {
         // single commit point every runtime-acceptance path funnels through —
         // means no future apply stage can forget to report success.
         self.publish_runtime_verdict(&slice.version, MeshSliceRuntimeOutcome::Applied);
+        true
     }
 
     /// Publish the proxy runtime's verdict on `version` for the configuration
@@ -804,7 +802,7 @@ impl MeshRuntimeState {
 ///
 /// Passing is not applying. It records only that this stage did not refuse the
 /// candidate; the stage that actually installs the generation still commits
-/// through [`MeshRuntimeState::record_applied_slice`].
+/// through [`MeshRuntimeState::record_applied_slice_with_token`].
 #[must_use = "an unresolved evaluation rolls the config-revision watermark back on drop"]
 pub struct MeshSliceEvaluation {
     state: MeshRuntimeState,
@@ -1063,7 +1061,9 @@ mod tests {
             version: "accepted".to_string(),
             ..MeshSlice::default()
         };
-        state.record_applied_slice(&accepted);
+        assert!(state.install_slice(accepted.clone()).installed());
+        let token = state.begin_revision_apply(&accepted);
+        state.record_applied_slice_with_token(&accepted, token);
 
         assert_eq!(
             state

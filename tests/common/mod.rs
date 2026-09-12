@@ -66,6 +66,7 @@ pub mod isolated_audit_fallback;
 pub mod protocol_managed_response_headers;
 pub mod scheduled_scaling;
 pub mod trusted_projected_gateway;
+pub mod workload_api_socket_paths;
 
 pub use backend_availability::{
     IsolatedSqlDatabase, continue_if_backend_available, continue_if_tls_fixture_available,
@@ -83,8 +84,8 @@ pub use echo_servers::{
     spawn_udp_echo,
 };
 pub use gateway_harness::{
-    DbType, GatewayMode, GatewaySpawnFailure, SpawnedGatewayIdentity, TestGateway,
-    TestGatewayBuilder, captured_output_reports_listener_addr_in_use,
+    DbType, GatewayChildGuard, GatewayMode, GatewaySpawnFailure, SpawnedGatewayIdentity,
+    TestGateway, TestGatewayBuilder, captured_output_reports_listener_addr_in_use,
     configure_coverage_gateway_command, ensure_gateway_built, ephemeral_port, explicit_test_binary,
     probe_gateway_identity, scrub_gateway_capture_for_diagnostics, shutdown_gateway_child,
     wait_for_owned_gateway_identity,

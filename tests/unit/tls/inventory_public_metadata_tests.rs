@@ -2,9 +2,9 @@
 //!
 //! `TlsInventory::collect_public_metadata` is what the cached snapshot behind the
 //! `/metrics` certificate gauges is built from. It must load public
-//! certificate-family material only, and must never materialize a private key,
-//! JWKS document, or OCSP response — those are loaded by the full operator
-//! inventory alone.
+//! certificate and revocation material only, and must never materialize a
+//! private key or JWKS document. OCSP responses are parsed for their public
+//! `nextUpdate` metadata so the revocation-expiry metric can cover staples.
 
 use ferrum_edge::config::env_config::EnvConfig;
 use ferrum_edge::config::types::GatewayConfig;
@@ -39,14 +39,14 @@ fn env_with_missing_sources() -> EnvConfig {
 }
 
 #[test]
-fn public_metadata_scope_never_reads_private_key_jwks_or_ocsp_sources() {
+fn public_metadata_scope_never_reads_private_key_or_jwks_sources() {
     let env = env_with_missing_sources();
 
     let public = TlsInventory::collect_public_metadata(Some(&env), None);
 
-    // Unreadable key/OCSP sources stay `loaded` because the scope never touched
-    // them: an unreachable path cannot be observed without reading it. Their
-    // health is owned by startup/reload validation instead.
+    // An unreadable key stays `loaded` because the scope never touched it: an
+    // unreachable path cannot be observed without reading it. Its health is
+    // owned by startup/reload validation instead.
     let key = entry_of_kind(&public, "private_key");
     assert_eq!(
         key.state,
@@ -60,8 +60,8 @@ fn public_metadata_scope_never_reads_private_key_jwks_or_ocsp_sources() {
     let ocsp = entry_of_kind(&public, "ocsp");
     assert_eq!(
         ocsp.state,
-        TlsInventoryState::Loaded,
-        "OCSP source must not be read by the metrics scope: {:?}",
+        TlsInventoryState::Unavailable,
+        "OCSP source must be read for revocation-expiry metrics: {:?}",
         ocsp.error
     );
 
@@ -73,6 +73,27 @@ fn public_metadata_scope_never_reads_private_key_jwks_or_ocsp_sources() {
         TlsInventoryState::Unavailable,
         "missing certificate source must be reported as unavailable"
     );
+}
+
+#[test]
+fn public_metadata_scope_populates_ocsp_expiry_metadata() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let ocsp_path = dir.path().join("staple.der");
+    std::fs::write(&ocsp_path, super::signed_ocsp_response_fixture()).expect("write OCSP fixture");
+    let env = EnvConfig {
+        frontend_tls_ocsp_response_source: Some(ocsp_path.to_string_lossy().into_owned()),
+        ..EnvConfig::default()
+    };
+
+    let public = TlsInventory::collect_public_metadata(Some(&env), None);
+    let ocsp = entry_of_kind(&public, "ocsp");
+
+    assert_eq!(ocsp.state, TlsInventoryState::Loaded);
+    assert!(
+        ocsp.next_update.is_some(),
+        "OCSP revocation metrics require next_update"
+    );
+    assert!(ocsp.days_until_next_update.is_some());
 }
 
 #[test]

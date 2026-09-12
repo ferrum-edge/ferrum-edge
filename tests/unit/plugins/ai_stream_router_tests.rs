@@ -14,6 +14,7 @@ use ferrum_edge::plugins::request_mirror::RequestMirror;
 use ferrum_edge::plugins::request_transformer::RequestTransformer;
 use ferrum_edge::plugins::response_caching::ResponseCaching;
 use ferrum_edge::plugins::serverless_function::ServerlessFunction;
+use ferrum_edge::plugins::utils::ai_model_glob::matches_model_glob;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
     ResponseStreamAction, ResponseStreamInspector, ResponseStreamInspectorStage,
@@ -8612,8 +8613,8 @@ async fn test_gemini_usage_metadata_fail_closed_and_valid_shapes() {
     );
 
     // Present malformed recognized count fields fail closed with field-specific
-    // diagnostics (including totalTokenCount, which is validated even when the
-    // normalizer publishes checked prompt+completion totals).
+    // diagnostics, including totalTokenCount — which the normalizer republishes
+    // as the authoritative total rather than recomputing it away.
     for (body, field) in [
         (
             "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":-1,\"candidatesTokenCount\":1,\"totalTokenCount\":0}}\n\n",
@@ -9284,13 +9285,23 @@ async fn test_gemini_finish_reasons_and_prompt_feedback_matrix() {
 
 #[tokio::test]
 async fn test_gemini_hostile_framing_identity_and_parts_fail_closed() {
-    // Unrecognized framing first byte.
-    let out = run_gemini_normalizer(4096, "not-sse-or-json", "application/json").await;
+    // Binary bytes are not a text/event-stream document at all, so they remain
+    // the unrecognized-framing case.
+    let binary = "\x01\x02not-sse-or-json";
+    let out = run_gemini_normalizer(4096, binary, "application/json").await;
     assert!(out.contains("upstream_error"), "{out}");
     assert!(
         out.contains("unrecognized Gemini/Vertex stream framing"),
         "{out}"
     );
+
+    // Printable garbage IS a legal SSE preamble as far as the grammar goes
+    // (issue #5299), so it is admitted as SSE and then fails closed at EOF
+    // without a single provider byte reaching the client.
+    let text = run_gemini_normalizer(4096, "not-sse-or-json", "application/json").await;
+    assert!(text.contains("upstream_error"), "{text}");
+    assert!(!text.contains("not-sse-or-json"), "{text}");
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
 
     // Empty JSON array is a complete no-candidate stream → premature EOF.
     let empty_arr = run_gemini_normalizer(4096, "[]", "application/json").await;
@@ -9519,4 +9530,557 @@ async fn test_gemini_gzip_brotli_and_buffered_normalization() {
         assert!(out.contains("\"content\":\"Array\""), "{out}");
         assert!(out.contains("\"finish_reason\":\"stop\""), "{out}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Anchored glob matching (issues #5297 / #5392)
+//
+// The matcher used to consume the FIRST occurrence of each literal segment and
+// then demand that the cursor had already reached the end of the input, so a
+// suffix that also occurs earlier rejected an ordinary model name: with no
+// other provider the request became a 404, and with a catch-all fallback it was
+// routed to a different provider entirely.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_glob_suffix_that_also_occurs_earlier_still_matches() {
+    for (pattern, model, expected) in [
+        ("*foo", "foo", true),
+        ("*foo", "foofoo", true),
+        ("*foo", "foobar", false),
+        ("*mini", "mini", true),
+        ("*mini", "model-mini", true),
+        ("*mini", "mini-mini", true),
+        ("*mini", "mini-pro", false),
+        ("*mini", "minim", false),
+    ] {
+        assert_eq!(
+            matches_model_glob(pattern, model),
+            expected,
+            "pattern {pattern:?} against model {model:?}"
+        );
+    }
+}
+
+#[test]
+fn test_glob_anchors_and_interior_literals_backtrack() {
+    for (pattern, model, expected) in [
+        ("gpt-*-mini", "gpt-4o-mini-mini", true),
+        ("gpt-*-mini", "gpt-4o-mini-x", false),
+        ("*claude*sonnet", "claude-3-sonnet-sonnet", true),
+        ("*claude*sonnet", "claude-3-sonnet-x", false),
+        // Patterns without a floating literal keep their existing meaning.
+        ("gpt-4o", "gpt-4o", true),
+        ("gpt-4o", "gpt-4o-mini", false),
+        ("gpt-*", "gpt-4o", true),
+        ("gpt-*", "claude-3", false),
+        ("*", "anything-at-all", true),
+    ] {
+        assert_eq!(
+            matches_model_glob(pattern, model),
+            expected,
+            "pattern {pattern:?} against model {model:?}"
+        );
+    }
+}
+
+#[test]
+fn test_glob_repair_still_refuses_url_separators_in_a_wildcard_window() {
+    // The repair must not weaken the security tightening: a `*` window still
+    // cannot consume a URL-structural separator, however the literals align.
+    for (pattern, model) in [
+        ("*foo", "bar/foo"),
+        ("*claude*sonnet", "claude/x-sonnet"),
+        ("gemini-*", "gemini-../foo:streamGenerate"),
+        ("*", "has space"),
+        ("*", "has\nnewline"),
+        ("*", "has?query"),
+        ("*", "has#fragment"),
+    ] {
+        assert!(
+            !matches_model_glob(pattern, model),
+            "pattern {pattern:?} must refuse model {model:?}"
+        );
+    }
+}
+
+/// The routing consequence of the matcher repair: a model that repeats its
+/// pattern's suffix must select the configured provider instead of failing
+/// closed as unmatched.
+#[tokio::test]
+async fn test_model_repeating_its_pattern_suffix_selects_the_configured_provider() {
+    let plugin = build(json!({
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "endpoint": "https://api.openai.com/v1/chat/completions",
+            "api_key": "sk-test",
+            "model_patterns": ["*foo"]
+        }]
+    }));
+
+    for model in ["foo", "foofoo"] {
+        let body = json!({"model": model, "stream": true, "messages": []});
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        let res = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(matches!(res, PluginResult::Continue), "model {model}");
+        assert_eq!(
+            ctx.metadata
+                .get("ai_stream_router.provider")
+                .map(String::as_str),
+            Some("openai"),
+            "model {model} must select the configured provider"
+        );
+    }
+
+    let body = json!({"model": "foobar", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    let res = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(reject_status(&res), Some(404));
+}
+
+// ---------------------------------------------------------------------------
+// Provider admission (issues #5300, #5301, #5302)
+// ---------------------------------------------------------------------------
+
+fn anthropic_provider(overrides: Value) -> Value {
+    let mut provider = json!({
+        "name": "anthropic",
+        "provider_type": "anthropic",
+        "endpoint": "https://api.anthropic.com/v1/messages",
+        "api_key": "sk-ant-good",
+        "model_patterns": ["claude-*"]
+    });
+    if let (Some(base), Some(extra)) = (provider.as_object_mut(), overrides.as_object()) {
+        for (key, value) in extra {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+    json!({ "providers": [provider] })
+}
+
+#[test]
+fn test_config_rejects_provider_strings_that_cannot_be_sent_as_headers() {
+    for field in ["api_key", "anthropic_version"] {
+        let config = anthropic_provider(json!({ field: "audit-secret\nvalue" }));
+        let err = AiStreamRouter::new(&config, http_client())
+            .err()
+            .expect("a value that cannot be sent as a header must fail admission");
+        assert!(err.contains(field), "{field}: {err}");
+        assert!(
+            err.contains("not a valid HTTP header value"),
+            "{field}: {err}"
+        );
+        assert!(
+            !err.contains("audit-secret"),
+            "the configured value must never be echoed: {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_explicit_anthropic_version_is_forwarded_unchanged() {
+    let config = anthropic_provider(json!({"anthropic_version": "2026-01-01"}));
+    let plugin = build(config);
+    let body = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        headers.get("anthropic-version").map(String::as_str),
+        Some("2026-01-01")
+    );
+}
+
+#[test]
+fn test_config_rejects_wrong_typed_optional_provider_fields() {
+    for (field, value) in [
+        ("allow_plaintext", json!("false")),
+        ("allow_plaintext", json!(3)),
+        ("anthropic_version", json!(123)),
+        ("anthropic_version", json!(true)),
+    ] {
+        let config = anthropic_provider(json!({ field: value }));
+        let err = AiStreamRouter::new(&config, http_client())
+            .err()
+            .expect("a wrong-typed value must be rejected, never silently defaulted");
+        assert!(err.contains(field), "{field}: {err}");
+    }
+}
+
+#[tokio::test]
+async fn test_explicit_null_optional_provider_fields_mean_omitted() {
+    let config = anthropic_provider(json!({
+        "allow_plaintext": null,
+        "anthropic_version": null,
+        "inherit_backend_tls": null,
+        "priority": null
+    }));
+    let plugin = build(config);
+    let body = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    // Omission keeps the documented default rather than an unset header.
+    assert_eq!(
+        headers.get("anthropic-version").map(String::as_str),
+        Some("2023-06-01")
+    );
+}
+
+#[test]
+fn test_config_rejects_endpoint_port_zero() {
+    for overrides in [
+        json!({"endpoint": "https://api.example.com:0/v1/messages"}),
+        json!({
+            "endpoint": "http://internal.example.com:0/v1/messages",
+            "allow_plaintext": true
+        }),
+    ] {
+        let config = anthropic_provider(overrides);
+        let err = AiStreamRouter::new(&config, http_client())
+            .err()
+            .expect("an outbound destination cannot be dialed on port 0");
+        assert!(err.contains("port 0"), "{err}");
+    }
+}
+
+#[test]
+fn test_config_accepts_explicit_non_zero_and_default_ports() {
+    for endpoint in [
+        "https://api.example.com:8443/v1/messages",
+        "https://api.example.com/v1/messages",
+        "http://internal.example.com:8080/v1/messages",
+    ] {
+        let config = anthropic_provider(json!({
+            "endpoint": endpoint,
+            "allow_plaintext": true
+        }));
+        assert!(
+            AiStreamRouter::new(&config, http_client()).is_ok(),
+            "{endpoint} must remain admissible"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SSE line terminators (issue #5298)
+//
+// The event-stream grammar terminates a line with LF, CRLF, or a lone CR. Both
+// normalizers used to search for the literal `\n\n` / `\r\n\r\n` byte pairs and
+// split lines with `str::lines()`, so a complete, successful CR-delimited
+// provider stream became an upstream error carrying none of its content.
+// ---------------------------------------------------------------------------
+
+async fn run_anthropic_normalizer_body(chunk_size: usize, body: &str) -> String {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    let mut collected = Vec::new();
+    for chunk in body.as_bytes().chunks(chunk_size.max(1)) {
+        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+    }
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    String::from_utf8(collected).unwrap()
+}
+
+/// Rewrite an LF-delimited fixture into another legal terminator.
+fn with_line_endings(body: &str, terminator: &str) -> String {
+    body.replace('\n', terminator)
+}
+
+#[tokio::test]
+async fn test_anthropic_sse_normalizes_cr_and_crlf_line_endings() {
+    let baseline = run_anthropic_normalizer_body(4096, ANTHROPIC_SSE).await;
+    assert!(baseline.contains("\"content\":\"Hello\""), "{baseline}");
+
+    for terminator in ["\r\n", "\r"] {
+        let body = with_line_endings(ANTHROPIC_SSE, terminator);
+        // Chunk size 1 also splits every CRLF between its CR and its LF.
+        for chunk_size in [4096, 7, 1] {
+            let out = run_anthropic_normalizer_body(chunk_size, &body).await;
+            assert!(
+                !out.contains("upstream_error"),
+                "terminator {terminator:?} chunk {chunk_size}: {out}"
+            );
+            assert_eq!(
+                strip_created(&out),
+                strip_created(&baseline),
+                "terminator {terminator:?} chunk {chunk_size}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_gemini_sse_normalizes_cr_and_crlf_line_endings() {
+    let baseline = run_gemini_normalizer(4096, GEMINI_SSE, "text/event-stream").await;
+    assert!(baseline.contains("\"content\":\"Hello\""), "{baseline}");
+
+    for terminator in ["\r\n", "\r"] {
+        let body = with_line_endings(GEMINI_SSE, terminator);
+        for chunk_size in [4096, 5, 1] {
+            let out = run_gemini_normalizer(chunk_size, &body, "text/event-stream").await;
+            assert!(
+                !out.contains("upstream_error"),
+                "terminator {terminator:?} chunk {chunk_size}: {out}"
+            );
+            assert_eq!(
+                strip_created(&out),
+                strip_created(&baseline),
+                "terminator {terminator:?} chunk {chunk_size}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_buffered_normalizers_accept_cr_delimited_provider_streams() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let buffered = plugin
+        .normalize_response_body_with_context(
+            &mut ctx,
+            200,
+            with_line_endings(ANTHROPIC_SSE, "\r").as_bytes(),
+            Some("text/event-stream"),
+            &HashMap::new(),
+        )
+        .await
+        .expect("buffered CR-delimited Anthropic SSE must normalize");
+    let buffered = String::from_utf8(buffered).unwrap();
+    let streamed = run_anthropic_normalizer_body(4096, ANTHROPIC_SSE).await;
+    assert_eq!(strip_created(&buffered), strip_created(&streamed));
+
+    let gemini = build(gemini_config());
+    let body = json!({"model": "gemini-1.5-flash", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    gemini.before_proxy(&mut ctx, &mut headers).await;
+    let buffered = gemini
+        .normalize_response_body_with_context(
+            &mut ctx,
+            200,
+            with_line_endings(GEMINI_SSE, "\r").as_bytes(),
+            Some("text/event-stream"),
+            &HashMap::new(),
+        )
+        .await
+        .expect("buffered CR-delimited Gemini SSE must normalize");
+    let buffered = String::from_utf8(buffered).unwrap();
+    let streamed = run_gemini_normalizer(4096, GEMINI_SSE, "text/event-stream").await;
+    assert_eq!(strip_created(&buffered), strip_created(&streamed));
+}
+
+// ---------------------------------------------------------------------------
+// Gemini stream framing detection (issue #5299)
+//
+// Framing used to be decided from a three-byte allowlist (`d`, `e`, `:`), so a
+// legal `id:` / `retry:` preamble or a leading UTF-8 BOM terminated the stream
+// before any candidate event was emitted.
+// ---------------------------------------------------------------------------
+
+fn utf8_bom() -> String {
+    String::from_utf8(vec![0xEF, 0xBB, 0xBF]).expect("BOM is valid UTF-8")
+}
+
+#[tokio::test]
+async fn test_gemini_accepts_a_legal_sse_preamble_and_byte_order_mark() {
+    let baseline = run_gemini_normalizer(4096, GEMINI_SSE, "text/event-stream").await;
+    let bom = utf8_bom();
+
+    for (label, prefixed) in [
+        ("id", format!("id: audit-event\n{GEMINI_SSE}")),
+        ("retry", format!("retry: 1000\n{GEMINI_SSE}")),
+        ("bom", format!("{bom}{GEMINI_SSE}")),
+        ("comment", format!(": keepalive\n{GEMINI_SSE}")),
+        (
+            "bom-then-fields",
+            format!("{bom}id: audit-event\nretry: 1000\n{GEMINI_SSE}"),
+        ),
+    ] {
+        // Chunk size 1 also splits the byte-order mark across three chunks.
+        for chunk_size in [4096, 1] {
+            let out = run_gemini_normalizer(chunk_size, &prefixed, "text/event-stream").await;
+            assert!(
+                !out.contains("upstream_error"),
+                "{label} chunk {chunk_size}: {out}"
+            );
+            assert_eq!(
+                strip_created(&out),
+                strip_created(&baseline),
+                "{label} chunk {chunk_size}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_gemini_json_framing_and_binary_framing_are_unchanged() {
+    // The JSON-object / array fallback still wins on `{` and `[`.
+    let out = run_gemini_normalizer(4096, GEMINI_JSON_ARRAY, "application/json").await;
+    assert!(out.contains("\"content\":\"Array\""), "{out}");
+
+    // A stream that opens with a control byte is not text, and remains the
+    // unrecognized-framing case.
+    let binary = "\x01\x02not-a-text-stream";
+    let out = run_gemini_normalizer(4096, binary, "text/event-stream").await;
+    assert!(
+        out.contains("unrecognized Gemini/Vertex stream framing"),
+        "{out}"
+    );
+    assert!(out.trim_end().ends_with("data: [DONE]"), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// Gemini usage normalization
+//
+// Gemini defines totalTokenCount as prompt + candidates + tool-use prompt +
+// thoughts. The adapter used to validate the provider's total and then discard
+// it, republishing a recomputed prompt+candidates sum, so a normalized route's
+// token budget under-charged every thinking or tool-using generation relative
+// to the same provider consumed natively.
+// ---------------------------------------------------------------------------
+
+const GEMINI_SSE_THINKING: &str = concat!(
+    "data: {\"responseId\":\"resp_g1\",\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hello\"}]}}]}\n\n",
+    "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"\"}]},\"finishReason\":\"STOP\"}],",
+    "\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5,\"thoughtsTokenCount\":40,",
+    "\"toolUsePromptTokenCount\":3,\"totalTokenCount\":58}}\n\n",
+);
+
+const GEMINI_JSON_THINKING: &str = concat!(
+    "[{",
+    "\"responseId\":\"resp_g2\",\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Array\"}]}}]",
+    "},{",
+    "\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\" ok\"}]},\"finishReason\":\"STOP\"}],",
+    "\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5,\"thoughtsTokenCount\":40,",
+    "\"toolUsePromptTokenCount\":3,\"totalTokenCount\":58}",
+    "}]",
+);
+
+const GEMINI_TERMINAL_EVENT_PREFIX: &str = concat!(
+    "data: {\"responseId\":\"resp_g1\",\"candidates\":[{\"index\":0,\"content\":",
+    "{\"role\":\"model\",\"parts\":[{\"text\":\"Hello\"}]},\"finishReason\":\"STOP\"}],",
+    "\"usageMetadata\":",
+);
+
+/// `thoughtsTokenCount` is billed output that Gemini reports outside
+/// `candidatesTokenCount`, and `toolUsePromptTokenCount` is billed input, so
+/// the normalized OpenAI counters must carry both and republish the provider's
+/// own total.
+fn assert_thinking_usage_normalized(out: &str) {
+    assert!(!out.contains("upstream_error"), "{out}");
+    assert!(out.contains("\"prompt_tokens\":13"), "{out}");
+    assert!(out.contains("\"completion_tokens\":45"), "{out}");
+    assert!(out.contains("\"total_tokens\":58"), "{out}");
+    assert!(out.contains("\"reasoning_tokens\":40"), "{out}");
+    assert!(out.trim_end().ends_with("data: [DONE]"), "{out}");
+}
+
+#[tokio::test]
+async fn test_gemini_usage_carries_thinking_and_tool_use_categories() {
+    let sse = GEMINI_SSE_THINKING;
+    for chunk_size in [4096, 7] {
+        let out = run_gemini_normalizer(chunk_size, sse, "text/event-stream").await;
+        assert_thinking_usage_normalized(&out);
+    }
+
+    let array_out = run_gemini_normalizer(5, GEMINI_JSON_THINKING, "application/json").await;
+    assert_thinking_usage_normalized(&array_out);
+
+    let plugin = build(gemini_config());
+    let body = json!({"model": "gemini-1.5-flash", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let buffered = plugin
+        .normalize_response_body_with_context(
+            &mut ctx,
+            200,
+            GEMINI_SSE_THINKING.as_bytes(),
+            Some("text/event-stream"),
+            &HashMap::new(),
+        )
+        .await
+        .expect("buffered Gemini SSE must normalize");
+    assert_thinking_usage_normalized(&String::from_utf8(buffered).unwrap());
+}
+
+#[tokio::test]
+async fn test_gemini_usage_keeps_a_provider_total_above_the_modelled_categories() {
+    // A billable category this adapter does not model yet still appears in the
+    // provider's own total; the published total must not drop below it.
+    let body = concat!(
+        "data: {\"responseId\":\"resp_g1\",\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",",
+        "\"parts\":[{\"text\":\"Hello\"}]},\"finishReason\":\"STOP\"}],",
+        "\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5,\"totalTokenCount\":99}}\n\n",
+    );
+    let out = run_gemini_normalizer(4096, body, "text/event-stream").await;
+    assert!(out.contains("\"prompt_tokens\":10"), "{out}");
+    assert!(out.contains("\"completion_tokens\":5"), "{out}");
+    assert!(out.contains("\"total_tokens\":99"), "{out}");
+    assert!(!out.contains("upstream_error"), "{out}");
+
+    // A provider total BELOW the components it reported is never published as
+    // the authoritative total either.
+    let inconsistent = concat!(
+        "data: {\"responseId\":\"resp_g1\",\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",",
+        "\"parts\":[{\"text\":\"Hello\"}]},\"finishReason\":\"STOP\"}],",
+        "\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5,\"totalTokenCount\":1}}\n\n",
+    );
+    let out = run_gemini_normalizer(4096, inconsistent, "text/event-stream").await;
+    assert!(out.contains("\"total_tokens\":15"), "{out}");
+}
+
+/// A well-formed `usageMetadata` opening, up to the quote of one more key.
+const GEMINI_USAGE_COUNTED_PREFIX: &str = "{\"promptTokenCount\":10,\"candidatesTokenCount\":5,\"";
+
+/// One terminal Gemini SSE event carrying `usage_metadata` verbatim.
+fn gemini_terminal_event_with_usage(usage_metadata: &str) -> String {
+    let mut body = String::from(GEMINI_TERMINAL_EVENT_PREFIX);
+    body.push_str(usage_metadata);
+    body.push_str("}\n\n");
+    body
+}
+
+#[tokio::test]
+async fn test_gemini_malformed_extended_usage_counts_fail_closed() {
+    for (field, value) in [
+        ("thoughtsTokenCount", "-1"),
+        ("toolUsePromptTokenCount", "\"3\""),
+    ] {
+        let mut usage = String::from(GEMINI_USAGE_COUNTED_PREFIX);
+        usage.push_str(field);
+        usage.push_str("\":");
+        usage.push_str(value);
+        usage.push('}');
+        let body = gemini_terminal_event_with_usage(&usage);
+        let out = run_gemini_normalizer(4096, &body, "text/event-stream").await;
+        assert!(out.contains("upstream_error"), "{field}: {out}");
+        assert!(out.contains(field), "{field}: {out}");
+        assert!(out.trim_end().ends_with("data: [DONE]"), "{field}: {out}");
+    }
+}
+
+#[tokio::test]
+async fn test_gemini_usage_without_extended_categories_is_unchanged() {
+    // The ordinary prompt/candidate stream must keep the counts it always had.
+    let out = run_gemini_normalizer(4096, GEMINI_SSE, "text/event-stream").await;
+    assert!(out.contains("\"prompt_tokens\":10"), "{out}");
+    assert!(out.contains("\"completion_tokens\":5"), "{out}");
+    assert!(out.contains("\"total_tokens\":15"), "{out}");
+    assert!(
+        !out.contains("completion_tokens_details"),
+        "no reasoning detail without a reported thoughts count: {out}"
+    );
 }

@@ -2785,8 +2785,7 @@ fn both_buffered_grpc_authorization_exits_release_their_admission_state() {
         .collect();
     assert_eq!(branches.len(), 2, "split and mixed buffered gRPC arms");
     for branch in branches {
-        assert!(branch.contains("grpc_probe_guard.disarm()"));
-        assert!(branch.contains("release_circuit_breaker_probe_on_admission_reject("));
+        assert!(branch.contains("cb_probe.release_neutral()"));
         assert!(branch.contains("preacquired_backend_admission.take_if_acquired()"));
         assert!(branch.contains("finalize_authorization_expired_rejection("));
         assert!(branch.contains("authorization_expired_buffered_grpc_upload"));
@@ -5441,15 +5440,18 @@ fn every_native_h3_streaming_response_headers_write_uses_the_shared_helper() {
         !sse_writer.contains("let _ = stream.finish().await"),
         "aggregate MCP SSE listener-lifetime expiry must not await finish unbounded"
     );
+    // Every pump exit reaches ONE post-pump terminal: an expired authorization
+    // resets and records, while the protocol-only listener-lifetime arm takes
+    // the bounded terminal grace instead of racing an elapsed instant.
     let post_pump = sse_writer
-        .split("if composed_deadline_fired {")
+        .split("if let Some(termination) = aggregate_sse_bound.expired_authorization() {")
         .nth(1)
-        .expect("composed deadline post-pump branch");
+        .expect("post-pump authorization attribution");
     let listener_terminal = post_pump
         .split("} else {")
         .nth(1)
         .expect("listener-lifetime else arm")
-        .split("    } else {")
+        .split("    if halt_recv {")
         .next()
         .expect("listener-lifetime else arm bounded");
     assert!(

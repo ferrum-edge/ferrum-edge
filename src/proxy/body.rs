@@ -477,6 +477,16 @@ struct GrpcWebStreamingBody {
     terminal_status: Arc<AtomicU64>,
     terminal_emitted: bool,
     failed: bool,
+    /// The backend/intermediary answered with an HTTP error whose entity is not
+    /// a gRPC message stream (a `text/plain` or `text/html` error document).
+    ///
+    /// gRPC-Web bodies are a frame sequence, so those bytes cannot be forwarded:
+    /// prepended to the synthesized terminal frame they make the WHOLE response
+    /// unparseable, and a client then cannot read the mapped status it is being
+    /// told about. The entity is drained and dropped; the terminal frame alone
+    /// is emitted. Decided once from the pristine backend response by
+    /// `grpc_web::unframed_backend_error_entity` — never from these bytes.
+    suppress_backend_entity: bool,
 }
 
 impl GrpcWebStreamingBody {
@@ -509,78 +519,86 @@ impl http_body::Body for GrpcWebStreamingBody {
             return Poll::Ready(None);
         }
 
-        match Pin::new(&mut this.inner).poll_frame(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Some(Err(error))) => {
-                this.failed = true;
-                Poll::Ready(Some(Err(error)))
-            }
-            Poll::Ready(Some(Ok(frame))) if frame.is_data() => {
-                let data = match frame.into_data() {
-                    Ok(data) => data,
-                    Err(_) => {
-                        this.failed = true;
-                        return Poll::Ready(Some(Err(Box::new(std::io::Error::other(
-                            "gRPC-Web streaming adapter received an invalid DATA frame",
-                        )))));
-                    }
-                };
-                // An inner client-deadline or authorization-lifetime wrapper may
-                // already have produced a body-framed gRPC-Web terminal status.
-                // Preserve it verbatim (especially text mode, which is already
-                // base64-encoded) and expose its status to the outer deferred
-                // logger. The authorization deadline is checked first so an
-                // expired credential is reported as `UNAUTHENTICATED` rather
-                // than a client-chosen `DEADLINE_EXCEEDED`.
-                let inner_auth_deadline_fired = this
-                    .inner
-                    .stream_auth_deadline
-                    .as_ref()
-                    .is_some_and(|state| state.fired.load(Ordering::Acquire));
-                let inner_deadline_fired = inner_auth_deadline_fired
-                    || this
-                        .inner
-                        .client_grpc_deadline_fired
-                        .as_ref()
-                        .is_some_and(|flag| flag.load(Ordering::Acquire));
-                if inner_deadline_fired {
-                    let terminal_status = if inner_auth_deadline_fired {
-                        crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED
-                    } else {
-                        crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED
-                    };
-                    this.terminal_status
-                        .store(u64::from(terminal_status), Ordering::Release);
-                    this.terminal_emitted = true;
-                    return Poll::Ready(Some(Ok(Frame::data(data))));
+        loop {
+            match Pin::new(&mut this.inner).poll_frame(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Err(error))) => {
+                    this.failed = true;
+                    return Poll::Ready(Some(Err(error)));
                 }
-                Poll::Ready(Some(Ok(Frame::data(
-                    crate::plugins::grpc_web::encode_streaming_data(data, this.text_mode),
-                ))))
-            }
-            Poll::Ready(Some(Ok(frame))) if frame.is_trailers() => {
-                let trailers = match frame.into_trailers() {
-                    Ok(trailers) => trailers,
-                    Err(_) => {
-                        this.failed = true;
-                        return Poll::Ready(Some(Err(Box::new(std::io::Error::other(
-                            "gRPC-Web streaming adapter received an invalid trailer frame",
-                        )))));
+                Poll::Ready(Some(Ok(frame))) if frame.is_data() => {
+                    let data = match frame.into_data() {
+                        Ok(data) => data,
+                        Err(_) => {
+                            this.failed = true;
+                            return Poll::Ready(Some(Err(Box::new(std::io::Error::other(
+                                "gRPC-Web streaming adapter received an invalid DATA frame",
+                            )))));
+                        }
+                    };
+                    // An inner client-deadline or authorization-lifetime wrapper may
+                    // already have produced a body-framed gRPC-Web terminal status.
+                    // Preserve it verbatim (especially text mode, which is already
+                    // base64-encoded) and expose its status to the outer deferred
+                    // logger. The authorization deadline is checked first so an
+                    // expired credential is reported as `UNAUTHENTICATED` rather
+                    // than a client-chosen `DEADLINE_EXCEEDED`.
+                    let inner_auth_deadline_fired = this
+                        .inner
+                        .stream_auth_deadline
+                        .as_ref()
+                        .is_some_and(|state| state.fired.load(Ordering::Acquire));
+                    let inner_deadline_fired = inner_auth_deadline_fired
+                        || this
+                            .inner
+                            .client_grpc_deadline_fired
+                            .as_ref()
+                            .is_some_and(|flag| flag.load(Ordering::Acquire));
+                    if inner_deadline_fired {
+                        let terminal_status = if inner_auth_deadline_fired {
+                            crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED
+                        } else {
+                            crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED
+                        };
+                        this.terminal_status
+                            .store(u64::from(terminal_status), Ordering::Release);
+                        this.terminal_emitted = true;
+                        return Poll::Ready(Some(Ok(Frame::data(data))));
                     }
-                };
-                let mut collected = std::collections::HashMap::new();
-                super::grpc_proxy::collect_buffered_grpc_trailers(&trailers, &mut collected);
-                Poll::Ready(Some(Ok(this.terminal_data(collected))))
-            }
-            Poll::Ready(Some(Ok(_))) => {
-                this.failed = true;
-                Poll::Ready(Some(Err(Box::new(std::io::Error::other(
-                    "gRPC-Web streaming adapter received an unsupported frame",
-                )))))
-            }
-            Poll::Ready(None) => {
-                let trailers = this.initial_terminal_metadata.take().unwrap_or_default();
-                Poll::Ready(Some(Ok(this.terminal_data(trailers))))
+                    // A non-gRPC HTTP error entity is drained, never forwarded:
+                    // see `suppress_backend_entity`. Keep polling so the
+                    // terminal frame is still emitted from EOF or trailers.
+                    if this.suppress_backend_entity {
+                        continue;
+                    }
+                    return Poll::Ready(Some(Ok(Frame::data(
+                        crate::plugins::grpc_web::encode_streaming_data(data, this.text_mode),
+                    ))));
+                }
+                Poll::Ready(Some(Ok(frame))) if frame.is_trailers() => {
+                    let trailers = match frame.into_trailers() {
+                        Ok(trailers) => trailers,
+                        Err(_) => {
+                            this.failed = true;
+                            return Poll::Ready(Some(Err(Box::new(std::io::Error::other(
+                                "gRPC-Web streaming adapter received an invalid trailer frame",
+                            )))));
+                        }
+                    };
+                    let mut collected = std::collections::HashMap::new();
+                    super::grpc_proxy::collect_buffered_grpc_trailers(&trailers, &mut collected);
+                    return Poll::Ready(Some(Ok(this.terminal_data(collected))));
+                }
+                Poll::Ready(Some(Ok(_))) => {
+                    this.failed = true;
+                    return Poll::Ready(Some(Err(Box::new(std::io::Error::other(
+                        "gRPC-Web streaming adapter received an unsupported frame",
+                    )))));
+                }
+                Poll::Ready(None) => {
+                    let trailers = this.initial_terminal_metadata.take().unwrap_or_default();
+                    return Poll::Ready(Some(Ok(this.terminal_data(trailers))));
+                }
             }
         }
     }
@@ -712,11 +730,14 @@ impl ProxyBody {
     /// to the returned outer body, where the body-framed terminal status can
     /// classify synthesized missing-trailer errors and encoded deadlines while
     /// text expansion and terminal DATA bytes are counted exactly once.
+    /// `suppress_backend_entity` drops a non-gRPC HTTP error entity instead of
+    /// framing it; see [`GrpcWebStreamingBody::suppress_backend_entity`].
     pub(crate) fn into_grpc_web_streaming(
         self,
         content_type: &str,
         http_status: u16,
         initial_terminal_metadata: Option<std::collections::HashMap<String, String>>,
+        suppress_backend_entity: bool,
     ) -> Self {
         let mut inner = self;
         let client_grpc_deadline_fired = inner.client_grpc_deadline_fired.clone();
@@ -734,6 +755,7 @@ impl ProxyBody {
             terminal_status: Arc::clone(&terminal_status),
             terminal_emitted: false,
             failed: false,
+            suppress_backend_entity,
         };
         let mut body = Self::streaming(Box::pin(adapter));
         body._backend_admission_permits = backend_admission_permits;
@@ -1059,6 +1081,10 @@ impl ProxyBody {
     /// `closer` is `None` for frontends that own their own downstream writes and
     /// already bound every one of them (the native HTTP/3 relays), where a
     /// transport close would be both unnecessary and wrong.
+    ///
+    /// A body that is already at end of stream, under a bound that has not yet
+    /// elapsed, is returned untouched — see the comment in the body for why the
+    /// wrapper must not change a complete response's framing.
     pub(crate) fn with_authorization_deadline(
         mut self,
         deadline: crate::proxy::auth_lifetime::StreamAuthDeadline,
@@ -1067,6 +1093,26 @@ impl ProxyBody {
         auth_latch: Option<crate::proxy::auth_lifetime::StreamAuthTerminationLatch>,
         closer: Option<crate::proxy::auth_lifetime::AuthorizationConnectionCloser>,
     ) -> Self {
+        // A response that is ALREADY complete carries no remaining frame for
+        // this bound to protect, and wrapping it would change its FRAMING: the
+        // pump-backed `AuthorizationCancellableBody` reports
+        // `is_end_stream() == false` until it has delivered a terminal, so a
+        // transport that reads the predicate before writing the head drops
+        // `END_STREAM` from the initial HEADERS and appends an empty DATA frame
+        // instead. That turns a backend's Trailers-Only gRPC answer — HEADERS
+        // with `grpc-status` and END_STREAM, no body at all — into a two-frame
+        // response. The request-upload seam declines for exactly this reason;
+        // see `UploadSource::install_pump`.
+        //
+        // Narrowed to a bound that has NOT already elapsed: an elapsed one
+        // replaces the upstream's answer with the gateway's own terminal, so
+        // the upstream's framing is not the thing being written.
+        if http_body::Body::is_end_stream(&self) {
+            let expired = crate::proxy::auth_lifetime::expired_authorization(Some(deadline));
+            if expired.is_none() {
+                return self;
+            }
+        }
         let terminal = DeadlineTerminal {
             grpc_status_header: AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER,
             grpc_message_header: deadline.termination.grpc_message(),
@@ -1288,6 +1334,42 @@ impl ProxyBody {
             }
         };
         (self, metrics)
+    }
+
+    /// Positive end-of-stream proof for the `Drop` safety net.
+    ///
+    /// "Polled but never drained" is normally a client disconnect, but it is
+    /// also the ordinary shape of a *successful* finite stream: a streaming
+    /// adapter may consume the backend's `Ready(None)`, mark itself done, and
+    /// yield its final buffered DATA frame, after which hyper is permitted to
+    /// observe `is_end_stream()` and drop the body without one redundant EOF
+    /// poll. `poll_frame` already trusts exactly that proof to return a pooled
+    /// HTTP/1.1 carrier (`clean_backend_end`), which is a strictly more
+    /// dangerous decision than a log classification.
+    ///
+    /// Classifying that case as a disconnect made a fully delivered finite
+    /// stream — a length-delimited `text/event-stream` response on H1/H2 —
+    /// report `body_completed: false`, which kept `request_deduplication`'s
+    /// in-flight lease until `inflight_ttl_seconds` and trained the adaptive
+    /// limiter on a client disconnect that never happened.
+    ///
+    /// Only the `true` direction is trusted, which is what makes this safe: a
+    /// wrapper that has not terminated may still report `false` before its
+    /// terminal poll, so this can never turn a real mid-stream disconnect into
+    /// a success. A synthesized client/authorization deadline terminal is
+    /// excluded by the caller, exactly as in `poll_frame`.
+    ///
+    /// Streaming kinds only. A `Full` body reports end-of-stream as soon as its
+    /// single buffered frame has been handed over, which says nothing about
+    /// whether the client was still there — that case keeps the existing
+    /// "polled but never drained is a disconnect" reading, the same asymmetry
+    /// the never-polled branch below already applies.
+    fn proved_end_of_stream_on_drop(&self) -> bool {
+        match &self.kind {
+            ProxyBodyKind::Full(_) => false,
+            ProxyBodyKind::Stream(body) => body.is_end_stream(),
+            ProxyBodyKind::Tracked(body) => body.inner.is_end_stream(),
+        }
     }
 
     fn record_deferred_backend_admission(
@@ -1683,15 +1765,17 @@ impl Drop for ProxyBody {
             //    `is_end_stream()` is still unreliable before terminal poll,
             //    so we trust `polled` exclusively and treat never-polled as
             //    success.
-            let completed_declared_bytes = self
+            let proved_complete = self
                 .success_on_drop_after_bytes
-                .is_some_and(|expected| bytes == expected);
+                .is_some_and(|expected| bytes == expected)
+                || (!client_deadline_fired && self.proved_end_of_stream_on_drop());
             let outcome = if self.polled.load(Ordering::Relaxed) {
                 // Polled at least once but never reached Ready(None) or an
                 // error terminal. That's normally a client disconnect
-                // mid-stream, except for protocol adapters that can prove the
-                // downstream body completed from the declared byte count.
-                if completed_declared_bytes {
+                // mid-stream, except when the body itself proves it ended:
+                // a protocol adapter's declared byte count, or an inner
+                // wrapper already reporting end-of-stream.
+                if proved_complete {
                     crate::proxy::deferred_log::BodyOutcome::success(bytes)
                 } else {
                     crate::proxy::deferred_log::BodyOutcome::client_disconnect(bytes)
@@ -1735,6 +1819,10 @@ impl Drop for ProxyBody {
             && self
                 .success_on_drop_after_bytes
                 .is_none_or(|expected| self.bytes_streamed.load(Ordering::Relaxed) != expected)
+            // Same proof as the logger branch above: a body whose wrapper
+            // already reported end-of-stream completed, so backend admission
+            // and dispatch accounting must not record a client disconnect.
+            && (client_deadline_fired || !self.proved_end_of_stream_on_drop())
         {
             deferred_admission_error_class = Some(ErrorClass::ClientDisconnect);
             deferred_admission_client_disconnected = true;
@@ -3149,7 +3237,7 @@ impl<S: FrameSource + Unpin> FrameSource for SizeLimitedFrameSource<S> {
 
 /// Default flush target for the [`Coalescing`] adapter when no explicit
 /// target is supplied (HTTP/1.1 + HTTP/2-via-reqwest path).
-const COALESCE_TARGET: usize = 128 * 1024;
+pub(crate) const COALESCE_TARGET: usize = 128 * 1024;
 
 pub(crate) trait FrameSource {
     /// A source may prove that no further frames exist before its first poll.
@@ -3651,10 +3739,97 @@ impl<S: H3RecvStream + Unpin> FrameSource for H3FrameSource<S> {
     }
 }
 
+/// Lazily-allocated accumulator behind the [`Coalescing`] adapter.
+///
+/// A response that yields exactly one DATA frame — the common case for a small
+/// streamed RPC message — never allocates an aggregation buffer at all: the
+/// frame's own `Bytes` is held by value and handed straight back on flush, so
+/// the storage the backend produced is the storage the client receives. The
+/// `BytesMut` appears only when a SECOND frame actually has to be merged with
+/// the first (issue #5040).
+///
+/// `Single` and `Merged` are never empty: [`Coalescing::buffer_data`] drops
+/// empty frames before they reach [`CoalesceBuffer::push`], so `is_empty()` is
+/// exactly `matches!(self, CoalesceBuffer::Empty)` and any flush of a
+/// non-`Empty` state yields a non-empty frame — the invariant the trailer- and
+/// error-stashing paths depend on.
+///
+/// Flushing a `Merged` state hands the region's unused tail back to
+/// `Coalescing::spare`, so a stream that repeatedly flushes below the target
+/// keeps the pre-#5040 amortization (one region shared by several flushes,
+/// promoted to shared storage once) instead of allocating a fresh region per
+/// flush.
+enum CoalesceBuffer {
+    Empty,
+    Single(Bytes),
+    Merged(BytesMut),
+}
+
+impl CoalesceBuffer {
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Single(data) => data.len(),
+            Self::Merged(merged) => merged.len(),
+        }
+    }
+
+    /// Append a NON-EMPTY payload, reaching for an aggregation region only on
+    /// the transition from one held frame to two merged frames: `spare` (the
+    /// tail of a previously flushed region) when it still fits, otherwise a
+    /// fresh region of the adapter's configured `capacity` — or of what the
+    /// pair needs, when that is larger.
+    fn push(&mut self, data: Bytes, capacity: usize, spare: &mut Option<BytesMut>) {
+        match std::mem::replace(self, Self::Empty) {
+            Self::Empty => *self = Self::Single(data),
+            Self::Single(first) => {
+                let needed = first.len().saturating_add(data.len());
+                let mut merged = match spare.take() {
+                    Some(region) if region.capacity() >= needed => region,
+                    _ => BytesMut::with_capacity(capacity.max(needed)),
+                };
+                merged.extend_from_slice(&first);
+                merged.extend_from_slice(&data);
+                *self = Self::Merged(merged);
+            }
+            Self::Merged(mut merged) => {
+                merged.extend_from_slice(&data);
+                *self = Self::Merged(merged);
+            }
+        }
+    }
+
+    fn state_name(&self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Single(_) => "single",
+            Self::Merged(_) => "merged",
+        }
+    }
+
+    fn aggregation_capacity(&self) -> usize {
+        match self {
+            Self::Merged(merged) => merged.capacity(),
+            Self::Empty | Self::Single(_) => 0,
+        }
+    }
+}
+
 pub(crate) struct Coalescing<S: FrameSource> {
     inner: S,
     target_bytes: usize,
-    buffer: BytesMut,
+    /// Capacity requested for the aggregation `BytesMut` the first time two
+    /// frames must be merged. Nothing is reserved up front (issue #5040).
+    buffer_capacity: usize,
+    buffer: CoalesceBuffer,
+    /// Unused tail of the last flushed aggregation region, reused by the next
+    /// merge. Only a merge ever fills it, so a body that never merges — one
+    /// frame, or none — holds no region at all.
+    spare: Option<BytesMut>,
     stashed_trailer: Option<Frame<Bytes>>,
     stashed_error: Option<BoxError>,
     done: bool,
@@ -3665,31 +3840,26 @@ pub(crate) struct Coalescing<S: FrameSource> {
 }
 
 impl<S: FrameSource> Coalescing<S> {
-    fn new(inner: S, target_bytes: usize, content_length: Option<u64>) -> Self {
+    pub(crate) fn new(inner: S, target_bytes: usize, content_length: Option<u64>) -> Self {
         Self::with_flush_after(inner, target_bytes, content_length, None)
     }
 
-    fn with_flush_after(
+    pub(crate) fn with_flush_after(
         inner: S,
         target_bytes: usize,
         content_length: Option<u64>,
         flush_after: Option<Duration>,
     ) -> Self {
-        Self {
+        Self::with_flush_after_and_capacity(
             inner,
             target_bytes,
-            buffer: BytesMut::with_capacity(target_bytes.min(COALESCE_TARGET)),
-            stashed_trailer: None,
-            stashed_error: None,
-            done: false,
+            target_bytes.min(COALESCE_TARGET),
             content_length,
             flush_after,
-            flush_timer: None,
-            flush_timer_armed: false,
-        }
+        )
     }
 
-    fn with_flush_after_and_capacity(
+    pub(crate) fn with_flush_after_and_capacity(
         inner: S,
         target_bytes: usize,
         buffer_capacity: usize,
@@ -3699,7 +3869,9 @@ impl<S: FrameSource> Coalescing<S> {
         Self {
             inner,
             target_bytes,
-            buffer: BytesMut::with_capacity(buffer_capacity),
+            buffer_capacity,
+            buffer: CoalesceBuffer::Empty,
+            spare: None,
             stashed_trailer: None,
             stashed_error: None,
             done: false,
@@ -3745,22 +3917,65 @@ impl<S: FrameSource> Coalescing<S> {
     }
 
     fn flush_buffer(&mut self) -> Option<Frame<Bytes>> {
-        if self.buffer.is_empty() {
-            self.flush_timer_armed = false;
-            return None;
-        }
-
         self.flush_timer_armed = false;
-        Some(Frame::data(self.buffer.split().freeze()))
+        match std::mem::replace(&mut self.buffer, CoalesceBuffer::Empty) {
+            CoalesceBuffer::Empty => None,
+            // The one-frame flush: the backend's own storage, uncopied.
+            CoalesceBuffer::Single(data) => Some(Frame::data(data)),
+            CoalesceBuffer::Merged(mut merged) => {
+                let flushed = merged.split().freeze();
+                // `merged` is now the region's unused tail. Keeping it lets the
+                // next merge reuse the region (and its one shared-storage
+                // promotion) instead of allocating per flush.
+                if merged.capacity() > 0 {
+                    self.spare = Some(merged);
+                }
+                Some(Frame::data(flushed))
+            }
+        }
     }
 
-    fn buffer_data(&mut self, data: &Bytes) {
+    fn buffer_data(&mut self, data: Bytes) {
         if data.is_empty() {
             return;
         }
-        self.buffer.extend_from_slice(data);
+        self.buffer
+            .push(data, self.buffer_capacity, &mut self.spare);
         if self.flush_after.is_some() && !self.flush_timer_armed {
             self.arm_flush_timer();
+        }
+    }
+
+    /// Test-only introspection of the lazy accumulator: `"empty"`, `"single"`
+    /// (one frame held with no aggregation buffer) or `"merged"`.
+    ///
+    /// Reached only through `crate::_test_support`, so the issue #5040
+    /// laziness contract is asserted on the production adapter.
+    #[allow(dead_code)]
+    pub(crate) fn buffer_state_name(&self) -> &'static str {
+        self.buffer.state_name()
+    }
+
+    /// Test-only introspection: capacity of the aggregation `BytesMut`, or `0`
+    /// while none has been allocated.
+    #[allow(dead_code)]
+    pub(crate) fn aggregation_capacity(&self) -> usize {
+        self.buffer.aggregation_capacity()
+    }
+
+    /// Test-only introspection: bytes currently held pending a flush.
+    #[allow(dead_code)]
+    pub(crate) fn buffered_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Test-only introspection: capacity of the retained aggregation region the
+    /// next merge would reuse, or `0` when the adapter holds no region.
+    #[allow(dead_code)]
+    pub(crate) fn retained_region_capacity(&self) -> usize {
+        match self.spare.as_ref() {
+            Some(region) => region.capacity(),
+            None => 0,
         }
     }
 }
@@ -3800,25 +4015,31 @@ impl<S: FrameSource + Unpin> http_body::Body for Coalescing<S> {
         loop {
             match Pin::new(&mut this.inner).poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => {
-                    if let Some(data) = frame.data_ref() {
-                        if this.buffer.is_empty() && data.len() >= this.target_bytes {
-                            return Poll::Ready(Some(Ok(frame)));
-                        }
+                    let frame = match frame.into_data() {
+                        Ok(data) => {
+                            if this.buffer.is_empty() && data.len() >= this.target_bytes {
+                                // Large-frame bypass: hand the backend's own
+                                // storage downstream without ever allocating
+                                // an aggregation buffer.
+                                return Poll::Ready(Some(Ok(Frame::data(data))));
+                            }
 
-                        this.buffer_data(data);
-                        if this.buffer.len() >= this.target_bytes
-                            && let Some(flushed) = this.flush_buffer()
-                        {
-                            return Poll::Ready(Some(Ok(flushed)));
+                            this.buffer_data(data);
+                            if this.buffer.len() >= this.target_bytes
+                                && let Some(flushed) = this.flush_buffer()
+                            {
+                                return Poll::Ready(Some(Ok(flushed)));
+                            }
+                            continue;
                         }
-                        continue;
-                    }
+                        Err(frame) => frame,
+                    };
 
-                    if !this.buffer.is_empty() {
+                    // A trailer (or any other non-DATA frame) ends aggregation:
+                    // flush what is held first and stash the frame so the next
+                    // poll still delivers it.
+                    if let Some(flushed) = this.flush_buffer() {
                         this.stashed_trailer = Some(frame);
-                        let flushed = this
-                            .flush_buffer()
-                            .expect("non-empty buffer must flush before stashed trailer");
                         return Poll::Ready(Some(Ok(flushed)));
                     }
 
@@ -3827,11 +4048,8 @@ impl<S: FrameSource + Unpin> http_body::Body for Coalescing<S> {
                 }
                 Poll::Ready(Some(Err(err))) => {
                     this.done = true;
-                    if !this.buffer.is_empty() {
+                    if let Some(flushed) = this.flush_buffer() {
                         this.stashed_error = Some(err);
-                        let flushed = this
-                            .flush_buffer()
-                            .expect("non-empty buffer must flush before stashed error");
                         return Poll::Ready(Some(Ok(flushed)));
                     }
                     return Poll::Ready(Some(Err(err)));
@@ -5933,12 +6151,20 @@ mod tests {
             Some(Duration::from_millis(2)),
         ));
 
-        body.buffer.extend_from_slice(b"stashed-");
+        // Hold one frame, then clear the armed flag by hand: this is the state
+        // a fired-but-unflushed timer leaves behind while data is still held.
+        body.buffer_data(Bytes::from_static(b"stashed-"));
+        body.flush_timer_armed = false;
         assert!(!body.buffer.is_empty());
-        assert!(!body.flush_timer_armed);
+        assert_eq!(body.buffer_state_name(), "single");
 
-        body.buffer_data(&Bytes::from_static(b"tail"));
+        body.buffer_data(Bytes::from_static(b"tail"));
         assert!(body.flush_timer_armed);
+        assert_eq!(
+            body.buffer_state_name(),
+            "merged",
+            "a second frame must allocate the aggregation buffer"
+        );
 
         tokio::time::sleep(Duration::from_millis(5)).await;
 

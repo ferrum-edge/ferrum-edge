@@ -377,3 +377,59 @@ fn ws_disconnect_projection_does_not_infer_path_from_backend_query() {
         "backend_target remains the already-stripped upgrade target"
     );
 }
+
+#[test]
+fn test_stdout_logging_rejects_unknown_errors_only_expression_fields() {
+    for (config, path) in [
+        (
+            json!({"filter": {"expression": {"op": "errors_only", "extra": 1}}}),
+            "stdout_logging.filter.expression.extra",
+        ),
+        (
+            json!({"filter": {"expression": {"op": "errors_only", "value": false}}}),
+            "stdout_logging.filter.expression.value",
+        ),
+        (
+            json!({
+                "filter": {
+                    "expression": {
+                        "op": "and",
+                        "left": {"op": "errors_only", "extra": 1},
+                        "right": {"op": "errors_only"}
+                    }
+                }
+            }),
+            "stdout_logging.filter.expression.left.extra",
+        ),
+        (
+            json!({
+                "filter": {
+                    "expression": {
+                        "op": "or",
+                        "left": {"op": "min_latency_ms", "value": 10},
+                        "right": {"op": "errors_only", "value": false}
+                    }
+                }
+            }),
+            "stdout_logging.filter.expression.right.value",
+        ),
+    ] {
+        let error = StdoutLogging::new(&config)
+            .err()
+            .expect("unknown errors_only fields must fail admission");
+        assert!(
+            error.contains("unknown configuration key"),
+            "expected unknown-key diagnostic, got {error}"
+        );
+        assert!(error.contains(path), "expected {path} in {error}");
+    }
+
+    let plugin = StdoutLogging::new(&json!({
+        "filter": {"expression": {"op": "errors_only"}}
+    }))
+    .expect("bare errors_only expression must remain valid");
+    let mut failed = create_test_transaction_summary();
+    failed.error_class = Some(ferrum_edge::retry::ErrorClass::ConnectionReset);
+    assert!(plugin.should_log_transaction(&failed));
+    assert!(!plugin.should_log_transaction(&create_test_transaction_summary()));
+}

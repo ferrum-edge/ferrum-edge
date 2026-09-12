@@ -707,9 +707,8 @@ Query: `epoch`, `sequence` (both required u64s), optional `wait_ms`
   also returns `pending`; retry harmlessly with the same cursor.
 - `rejected` — a completed poll attempted a covering sequence and the runtime
   rejected the candidate. Fail-closed: durable but not live.
-- `unverifiable` — the cursor's topology was replaced
-  (failover/reconnect/restart) or was never issued by this process; observe
-  config directly instead.
+- `unverifiable` — the cursor was not issued by this process or its topology
+  was replaced (failover/reconnect/restart); observe config directly instead.
 
 With `wait_ms`, the probe registers as a live-apply waiter and inherits the
 immediate poll nudge. The bulk recipe: POST every chunk with `apply=async`,
@@ -800,9 +799,10 @@ default would otherwise silently change security state are handled explicitly:
   `200`. A `PUT` body that is a JSON object without an `enabled` key is
   rejected with `400` and nothing is mutated:
   `{"error":"PUT is a full replace: 'enabled' is required (openapi.yaml declares it required). Send the field explicitly."}`.
-  `openapi.yaml` already lists `enabled` in the `PluginConfig` `required` set;
-  this makes the implementation match it. `POST /plugins/config` still defaults
-  `enabled` to `true` when the key is absent.
+  `openapi.yaml` requires `enabled` on `PluginConfigReplace` (`PUT
+  /plugins/config/{id}`) and on the stored `PluginConfig` response. `POST
+  /plugins/config` uses `PluginConfigCreate`, which omits `enabled` from
+  `required` so the server can default it to `true`.
 - **An omitted `Proxy.plugins` preserves the stored associations.** Its default
   is the empty list, so an omitted key would detach every plugin association —
   including an authentication plugin — with a `200`. `PUT /proxies/{id}` is
@@ -872,7 +872,9 @@ through `PUT /proxies/{id}` and stay valid for any proxy in the namespace. File
 mode is unchanged: the configuration file's association arrays are the only
 attachment surface there.
 
-Disabled plugin configs are stored without plugin-specific construction, so operators can stage configuration before runtime-only prerequisites are present. For example, `basic_auth` may be created or imported with `enabled: false` before `FERRUM_BASIC_AUTH_HMAC_SECRET` is provisioned. Enabling the config performs normal construction and fails closed unless the secret is present and at least 32 bytes.
+Disabled plugin configs are stored without plugin-specific construction, so operators can stage configuration before runtime-only prerequisites are present. For example, `basic_auth` may be created or imported with `enabled: false` before `FERRUM_BASIC_AUTH_HMAC_SECRET` is provisioned. Enabling the config performs normal construction and fails closed unless the secret is present and at least 32 bytes. The shared OpenAPI wrapper matches that admission: plugin-specific `config` schemas apply only while `enabled` is true (or omitted on `POST`, which defaults to true), and plugins whose constructors accept JSON `null` (`stdout_logging`, `prometheus_metrics`, `mtls_auth`, `compression`) document `config` as `[object, null]`.
+
+Global-scope requirements for `transaction_log_schema` and `prometheus_metrics` still apply while disabled.
 
 Plugin-config reads by `viewer` and `operator` roles use the same redacted projection stored in admin audit diffs; `admin` reads remain raw.
 
@@ -1343,6 +1345,11 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/cluster
 ### CP Mode Response
 
 Returns all currently connected Data Plane nodes and Mesh nodes. Each registry is independent: a node that subscribes to both `ConfigSync.Subscribe` (DP) and `MeshConfigSync.MeshSubscribe` (mesh) appears in both arrays with separate `connected_at` timestamps.
+
+Both subscription services require the request's trimmed `node_id` to equal the
+authenticated bearer JWT's `sub`. A mismatched identity is rejected before
+registration and cannot replace another node's `GET /cluster` entry. Built-in
+DP token minting uses the node ID as `sub`; external issuers must do the same.
 
 ```json
 {

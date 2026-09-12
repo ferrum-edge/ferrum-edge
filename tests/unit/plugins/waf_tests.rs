@@ -4370,7 +4370,7 @@ fn assert_waf_stdout_hit_action(logs: &str, effective: &str, configured: &str) {
 
 #[tokio::test]
 async fn log_to_stdout_monitor_mode_logs_monitored_effective_action() {
-    let (logs, guard) = super::plugin_utils::capture_logs();
+    let (logs, guard) = super::plugin_utils::capture_debug_logs();
     let plugin = Waf::new(&json!({
         "mode": "monitor",
         "default_rule_action": "enforce",
@@ -4391,14 +4391,14 @@ async fn log_to_stdout_monitor_mode_logs_monitored_effective_action() {
     let captured = logs.contents();
     assert!(
         captured.contains("WAF rule matched"),
-        "expected per-hit warning: {captured}"
+        "expected per-hit diagnostic: {captured}"
     );
     assert_waf_stdout_hit_action(&captured, "monitored", "enforce");
 }
 
 #[tokio::test]
 async fn log_to_stdout_enforce_mode_logs_blocked_effective_action() {
-    let (logs, guard) = super::plugin_utils::capture_logs();
+    let (logs, guard) = super::plugin_utils::capture_debug_logs();
     let plugin = Waf::new(&json!({
         "rule_modes": { "FE-SQLI-002": "enforce" },
         "log_to_stdout": true
@@ -4418,14 +4418,14 @@ async fn log_to_stdout_enforce_mode_logs_blocked_effective_action() {
     let captured = logs.contents();
     assert!(
         captured.contains("WAF rule matched"),
-        "expected per-hit warning: {captured}"
+        "expected per-hit diagnostic: {captured}"
     );
     assert_waf_stdout_hit_action(&captured, "blocked", "enforce");
 }
 
 #[tokio::test]
 async fn log_to_stdout_stream_monitor_mode_logs_monitored_effective_action() {
-    let (logs, guard) = super::plugin_utils::capture_logs();
+    let (logs, guard) = super::plugin_utils::capture_debug_logs();
     let plugin = Waf::new(&json!({
         "mode": "monitor",
         "include_default_rules": false,
@@ -4451,7 +4451,7 @@ async fn log_to_stdout_stream_monitor_mode_logs_monitored_effective_action() {
     let captured = logs.contents();
     assert!(
         captured.contains("WAF stream signature matched"),
-        "expected per-hit stream warning: {captured}"
+        "expected per-hit stream diagnostic: {captured}"
     );
     assert_waf_stdout_hit_action(&captured, "monitored", "enforce");
 }
@@ -7167,12 +7167,14 @@ fn on_body_too_large_openapi_runtime_parity() {
         schema["default"], "fail_closed",
         "openapi default must stay the fail-closed value"
     );
-    let documented: Vec<&str> = schema["enum"]
-        .as_array()
-        .expect("on_body_too_large enum")
-        .iter()
-        .map(|value| value.as_str().expect("enum entries are strings"))
-        .collect();
+    let members = schema["enum"].as_array().expect("on_body_too_large enum");
+    // The schema is nullable because the runtime treats an explicit null as an
+    // omitted key, so the enum carries a null member alongside the action names.
+    assert!(
+        members.iter().any(JsonValue::is_null),
+        "nullable enum must admit an explicit null"
+    );
+    let documented: Vec<&str> = members.iter().filter_map(JsonValue::as_str).collect();
     assert_eq!(
         documented,
         vec!["fail_closed", "scan_truncated", "skip", "block"]
@@ -7183,6 +7185,10 @@ fn on_body_too_large_openapi_runtime_parity() {
             "runtime must accept documented on_body_too_large value {value}"
         );
     }
+    assert!(
+        Waf::new(&json!({ "mode": "monitor", "on_body_too_large": null })).is_ok(),
+        "runtime must accept an explicit null as the documented default"
+    );
 }
 
 // ── Issue #4519 coverage: BOM / declaration resolution paths ────────────────
@@ -7729,5 +7735,690 @@ async fn wide_body_filters_and_wire_size_limits_still_apply() {
                 );
             }
         }
+    }
+}
+
+// ── Issue #5117: stream inspection is scoped to its actual transport ────────
+
+use ferrum_edge::plugins::StreamFrontendTransport;
+
+/// A UDP/DTLS session runs the same connection-admission hook as TCP but has no
+/// TCP first bytes to capture. `inspect_tcp` governs that capture, so it must
+/// not judge a datagram session: with the documented stream defaults
+/// (`inspect_tcp: true`, `inspect_udp: true`) a clean UDP session used to be
+/// rejected at admission before its own per-datagram policy could ever run.
+fn stream_ctx_for_transport(
+    transport: StreamFrontendTransport,
+    backend_scheme: BackendScheme,
+) -> StreamConnectionContext {
+    let mut ctx = StreamConnectionContext::new(
+        "203.0.113.10".to_string(),
+        "203.0.113.10".to_string(),
+        "udp-proxy".to_string(),
+        Some("UDP Proxy".to_string()),
+        9000,
+        backend_scheme,
+        Arc::new(ConsumerIndex::new(&[])),
+    );
+    ctx.frontend_transport = transport;
+    ctx
+}
+
+#[tokio::test]
+async fn udp_session_admission_ignores_the_tcp_first_byte_guard() {
+    let plugin = sig_waf("enforce");
+    let mut sctx = stream_ctx_for_transport(StreamFrontendTransport::Udp, BackendScheme::Udp);
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a UDP session carries no TCP first bytes and must still be admitted"
+    );
+    assert!(
+        sctx.metadata
+            .as_ref()
+            .is_none_or(|md| !md.contains_key("waf.block_reason")),
+        "no TCP first-bytes block reason may be recorded for a UDP session"
+    );
+}
+
+#[tokio::test]
+async fn dtls_session_admission_ignores_the_tcp_first_byte_guard() {
+    let plugin = sig_waf("enforce");
+    let mut sctx = stream_ctx_for_transport(StreamFrontendTransport::Dtls, BackendScheme::Dtls);
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn admitted_udp_session_still_drops_a_matching_datagram() {
+    // The full lifecycle with default stream settings: admission first, then the
+    // per-datagram policy. A clean datagram is forwarded and a signature match
+    // is still dropped.
+    let plugin = sig_waf("enforce");
+    let mut sctx = stream_ctx_for_transport(StreamFrontendTransport::Udp, BackendScheme::Udp);
+    assert!(matches!(
+        plugin.on_stream_connect(&mut sctx).await,
+        PluginResult::Continue
+    ));
+
+    assert_eq!(
+        plugin
+            .on_udp_datagram(&udp_ctx(b"hello", StreamBytesKind::PlaintextWire))
+            .await,
+        UdpDatagramVerdict::Forward
+    );
+    assert_eq!(
+        plugin
+            .on_udp_datagram(&udp_ctx(
+                b"id=1 UNION SELECT secret",
+                StreamBytesKind::PlaintextWire
+            ))
+            .await,
+        UdpDatagramVerdict::Drop
+    );
+}
+
+#[tokio::test]
+async fn tcp_missing_first_bytes_still_fails_closed() {
+    // The TCP contract is unchanged: an inspectable TCP stream that produced no
+    // opening bytes before the capture deadline still fails closed in enforce
+    // mode when an enforce-action signature is configured.
+    let plugin = sig_waf("enforce");
+    let mut sctx = stream_ctx_absent();
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    let md = sctx.metadata.as_ref().expect("metadata");
+    assert_eq!(
+        md.get("waf.block_reason").map(String::as_str),
+        Some("first_bytes_unavailable")
+    );
+}
+
+// ── Issue #5121: stream enforce admission mirrors runtime reachability ──────
+
+fn stream_only_waf(stream: serde_json::Value) -> Result<Waf, String> {
+    Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "stream": stream,
+    }))
+}
+
+fn stream_signature() -> serde_json::Value {
+    json!([{ "id": "STREAM-1", "pattern": "AUDIT_MARKER", "action": "enforce" }])
+}
+
+#[test]
+fn enforce_admission_rejects_a_response_only_stream_policy() {
+    // `inspect_response` is read INSIDE the datagram hook, after `inspect_udp`
+    // has admitted it, so with both transports off no runtime hook can ever
+    // apply the signature.
+    let err = stream_only_waf(json!({
+        "inspect_tcp": false,
+        "inspect_udp": false,
+        "inspect_response": true,
+        "signatures": stream_signature(),
+    }))
+    .expect_err("a response-only stream policy has no reachable hook");
+    assert!(
+        err.contains("no enabled enforcement path"),
+        "admission must name the reachability gate: {err}"
+    );
+}
+
+#[test]
+fn enforce_admission_accepts_every_reachable_stream_switch_combination() {
+    for (inspect_tcp, inspect_udp, inspect_response) in [
+        (true, true, false),
+        (true, true, true),
+        (true, false, false),
+        (true, false, true),
+        (false, true, false),
+        (false, true, true),
+    ] {
+        assert!(
+            stream_only_waf(json!({
+                "inspect_tcp": inspect_tcp,
+                "inspect_udp": inspect_udp,
+                "inspect_response": inspect_response,
+                "signatures": stream_signature(),
+            }))
+            .is_ok(),
+            "tcp={inspect_tcp} udp={inspect_udp} response={inspect_response} is reachable"
+        );
+    }
+    for inspect_response in [false, true] {
+        assert!(
+            stream_only_waf(json!({
+                "inspect_tcp": false,
+                "inspect_udp": false,
+                "inspect_response": inspect_response,
+                "signatures": stream_signature(),
+            }))
+            .is_err(),
+            "no transport enabled is unreachable regardless of inspect_response"
+        );
+    }
+}
+
+#[test]
+fn the_tls_shape_guard_still_admits_enforce_without_any_signature_hook() {
+    assert!(
+        stream_only_waf(json!({
+            "tcp_require_tls": true,
+            "inspect_tcp": false,
+            "inspect_udp": false,
+        }))
+        .is_ok(),
+        "tcp_require_tls is its own enforcement path"
+    );
+}
+
+#[test]
+fn monitor_mode_keeps_an_unreachable_stream_policy_constructible() {
+    // Admission reachability is an `enforce`-mode gate; monitor semantics are
+    // unchanged.
+    assert!(
+        Waf::new(&json!({
+            "mode": "monitor",
+            "include_default_rules": false,
+            "stream": {
+                "inspect_tcp": false,
+                "inspect_udp": false,
+                "inspect_response": true,
+                "signatures": stream_signature(),
+            },
+        }))
+        .is_ok()
+    );
+}
+
+// ── Issue #5118: false-positive filters apply to non-UTF-8 body matches ─────
+
+/// A request WAF whose single body rule carries `fp_filters`, or whose instance
+/// carries `global_exemptions.fp_capture_filters`, depending on `global`.
+fn fp_filtered_body_waf(global: bool, direction: &str) -> Waf {
+    let mut rule = json!({
+        "id": "CUSTOM-FP",
+        "name": "audit marker",
+        "category": "custom",
+        "severity": "high",
+        "target": direction,
+        "match_kind": "contains",
+        "pattern": "AUDIT_MARKER",
+        "action": "enforce"
+    });
+    let mut config = json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "scan_budget_ms": 0,
+        "inspect_binary_body": true,
+        "response_inspection": true,
+        "response_body_inspection": true,
+    });
+    if global {
+        config["global_exemptions"] = json!({ "fp_capture_filters": ["allow-note"] });
+    } else {
+        rule["fp_filters"] = json!(["allow-note"]);
+    }
+    config["custom_rules"] = json!([rule]);
+    Waf::new(&config).unwrap()
+}
+
+async fn scan_octet_stream_request(plugin: &Waf, body: &[u8]) -> PluginResult {
+    let mut request = ctx("POST", "/fp");
+    request
+        .headers
+        .insert("content-type".into(), "application/octet-stream".into());
+    let headers = request.headers.clone();
+    plugin
+        .on_final_request_body_with_context(&mut request, &headers, body)
+        .await
+}
+
+async fn scan_octet_stream_response(plugin: &Waf, body: &[u8]) -> PluginResult {
+    let mut request = ctx("GET", "/fp");
+    let headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/octet-stream".to_string(),
+    )]);
+    plugin
+        .finalize_client_visible_response_body(&mut request, 200, &headers, body)
+        .await
+}
+
+/// The same bytes with one trailing non-UTF-8 byte must be filtered exactly as
+/// the valid-UTF-8 form is: the byte-match path used to record the hit without
+/// consulting either filter set.
+#[tokio::test]
+async fn per_rule_fp_filters_suppress_a_non_utf8_request_body_match() {
+    let plugin = fp_filtered_body_waf(false, "body_text");
+
+    assert!(matches!(
+        scan_octet_stream_request(&plugin, b"AUDIT_MARKER allow-note").await,
+        PluginResult::Continue
+    ));
+    assert!(
+        matches!(
+            scan_octet_stream_request(&plugin, b"AUDIT_MARKER allow-note\xff").await,
+            PluginResult::Continue
+        ),
+        "a single non-UTF-8 byte must not bypass the configured fp_filter"
+    );
+}
+
+#[tokio::test]
+async fn global_fp_capture_filters_suppress_a_non_utf8_request_body_match() {
+    let plugin = fp_filtered_body_waf(true, "body_text");
+
+    assert!(matches!(
+        scan_octet_stream_request(&plugin, b"AUDIT_MARKER allow-note").await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        scan_octet_stream_request(&plugin, b"AUDIT_MARKER allow-note\xff").await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn per_rule_fp_filters_suppress_a_non_utf8_response_body_match() {
+    let plugin = fp_filtered_body_waf(false, "response_body");
+
+    assert!(matches!(
+        scan_octet_stream_response(&plugin, b"AUDIT_MARKER allow-note").await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        scan_octet_stream_response(&plugin, b"AUDIT_MARKER allow-note\xff").await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn global_fp_capture_filters_suppress_a_non_utf8_response_body_match() {
+    let plugin = fp_filtered_body_waf(true, "response_body");
+
+    assert!(matches!(
+        scan_octet_stream_response(&plugin, b"AUDIT_MARKER allow-note\xff").await,
+        PluginResult::Continue
+    ));
+}
+
+/// Filtering must stay precise: a body that does NOT satisfy the filter is
+/// still enforced, with or without a non-UTF-8 byte.
+#[tokio::test]
+async fn a_filter_miss_still_enforces_a_non_utf8_body_match() {
+    for global in [false, true] {
+        let plugin = fp_filtered_body_waf(global, "body_text");
+        assert!(
+            matches!(
+                scan_octet_stream_request(&plugin, b"AUDIT_MARKER").await,
+                PluginResult::Reject { .. }
+            ),
+            "utf-8 filter miss must still block (global={global})"
+        );
+        assert!(
+            matches!(
+                scan_octet_stream_request(&plugin, b"AUDIT_MARKER\xff").await,
+                PluginResult::Reject { .. }
+            ),
+            "non-utf-8 filter miss must still block (global={global})"
+        );
+    }
+}
+
+// ── GHSA-v8p4-f3c9-g3w4: size-only response postures claim origin decoding ──
+
+const ORIGIN_ENCODED_RESPONSE_METADATA_KEY: &str = "ferrum:origin_encoded_response";
+
+/// A response policy whose ONLY blocking disposition is the strict size cap:
+/// globally enforcing, one monitor-only response-body rule, and
+/// `on_body_too_large: block`. Nothing here can refuse a response except the
+/// cap — which is exactly why the cap must be measured against plaintext.
+fn size_only_enforcing_response_waf(mode: &str) -> Waf {
+    Waf::new(&json!({
+        "mode": mode,
+        "include_default_rules": false,
+        "scan_budget_ms": 0,
+        "response_inspection": true,
+        "response_body_inspection": true,
+        "on_body_too_large": "block",
+        "max_scan_bytes": 64,
+        "custom_rules": [{
+            "id": "CUSTOM-RESP-SIZE-ONLY",
+            "name": "observed response payload",
+            "category": "custom",
+            "severity": "high",
+            "target": "response_body",
+            "match_kind": "contains",
+            "pattern": "ferrum-observed-token",
+            "action": "monitor"
+        }]
+    }))
+    .unwrap()
+}
+
+fn origin_encoded_ctx() -> RequestContext {
+    let mut request = ctx("GET", "/report");
+    request.metadata.insert(
+        ORIGIN_ENCODED_RESPONSE_METADATA_KEY.to_string(),
+        "zstd".to_string(),
+    );
+    request
+}
+
+#[test]
+fn a_size_only_enforcing_response_policy_claims_the_decoded_representation() {
+    let plugin = size_only_enforcing_response_waf("enforce");
+    let request = origin_encoded_ctx();
+
+    assert!(
+        plugin.may_enforce_response_body_policy(&request),
+        "the pre-content-type over-approximation must include the strict size cap"
+    );
+    assert!(
+        plugin.enforces_response_body_policy(&request, Some("text/plain"), &[]),
+        "an origin-encoded response must be decoded before max_scan_bytes is measured"
+    );
+}
+
+#[test]
+fn a_monitor_mode_size_policy_does_not_claim_the_decoded_representation() {
+    // `on_body_too_large: block` only blocks while globally enforcing, so a
+    // monitor instance still loses an observation rather than the response.
+    let plugin = size_only_enforcing_response_waf("monitor");
+    let request = origin_encoded_ctx();
+
+    assert!(!plugin.may_enforce_response_body_policy(&request));
+    assert!(!plugin.enforces_response_body_policy(&request, Some("text/plain"), &[]));
+}
+
+#[test]
+fn an_identity_coded_response_is_never_claimed_by_the_size_policy() {
+    // No origin coding stamp: the buffered bytes are already the plaintext this
+    // plugin scans, so claiming would only risk a needless 502.
+    let plugin = size_only_enforcing_response_waf("enforce");
+    let request = ctx("GET", "/report");
+
+    assert!(!plugin.enforces_response_body_policy(&request, Some("text/plain"), &[]));
+}
+
+#[test]
+fn request_and_response_size_only_claims_agree() {
+    // The request side has claimed a size-only enforcing posture since #4006;
+    // this pins the two directions to the same rule.
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "scan_budget_ms": 0,
+        "on_body_too_large": "block",
+        "max_scan_bytes": 64,
+        "custom_rules": [{
+            "id": "CUSTOM-REQ-SIZE-ONLY",
+            "name": "observed request payload",
+            "category": "custom",
+            "severity": "high",
+            "target": "body_text",
+            "match_kind": "contains",
+            "pattern": "ferrum-observed-token",
+            "action": "monitor"
+        }]
+    }))
+    .unwrap();
+    let mut request = ctx("POST", "/upload");
+    request
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    let headers = request.headers.clone();
+
+    assert!(
+        plugin.enforces_final_request_body_policy(&request, &headers, &[]),
+        "the request side already claims a size-only enforcing posture"
+    );
+}
+
+// ── Issue #5120: the main plugin reference states the real lifecycle ────────
+
+/// The `waf` section of `docs/plugins.md`, bounded at the next `###` heading so
+/// a neighbouring plugin's rows can never satisfy an assertion about this one.
+fn waf_plugins_doc_section() -> &'static str {
+    const PLUGINS_DOC: &str = include_str!("../../../docs/plugins.md");
+    let section = PLUGINS_DOC
+        .split("\n### `waf`\n")
+        .nth(1)
+        .expect("waf reference section");
+    section.split("\n### ").next().unwrap_or(section)
+}
+
+/// `docs/plugins.md` is the reference most operators read first; its WAF
+/// summary listed only the compatibility response hook and the HTTP-family
+/// protocols, so the actual ordering contract was unrecoverable from it. The
+/// execution-order table is already parity-checked against
+/// `BUILTIN_PLUGIN_PARITY_META`; this pins the main reference to the same
+/// source of truth.
+#[test]
+fn waf_main_reference_summary_matches_the_parity_registry() {
+    use ferrum_edge::plugins::builtin_plugin_parity_meta;
+
+    let meta = builtin_plugin_parity_meta("waf").expect("waf parity meta");
+    let section = waf_plugins_doc_section();
+
+    // Each summary line is a bold label whose value may wrap across lines; the
+    // value ends at the next bold label or the end of its paragraph, whichever
+    // comes first, so a following paragraph cannot make an assertion vacuous.
+    let field = |label: &str| -> String {
+        let rest = section
+            .split(label)
+            .nth(1)
+            .unwrap_or_else(|| panic!("waf reference must carry {label}"));
+        let end = [rest.find("\n**"), rest.find("\n\n")]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(rest.len());
+        rest[..end]
+            .replace('\n', " ")
+            .replace('`', "")
+            .trim()
+            .to_string()
+    };
+
+    assert_eq!(field("**Priority:**"), meta.priority.to_string());
+
+    let documented: Vec<&str> = field("**Phase:**")
+        .split(',')
+        .map(str::trim)
+        .filter(|phase| !phase.is_empty())
+        .map(|phase| {
+            meta.active_phases
+                .split(',')
+                .map(str::trim)
+                .find(|known| *known == phase)
+                .unwrap_or_else(|| panic!("undocumented phase in the main reference: {phase}"))
+        })
+        .collect();
+    let expected: Vec<&str> = meta.active_phases.split(',').map(str::trim).collect();
+    assert_eq!(
+        documented, expected,
+        "the main reference must list exactly the registry's active phases, in order"
+    );
+
+    // The protocol line is prose rather than a cell, so assert it names every
+    // protocol the registry claims and marks the stream ones as conditional.
+    let protocols = field("**Protocol:**").to_ascii_lowercase();
+    for protocol in meta.matrix_protocols {
+        let name = match protocol {
+            ProxyProtocol::Http => "http",
+            ProxyProtocol::Grpc => "grpc",
+            ProxyProtocol::WebSocket => "websocket",
+            ProxyProtocol::Tcp => "tcp",
+            ProxyProtocol::Udp => "udp",
+        };
+        assert!(
+            protocols.contains(name),
+            "the main reference protocol line must name {name}: {protocols}"
+        );
+    }
+    assert!(
+        protocols.contains("stream"),
+        "TCP/UDP coverage is conditional on a stream block: {protocols}"
+    );
+}
+
+/// The `stream` key is accepted by the constructor, so the main reference's
+/// parameter table must carry it.
+#[test]
+fn waf_main_reference_parameter_table_documents_every_top_level_key() {
+    let section = waf_plugins_doc_section();
+
+    for key in [
+        "mode",
+        "default_rule_action",
+        "paranoia_level",
+        "request_inspection",
+        "request_body_inspection",
+        "response_inspection",
+        "response_body_inspection",
+        "log_to_metadata",
+        "log_to_stdout",
+        "scan_budget_ms",
+        "max_scan_bytes",
+        "on_scan_timeout",
+        "on_body_too_large",
+        "include_default_rules",
+        "disabled_default_rules",
+        "rule_modes",
+        "rule_overrides",
+        "custom_rules",
+        "scoring",
+        "global_exemptions",
+        "body_methods",
+        "body_content_types",
+        "inspect_multipart",
+        "inspect_binary_body",
+        "disallowed_methods",
+        "reject_status_code",
+        "reject_content_type",
+        "reject_body",
+        "stream",
+    ] {
+        assert!(
+            section.contains(&format!("| `{key}` |")),
+            "the waf parameter table must document `{key}`"
+        );
+    }
+}
+
+// ── Issue #5119: published schema and constructor admission agree ───────────
+
+/// One shared fixture matrix driven through BOTH validators.
+///
+/// Every case is a complete plugin config that is representable in JSON Schema:
+/// bounds, nullability, action aliases, required-field conditions, and
+/// non-empty identifiers. Deliberately excluded are the semantic checks a
+/// document schema cannot express — regex/CIDR syntax, rule-id resolution, and
+/// `mode: enforce` enforcement REACHABILITY — so every case here fixes
+/// `mode: monitor` and the constructor is the source of truth for the rest.
+#[test]
+fn waf_config_schema_and_constructor_admission_agree() {
+    use serde_json::Value as JsonValue;
+
+    let spec: JsonValue =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
+    let root = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/WafPluginConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&root)
+        .expect("WafPluginConfig schema compiles");
+
+    let body_rule = |extra: JsonValue| -> JsonValue {
+        let mut rule = json!({
+            "id": "CUSTOM-MATRIX",
+            "category": "custom",
+            "target": "body_text"
+        });
+        for (key, value) in extra.as_object().expect("rule overlay is an object") {
+            rule[key.as_str()] = value.clone();
+        }
+        json!({ "mode": "monitor", "custom_rules": [rule] })
+    };
+
+    let cases: Vec<JsonValue> = vec![
+        // Baseline and explicit-null defaults.
+        json!({ "mode": "monitor" }),
+        json!({ "mode": "monitor", "max_scan_bytes": null }),
+        json!({ "mode": "monitor", "scoring": null }),
+        json!({ "mode": "monitor", "stream": null }),
+        json!({ "mode": "monitor", "global_exemptions": null }),
+        json!({ "mode": "monitor", "on_body_too_large": null }),
+        // Numeric bounds.
+        json!({ "mode": "monitor", "max_scan_bytes": 0 }),
+        json!({ "mode": "monitor", "scan_budget_ms": -1 }),
+        json!({ "mode": "monitor", "paranoia_level": 5 }),
+        json!({ "mode": "monitor", "paranoia_level": 0 }),
+        json!({ "mode": "monitor", "reject_status_code": 600 }),
+        json!({ "mode": "monitor", "scoring": { "block_threshold": 0 } }),
+        json!({ "mode": "monitor", "scoring": { "block_threshold": 4294967296u64 } }),
+        json!({ "mode": "monitor", "scoring": { "enabled": false, "block_threshold": 0 } }),
+        // Runtime action aliases.
+        json!({ "mode": "monitor", "default_rule_action": "block" }),
+        json!({ "mode": "monitor", "default_rule_action": "log" }),
+        json!({ "mode": "monitor", "rule_modes": { "FE-XSS-001": "block" } }),
+        json!({ "mode": "monitor", "rule_modes": { "FE-XSS-001": "nonsense" } }),
+        // Non-empty identifiers and list elements.
+        json!({ "mode": "monitor", "body_methods": [""] }),
+        json!({ "mode": "monitor", "disabled_default_rules": [""] }),
+        json!({ "mode": "monitor", "reject_content_type": "" }),
+        // Per-rule overrides.
+        json!({ "mode": "monitor", "rule_overrides": { "FE-XSS-001": { "paranoia_min": 5 } } }),
+        json!({ "mode": "monitor", "rule_overrides": { "FE-XSS-001": { "score": 4294967296u64 } } }),
+        json!({ "mode": "monitor", "rule_overrides": { "FE-XSS-001": { "action": "block" } } }),
+        // Rule pattern / match_kind / target conditions.
+        body_rule(json!({})),
+        body_rule(json!({ "pattern": "needle" })),
+        body_rule(json!({ "id": "", "pattern": "needle" })),
+        body_rule(json!({ "match_kind": "luhn" })),
+        body_rule(json!({ "match_kind": "luhn", "target": "response_body" })),
+        body_rule(json!({ "match_kind": "luhn", "target": "header_values" })),
+        body_rule(json!({ "match_kind": "luhn", "target": "url_path" })),
+        body_rule(json!({ "pattern": "needle", "score": 4294967296u64 })),
+        body_rule(json!({ "pattern": "needle", "action": "reject" })),
+        body_rule(json!({ "pattern": "needle", "fp_filters": [""] })),
+        // Stream signatures.
+        json!({
+            "mode": "monitor",
+            "stream": { "signatures": [{ "id": "S", "pattern": "marker" }] }
+        }),
+        json!({
+            "mode": "monitor",
+            "stream": { "signatures": [{ "id": "S", "pattern": "marker", "severity": null }] }
+        }),
+        json!({ "mode": "monitor", "stream": { "signatures": [{ "id": "S" }] } }),
+        json!({
+            "mode": "monitor",
+            "stream": { "signatures": [{ "id": "", "pattern": "marker" }] }
+        }),
+    ];
+
+    for case in cases {
+        let schema_ok = validator.validate(&case).is_ok();
+        let runtime = Waf::new(&case);
+        let runtime_ok = runtime.is_ok();
+        assert_eq!(
+            schema_ok,
+            runtime_ok,
+            "schema valid={schema_ok}, constructor={:?}, config={case}",
+            runtime.err()
+        );
     }
 }

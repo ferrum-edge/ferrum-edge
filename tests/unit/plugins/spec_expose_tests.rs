@@ -98,6 +98,18 @@ impl<'a> MakeWriter<'a> for SharedWriter {
     }
 }
 
+fn gzip_bytes(plaintext: &[u8]) -> Vec<u8> {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(plaintext).expect("gzip compress");
+    encoder.finish().expect("gzip finish")
+}
+
+const GZIP_SPEC_JSON: &[u8] =
+    br#"{"openapi":"3.0.3","info":{"title":"Audit fixture","version":"1"},"paths":{}}"#;
+
 // === Plugin creation ===
 
 #[test]
@@ -749,6 +761,184 @@ async fn test_specz_request_fetches_mocked_spec_and_preserves_content_type() {
         }
         other => panic!("expected RejectBinary, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn test_gzip_origin_document_is_decoded_to_identity_before_cache_and_specz() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let gzipped = gzip_bytes(GZIP_SPEC_JSON);
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/origin/gzip"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(gzipped.clone())
+                .insert_header("content-type", "application/json")
+                .insert_header("content-encoding", "gzip"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = SpecExpose::new(
+        &json!({
+            "spec_url": format!("{}/origin/gzip", mock_server.uri()),
+            "cache_ttl_seconds": 60
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx("GET", "/spec-gzip/specz", "/spec-gzip");
+    let (status, body, headers) = reject_parts(plugin.on_request_received(&mut ctx).await);
+    assert_eq!(status, 200);
+    assert_eq!(body, GZIP_SPEC_JSON);
+    assert_eq!(headers.get("content-type").unwrap(), "application/json");
+    assert_eq!(
+        headers.get("content-length").and_then(|v| v.parse().ok()),
+        Some(GZIP_SPEC_JSON.len())
+    );
+    assert!(
+        !headers.contains_key("content-encoding"),
+        "identity /specz must not forward origin Content-Encoding: {headers:?}"
+    );
+    assert_eq!(
+        headers.get("x-content-type-options").map(String::as_str),
+        Some("nosniff")
+    );
+
+    let mut cached = make_ctx("GET", "/spec-gzip/specz", "/spec-gzip");
+    let (cached_status, cached_body, cached_headers) =
+        reject_parts(plugin.on_request_received(&mut cached).await);
+    assert_eq!(cached_status, 200);
+    assert_eq!(cached_body, GZIP_SPEC_JSON);
+    assert!(!cached_headers.contains_key("content-encoding"));
+}
+
+#[tokio::test]
+async fn test_gzip_origin_head_uses_decoded_representation_without_wire_body() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let gzipped = gzip_bytes(GZIP_SPEC_JSON);
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/origin/gzip"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(gzipped)
+                .insert_header("content-type", "application/json")
+                .insert_header("content-encoding", "gzip"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = SpecExpose::new(
+        &json!({
+            "spec_url": format!("{}/origin/gzip", mock_server.uri()),
+            "cache_ttl_seconds": 60
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut head_ctx = make_ctx("HEAD", "/spec-gzip/specz", "/spec-gzip");
+    let (head_status, head_representation, mut head_headers) =
+        reject_parts(plugin.on_request_received(&mut head_ctx).await);
+    assert_eq!(head_status, 200);
+    assert_eq!(head_representation, GZIP_SPEC_JSON);
+    assert_eq!(
+        head_headers
+            .get("content-length")
+            .and_then(|value| value.parse::<usize>().ok()),
+        Some(GZIP_SPEC_JSON.len())
+    );
+    assert!(!head_headers.contains_key("content-encoding"));
+
+    let (suppressed_status, suppressed_body, suppressed_headers) = reject_parts(
+        plugin
+            .after_proxy(&mut head_ctx, head_status, &mut head_headers)
+            .await,
+    );
+    assert_eq!(suppressed_status, 200);
+    assert!(suppressed_body.is_empty());
+    assert_eq!(suppressed_headers, head_headers);
+}
+
+#[tokio::test]
+async fn test_identity_content_encoding_is_served_as_identity() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/openapi.yaml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"openapi: 3.0.0\n".to_vec())
+                .insert_header("content-type", "application/yaml")
+                .insert_header("content-encoding", "identity"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = SpecExpose::new(
+        &json!({
+            "spec_url": format!("{}/openapi.yaml", mock_server.uri()),
+            "cache_ttl_seconds": 60
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx("GET", "/api/specz", "/api");
+    let (status, body, headers) = reject_parts(plugin.on_request_received(&mut ctx).await);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"openapi: 3.0.0\n");
+    assert!(!headers.contains_key("content-encoding"));
+}
+
+#[tokio::test]
+async fn test_unsupported_origin_content_encoding_returns_sanitized_502() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/origin/zstd"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(GZIP_SPEC_JSON.to_vec())
+                .insert_header("content-type", "application/json")
+                .insert_header("content-encoding", "zstd"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = SpecExpose::new(
+        &json!({
+            "spec_url": format!("{}/origin/zstd", mock_server.uri()),
+            "cache_ttl_seconds": 60
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx("GET", "/api/specz", "/api");
+    let (status, body, headers) = reject_parts(plugin.on_request_received(&mut ctx).await);
+    assert_eq!(status, 502);
+    let body_text = String::from_utf8(body).expect("json error body");
+    assert!(body_text.contains("Failed to decode"), "got: {body_text}");
+    assert!(
+        !body_text.contains("zstd"),
+        "public 502 must not echo the coding token: {body_text}"
+    );
+    assert_eq!(headers.get("content-type").unwrap(), "application/json");
 }
 
 #[tokio::test]

@@ -12,7 +12,7 @@ The CORS plugin handles the [CORS protocol](https://developer.mozilla.org/en-US/
 
 2. **Actual-request origin enforcement** -- Non-preflight requests that carry an `Origin` header are checked against the allowed origins list. A native direct policy rejects disallowed origins with `403 Forbidden` and the JSON body `{"error":"CORS origin not allowed"}`; an Istio projection forwards unmatched actual requests while stripping every upstream `Access-Control-*` response field and adding no gateway CORS authorization fields. `allowed_methods` and `allowed_headers` are preflight policy only: they never reject an actual request or re-authorize headers on that phase.
 
-3. **Response header injection** -- For allowed cross-origin requests that pass through to the backend, the plugin injects `Access-Control-Allow-Origin`, `Vary`, and optionally `Access-Control-Allow-Credentials` and `Access-Control-Expose-Headers` into the backend response before it reaches the client.
+3. **Response header injection** -- For allowed cross-origin requests that pass through to the backend, the plugin injects `Access-Control-Allow-Origin`, `Vary`, and optionally `Access-Control-Allow-Credentials` and `Access-Control-Expose-Headers` into the backend response before it reaches the client. Every participating CORS policy merges `Origin` into `Vary`, including responses to originless or unmatched requests. Preflight responses also vary on `Access-Control-Request-Method` and `Access-Control-Request-Headers`. Existing `Vary` tokens and `Vary: *` are preserved.
 
 Denials use JSON objects with a fixed `error` message. Denied method and header values are not reflected. Successful preflights keep their empty response bodies.
 
@@ -25,11 +25,11 @@ The CORS plugin is configured via the `plugin_configs` section in your YAML conf
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `allowed_origins` | `(string \| object)[]` | required, max 64 entries | Origins permitted to make cross-origin requests. Use `"*"` only for intentional allow-all. **Plain strings are native syntax:** exact `scheme://host[:port]` values are URL-parsed and canonicalized once at config load (scheme/host case, default ports, IDNA, IPv4, and IPv6) and matched case-insensitively, and `"*.company.com"` matches subdomains; request matching remains a direct comparison with no per-request URL parse/allocation. **Istio-shaped objects carry exactly one of `exact` / `prefix` / `regex` and retain literal source semantics:** object `exact` is a byte-for-byte, case-sensitive comparison with no canonicalization and no wildcard interpretation (so `{exact: "*.example.com"}` matches only that literal string), except `{exact: "*"}` which is Istio allow-all. Each matcher value is bounded at 512 bytes; regexes are compiled once at config construction/reload under explicit complexity limits. |
-| `allowed_methods` | `string[]` | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Preflight-only policy returned in `Access-Control-Allow-Methods`. Native preflights for unlisted methods are rejected with 403; the list is not evaluated against an actual request's method. |
-| `allowed_headers` | `string[]` | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Preflight-only policy returned in `Access-Control-Allow-Headers`. It is not evaluated against headers on the actual request. |
+| `allowed_methods` | `string[]` | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Case-sensitive preflight-only policy returned in `Access-Control-Allow-Methods`. Native preflights for unlisted methods are rejected with 403. With credentials disabled, `*` allows any valid method; with credentials enabled, it is a literal token. The list is not evaluated against an actual request's method. |
+| `allowed_headers` | `string[]` | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Case-insensitive preflight-only policy returned in `Access-Control-Allow-Headers`. With credentials disabled, `*` permits every header except `Authorization`, which requires an explicit entry. With credentials enabled, `*` is a literal token. It is not evaluated against headers on the actual request. |
 | `exposed_headers` | `string[]` | `[]` | Response headers the browser is allowed to access via JavaScript, returned in `Access-Control-Expose-Headers`. |
 | `allow_credentials` | `bool` | `false` | When `true`, sends `Access-Control-Allow-Credentials: true`. Cannot be used with wildcard origins, opaque exact `null`, or an effectively universal prefix/regex (see below). A credentialed prefix must be the host-bounded `scheme://host:` form. |
-| `max_age` | `u64` | `86400` | Number of seconds browsers should cache preflight results (`Access-Control-Max-Age`). |
+| `max_age` | `u64` | `86400` | Number of seconds browsers should cache preflight results (`Access-Control-Max-Age`), from 0 through 18446744073709551615. Translated Istio omission remains absent. |
 | `preflight_continue` | `bool` | `false` | When `true`, preflight requests are passed through to the backend instead of being short-circuited by the plugin. Useful if your backend needs to handle `OPTIONS` itself. |
 | `unmatched_preflights` | `forward` or `ignore` | not set | Translation marker used for Istio policies. `forward` represents omitted/`UNSPECIFIED`/`FORWARD`; `ignore` answers unmatched preflights locally with 200 and no CORS authorization fields. Its presence also preserves empty method/header lists and absent max age. Do not combine it with `preflight_continue`. |
 
@@ -122,20 +122,21 @@ plugin_configs:
 Apply different CORS policies to different proxied services. Attach the plugin to a specific proxy rather than using global scope.
 
 ```yaml
+version: "1"
 proxies:
   - id: "public-api"
     listen_path: "/api/public"
     backend_host: "public-svc.internal"
     backend_port: 8080
     plugins:
-      - "cors-permissive"
+      - plugin_config_id: "cors-permissive"
 
   - id: "admin-api"
     listen_path: "/api/admin"
     backend_host: "admin-svc.internal"
     backend_port: 8081
     plugins:
-      - "cors-strict"
+      - plugin_config_id: "cors-strict"
 
 plugin_configs:
   - id: "cors-permissive"
@@ -143,6 +144,7 @@ plugin_configs:
     config:
       allowed_origins: ["*"]
     scope: proxy
+    proxy_id: "public-api"
     enabled: true
 
   - id: "cors-strict"
@@ -153,6 +155,7 @@ plugin_configs:
       allowed_methods: ["GET", "POST"]
       max_age: 600
     scope: proxy
+    proxy_id: "admin-api"
     enabled: true
 ```
 
@@ -183,6 +186,15 @@ This allows:
 - `https://evil.com` ❌ (no match)
 
 > **Note:** Wildcard subdomain patterns match the host portion of syntactically valid HTTP(S) origins only. `*.company.com` matches any origin whose host ends with `.company.com`, with an optional numeric port. The bare domain (`company.com` without a subdomain) does **not** match — add it as a separate exact entry if needed.
+
+Native wildcard suffixes are DNS hostnames normalized to IDNA ASCII at config
+load: `*.bücher.example` matches `https://shop.xn--bcher-kva.example`.
+URL delimiters, percent-encoding, whitespace, control characters, IP literals,
+and empty labels are rejected. After IDNA conversion, labels contain ASCII
+letters, digits, or interior hyphens, with a maximum of 63 bytes per label and
+253 bytes for the hostname excluding an optional trailing root dot. A root dot
+is preserved, so `*.company.com.` requires the request host's trailing dot too.
+Istio object matchers retain their literal semantics.
 
 ### Example 5: Exact / Prefix / Regex Origin Matchers (Istio `StringMatch`)
 
@@ -229,6 +241,10 @@ Origin matchers are admitted against explicit bounds on the cold config path. Ev
 | Compiled regex program size | 64 KiB |
 | Regex lazy-DFA cache | 64 KiB |
 | Regex AST nesting depth | 24 |
+
+OpenAPI applies `maxLength: 512` to every matcher form, including native exact
+origins. JSON Schema counts characters; the runtime additionally checks the
+512-byte UTF-8 budget, so a non-ASCII value can reach that limit sooner.
 
 The `regex` crate is finite-automaton based, so a hostile pattern cannot cause catastrophic backtracking; the bounds above additionally cap compile-time memory and per-match cache growth. An empty or whitespace-only `exact`, an empty `prefix` (which would match every origin), and an invalid or over-complex pattern are all rejected when the plugin is created. A non-empty prefix that does not terminate at an origin boundary — anything but the `scheme://host:` form, including `https://app.example.com`, `https://app.`, `https://app.example.com:8443`, `https://`, and `h` — is admitted without credentials but is **not** a strict origin policy; combined with `allow_credentials: true` it is refused. Regex universality is probed against a fixed set of reserved DNS-shaped origins (`.invalid` / `.example` / `.test`) rather than IP literals, so a hostname-character-class regex such as `https://[\\w.-]+` is correctly classified as effectively universal, while an anchored host-constraining pattern such as `^https://[a-z0-9-]+\\.example\\.com$` stays strict. The same predicates gate the Istio VirtualService translator and native/file mesh validation, so an unrepresentable source policy is reported as a deferred field instead of failing plugin construction later.
 
@@ -301,6 +317,15 @@ because they govern preflight only. On preflight, allowed methods and request
 headers also intersect and the shortest max age wins, so an empty translated
 Istio list cannot be widened by a permissive native instance. A permissive
 earlier instance cannot short-circuit a stricter later preflight policy.
+
+Method intersections are case-sensitive (`REPORT` and `report` are distinct);
+header-name intersections are case-insensitive. An uncredentialed wildcard
+intersected with a specific list retains that list. `Authorization` survives
+only when every sibling lists it explicitly, even if a sibling allows `*`.
+Each policy's credential setting controls its wildcard meaning; a credentialed
+policy's literal `*` never becomes a wildcard when composed with a policy that
+disables credentials. That literal token is omitted from an uncredentialed
+aggregate response because it cannot be serialized there without widening it.
 
 Priority overrides that interleave another HTTP/gRPC-capable plugin inside the
 CORS block are rejected at cache construction. Stream-only and other plugins

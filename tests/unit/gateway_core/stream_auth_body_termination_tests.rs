@@ -58,6 +58,27 @@ impl Drop for ProbeBody {
     }
 }
 
+/// A backend response that is ALREADY complete before it is polled: the shape a
+/// gRPC Trailers-Only answer takes, where END_STREAM rides the response HEADERS
+/// and no body frame is ever produced.
+struct EndedBody;
+
+impl http_body::Body for EndedBody {
+    type Data = Bytes;
+    type Error = ProxyBodyError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        std::task::Poll::Ready(None)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        true
+    }
+}
+
 fn elapsed_deadline(termination: StreamAuthTermination) -> StreamAuthDeadline {
     StreamAuthDeadline {
         at: tokio::time::Instant::now()
@@ -528,6 +549,66 @@ async fn a_body_with_no_authorization_deadline_streams_to_completion() {
         b"public".as_slice()
     );
     assert!(body.frame().await.is_none());
+}
+
+// --- An already-complete response keeps its END_STREAM framing --------------
+//
+// A gRPC Trailers-Only answer is HEADERS carrying `grpc-status` with
+// END_STREAM and no body frames at all, so its body reports end of stream
+// before it is ever polled. The pump-backed authorization wrapper reports
+// `is_end_stream() == false` until it has delivered a terminal, so installing
+// it over such a body costs the initial HEADERS their END_STREAM flag and
+// appends an empty DATA frame — a two-frame response where the backend wrote
+// one. Every mesh chain reaches this: `spiffe_identity` admits a
+// certificate-derived principal (GHSA-qqg9-3r2g-fh44), which makes
+// `effective_request_auth_deadline` return a plan for ordinary
+// `spiffe_identity` + `mesh_authz` traffic that carries no `mtls_auth`.
+
+#[tokio::test]
+async fn an_already_complete_response_is_returned_with_its_end_stream_intact() {
+    let mut body = proxy_body_with_authorization_deadline_for_test(
+        proxy_body_streaming_for_test(Box::pin(EndedBody)),
+        future_deadline(
+            Duration::from_secs(3_600),
+            StreamAuthTermination::CredentialExpired,
+        ),
+        None,
+        StreamAuthProtocolFamily::Grpc,
+        None,
+    );
+
+    // Read BEFORE the response head is written: a `false` here is what costs a
+    // Trailers-Only answer its END_STREAM flag on the wire.
+    assert!(
+        Body::is_end_stream(&body),
+        "a complete response must still report end of stream once bounded"
+    );
+    assert!(body.frame().await.is_none(), "no frame may be fabricated");
+}
+
+#[tokio::test]
+async fn an_already_elapsed_bound_still_replaces_a_complete_response() {
+    let mut body = proxy_body_with_authorization_deadline_for_test(
+        proxy_body_streaming_for_test(Box::pin(EndedBody)),
+        elapsed_deadline(StreamAuthTermination::CredentialExpired),
+        None,
+        StreamAuthProtocolFamily::Grpc,
+        None,
+    );
+
+    // The framing exemption above is narrowed to a LIVE bound: an elapsed one
+    // writes the gateway's own terminal, so the upstream's framing is not what
+    // reaches the client.
+    let frame = body
+        .frame()
+        .await
+        .expect("an elapsed bound must terminate the response")
+        .expect("terminal frame must be readable");
+    let trailers = frame
+        .trailers_ref()
+        .expect("native gRPC terminates in trailers");
+    assert_eq!(trailers.get("grpc-status").unwrap().to_str().unwrap(), "16");
+    assert!(body.frame().await.is_none(), "no second completion");
 }
 
 // --- The gateway-owned response watchdog (issue #3815) ----------------------

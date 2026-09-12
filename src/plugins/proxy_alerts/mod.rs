@@ -65,6 +65,8 @@
 //!   lifecycle eviction use one process-monotonic clock. UTC is consulted only
 //!   for quiet-hour policy and human-readable notification timestamps.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -75,7 +77,6 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::Value;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tracing::warn;
 
 use crate::notifications::dispatch::{DeliveryCallback, DeliveryRetryPolicy};
 use crate::notifications::generation::{DispatchGeneration, DispatchSettle};
@@ -638,7 +639,7 @@ impl ProxyAlerts {
             Ok(permit) => Some(permit),
             Err(_) => {
                 crate::notifications::metrics::global().record_backpressure_dropped(channel_type);
-                warn!(
+                warn_sampled!(
                     plugin = "proxy_alerts",
                     channel = %channel_name,
                     channel_type,
@@ -690,7 +691,7 @@ impl ProxyAlerts {
             }
         });
         if !spawned {
-            warn!(
+            warn_sampled!(
                 plugin = "proxy_alerts",
                 channel = %channel.name(),
                 channel_type,

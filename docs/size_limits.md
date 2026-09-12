@@ -76,7 +76,7 @@ returned from the `Content-Length` fast path without reading body bytes.
 
 Response body limits protect against backends sending unexpectedly large payloads. Enforcement splits on whether the overrun is known **before** downstream response headers are committed:
 
-1. **Declared-size or buffered pre-commit rejection**: If the backend's `Content-Length` exceeds `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`, or if the response is collected under `response_body_mode: buffer` / plugin-forced buffering and the accumulated body crosses the limit before any response bytes are sent downstream, the gateway rejects with a protocol-normalized error (HTTP JSON `502` on ordinary HTTP paths; trailers-only `RESOURCE_EXHAUSTED` on native gRPC buffered paths). No downstream body streaming has begun.
+1. **Declared-size or buffered pre-commit rejection**: If the backend's transferable `Content-Length` exceeds `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` (or the stricter active route ceiling from `response_size_limiting`), or if the response is collected under `response_body_mode: buffer` / plugin-forced buffering and the accumulated body crosses the limit before any response bytes are sent downstream, the gateway rejects with a protocol-normalized error (HTTP JSON `502` on ordinary HTTP paths; trailers-only `RESOURCE_EXHAUSTED` on native gRPC buffered paths). No downstream body streaming has begun. Bodyless replies (`HEAD`, `1xx`, `204`/`205`/`304`) may advertise a representation `Content-Length` while sending zero body bytes (RFC 9110 §8.6 / §6.4.1); that header is not compared against the ceiling.
 2. **Unknown-length streaming post-commit termination**: When streaming and the **backend** did not declare a canonical `Content-Length` (captured before `after_proxy`; a hook-authored field cannot substitute), the gateway does **not** fall back to full-body buffering solely to enforce the limit. It wraps the body in a size-limited streaming adapter (`SizeLimitedStreamingResponse` on the reqwest HTTP/1.1 + HTTP/2 path; `SizeLimitedFrameSource` / size-limited coalescing builders on direct HTTP/2, gRPC, and HTTP/3). Frames are forwarded until the running count crosses the limit; the body then terminates with a stream/body error classified as `ResponseBodyTooLarge`. Downstream headers — and the original backend status — may already be visible to the client, so the gateway cannot replace the response with a JSON `502`. A custom `after_proxy` hook that inserts or rewrites `Content-Length` cannot suppress this adapter or select the large-response direct-H2 passthrough.
 
 ### Interaction with Response Body Streaming
@@ -86,7 +86,7 @@ When `response_body_mode: stream` is configured (the default), the gateway can f
 | Scenario | Size limit | Content-Length | Behavior |
 |----------|------------|----------------|----------|
 | Stream mode | Enabled | Present, within limit | Stream directly (or eagerly buffer when ≤ the adaptive cutoff) |
-| Stream mode | Enabled | Present, exceeds limit | Pre-commit reject (`502` / protocol-normalized) before body bytes flow |
+| Stream mode | Enabled | Present, exceeds limit | Pre-commit reject (`502` / protocol-normalized) before body bytes flow. Bodyless `HEAD` / `1xx` / `204`/`205`/`304` replies skip this comparison: their `Content-Length` is representation metadata, not transferred bytes. |
 | Stream mode | Enabled | Absent (backend-observed) | Stream with `SizeLimitedStreamingResponse` (or protocol-equivalent) — frame-by-frame enforcement; overrun terminates the body after commit |
 | Stream mode | Disabled (`0`) | Any | Stream with no size checks |
 | Buffer mode / plugin buffering | Any nonzero | Any | Collect with a running counter; overrun returns the pre-commit rejection above |
@@ -104,7 +104,7 @@ Ordinary plain-HTTPS traffic prefers the multiplexed direct HTTP/2 pool whenever
 |---------|------------|------------------------|
 | Request body | Declared `Content-Length` over limit | `413` / `RequestBodyTooLarge` **before** dial/admission (same deferred-admission ordering as reqwest) |
 | Request body | Unknown length / mid-stream | Frame-by-frame via `SizeLimitedIncoming`; `413` / `RequestBodyTooLarge`, `connection_error=false` |
-| Response body | Declared `Content-Length` over limit | `502` / `ResponseBodyTooLarge` before body bytes flow |
+| Response body | Declared transferable `Content-Length` over limit | `502` / `ResponseBodyTooLarge` before body bytes flow. `HEAD` / `1xx` / `204`/`205`/`304` representation lengths are exempt. |
 | Response body | Unknown length / mid-stream | Size-limited H2 body adapters; post-commit stream termination after the limit |
 
 `SizeLimitedIncoming` treats `max_bytes = 0` as deny-all. A **nonzero** operator cap is passed to the limiter as that budget. Operator `0` (unlimited) on ordinary direct-H2 does **not** wrap `SizeLimitedIncoming`: the client `Incoming` is forwarded with only the early-return cancel channel, which is the Jun 19 hot path the HTTP/2 protocol bench uses (`FERRUM_MAX_*_BODY_SIZE_BYTES=0`, issue #3942). That passthrough arm tallies DATA frames in a plain `u64` (no per-frame atomic) and publishes `bytes_sent_observed` once at end-of-stream, body error, cancellation, or `Drop`. HTTP/2 may still return backend response headers while that upload is in hyper's detached pipe; transaction summaries and `api_chargeback` wait for that publication rather than freezing a header-flush snapshot. Mesh/HBONE pools that share a limiter-typed sender still map `0` to `usize::MAX` before constructing the adapter.
@@ -392,6 +392,7 @@ Beyond request/response size limits, the Admin API enforces validation on all co
 | `success_threshold` | 1–10,000 | Successes to close |
 | `timeout_seconds` | 1–86,400 | Open-state duration |
 | `half_open_max_requests` | 1–10,000 | Probe requests in half-open |
+| `half_open_probe_dwell_seconds` | 1–86,400 (optional) | Unsettled probe-slot dwell before reclaim |
 | `failure_status_codes` | 50 entries, 100–599 | Status codes that count as failure |
 
 ### Retry Config Fields

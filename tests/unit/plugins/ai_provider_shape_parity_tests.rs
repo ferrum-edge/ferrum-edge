@@ -21,7 +21,10 @@
 //! `ai_prompt_shield` / `ai_request_guard` gaps — Converse `toolResult` and
 //! `guardContent`, Anthropic `tool_result` blocks, Cohere v1
 //! `message`/`preamble`/`chat_history`, Hugging Face TGI `inputs`, and Vertex
-//! legacy `instances[].prompt` — closed last.
+//! legacy `instances[].prompt` — closed after them. Issue #5431 closed the last
+//! pair the other way round: `ai_request_guard` learned Converse
+//! `toolUse.input` and member-wise Cohere `documents[]` first, and its two
+//! siblings followed.
 //!
 //! Out of scope here: `ai_tool_governor` (governs tool-call and tool-definition
 //! shapes, not prompt text — its provider parity is covered by its own tests
@@ -197,8 +200,43 @@ fn provider_shapes() -> Vec<ProviderShape> {
             request_guard: Coverage::Extracts,
         },
         ProviderShape {
+            // The untyped Converse spelling of a tool call. The block carries
+            // no `text` and no `type` discriminator, so neither the typed
+            // `tool_use` arm nor a `content[].text` reader visits it, while the
+            // arguments it carries are replayed to the model on the next turn.
+            name: "bedrock converse messages[].content[].toolUse.input",
+            body: json!({
+                "messages": [{
+                    "role": "assistant",
+                    "content": [{
+                        "toolUse": {
+                            "toolUseId": "tooluse_1",
+                            "name": "lookup_account",
+                            "input": {"query": MARKER}
+                        }
+                    }]
+                }]
+            }),
+            semantic_firewall: Coverage::Extracts,
+            prompt_shield: Coverage::Extracts,
+            request_guard: Coverage::Extracts,
+        },
+        ProviderShape {
             name: "cohere v1 chat message",
             body: json!({"message": MARKER, "preamble": "Be helpful."}),
+            semantic_firewall: Coverage::Extracts,
+            prompt_shield: Coverage::Extracts,
+            request_guard: Coverage::Extracts,
+        },
+        ProviderShape {
+            // A Cohere v1 document is an arbitrary string-to-string map whose
+            // eligible members the provider all serializes into the prompt, so
+            // a reader that stops at a recognized `text` member never sees a
+            // payload smuggled into `snippet` (or any operator-chosen key).
+            name: "cohere v1 documents[] map member",
+            body: json!({
+                "documents": [{"id": "doc-1", "snippet": MARKER}]
+            }),
             semantic_firewall: Coverage::Extracts,
             prompt_shield: Coverage::Extracts,
             request_guard: Coverage::Extracts,
@@ -336,8 +374,9 @@ fn every_request_plugin_covers_every_shape_in_the_table() {
     // on the Gemini, Bedrock Titan, and Bedrock Converse text shapes, then on
     // the tool-result / guarded-text / Cohere / TGI / Vertex shapes the #4900
     // review round added to this table. `ai_request_guard` carried it on
-    // Converse `toolResult` and Vertex `instances[].prompt`. All of them are
-    // closed.
+    // Converse `toolResult` and Vertex `instances[].prompt`, and the firewall
+    // and the shield carried it on Converse `toolUse.input` and member-wise
+    // Cohere `documents[]` until #5431. All of them are closed.
     //
     // Every column is asserted all-`Extracts` directly rather than only
     // per-row, so a regression cannot be papered over by re-recording a cell

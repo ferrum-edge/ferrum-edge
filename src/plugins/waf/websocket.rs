@@ -63,13 +63,14 @@
 //! Control frames (Ping / Pong / Close) are protocol machinery, never
 //! application payload, and are passed through untouched.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tracing::warn;
 
 use super::rules::{RuleAction, Severity};
 use super::scan::{ScanOutcome, ScanSubject};
@@ -252,7 +253,7 @@ impl WafWsSession {
         // repeat per message, so it stays behind `log_to_stdout`. Both records
         // are fixed-cardinality; neither logs message bytes.
         if should_block || self.waf.config.log_to_stdout {
-            warn!(
+            warn_sampled!(
                 target: "waf",
                 plugin = "waf",
                 proxy = %proxy_id,
@@ -281,7 +282,7 @@ impl WafWsSession {
     ) -> Option<Message> {
         let blocked = self.policy.enforces(body_direction(direction));
         if blocked || self.waf.config.log_to_stdout {
-            warn!(
+            warn_sampled!(
                 target: "waf",
                 plugin = "waf",
                 proxy = %proxy_id,
@@ -332,7 +333,7 @@ impl WafWsSession {
                 first_blocking_rule = Some(rule.id.as_str());
             }
             if self.waf.config.log_to_stdout {
-                warn!(
+                warn_sampled!(
                     target: "waf",
                     plugin = "waf",
                     proxy = %proxy_id,
@@ -358,7 +359,7 @@ impl WafWsSession {
             // transaction-summary metadata surface of its own, so this warning
             // is the operator's record of the decision. Fixed-cardinality
             // fields only — no message bytes are ever logged.
-            warn!(
+            warn_sampled!(
                 target: "waf",
                 plugin = "waf",
                 proxy = %proxy_id,
@@ -373,7 +374,7 @@ impl WafWsSession {
             return Some(policy_close(CLOSE_REASON_RULE));
         }
         if score_block {
-            warn!(
+            warn_sampled!(
                 target: "waf",
                 plugin = "waf",
                 proxy = %proxy_id,
@@ -403,7 +404,7 @@ impl WafWsSession {
         }
         let block = matches!(self.waf.config.on_scan_timeout, TimeoutAction::Block);
         if block || self.waf.config.log_to_stdout {
-            warn!(
+            warn_sampled!(
                 target: "waf",
                 plugin = "waf",
                 proxy = %proxy_id,

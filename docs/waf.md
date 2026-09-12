@@ -391,7 +391,11 @@ paranoia, change severity/score, or set a per-rule `action`. Per-rule
 `fp_filters` are unanchored regular expressions evaluated against the **complete
 inspected target value** after the rule matcher finds a hit — for example the
 full query value, header value, or `body_json_path` scalar string — not merely
-the substring that satisfied `contains`/`regex`/…:
+the substring that satisfied `contains`/`regex`/…. A body carrying non-UTF-8
+bytes is filtered too: the filter (and `global_exemptions.fp_capture_filters`)
+sees the same lossy text view the wide-charset path uses, with invalid bytes
+replaced by `U+FFFD`, so binary and legacy-encoded content is suppressed on the
+same terms as text:
 
 ```json
 {
@@ -524,6 +528,14 @@ H2, and H3 behave identically, and the request decision is made on the finalized
 backend-visible body — a request transformer that grows a body past the cap is
 still governed.
 
+**The cap is measured against plaintext, in both directions.** A globally
+enforcing `on_body_too_large: block` is itself a blocking disposition, so a
+request or response whose ORIGIN declared a `Content-Encoding` is decoded by the
+shared representation gate before the cap is applied — even when every
+applicable body rule is monitor-only. Otherwise a compressed body would slip
+under a cap its plaintext exceeds. `mode: monitor` never claims: an undecodable
+origin coding there costs an observation, not the response.
+
 Prefer sizing over rejecting where you can: setting `max_scan_bytes` at or above
 the effective request/response ceiling (including any route-scoped ceiling)
 means no admitted body is ever oversize, and `fail_closed` never fires.
@@ -635,10 +647,12 @@ and later instances are not invoked for it.
 **Observability.** A closed WebSocket session has no per-message
 transaction-summary surface, so message findings are emitted as
 fixed-cardinality `waf`-target log events instead of `waf.*` transaction
-metadata: one event for every block (always, since the close is the only other
+metadata: a diagnostic for every block (always, since the close is the only other
 signal), plus one per matched rule and one per non-blocking
 oversize/uninspectable/scan-timeout signal when `log_to_stdout` is enabled. No
-message bytes are logged. Monitor-mode WebSocket findings are non-blocking and
+message bytes are logged. Warnings are sampled once per source site per 10 seconds
+across all sessions, with suppressed-event counts; every diagnostic is available
+at debug level. Monitor-mode WebSocket findings are non-blocking and
 there is no per-message transaction metadata surface, so enable
 `log_to_stdout` when staging WebSocket policy in `mode: monitor`; otherwise
 those findings intentionally produce no operator-visible signal.
@@ -751,8 +765,21 @@ Limitations and behavior to know:
   session is established: there is no session summary to attach to, and emitting a
   per-datagram summary for a spoofable, sessionless datagram would be a log-flood
   amplifier, so those blocks surface only on the opt-in `log_to_stdout` channel.
+- **`inspect_tcp` governs a TCP-only surface.** It selects the opening-bytes
+  capture that only a TCP frontend performs. A UDP or DTLS session runs the same
+  connection-admission hook, but carries no TCP first bytes and is never judged
+  by this switch — its datagrams are governed entirely by `inspect_udp`. So the
+  documented defaults (`inspect_tcp: true`, `inspect_udp: true`) are usable on a
+  UDP route as-is: clean datagrams reach the backend, and a configured signature
+  match still drops.
 - By default only client→backend traffic is inspected; set `inspect_response`
-  to also scan backend→client datagrams.
+  to also scan backend→client datagrams. It is a **direction switch inside UDP
+  inspection**, not an independent surface: it is read after `inspect_udp` has
+  admitted the datagram hook, so `inspect_response: true` inspects nothing while
+  `inspect_udp` is false. Under `mode: enforce`, a stream policy whose only
+  claimed enforcement is a response-only direction with both `inspect_tcp` and
+  `inspect_udp` off is rejected at construction rather than silently doing
+  nothing.
 
 ## Observability
 
@@ -787,8 +814,10 @@ so enforce-mode impact stays directly countable before you switch modes — in
 particular the server-first `first_bytes_unavailable` false-positive risk noted
 above, whose would-blocks carry no `waf.rule_hits` to infer from.
 
-`log_to_stdout` additionally emits a dedicated structured `warn!`
-(`target: "waf"`) per matched rule, independent of any logging plugin. Each
+`log_to_stdout` additionally emits dedicated structured diagnostics
+(`target: "waf"`), independent of any logging plugin. Per-rule details are
+available at debug level; warnings sample one event per source site per 10 seconds
+and report `suppressed_events` (shared across rules and instances). Each
 event carries `action` as that rule's **effective direct outcome** after applying
 the global mode (`blocked`, `monitored`, or `disabled`) and `rule_action` as the
 configured rule action (`enforce`, `monitor`, or `disabled`). Aggregate anomaly
@@ -831,7 +860,7 @@ fire, then switch to `enforce`.
 | `reject_content_type` | string | `application/json` | blocked-response content type |
 | `reject_body` | string | `{"error":"Forbidden"}` | blocked-response body |
 | `log_to_metadata` | bool | `true` | write `waf.*` metadata |
-| `log_to_stdout` | bool | `false` | structured per-hit warning |
+| `log_to_stdout` | bool | `false` | structured hit diagnostics: sampled warnings and per-hit debug detail |
 | `stream` | object | _(off)_ | raw TCP/UDP inspection (see [Stream inspection](#stream-tcpudp-inspection)) |
 
 ### `stream` block
@@ -839,7 +868,7 @@ fire, then switch to `enforce`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `tcp_require_tls` | bool | `false` | reject TCP whose opening bytes aren't a TLS ClientHello (raw-wire proxies only) |
-| `inspect_tcp` | bool | `true` | run signatures over TCP opening bytes |
+| `inspect_tcp` | bool | `true` | run signatures over TCP opening bytes; TCP frontends only |
 | `inspect_udp` | bool | `true` | run signatures over UDP/DTLS datagrams |
-| `inspect_response` | bool | `false` | also scan backend→client datagrams |
+| `inspect_response` | bool | `false` | also scan backend→client datagrams; a direction switch inside UDP inspection, so it does nothing unless `inspect_udp` is on |
 | `signatures` | object[] | `[]` | byte-pattern rules: `id`, `pattern`, `severity?`, `action?` |

@@ -320,6 +320,7 @@ fn compare_service_graph_edges(
 
 fn service_graph_error(summary: &TransactionSummary, mesh_key: &MeshRequestKey) -> bool {
     summary.response_status_code >= 500
+        || summary.grpc_status().is_some_and(|status| status != 0)
         || mesh_key.response_flags.as_ref() != "-"
         || summary.error_class.is_some()
         || summary.body_error_class.is_some()

@@ -57,6 +57,8 @@
 //! `ai_semantic_firewall`, `ai_response_guard`, and the tool governance in
 //! `ai_semantic_firewall` for enforcement.
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Write};
@@ -89,7 +91,7 @@ use super::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metada
 use super::utils::response_body::{
     BoundedReadError, measure_response_body_bounded, read_response_body_bounded,
 };
-use super::utils::sink_loss::SinkLossReason;
+use super::utils::sink_loss::{SinkLossReason, record_dropped as record_sink_loss};
 use super::utils::{
     BatchConfig, BatchConfigDefaults, BatchingLoggerPermit, DeferredBatchingLogger,
     HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES, LoggerHooks, PluginHttpClient, build_batch_config,
@@ -1294,7 +1296,7 @@ fn expire_stream_reservation(
     let total = stream_reservations_expired
         .fetch_add(1, Ordering::Relaxed)
         .saturating_add(1);
-    tracing::warn!(
+    warn_sampled!(
         plugin = "ai_transcript_audit",
         expired = 1_u64,
         total_expired = total,
@@ -1332,6 +1334,14 @@ struct AuditRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<String>,
     status_code: u16,
+    /// Final client-visible gRPC application status. Present only when the
+    /// transaction ended as a gRPC call: native gRPC reports application
+    /// failure under HTTP 200, so `status_code` alone cannot convey the
+    /// outcome. A malformed peer value is reported as `u32::MAX` rather than
+    /// being allowed to look like success. Never the peer's `grpc-message`
+    /// text or `grpc-status-details-bin`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grpc_status: Option<u32>,
     mode: &'static str,
     sampled: bool,
     capture_reason: &'static str,
@@ -1703,6 +1713,23 @@ impl RecordsPerMinute {
             .map(RateLimitReservation::commit)
             .is_some()
     }
+
+    /// Non-consuming peek: whether the current window has already refused every
+    /// further reservation.
+    ///
+    /// Deliberately does NOT reserve. Only fail-closed *sink* admission reads
+    /// it, to decline to reject traffic on behalf of a record the finite window
+    /// can never export. A `true` grants nothing, and a stale `false` leaves
+    /// admission exactly where it was before, so unlike a non-consuming
+    /// *capture* peek this cannot let concurrent candidates amplify capture
+    /// past the configured ceiling.
+    fn window_exhausted(&self) -> bool {
+        if self.max_per_minute == 0 {
+            return false;
+        }
+        let (window, count) = Self::unpack(self.state.load(Ordering::Relaxed));
+        window == Self::current_window() && count >= self.max_per_minute
+    }
 }
 
 #[derive(Clone)]
@@ -1963,8 +1990,14 @@ impl AiTranscriptAudit {
             cfg_str(redaction_obj, "placeholder", "redaction")?.unwrap_or("[REDACTED:{type}]");
         let hash_redacted = cfg_bool(redaction_obj, "hash_redacted_values", true, "redaction")?;
         let hash_secret = cfg_str(redaction_obj, "hash_secret", "redaction")?;
+        // Counted in CHARACTERS, not UTF-8 bytes, so the admitted contract is
+        // the one the documentation, the diagnostic, and the JSON Schema
+        // `minLength` all state (JSON Schema counts code points, and a
+        // byte-counted minimum would silently admit an 8-character secret that
+        // the published component refuses). 16 characters is never fewer than
+        // 16 bytes, so this is the stricter of the two readings.
         if let Some(secret) = hash_secret
-            && secret.len() < 16
+            && secret.chars().count() < 16
         {
             return Err(
                 "ai_transcript_audit: 'redaction.hash_secret' must be at least 16 characters"
@@ -2443,6 +2476,29 @@ impl AiTranscriptAudit {
         sample_hit || self.sampling.always_on_error || self.sampling.always_on_guardrail
     }
 
+    /// Whether a finite sampling window could still admit an export for this
+    /// staged record.
+    ///
+    /// `sampling.max_records_per_minute` is a documented volume cap that drops
+    /// records and NEVER rejects traffic, so a record the window has already
+    /// refused must not select a fail-closed `503` on behalf of an audit record
+    /// that can never be written — nor take a queue permit and a retained-byte
+    /// reservation that a still-exportable record could use. A record holding a
+    /// capture-time reservation already owns its slot and is gated normally; an
+    /// override-only candidate acquires at enqueue, so the live window is the
+    /// only thing that can answer for it here.
+    ///
+    /// Export suppression is bounded by the window itself: traffic continues,
+    /// and the first record admitted after the window rolls over flushes
+    /// normally, which is the same background-send recovery probe that restores
+    /// `sink_healthy` on every other path.
+    fn capture_admission_possible(&self, staged: &AuditStaging) -> bool {
+        if staged.capture_skipped.is_some() {
+            return false;
+        }
+        staged.rate_reservation.is_some() || !self.rate_limiter.window_exhausted()
+    }
+
     /// Reserve fail-closed sink capacity before the response becomes
     /// immutable. The permit is stored with the bounded request staging and is
     /// consumed only after validators determine the final status/body.
@@ -2455,6 +2511,9 @@ impl AiTranscriptAudit {
                 return PluginResult::Continue;
             };
             if !self.commit_may_emit(staging.sample_hit) {
+                return PluginResult::Continue;
+            }
+            if !self.capture_admission_possible(&staging) {
                 return PluginResult::Continue;
             }
             let sample_hit = staging.sample_hit;
@@ -2491,7 +2550,11 @@ impl AiTranscriptAudit {
             return PluginResult::Continue;
         };
         let sample_hit = staging.sample_hit;
+        let admissible = self.capture_admission_possible(&staging);
         drop(staging);
+        if !admissible {
+            return PluginResult::Continue;
+        }
         self.ensure_sink_error_admission_for_sample(ctx, sample_hit)
     }
 
@@ -2608,6 +2671,9 @@ impl AiTranscriptAudit {
         let Some(mut staging) = self.staging.get_mut(&record_id) else {
             return PluginResult::Continue;
         };
+        if !self.capture_admission_possible(&staging) {
+            return PluginResult::Continue;
+        }
         if self.on_buffer_full == BufferFullPolicy::Reject && staging.commit_permit.is_none() {
             let Some(permit) = self.logger.try_reserve() else {
                 ctx.metadata
@@ -4111,6 +4177,7 @@ impl AiTranscriptAudit {
             model,
             provider,
             status_code: envelope.status_code,
+            grpc_status: final_grpc_status(metadata, response_headers),
             mode: self.mode.as_str(),
             sampled,
             capture_reason: reason,
@@ -4250,6 +4317,7 @@ impl Plugin for AiTranscriptAudit {
             on_failed_batch: Some(Arc::new(
                 move |_batch: Arc<Vec<QueuedAuditRecord>>, _error: String| {
                     healthy.store(false, Ordering::Relaxed);
+                    false
                 },
             )),
             ..LoggerHooks::default()
@@ -4826,11 +4894,13 @@ impl Plugin for AiTranscriptAudit {
             return;
         };
         let sample_hit = staging.sample_hit;
-        let (emit, reason) = self.emit_decision(
-            sample_hit,
-            guardrail_fired(&ctx.metadata),
-            response_status >= 400,
-        );
+        // A native gRPC call normally fails under HTTP 200, so the transport
+        // status alone would drop an ordinary RPC failure whenever the sampling
+        // roll lost — exactly the case `always_capture_on_error` covers.
+        let errored =
+            response_status >= 400 || grpc_call_failed(&ctx.metadata, Some(response_headers));
+        let (emit, reason) =
+            self.emit_decision(sample_hit, guardrail_fired(&ctx.metadata), errored);
         ctx.metadata
             .insert(MD_SAMPLED.to_string(), bool_str(sample_hit));
 
@@ -5153,7 +5223,13 @@ impl Plugin for AiTranscriptAudit {
             };
             sample_hit
         };
-        let errored = response_status >= 400 || !outcome.body_completed;
+        // The terminal gRPC status is known here: the deferred logger folds
+        // `outcome.grpc_status` into `metadata["grpc_status"]` before running
+        // these hooks, so a server-streaming RPC that completed its body under
+        // HTTP 200 with a non-zero final status is still an error for capture.
+        let errored = response_status >= 400
+            || !outcome.body_completed
+            || grpc_call_failed(&ctx.metadata, None);
         let guardrail = guardrail_fired(&ctx.metadata) || downstream_terminated;
         let response = if revoked || downstream_terminated {
             ResponseCapture {
@@ -5274,9 +5350,15 @@ impl Plugin for AiTranscriptAudit {
         };
 
         let sample_hit = staging.sample_hit;
+        // `TransactionSummary::grpc_status` is the same normalized terminal
+        // status the transaction log reports, including the Trailers-Only
+        // encoding and the `UNKNOWN` a gRPC transaction that never produced a
+        // terminal status carries. Without it a completed RPC failure — HTTP
+        // 200 plus a non-zero `grpc-status` — is lost whenever sampling loses.
         let errored = summary.response_status_code >= 400
             || (summary.response_streamed
-                && (!summary.body_completed || summary.body_error_class.is_some()));
+                && (!summary.body_completed || summary.body_error_class.is_some()))
+            || summary.grpc_status().is_some_and(|status| status != 0);
         let (emit, reason) =
             self.emit_decision(sample_hit, guardrail_fired(&summary.metadata), errored);
         if !emit {
@@ -5711,6 +5793,13 @@ fn validate_ack_json(bytes: &[u8]) -> Result<(), AckFailure> {
 /// - health goes true only after a 2xx whose acknowledgement fully drained and
 ///   validated. Each retry attempt re-publishes, so a batch that succeeds on
 ///   attempt N restores health at attempt N and not before.
+///
+/// Loss accounting: a permanent (non-retryable) 4xx returns `Ok` so the shared
+/// retry loop stops immediately, which also means that loop never sees the
+/// batch as lost. Those records are therefore counted here, exactly once, under
+/// the same `batch_discard` reason the retry-exhausted path uses. Every other
+/// terminal outcome returns `Err` and is counted by
+/// [`crate::plugins::utils::batching_logger`] after the retry budget is spent.
 fn classify_batch_delivery(
     cfg: &HttpFlushConfig,
     entry_count: usize,
@@ -5726,7 +5815,12 @@ fn classify_batch_delivery(
             && status != reqwest::StatusCode::REQUEST_TIMEOUT
             && status != reqwest::StatusCode::TOO_MANY_REQUESTS
         {
-            tracing::warn!(
+            record_sink_loss(
+                "ai_transcript_audit",
+                SinkLossReason::BatchDiscard,
+                entry_count as u64,
+            );
+            warn_sampled!(
                 "ai_transcript_audit batch discarded due to {} response ({} entries lost){}",
                 status,
                 entry_count,
@@ -6426,11 +6520,48 @@ fn merge_sse_scalar_fragment(target: &mut String, fragment: &str) {
 
 const MAX_JSON_REDACTION_DEPTH: usize = 64;
 
-fn redact_json_value_strings(redactor: &PiiRedactor, value: &mut Value) {
-    redact_json_value_strings_at_depth(redactor, value, 0);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsonRedactionContext {
+    Normal,
+    DataSourceItem,
 }
 
-fn redact_json_value_strings_at_depth(redactor: &PiiRedactor, value: &mut Value, depth: usize) {
+fn compact_json_key(key: &str) -> String {
+    key.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn is_azure_data_sources_key(key: &str) -> bool {
+    compact_json_key(key) == "datasources"
+}
+
+fn is_azure_parameters_key(key: &str) -> bool {
+    compact_json_key(key) == "parameters"
+}
+
+fn wholesale_redact_data_source_parameters(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for entry in map.values_mut() {
+                *entry = Value::String(REDACTED_PLACEHOLDER.to_string());
+            }
+        }
+        _ => *value = Value::String(REDACTED_PLACEHOLDER.to_string()),
+    }
+}
+
+fn redact_json_value_strings(redactor: &PiiRedactor, value: &mut Value) {
+    redact_json_value_strings_at_depth(redactor, value, 0, JsonRedactionContext::Normal);
+}
+
+fn redact_json_value_strings_at_depth(
+    redactor: &PiiRedactor,
+    value: &mut Value,
+    depth: usize,
+    ctx: JsonRedactionContext,
+) {
     if depth >= MAX_JSON_REDACTION_DEPTH {
         *value = Value::String(REDACTED_PLACEHOLDER.to_string());
         return;
@@ -6443,7 +6574,7 @@ fn redact_json_value_strings_at_depth(redactor: &PiiRedactor, value: &mut Value,
             if let Ok(mut embedded) = serde_json::from_str::<Value>(text)
                 && matches!(embedded, Value::Object(_) | Value::Array(_))
             {
-                redact_json_value_strings_at_depth(redactor, &mut embedded, depth + 1);
+                redact_json_value_strings_at_depth(redactor, &mut embedded, depth + 1, ctx);
                 if let Ok(serialized) = serde_json::to_string(&embedded) {
                     *text = redactor.redact(&serialized);
                     return;
@@ -6460,7 +6591,7 @@ fn redact_json_value_strings_at_depth(redactor: &PiiRedactor, value: &mut Value,
         }
         Value::Array(values) => {
             for value in values {
-                redact_json_value_strings_at_depth(redactor, value, depth + 1);
+                redact_json_value_strings_at_depth(redactor, value, depth + 1, ctx);
             }
         }
         Value::Object(map) => {
@@ -6479,8 +6610,43 @@ fn redact_json_value_strings_at_depth(redactor: &PiiRedactor, value: &mut Value,
             for (key, mut value) in entries {
                 if sensitive_json_field(&key) {
                     value = Value::String(REDACTED_PLACEHOLDER.to_string());
+                } else if ctx == JsonRedactionContext::DataSourceItem
+                    && is_azure_parameters_key(&key)
+                {
+                    wholesale_redact_data_source_parameters(&mut value);
+                } else if ctx == JsonRedactionContext::Normal && is_azure_data_sources_key(&key) {
+                    // The provider's conventional shape is an array of
+                    // data-source items, but a captured transcript is arbitrary
+                    // JSON and this name proves no type invariant. Every other
+                    // shape is traversed as a single data-source item instead of
+                    // falling out of the branch untouched: a recognized
+                    // container name must never bypass the ordinary member-name
+                    // and value visitor.
+                    match &mut value {
+                        Value::Array(sources) => {
+                            for source in sources.iter_mut() {
+                                redact_json_value_strings_at_depth(
+                                    redactor,
+                                    source,
+                                    depth + 1,
+                                    JsonRedactionContext::DataSourceItem,
+                                );
+                            }
+                        }
+                        other => redact_json_value_strings_at_depth(
+                            redactor,
+                            other,
+                            depth + 1,
+                            JsonRedactionContext::DataSourceItem,
+                        ),
+                    }
                 } else {
-                    redact_json_value_strings_at_depth(redactor, &mut value, depth + 1);
+                    let next_ctx = if ctx == JsonRedactionContext::DataSourceItem {
+                        JsonRedactionContext::DataSourceItem
+                    } else {
+                        JsonRedactionContext::Normal
+                    };
+                    redact_json_value_strings_at_depth(redactor, &mut value, depth + 1, next_ctx);
                 }
                 map.insert(redactor.redact(&key), value);
             }
@@ -6531,6 +6697,13 @@ fn sensitive_json_field(key: &str) -> bool {
                 | "bearertoken"
                 | "sessiontoken"
                 | "csrftoken"
+                | "key"
+                | "passphrase"
+                | "accesskey"
+                | "signature"
+                | "assertion"
+                | "jwt"
+                | "embeddingkey"
         )
 }
 
@@ -6616,6 +6789,52 @@ fn redact_headers(headers: &HashMap<String, String>) -> BTreeMap<String, String>
             (name.clone(), value)
         })
         .collect()
+}
+
+/// Final client-visible gRPC application status for this transaction, or
+/// `None` when it did not end as a gRPC call.
+///
+/// Native gRPC reports application failure with HTTP 200 plus a non-zero
+/// `grpc-status`, so the transport status alone cannot say whether the call
+/// failed. The proxy core normalizes both wire encodings — the terminal
+/// TRAILERS frame and the Trailers-Only initial HEADERS block — into
+/// `metadata["grpc_status"]` before the committed and stream-termination hooks
+/// run (the streaming path folds `BodyOutcome::grpc_status` into the same key),
+/// and [`TransactionSummary::grpc_status`] exposes it to the log fallback. That
+/// normalized value is what the transaction log, the access log, and the
+/// Prometheus status bucket already report, so reading it here keeps audit
+/// retention from disagreeing with the recorded outcome.
+///
+/// `response_headers` is the Trailers-Only fallback for a hook that holds the
+/// initial header block and whose status never reached metadata. A gRPC
+/// transaction that ends with no terminal status at all is `UNKNOWN` for the
+/// client, matching [`TransactionSummary::grpc_status`].
+fn final_grpc_status(
+    metadata: &HashMap<String, String>,
+    response_headers: Option<&HashMap<String, String>>,
+) -> Option<u32> {
+    if let Some(status) = metadata.get("grpc_status") {
+        return Some(crate::proxy::grpc_proxy::parse_grpc_status_value(status));
+    }
+    if let Some(status) =
+        response_headers.and_then(crate::proxy::grpc_proxy::grpc_status_from_headers)
+    {
+        return Some(status);
+    }
+    metadata
+        .get("request_protocol")
+        .is_some_and(|protocol| protocol == "grpc")
+        .then_some(crate::proxy::grpc_proxy::grpc_status::UNKNOWN)
+}
+
+/// Whether this transaction ended as a FAILED gRPC call, which
+/// `always_capture_on_error` must retain exactly like an HTTP error status.
+/// `false` for every non-gRPC transaction, so HTTP retention is unchanged.
+fn grpc_call_failed(
+    metadata: &HashMap<String, String>,
+    response_headers: Option<&HashMap<String, String>>,
+) -> bool {
+    final_grpc_status(metadata, response_headers).is_some_and(|status| status != 0)
 }
 
 /// Whether any guard plugin fired on this transaction (drives

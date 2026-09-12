@@ -286,8 +286,8 @@ def no_configured_state() -> None:
     payload = read_stdin_json()
     if (
         not isinstance(payload, dict)
-        or payload.get("configured")
-        or payload.get("discovered")
+        or payload.get("configured") != []
+        or payload.get("discovered") != []
     ):
         raise SystemExit(1)
 

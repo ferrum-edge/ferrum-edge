@@ -999,6 +999,12 @@ async fn a_replacement_generation_cannot_register_during_a_fenced_withdrawal() {
 #[tokio::test(start_paused = true)]
 async fn a_superseded_supervisor_does_not_withdraw_when_its_staleness_bound_elapses() {
     let _guard = isolated().await;
+    let poll_interval = 1;
+    let configured_max_stale = 3;
+    let resolved_max_stale =
+        health::resolve_staleness(configured_max_stale, SdStalePolicy::Withdraw, poll_interval)
+            .max_stale
+            .expect("a nonzero staleness bound must resolve to a finite duration");
 
     let statics = vec![target("static.local", 9000)];
     let config = config_with(vec![upstream_with_sd(
@@ -1032,8 +1038,8 @@ async fn a_superseded_supervisor_does_not_withdraw_when_its_staleness_bound_elap
         DnsCache::new(Default::default()),
         statics,
         LoadBalancerAlgorithm::RoundRobin,
-        1,
-        3,
+        poll_interval,
+        configured_max_stale,
         SdStalePolicy::Withdraw,
         1,
     );
@@ -1057,23 +1063,24 @@ async fn a_superseded_supervisor_does_not_withdraw_when_its_staleness_bound_elap
     );
 
     // Park the poller inside discover() so the registry stops answering, then
-    // supersede it exactly as a reconcile would — before its 3s staleness bound
-    // elapses. A deadline armed before the replacement registered still reaches
-    // the expiry path, where the fence must refuse it.
+    // supersede it exactly as a reconcile would — before its resolved staleness
+    // bound elapses. A deadline armed before the replacement registered still
+    // reaches the expiry path, where the fence must refuse it.
     hang.store(true, Ordering::SeqCst);
-    // Next poll is 1s out; the 3s bound is still in the future. Advance only
-    // the poll interval so the hung discover() samples its deadline while
-    // generation 1 still owns the key.
-    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    // Advance only the poll interval so the hung discover() samples its deadline
+    // while generation 1 still owns the key.
+    let poll_advance = std::time::Duration::from_secs(poll_interval);
+    tokio::time::advance(poll_advance).await;
     assert!(
         wait_for_progress(|| calls.load(Ordering::SeqCst) >= 2).await,
         "the poller must park inside discover() with its pre-supersession deadline armed"
     );
     health::register_task_for_test(&task.key, 99, "scripted", scripted_staleness());
 
-    // Remaining window after the 1s poll advance. The fence must refuse the
-    // deadline that was armed while generation 1 still owned the key.
-    let withdrew = wait_for_deadline_action(std::time::Duration::from_secs(2), || {
+    // Cross the resolved deadline after accounting for the poll advance. The
+    // fence must refuse the deadline armed while generation 1 owned the key.
+    let remaining_stale_window = resolved_max_stale - poll_advance;
+    let withdrew = wait_for_deadline_action(remaining_stale_window, || {
         metrics.service_discovery_stale_withdrawals_total() > withdrawals_before
             || health::expiry_applied_for_test(&task.key) == Some(true)
             || !lb_has_host(

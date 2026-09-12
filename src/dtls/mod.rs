@@ -10,7 +10,7 @@
 //! It uses a Sans-IO design where the caller drives the state machine via
 //! `handle_packet()` / `poll_output()` / `handle_timeout()`.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -709,10 +709,12 @@ pub struct DtlsServerLimits {
     /// owning UDP listener's metrics so plain-UDP and DTLS refusals are one
     /// number. `None` outside the proxy listener path.
     pub datagram_client_address_drops: Option<Arc<AtomicU64>>,
-    /// `(proxy_id, listen_port)` stamped on client-address metadata refusal
-    /// warnings so a DTLS refusal correlates with the plain-UDP listener's
-    /// record for the same proxy. Cloned once at listener spawn, never per
-    /// datagram. `None` outside the proxy listener path.
+    /// `(proxy_id, listen_port)` stamped on the demux path's rate-limited
+    /// refusal diagnostics — client-address metadata refusals and
+    /// per-source-IP pre-handshake refusals alike — so a DTLS refusal
+    /// correlates with the plain-UDP listener's record for the same proxy.
+    /// Cloned once at listener spawn, never per datagram. `None` outside the
+    /// proxy listener path.
     pub datagram_client_address_listener: Option<(Arc<str>, u16)>,
     /// Client-trust retirement domain this listener's authenticated sessions
     /// join (issues #3857, #3858).
@@ -729,6 +731,27 @@ pub struct DtlsServerLimits {
     /// retirable by any published generation", which is exactly the mesh
     /// posture today.
     pub client_trust_scope: Option<crate::tls::ClientTrustScope>,
+    /// Gateway-wide per-effective-source-IP bound on the PRE-HANDSHAKE demux
+    /// table (`FERRUM_UDP_MAX_SESSIONS_PER_IP`).
+    ///
+    /// [`Self::max_sessions`] is a listener-wide cap, so without this one
+    /// source address can occupy the whole demux table with unauthenticated
+    /// ClientHellos and deny DTLS service to every other client. The plain-UDP
+    /// and TCP listeners already carry the same bound, but their guard is taken
+    /// at SESSION reservation — a DTLS peer holds demux state long before a
+    /// session exists, so the gate has to run on the ClientHello admission path
+    /// instead.
+    ///
+    /// This is a HANDLE to the one counter map `ProxyState` owns, shared with
+    /// the owning UDP listener, so TCP, plain UDP and DTLS share one accounting
+    /// and one configuration surface. The pre-handshake slot is released the
+    /// moment the accepted connection is handed to `accept()`, where the
+    /// listener's session reservation takes over: an established DTLS session
+    /// must count once against a source's budget, not twice.
+    ///
+    /// `Default` is the disabled dimension, which is what standalone/test
+    /// constructors and generated mesh listeners get.
+    pub per_source_ip_admission: crate::proxy::PerIpStreamAdmission,
 }
 
 /// Owner-scoped client-trust retirement domain for a DTLS listener (issues
@@ -771,6 +794,7 @@ impl Default for DtlsServerLimits {
             datagram_client_address_drops: None,
             datagram_client_address_listener: None,
             client_trust_scope: dtls_client_trust_scope_for_owner(false),
+            per_source_ip_admission: crate::proxy::PerIpStreamAdmission::default(),
         }
     }
 }
@@ -1902,6 +1926,27 @@ pub struct DtlsServer {
     /// datagram; the counter still moves for every one of them. Lock-free, so
     /// the non-emitting path is two relaxed atomics and no allocation.
     datagram_client_address_warn: crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+    /// ClientHellos refused because the effective source IP already held its
+    /// full `FERRUM_UDP_MAX_SESSIONS_PER_IP` budget. Fixed cardinality: one
+    /// listener-local counter, never labelled by client address.
+    per_source_ip_rejections: AtomicU64,
+    /// Bounds this listener's rate of per-source-IP refusal warnings. The
+    /// refusal path is exactly the flood an attacker controls, so it must not
+    /// turn one refused ClientHello into one log record.
+    per_source_ip_warn: crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+    /// Bounds this listener's rate of handshake-timeout warnings, shared with
+    /// every spawned session driver.
+    ///
+    /// An abandoned handshake is an unauthenticated, attacker-reachable event
+    /// whose rate is bounded only by how fast demux entries can be created and
+    /// expire, so one line per peer is a log-pipeline denial of service and an
+    /// unbounded label cardinality on the peer field. `Arc` because the emit
+    /// sites live inside the per-session driver task, not on `&self`.
+    handshake_timeout_warn: Arc<crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter>,
+    /// Total handshakes this listener abandoned at the deadline, emitted or
+    /// suppressed. Reported on every warning so the withheld volume stays
+    /// visible without one record per peer.
+    handshake_timeouts: Arc<AtomicU64>,
 }
 
 /// State for a server-side DTLS session being managed by the DtlsServer.
@@ -2023,6 +2068,74 @@ fn record_datagram_metadata_refusal(
     Some(suppressed)
 }
 
+/// Count a ClientHello refused by the per-source-IP pre-handshake bound and
+/// emit a rate-limited structured diagnostic for it.
+///
+/// The refusal path is precisely the flood an attacker controls, so the record
+/// carries only fixed-cardinality fields: the owning listener, the configured
+/// limit, the listener's running refusal total, and what the limiter withheld.
+/// The client address is deliberately absent — the same posture the plain-UDP
+/// per-source refusal takes — because a spoofed-source spray would otherwise
+/// write attacker-chosen labels into the log at one entry per refusal.
+///
+/// Returns the suppressed count when a record was emitted, so the limiter
+/// contract is assertable without a log-capture harness.
+fn record_dtls_per_source_ip_refusal(
+    limiter: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+    rejections: &AtomicU64,
+    listener: Option<&(Arc<str>, u16)>,
+    limit: u64,
+    now_ms: u64,
+) -> Option<u64> {
+    let refusals = rejections.fetch_add(1, Ordering::Relaxed) + 1;
+    let suppressed = limiter.on_event(now_ms)?;
+    let (proxy_id, listen_port) = match listener {
+        Some((proxy_id, listen_port)) => (proxy_id.as_ref(), *listen_port),
+        None => ("", 0u16),
+    };
+    warn!(
+        proxy_id = proxy_id,
+        listen_port = listen_port,
+        limit = limit,
+        refusals = refusals,
+        suppressed = suppressed,
+        "DTLS ClientHello refused: per-source-IP pre-handshake session limit reached"
+    );
+    Some(suppressed)
+}
+
+/// Count an abandoned frontend DTLS handshake and emit a rate-limited
+/// structured diagnostic for it.
+///
+/// Reaching the handshake deadline is an unauthenticated, attacker-reachable
+/// event whose rate is bounded only by how fast pre-handshake demux entries can
+/// be created and expire. One warning per peer therefore turns a ClientHello
+/// spray into a log flood with unbounded cardinality on the peer field, so the
+/// emit is gated by the module's shared limiter: at most one record per window,
+/// carrying the listener's running timeout total and the number of records the
+/// limiter withheld since the last one. The peer address rides only on the
+/// records that are actually emitted, which bounds it to one per window while
+/// keeping an isolated timeout fully diagnosable.
+///
+/// Returns the suppressed count when a record was emitted, so the limiter
+/// contract is assertable without a log-capture harness.
+fn record_dtls_handshake_timeout(
+    limiter: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+    timeouts: &AtomicU64,
+    peer_addr: SocketAddr,
+    now_ms: u64,
+) -> Option<u64> {
+    let timed_out = timeouts.fetch_add(1, Ordering::Relaxed) + 1;
+    let suppressed = limiter.on_event(now_ms)?;
+    warn!(
+        client = %crate::util::client_identity::canonical_socket_addr(peer_addr),
+        timed_out = timed_out,
+        suppressed = suppressed,
+        "DTLS handshake timed out"
+    );
+    Some(suppressed)
+}
+
 /// Regression harness for the DTLS refusal diagnostic (issue #3289): every
 /// refusal is counted, while the warning is bounded to one record per limiter
 /// window and the next record reports what it suppressed.
@@ -2079,6 +2192,171 @@ pub(crate) fn dtls_datagram_metadata_refusal_accounting_for_test(
         drops.load(Ordering::Relaxed),
         emitted,
         suppressed.unwrap_or_default(),
+    ))
+}
+
+/// Regression harness for the handshake-timeout diagnostic: every abandoned
+/// handshake is counted, while the warning is bounded to one record per limiter
+/// window and the next record reports what it suppressed.
+///
+/// Drives [`record_dtls_handshake_timeout`] directly with an injected clock so
+/// the contract is asserted without a live listener, a log-capture harness, or
+/// any wall-clock sleep. Times out `timeouts_in_window` distinct peers inside
+/// one window and one more after it, returning
+/// `(counted, records_emitted, suppressed_reported_by_the_second_record)`.
+///
+/// Each peer gets its own source port, which is exactly the shape that produced
+/// one record per peer before the limiter was introduced.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn dtls_handshake_timeout_warning_accounting_for_test(
+    timeouts_in_window: u64,
+) -> Result<(u64, u64, u64), String> {
+    let window_ms = crate::util::atomic_log_rate_limiter::DEFAULT_ATOMIC_LOG_RATE_LIMIT_WINDOW_MS;
+    let limiter = crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter::new();
+    let timeouts = AtomicU64::new(0);
+    let peer_ip: IpAddr = "203.0.113.7"
+        .parse()
+        .map_err(|e| format!("parse peer ip: {e}"))?;
+    let now_ms = 1_000_000u64;
+
+    let mut emitted = 0u64;
+    for index in 0..timeouts_in_window {
+        // A distinct ephemeral source port per abandoned handshake, wrapped so
+        // a large burst still produces valid ports.
+        let port = 40_000u16.wrapping_add((index % 20_000) as u16);
+        let peer = SocketAddr::new(peer_ip, port);
+        if record_dtls_handshake_timeout(&limiter, &timeouts, peer, now_ms).is_some() {
+            emitted += 1;
+        }
+    }
+
+    // One more once the window has elapsed: it must emit and report the
+    // timeouts the limiter withheld in between.
+    let late_peer = SocketAddr::new(peer_ip, 39_999);
+    let suppressed =
+        record_dtls_handshake_timeout(&limiter, &timeouts, late_peer, now_ms + window_ms);
+    if suppressed.is_some() {
+        emitted += 1;
+    }
+
+    Ok((
+        timeouts.load(Ordering::Relaxed),
+        emitted,
+        suppressed.unwrap_or_default(),
+    ))
+}
+
+/// Build one real DTLS ClientHello record for the admission harnesses.
+///
+/// The pre-handshake table is opened by exactly this record, so the harness
+/// sprays the genuine article rather than a synthetic prefix.
+#[allow(dead_code)] // used through library `_test_support`
+fn client_hello_record_for_test() -> Result<Vec<u8>, String> {
+    let config = Arc::new(
+        Config::builder()
+            .build()
+            .map_err(|e| format!("build DTLS config: {e}"))?,
+    );
+    let certificate = dimpl::certificate::generate_self_signed_certificate()
+        .map_err(|e| format!("generate client certificate: {e}"))?;
+    let mut client = Dtls::new_auto(config, certificate, Instant::now());
+    client.set_active(true);
+    let mut buf = vec![0u8; 4096];
+    for _ in 0..MAX_OUTPUTS_PER_DRAIN {
+        if let Output::Packet(data) = client.poll_output(&mut buf) {
+            return Ok(data.to_vec());
+        }
+    }
+    Err("client did not emit a ClientHello packet".into())
+}
+
+/// Regression harness for the per-source-IP pre-handshake bound
+/// (GHSA-cc8p-2cqj-7fgg): a ClientHello spray from ONE source may occupy at
+/// most `max_per_source` demux entries, and a second source is still admitted
+/// while the first is saturated.
+///
+/// Drives [`DtlsServer::spawn_session`] — the ClientHello admission path — on a
+/// server whose listener-wide `max_sessions` is deliberately far larger than the
+/// spray, so the only thing that can bound the first source is the per-source
+/// gate. Nothing is awaited between spawns, so no driver task can run and the
+/// observed demux table is exactly what admission allowed.
+///
+/// Returns `(entries_for_the_spraying_source, entries_for_the_second_source,
+/// refusals_recorded)`.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) async fn dtls_pre_handshake_per_source_ip_admission_for_test(
+    max_per_source: u64,
+    attempts_from_one_source: u16,
+) -> Result<(usize, usize, u64), String> {
+    let admission = crate::proxy::PerIpStreamAdmission {
+        counts: Some(Arc::new(DashMap::new())),
+        max: max_per_source,
+    };
+    let socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| format!("bind DTLS test socket: {e}"))?;
+    let config = Config::builder()
+        .build()
+        .map_err(|e| format!("build DTLS config: {e}"))?;
+    let certificate = dimpl::certificate::generate_self_signed_certificate()
+        .map_err(|e| format!("generate server certificate: {e}"))?;
+    let server = DtlsServer::from_socket_with_limits(
+        socket,
+        FrontendDtlsConfig {
+            dimpl_config: Arc::new(config),
+            certificate: certificate.into(),
+            client_cert_verifier: None,
+            client_trust: None,
+        },
+        DtlsServerLimits {
+            // Far above the spray: the listener-wide cap must not be what
+            // bounds the first source, or the regression would pass without
+            // the per-source gate.
+            max_sessions: Some(usize::from(attempts_from_one_source) + 64),
+            handshake_timeout: None,
+            per_source_ip_admission: admission,
+            datagram_client_address_listener: Some((Arc::<str>::from("dtls-per-ip"), 4433u16)),
+            ..DtlsServerLimits::default()
+        },
+    )
+    .map_err(|e| format!("construct DTLS test server: {e}"))?;
+
+    let hello = client_hello_record_for_test()?;
+    let spraying_source: IpAddr = "203.0.113.10"
+        .parse()
+        .map_err(|e| format!("parse spraying source: {e}"))?;
+    let second_source: IpAddr = "203.0.113.11"
+        .parse()
+        .map_err(|e| format!("parse second source: {e}"))?;
+
+    for index in 0..attempts_from_one_source {
+        let peer = SocketAddr::new(spraying_source, 40_000u16.wrapping_add(index));
+        server.spawn_session(peer, hello.clone(), None, None);
+    }
+    let second_peer = SocketAddr::new(second_source, 40_000);
+    server.spawn_session(second_peer, hello.clone(), None, None);
+
+    let sprayed = server
+        .sessions
+        .iter()
+        .filter(|entry| entry.key().ip() == spraying_source)
+        .count();
+    let second = server
+        .sessions
+        .iter()
+        .filter(|entry| entry.key().ip() == second_source)
+        .count();
+    if server.active_session_count() != sprayed + second {
+        return Err(format!(
+            "listener-wide counter {} disagrees with the demux table ({sprayed} + {second})",
+            server.active_session_count()
+        ));
+    }
+
+    Ok((
+        sprayed,
+        second,
+        server.per_source_ip_rejections.load(Ordering::Relaxed),
     ))
 }
 
@@ -2416,6 +2694,12 @@ impl DtlsServer {
             shutdown_tx,
             datagram_client_address_warn:
                 crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter::new(),
+            per_source_ip_rejections: AtomicU64::new(0),
+            per_source_ip_warn: crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter::new(),
+            handshake_timeout_warn: Arc::new(
+                crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter::new(),
+            ),
+            handshake_timeouts: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -2805,9 +3089,13 @@ impl DtlsServer {
     ///      gate read and the CAS below can let a few sessions in past the
     ///      gate's intent. This is acceptable because the gate's job is
     ///      coarse-grained backpressure, not exact admission.
-    ///   2. `max_sessions` is the *hard* cap, enforced via a CAS loop on
-    ///      `active_sessions`. This is the authoritative bound — even if the
-    ///      soft gate races, the hard cap cannot be exceeded.
+    ///   2. `per_source_ip_admission` is the *hard* per-source bound. It is
+    ///      taken before the listener-wide reservation so a refusal unwinds
+    ///      nothing, and it is the gate that keeps one source address from
+    ///      occupying the whole pre-handshake table.
+    ///   3. `max_sessions` is the *hard* listener-wide cap, enforced via a CAS
+    ///      loop on `active_sessions`. This is the authoritative bound — even
+    ///      if the soft gate races, the hard cap cannot be exceeded.
     fn spawn_session(
         &self,
         peer_addr: SocketAddr,
@@ -2830,6 +3118,39 @@ impl DtlsServer {
             trace!(client = %peer_addr, "DTLS new session rejected by admission gate");
             return;
         }
+
+        // Per-effective-source-IP bound on the PRE-HANDSHAKE table. Taken here,
+        // before any per-peer allocation and before the listener-wide
+        // reservation, because a DTLS peer occupies demux state from its first
+        // ClientHello — long before the session the plain-UDP guard covers
+        // exists. The effective source is the authenticated forwarded client
+        // when a datagram client-address envelope was accepted, otherwise the
+        // socket peer, matching the listener's session reservation exactly so
+        // both guards move the same counter.
+        //
+        // The guard is moved into the driver task below and released the moment
+        // the accepted connection is handed to `accept()`, where the listener's
+        // session reservation takes over; an established session must not hold
+        // two slots out of one source's budget.
+        let per_source_ip_guard = if self.limits.per_source_ip_admission.counts.is_some() {
+            let effective_source = forwarded_client.unwrap_or(peer_addr);
+            let client_ip = crate::proxy::udp_proxy::udp_session_client_ip(effective_source);
+            match self.limits.per_source_ip_admission.try_acquire(&client_ip) {
+                Ok(guard) => guard,
+                Err(crate::proxy::PerIpLimitExceeded) => {
+                    record_dtls_per_source_ip_refusal(
+                        &self.per_source_ip_warn,
+                        &self.per_source_ip_rejections,
+                        self.limits.datagram_client_address_listener.as_ref(),
+                        self.limits.per_source_ip_admission.max,
+                        crate::proxy::udp_proxy::coarse_epoch_millis(),
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
 
         if let Some(max_sessions) = self.limits.max_sessions {
             let mut current = self.active_sessions.load(Ordering::Relaxed);
@@ -2924,6 +3245,8 @@ impl DtlsServer {
             .limits
             .handshake_timeout
             .map(|timeout| Instant::now() + timeout);
+        let handshake_timeout_warn = self.handshake_timeout_warn.clone();
+        let handshake_timeouts = self.handshake_timeouts.clone();
 
         tokio::spawn(async move {
             let _session_guard = SessionGuard {
@@ -2933,6 +3256,10 @@ impl DtlsServer {
                 peer_addr,
                 generation,
             };
+            // This peer's slot in its source's pre-handshake budget. Released
+            // at accept handoff below, and by `Drop` on every other exit path
+            // (refused handshake, timeout, socket error, task cancellation).
+            let mut per_source_ip_guard = per_source_ip_guard;
 
             let mut dtls = Dtls::new_auto(config, certificate, Instant::now());
             // Server role (default — is_active=false)
@@ -3009,7 +3336,12 @@ impl DtlsServer {
                     && let Some(deadline) = handshake_deadline
                     && Instant::now() >= deadline
                 {
-                    warn!(client = %peer_addr, "DTLS handshake timed out");
+                    record_dtls_handshake_timeout(
+                        &handshake_timeout_warn,
+                        &handshake_timeouts,
+                        peer_addr,
+                        crate::proxy::udp_proxy::coarse_epoch_millis(),
+                    );
                     break;
                 }
 
@@ -3157,7 +3489,12 @@ impl DtlsServer {
                     // Handshake deadline (top-of-loop check is primary;
                     // this is defense in depth).
                     _ = tokio::time::sleep(handshake_sleep_dur), if !connected && handshake_deadline.is_some() => {
-                        warn!(client = %peer_addr, "DTLS handshake timed out");
+                        record_dtls_handshake_timeout(
+                            &handshake_timeout_warn,
+                            &handshake_timeouts,
+                            peer_addr,
+                            crate::proxy::udp_proxy::coarse_epoch_millis(),
+                        );
                         break;
                     }
                 }
@@ -3320,7 +3657,17 @@ impl DtlsServer {
                                 )
                                 .await
                                 {
-                                    Ok(Ok(())) => {}
+                                    Ok(Ok(())) => {
+                                        // The pre-handshake budget has done its
+                                        // job: this peer is no longer occupying
+                                        // demux state ahead of authentication,
+                                        // and the listener's accept path
+                                        // reserves the session slot that now
+                                        // represents it. Holding both would
+                                        // charge one established session twice
+                                        // against its source's budget.
+                                        drop(per_source_ip_guard.take());
+                                    }
                                     Ok(Err(_)) => {
                                         fail_queued_frontend_app_sends(
                                             &mut app_in_rx,

@@ -141,7 +141,12 @@ pub fn create_test_context() -> RequestContext {
 }
 
 /// Build a request context whose raw header map contains `value`, then run
-/// `materialize_headers()` so non-visible-ASCII values stay out of `ctx.headers`.
+/// `materialize_headers()`.
+///
+/// `value` is always valid UTF-8, so materialization keeps it byte-exact (issue
+/// #5010). The divergence these repros exercise is the RFC-bound visible-ASCII
+/// credential policy in `header_extract`, which reads the retained RAW map and
+/// still reports a non-ASCII field line as present-but-malformed.
 pub fn context_with_materialized_raw_header(name: &str, value: &str) -> RequestContext {
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
@@ -159,23 +164,29 @@ pub fn context_with_materialized_raw_header(name: &str, value: &str) -> RequestC
     );
     ctx.set_raw_headers(raw);
     ctx.materialize_headers();
-    assert!(
-        !ctx.headers.contains_key(name.to_ascii_lowercase().as_str())
-            && !ctx.headers.contains_key(name),
-        "non-ASCII header values must stay out of the materialized map in this repro"
+    assert_eq!(
+        ctx.headers
+            .get(name.to_ascii_lowercase().as_str())
+            .map(String::as_str),
+        Some(value),
+        "valid UTF-8 header values must be materialized byte-exact in this repro"
     );
     ctx
 }
 
-/// Build a request context from raw header bytes that `materialize_headers()`
-/// omits, then materialize the rest of the map.
+/// Build a request context from raw header bytes, then materialize the map.
+///
+/// Bytes that are not valid UTF-8 cannot be represented in the materialized map
+/// and stay out of it; valid UTF-8 is materialized byte-exact.
 pub fn context_with_materialized_raw_header_bytes(name: &str, value: &[u8]) -> RequestContext {
     let ctx = context_with_materialized_raw_header_lines(name, &[value]);
-    assert!(
-        !ctx.headers.contains_key(name.to_ascii_lowercase().as_str())
-            && !ctx.headers.contains_key(name),
-        "non-materializable header values must stay out of the materialized map in this repro"
-    );
+    if std::str::from_utf8(value).is_err() {
+        assert!(
+            !ctx.headers.contains_key(name.to_ascii_lowercase().as_str())
+                && !ctx.headers.contains_key(name),
+            "non-UTF-8 header values must stay out of the materialized map in this repro"
+        );
+    }
     ctx
 }
 
@@ -438,6 +449,38 @@ pub fn assert_continue(result: PluginResult) {
     }
 }
 
+/// Assert that a validated far-future credential expiry was admitted without an
+/// *effective* deadline (issue #5420).
+///
+/// Which of the two admissible answers a platform gives is decided by its
+/// monotonic clock rather than by the plugin: a `timespec`-backed
+/// `tokio::time::Instant` carries `i64` seconds and can express
+/// `now + (i64::MAX - now_unix)`, so it publishes that astronomically distant
+/// bound, while a narrower representation saturates and publishes no bound at
+/// all. Both admit the credential. What must never happen — the regression
+/// issue #5420 fixed — is a bound that has ALREADY elapsed, which is how the
+/// old collapse onto `now` presented a token the JWT layer had just validated
+/// as live.
+///
+/// The conversion's `Unbounded` branch itself is proven deterministically, on
+/// every platform, by the injected-clock tests in
+/// `auth_flow_credential_deadline_tests`.
+#[allow(dead_code)]
+pub fn assert_no_effective_credential_deadline(ctx: &RequestContext) {
+    // Longer than any authenticated stream this gateway holds open, so a
+    // deadline still beyond it is indistinguishable from an absent one.
+    const A_YEAR: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 60 * 60);
+
+    if let Some(deadline) = ferrum_edge::_test_support::request_credential_deadline_at(ctx) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            remaining > A_YEAR,
+            "a validated far-future expiry must publish either no monotonic bound or one \
+             far beyond any real session, never one that already elapsed: {remaining:?} left"
+        );
+    }
+}
+
 /// Assert that a plugin result is Reject with optional status code check
 #[allow(dead_code)]
 pub fn assert_reject(result: PluginResult, expected_status: Option<u16>) {
@@ -574,10 +617,23 @@ pub fn ensure_basic_auth_test_secret() {
 /// thread the subscriber is installed for.
 #[allow(dead_code)]
 pub fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+    capture_logs_at_level(tracing::Level::INFO)
+}
+
+/// Capture every event when a diagnostic's warning is shared and sampled.
+#[allow(dead_code)]
+pub fn capture_debug_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+    capture_logs_at_level(tracing::Level::DEBUG)
+}
+
+fn capture_logs_at_level(
+    level: tracing::Level,
+) -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
     install_interest_floor();
     let writer = CapturedLogs::default();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
+        .with_max_level(level)
         .with_target(false)
         .without_time()
         .with_writer(writer.clone())
@@ -751,7 +807,8 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
         }),
         "ldap_auth" => json!({
             "ldap_url": "ldaps://ldap.example.com:636",
-            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         "spec_expose" => json!({"spec_url": "https://example.com/openapi.yaml"}),
         "api_chargeback" => {

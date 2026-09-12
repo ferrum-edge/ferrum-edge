@@ -83,8 +83,11 @@ thread_local! {
 pub struct OutboundRegistryConfig {
     /// Operator-supplied list of known destinations. Each entry is a bare
     /// hostname (`reviews.default.svc.cluster.local`), a `host:port` pair,
-    /// or a `host:*` any-explicit-port pair. Matches are exact after
-    /// ASCII-lowercase normalisation.
+    /// or a `host:*` any-explicit-port pair, optionally with a leading `*.`
+    /// one-label wildcard. IPv6 literals are canonicalized; numeric ports
+    /// require brackets and must be 1..=65535. Hostnames use ASCII labels
+    /// (punycode for IDNs). Empty entries are ignored; malformed entries fail
+    /// construction. Matches are exact after ASCII-lowercase normalisation.
     #[serde(default)]
     pub registry: Vec<String>,
     /// Status code returned when a request's destination is not in the
@@ -143,6 +146,22 @@ pub struct OutboundRegistry {
 }
 
 impl OutboundRegistry {
+    /// Build an empty registry when a mesh-derived registry cannot be admitted.
+    /// Keeping the gate installed preserves REGISTRY_ONLY enforcement.
+    pub(crate) fn deny_all() -> Self {
+        Self {
+            hosts: HashSet::new(),
+            host_ports: HashSet::new(),
+            any_port_hosts: HashSet::new(),
+            wildcard_suffixes: HashSet::new(),
+            wildcard_port_suffixes: HashMap::new(),
+            wildcard_any_port_suffixes: HashSet::new(),
+            outbound_listen_ports: Vec::new(),
+            reject_status: default_reject_status(),
+            namespace: default_namespace_label(),
+        }
+    }
+
     pub fn new(config: &Value) -> Result<Self, String> {
         let parsed: OutboundRegistryConfig = serde_json::from_value(config.clone())
             .map_err(|e| format!("mesh_outbound_registry: {e}"))?;
@@ -165,8 +184,10 @@ impl OutboundRegistry {
         let mut wildcard_suffixes: HashSet<String> = HashSet::new();
         let mut wildcard_port_suffixes: HashMap<u16, HashSet<String>> = HashMap::new();
         let mut wildcard_any_port_suffixes: HashSet<String> = HashSet::new();
-        for entry in parsed.registry {
-            let Some(normalised) = normalise_registry_entry(&entry) else {
+        for (index, entry) in parsed.registry.iter().enumerate() {
+            let normalised = normalise_registry_entry(entry)
+                .map_err(|error| format!("mesh_outbound_registry: registry[{index}]: {error}"))?;
+            let Some(normalised) = normalised else {
                 continue;
             };
             if let Some(host) = split_registry_host_any_port(&normalised) {
@@ -288,7 +309,7 @@ impl OutboundRegistry {
             buf.clear();
             buf.reserve(host.len());
             normalise_request_host_into(host, &mut buf);
-            if buf.is_empty() || self.hosts.contains(buf.as_str()) {
+            if buf.is_empty() || (port.is_none() && self.hosts.contains(buf.as_str())) {
                 return EXPLICIT_HOST_BUCKET;
             }
             if let Some(port) = port {
@@ -330,37 +351,51 @@ pub(crate) const ADMITTED_WILDCARD_BUCKET: &str = "<admit_wildcard>";
 /// bounded independently of registry size.
 pub(crate) const EXPLICIT_HOST_BUCKET: &str = "<admit_explicit>";
 
-fn normalise_registry_entry(entry: &str) -> Option<String> {
+fn normalise_registry_entry(entry: &str) -> Result<Option<String>, &'static str> {
     let entry = entry.trim().to_ascii_lowercase();
     if entry.is_empty() {
-        return None;
+        return Ok(None);
+    }
+    if !entry.is_ascii() || entry.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return Err("destination must be ASCII without internal whitespace; use punycode for IDNs");
     }
     if let Some(host) = split_registry_host_any_port(&entry) {
-        return normalise_host_part(host).map(|host| format!("{host}:*"));
+        return normalise_host_part(host).map(|host| Some(format!("{host}:*")));
     }
     if let Some((host, port)) = split_registry_host_port(&entry) {
-        return normalise_host_part(host).map(|host| format!("{host}:{port}"));
+        return normalise_host_part(host).map(|host| Some(format!("{host}:{port}")));
     }
-    normalise_host_part(&entry)
+    normalise_host_part(&entry).map(Some)
 }
 
-fn normalise_host_part(host: &str) -> Option<String> {
-    let host = host.trim().trim_end_matches('.');
-    if host.is_empty() {
-        return None;
-    }
+fn normalise_host_part(host: &str) -> Result<String, &'static str> {
     if host.starts_with('[') {
         if host.ends_with(']')
             && let Ok(IpAddr::V6(addr)) = host[1..host.len() - 1].parse::<IpAddr>()
         {
-            return Some(format!("[{addr}]"));
+            return Ok(format!("[{addr}]"));
         }
-        return Some(host.to_string());
+        return Err("expected a bracketed IPv6 literal with an optional port in 1..=65535 or *");
     }
     if let Ok(IpAddr::V6(addr)) = host.parse::<IpAddr>() {
-        return Some(format!("[{addr}]"));
+        return Ok(format!("[{addr}]"));
     }
-    Some(host.to_string())
+    let host = host.trim_end_matches('.');
+    let suffix = host.strip_prefix("*.").unwrap_or(host);
+    if suffix.split('.').any(|label| {
+        label.is_empty()
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    }) {
+        return Err(
+            "expected an ASCII hostname, IPv6 literal, or leading *. wildcard; \
+             optional ports must be decimal 1..=65535 or *",
+        );
+    }
+    Ok(host.to_string())
 }
 
 fn normalise_request_host_into(host: &str, buf: &mut String) {
@@ -415,17 +450,21 @@ fn wildcard_suffix_set_matches(host: &str, suffixes: &HashSet<String>) -> bool {
 }
 
 fn split_registry_host_port(entry: &str) -> Option<(&str, u16)> {
-    if entry.starts_with('[') {
+    let (host, port_str) = if entry.starts_with('[') {
         let end = entry.rfind("]:")?;
-        let port = entry[end + 2..].parse::<u16>().ok()?;
-        return Some((&entry[..end + 1], port));
-    }
-    let (host, port_str) = entry.rsplit_once(':')?;
-    if host.contains(':') {
+        (&entry[..end + 1], &entry[end + 2..])
+    } else {
+        let (host, port_str) = entry.rsplit_once(':')?;
+        if host.contains(':') {
+            return None;
+        }
+        (host, port_str)
+    };
+    if !port_str.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
     let port = port_str.parse::<u16>().ok()?;
-    Some((host, port))
+    (port != 0).then_some((host, port))
 }
 
 fn split_registry_host_any_port(entry: &str) -> Option<&str> {
@@ -966,7 +1005,7 @@ mod tests {
     fn normalizes_unbracketed_ipv6_any_port_registry_entry() {
         assert_eq!(
             normalise_registry_entry("2001:db8::1:*"),
-            Some("[2001:db8::1]:*".to_string())
+            Ok(Some("[2001:db8::1]:*".to_string()))
         );
     }
 

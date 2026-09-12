@@ -611,17 +611,44 @@ const DRAIN_WATERMARK_MS: u64 = 400;
 // reads leaves the remainder parked in the gateway's own send queue.
 const DRAIN_PROBE_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
 
-/// Fill `stream`'s send queue as far as the kernel will take it, returning the
-/// bytes accepted. Stops at the first `WouldBlock`, which is exactly the state
-/// a stalled backend leaves the gateway in.
+/// How long `fill_send_queue` keeps offering bytes after the first short write.
+const FILL_DEADLINE: Duration = Duration::from_millis(200);
+
+/// Receive buffer pinned on the never-reading peer's listener.
+///
+/// Accepted sockets inherit the listening socket's `SO_RCVBUF`, so this caps
+/// how much the peer's kernel can absorb on the fixture's behalf before the
+/// sender sees real backpressure.
+const NEVER_READING_PEER_RCVBUF: usize = 16 * 1024;
+
+/// Fill `stream`'s send queue until it stops draining, returning the bytes
+/// accepted.
+///
+/// A single `WouldBlock` is not evidence of a stall: it only says the socket
+/// was full at that instant, and a loopback peer's kernel keeps absorbing into
+/// its own receive buffer for a while afterwards, which lets the send queue
+/// drain and makes the watch correctly report progress (issue #4983 observed
+/// exactly that on macOS). So keep offering bytes across writable readiness
+/// under a bounded deadline: the loop ends when writability stops coming back,
+/// which IS persistent backpressure — the state a stalled backend leaves the
+/// gateway in — or when the deadline expires.
 async fn fill_send_queue(stream: &TcpStream, total: usize) -> usize {
     let chunk = vec![b'x'; 64 * 1024];
+    let started = Instant::now();
     let mut written = 0;
-    while written < total {
+    while written < total && started.elapsed() < FILL_DEADLINE {
         match stream.try_write(&chunk[..chunk.len().min(total - written)]) {
             Ok(0) => break,
             Ok(n) => written += n,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Readiness that never returns is the stall this fixture wants.
+                if tokio::time::timeout(Duration::from_millis(50), stream.writable())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
             Err(_) => break,
         }
     }
@@ -639,6 +666,13 @@ async fn send_queue_drain_watch_terminates_a_peer_that_never_reads() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind never-reading peer");
+    // Constrain what the peer's kernel will absorb for a socket nobody reads.
+    // Without this the fixture can hand the whole probe upload to the peer's
+    // receive buffer, the send queue drains, and the watch correctly reports
+    // progress instead of the stall the test is about.
+    socket2::SockRef::from(&listener)
+        .set_recv_buffer_size(NEVER_READING_PEER_RCVBUF)
+        .expect("pin the never-reading peer receive buffer");
     let addr = listener.local_addr().expect("local addr");
     // Accept and then never call `recv()` — the #4411 backend exactly.
     let peer = tokio::spawn(async move {

@@ -2457,3 +2457,235 @@ fn gateway_owned_request_destinations_fail_admission() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #5106 — a JSON-only body rule must not pin an ordinary non-JSON upload
+// to the buffered path. The config-time capability stays the upper bound; the
+// per-request predicate is the exact negation of what `transform_request_body`
+// declines on media type.
+// ---------------------------------------------------------------------------
+
+fn body_rule_plugin() -> RequestTransformer {
+    RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "update", "target": "body", "key": "state", "value": "changed"}
+        ]
+    }))
+    .unwrap()
+}
+
+fn upload_ctx(content_type: Option<&str>) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/upload".to_string(),
+    );
+    if let Some(content_type) = content_type {
+        ctx.headers
+            .insert("content-type".to_string(), content_type.to_string());
+    }
+    ctx
+}
+
+#[test]
+fn declared_non_json_uploads_release_request_buffering() {
+    let plugin = body_rule_plugin();
+    assert!(
+        plugin.requires_request_body_buffering(),
+        "the config-time capability remains the upper bound"
+    );
+
+    for content_type in [
+        "application/octet-stream",
+        "multipart/form-data; boundary=----x",
+        "application/x-www-form-urlencoded",
+        "image/png",
+        "video/mp4",
+        "text/plain; charset=utf-8",
+        "application/grpc",
+        "application/grpc-web+proto",
+    ] {
+        let ctx = upload_ctx(Some(content_type));
+        assert!(
+            !plugin.should_buffer_request_body(&ctx),
+            "the transform declines `{content_type}`, so it must stream"
+        );
+    }
+}
+
+#[test]
+fn json_and_untyped_uploads_keep_request_buffering() {
+    let plugin = body_rule_plugin();
+
+    for content_type in [
+        "application/json",
+        "application/json; charset=utf-8",
+        "application/merge-patch+json",
+        // Framed gRPC `+json` satisfies `is_json_content_type`, so it stays
+        // buffered exactly as the transform treats it: declined only after the
+        // document parse fails.
+        "application/grpc+json",
+    ] {
+        let ctx = upload_ctx(Some(content_type));
+        assert!(
+            plugin.should_buffer_request_body(&ctx),
+            "the transform inspects `{content_type}`, so it must buffer"
+        );
+    }
+
+    let untyped = upload_ctx(None);
+    assert!(
+        plugin.should_buffer_request_body(&untyped),
+        "an absent Content-Type is parsed as JSON by the transform"
+    );
+}
+
+#[test]
+fn header_and_query_only_instances_never_pin_a_request_body() {
+    let header_only = RequestTransformer::new(&json!({
+        "rules": [{"operation": "add", "target": "header", "key": "X-A", "value": "1"}]
+    }))
+    .unwrap();
+    let query_only = RequestTransformer::new(&json!({
+        "rules": [{"operation": "add", "target": "query", "key": "a", "value": "1"}]
+    }))
+    .unwrap();
+
+    let ctx = upload_ctx(Some("application/json"));
+    for plugin in [header_only, query_only] {
+        assert!(!plugin.requires_request_body_buffering());
+        assert!(!plugin.should_buffer_request_body(&ctx));
+    }
+}
+
+#[test]
+fn an_unrelated_header_rule_does_not_rebuffer_a_non_json_upload() {
+    // The mixed-rule shape: one ordinary header rule beside the JSON body rule.
+    // Header rules run in `before_proxy` and need no body, so the upload still
+    // streams.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "update", "target": "header", "key": "X-Audit", "value": "yes"},
+            {"operation": "update", "target": "body", "key": "state", "value": "changed"}
+        ]
+    }))
+    .unwrap();
+
+    let binary = upload_ctx(Some("application/octet-stream"));
+    assert!(!plugin.should_buffer_request_body(&binary));
+
+    let json_upload = upload_ctx(Some("application/json"));
+    assert!(plugin.should_buffer_request_body(&json_upload));
+}
+
+#[test]
+fn a_disabled_generation_releases_every_upload() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "secret"}],
+        "runtime_overlay_scope": "gated",
+        "runtime_overlay_resolved_enabled": false
+    }))
+    .unwrap();
+
+    let json_upload = upload_ctx(Some("application/json"));
+    assert!(!plugin.should_buffer_request_body(&json_upload));
+}
+
+#[tokio::test]
+async fn a_released_non_json_upload_would_have_been_declined_anyway() {
+    // Proves the predicate is not widening behaviour: the bytes the gateway now
+    // streams are exactly the bytes the transform returns `None` for, while a
+    // JSON control still gets rewritten.
+    let plugin = body_rule_plugin();
+    let body = br#"{"state":"original"}"#;
+    let hdrs = HashMap::new();
+
+    let ct = "application/octet-stream";
+    let declined = plugin.transform_request_body(body, Some(ct), &hdrs).await;
+    assert!(declined.is_none(), "a binary upload must be declined");
+
+    let json_ct = "application/json";
+    let rewritten = plugin
+        .transform_request_body(body, Some(json_ct), &hdrs)
+        .await
+        .expect("the JSON control is still transformed");
+    let rewritten = String::from_utf8(rewritten).expect("UTF-8 output");
+    assert_eq!(rewritten, r#"{"state":"changed"}"#);
+}
+
+#[test]
+fn the_shared_request_dispatch_decision_follows_the_upload_media_type() {
+    use ferrum_edge::_test_support::final_request_body_requirements_for_test;
+
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(body_rule_plugin())];
+
+    let binary = upload_ctx(Some("application/octet-stream"));
+    let (buffers_binary, _, _) =
+        final_request_body_requirements_for_test(&plugins, &binary, true, false, false, false);
+    assert!(!buffers_binary, "an ordinary binary upload must stream");
+
+    // The post-`before_proxy` re-evaluation is what keeps a header rewrite from
+    // bypassing the rules: proxy core re-runs this against the effective
+    // outbound headers, so a `text/plain` -> `application/json` rewrite still
+    // selects buffering before the body is read.
+    let rewritten = upload_ctx(Some("application/json"));
+    let (buffers_json, _, _) =
+        final_request_body_requirements_for_test(&plugins, &rewritten, true, false, false, false);
+    assert!(buffers_json, "a JSON upload is still collected");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #5108 — body rules reject operation-incompatible `new_key` by PRESENCE,
+// so an explicit `new_key: null` fails exactly as a string would.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn body_rules_reject_explicitly_null_new_key_on_every_incompatible_operation() {
+    for operation in ["add", "update", "remove"] {
+        let mut rule = json!({
+            "operation": operation,
+            "target": "body",
+            "key": "v",
+            "new_key": null
+        });
+        if operation != "remove" {
+            rule["value"] = json!(1);
+        }
+        let error = RequestTransformer::new(&json!({"rules": [rule]}))
+            .err()
+            .expect("an explicit null new_key must fail admission");
+        let needle = format!("must not be set for body '{operation}'");
+        assert!(error.contains("'new_key'"), "got: {error}");
+        assert!(error.contains(&needle), "got: {error}");
+    }
+}
+
+#[test]
+fn body_rules_keep_explicit_null_as_a_value() {
+    // `value: null` on add/update is a legitimate operation — it sets the field
+    // to JSON null — and must keep passing.
+    for operation in ["add", "update"] {
+        let config = json!({
+            "rules": [
+                {"operation": operation, "target": "body", "key": "v", "value": null}
+            ]
+        });
+        assert!(RequestTransformer::new(&config).is_ok(), "{operation}");
+    }
+}
+
+#[test]
+fn a_null_body_rename_target_is_still_a_missing_rename_target() {
+    let config = json!({
+        "rules": [{"operation": "rename", "target": "body", "key": "a", "new_key": null}]
+    });
+    let error = RequestTransformer::new(&config)
+        .err()
+        .expect("rename without a new_key must fail");
+    assert!(error.contains("requires a 'new_key'"), "got: {error}");
+
+    let valid = json!({
+        "rules": [{"operation": "rename", "target": "body", "key": "a", "new_key": "b"}]
+    });
+    assert!(RequestTransformer::new(&valid).is_ok());
+}

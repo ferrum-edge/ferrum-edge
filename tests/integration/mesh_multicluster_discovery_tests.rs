@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Utc;
-use dashmap::DashMap;
 use ferrum_edge::config::types::{
     GatewayConfig, LoadBalancerAlgorithm, MeshSdTopology, Upstream, UpstreamLocalityLbSetting,
     UpstreamTarget,
@@ -24,6 +23,7 @@ use ferrum_edge::config_sources::k8s::{
     GatewayApiListenerParentKind, gateway_api_listener_mesh_service_name,
 };
 use ferrum_edge::consumer_index::ConsumerIndex;
+use ferrum_edge::health_check::ActiveUnhealthyTargets;
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::load_balancer::{HealthContext, LoadBalancerCache};
 use ferrum_edge::modes::mesh::config::{
@@ -383,7 +383,7 @@ async fn mesh_multicluster_load_balancer_fails_over_local_to_remote() {
 
     // Eject the local endpoint (active unhealthy, keyed
     // `namespace|upstream_id::host:port` to match production identity).
-    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    let active_unhealthy: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     let local_active_key = format!(
         "{}::10.1.0.1:8080",
         ferrum_edge::config::db_backend::namespaced_runtime_key("default", upstream_id)

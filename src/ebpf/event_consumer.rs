@@ -24,9 +24,12 @@
 //!      overrun regime; [`SockOpsConsumer::record_overrun`] handles the
 //!      warn/recover state machine so the log line never spams.
 //!
-//! When the SOCK_OPS program is not pinned (no node-agent on the host,
-//! kernel < 5.7, BPF feature not built), [`run_pinned_consumer`] logs
-//! once and exits. The [`BpfMetricsState`] stays at zero — the
+//! On Linux `ebpf` builds, [`run_pinned_consumer`] waits for the
+//! node-agent pins with capped exponential backoff (1s → 30s) and
+//! attaches when they appear; it returns only on shutdown or an
+//! unrecoverable attach error. The first miss logs one `info!` line.
+//! Non-Linux / non-`ebpf` builds never start this task. The
+//! [`BpfMetricsState`] stays at zero until maps appear — the
 //! `__mesh_bpf_metrics` plugin still emits a stable Prometheus surface so
 //! dashboards do not break.
 
@@ -273,10 +276,11 @@ pub fn seed_dropped_baseline(consumer: &SockOpsConsumer, dropped_total: u64) -> 
 /// drives the [`SockOpsConsumer`] dispatch from kernel events.
 ///
 /// Spawned once per gateway from `ProxyState` init when mesh topology is
-/// `NodeWaypoint`. When the BPF program is not pinned (no node-agent on
-/// the host, kernel too old, etc.), the function logs a single info line
-/// and returns — the `__mesh_bpf_metrics` plugin continues to emit a
-/// stable Prometheus surface populated by the empty [`BpfMetricsState`].
+/// `NodeWaypoint` on Linux `ebpf` builds. Missing pins (no node-agent
+/// yet, kernel too old, etc.) log one `info!` line and retry with capped
+/// exponential backoff until the maps appear or shutdown fires — the
+/// `__mesh_bpf_metrics` plugin continues to emit a stable Prometheus
+/// surface populated by the empty [`BpfMetricsState`] until attach.
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub mod production {
     use std::collections::VecDeque;

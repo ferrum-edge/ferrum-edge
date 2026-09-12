@@ -11,6 +11,7 @@ use ferrum_edge::_test_support::{
     request_deduplication_redis_cached_response_payload_is_valid,
     request_deduplication_redis_payload_for_test,
     request_deduplication_redis_record_payload_is_valid,
+    request_deduplication_redis_requires_no_eviction_for_test,
     request_deduplication_request_identity_for_test,
     request_deduplication_set_request_state_for_test,
     request_deduplication_with_instance_id_for_test,
@@ -379,6 +380,19 @@ fn body_ctx(method: &str, path: &str, body: &'static [u8]) -> RequestContext {
     ctx
 }
 
+/// A body-bearing POST as the pre-`before_proxy` buffering phase sees it:
+/// client headers only, with no idempotency key on the wire yet.
+fn post_ctx_with_declared_body() -> RequestContext {
+    let mut ctx = new_ctx("POST", "/orders");
+    ctx.headers
+        .insert("content-length".to_string(), "7".to_string());
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/octet-stream".to_string(),
+    );
+    ctx
+}
+
 fn gzip_body(body: &[u8]) -> Vec<u8> {
     use flate2::Compression;
     use flate2::write::GzEncoder;
@@ -744,6 +758,152 @@ fn test_new_with_redis_config() {
         plugin.warmup_hostnames(),
         vec!["dedup-redis.internal".to_string()]
     );
+}
+
+/// GHSA-26gf-943w-w5x8: an idempotency record is this plugin's control, not a
+/// cache copy, so its Redis client must demand the no-eviction screen. Built
+/// with the generic operational client, an `allkeys-*` / `volatile-*` endpoint
+/// under memory pressure silently drops a live in-flight or completed record
+/// mid-lease and lets a retried non-idempotent request execute twice while
+/// Redis stays reachable and every ownership transition stays atomic.
+#[test]
+fn redis_mode_demands_the_no_eviction_retention_screen() {
+    let plugin = make_plugin(json!({
+        "sync_mode": "redis",
+        "redis_url": "redis://dedup-redis.internal:6379/0",
+        "redis_key_prefix": "dedup",
+    }));
+    assert_eq!(
+        request_deduplication_redis_requires_no_eviction_for_test(&plugin),
+        Some(true),
+        "the deduplication Redis client must prove the endpoint retains records"
+    );
+
+    // Local mode owns no client at all, so there is nothing to screen.
+    let local = make_plugin(json!({}));
+    assert_eq!(
+        request_deduplication_redis_requires_no_eviction_for_test(&local),
+        None
+    );
+}
+
+/// Issue #5070: the constructor is the admission contract the published schema
+/// is written to describe, so pin the normalization it actually performs.
+/// `tests/unit/openapi_yaml_tests.rs` asserts the OpenAPI component agrees with
+/// these rows (and names the two the enum keyword cannot express).
+#[test]
+fn config_admission_normalization_is_the_published_contract() {
+    // Explicit null is NOT "omitted": the field must be a string or absent.
+    // `RequestDeduplication` is not `Debug`, so take the error side directly.
+    let null_scope = match RequestDeduplication::new(
+        &json!({"anonymous_caller_scope": null}),
+        PluginHttpClient::default(),
+    ) {
+        Ok(_) => panic!("null anonymous_caller_scope must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        null_scope.contains("'anonymous_caller_scope' must be a string"),
+        "{null_scope}"
+    );
+
+    // Enumerated strings are trimmed and case-insensitive, and `_`/`-` are
+    // interchangeable in the shared anonymous-scope parser.
+    for scope in ["caller_address", "caller-address", " SHARED ", "Shared"] {
+        RequestDeduplication::new(
+            &json!({ "anonymous_caller_scope": scope }),
+            PluginHttpClient::default(),
+        )
+        .unwrap_or_else(|e| panic!("anonymous_caller_scope {scope:?} must be accepted: {e}"));
+    }
+    assert!(
+        RequestDeduplication::new(
+            &json!({"anonymous_caller_scope": "everyone"}),
+            PluginHttpClient::default()
+        )
+        .is_err(),
+        "an unknown scope must still be refused"
+    );
+
+    // `sync_mode` is lowercased before it is compared, so an uppercase value
+    // selects the same mode — including the Redis-only key admission that
+    // depends on it, and the client it really builds.
+    let upper_redis = make_plugin(json!({
+        "sync_mode": "REDIS",
+        "redis_url": "redis://dedup-redis.internal:6379/0",
+    }));
+    assert_eq!(
+        request_deduplication_redis_requires_no_eviction_for_test(&upper_redis),
+        Some(true),
+        "an uppercase sync_mode must really enable centralized mode"
+    );
+
+    // Methods are trimmed and uppercased before validation.
+    let padded = make_plugin(json!({"applicable_methods": [" post ", "put"]}));
+    assert!(padded.should_buffer_request_body(&post_ctx_with_declared_body()));
+
+    // Every bounded unsigned field refuses a value that does not fit u64.
+    for field in [
+        "ttl_seconds",
+        "inflight_ttl_seconds",
+        "max_entries",
+        "max_entry_size_bytes",
+        "max_total_size_bytes",
+    ] {
+        // A JSON number larger than u64::MAX must reach the parser as a
+        // number, so build it from raw JSON text rather than a Rust literal.
+        let raw = format!("{{\"{field}\": 18446744073709551616}}");
+        let config: serde_json::Value =
+            serde_json::from_str(&raw).expect("oversized literal parses as JSON");
+        assert!(
+            RequestDeduplication::new(&config, PluginHttpClient::default()).is_err(),
+            "{field} must refuse a value outside u64"
+        );
+        let zero: serde_json::Value =
+            serde_json::from_str(&format!("{{\"{field}\": 0}}")).expect("zero parses");
+        assert!(
+            RequestDeduplication::new(&zero, PluginHttpClient::default()).is_err(),
+            "{field} must refuse zero"
+        );
+    }
+}
+
+/// Issue #5071: this phase runs before every `before_proxy` hook, so it sees
+/// the client's headers and not the effective ones. An earlier
+/// `request_transformer` that supplies the key — a composition the plugin-cache
+/// ordering guard admits precisely so it can — has not run yet, so gating the
+/// prebuffer on the inbound header made that composition fail closed with 400
+/// on the very requests it was configured to deduplicate.
+#[test]
+fn applicable_bodied_requests_prebuffer_even_without_an_inbound_key() {
+    let plugin = make_plugin(json!({}));
+
+    let keyless = post_ctx_with_declared_body();
+    assert!(
+        plugin.should_buffer_request_body(&keyless),
+        "a body-bearing POST must be prebuffered so a later-added key can be fingerprinted"
+    );
+
+    let mut keyed = post_ctx_with_declared_body();
+    keyed
+        .headers
+        .insert("idempotency-key".to_string(), "k-1".to_string());
+    assert!(plugin.should_buffer_request_body(&keyed));
+
+    // Still narrow: a method this instance never deduplicates is untouched.
+    let mut get = post_ctx_with_declared_body();
+    get.method = "GET".to_string();
+    assert!(!plugin.should_buffer_request_body(&get));
+
+    // And a bodyless request stays unbuffered even when its method IS
+    // deduplicated, so the declared-body condition still does its work.
+    let bodyless_methods = make_plugin(json!({"applicable_methods": ["GET"]}));
+    let mut bodyless = new_ctx("GET", "/orders");
+    assert!(!bodyless_methods.should_buffer_request_body(&bodyless));
+    bodyless
+        .headers
+        .insert("content-length".to_string(), "7".to_string());
+    assert!(bodyless_methods.should_buffer_request_body(&bodyless));
 }
 
 /// GHSA-h2c3-j3cm-7ghh: unknown root keys must fail closed with a
@@ -5269,20 +5429,18 @@ async fn test_keyed_applicable_methods_buffer_request_body_for_fingerprint() {
     keyed_post.headers = keyed_headers("body-key", "api.example", 7);
     assert!(plugin.should_buffer_request_body(&keyed_post));
 
+    // Issue #5071: this phase precedes every `before_proxy` hook, so a keyless
+    // applicable request must still be prebuffered — an earlier admitted
+    // header transform may be about to supply the key, and the fingerprint
+    // fails closed with 400 if the bytes are gone by then.
     let keyless_without_declared_body = new_ctx("POST", "/api");
-    assert!(
-        !plugin.should_buffer_request_body(&keyless_without_declared_body),
-        "keyless optional requests must not lose streaming semantics"
-    );
+    assert!(plugin.should_buffer_request_body(&keyless_without_declared_body));
 
     let mut keyless_declared_body = new_ctx("POST", "/api");
     keyless_declared_body
         .headers
         .insert("content-length".to_string(), "7".to_string());
-    assert!(
-        !plugin.should_buffer_request_body(&keyless_declared_body),
-        "keyless optional requests must not be rejected by body buffering limits before this plugin ignores them"
-    );
+    assert!(plugin.should_buffer_request_body(&keyless_declared_body));
 
     let required_keyless = new_ctx("POST", "/api");
     let required_plugin = make_plugin(json!({

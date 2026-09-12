@@ -18,7 +18,7 @@
 use crate::fips::approved::Sha256;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -645,6 +645,12 @@ impl StatsdLogging {
         let runtime_tag_keys = validate_statsd_schema_keys(schema.as_deref())?;
         let global_tags = build_global_tags(config, ns, &runtime_tag_keys)?;
         let limits = admit_byte_limits(config, "statsd_logging")?;
+        validate_minimum_record_budget(
+            &prefix,
+            &global_tags,
+            schema.as_deref(),
+            limits.max_entry_bytes,
+        )?;
 
         let flush_config = StatsdFlushConfig {
             hostname: host.clone(),
@@ -1153,6 +1159,127 @@ pub fn format_ws_metrics(
         "{prefix}.websocket.frames_backend_to_client:{}|g{tags}",
         ctx.frames_backend_to_client
     );
+}
+
+/// Reject a prefix / tag / schema / `max_entry_bytes` combination that cannot
+/// hold one ordinary record in every supported family. Per-request fields
+/// (long proxy names, extra gRPC codes) can still overflow at runtime.
+fn validate_minimum_record_budget(
+    prefix: &str,
+    global_tags: &str,
+    schema: Option<&SummarySchema>,
+    max_entry_bytes: usize,
+) -> Result<(), String> {
+    let required = minimum_ordinary_record_bytes(prefix, global_tags, schema);
+    if required > max_entry_bytes {
+        return Err(format!(
+            "statsd_logging: 'max_entry_bytes' must fit at least the smallest ordinary record (HTTP, gRPC, stream, or WebSocket) with the resolved prefix, tags, and schema (requires at least {required} bytes, configured {max_entry_bytes})"
+        ));
+    }
+    Ok(())
+}
+
+fn render_metrics_len(render: impl FnOnce(&mut String)) -> usize {
+    let mut buf = String::new();
+    render(&mut buf);
+    buf.len()
+}
+
+fn minimum_http_summary() -> TransactionSummary {
+    TransactionSummary {
+        http_method: "GET".to_string(),
+        response_status_code: 200,
+        latency_total_ms: 0.0,
+        latency_backend_ttfb_ms: 0.0,
+        latency_gateway_overhead_ms: 0.0,
+        latency_plugin_execution_ms: 0.0,
+        ..TransactionSummary::default()
+    }
+}
+
+fn minimum_grpc_summary() -> TransactionSummary {
+    let mut summary = minimum_http_summary();
+    summary
+        .metadata
+        .insert("grpc_status".to_string(), "0".to_string());
+    summary
+}
+
+fn minimum_stream_summary() -> StreamTransactionSummary {
+    StreamTransactionSummary {
+        namespace: String::new(),
+        proxy_id: "a".to_string(),
+        proxy_name: None,
+        client_ip: String::new(),
+        consumer_username: None,
+        auth_method: None,
+        backend_target: String::new(),
+        backend_resolved_ip: None,
+        protocol: "tcp".to_string(),
+        listen_port: 1,
+        duration_ms: 0.0,
+        bytes_sent: 0,
+        bytes_received: 0,
+        connection_error: None,
+        error_class: None,
+        disconnect_direction: None,
+        disconnect_cause: None,
+        timestamp_connected: String::new(),
+        timestamp_disconnected: String::new(),
+        sni_hostname: None,
+        metadata: HashMap::new(),
+        proxy_lifecycle_generation: None,
+        plugin_trigger_decisions: Default::default(),
+    }
+}
+
+fn minimum_ws_context() -> WsDisconnectContext {
+    WsDisconnectContext {
+        namespace: String::new(),
+        proxy_id: "a".to_string(),
+        proxy_name: None,
+        client_ip: String::new(),
+        backend_target: String::new(),
+        http_method: "GET".to_string(),
+        request_path: "/".to_string(),
+        handshake_status_code: 101,
+        listen_port: 1,
+        connection_id: 0,
+        duration_ms: 0.0,
+        frames_client_to_backend: 0,
+        frames_backend_to_client: 0,
+        bytes_client_to_backend: 0,
+        bytes_backend_to_client: 0,
+        timestamp_connected: String::new(),
+        timestamp_disconnected: String::new(),
+        direction: None,
+        io_side: None,
+        error_class: None,
+        consumer_username: None,
+        auth_method: None,
+        metadata: HashMap::new(),
+        proxy_lifecycle_generation: None,
+    }
+}
+
+fn minimum_ordinary_record_bytes(
+    prefix: &str,
+    global_tags: &str,
+    schema: Option<&SummarySchema>,
+) -> usize {
+    let http = render_metrics_len(|buf| {
+        format_http_metrics(&minimum_http_summary(), prefix, global_tags, schema, buf);
+    });
+    let grpc = render_metrics_len(|buf| {
+        format_http_metrics(&minimum_grpc_summary(), prefix, global_tags, schema, buf);
+    });
+    let stream = render_metrics_len(|buf| {
+        format_stream_metrics(&minimum_stream_summary(), prefix, global_tags, schema, buf);
+    });
+    let ws = render_metrics_len(|buf| {
+        format_ws_metrics(&minimum_ws_context(), prefix, global_tags, schema, buf);
+    });
+    http.min(grpc).min(stream).min(ws)
 }
 
 /// Pack newline-delimited StatsD lines into UDP datagrams that each stay at

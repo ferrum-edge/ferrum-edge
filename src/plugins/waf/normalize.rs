@@ -54,6 +54,12 @@ const MAX_NUMERIC_ENTITY_DIGITS: usize = 16;
 /// flag returned by [`decoded_variants_with_residual`]).
 const MAX_DECODE_ROUNDS: usize = 3;
 
+/// Maximum hex digits inside a braced `\u{...}` escape (Rust/JS both cap a
+/// scalar value at six). The terminator search in [`decode_escape`] is bounded
+/// by this before it scans, so an unterminated candidate costs constant work
+/// rather than a suffix scan the caller then repeats one byte later.
+const MAX_BRACED_ESCAPE_HEX_DIGITS: usize = 6;
+
 /// Produce normalized decodings of `text` distinct from the raw input, and
 /// report whether the layered decode left an actively-decoding residual.
 ///
@@ -675,9 +681,18 @@ fn decode_escape(after: &[u8]) -> Option<(u32, usize)> {
     match after.first()? {
         b'u' | b'U' => {
             if after.get(1) == Some(&b'{') {
-                let rel = after[2..].iter().position(|&c| c == b'}')?;
-                let hex = &after[2..2 + rel];
-                if hex.is_empty() || hex.len() > 6 {
+                // Bound the terminator search BEFORE scanning. The caller
+                // advances a single byte per refused candidate, so searching
+                // the whole remaining slice for `}` here made a run of `\u{`
+                // quadratic in client-controlled text. A valid escape can only
+                // carry `MAX_BRACED_ESCAPE_HEX_DIGITS` hex digits, so a `}`
+                // further out is an over-width candidate either way and is
+                // refused after constant work.
+                let limit = MAX_BRACED_ESCAPE_HEX_DIGITS + 1;
+                let window = &after[2..after.len().min(2 + limit)];
+                let rel = window.iter().position(|&c| c == b'}')?;
+                let hex = &window[..rel];
+                if hex.is_empty() {
                     return None;
                 }
                 Some((hex_n(hex)?, 2 + rel + 1))
@@ -892,6 +907,36 @@ mod tests {
         assert_eq!(unicode_unescape(r"😀"), "\u{1F600}");
         assert_eq!(unicode_unescape(r"\u{3c}script"), "<script");
         assert_eq!(unicode_unescape(r"\x3cscript"), "<script");
+    }
+
+    #[test]
+    fn braced_unicode_escape_refuses_an_over_width_candidate_in_constant_work() {
+        // Six hex digits is the ceiling, so the widest valid escape decodes...
+        assert_eq!(unicode_unescape(r"\u{10FFFF}"), "\u{10FFFF}");
+        // ...and a seventh digit is refused, leaving the literal backslash.
+        assert_eq!(unicode_unescape(r"\u{1000000}"), r"\u{1000000}");
+        // A terminator beyond the ceiling is refused without being searched
+        // for: `decode_escape` never inspects past the bounded window.
+        assert_eq!(decode_escape(b"u{1234567}"), None);
+        assert_eq!(decode_escape(b"u{}"), None);
+        assert_eq!(decode_escape(b"u{3c}"), Some((0x3c, 5)));
+    }
+
+    #[test]
+    fn unterminated_braced_escapes_do_not_scan_the_whole_remaining_input() {
+        // The caller advances one byte per refused candidate, so an unbounded
+        // terminator search here is quadratic in client-controlled text. This
+        // input is a pure passthrough after the bound; before it, the same
+        // input cost ~10^11 byte comparisons (GHSA-27g8-5rv5-m3pf).
+        let payload = r"\u{".repeat(350_000);
+        let started = std::time::Instant::now();
+        let decoded = unicode_unescape(&payload);
+        assert_eq!(decoded, payload);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "bounded escape parsing must stay linear, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

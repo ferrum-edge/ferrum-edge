@@ -162,6 +162,8 @@ pub mod unix_backend;
 pub mod unix_backend_pool;
 pub mod upload_pump;
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
@@ -4306,6 +4308,57 @@ fn client_request_body_proven_empty(client_request_body: &ClientRequestBody) -> 
     }
 }
 
+/// Publish the transport's proof that a WebSocket HANDSHAKE carries no request
+/// body, so integrity-verifying authentication plugins can verify a signature
+/// over the empty body (issue #5000).
+///
+/// WebSocket streams are categorically excluded from request-body collection:
+/// after the upgrade, DATA is tunnel payload rather than an HTTP request body,
+/// and draining it would break the relay. That left `hmac_auth` with absent
+/// digest snapshots on every WebSocket route, and absent snapshots MUST fail
+/// closed — so a correctly signed handshake was answered `401` with a digest
+/// mismatch even though the plugin declares WebSocket support.
+///
+/// The handshake itself is an ordinary HTTP request whose body the transport can
+/// prove empty from wire framing alone, without reading a single tunnel byte.
+/// This publishes exactly that proof and nothing else:
+///
+/// * Only for the WebSocket flavor. HBONE CONNECT and `connect-udp` tunnels
+///   keep their absent snapshots and their documented fail-closed behavior.
+/// * Only when [`inbound_request_declares_body`] — which fails closed on any
+///   `Transfer-Encoding` and on any `Content-Length` that is not provably zero —
+///   says the handshake declared no body. A handshake that did declare one keeps
+///   the absent snapshots and is still rejected.
+/// * Only when a configured plugin actually asked for body digests, so an
+///   ordinary WebSocket route does no hashing at all.
+///
+/// This is never a global substitution of the empty digest for "the body was not
+/// collected": the empty representation here is a transport fact about the
+/// handshake, not an assumption about an uncollected body. Only the digest
+/// snapshots are published — no buffered-body metadata, text view, or byte view
+/// is synthesized, so nothing else can mistake a handshake for a collected body.
+pub(crate) fn publish_websocket_handshake_body_digests(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+) {
+    use crate::fips::approved::{Sha256, Sha512};
+
+    if ctx.request_body_sha256.is_some() || ctx.request_body_sha512.is_some() {
+        return;
+    }
+    if inbound_request_declares_body(ctx) {
+        return;
+    }
+    if !plugins
+        .iter()
+        .any(|plugin| plugin.needs_request_body_digests())
+    {
+        return;
+    }
+    ctx.request_body_sha256 = Some(Sha256::digest(b""));
+    ctx.request_body_sha512 = Some(Sha512::digest(b""));
+}
+
 /// Whether a `Content-Length` field-line value provably declares a zero-length
 /// body. Anything that is not a parseable zero — a non-UTF-8 field line, a
 /// malformed number, a value out of `u64` range — answers `false` so the
@@ -4603,6 +4656,10 @@ pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<Strin
     // transaction logs and retain only safe present/length correlation hints.
     crate::plugins::sse::redact_sse_log_metadata(metadata);
     crate::plugins::mcp_gateway::redact_internal_log_metadata(metadata);
+    // gRPC-Web stages the client's COMPLETE request trailer block for dispatch.
+    // It is transport state, not observability metadata, and the application
+    // trailing metadata inside it may carry credentials (GHSA-9f6g-hqpq-v8h7).
+    crate::plugins::grpc_web::redact_internal_log_metadata(metadata);
     // Fail-closed shared contract: request-deduplication lifecycle keys under
     // `_dedup_*` never enter any transaction-log projection. Ownership lives in
     // typed request state; this strips any residual public-metadata copies.
@@ -4979,31 +5036,157 @@ impl Drop for StreamLbSetupFailureGuard {
     }
 }
 
-/// RAII guard that releases a half-open circuit-breaker probe slot on drop
-/// unless an explicit outcome was recorded first (`disarm`).
+/// RAII owner of the HALF_OPEN circuit-breaker probe slot a request was admitted
+/// with (GHSA-4cq4-3f3f-mq76).
 ///
-/// The gRPC dispatch block has many early-return paths (plugin rejects,
-/// body-too-large, internal errors) reached AFTER `check_circuit_breaker` may
-/// have admitted a HALF_OPEN probe. The gRPC path historically recorded no
-/// outcome on those paths, leaking the probe slot and wedging the breaker. On
-/// such early returns this guard records a NEUTRAL outcome (a gateway-side
-/// decision is neither a backend success nor failure), releasing the slot
-/// without changing breaker health. The success/failure paths disarm it and
-/// record the real outcome instead.
-struct GrpcProbeReleaseGuard {
+/// `check_circuit_breaker` may admit a request as one of the breaker's
+/// `half_open_max_requests` probes (the default, and the clamped minimum, is a
+/// single slot). That slot is returned only when someone settles it. Every
+/// dispatch path used to signal ownership with a bare `bool` threaded through
+/// dozens of explicit `record_*` call sites, and NONE of those sites run when the
+/// client disconnects mid-probe: the transport drops the whole service future,
+/// the packed breaker state stays `(HALF_OPEN, count = 1)`, and — because the
+/// state machine has no timer out of HALF_OPEN — the gateway then sheds every
+/// later request to that backend with `503 circuit_breaker_open` for the rest of
+/// the process lifetime, healthy backend or not.
+///
+/// This guard makes the release structural rather than conventional:
+///
+/// * [`Self::take_slot`] hands the slot to exactly one explicit outcome record.
+///   It returns the `is_half_open_probe` argument `record_success` /
+///   `record_failure` / `record_neutral` take and disarms the guard in the same
+///   call, so a slot cannot be released twice (a double release decrements a
+///   DIFFERENT probe's slot and over-admits).
+/// * [`Self::release_neutral`] settles a gateway-side refusal. Such a refusal is
+///   neither a backend success nor a backend failure, so the slot is returned
+///   without moving breaker health in either direction: releasing as success
+///   would mask a genuinely broken backend, releasing as failure would let a
+///   client drive a healthy backend to OPEN.
+/// * [`Drop`] does the same for every path that settles nothing at all — above
+///   all a service future dropped under the gateway by a client disconnect.
+/// * [`Self::rearm`] re-points the guard at the breaker of a rotated retry
+///   target after the previous target's slot has been settled.
+///
+/// Siblings that share this invariant and MUST route through this one type
+/// (issue #4792): the H1/H2, WebSocket and gRPC dispatch paths in this module,
+/// the HBONE CONNECT relay in [`crate::proxy::hbone_proxy`], the HTTP/3
+/// request and WebSocket paths in [`crate::http3`], the UDP/DTLS session
+/// setup paths in [`crate::proxy::udp_proxy`], and the passthrough and
+/// terminating TCP paths in [`crate::proxy::tcp_proxy`].
+/// `tests/unit/gateway_core/shared_invariant_parity_tests.rs` asserts that every
+/// file calling `check_circuit_breaker` and all UDP/TCP direct-cache admission
+/// paths own a guard and that the guard settles NEUTRAL.
+pub struct HalfOpenProbeGuard {
+    /// The breaker that granted the slot, resolved ONCE at admission so a
+    /// concurrent configuration reload cannot make the release land on a
+    /// different `CircuitBreaker` instance than the one that admitted the probe.
+    /// `None` whenever no slot was ever held.
     cb: Option<Arc<crate::circuit_breaker::CircuitBreaker>>,
-    armed: bool,
+    /// Whether this guard still owns an unsettled probe slot.
+    armed: AtomicBool,
 }
 
-impl GrpcProbeReleaseGuard {
-    fn disarm(&mut self) {
-        self.armed = false;
+impl HalfOpenProbeGuard {
+    /// A guard owning no slot: the request was admitted in CLOSED state, or the
+    /// proxy configures no circuit breaker at all.
+    pub fn none() -> Self {
+        Self {
+            cb: None,
+            armed: AtomicBool::new(false),
+        }
+    }
+
+    /// Take ownership of the slot `check_circuit_breaker` just admitted.
+    ///
+    /// The breaker is looked up only for an ACTUAL probe, so the CLOSED-state hot
+    /// path costs one `bool` test and no cache touch.
+    pub fn new(
+        state: &ProxyState,
+        proxy: &Proxy,
+        target_key: Option<&str>,
+        is_half_open_probe: bool,
+    ) -> Self {
+        if !is_half_open_probe {
+            return Self::none();
+        }
+        let Some(cb_config) = &proxy.circuit_breaker else {
+            return Self::none();
+        };
+        let cb = state.circuit_breaker_cache.get_or_create(
+            &proxy.namespace,
+            &proxy.id,
+            target_key,
+            cb_config,
+        );
+        Self {
+            cb: Some(cb),
+            armed: AtomicBool::new(true),
+        }
+    }
+
+    /// Take ownership of the slot an admission on an already-resolved breaker
+    /// just returned — the retry paths, which re-admit through
+    /// `can_execute*` and get the `Arc` back directly. `is_half_open_probe`
+    /// is that admission's own verdict: `false` yields an empty guard.
+    pub fn for_admitted_probe(
+        cb: &Arc<crate::circuit_breaker::CircuitBreaker>,
+        is_half_open_probe: bool,
+    ) -> Self {
+        Self {
+            cb: is_half_open_probe.then(|| Arc::clone(cb)),
+            armed: AtomicBool::new(is_half_open_probe),
+        }
+    }
+
+    /// Does this guard still own an unsettled probe slot? A plain read — use
+    /// [`Self::take_slot`] anywhere the answer is about to settle the slot.
+    pub fn holds_slot(&self) -> bool {
+        self.armed.load(Ordering::Acquire)
+    }
+
+    /// Hand the slot to ONE explicit `record_success` / `record_failure` /
+    /// `record_neutral`, returning the `is_half_open_probe` argument it takes.
+    /// Every later caller — `Drop` included — sees `false`.
+    pub fn take_slot(&self) -> bool {
+        self.armed.swap(false, Ordering::AcqRel)
+    }
+
+    /// Give the slot up without recording anything, for a caller that has handed
+    /// ownership to a deferred recorder which will settle it later.
+    pub fn disarm(&self) {
+        self.armed.store(false, Ordering::Release);
+    }
+
+    /// Release the slot NEUTRAL: the gateway refused this request before any
+    /// backend outcome existed, so the breaker's health must not move.
+    pub fn release_neutral(&self) {
+        if self.take_slot()
+            && let Some(cb) = &self.cb
+        {
+            cb.record_neutral(true);
+        }
+    }
+
+    /// Adopt the probe slot a retry's re-admission claimed on a (possibly
+    /// rotated) target. Any slot still held on the PREVIOUS target is released
+    /// NEUTRAL first: callers settle it before rotating, and releasing here
+    /// rather than dropping the reference is what keeps a future reordering from
+    /// silently reintroducing the leak this type exists to close.
+    pub fn rearm(
+        &mut self,
+        cb: &Arc<crate::circuit_breaker::CircuitBreaker>,
+        is_half_open_probe: bool,
+    ) {
+        self.release_neutral();
+        // The old value is disarmed by the release above, so the assignment's
+        // implicit drop cannot free the slot this guard is about to adopt.
+        *self = Self::for_admitted_probe(cb, is_half_open_probe);
     }
 }
 
-impl Drop for GrpcProbeReleaseGuard {
+impl Drop for HalfOpenProbeGuard {
     fn drop(&mut self) {
-        if self.armed
+        if self.armed.swap(false, Ordering::AcqRel)
             && let Some(cb) = &self.cb
         {
             cb.record_neutral(true);
@@ -5412,6 +5595,34 @@ impl GrpcStreamingProbeRecorder {
     }
 }
 
+impl Drop for GrpcStreamingProbeRecorder {
+    /// Last line of defence for the HALF_OPEN probe slot (GHSA-4cq4-3f3f-mq76).
+    ///
+    /// Ownership of the slot reaches this recorder at
+    /// `note_headers_arrived` — the same call that sets `headers_seen` and
+    /// disarms the dispatch path's [`HalfOpenProbeGuard`]. From that instant the
+    /// only scheduled releases are the upload-termination join and the
+    /// post-header upload guard, and BOTH can be skipped when the client
+    /// disappears and the whole request is dropped: the guard is spawned only
+    /// when `post_header_upload_timeout_ms` is configured, and the join needs an
+    /// upload-termination signal the abandoned upload may never deliver. Release
+    /// NEUTRAL here so the slot cannot outlive the request that held it.
+    ///
+    /// Gating on `headers_seen` is what keeps this from double-releasing: before
+    /// the handoff the dispatch path still owns the slot and settles it itself.
+    /// `slot_released` is the same exactly-once CAS every other release path
+    /// takes.
+    fn drop(&mut self) {
+        if !self.is_half_open_probe || !self.headers_seen.load(Ordering::Acquire) {
+            return;
+        }
+        if self.slot_released.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.cb.record_neutral(true);
+    }
+}
+
 impl crate::proxy::grpc_proxy::GrpcUploadTerminationObserver for GrpcStreamingProbeRecorder {
     fn on_upload_terminated(&self) {
         self.upload_terminated.store(true, Ordering::Release);
@@ -5506,12 +5717,15 @@ fn grpc_post_header_upload_guard_duration(timeout_ms: u64) -> Option<Duration> {
 /// here and the outcome is recorded solely at body completion.
 fn finalize_grpc_streaming_probe_outcome(
     recorder: Option<&Arc<GrpcStreamingProbeRecorder>>,
-    probe_guard: &mut GrpcProbeReleaseGuard,
+    probe_guard: &HalfOpenProbeGuard,
 ) {
     if let Some(recorder) = recorder {
-        // The recorder owns the probe-slot release (NEUTRAL at upload
-        // termination, or when the post-header upload guard expires), so disarm
-        // the eager guard to avoid a double release.
+        // The recorder owns the probe-slot release from here on (NEUTRAL at
+        // upload termination, when the post-header upload guard expires, or from
+        // its own `Drop` if the client vanishes before either), so disarm the
+        // eager guard to avoid a double release. This is the single ownership
+        // handoff point: `note_headers_arrived` is also what arms the recorder's
+        // drop-time fallback.
         probe_guard.disarm();
         recorder.note_headers_arrived();
     }
@@ -5798,7 +6012,9 @@ pub(crate) async fn run_final_request_body_hooks_with_provenance_in(
                 // the `UNAVAILABLE` a bare `503` would otherwise map to, which
                 // would claim the backend is down.
                 use crate::proxy::response_buffer_budget as budget;
-                warn!("Governed request body decode refused: request-decode budget exhausted");
+                warn_sampled!(
+                    "Governed request body decode refused: request-decode budget exhausted"
+                );
                 // The SAME gateway-capacity terminal state the retained-response
                 // refusal uses. Without it this fixed `503` is an ordinary
                 // rejection with no provenance, and the response-side finalizer
@@ -5831,7 +6047,7 @@ pub(crate) async fn run_final_request_body_hooks_with_provenance_in(
             FinalRequestBodyPosture::Reject(rejection) => {
                 // Fixed-cardinality reason only: no coding token, no header
                 // value, and no body byte reaches the log or the client.
-                warn!(
+                warn_sampled!(
                     reason = rejection.reason(),
                     "Governed request body could not be reduced to plaintext; failing closed"
                 );
@@ -14216,7 +14432,11 @@ async fn handle_websocket_request_authenticated(
     is_tls: bool,
     mesh_inbound_pre_handshake_app_port: Option<u16>,
     cb_target_key: Option<String>,
-    cb_is_half_open_probe: bool,
+    // Ownership of the HALF_OPEN circuit-breaker probe slot admitted for this
+    // upgrade, moved in from the generic handler. Dropping it releases the slot
+    // NEUTRALLY, which is what stops a client that abandons the upgrade
+    // mid-probe from wedging the breaker (GHSA-4cq4-3f3f-mq76).
+    mut cb_probe: HalfOpenProbeGuard,
     requires_websocket_framing: bool,
     query_string: String,
     strip_len: usize,
@@ -14269,12 +14489,7 @@ async fn handle_websocket_request_authenticated(
         )
         .await;
         record_request(&state, status.as_u16());
-        release_circuit_breaker_probe_on_admission_reject(
-            &state,
-            &proxy,
-            current_cb_target_key.as_deref(),
-            cb_is_half_open_probe,
-        );
+        cb_probe.release_neutral();
         return Ok(build_websocket_error_response(
             status,
             body,
@@ -14304,12 +14519,7 @@ async fn handle_websocket_request_authenticated(
     ) {
         Ok(url) => url,
         Err(_) => {
-            release_circuit_breaker_probe_on_admission_reject(
-                &state,
-                &proxy,
-                current_cb_target_key.as_deref(),
-                cb_is_half_open_probe,
-            );
+            cb_probe.release_neutral();
             return Ok(build_websocket_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 r#"{"error":"Invalid backend path coordinates"}"#,
@@ -14330,12 +14540,7 @@ async fn handle_websocket_request_authenticated(
             // The caller's CB check may have claimed a HALF_OPEN probe slot —
             // release it (gateway-side reject, not a backend outcome) so the
             // breaker can admit the next probe instead of wedging.
-            release_circuit_breaker_probe_on_admission_reject(
-                &state,
-                &proxy,
-                current_cb_target_key.as_deref(),
-                cb_is_half_open_probe,
-            );
+            cb_probe.release_neutral();
             return Ok(build_websocket_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 r#"{"error":"Internal server error during WebSocket upgrade"}"#,
@@ -14372,12 +14577,7 @@ async fn handle_websocket_request_authenticated(
                 record_request(&state, 503);
                 // Gateway-side reject after the CB check — release a claimed
                 // HALF_OPEN probe slot so the breaker doesn't wedge.
-                release_circuit_breaker_probe_on_admission_reject(
-                    &state,
-                    &proxy,
-                    current_cb_target_key.as_deref(),
-                    cb_is_half_open_probe,
-                );
+                cb_probe.release_neutral();
                 return Ok(build_websocket_error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     r#"{"error":"WebSocket connection limit exceeded"}"#,
@@ -14414,12 +14614,7 @@ async fn handle_websocket_request_authenticated(
             )
             .await;
             record_request(&state, 503);
-            release_circuit_breaker_probe_on_admission_reject(
-                &state,
-                &proxy,
-                current_cb_target_key.as_deref(),
-                cb_is_half_open_probe,
-            );
+            cb_probe.release_neutral();
             return Ok(build_websocket_error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 r#"{"error":"WebSocket connection limit exceeded"}"#,
@@ -14488,7 +14683,6 @@ async fn handle_websocket_request_authenticated(
     let mut current_target = upstream_target;
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet>;
     let mut backend_admission_start: Instant;
-    let mut ws_cb_probe_slot_available = cb_is_half_open_probe;
     let mut ws_attempt = 0u32;
 
     // Connection-wide idle tracker created BEFORE the backend dial so the
@@ -14554,12 +14748,7 @@ async fn handle_websocket_request_authenticated(
                 record_request(&state, 503);
                 // Gateway-side reject after the CB check — release a claimed
                 // HALF_OPEN probe slot so the breaker doesn't wedge.
-                release_circuit_breaker_probe_on_admission_reject(
-                    &state,
-                    &proxy,
-                    current_cb_target_key.as_deref(),
-                    ws_cb_probe_slot_available,
-                );
+                cb_probe.release_neutral();
                 return Ok(build_websocket_error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     r#"{"error":"Backend connection limit exceeded"}"#,
@@ -14580,12 +14769,7 @@ async fn handle_websocket_request_authenticated(
             Ok(permits) => permits,
             Err(rejection) => {
                 drop(conn_slot);
-                release_circuit_breaker_probe_on_admission_reject(
-                    &state,
-                    &proxy,
-                    current_cb_target_key.as_deref(),
-                    ws_cb_probe_slot_available,
-                );
+                cb_probe.release_neutral();
                 let response = handle_backend_admission_rejection(
                     rejection,
                     &plugins,
@@ -14933,8 +15117,7 @@ async fn handle_websocket_request_authenticated(
                             current_cb_target_key.as_deref(),
                             cb_config,
                         );
-                        cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
-                        ws_cb_probe_slot_available = false;
+                        cb.record_failure(502, ws_is_pre_wire, cb_probe.take_slot());
                         cb_failure_already_recorded = true;
                     }
 
@@ -15057,8 +15240,12 @@ async fn handle_websocket_request_authenticated(
                             retry_cb_target_key.as_deref(),
                             cb_config,
                         ) {
-                            Ok((_cb, is_half_open_probe)) => {
-                                ws_cb_probe_slot_available = is_half_open_probe;
+                            Ok((cb, is_half_open_probe)) => {
+                                // Re-point the probe guard at the rotated target's
+                                // breaker: the prior target's slot was taken by the
+                                // intermediate failure record above, and this retry
+                                // may itself have been admitted as a probe.
+                                cb_probe.rearm(&cb, is_half_open_probe);
                             }
                             Err(_) => {
                                 retry_admitted_by_cb = false;
@@ -15120,9 +15307,9 @@ async fn handle_websocket_request_authenticated(
                         // admitted HALF_OPEN probe slot NEUTRALLY (no failure count)
                         // so the breaker can recover, rather than leaking it by
                         // skipping the record entirely.
-                        cb.record_neutral(ws_cb_probe_slot_available);
+                        cb.record_neutral(cb_probe.take_slot());
                     } else {
-                        cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
+                        cb.record_failure(502, ws_is_pre_wire, cb_probe.take_slot());
                     }
                 }
                 if !backend_outcome_already_recorded
@@ -15271,7 +15458,7 @@ async fn handle_websocket_request_authenticated(
             current_cb_target_key.as_deref(),
             cb_config,
         );
-        cb.record_success(ws_cb_probe_slot_available);
+        cb.record_success(cb_probe.take_slot());
     }
 
     if ws_session_deadline.at <= tokio::time::Instant::now() {
@@ -15629,11 +15816,6 @@ async fn handle_websocket_request_authenticated(
                             ws_write_buf,
                             ws_tunnel,
                             ws_tunnel_idle_disabled_safety_cap,
-                            // H1/H2: RFC 6455 / RFC 8441 mandate masked
-                            // client-to-server frames. The H3 caller in
-                            // `src/http3/websocket.rs` passes `true` for
-                            // RFC 9220 §5 compliance.
-                            false,
                             ws_idle_tracker,
                             ws_session_deadline,
                             ws_shutdown_rx,
@@ -15660,7 +15842,6 @@ async fn handle_websocket_request_authenticated(
                             ws_write_buf,
                             ws_tunnel,
                             ws_tunnel_idle_disabled_safety_cap,
-                            false,
                             ws_idle_tracker,
                             ws_session_deadline,
                             ws_shutdown_rx,
@@ -15699,7 +15880,6 @@ async fn handle_websocket_request_authenticated(
                             ws_write_buf,
                             ws_tunnel,
                             ws_tunnel_idle_disabled_safety_cap,
-                            false,
                             ws_idle_tracker,
                             ws_session_deadline,
                             ws_shutdown_rx,
@@ -15902,9 +16082,10 @@ fn proxy_header_entry_case_insensitive<'a>(
 }
 
 fn is_websocket_backend_strip_header(name: &str) -> bool {
-    matches!(
-        name,
-        "host"
+    headers_mod::is_consumer_assertion_header(name)
+        || matches!(
+            name,
+            "host"
             | "proxy-authenticate"
             | "sec-websocket-key"
             | "sec-websocket-version"
@@ -15916,10 +16097,8 @@ fn is_websocket_backend_strip_header(name: &str) -> bool {
             // down with a protocol error. Strip the offer so no extension is
             // ever negotiated end to end.
             | "sec-websocket-extensions"
-            | "x-consumer-username"
-            | "x-consumer-custom-id"
             | "x-geo-country"
-    )
+        )
 }
 
 fn push_forwardable_header_override(
@@ -18684,14 +18863,12 @@ where
 /// false` because RFC 9220 is already bridged as WebSocket frames over QUIC, not
 /// a raw TCP socket.
 ///
-/// `accept_unmasked_client_frames` controls whether the WebSocket framer
-/// accepts client-to-server frames without the RFC 6455 mask bit set.
-/// HTTP/1.1 and HTTP/2 callers pass `false` (RFC 6455 / RFC 8441 mandate
-/// masked client frames). HTTP/3 callers pass `true` — RFC 9220 §5
-/// REVERSES the masking requirement: client-to-server frames MUST NOT
-/// be masked when the WebSocket runs over HTTP/3. The H3 bridge validates
-/// that rule before bytes reach this shared tungstenite framer, then passes
-/// `true` here so compliant unmasked client frames are accepted.
+/// Client-to-server frame masking is RFC 6455 §5.1 on every frontend. RFC 8441
+/// §5 and RFC 9220 §3 only bootstrap the session — they hand the CONNECT stream
+/// to RFC 6455 "as if it were the TCP connection" and say nothing about masking
+/// — so H1, H2, and H3 all run this framer with `accept_unmasked_frames` off:
+/// masked client frames are unmasked here, and an unmasked one is a protocol
+/// error that closes the client with 1002 (issue #5011).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_websocket_proxy<C, B>(
     client_io: C,
@@ -18707,7 +18884,6 @@ pub(crate) async fn run_websocket_proxy<C, B>(
     websocket_write_buffer_size: usize,
     websocket_tunnel_mode: bool,
     websocket_tunnel_idle_disabled_safety_cap: Duration,
-    accept_unmasked_client_frames: bool,
     ws_idle_tracker: Option<Arc<WsIdleTracker>>,
     session_deadline: WsSessionDeadline,
     shutdown_rx: Option<watch::Receiver<bool>>,
@@ -18730,20 +18906,6 @@ where
     // return below stays generic.
     B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    // Invariant: the tunnel-mode raw-copy fast path is only reachable from H1
-    // frontends. RFC 6455 (H1.1) and RFC 8441 (H2 Extended CONNECT) mandate
-    // masked client frames, so H1/H2 always pass `accept_unmasked_client_frames
-    // = false`. RFC 9220 (H3 Extended CONNECT) reverses the rule and the H3
-    // caller passes `true` — but H3 cannot tunnel raw bytes (there is no TCP
-    // underneath QUIC) so the caller also passes `websocket_tunnel_mode =
-    // false`. If both are ever `true` simultaneously, a refactor has wired a
-    // non-TCP transport into the tunnel branch and `copy_bidirectional` would
-    // silently elide frame parsing on traffic that needs it.
-    debug_assert!(
-        !(websocket_tunnel_mode && accept_unmasked_client_frames),
-        "run_websocket_proxy: tunnel mode is incompatible with unmasked client \
-         frames (H3 caller must pass websocket_tunnel_mode=false)"
-    );
     // Issue #3857: the HTTP connection guard is dropped when
     // `serve_connection_with_upgrades` returns, which for an H1 upgrade is
     // before this relay ends. The cloned session handle still lives here; wrap
@@ -18985,10 +19147,11 @@ where
     ws_config.max_frame_size = Some(effective_size_limits.max_frame_bytes);
     ws_config.max_message_size = Some(effective_size_limits.max_message_bytes);
     ws_config.write_buffer_size = websocket_write_buffer_size;
-    // RFC 9220 §5: frames over HTTP/3 are NOT masked. H1/H2 callers
-    // pass `false` (RFC 6455 / RFC 8441 mandate masked client frames);
-    // H3 callers pass `true`.
-    ws_config.accept_unmasked_frames = accept_unmasked_client_frames;
+    // RFC 6455 §5.1: a server MUST close the connection on an unmasked
+    // client frame. RFC 8441 / RFC 9220 Extended CONNECT bootstrap the
+    // session without changing framing, so H1, H2, and H3 are identical
+    // here — there is no HTTP/3 masking exemption (issue #5011).
+    ws_config.accept_unmasked_frames = false;
     // Transparent relay shared by H1/H2/H3: forward Ping without a local
     // auto-Pong so end-to-end keepalive reflects the far side (issue #2963).
     ws_config.auto_pong = false;
@@ -19355,7 +19518,7 @@ where
                             let error_class = if let Some((close, limit_kind, size, max_size)) =
                                 size_limits_ctb.plugin_close_for_error(&e)
                             {
-                                warn!(
+                                warn_sampled!(
                                     plugin = "ws_message_size_limiting",
                                     proxy_id = %proxy_id_ctb,
                                     connection_id,
@@ -19377,7 +19540,7 @@ where
                             } else if let Some((close, limit_kind, size, max_size)) =
                                 EffectiveWsSizeLimits::global_capacity_close_for_error(&e)
                             {
-                                warn!(
+                                warn_sampled!(
                                     proxy_id = %proxy_id_ctb,
                                     connection_id,
                                     direction = "client->backend",
@@ -19396,7 +19559,7 @@ where
                             } else if let Some((close, limit_kind)) =
                                 ws_fragment_policy_close_for_error(&e)
                             {
-                                warn!(
+                                warn_sampled!(
                                     proxy_id = %proxy_id_ctb,
                                     connection_id,
                                     direction = "client->backend",
@@ -19681,7 +19844,7 @@ where
                             let error_class = if let Some((close, limit_kind, size, max_size)) =
                                 size_limits_btc.plugin_close_for_error(&e)
                             {
-                                warn!(
+                                warn_sampled!(
                                     plugin = "ws_message_size_limiting",
                                     proxy_id = %proxy_id_btc,
                                     connection_id,
@@ -19701,7 +19864,7 @@ where
                             } else if let Some((close, limit_kind, size, max_size)) =
                                 EffectiveWsSizeLimits::global_capacity_close_for_error(&e)
                             {
-                                warn!(
+                                warn_sampled!(
                                     proxy_id = %proxy_id_btc,
                                     connection_id,
                                     direction = "backend->client",
@@ -19720,7 +19883,7 @@ where
                             } else if let Some((close, limit_kind)) =
                                 ws_fragment_policy_close_for_error(&e)
                             {
-                                warn!(
+                                warn_sampled!(
                                     proxy_id = %proxy_id_btc,
                                     connection_id,
                                     direction = "backend->client",
@@ -22716,7 +22879,7 @@ async fn run_after_proxy_hooks_on_rejection(
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {
-                    warn!(
+                    warn_sampled!(
                         rejecting_plugin = plugin.name(),
                         "after_proxy rejection could not be normalized"
                     );
@@ -22785,7 +22948,7 @@ async fn run_after_proxy_hooks_on_rejection(
                         ctx.mark_final_body_policy_terminal_replacement();
                     }
                     if plugin.warn_on_rejection_response_replacement() {
-                        warn!(
+                        warn_sampled!(
                             rejecting_plugin = plugin.name(),
                             replacement_status = *status_code,
                             replaced_status,
@@ -22810,7 +22973,7 @@ async fn run_after_proxy_hooks_on_rejection(
                 // short-circuit — a federated 2xx missing usage metadata is still
                 // returned to the client. See docs/plugins.md (ai_rate_limiter
                 // federation limitation).
-                warn!(
+                warn_sampled!(
                     rejecting_plugin = plugin.name(),
                     attempted_reject_status = reject_status,
                     committed_status = *status_code,
@@ -23290,7 +23453,7 @@ async fn evaluate_final_synthetic_client_visible_response_body_policy(
             }
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let reject = plugin_result_into_reject_parts(reject).unwrap_or_else(|| {
-                    warn!(
+                    warn_sampled!(
                         plugin = plugin.name(),
                         "Final client-visible response policy re-decision could not be \
                          converted; failing closed"
@@ -23491,7 +23654,7 @@ async fn reenforce_final_synthetic_client_visible_response_body_policy(
                 if final_response_body_policy_scope(response_headers)
                     != gateway_authored_rejection_body_policy_scope()
                 {
-                    warn!(
+                    warn_sampled!(
                         "Final client-visible response body policy rejection rebuilt an unexpected \
                          representation; collapsing to the fixed gateway terminal"
                     );
@@ -23551,6 +23714,13 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     response_headers: &mut HashMap<String, String>,
     response_body: &mut Bytes,
 ) -> Option<FinalSyntheticBodyPolicyWitness> {
+    // Semantic-cache entries retain the finalized application body with only
+    // transport encoding removed. Body inspection must see replay provenance
+    // so mandatory policy rewrites still run, while ordinary rewrites do not.
+    // Restore it before live header rules and the late compression phase.
+    let previous_finalized_response_replay = ctx.finalized_response_replay;
+    ctx.finalized_response_replay |= ctx.semantic_cache_response_replay;
+
     // Mark the context for the duration of this body-hook phase so that storing
     // plugins (e.g. `request_deduplication`) can tell this body is a synthetic
     // plugin short-circuit and skip caching/replaying it. Saved/restored so a
@@ -23884,6 +24054,8 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     } else {
         ctx.metadata.remove(SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
     }
+
+    ctx.finalized_response_replay = previous_finalized_response_replay;
 
     // A gateway-authored terminal — a capacity refusal, a body rejection, a
     // failed mandatory replay redaction — is already the answer, and must never
@@ -24390,7 +24562,7 @@ pub(crate) async fn run_after_proxy_hooks(
                     mut headers,
                 } = plugin_result_into_reject_parts(reject)
                     .expect("reject result should convert to rejection parts");
-                warn!(
+                warn_sampled!(
                     "after_proxy plugin '{}' rejected response before downstream commit (status {})",
                     plugin.name(),
                     status_code,
@@ -25997,7 +26169,7 @@ pub(crate) fn install_pending_buffered_response_capacity_refusal(
     }
     if let Some(produced_bytes) = produced_bytes {
         ctx.mark_response_transform_size_refusal_selected();
-        warn!(
+        warn_sampled!(
             proxy_id = ctx.matched_proxy.as_ref().map(|proxy| proxy.id.as_str()),
             plugin = "response_transformer",
             produced_bytes_at_least = produced_bytes,
@@ -26135,7 +26307,7 @@ async fn replace_buffered_response_with_representation_error(
     initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
     apply_reject_after_proxy_hooks: bool,
 ) {
-    warn!(
+    warn_sampled!(
         reason = rejection.reason(),
         "Buffered response rejected: configured response body policy could not be enforced"
     );
@@ -26313,7 +26485,9 @@ pub(crate) async fn admit_buffered_response_body_transforms(
             // passive health, and adaptive concurrency, rather than the `502`
             // representation error that would blame the upstream
             // (GHSA-pwcm-6rh8-f2gh).
-            warn!("Response representation decode refused: retained-response budget exhausted");
+            warn_sampled!(
+                "Response representation decode refused: retained-response budget exhausted"
+            );
             replace_buffered_response_with_capacity_refusal_with_policy_source(
                 ctx,
                 response_status,
@@ -26333,7 +26507,7 @@ pub(crate) async fn admit_buffered_response_body_transforms(
                 // decode above does — never a forward of the claimed encoded
                 // bytes (GHSA-pwcm-6rh8-f2gh).
                 if !install_decoded_response_body(ctx, response_headers, response_body, decoded) {
-                    warn!(
+                    warn_sampled!(
                         "Response representation decode refused: retained-response budget exhausted"
                     );
                     replace_buffered_response_with_capacity_refusal_with_policy_source(
@@ -26467,7 +26641,7 @@ async fn run_final_client_visible_response_body_policy(
                     // body a policy just refused — so substitute the fixed,
                     // non-sensitive gateway terminal rather than continuing.
                     None => {
-                        warn!(
+                        warn_sampled!(
                             plugin = plugin.name(),
                             "Final client-visible response policy rejection could not be \
                              converted; failing closed"
@@ -26943,7 +27117,7 @@ async fn enforce_final_client_visible_response_header_policy(
             );
             return true;
         }
-        warn!(
+        warn_sampled!(
             "Final client-visible response header policy still refused the rebuilt rejection; \
              collapsing to the fixed gateway terminal"
         );
@@ -27049,7 +27223,7 @@ pub(crate) async fn enforce_buffered_final_client_visible_response_header_policy
             .await;
             return true;
         }
-        warn!(
+        warn_sampled!(
             "Final client-visible response header policy still refused the buffered rejection; \
              collapsing to the fixed protocol terminal"
         );
@@ -27245,7 +27419,9 @@ async fn transform_buffered_response_body_with_deadline_inner(
         match response_buffer_budget::ResponseTransformWindow::open(ceiling) {
             Some(window) => Some(window),
             None => {
-                warn!("Response body transform refused: retained-response budget exhausted");
+                warn_sampled!(
+                    "Response body transform refused: retained-response budget exhausted"
+                );
                 replace_buffered_response_with_capacity_refusal(
                     ctx,
                     response_status,
@@ -27286,9 +27462,10 @@ async fn transform_buffered_response_body_with_deadline_inner(
                 plugin.response_body_production(),
                 window.as_mut(),
             ) {
-                warn!(
+                warn_sampled!(
                     plugin = plugin.name(),
-                    reason, "Response body transform refused before invoking the producer"
+                    reason,
+                    "Response body transform refused before invoking the producer"
                 );
                 replace_buffered_response_with_capacity_refusal(
                     ctx,
@@ -27379,7 +27556,7 @@ async fn transform_buffered_response_body_with_deadline_inner(
                 // refused rather than installed uncharged.
                 let transformed_len = transformed.len();
                 let Some(charged) = window.as_mut().and_then(|w| w.charge(transformed)) else {
-                    warn!(
+                    warn_sampled!(
                         plugin = plugin.name(),
                         replacement_bytes = transformed_len,
                         "Response body transform refused: replacement body is not covered by a \
@@ -27864,6 +28041,8 @@ async fn build_grpc_web_reject_response(
 ) -> Option<Response<ProxyBody>> {
     let (Some(content_type), Some(mut grpc_status)) = (response_content_type, reject.grpc_status)
     else {
+        ctx.metadata
+            .remove(FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY);
         return None;
     };
     let mut message = reject
@@ -27960,6 +28139,12 @@ async fn build_grpc_web_reject_response(
             break;
         }
     }
+    // gRPC-Web defers committed hooks until after its HTTP 200 response has
+    // been framed. The synthetic marker must survive those hooks for ownership
+    // plugins, but it is internal bookkeeping and must not reach rejection
+    // logging performed by the caller.
+    ctx.metadata
+        .remove(FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY);
     Some(build_grpc_web_error_response_from_parts(
         translated,
         grpc_status,
@@ -28302,41 +28487,6 @@ async fn finalize_upload_deadline_rejection(
     .await;
     record_request(state, log_status);
     response
-}
-
-/// Release a HALF_OPEN probe slot `check_circuit_breaker` admitted, for a
-/// request the gateway rejects before it ever reaches the backend.
-///
-/// A gateway-side refusal is neither a backend success nor a backend failure,
-/// so the slot is released NEUTRAL: the breaker's health is unchanged and the
-/// next probe can be admitted instead of the breaker wedging OPEN forever.
-///
-/// Siblings that share this invariant and MUST route through this one
-/// implementation (issue #4792): the H1/H2/WebSocket/gRPC handler in this
-/// module, [`crate::http3::server::release_h3_circuit_breaker_probe_on_admission_reject`],
-/// and [`crate::http3::websocket::release_h3_ws_circuit_breaker_probe_on_admission_reject`].
-/// The gRPC dispatch block additionally carries `GrpcProbeReleaseGuard`, an RAII
-/// wrapper over the same NEUTRAL release for its many early returns. When one of
-/// these changes, change them together —
-/// `tests/unit/gateway_core/shared_invariant_parity_tests.rs` asserts they agree.
-pub(crate) fn release_circuit_breaker_probe_on_admission_reject(
-    state: &ProxyState,
-    proxy: &Proxy,
-    target_key: Option<&str>,
-    is_half_open_probe: bool,
-) {
-    if !is_half_open_probe {
-        return;
-    }
-    if let Some(cb_config) = &proxy.circuit_breaker {
-        let cb = state.circuit_breaker_cache.get_or_create(
-            &proxy.namespace,
-            &proxy.id,
-            target_key,
-            cb_config,
-        );
-        cb.record_neutral(true);
-    }
 }
 
 /// Fixed trailers-only gRPC terminal for an admitted stream whose authorization
@@ -30167,7 +30317,9 @@ async fn handle_proxy_request_inner(
     // materializing the full HashMap — only 2-3 targeted lookups on the raw
     // HeaderMap. The configured real-IP header is read as ALL of its field
     // lines, never a single `get()`, so duplicate lines cannot hide a competing
-    // attacker-supplied value (advisory GHSA-fx4w-68hx-mj7r).
+    // attacker-supplied value (advisory GHSA-fx4w-68hx-mj7r). X-Forwarded-For
+    // is read through the same byte-preserving accessor so no field line can
+    // leave the chain before it is walked (advisory GHSA-73ff-frj6-cpmp).
     if !state.trusted_proxies.is_empty() {
         // Latch the immediate-peer trust verdict for the whole request, before
         // any plugin phase runs. Plugin phases that build their own outbound
@@ -30185,19 +30337,8 @@ async fn handle_proxy_request_inner(
             {
                 request_scheme = forwarded_scheme;
             }
-            let xff_chain = {
-                let mut values = ctx.raw_header_values("x-forwarded-for");
-                values.next().map(|first| {
-                    let mut combined = String::from(first);
-                    for value in values {
-                        combined.push(',');
-                        combined.push_str(value);
-                    }
-                    combined
-                })
-            };
-            // Bound the immutable borrow of `ctx` (held by the field-line
-            // iterator) to this statement so the assignment below can take a
+            // Bound the immutable borrows of `ctx` (held by the field-line
+            // iterators) to this statement so the assignment below can take a
             // mutable borrow.
             let resolved = client_ip::resolve_forwarded_client_ip(
                 &socket_ip,
@@ -30210,7 +30351,7 @@ async fn handle_proxy_request_inner(
                     .map(|name| ctx.header_field_lines(name))
                     .into_iter()
                     .flatten(),
-                xff_chain.as_deref(),
+                ctx.header_field_lines("x-forwarded-for"),
                 &state.trusted_proxies,
             );
             if let Some(resolved) = resolved {
@@ -31063,6 +31204,14 @@ async fn handle_proxy_request_inner(
     } else {
         RequestBodyPhaseRequirements::default()
     };
+    // A WebSocket handshake declares no body on the wire, so the transport can
+    // prove the empty representation an integrity-verifying auth plugin has to
+    // sign over without touching a tunnel byte (issue #5000).
+    if matches!(flavor, HttpFlavor::WebSocket)
+        && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
+    {
+        publish_websocket_handshake_body_digests(&plugins, &mut ctx);
+    }
 
     if authenticate_body_requirements.required {
         client_request_body = match client_request_body {
@@ -32862,6 +33011,21 @@ async fn handle_proxy_request_inner(
                 return Ok(build_response_from_normalized_reject(reject));
             }
         };
+    // GHSA-4cq4-3f3f-mq76: own the admitted HALF_OPEN probe slot with an RAII
+    // guard rather than a bare `bool` threaded through every explicit `record_*`
+    // site. Between here and the point a `ProxyBody` takes over the deferred
+    // outcome there are awaits the client can outlive — request-body buffering,
+    // plugin hooks, the backend dial itself, retry backoff — and a client that
+    // disconnects during any of them drops this whole future, running none of
+    // those sites. Dropping `cb_probe` then releases the slot NEUTRALLY, so the
+    // breaker can admit the next probe instead of wedging at
+    // `(HALF_OPEN, count = 1)` for the rest of the process lifetime.
+    let mut cb_probe = HalfOpenProbeGuard::new(
+        &state,
+        &proxy,
+        cb_target_key.as_deref(),
+        cb_is_half_open_probe,
+    );
 
     // For ordinary response-policy reevaluation, finalize the body only after
     // fail-fast routing and breaker gates have admitted the request. This
@@ -32904,12 +33068,7 @@ async fn handle_proxy_request_inner(
             ) {
                 Ok(permits) => permits,
                 Err(rejection) => {
-                    release_circuit_breaker_probe_on_admission_reject(
-                        &state,
-                        &proxy,
-                        cb_target_key.as_deref(),
-                        cb_is_half_open_probe,
-                    );
+                    cb_probe.release_neutral();
                     return Ok(boxed_handle_backend_admission_rejection(
                         rejection,
                         &plugins,
@@ -32941,12 +33100,7 @@ async fn handle_proxy_request_inner(
                 {
                     Ok(body) => body,
                     Err(RequestBodyBufferError::TooLarge) => {
-                        release_circuit_breaker_probe_on_admission_reject(
-                            &state,
-                            &proxy,
-                            cb_target_key.as_deref(),
-                            cb_is_half_open_probe,
-                        );
+                        cb_probe.release_neutral();
                         record_request(&state, 413);
                         return Ok(build_response(
                             StatusCode::PAYLOAD_TOO_LARGE,
@@ -32954,12 +33108,7 @@ async fn handle_proxy_request_inner(
                         ));
                     }
                     Err(RequestBodyBufferError::ClientDisconnected(error_message)) => {
-                        release_circuit_breaker_probe_on_admission_reject(
-                            &state,
-                            &proxy,
-                            cb_target_key.as_deref(),
-                            cb_is_half_open_probe,
-                        );
+                        cb_probe.release_neutral();
                         error!(
                             proxy_id = %proxy.id,
                             path = %ctx.path,
@@ -32974,12 +33123,7 @@ async fn handle_proxy_request_inner(
                         ));
                     }
                     Err(RequestBodyBufferError::BufferCapacityExceeded) => {
-                        release_circuit_breaker_probe_on_admission_reject(
-                            &state,
-                            &proxy,
-                            cb_target_key.as_deref(),
-                            cb_is_half_open_probe,
-                        );
+                        cb_probe.release_neutral();
                         drop(preacquired_backend_admission.take_if_acquired());
                         let response = build_request_buffer_capacity_response(
                             is_grpc_request,
@@ -32992,12 +33136,7 @@ async fn handle_proxy_request_inner(
                         return Ok(response);
                     }
                     Err(RequestBodyBufferError::TimedOut) => {
-                        release_circuit_breaker_probe_on_admission_reject(
-                            &state,
-                            &proxy,
-                            cb_target_key.as_deref(),
-                            cb_is_half_open_probe,
-                        );
+                        cb_probe.release_neutral();
                         drop(preacquired_backend_admission.take_if_acquired());
                         let response = build_request_body_timeout_response(
                             is_grpc_request,
@@ -33010,12 +33149,7 @@ async fn handle_proxy_request_inner(
                         return Ok(response);
                     }
                     Err(RequestBodyBufferError::DeadlineExceeded) => {
-                        release_circuit_breaker_probe_on_admission_reject(
-                            &state,
-                            &proxy,
-                            cb_target_key.as_deref(),
-                            cb_is_half_open_probe,
-                        );
+                        cb_probe.release_neutral();
                         drop(preacquired_backend_admission.take_if_acquired());
                         let response = boxed_finalize_upload_deadline_rejection(
                             &plugins,
@@ -33118,12 +33252,7 @@ async fn handle_proxy_request_inner(
                     }
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
-                        release_circuit_breaker_probe_on_admission_reject(
-                            &state,
-                            &proxy,
-                            cb_target_key.as_deref(),
-                            cb_is_half_open_probe,
-                        );
+                        cb_probe.release_neutral();
                         let Some(reject) = plugin_result_into_reject_parts(reject) else {
                             record_request(&state, 500);
                             return Ok(build_response(
@@ -33219,12 +33348,7 @@ async fn handle_proxy_request_inner(
         // probe slot `check_circuit_breaker` may have claimed — otherwise
         // repeated refusals leak `half_open_in_flight` slots and wedge the
         // breaker (same reason the HBONE / mesh-mTLS refusals do it).
-        release_circuit_breaker_probe_on_admission_reject(
-            &state,
-            &proxy,
-            cb_target_key.as_deref(),
-            cb_is_half_open_probe,
-        );
+        cb_probe.release_neutral();
         record_request(&state, 502);
         return Ok(build_response(
             StatusCode::BAD_GATEWAY,
@@ -33255,12 +33379,7 @@ async fn handle_proxy_request_inner(
                 // and wedge the breaker. Mirrors the H3 origin reject in
                 // `src/http3/server.rs` and the other H1/H2 WebSocket gateway-side
                 // rejects (missing OnUpgrade, connection limits, backend admission).
-                release_circuit_breaker_probe_on_admission_reject(
-                    &state,
-                    &proxy,
-                    cb_target_key.as_deref(),
-                    cb_is_half_open_probe,
-                );
+                cb_probe.release_neutral();
                 record_request(&state, 403);
                 return Ok(build_websocket_error_response(
                     StatusCode::FORBIDDEN,
@@ -33316,7 +33435,7 @@ async fn handle_proxy_request_inner(
             is_tls,
             mesh_inbound_pre_handshake_app_port,
             cb_target_key,
-            cb_is_half_open_probe,
+            cb_probe,
             requires_websocket_framing,
             effective_query_string.to_string(),
             strip_len,
@@ -33465,12 +33584,7 @@ async fn handle_proxy_request_inner(
                 // `check_circuit_breaker` may have admitted for this request — this
                 // reject precedes any backend dispatch, so a leaked probe slot would
                 // wedge the breaker (mirrors the WebSocket gateway-side rejects).
-                release_circuit_breaker_probe_on_admission_reject(
-                    &state,
-                    &proxy,
-                    cb_target_key.as_deref(),
-                    cb_is_half_open_probe,
-                );
+                cb_probe.release_neutral();
                 record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
                 if let Some(content_type) = grpc_web_response_content_type {
                     return Ok(build_grpc_web_error_response(
@@ -33497,21 +33611,12 @@ async fn handle_proxy_request_inner(
         // dispatch. Borrowed when no override applies; cloned only when the
         // selected target or per-port timeout differs.
 
-        // Account for a HALF_OPEN circuit-breaker probe slot that
-        // check_circuit_breaker may have admitted for this request. The gRPC
-        // block returns from many early paths; this guard records a NEUTRAL
-        // outcome on drop (releasing the probe slot) unless an explicit
-        // success/failure is recorded after dispatch. `grpc_cb_probe_slot`
-        // tracks whether that probe is still unconsumed so the retry loop and
-        // the final record below cannot double-decrement it.
-        let mut grpc_cb_probe_slot = cb_is_half_open_probe;
         // The post-dispatch breaker record must be charged to the target that
         // actually produced grpc_result. The retry loop can rotate targets, so
         // track the final target here (init to the initial target) and update it
         // on each rotation, mirroring the HTTP path's final_cb_target_key. The
-        // probe-slot release still lands correctly: grpc_cb_probe_slot is only
-        // still true when no rotation occurred, in which case this equals
-        // cb_target_key.
+        // probe-slot release still lands correctly: `cb_probe` is re-pointed at
+        // the rotated target's breaker when the retry loop re-admits.
         let mut grpc_final_cb_key = cb_target_key.clone();
         // Set when a load-balanced retry rotates to a target whose breaker
         // rejects the attempt (see the can_execute gate in the retry loop): the
@@ -33519,21 +33624,6 @@ async fn handle_proxy_request_inner(
         // post-dispatch record below must be skipped. Mirrors the HTTP path's
         // `skip_final_cb_record`.
         let mut grpc_skip_final_cb_record = false;
-        let mut grpc_probe_guard = GrpcProbeReleaseGuard {
-            cb: if cb_is_half_open_probe {
-                proxy.circuit_breaker.as_ref().map(|cfg| {
-                    state.circuit_breaker_cache.get_or_create(
-                        &proxy.namespace,
-                        &proxy.id,
-                        cb_target_key.as_deref(),
-                        cfg,
-                    )
-                })
-            } else {
-                None
-            },
-            armed: true,
-        };
 
         let grpc_connection_proxy =
             resolve_backend_connection_proxy_for_target(&proxy, upstream_target.as_deref());
@@ -33559,17 +33649,9 @@ async fn handle_proxy_request_inner(
             // Release a HALF_OPEN probe slot `check_circuit_breaker` may have
             // admitted (else it wedges the breaker) and count the request so
             // policy-denied gRPC calls still appear in request/status metrics.
-            // Unlike the cross-cluster reject above (which runs BEFORE
-            // `grpc_probe_guard` exists), this reject is AFTER the guard, so
-            // disarm it first — otherwise its still-armed `Drop` fires a SECOND
-            // neutral release that would decrement another in-flight probe slot.
-            grpc_probe_guard.disarm();
-            release_circuit_breaker_probe_on_admission_reject(
-                &state,
-                &proxy,
-                cb_target_key.as_deref(),
-                cb_is_half_open_probe,
-            );
+            // `release_neutral` takes the slot, so the guard's `Drop` cannot fire
+            // a SECOND release that would free another in-flight probe's slot.
+            cb_probe.release_neutral();
             record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
             return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                 14,
@@ -33612,16 +33694,9 @@ async fn handle_proxy_request_inner(
                     "No dispatchable mesh transport for the selected gRPC target; failing \
                      closed with gRPC UNAVAILABLE instead of an unauthenticated direct dial"
                 );
-                // This reject is AFTER `grpc_probe_guard` exists, so disarm
-                // it before the explicit release (a still-armed Drop would
-                // free a SECOND, unrelated in-flight probe slot).
-                grpc_probe_guard.disarm();
-                release_circuit_breaker_probe_on_admission_reject(
-                    &state,
-                    &proxy,
-                    cb_target_key.as_deref(),
-                    cb_is_half_open_probe,
-                );
+                // Gateway-side refusal before any dial: hand the admitted
+                // HALF_OPEN slot back neutrally.
+                cb_probe.release_neutral();
                 record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
                 if let Some(content_type) = grpc_web_response_content_type {
                     return Ok(build_grpc_web_error_response(
@@ -33738,6 +33813,14 @@ async fn handle_proxy_request_inner(
         // CLOSED state, or the buffered-request streaming path) records the
         // outcome at response-header time as before.
         let mut grpc_streaming_probe_recorder: Option<Arc<GrpcStreamingProbeRecorder>> = None;
+        // Publication latch for the fully-streamed native-gRPC upload's
+        // forwarded request bytes (GHSA-8x5h-g4xh-hgc9). That arm never
+        // collects a body, so `ctx.bytes_sent_observed` is written once at
+        // upload termination; a backend that answers before a client-streaming
+        // upload finishes would otherwise build the deferred summary — and bill
+        // `api_chargeback` — against a still-zero counter. `None` on every
+        // buffered arm, which publishes the collected length synchronously.
+        let mut grpc_streaming_request_bytes_latch: Option<Arc<body::DirectH2BytesLatch>> = None;
         // Unread frontend upload retained across a synthesized Trailers-Only
         // error on the fully-streaming H2 path. The pinned h2 transport already
         // orders response HEADERS before its permitted NO_ERROR cancellation;
@@ -33779,7 +33862,7 @@ async fn handle_proxy_request_inner(
                     {
                         Ok(parts) => parts,
                         Err(grpc_proxy::GrpcRequestBodyCollectError::TimedOut) => {
-                            // `grpc_probe_guard` remains armed: returning drops it and
+                            // `cb_probe` remains armed: returning drops it and
                             // releases the admitted HALF_OPEN slot exactly once,
                             // neutrally, before the response is written by hyper.
                             record_request(&state, StatusCode::OK.as_u16());
@@ -33795,13 +33878,7 @@ async fn handle_proxy_request_inner(
                             // Rejection decorators/logging may await external sinks.
                             // Release the admitted HALF_OPEN probe and any body-phase
                             // preacquisition before entering that cleanup pipeline.
-                            grpc_probe_guard.disarm();
-                            release_circuit_breaker_probe_on_admission_reject(
-                                &state,
-                                &proxy,
-                                cb_target_key.as_deref(),
-                                grpc_cb_probe_slot,
-                            );
+                            cb_probe.release_neutral();
                             drop(preacquired_backend_admission.take_if_acquired());
                             return Ok(boxed_finalize_upload_deadline_rejection(
                                 &plugins,
@@ -33823,13 +33900,7 @@ async fn handle_proxy_request_inner(
                             // are released neutrally before the rejection
                             // pipeline, which may await external sinks. No
                             // backend was dialed, so this is health-neutral.
-                            grpc_probe_guard.disarm();
-                            release_circuit_breaker_probe_on_admission_reject(
-                                &state,
-                                &proxy,
-                                cb_target_key.as_deref(),
-                                grpc_cb_probe_slot,
-                            );
+                            cb_probe.release_neutral();
                             drop(preacquired_backend_admission.take_if_acquired());
                             // Constructed out of line and boxed so this cold arm
                             // is not a permanent frame slot in the generic
@@ -34086,17 +34157,11 @@ async fn handle_proxy_request_inner(
                     // HALF_OPEN probe; an adaptive-concurrency reject here must
                     // release that probe slot so the breaker can admit the next
                     // probe (the retry path and HTTP/WS/H3 paths do the same).
-                    // Disarm the RAII guard FIRST — its Drop would otherwise
-                    // fire a second `record_neutral(true)` on the same breaker,
-                    // and the spurious extra decrement can free a DIFFERENT
-                    // in-flight probe's slot, over-admitting probes.
-                    grpc_probe_guard.disarm();
-                    release_circuit_breaker_probe_on_admission_reject(
-                        &state,
-                        &proxy,
-                        cb_target_key.as_deref(),
-                        grpc_cb_probe_slot,
-                    );
+                    // `release_neutral` TAKES the slot, so the guard's own Drop
+                    // cannot fire a second `record_neutral(true)` on the same
+                    // breaker — that spurious extra decrement would free a
+                    // DIFFERENT in-flight probe's slot, over-admitting probes.
+                    cb_probe.release_neutral();
                     return Ok(boxed_handle_backend_admission_rejection(
                         rejection,
                         &plugins,
@@ -34195,10 +34260,11 @@ async fn handle_proxy_request_inner(
                 // fired from the request body's `Drop` so the single slot is
                 // released (NEUTRAL) at upload termination — never pinned for the
                 // life of a long server/bidi response stream. No retry on this
-                // path means `grpc_final_cb_key == cb_target_key` and
-                // `grpc_cb_probe_slot` is unconsumed, so the recorder owns the
-                // single slot release. A CLOSED-state (non-probe) request has no
-                // slot to settle.
+                // path means `grpc_final_cb_key == cb_target_key` and `cb_probe`
+                // is unconsumed, so the recorder owns the single slot release
+                // (`finalize_grpc_streaming_probe_outcome` disarms the guard at the
+                // handoff). A CLOSED-state (non-probe) request has no slot to
+                // settle.
                 let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 // Build the recorder whenever a breaker is configured (not just for
                 // HALF_OPEN probes): on the fully-streaming path it owns the gRPC
@@ -34228,7 +34294,7 @@ async fn handle_proxy_request_inner(
                                 );
                             let recorder = Arc::new(GrpcStreamingProbeRecorder::new(
                                 cb,
-                                grpc_cb_probe_slot,
+                                cb_probe.holds_slot(),
                                 Arc::clone(&body_size_exceeded),
                                 post_header_upload_timeout_ms,
                                 cb_admission_open_epoch,
@@ -34257,14 +34323,8 @@ async fn handle_proxy_request_inner(
                     Err(rejection) => {
                         // Release the CB HALF_OPEN probe slot before rejecting, as on
                         // the other admission paths (see the split-path branch above).
-                        // Disarm the RAII guard first so its Drop doesn't double-release.
-                        grpc_probe_guard.disarm();
-                        release_circuit_breaker_probe_on_admission_reject(
-                            &state,
-                            &proxy,
-                            cb_target_key.as_deref(),
-                            grpc_cb_probe_slot,
-                        );
+                        // Taking the slot is what stops the guard's Drop repeating it.
+                        cb_probe.release_neutral();
                         return Ok(boxed_handle_backend_admission_rejection(
                             rejection,
                             &plugins,
@@ -34284,6 +34344,12 @@ async fn handle_proxy_request_inner(
                     upstream_balancer.clone(),
                 ));
                 grpc_backend_admission_started_at = Instant::now();
+                let request_bytes_latch = Arc::new(body::DirectH2BytesLatch::new());
+                grpc_streaming_request_bytes_latch = Some(Arc::clone(&request_bytes_latch));
+                let request_bytes_accounting = grpc_proxy::GrpcUploadByteAccounting::new(
+                    Arc::clone(&ctx.bytes_sent_observed),
+                    request_bytes_latch,
+                );
                 let result = grpc_proxy::proxy_grpc_request_streaming(
                     request,
                     grpc_dispatch_proxy,
@@ -34301,6 +34367,11 @@ async fn handle_proxy_request_inner(
                     ctx.grpc_deadline_at(),
                     &mut held_frontend_grpc_upload,
                     Some(Arc::clone(&ctx.grpc_request_messages_observed)),
+                    // The buffered arms `fetch_max` the collected length into
+                    // this counter; the streamed arm has no collected length,
+                    // so the body publishes its forwarded DATA tally at upload
+                    // termination instead (GHSA-8x5h-g4xh-hgc9).
+                    Some(request_bytes_accounting),
                     // Same absolute plan the buffered gRPC arms use (#3815);
                     // the fully-streamed upload gets the gateway-owned pump
                     // instead of a bounded collect.
@@ -34377,15 +34448,9 @@ async fn handle_proxy_request_inner(
                                 Err(rejection) => {
                                     // Release the CB HALF_OPEN probe slot before
                                     // rejecting, as on the other admission paths.
-                                    // Disarm the RAII guard first so its Drop
-                                    // doesn't double-release.
-                                    grpc_probe_guard.disarm();
-                                    release_circuit_breaker_probe_on_admission_reject(
-                                        &state,
-                                        &proxy,
-                                        cb_target_key.as_deref(),
-                                        grpc_cb_probe_slot,
-                                    );
+                                    // Taking the slot is what stops the guard's
+                                    // Drop repeating it.
+                                    cb_probe.release_neutral();
                                     return Ok(boxed_handle_backend_admission_rejection(
                                         rejection,
                                         &plugins,
@@ -34442,13 +34507,7 @@ async fn handle_proxy_request_inner(
                         ));
                     }
                     Err(grpc_proxy::GrpcRequestBodyCollectError::DeadlineExceeded) => {
-                        grpc_probe_guard.disarm();
-                        release_circuit_breaker_probe_on_admission_reject(
-                            &state,
-                            &proxy,
-                            cb_target_key.as_deref(),
-                            grpc_cb_probe_slot,
-                        );
+                        cb_probe.release_neutral();
                         drop(preacquired_backend_admission.take_if_acquired());
                         return Ok(boxed_finalize_upload_deadline_rejection(
                             &plugins,
@@ -34465,13 +34524,7 @@ async fn handle_proxy_request_inner(
                     Err(grpc_proxy::GrpcRequestBodyCollectError::AuthorizationExpired(
                         termination,
                     )) => {
-                        grpc_probe_guard.disarm();
-                        release_circuit_breaker_probe_on_admission_reject(
-                            &state,
-                            &proxy,
-                            cb_target_key.as_deref(),
-                            grpc_cb_probe_slot,
-                        );
+                        cb_probe.release_neutral();
                         drop(preacquired_backend_admission.take_if_acquired());
                         // Boxed out of line for the same stack-budget reason as
                         // the split-path arm above.
@@ -34660,22 +34713,18 @@ async fn handle_proxy_request_inner(
                     // signal — the ceiling is the gateway's own policy. Settle
                     // the breaker neutrally instead of opening it on a healthy
                     // destination whose cap simply saturated.
+                    // `take_slot` hands the probe slot to exactly this record and
+                    // disarms `cb_probe`. Without that, a future dropped during the
+                    // retry backoff or the next attempt would `record_neutral` on
+                    // the same breaker and release a SECOND slot (over-admitting
+                    // probes when `half_open_max_requests > 1`), and the
+                    // post-dispatch record below would decrement it again.
+                    let grpc_retry_probe_slot = cb_probe.take_slot();
                     if backend_dispatch::client_side_no_backend_signal(grpc_retry_error_class) {
-                        cb.record_neutral(grpc_cb_probe_slot);
+                        cb.record_neutral(grpc_retry_probe_slot);
                     } else {
-                        cb.record_failure(502, true, grpc_cb_probe_slot);
+                        cb.record_failure(502, true, grpc_retry_probe_slot);
                     }
-                    // This intermediate failure consumes the probe slot (if any);
-                    // the post-dispatch record must not decrement it again.
-                    grpc_cb_probe_slot = false;
-                    // The probe slot this guard would release on drop has now
-                    // been released by the record above (failure or neutral —
-                    // both consume it), so disarm it.
-                    // Otherwise a future dropped during the retry backoff/next
-                    // attempt would call record_neutral on the same breaker and
-                    // release a second slot (over-admitting probes when
-                    // half_open_max_requests > 1).
-                    grpc_probe_guard.disarm();
                 }
 
                 let delay = retry::retry_delay(retry_config, grpc_attempt);
@@ -34837,24 +34886,22 @@ async fn handle_proxy_request_inner(
                             cb_config,
                         ) {
                         Ok((cb, is_half_open_probe, admission_open_epoch)) => {
-                            grpc_cb_probe_slot = is_half_open_probe;
                             // #1649 R6 finding 1: re-capture the admission epoch for
                             // the rotated target so the deferred body-completion
                             // outcome is stale-checked against THIS target's
                             // generation, not the initial target's.
                             cb_admission_open_epoch = admission_open_epoch;
-                            // #1649 R6 finding 4: re-point the probe-release guard at
-                            // the rotated target. On rotation the guard was disarmed
-                            // (after recording the prior target's intermediate
-                            // failure), so without this a HALF_OPEN slot acquired on
-                            // the rotated target would never be released on the
-                            // buffered streaming path (the deferred outcome records
-                            // the health as a non-probe). The buffered/retry request
-                            // has finished uploading, so header-flush release (guard
-                            // Drop) is the correct timing; the eager-record arms below
-                            // disarm the guard and release via `grpc_cb_probe_slot`.
-                            grpc_probe_guard.cb = is_half_open_probe.then(|| Arc::clone(&cb));
-                            grpc_probe_guard.armed = is_half_open_probe;
+                            // #1649 R6 finding 4: re-point the probe guard at the
+                            // rotated target. On rotation the guard was taken (the
+                            // prior target's intermediate failure consumed it), so
+                            // without this a HALF_OPEN slot acquired on the rotated
+                            // target would never be released on the buffered
+                            // streaming path (the deferred outcome records the health
+                            // as a non-probe). The buffered/retry request has
+                            // finished uploading, so header-flush release (guard
+                            // `Drop`) is the correct timing; the eager-record arms
+                            // below take the slot instead.
+                            cb_probe.rearm(&cb, is_half_open_probe);
                         }
                         Err(_) => {
                             // Rotated/retried target's breaker rejected: don't
@@ -34882,17 +34929,11 @@ async fn handle_proxy_request_inner(
                 ) {
                     Ok(permits) => permits,
                     Err(rejection) => {
-                        // Disarm the RAII guard first so its Drop doesn't
-                        // double-release: after a rotation the guard was re-armed to
-                        // this target (#1649 R6 finding 4), so the explicit release
-                        // below would otherwise be duplicated by the guard's Drop.
-                        grpc_probe_guard.disarm();
-                        release_circuit_breaker_probe_on_admission_reject(
-                            &state,
-                            &proxy,
-                            grpc_current_cb_key.as_deref(),
-                            grpc_cb_probe_slot,
-                        );
+                        // After a rotation the guard was re-pointed at THIS
+                        // target (#1649 R6 finding 4), so release its slot here;
+                        // taking it is what stops the guard's Drop repeating the
+                        // release on the rotated target's breaker.
+                        cb_probe.release_neutral();
                         return Ok(boxed_handle_backend_admission_rejection(
                             rejection,
                             &plugins,
@@ -35046,8 +35087,7 @@ async fn handle_proxy_request_inner(
                 // streaming arm, where HALF_OPEN fast-path probes can
                 // neutralize late upload overflows via the deferred recorder.
                 Ok(GrpcResponseKind::Buffered(r)) => {
-                    grpc_probe_guard.disarm();
-                    record_grpc_backend_status_outcome(&cb, r.status, grpc_cb_probe_slot);
+                    record_grpc_backend_status_outcome(&cb, r.status, cb_probe.take_slot());
                 }
                 Ok(GrpcResponseKind::Streaming(_)) => {
                     // Defer: the streaming arm finalizes via
@@ -35081,11 +35121,10 @@ async fn handle_proxy_request_inner(
                     | GrpcProxyError::ResponseBufferCapacity(_)
                     | GrpcProxyError::Internal(_),
                 ) => {
-                    grpc_probe_guard.disarm();
-                    cb.record_neutral(grpc_cb_probe_slot);
+                    cb.record_neutral(cb_probe.take_slot());
                 }
                 Err(e) => {
-                    grpc_probe_guard.disarm();
+                    let grpc_final_probe_slot = cb_probe.take_slot();
                     let connection_error = matches!(
                         e,
                         GrpcProxyError::BackendUnavailable { kind, message, .. }
@@ -35108,9 +35147,9 @@ async fn handle_proxy_request_inner(
                     // destination.
                     let grpc_error_class = retry::classify_grpc_proxy_error(e);
                     if backend_dispatch::client_side_no_backend_signal(Some(grpc_error_class)) {
-                        cb.record_neutral(grpc_cb_probe_slot);
+                        cb.record_neutral(grpc_final_probe_slot);
                     } else {
-                        cb.record_failure(502, connection_error, grpc_cb_probe_slot);
+                        cb.record_failure(502, connection_error, grpc_final_probe_slot);
                     }
                 }
             }
@@ -35136,7 +35175,7 @@ async fn handle_proxy_request_inner(
                 if !grpc_skip_final_cb_record {
                     finalize_grpc_streaming_probe_outcome(
                         grpc_streaming_probe_recorder.as_ref(),
-                        &mut grpc_probe_guard,
+                        &cb_probe,
                     );
                 }
 
@@ -35584,6 +35623,17 @@ async fn handle_proxy_request_inner(
                 } else {
                     None
                 };
+                // A fully-streamed upload publishes its forwarded request bytes
+                // only at upload termination, which a server- or bidi-streaming
+                // RPC can reach long after the response headers this summary was
+                // built from. Waiting on the latch is what keeps `bytes_sent`
+                // (and `api_chargeback`'s sent-bandwidth charge) from settling on
+                // a still-zero counter. `None` on every buffered request arm.
+                let deferred_grpc_logger = deferred_grpc_logger.map(|logger| {
+                    logger.with_passthrough_request_bytes_latch(
+                        grpc_streaming_request_bytes_latch.clone(),
+                    )
+                });
 
                 if body_exceeded {
                     drop(backend_admission_permits.take());
@@ -35876,6 +35926,7 @@ async fn handle_proxy_request_inner(
                         content_type,
                         grpc_streaming.status,
                         grpc_web_streaming_initial_metadata,
+                        crate::plugins::grpc_web::response_entity_is_unframed_backend_error(&ctx),
                     );
                 }
                 if let Some(logger) = deferred_grpc_logger {
@@ -36918,12 +36969,7 @@ async fn handle_proxy_request_inner(
     ) {
         Ok(value) => value,
         Err(_) => {
-            release_circuit_breaker_probe_on_admission_reject(
-                &state,
-                &proxy,
-                cb_target_key.as_deref(),
-                cb_is_half_open_probe,
-            );
+            cb_probe.release_neutral();
             return Ok(build_pre_plugin_reject_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 b"Invalid backend path coordinates",
@@ -37055,12 +37101,7 @@ async fn handle_proxy_request_inner(
         // fail-closed refusals would otherwise leak `half_open_in_flight`
         // slots and wedge the breaker (mirrors the WebSocket origin reject
         // and the gRPC-branch mesh refusals).
-        release_circuit_breaker_probe_on_admission_reject(
-            &state,
-            &proxy,
-            cb_target_key.as_deref(),
-            cb_is_half_open_probe,
-        );
+        cb_probe.release_neutral();
         // A gRPC-flavored request gets a protocol-appropriate Trailers-Only
         // refusal (gRPC errors ride HTTP 200 + grpc-status) instead of a JSON
         // 502 the client cannot parse. Same fail-closed contract either way.
@@ -37116,12 +37157,7 @@ async fn handle_proxy_request_inner(
         // refusals leak `half_open_in_flight` slots and wedge the breaker
         // (mirrors the WebSocket origin reject and the gRPC-branch mesh
         // refusals).
-        release_circuit_breaker_probe_on_admission_reject(
-            &state,
-            &proxy,
-            cb_target_key.as_deref(),
-            cb_is_half_open_probe,
-        );
+        cb_probe.release_neutral();
         // This gate is the fail-closed surface for gRPC-over-mesh-mTLS (issue
         // #2003): gRPC requests to same-cluster `mesh.mtls` targets skip the
         // direct-dial gRPC branch and dispatch through the mesh-mTLS pool, so
@@ -37184,7 +37220,6 @@ async fn handle_proxy_request_inner(
     // translation independently of the relative upstream header.
     let grpc_request_deadline = ctx.grpc_deadline_at();
     let bytes_sent_observed = Arc::clone(&ctx.bytes_sent_observed);
-    let mut cb_retry_probe_slot_available = cb_is_half_open_probe;
     let mut skip_final_cb_record = false;
     let mut backend_admission_started_at = backend_start;
     // Mesh-transport (HBONE and mesh-mTLS) client-upload overflow flag,
@@ -37297,12 +37332,7 @@ async fn handle_proxy_request_inner(
                 (*response, retained_body)
             }
             BackendDispatchResult::AdmissionRejected(rejection) => {
-                release_circuit_breaker_probe_on_admission_reject(
-                    &state,
-                    &proxy,
-                    cb_target_key.as_deref(),
-                    cb_is_half_open_probe,
-                );
+                cb_probe.release_neutral();
                 // Codex r2-2 finding 3: gRPC-flavored requests on the generic
                 // path (mesh fall-through) keep the gRPC rejection shape — the
                 // direct gRPC branch passes `true` unconditionally to
@@ -37463,16 +37493,19 @@ async fn handle_proxy_request_inner(
                 // gateway-side ceiling, so charging it would open the breaker on
                 // a healthy destination. Mirrors `apply_circuit_breaker_outcome`
                 // and the raw-TCP over-cap path's `record_cb_neutral`.
+                // Take the probe slot here so this intermediate record owns it:
+                // the post-loop record must not decrement it again, and a future
+                // dropped during the backoff must not release a second slot.
+                let retry_probe_slot = cb_probe.take_slot();
                 if backend_dispatch::client_side_no_backend_signal(result.error_class) {
-                    cb.record_neutral(cb_retry_probe_slot_available);
+                    cb.record_neutral(retry_probe_slot);
                 } else {
                     cb.record_failure(
                         result.status_code,
                         result.connection_error,
-                        cb_retry_probe_slot_available,
+                        retry_probe_slot,
                     );
                 }
-                cb_retry_probe_slot_available = false;
             }
 
             let delay = retry::retry_delay(retry_config, attempt);
@@ -37759,8 +37792,10 @@ async fn handle_proxy_request_inner(
                         current_cb_target_key.as_deref(),
                         cb_config,
                     ) {
-                    Ok((_cb, is_half_open_probe, admission_open_epoch)) => {
-                        cb_retry_probe_slot_available = is_half_open_probe;
+                    Ok((cb, is_half_open_probe, admission_open_epoch)) => {
+                        // Adopt the rotated target's probe slot (the prior
+                        // target's was taken by the intermediate record above).
+                        cb_probe.rearm(&cb, is_half_open_probe);
                         // #1649 R6 finding 2: re-capture the admission epoch for the
                         // rotated target so the deferred StreamingH2 body-completion
                         // outcome is stale-checked against THIS target's generation,
@@ -37788,12 +37823,7 @@ async fn handle_proxy_request_inner(
             ) {
                 Ok(permits) => permits,
                 Err(rejection) => {
-                    release_circuit_breaker_probe_on_admission_reject(
-                        &state,
-                        &proxy,
-                        current_cb_target_key.as_deref(),
-                        cb_retry_probe_slot_available,
-                    );
+                    cb_probe.release_neutral();
                     // Codex r2-2 finding 3: keep the gRPC rejection shape for
                     // gRPC-flavored requests (see the initial-dispatch arm).
                     return Ok(boxed_handle_backend_admission_rejection(
@@ -38008,12 +38038,7 @@ async fn handle_proxy_request_inner(
                 *response
             }
             BackendDispatchResult::AdmissionRejected(rejection) => {
-                release_circuit_breaker_probe_on_admission_reject(
-                    &state,
-                    &proxy,
-                    cb_target_key.as_deref(),
-                    cb_is_half_open_probe,
-                );
+                cb_probe.release_neutral();
                 // Codex r2-2 finding 3: keep the gRPC rejection shape for
                 // gRPC-flavored requests (see the initial-dispatch arm).
                 return Ok(boxed_handle_backend_admission_rejection(
@@ -38405,22 +38430,20 @@ async fn handle_proxy_request_inner(
         // outcome; the deferred dispatch records the real outcome at body
         // completion as a non-probe. Gated by `!skip_final_cb_record` because a
         // rotated-retry break already recorded (and released) the breaker for
-        // the prior target.
-        if cb_retry_probe_slot_available
-            && !skip_final_cb_record
-            && let Some(cb_config) = &proxy.circuit_breaker
-        {
-            state
-                .circuit_breaker_cache
-                .get_or_create(
-                    &proxy.namespace,
-                    &proxy.id,
-                    final_cb_target_key.as_deref(),
-                    cb_config,
-                )
-                .record_neutral(true);
+        // the prior target. `cb_probe` was re-pointed at the rotated target on
+        // every re-admission, so it names the breaker that granted the slot.
+        if !skip_final_cb_record {
+            cb_probe.release_neutral();
         }
     } else {
+        // A skipped breaker record must not swallow the probe slot: leave it
+        // with the guard, whose `Drop` settles it NEUTRALLY on the breaker
+        // that granted it.
+        let final_probe_slot = if skip_final_cb_record {
+            false
+        } else {
+            cb_probe.take_slot()
+        };
         backend_dispatch::record_backend_outcome_no_conn_end(
             &state,
             &proxy,
@@ -38431,7 +38454,7 @@ async fn handle_proxy_request_inner(
             recorded_backend_status,
             backend_resp.connection_error,
             backend_error_class,
-            cb_retry_probe_slot_available,
+            final_probe_slot,
             skip_final_cb_record,
             final_backend_dispatch_elapsed,
         );
@@ -38814,28 +38837,6 @@ async fn handle_proxy_request_inner(
             .await;
             response_body = ResponseBody::buffered(body);
         }
-        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-    }
-
-    // `mcp_gateway` may have replaced the governed JSON-RPC body with an empty
-    // POST-side 202 while privately reserving the event. The ordinary buffered
-    // header policy ran before that legacy final-body hook, over the original
-    // 200 response. Close the newly selected acknowledgement here so the
-    // committed hook never publishes an event whose actual POST response did
-    // not pass final header policy. Synthetic rejects reach the equivalent
-    // boundary inside `apply_reject_after_proxy_and_synthetic_body_hooks`.
-    if ctx.mcp_sse_publication.is_some()
-        && let ResponseBody::Buffered(ref mut data) = response_body
-    {
-        let phase_start = Instant::now();
-        let _ = enforce_buffered_final_client_visible_response_header_policy(
-            &plugins,
-            &mut ctx,
-            &mut response_status,
-            &mut response_headers,
-            data,
-        )
-        .await;
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
@@ -39992,6 +39993,7 @@ async fn handle_proxy_request_inner(
             &content_type,
             response_status,
             Some(initial_terminal_metadata),
+            crate::plugins::grpc_web::response_entity_is_unframed_backend_error(&ctx),
         )
     } else {
         body
@@ -41342,13 +41344,18 @@ pub(crate) async fn proxy_to_backend_retry(
                 .and_then(|len| usize::try_from(len).ok());
 
             // Fast path: reject immediately when Content-Length exceeds limit.
-            if effective_max_response_body_size_bytes > 0
-                && let Some(len) = content_length
-                && len > effective_max_response_body_size_bytes
-            {
-                warn!(
+            // HEAD / 1xx / 204 / 205 / 304 advertise a representation length,
+            // not transferred body bytes, so they skip this comparison.
+            if let Some(len) = declared_response_length_exceeds_limit(
+                method,
+                status,
+                &resp_headers,
+                effective_max_response_body_size_bytes,
+            ) {
+                warn_sampled!(
                     "Backend response body ({} bytes) exceeds limit ({} bytes)",
-                    len, effective_max_response_body_size_bytes
+                    len,
+                    effective_max_response_body_size_bytes
                 );
                 return retry::BackendResponse {
                     status_code: 502,
@@ -42532,7 +42539,7 @@ fn buffered_backend_response_from_eager_collect(
             // Size POLICY, not process capacity: the origin sent more than the
             // operator allows to be retained. Kept separate from the aggregate
             // refusal above so telemetry and health accounting stay honest.
-            warn!(
+            warn_sampled!(
                 proxy_id = %proxy.id,
                 transport,
                 max_response_body_size_bytes = ceiling,
@@ -45165,7 +45172,7 @@ async fn proxy_to_backend(
             // contractual 413. Mirror the `Err`-branch check so the outcome is
             // deterministic across both arms of the race.
             if body_size_exceeded.load(Ordering::Acquire) {
-                warn!(
+                warn_sampled!(
                     proxy_id = %proxy.id,
                     backend_url = %strip_query_params(backend_url),
                     max_body_size = effective_max_request_body_size_bytes,
@@ -45214,16 +45221,22 @@ async fn proxy_to_backend(
                 // failing to parse and skipping this reject
                 // (`GHSA-xrfj-852f-645j`). An ambiguous declaration yields `None`
                 // and falls through to the bounded collect/stream paths below,
-                // which never trust a declared length.
+                // which never trust a declared length. HEAD / 1xx / 204 / 205 /
+                // 304 keep a representation Content-Length without transferring
+                // those bytes, so they are not compared against the ceiling.
                 let content_length = canonical_header_content_length(response.headers())
                     .and_then(|len| usize::try_from(len).ok());
 
-                if let Some(len) = content_length
-                    && len > effective_max_response_body_size_bytes
-                {
-                    warn!(
+                if let Some(len) = declared_response_length_exceeds_limit(
+                    method,
+                    status,
+                    &resp_headers,
+                    effective_max_response_body_size_bytes,
+                ) {
+                    warn_sampled!(
                         "Backend response body ({} bytes) exceeds limit ({} bytes)",
-                        len, effective_max_response_body_size_bytes
+                        len,
+                        effective_max_response_body_size_bytes
                     );
                     return backend_dispatch_response(
                         retry::BackendResponse {
@@ -45538,7 +45551,7 @@ async fn proxy_to_backend(
             // Check if the error was caused by the streaming body exceeding
             // the size limit. If so, return 413 instead of generic 502.
             if body_size_exceeded.load(Ordering::Acquire) {
-                warn!(
+                warn_sampled!(
                     proxy_id = %proxy.id,
                     backend_url = %strip_query_params(backend_url),
                     max_body_size = effective_max_request_body_size_bytes,
@@ -45779,14 +45792,16 @@ fn buffered_collect_retain_failure(
 ) -> BufferedCollectFailure {
     match rejection {
         response_buffer_budget::RetainRejection::TooLarge => {
-            warn!(
+            warn_sampled!(
                 "Backend response truncated: exceeded {} byte limit",
                 max_size
             );
             BufferedCollectFailure::too_large()
         }
         response_buffer_budget::RetainRejection::BudgetExhausted => {
-            warn!("Response buffering refused: aggregate retained-response budget exhausted");
+            warn_sampled!(
+                "Response buffering refused: aggregate retained-response budget exhausted"
+            );
             BufferedCollectFailure::budget_exhausted()
         }
     }
@@ -47397,7 +47412,9 @@ fn hyper_collect_retain_error(
     match rejection {
         response_buffer_budget::RetainRejection::TooLarge => HyperBodyCollectError::TooLarge,
         response_buffer_budget::RetainRejection::BudgetExhausted => {
-            warn!("Response buffering refused: aggregate retained-response budget exhausted");
+            warn_sampled!(
+                "Response buffering refused: aggregate retained-response budget exhausted"
+            );
             HyperBodyCollectError::BudgetExhausted
         }
     }
@@ -47429,7 +47446,7 @@ fn response_buffer_capacity_response(
     resolved_ip: Option<String>,
     transport: &'static str,
 ) -> retry::BackendResponse {
-    warn!(
+    warn_sampled!(
         proxy_id = %proxy.id,
         transport = transport,
         "Response buffering refused: aggregate retained-response budget exhausted"
@@ -47458,7 +47475,7 @@ fn mesh_grpc_response_buffer_capacity_response(
     proxy: &Proxy,
     resolved_ip: Option<String>,
 ) -> retry::BackendResponse {
-    warn!(
+    warn_sampled!(
         proxy_id = %proxy.id,
         transport = "mesh-mtls-grpc",
         "gRPC response buffering refused: aggregate retained-response budget exhausted"
@@ -47588,7 +47605,7 @@ fn grpc_web_reframe_capacity_terminal(
     response_headers: &mut HashMap<String, String>,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) {
-    warn!("gRPC-Web trailer reframing refused: retained-response capacity unavailable");
+    warn_sampled!("gRPC-Web trailer reframing refused: retained-response capacity unavailable");
     replace_buffered_response_with_capacity_refusal(
         ctx,
         response_status,
@@ -47611,14 +47628,14 @@ fn mesh_transport_response_body_too_large_response(
     max_size: usize,
 ) -> retry::BackendResponse {
     match observed_size {
-        Some(size) => warn!(
+        Some(size) => warn_sampled!(
             proxy_id = %proxy.id,
             response_body_bytes = size,
             max_response_body_size_bytes = max_size,
             "{} backend response body exceeds configured size limit",
             transport.log_noun()
         ),
-        None => warn!(
+        None => warn_sampled!(
             proxy_id = %proxy.id,
             max_response_body_size_bytes = max_size,
             "{} backend response body exceeded configured size limit while buffering",
@@ -47650,14 +47667,14 @@ fn mesh_transport_request_body_too_large_response(
     max_size: usize,
 ) -> retry::BackendResponse {
     match observed_size {
-        Some(size) => warn!(
+        Some(size) => warn_sampled!(
             proxy_id = %proxy.id,
             request_body_bytes = size,
             max_request_body_size_bytes = max_size,
             "{} request body exceeds configured size limit",
             transport.log_noun()
         ),
-        None => warn!(
+        None => warn_sampled!(
             proxy_id = %proxy.id,
             max_request_body_size_bytes = max_size,
             "{} streaming request body exceeded configured size limit",
@@ -48732,13 +48749,13 @@ fn mesh_grpc_response_body_too_large_response(
     max_size: usize,
 ) -> retry::BackendResponse {
     match observed_size {
-        Some(size) => warn!(
+        Some(size) => warn_sampled!(
             proxy_id = %proxy.id,
             response_body_bytes = size,
             max_response_body_size_bytes = max_size,
             "sidecar mTLS gRPC backend response body exceeds configured size limit"
         ),
-        None => warn!(
+        None => warn_sampled!(
             proxy_id = %proxy.id,
             max_response_body_size_bytes = max_size,
             "sidecar mTLS gRPC backend response body exceeded configured size limit while buffering"
@@ -49609,12 +49626,14 @@ async fn proxy_to_backend_hbone_after_ready(
     };
 
     let status = response.status().as_u16();
-    let content_length = canonical_header_content_length(response.headers())
-        .and_then(|len| usize::try_from(len).ok());
-    if effective_max_response_body_size_bytes > 0
-        && let Some(len) = content_length
-        && len > effective_max_response_body_size_bytes
-    {
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    collect_hyper_response_headers(response.headers(), &mut resp_headers);
+    if let Some(len) = declared_response_length_exceeds_limit(
+        method,
+        status,
+        &resp_headers,
+        effective_max_response_body_size_bytes,
+    ) {
         return (
             hbone_response_body_too_large_response(
                 proxy,
@@ -49626,8 +49645,6 @@ async fn proxy_to_backend_hbone_after_ready(
             None,
         );
     }
-    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
-    collect_hyper_response_headers(response.headers(), &mut resp_headers);
 
     // Content-type-aware buffer -> stream downgrade (see `proxy_to_backend`).
     let stream_response = refine_stream_response_for_content_type(
@@ -50397,10 +50414,14 @@ async fn proxy_to_backend_unix(
     let status = response.status().as_u16();
     let content_length = canonical_header_content_length(response.headers())
         .and_then(|len| usize::try_from(len).ok());
-    if effective_max_response_body_size_bytes > 0
-        && let Some(len) = content_length
-        && len > effective_max_response_body_size_bytes
-    {
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    collect_hyper_response_headers(response.headers(), &mut resp_headers);
+    if let Some(len) = declared_response_length_exceeds_limit(
+        method,
+        status,
+        &resp_headers,
+        effective_max_response_body_size_bytes,
+    ) {
         return (
             unix_response_body_too_large_response(
                 proxy,
@@ -50412,8 +50433,6 @@ async fn proxy_to_backend_unix(
             None,
         );
     }
-    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
-    collect_hyper_response_headers(response.headers(), &mut resp_headers);
 
     let stream_response = refine_stream_response_for_content_type(
         stream_response,
@@ -50693,7 +50712,7 @@ fn unix_request_body_too_large_response(
     resolved_ip: Option<String>,
     max_size: usize,
 ) -> retry::BackendResponse {
-    warn!(
+    warn_sampled!(
         proxy_id = %proxy.id,
         max_request_body_size_bytes = max_size,
         "Unix backend streaming request body exceeded configured size limit"
@@ -50718,13 +50737,13 @@ fn unix_response_body_too_large_response(
     max_size: usize,
 ) -> retry::BackendResponse {
     match observed_size {
-        Some(size) => warn!(
+        Some(size) => warn_sampled!(
             proxy_id = %proxy.id,
             response_body_bytes = size,
             max_response_body_size_bytes = max_size,
             "Unix backend response body exceeds configured size limit"
         ),
-        None => warn!(
+        None => warn_sampled!(
             proxy_id = %proxy.id,
             max_response_body_size_bytes = max_size,
             "Unix backend response body exceeded configured size limit while buffering"
@@ -51961,12 +51980,14 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
     };
 
     let status = response.status().as_u16();
-    let content_length = canonical_header_content_length(response.headers())
-        .and_then(|len| usize::try_from(len).ok());
-    if effective_max_response_body_size_bytes > 0
-        && let Some(len) = content_length
-        && len > effective_max_response_body_size_bytes
-    {
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    collect_hyper_response_headers(response.headers(), &mut resp_headers);
+    if let Some(len) = declared_response_length_exceeds_limit(
+        method,
+        status,
+        &resp_headers,
+        effective_max_response_body_size_bytes,
+    ) {
         return (
             if is_grpc_flavored {
                 mesh_grpc_response_body_too_large_response(
@@ -51987,8 +52008,6 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
             None,
         );
     }
-    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
-    collect_hyper_response_headers(response.headers(), &mut resp_headers);
 
     // Content-type-aware buffer -> stream downgrade (see `proxy_to_backend`).
     let stream_response = refine_stream_response_for_content_type(
@@ -53158,10 +53177,12 @@ async fn proxy_to_backend_http2(
     collect_hyper_response_headers(response.headers(), &mut resp_headers);
 
     if let Some(len) = declared_response_length_exceeds_limit(
+        method,
+        status,
         &resp_headers,
         effective_max_response_body_size_bytes,
     ) {
-        warn!(
+        warn_sampled!(
             proxy_id = %proxy.id,
             response_body_bytes = len,
             max_response_body_size_bytes = effective_max_response_body_size_bytes,
@@ -53246,7 +53267,7 @@ async fn proxy_to_backend_http2(
         let body_bytes = match collect_result {
             Ok(collected) => collected,
             Err(HyperBodyCollectError::TooLarge) => {
-                warn!(
+                warn_sampled!(
                     proxy_id = %proxy.id,
                     max_response_body_size_bytes = effective_max_response_body_size_bytes,
                     "HTTP/2 buffered body collection exceeded configured size limit"
@@ -53677,6 +53698,7 @@ async fn proxy_to_backend_http3(
                                 h3_streaming_backend_response(
                                     response,
                                     proxy,
+                                    method,
                                     resolved_ip,
                                     effective_max_response_body_size_bytes,
                                 ),
@@ -54074,6 +54096,7 @@ async fn proxy_to_backend_http3(
                 h3_streaming_backend_response(
                     response,
                     proxy,
+                    method,
                     resolved_ip,
                     effective_max_response_body_size_bytes,
                 ),
@@ -54193,6 +54216,7 @@ async fn proxy_to_backend_http3(
                         h3_streaming_backend_response(
                             response,
                             proxy,
+                            method,
                             resolved_ip,
                             effective_max_response_body_size_bytes,
                         ),
@@ -54291,12 +54315,16 @@ async fn proxy_to_backend_http3(
 fn h3_streaming_backend_response(
     response: crate::http3::client::H3StreamingResponse,
     proxy: &Proxy,
+    method: &str,
     resolved_ip: Option<String>,
     max_response_body_size_bytes: usize,
 ) -> retry::BackendResponse {
-    if let Some(len) =
-        declared_response_length_exceeds_limit(&response.headers, max_response_body_size_bytes)
-    {
+    if let Some(len) = declared_response_length_exceeds_limit(
+        method,
+        response.status,
+        &response.headers,
+        max_response_body_size_bytes,
+    ) {
         return h3_response_body_too_large_response(
             proxy,
             resolved_ip,
@@ -54574,13 +54602,13 @@ fn h3_response_body_too_large_response(
     max_size: usize,
 ) -> retry::BackendResponse {
     match observed_size {
-        Some(size) => warn!(
+        Some(size) => warn_sampled!(
             proxy_id = %proxy.id,
             response_body_bytes = size,
             max_response_body_size_bytes = max_size,
             "HTTP/3 backend response body exceeds configured size limit"
         ),
-        None => warn!(
+        None => warn_sampled!(
             proxy_id = %proxy.id,
             max_response_body_size_bytes = max_size,
             "HTTP/3 backend response body exceeded configured size limit while streaming"
@@ -54611,11 +54639,20 @@ fn h3_response_body_too_large_response(
 /// failed and skipped this fast path (`GHSA-xrfj-852f-645j`). An ambiguous fold
 /// yields `None` here and is bounded by the collection/streaming ceiling
 /// instead, which never trusts a declared length.
+///
+/// Bodyless semantics (`HEAD`, `1xx`, `204`/`205`/`304`) may advertise a
+/// representation `Content-Length` while transferring zero body bytes (RFC 9110
+/// §8.6 / §6.4.1). That value is not a transferable-body size and must not be
+/// compared against the ceiling.
 pub(crate) fn declared_response_length_exceeds_limit(
+    method: &str,
+    status: u16,
     headers: &HashMap<String, String>,
     max_response_body_size_bytes: usize,
 ) -> Option<usize> {
-    if max_response_body_size_bytes == 0 {
+    if max_response_body_size_bytes == 0
+        || crate::plugins::utils::synthetic_response::synthetic_response_omits_body(method, status)
+    {
         return None;
     }
     let len = canonical_header_content_length_from_map(headers)?;
@@ -54774,6 +54811,8 @@ async fn proxy_to_backend_http3_retry(
                 // oversized declared body unguarded (the downstream H3 body
                 // builder only size-limits when Content-Length is absent).
                 if let Some(len) = declared_response_length_exceeds_limit(
+                    method,
+                    response.status,
                     &response.headers,
                     effective_max_response_body_size_bytes,
                 ) {
@@ -54920,7 +54959,7 @@ async fn proxy_to_backend_http3_retry(
             if effective_max_response_body_size_bytes > 0
                 && response.body.len() > effective_max_response_body_size_bytes
             {
-                warn!(
+                warn_sampled!(
                     "Backend response body ({} bytes) exceeds limit ({} bytes)",
                     response.body.len(),
                     effective_max_response_body_size_bytes
@@ -55082,6 +55121,7 @@ mod tests {
             failure_status_codes: vec![500],
             half_open_max_requests: 1,
             trip_on_connection_errors: true,
+            half_open_probe_dwell_seconds: None,
         });
         cb.record_failure(500, false, false);
         assert!(
@@ -55934,6 +55974,7 @@ mod tests {
                 failure_status_codes: vec![500],
                 half_open_max_requests: 1,
                 trip_on_connection_errors: true,
+                half_open_probe_dwell_seconds: None,
             }
         }
 
@@ -59827,6 +59868,7 @@ mod tests {
         headers.insert("connection".to_string(), "upgrade".to_string());
         headers.insert("x-request-id".to_string(), "req-1".to_string());
         headers.insert("x-added-by-plugin".to_string(), "kept".to_string());
+        headers.insert("X-Consumer-Role".to_string(), "admin".to_string());
 
         let forwarded = collect_forwardable_proxy_headers(&headers);
 
@@ -59836,6 +59878,12 @@ mod tests {
         assert!(forwarded.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("x-added-by-plugin") && value == "kept"
         }));
+        assert!(
+            !forwarded
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-consumer-role")),
+            "the complete consumer assertion namespace must be stripped"
+        );
         assert!(
             !forwarded
                 .iter()
@@ -62208,22 +62256,44 @@ mod tests {
 
     /// Guards the declared-Content-Length fast-path reject used by every
     /// streaming H3 retry attempt: only a nonzero limit with a parseable
-    /// over-limit Content-Length triggers the pre-stream 502.
+    /// over-limit Content-Length on a body-bearing response triggers the
+    /// pre-stream 502. HEAD / 1xx / 204 / 205 / 304 keep a representation length.
     #[test]
     fn declared_response_length_exceeds_limit_only_when_header_is_over_cap() {
         let mut headers = HashMap::new();
-        assert_eq!(declared_response_length_exceeds_limit(&headers, 10), None);
+        assert_eq!(
+            declared_response_length_exceeds_limit("GET", 200, &headers, 10),
+            None
+        );
 
         headers.insert("content-length".to_string(), "11".to_string());
-        assert_eq!(declared_response_length_exceeds_limit(&headers, 0), None);
-        assert_eq!(declared_response_length_exceeds_limit(&headers, 11), None);
         assert_eq!(
-            declared_response_length_exceeds_limit(&headers, 10),
+            declared_response_length_exceeds_limit("GET", 200, &headers, 0),
+            None
+        );
+        assert_eq!(
+            declared_response_length_exceeds_limit("GET", 200, &headers, 11),
+            None
+        );
+        assert_eq!(
+            declared_response_length_exceeds_limit("GET", 200, &headers, 10),
             Some(11)
         );
 
         headers.insert("content-length".to_string(), "not-a-number".to_string());
-        assert_eq!(declared_response_length_exceeds_limit(&headers, 10), None);
+        assert_eq!(
+            declared_response_length_exceeds_limit("GET", 200, &headers, 10),
+            None
+        );
+
+        headers.insert("content-length".to_string(), "11".to_string());
+        for (method, status) in [("HEAD", 200), ("GET", 304), ("GET", 204)] {
+            assert_eq!(
+                declared_response_length_exceeds_limit(method, status, &headers, 10),
+                None,
+                "bodyless {method} {status} must not trip the declared-length ceiling"
+            );
+        }
     }
 
     /// The 502 built for an over-limit H3 response must not replay (no

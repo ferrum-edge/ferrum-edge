@@ -161,28 +161,25 @@ CI today."
 ## Wildcard-host egress ServiceEntries
 
 An Istio `ServiceEntry` with a wildcard host (`hosts: ["*.example.com"]`,
-`location: MESH_EXTERNAL`) is admitted by the EgressGateway materializer only
-when the operator declared a concrete dial set:
+`location: MESH_EXTERNAL`) is handled according to its transport family:
 
 | Shape | Outcome |
 |---|---|
-| `resolution: STATIC` + non-empty `endpoints[]`, HTTP-family or stream-family | **Supported.** The dial targets are the declared endpoint addresses; the wildcard is only the route/authority selector, and no upstream target ever carries a `*`. |
-| `resolution: DNS` or `NONE` (or `STATIC` with no endpoints), any family | **Refused.** The host is skipped with a `hosts[]`-named `warn!`, no proxy/upstream is materialized, and the Istio CRD status carries a `spec.hosts[]` entry in `deferred_fields` (`FerrumAccepted` stays `True` — the resource *is* translated, just inert for that host). |
-| `protocol: UDP` / `DTLS`, **any** resolution | **Refused.** Datagram egress matches the CONNECT `:authority` exactly, so a wildcard authority could never be named by a client. This branch is deliberately stricter than the HTTP-family and stream-family ones. |
+| `resolution: DNS` or `NONE`, HTTP family | **Supported.** The wildcard route and configured target materialize; request dispatch replaces the target with the matching concrete authority before DNS, SNI, and pool selection. |
+| `resolution: STATIC` + non-empty `endpoints[]`, HTTP or stream family | **Supported.** The declared endpoint addresses are the dial targets and the wildcard is only the route selector. |
+| `resolution: STATIC` + no usable endpoint, HTTP family | **Refused.** STATIC never falls back to resolving the route host or a request authority; without an operator-declared dial target the entry fails closed. |
+| `resolution: DNS` or `NONE` (or `STATIC` with no endpoints), stream family | **Refused.** Raw streams have no HTTP authority from which to derive a concrete dial target. The host is skipped with a `hosts[]`-named `warn!`, and the Istio CRD status carries a `spec.hosts[]` entry in `deferred_fields` (`FerrumAccepted` stays `True`). |
+| `protocol: UDP` / `DTLS`, **any** resolution | **Refused.** Datagram egress matches the CONNECT `:authority` exactly, so a wildcard authority could never be named by a client. |
 
-Without the refusal, a `DNS`/`NONE` wildcard host became the **literal** upstream
-target host (`*.example.com`), which no resolver can answer — while Ferrum's
-wildcard host tier still matched `foo.example.com`, so every request routed and
-then failed with a 502 and no apply-time signal. A refused stream-family entry
-does **not** claim its listen port, so a following exact-host `ServiceEntry` on
-the same port still materializes.
+For HTTP-family traffic the literal wildcard is only configured selection
+identity: the request path clones the selected target with the matching concrete
+authority before it can reach DNS or connection setup. A refused stream-family
+entry does **not** claim its listen port, so a following exact-host
+`ServiceEntry` on the same port still materializes.
 
 **`resolution: NONE` is currently handled identically to `DNS`.** Istio's
-`NONE` semantics ("dial the original destination the client asked for", without
-resolving the ServiceEntry host) is **not implemented**: both modes make the
-ServiceEntry host itself the upstream dial target. Wildcard/original-destination
-egress (SNI- or Host-driven dial) is out of scope; declare exact hosts, or use
-`resolution: STATIC` with `endpoints[]`.
+original-destination semantics for raw streams are not implemented; stream
+entries must declare exact hosts or use `resolution: STATIC` with `endpoints[]`.
 
 ## Acceptable residual / out-of-scope (the long tail)
 

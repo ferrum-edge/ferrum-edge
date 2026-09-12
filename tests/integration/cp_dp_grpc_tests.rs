@@ -3312,7 +3312,7 @@ async fn test_cp_rejects_dp_with_version_mismatch() {
 
     // Verify that a matching version succeeds
     let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
-        node_id: "test-dp-good".to_string(),
+        node_id: "test-dp".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
@@ -3370,7 +3370,7 @@ async fn test_cp_rejects_dp_with_empty_version() {
 
     // Empty version simulates a pre-v0.9.0 DP that doesn't set the field
     let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
-        node_id: "old-dp".to_string(),
+        node_id: "test-dp".to_string(),
         ferrum_version: String::new(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
@@ -4424,7 +4424,7 @@ async fn test_cp_accepts_dp_with_matching_namespace() {
         );
 
     let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
-        node_id: "test-dp-good".to_string(),
+        node_id: "test-dp".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "production".to_string(),
         real_ip_header: Some(String::new()),
@@ -6423,7 +6423,7 @@ async fn native_configsync_rejects_unsafe_node_id_before_allocation() {
         ))
         .await
         .expect_err("unsafe node_id must fail closed before a stream exists");
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
     assert!(
         !status.message().contains("injected"),
         "a rejection must never echo the client-supplied node_id: {status}"
@@ -7230,6 +7230,102 @@ async fn test_cp_refuses_unconstructible_plugin_config_and_dp_reports_rejection(
     );
 
     client_handle.abort();
+}
+
+mod configsync_identity_binding {
+    use super::*;
+    use ferrum_edge::grpc::admission::{CpGrpcAdmissionController, CpGrpcAdmissionLimits};
+    use ferrum_edge::grpc::cp_server::DpNodeRegistry;
+    use ferrum_edge::grpc::proto::SubscribeRequest;
+    use ferrum_edge::grpc::proto::config_sync_server::ConfigSync;
+    use std::io::{self, Write};
+    use std::sync::Mutex;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLogs {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn request(subject: &str, node_id: &str) -> tonic::Request<SubscribeRequest> {
+        let mut request = tonic::Request::new(SubscribeRequest {
+            node_id: node_id.to_string(),
+            ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+            namespace: "ferrum".to_string(),
+            real_ip_header: Some(String::new()),
+            supports_heartbeat: false,
+        });
+        request
+            .metadata_mut()
+            .insert("authorization", bearer_for(subject));
+        request
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn configsync_rejects_and_audits_forged_node_without_replacing_live_registration() {
+        let registry = Arc::new(DpNodeRegistry::new());
+        let admission = CpGrpcAdmissionController::new(CpGrpcAdmissionLimits::default());
+        let (server, tx) = CpGrpcServer::builder(
+            Arc::new(ArcSwap::from_pointee(create_test_config(1))),
+            TEST_JWT_SECRET.to_string(),
+        )
+        .registry(registry.clone())
+        .admission(admission.clone())
+        .build();
+        let logs = CapturedLogs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // The matching identity is admitted and owns the cluster registry row.
+        let stream = server
+            .subscribe(request("victim-dp", "victim-dp"))
+            .await
+            .unwrap();
+        let connected_at = registry.snapshot()[0].connected_at;
+        assert_eq!(registry.snapshot()[0].node_id, "victim-dp");
+        assert_eq!(tx.receiver_count(), 1);
+
+        let status = match server.subscribe(request("other-dp", "victim-dp")).await {
+            Ok(_) => panic!("a different subject must not claim the live node"),
+            Err(status) => status,
+        };
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(admission.active_streams(), 1);
+        assert_eq!(admission.active_nodes(), 1);
+        assert_eq!(tx.receiver_count(), 1);
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.snapshot()[0].connected_at, connected_at);
+
+        let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let failure = captured
+            .lines()
+            .find(|line| line.contains("result=\"failure\""))
+            .expect("identity mismatch must produce a failure audit record");
+        assert!(failure.contains("audit.event=\"tenant_subscription\""));
+        assert!(failure.contains("surface=\"ConfigSync.Subscribe\""));
+        assert!(failure.contains("node_id=\"other-dp\""));
+        assert!(failure.contains("namespace=\"ferrum\""));
+        assert!(failure.contains("node_id does not match authenticated subject"));
+        assert!(!failure.contains("victim-dp"));
+
+        drop(stream);
+        assert!(registry.is_empty());
+        assert_eq!(admission.active_streams(), 0);
+        assert_eq!(tx.receiver_count(), 0);
+    }
 }
 
 mod configsync_size_bounds {

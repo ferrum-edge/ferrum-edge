@@ -1200,6 +1200,7 @@ jobs:
               integration::mesh_destination_rule_locality_lb_tests
               integration::mesh_destination_rule_port_policy_tests
               integration::mesh_destination_rule_max_connections_tests
+              integration::mesh_mtls_pool_width_tests
               integration::mesh_destination_rule_connection_pool_audit_tests
               integration::mesh_destination_rule_route_rebuild_tests
               integration::mesh_destination_rule_visibility_tests
@@ -3943,6 +3944,21 @@ jobs:
             --set-string controlPlane.admin.bindAddress=0.0.0.0 \
             --set-string 'controlPlane.admin.allowedCidrs=::ffff:127.0.0.1/128' \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-mapped-cidr-host.yaml"
+          for component in controlPlane ca; do
+            component_args=()
+            if [[ "$component" == "ca" ]]; then
+              component_args+=(--set ca.enabled=true)
+            fi
+            if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+              -f ./charts/ferrum-mesh/examples/development-values.yaml \
+              "${component_args[@]}" \
+              --set-string "${component}.admin.bindAddress=::ffff:127.0.0.1" \
+              > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-${component}-mapped-bind.yaml" \
+              2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-${component}-mapped-bind.err"; then
+              echo "::error title=Mapped IPv4 loopback accepted::${component} would classify ::ffff:127.0.0.1 as non-loopback at runtime and refuse startup"
+              exit 1
+            fi
+          done
           if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             -f ./charts/ferrum-mesh/examples/development-values.yaml \
             --set-string controlPlane.admin.bindAddress=::ffff:127.0.0.2 \

@@ -43,6 +43,7 @@ const API_CHARGEBACK_FAMILIES: &[&str] = &[
     "ferrum_api_chargeback_registry_max_entries",
     "ferrum_api_chargeback_registry_max_retained_bytes",
     "ferrum_api_chargeback_registry_retained_bytes",
+    "ferrum_api_chargeback_uncollected_retained_entries",
     "ferrum_api_charges_total",
     "ferrum_api_stream_connection_charges_total",
     "ferrum_api_stream_connections_total",

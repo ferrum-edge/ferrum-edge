@@ -240,11 +240,69 @@ fn breaker_transitions_render_per_state_without_a_target_label() {
         "ceiling pressure must be observable even while zero (#4516):\n{out}"
     );
 
+    assert!(
+        out.contains(
+            "ferrum_circuit_breaker_probe_reclaimed_total{proxy_id=\"checkout-api\",proxy_namespace=\"ferrum\",namespace=\"ferrum\"} 0"
+        ),
+        "a healthy proxy must still publish a zero baseline for probe-slot leaks (#4980):\n{out}"
+    );
+
     // Two per-target breakers collapse to exactly three per-proxy series.
     assert_eq!(samples(&out, "ferrum_circuit_breakers").len(), 3);
+    let reclaim_samples = samples(&out, "ferrum_circuit_breaker_probe_reclaimed_total");
+    assert_eq!(
+        reclaim_samples.len(),
+        1,
+        "reclaims aggregate to one series per proxy:\n{out}"
+    );
     assert!(
         !out.contains("orders-a.internal") && !out.contains("orders-b.internal"),
         "breaker target host:port must never become a label:\n{out}"
+    );
+}
+
+/// A leaked half-open probe slot reclaimed after the dwell (#4980) must be
+/// attributable to its proxy, and its `host:port` must stay out of the labels.
+#[test]
+fn reclaimed_probe_slots_render_per_proxy_without_a_target_label() {
+    let cache = CircuitBreakerCache::with_max_entries(64);
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        timeout_seconds: 1,
+        half_open_max_requests: 1,
+        half_open_probe_dwell_seconds: Some(10),
+        ..CircuitBreakerConfig::default()
+    };
+    let breaker = cache.get_or_create(
+        "ferrum",
+        "checkout-api",
+        Some("orders-a.internal:8080"),
+        &config,
+    );
+
+    // Trip the breaker, admit its only probe, then never settle that probe.
+    breaker.record_failure_at_for_test(500, false, false, 0, 0);
+    assert_eq!(breaker.state_name(), "open");
+    assert_eq!(breaker.can_execute_at_for_test(1_000).ok(), Some(true));
+    assert_eq!(breaker.half_open_in_flight(), 1);
+
+    // A full dwell later the leaked slot is reclaimed and a fresh probe runs.
+    assert_eq!(breaker.can_execute_at_for_test(11_000).ok(), Some(true));
+    assert_eq!(breaker.probe_reclaimed_total(), 1);
+
+    let mut out = String::new();
+    data_path_metrics::render_circuit_breakers(&mut out, &cache, NS_LABEL);
+
+    assert!(
+        out.contains(
+            "ferrum_circuit_breaker_probe_reclaimed_total{proxy_id=\"checkout-api\",proxy_namespace=\"ferrum\",namespace=\"ferrum\"} 1"
+        ),
+        "{out}"
+    );
+    assert!(
+        !out.contains("orders-a.internal"),
+        "the leaking target belongs in the warning log, never in a label:\n{out}"
     );
 }
 

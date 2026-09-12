@@ -488,13 +488,12 @@ True when the bind is loopback (or empty, which the binary defaults to
 
 Decided from the PARSED address rather than a prefix string, so every spelling
 the runtime's `IpAddr::is_loopback()` accepts is classified the same way here:
-any address in 127.0.0.0/8, `::1` in any valid contraction, and the IPv4-mapped
-form of a 127/8 address (which the runtime canonicalizes to IPv4).
+any address in 127.0.0.0/8 and `::1` in any valid contraction. IPv4-mapped
+127/8 addresses remain IPv6, so the runtime does not classify them as loopback.
 */}}
 {{- define "ferrum-mesh.isLoopbackBind" -}}
 {{- $bind := . | toString | trim | trimPrefix "[" | trimSuffix "]" -}}
 {{- $v4 := include "ferrum-mesh.ipv4ToInt" $bind -}}
-{{- if eq $v4 "" -}}{{- $v4 = include "ferrum-mesh.ipv4MappedToInt" $bind -}}{{- end -}}
 {{- if eq $bind "" -}}
 true
 {{- else if ne $v4 "" -}}
@@ -538,7 +537,7 @@ trim, lowercase, accept true/false/1/0 only. Returns canonical "true" or
 */}}
 {{- define "ferrum-mesh.parseEnvBool" -}}
 {{- $field := .field -}}
-{{- $lower := lower (trim (toString (.value | default ""))) -}}
+{{- $lower := lower (trim (toString .value)) -}}
 {{- if not (has $lower (list "true" "false" "1" "0")) -}}
 {{- fail (printf "%s is not a valid boolean; expected true, false, 1, or 0" $field) -}}
 {{- end -}}

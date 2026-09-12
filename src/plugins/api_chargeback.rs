@@ -47,8 +47,8 @@ use crate::plugins::chargeback::pricing::{
 };
 use crate::plugins::chargeback::{bounded_billing_identity, bounded_display};
 use crate::plugins::utils::log_schema::{
-    DerivedKind, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView, SummarySchema,
-    TimestampFormat, resolve_schema,
+    DerivedKind, EmittedKeys, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView,
+    SummarySchema, TimestampFormat, resolve_schema,
 };
 use crate::util::unknown_keys::reject_unknown_keys;
 
@@ -835,6 +835,19 @@ fn render_projection_config(config: &Value) -> (Option<&Value>, Option<&Value>) 
     (config.get("schema"), config.get("schema_ref"))
 }
 
+/// Whether a populated render cache generated at `generated_at` has reached the
+/// configured `cache_invalidation_min_age_ms`.
+///
+/// An empty cache (`None`) is never "aged": there is nothing to invalidate, and
+/// restamping it would allocate a fresh `Arc` on every recorded request.
+#[inline]
+fn render_cache_reached_min_age(generated_at: Option<Instant>, min_age_nanos: u64) -> bool {
+    match generated_at {
+        Some(at) => at.elapsed().as_nanos() as u64 >= min_age_nanos,
+        None => false,
+    }
+}
+
 /// Sentinel `status_code` for stream sessions and WebSocket-disconnect
 /// bandwidth rows. Ordinary HTTP wire statuses are in `100..=599`; the
 /// registry key also carries [`ProtocolFamily`] so a bandwidth-only stream
@@ -881,6 +894,21 @@ pub struct ChargebackRegistry {
     render_cache_ttl_secs: AtomicU64,
     stale_entry_ttl_nanos: AtomicU64,
     cache_invalidation_min_age_nanos: AtomicU64,
+    /// Nanos-since-[`Self::epoch`] snapshot taken immediately before the walk
+    /// that produced the most recent COMPLETED `/charges` export.
+    ///
+    /// Every entry that existed at that instant had its counters serialized
+    /// into the document that export returned, so an entry whose `last_updated`
+    /// precedes this watermark has been collected. Idle-age eviction requires
+    /// that acknowledgement (issue #5276): without it, `stale_entry_ttl_seconds`
+    /// could delete call/byte counters that no collector ever saw, and the
+    /// charges they represent would simply disappear.
+    collection_watermark_nanos: AtomicU64,
+    /// Entries the most recent [`Self::evict_stale`] pass kept even though they
+    /// were idle past the TTL, because no completed export has observed their
+    /// current counters. Exported as a fixed-cardinality, identity-free gauge
+    /// so an operator can see uncollected billing state accumulating.
+    uncollected_retained_entries: AtomicUsize,
     /// Compiled `/charges` billing-row projection published by the accepted
     /// generation. Read-only on the render path behind a lock-free `ArcSwap`.
     render_schema: ArcSwap<Option<Arc<SummarySchema>>>,
@@ -941,6 +969,9 @@ impl ChargebackRegistry {
             cache_invalidation_min_age_nanos: AtomicU64::new(
                 DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS,
             ),
+            // Nothing has been exported yet, so nothing is collected.
+            collection_watermark_nanos: AtomicU64::new(0),
+            uncollected_retained_entries: AtomicUsize::new(0),
             render_schema: ArcSwap::from_pointee(None),
             cleanup_interval_seconds: AtomicU64::new(0),
             cleanup_interval_changed: tokio::sync::Notify::new(),
@@ -1667,35 +1698,100 @@ impl ChargebackRegistry {
         }
     }
 
+    /// Invalidate each render cache that has reached the configured minimum
+    /// age, evaluating the two formats independently (issue #5238).
+    ///
+    /// `cache_invalidation_min_age_ms` is a per-document protection: a `/charges`
+    /// collector must be able to re-read the document it just fetched without a
+    /// concurrent billed request forcing a full registry walk. Judging both
+    /// caches by the Prometheus timestamp alone made that protection depend on
+    /// whether some *other* collector happened to scrape the *other* format —
+    /// a JSON-only deployment (no Prometheus cache at all) invalidated a
+    /// brand-new JSON document on the very next recorded request.
+    ///
+    /// An already-empty cache is left alone rather than restamped with a fresh
+    /// `Arc::new(None)`, so the common recording path allocates nothing.
     fn maybe_invalidate_caches(&self) {
         let min_age_nanos = self
             .cache_invalidation_min_age_nanos
             .load(Ordering::Relaxed);
 
-        let cached = self.prometheus_cache.load();
-        if let Some((generated_at, _, _)) = **cached {
-            let age_nanos = generated_at.elapsed().as_nanos() as u64;
-            if age_nanos < min_age_nanos {
-                return;
-            }
+        let prometheus_at = {
+            let cached = self.prometheus_cache.load();
+            (**cached).as_ref().map(|(at, _, _)| *at)
+        };
+        if render_cache_reached_min_age(prometheus_at, min_age_nanos) {
+            self.prometheus_cache.store(Arc::new(None));
         }
-        self.prometheus_cache.store(Arc::new(None));
-        self.json_cache.store(Arc::new(None));
+
+        let json_at = {
+            let cached = self.json_cache.load();
+            (**cached).as_ref().map(|(at, _, _, _)| *at)
+        };
+        if render_cache_reached_min_age(json_at, min_age_nanos) {
+            self.json_cache.store(Arc::new(None));
+        }
     }
 
+    /// Snapshot the instant a `/charges` export is about to start walking the
+    /// registry. Pair with [`Self::commit_collection_watermark`].
+    fn begin_collection(&self) -> u64 {
+        self.epoch.elapsed().as_nanos() as u64
+    }
+
+    /// Acknowledge collection of every entry that existed when the completed
+    /// export began its walk (issue #5276).
+    ///
+    /// Committed only after the document has been produced AND accepted, so a
+    /// failed render never acknowledges counters no collector received. Taken
+    /// BEFORE the walk rather than after it so a charge recorded mid-walk —
+    /// which the document may or may not include — stays uncollected and
+    /// therefore un-evictable. `fetch_max` keeps the watermark monotonic when
+    /// two exports interleave.
+    fn commit_collection_watermark(&self, walk_started_nanos: u64) {
+        self.collection_watermark_nanos
+            .fetch_max(walk_started_nanos, Ordering::Release);
+    }
+
+    /// Evict entries idle for at least `ttl_nanos` **whose counters a completed
+    /// `/charges` export has already collected**.
+    ///
+    /// Idle age alone is not a safe deletion trigger for a billing ledger: the
+    /// in-memory registry is authoritative for `/charges`, and dropping an entry
+    /// that no export ever observed destroys billable state with no record that
+    /// it existed (issue #5276). An idle entry whose last update postdates the
+    /// registry's collection watermark is therefore retained until an export
+    /// collects it, and counted into `uncollected_retained_entries` so the
+    /// condition is observable.
+    ///
+    /// This does not weaken the registry's memory bound: retained rows still
+    /// hold their `max_entries` / `max_retained_bytes` reservations, and a
+    /// registry at either ceiling folds further new rows into the
+    /// fixed-cardinality aggregate overflow row exactly as before.
     pub fn evict_stale(&self, ttl_nanos: u64) -> usize {
+        let collected_before = self.collection_watermark_nanos.load(Ordering::Acquire);
         let mut evicted = 0;
+        let mut uncollected = 0;
         self.entries.retain(|_, v| {
-            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
-            if !keep {
-                evicted += 1;
-                // Release the evicted entry's reservation so capacity recovers
-                // exactly. `retain` holds the shard lock, so no concurrent
-                // insert can observe the slot before the release.
-                self.release_reservation(v.retained_bytes, v.counts_against_identity_budget);
+            if v.nanos_since_update(self.epoch) < ttl_nanos {
+                return true;
             }
-            keep
+            if v.last_updated.load(Ordering::Relaxed) >= collected_before {
+                // Idle, but its current counters have never appeared in a
+                // completed export. Deleting it here would silently discard
+                // uncollected charges.
+                uncollected += 1;
+                return true;
+            }
+            evicted += 1;
+            // Release the evicted entry's reservation so capacity recovers
+            // exactly. `retain` holds the shard lock, so no concurrent
+            // insert can observe the slot before the release.
+            self.release_reservation(v.retained_bytes, v.counts_against_identity_budget);
+            false
         });
+        self.uncollected_retained_entries
+            .store(uncollected, Ordering::Relaxed);
         if evicted > 0 {
             self.prometheus_cache.store(Arc::new(None));
             self.json_cache.store(Arc::new(None));
@@ -1721,6 +1817,10 @@ impl ChargebackRegistry {
         let stale_ttl = self.stale_entry_ttl_nanos.load(Ordering::Relaxed);
         self.evict_stale(stale_ttl);
 
+        // Snapshot before the first walk, commit only once a document is
+        // accepted: an export that errors out, or one whose generation check
+        // discards it, must not acknowledge collection (issue #5276).
+        let walk_started = self.begin_collection();
         loop {
             let metadata_generation = self.proxy_metadata_generation.load(Ordering::Acquire);
             let output = self.render_prometheus_uncached()?;
@@ -1733,6 +1833,7 @@ impl ChargebackRegistry {
                 output.clone(),
             ))));
             if self.proxy_metadata_generation.load(Ordering::Acquire) == metadata_generation {
+                self.commit_collection_watermark(walk_started);
                 return Ok(output);
             }
             self.prometheus_cache.store(Arc::new(None));
@@ -2049,6 +2150,14 @@ impl ChargebackRegistry {
             "ferrum_api_chargeback_dropped_charges_total {}\n",
             self.dropped_charges_total.load(Ordering::Relaxed)
         ));
+        output.push_str(
+            "# HELP ferrum_api_chargeback_uncollected_retained_entries Billing rows the last eviction pass kept past stale_entry_ttl_seconds because no completed /charges export has collected their current counters.\n",
+        );
+        output.push_str("# TYPE ferrum_api_chargeback_uncollected_retained_entries gauge\n");
+        output.push_str(&format!(
+            "ferrum_api_chargeback_uncollected_retained_entries {}\n",
+            self.uncollected_retained_entries.load(Ordering::Relaxed)
+        ));
 
         Ok(output)
     }
@@ -2063,6 +2172,9 @@ impl ChargebackRegistry {
             "max_retained_bytes": self.max_retained_bytes.load(Ordering::Relaxed),
             "identity_overflow_total": self.identity_overflow_total.load(Ordering::Relaxed),
             "dropped_charges_total": self.dropped_charges_total.load(Ordering::Relaxed),
+            "uncollected_retained_entries": self
+                .uncollected_retained_entries
+                .load(Ordering::Relaxed),
             "overflow_consumer_id": OVERFLOW_CONSUMER_SENTINEL,
         })
     }
@@ -2091,6 +2203,9 @@ impl ChargebackRegistry {
         let stale_ttl = self.stale_entry_ttl_nanos.load(Ordering::Relaxed);
         self.evict_stale(stale_ttl);
 
+        // Same collection contract as the Prometheus export (issue #5276):
+        // snapshot before the walk, acknowledge only an accepted document.
+        let walk_started = self.begin_collection();
         loop {
             let metadata_generation = self.proxy_metadata_generation.load(Ordering::Acquire);
             let schema_generation = self.render_schema_generation.load(Ordering::Acquire);
@@ -2109,6 +2224,7 @@ impl ChargebackRegistry {
             if self.proxy_metadata_generation.load(Ordering::Acquire) == metadata_generation
                 && self.render_schema_generation.load(Ordering::Acquire) == schema_generation
             {
+                self.commit_collection_watermark(walk_started);
                 return Ok(output);
             }
             self.json_cache.store(Arc::new(None));
@@ -2563,7 +2679,7 @@ impl<'a> SchemaSerializable for ChargebackProxyRow<'a> {
     fn serialize_metadata<S>(
         &self,
         _policy: &MetadataPolicy,
-        _emitted: &mut std::collections::HashSet<String>,
+        _emitted: &EmittedKeys<'_>,
         _map: &mut S,
     ) -> Result<(), S::Error>
     where

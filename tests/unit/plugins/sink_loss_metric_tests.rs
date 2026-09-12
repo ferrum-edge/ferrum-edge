@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ferrum_edge::plugins::utils::batching_logger::{
-    BatchConfig, BatchingLogger, DeferredBatchingLogger, RetryPolicy, TrySendOutcome,
+    BatchConfig, BatchingLogger, DeferredBatchingLogger, LoggerHooks, RetryPolicy, TrySendOutcome,
 };
 use ferrum_edge::plugins::utils::byte_budget::{ByteBudget, RetainedByteCeiling};
 use ferrum_edge::plugins::utils::sink_loss::{
@@ -228,12 +228,17 @@ async fn a_healthy_sink_reports_accepted_records_and_no_drops() {
 }
 
 #[tokio::test]
-async fn batch_discarded_after_retry_exhaustion_counts_every_lost_record() {
+async fn declined_failed_batch_fallback_counts_every_lost_record() {
     let before = dropped_total(OTHER_PLUGIN, SinkLossReason::BatchDiscard);
 
-    // No `on_failed_batch` hook, so terminal failure is real record loss.
-    let mut logger: BatchingLogger<u64> = BatchingLogger::spawn(
+    // Merely installing a fallback is not evidence of durable ownership. A
+    // hook that declines the batch must leave terminal-loss accounting intact.
+    let mut logger: BatchingLogger<u64> = BatchingLogger::spawn_with_hooks(
         probe_batch_config(4, 64, 2),
+        LoggerHooks {
+            on_failed_batch: Some(Arc::new(|_batch, _error| false)),
+            ..LoggerHooks::default()
+        },
         |_batch: Arc<Vec<u64>>| async { Err::<(), String>("probe sink is down".to_string()) },
     );
     logger.commit();

@@ -79,7 +79,7 @@ use async_trait::async_trait;
 use http::header::HeaderName;
 use serde::ser::SerializeMap;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -91,8 +91,8 @@ use crate::plugins::utils::log_schema::view::{
     MetadataNested, emit_timestamp, extract_host_from_url, serialize_schema_metadata, status_class,
 };
 use crate::plugins::utils::log_schema::{
-    DerivedKind, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView, SummarySchema,
-    TimestampFormat, resolve_schema,
+    DerivedKind, EmittedKeys, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView,
+    SummarySchema, TimestampFormat, resolve_schema,
 };
 use crate::plugins::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metadata_key};
 use crate::proxy::tcp_proxy::StreamIoSide;
@@ -202,8 +202,49 @@ const SENSITIVE_BODY_KEY_SUBSTRINGS: &[&str] = &[
 /// Short field names that are credential-bearing only as an exact match, so a
 /// benign name such as `pinned` or `keyboard` is not redacted away.
 const SENSITIVE_BODY_KEY_EXACT: &[&str] = &[
-    "auth", "code", "cookie", "jwt", "key", "otp", "pin", "pwd", "sig",
+    "auth",
+    "code",
+    "cookie",
+    "embeddingkey",
+    "jwt",
+    "key",
+    "otp",
+    "pin",
+    "pwd",
+    "sig",
 ];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsonBodyRedactionContext {
+    Normal,
+    DataSourceItem,
+}
+
+fn compact_json_field_key(key: &str) -> String {
+    key.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn is_azure_data_sources_field(key: &str) -> bool {
+    compact_json_field_key(key) == "datasources"
+}
+
+fn is_azure_parameters_field(key: &str) -> bool {
+    compact_json_field_key(key) == "parameters"
+}
+
+fn wholesale_redact_data_source_parameters(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for entry in map.values_mut() {
+                *entry = Value::String(REDACTED.to_string());
+            }
+        }
+        _ => *value = Value::String(REDACTED.to_string()),
+    }
+}
 
 /// Capturable textual body families. Everything outside this set is skipped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -646,7 +687,7 @@ impl TransactionDebugger {
         let (redacted, dropped_lines) = match kind {
             BodyKind::Json => match serde_json::from_str::<Value>(text) {
                 Ok(mut value) => {
-                    self.redact_json_value(&mut value, 0);
+                    self.redact_json_value(&mut value, 0, JsonBodyRedactionContext::Normal);
                     match serde_json::to_string(&value) {
                         Ok(rendered) => (rendered, false),
                         // Serializing an already-parsed, redacted document
@@ -718,24 +759,63 @@ impl TransactionDebugger {
             || lowered.contains("eyj")
     }
 
-    fn redact_json_value(&self, value: &mut Value, depth: usize) {
+    fn redact_json_value(&self, value: &mut Value, depth: usize, ctx: JsonBodyRedactionContext) {
         if depth > MAX_JSON_REDACTION_DEPTH {
             *value = Value::String(BODY_DEPTH_MARKER.to_string());
             return;
         }
         match value {
             Value::Object(map) => {
-                for (key, entry) in map.iter_mut() {
-                    if self.is_sensitive_body_key(key) {
+                let keys = map.keys().cloned().collect::<Vec<_>>();
+                for key in keys {
+                    let Some(entry) = map.get_mut(&key) else {
+                        continue;
+                    };
+                    if self.is_sensitive_body_key(&key) {
                         *entry = Value::String(REDACTED.to_string());
+                    } else if ctx == JsonBodyRedactionContext::DataSourceItem
+                        && is_azure_parameters_field(&key)
+                    {
+                        wholesale_redact_data_source_parameters(entry);
+                    } else if ctx == JsonBodyRedactionContext::Normal
+                        && is_azure_data_sources_field(&key)
+                    {
+                        // The provider's conventional shape is an array of
+                        // data-source items, but a captured body is arbitrary
+                        // JSON and this name proves no type invariant. Every
+                        // other shape is traversed as a single data-source item
+                        // instead of falling out of the branch untouched: a
+                        // recognized container name must never bypass the
+                        // ordinary member-name and credential-string visitor.
+                        match entry {
+                            Value::Array(sources) => {
+                                for source in sources.iter_mut() {
+                                    self.redact_json_value(
+                                        source,
+                                        depth + 1,
+                                        JsonBodyRedactionContext::DataSourceItem,
+                                    );
+                                }
+                            }
+                            other => self.redact_json_value(
+                                other,
+                                depth + 1,
+                                JsonBodyRedactionContext::DataSourceItem,
+                            ),
+                        }
                     } else {
-                        self.redact_json_value(entry, depth + 1);
+                        let next_ctx = if ctx == JsonBodyRedactionContext::DataSourceItem {
+                            JsonBodyRedactionContext::DataSourceItem
+                        } else {
+                            JsonBodyRedactionContext::Normal
+                        };
+                        self.redact_json_value(entry, depth + 1, next_ctx);
                     }
                 }
             }
             Value::Array(items) => {
                 for entry in items.iter_mut() {
-                    self.redact_json_value(entry, depth + 1);
+                    self.redact_json_value(entry, depth + 1, ctx);
                 }
             }
             Value::String(text) if looks_like_credential(text) => {
@@ -1467,7 +1547,7 @@ impl<'a> SchemaSerializable for DebugHttpRecord<'a> {
     fn serialize_metadata<S>(
         &self,
         policy: &MetadataPolicy,
-        emitted: &mut HashSet<String>,
+        emitted: &EmittedKeys<'_>,
         map: &mut S,
     ) -> Result<(), S::Error>
     where
@@ -1595,7 +1675,7 @@ impl<'a> SchemaSerializable for DebugStreamRecord<'a> {
     fn serialize_metadata<S>(
         &self,
         policy: &MetadataPolicy,
-        emitted: &mut HashSet<String>,
+        emitted: &EmittedKeys<'_>,
         map: &mut S,
     ) -> Result<(), S::Error>
     where
@@ -1710,7 +1790,7 @@ impl<'a> SchemaSerializable for DebugWsRecord<'a> {
     fn serialize_metadata<S>(
         &self,
         policy: &MetadataPolicy,
-        emitted: &mut HashSet<String>,
+        emitted: &EmittedKeys<'_>,
         map: &mut S,
     ) -> Result<(), S::Error>
     where

@@ -5,6 +5,9 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use ferrum_edge::plugins::utils::sink_loss::{
+    SinkLossReason, accepted_total, dropped_total, render_prometheus, snapshot,
+};
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Direction, Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult,
     WsDisconnectContext, plugin_failure_policy, ws_logging::WsLogging,
@@ -129,6 +132,47 @@ async fn test_ws_logging_plugin_creation() {
     assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
     assert!(plugin.requires_ws_disconnect_hooks());
     assert_eq!(plugin.warmup_hostnames(), vec!["localhost".to_string()]);
+}
+
+async fn wait_for_ws_sink_loss(reason: SinkLossReason, at_least: u64) -> u64 {
+    let start = tokio::time::Instant::now();
+    loop {
+        let current = dropped_total("ws_logging", reason);
+        if current >= at_least {
+            return current;
+        }
+        if start.elapsed() > Duration::from_secs(5) {
+            panic!(
+                "timed out waiting for ws_logging {:?} >= {} (have {})",
+                reason, at_least, current,
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn assert_ws_batch_discard_projections() {
+    let expected = dropped_total("ws_logging", SinkLossReason::BatchDiscard);
+    assert!(
+        expected > 0,
+        "batch_discard projection requires a non-zero process total"
+    );
+    let status = snapshot();
+    assert_eq!(
+        status
+            .dropped_by_plugin
+            .get("ws_logging")
+            .and_then(|reasons| reasons.get("batch_discard"))
+            .copied(),
+        Some(expected)
+    );
+    let line = format!(
+        "ferrum_plugin_log_sink_records_dropped_total{{plugin=\"ws_logging\",reason=\"batch_discard\"}} {expected}"
+    );
+    assert!(
+        render_prometheus().contains(&line),
+        "prometheus exposition missing {line}"
+    );
 }
 
 #[test]
@@ -1694,4 +1738,271 @@ async fn ws_logging_denied_literal_endpoint_is_rejected_at_config_admission() {
             "unexpected error for {endpoint}: {error}"
         );
     }
+}
+
+#[tokio::test]
+async fn test_ws_logging_accepts_uppercase_scheme_and_encoded_paths() {
+    for endpoint in [
+        "WS://127.0.0.1:9300/logs",
+        "ws://127.0.0.1:9300/ingest/a b",
+        "ws://127.0.0.1:9300/ingest/\u{65e5}\u{5fd7}",
+    ] {
+        WsLogging::new(&json!({ "endpoint_url": endpoint }), default_client())
+            .unwrap_or_else(|error| panic!("expected {endpoint} to be admitted: {error}"));
+    }
+}
+
+#[tokio::test]
+async fn ws_logging_canonical_urls_complete_collector_handshake() {
+    async fn deliver(make_endpoint: impl FnOnce(std::net::SocketAddr) -> String) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let endpoint = make_endpoint(addr);
+        let (payload_tx, payload_rx) = tokio::sync::oneshot::channel::<String>();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake");
+            let (_sink, mut read) = ws.split();
+            let payload = match read.next().await {
+                Some(Ok(Message::Text(payload))) => payload.to_string(),
+                other => panic!("expected text log batch, got {other:?}"),
+            };
+            let _ = payload_tx.send(payload);
+        });
+
+        let plugin = WsLogging::new(
+            &json!({
+                "endpoint_url": endpoint,
+                "batch_size": 1,
+                "flush_interval_ms": 100,
+                "max_retries": 0,
+                "reconnect_delay_ms": 50,
+                "buffer_capacity": 16
+            }),
+            default_client(),
+        )
+        .expect("admitted endpoint");
+        plugin.start_background_tasks().expect("live start");
+        plugin.commit_background_tasks();
+        plugin.log(&create_test_transaction_summary()).await;
+
+        let payload = await_within("canonical-url batch", payload_rx)
+            .await
+            .expect("payload channel closed");
+        assert!(
+            payload.starts_with('['),
+            "expected JSON-array batch, got {payload}"
+        );
+
+        drop(plugin);
+        let _ = await_within("canonical-url server", server).await;
+    }
+
+    deliver(|addr| format!("WS://{addr}/logs")).await;
+    deliver(|addr| format!("ws://{addr}/ingest/a b")).await;
+    deliver(|addr| format!("ws://{addr}/ingest/\u{65e5}\u{5fd7}")).await;
+}
+
+#[tokio::test]
+async fn ws_logging_exhausted_connection_failure_counts_batch_discard() {
+    let discarded_before = dropped_total("ws_logging", SinkLossReason::BatchDiscard);
+    let accepted_before = accepted_total("ws_logging");
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": "ws://127.0.0.1:1/unreachable",
+            "batch_size": 1,
+            "flush_interval_ms": 600000,
+            "max_retries": 1,
+            "retry_delay_ms": 10,
+            "reconnect_delay_ms": 10,
+            "connect_timeout_ms": 200,
+            "write_timeout_ms": 200,
+            "buffer_capacity": 16
+        }),
+        default_client(),
+    )
+    .expect("build plugin");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    plugin.log(&create_test_transaction_summary()).await;
+
+    let after = wait_for_ws_sink_loss(SinkLossReason::BatchDiscard, discarded_before + 1).await;
+    assert!(accepted_total("ws_logging") > accepted_before);
+    assert_ws_batch_discard_projections();
+
+    drop(plugin);
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": "ws://127.0.0.1:1/unreachable",
+            "batch_size": 1,
+            "flush_interval_ms": 600000,
+            "max_retries": 0,
+            "buffer_capacity": 16
+        }),
+        default_client(),
+    )
+    .expect("rebuild after drop");
+    assert!(
+        dropped_total("ws_logging", SinkLossReason::BatchDiscard) >= after,
+        "batch_discard must persist across plugin reload"
+    );
+    drop(plugin);
+}
+
+#[tokio::test]
+async fn ws_logging_exhausted_connect_timeout_counts_batch_discard() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let discarded_before = dropped_total("ws_logging", SinkLossReason::BatchDiscard);
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": format!("ws://{addr}/logs"),
+            "batch_size": 1,
+            "flush_interval_ms": 600000,
+            "max_retries": 0,
+            "retry_delay_ms": 10,
+            "reconnect_delay_ms": 10,
+            "connect_timeout_ms": 100,
+            "write_timeout_ms": 200,
+            "buffer_capacity": 16
+        }),
+        default_client(),
+    )
+    .expect("build plugin");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    plugin.log(&create_test_transaction_summary()).await;
+
+    wait_for_ws_sink_loss(SinkLossReason::BatchDiscard, discarded_before + 1).await;
+    drop(plugin);
+    drop(listener);
+}
+
+#[tokio::test]
+async fn ws_logging_exhausted_handshake_failure_counts_batch_discard() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            let _ = stream.shutdown().await;
+        }
+    });
+
+    let discarded_before = dropped_total("ws_logging", SinkLossReason::BatchDiscard);
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": format!("ws://{addr}/logs"),
+            "batch_size": 1,
+            "flush_interval_ms": 600000,
+            "max_retries": 1,
+            "retry_delay_ms": 10,
+            "reconnect_delay_ms": 10,
+            "connect_timeout_ms": 200,
+            "write_timeout_ms": 200,
+            "buffer_capacity": 16
+        }),
+        default_client(),
+    )
+    .expect("build plugin");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    plugin.log(&create_test_transaction_summary()).await;
+
+    wait_for_ws_sink_loss(SinkLossReason::BatchDiscard, discarded_before + 1).await;
+    drop(plugin);
+    server.abort();
+}
+
+#[tokio::test]
+async fn ws_logging_exhausted_multi_record_batch_counts_each_entry() {
+    let discarded_before = dropped_total("ws_logging", SinkLossReason::BatchDiscard);
+    let accepted_before = accepted_total("ws_logging");
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": "ws://127.0.0.1:1/unreachable",
+            "batch_size": 3,
+            "flush_interval_ms": 600000,
+            "max_retries": 0,
+            "retry_delay_ms": 10,
+            "reconnect_delay_ms": 10,
+            "connect_timeout_ms": 200,
+            "write_timeout_ms": 200,
+            "buffer_capacity": 16
+        }),
+        default_client(),
+    )
+    .expect("build plugin");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    for _ in 0..3 {
+        plugin.log(&create_test_transaction_summary()).await;
+    }
+
+    wait_for_ws_sink_loss(SinkLossReason::BatchDiscard, discarded_before + 3).await;
+    assert!(accepted_total("ws_logging") >= accepted_before + 3);
+    drop(plugin);
+}
+
+#[tokio::test]
+async fn ws_logging_successful_retry_does_not_count_batch_discard() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let (payload_tx, payload_rx) = tokio::sync::oneshot::channel::<String>();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("first accept");
+        let _ = stream
+            .write_all(
+                b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+        drop(stream);
+
+        let (stream, _) = listener.accept().await.expect("retry accept");
+        let ws = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("retry handshake");
+        let (_sink, mut read) = ws.split();
+        let payload = match read.next().await {
+            Some(Ok(Message::Text(payload))) => payload.to_string(),
+            other => panic!("expected text log batch, got {other:?}"),
+        };
+        let _ = payload_tx.send(payload);
+    });
+
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": format!("ws://{addr}/logs"),
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 1,
+            "retry_delay_ms": 20,
+            "reconnect_delay_ms": 20,
+            "connect_timeout_ms": 500,
+            "write_timeout_ms": 500,
+            "buffer_capacity": 16
+        }),
+        default_client(),
+    )
+    .expect("build plugin");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    plugin.log(&create_test_transaction_summary()).await;
+
+    let payload = await_within("retry-success batch", payload_rx)
+        .await
+        .expect("payload channel closed");
+    assert!(payload.starts_with('['), "got {payload}");
+    drop(plugin);
+    let _ = await_within("retry-success server", server).await;
 }

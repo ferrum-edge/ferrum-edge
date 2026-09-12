@@ -49,7 +49,11 @@ use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet, TrustDomain};
 use crate::tls::CrlList;
 
 /// Errors raised by the SPIFFE TLS builders.
-#[derive(Debug, thiserror::Error)]
+///
+/// `Clone` is derived so a mesh pool can rebuild a coalesced create failure for
+/// the waiters that joined the same in-flight attempt (issue #5046). Every
+/// payload is already an owned `String`, so the clone is exact.
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum SpiffeTlsError {
     #[error("SVID bundle has no leaf certificate")]
     NoLeafCert,

@@ -63,6 +63,25 @@ fn test_creation_valid_config() {
 }
 
 #[test]
+fn test_creation_accepts_explicit_null_for_optional_fields() {
+    let plugin = ResponseMock::new(&json!({
+        "passthrough_on_no_match": null,
+        "rules": [{
+            "method": null,
+            "path": "/",
+            "status_code": null,
+            "headers": null,
+            "body": null,
+            "delay_ms": null
+        }]
+    }));
+    assert!(
+        plugin.is_ok(),
+        "explicit null optional fields must match omitted defaults"
+    );
+}
+
+#[test]
 fn test_creation_rejects_non_object_config() {
     let err = ResponseMock::new(&json!("bad")).err().unwrap();
     assert!(err.contains("config must be an object"));

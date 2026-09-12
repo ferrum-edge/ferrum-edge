@@ -21,7 +21,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[cfg(test)]
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, error};
 
@@ -33,6 +32,7 @@ use crate::modes::mesh::hbone::{
     BAGGAGE_HEADER, ISTIO_HBONE_PORT, UdpSourceIdentity, baggage_header_for_source,
     baggage_header_for_udp_source,
 };
+use crate::pool::{SharedCreationRole, SharedCreationSlot};
 use crate::proxy::mesh_trust_registry::{
     MESH_KEEPALIVE_FAILED_MESSAGE, MeshTransportGate, MeshTransportKind, MeshTransportRegistration,
     MeshTrustRegistry,
@@ -421,6 +421,114 @@ impl HbonePoolError {
             _ => None,
         }
     }
+
+    /// A cloneable reconstruction of this create failure, broadcast to the
+    /// coalesced waiters that joined the same in-flight mesh-pool creation
+    /// attempt (issue #5046).
+    ///
+    /// The mesh pools hand waiters the creator's TYPED error rather than a
+    /// sanitized payload, so a waiter's [`Self::error_class`],
+    /// [`Self::is_capability_failure`], [`Self::public_reason`],
+    /// [`Self::public_status`] and gRPC / H3 taxonomy mapping are identical to
+    /// the creator's — the pre-wire classification the retry, circuit-breaker
+    /// and capability-gate paths read is preserved exactly, without a second
+    /// dial. The match is exhaustive on purpose: a new variant must decide how
+    /// it reconstructs rather than silently degrading to a generic shape.
+    ///
+    /// Only the two `std::io::Error` sources cannot be cloned. They are rebuilt
+    /// from the raw OS code when there is one — so both `ErrorKind` and
+    /// [`crate::retry::is_port_exhaustion`]'s `raw_os_error()` survive — and
+    /// from kind plus text otherwise, which is all
+    /// `tls_handshake_is_capability_failure` and `error_class` read.
+    pub fn clone_for_broadcast(&self) -> Self {
+        match self {
+            Self::NoSvid => Self::NoSvid,
+            Self::NoLeafCert => Self::NoLeafCert,
+            Self::DnsLookup { host, message } => Self::DnsLookup {
+                host: host.clone(),
+                message: message.clone(),
+            },
+            Self::ConnectTimeout { addr, timeout_ms } => Self::ConnectTimeout {
+                addr: addr.clone(),
+                timeout_ms: *timeout_ms,
+            },
+            Self::Connect { addr, source } => Self::Connect {
+                addr: addr.clone(),
+                source: clone_io_error(source),
+            },
+            Self::InvalidServerName { host, message } => Self::InvalidServerName {
+                host: host.clone(),
+                message: message.clone(),
+            },
+            Self::InvalidDialHostTag { value, message } => Self::InvalidDialHostTag {
+                value: value.clone(),
+                message: message.clone(),
+            },
+            Self::InvalidAuthorityHostTag { value, message } => Self::InvalidAuthorityHostTag {
+                value: value.clone(),
+                message: message.clone(),
+            },
+            Self::InvalidPeerSpiffeTag { value, message } => Self::InvalidPeerSpiffeTag {
+                value: value.clone(),
+                message: message.clone(),
+            },
+            Self::TlsConfig(source) => Self::TlsConfig(source.clone()),
+            Self::TlsHandshake { host, source } => Self::TlsHandshake {
+                host: host.clone(),
+                source: clone_io_error(source),
+            },
+            Self::H2Handshake { host, message } => Self::H2Handshake {
+                host: host.clone(),
+                message: message.clone(),
+            },
+            Self::InvalidConnectRequest { authority, message } => Self::InvalidConnectRequest {
+                authority: authority.clone(),
+                message: message.clone(),
+            },
+            Self::ConnectStream { authority, message } => Self::ConnectStream {
+                authority: authority.clone(),
+                message: message.clone(),
+            },
+            Self::ConnectRejected { authority, status } => Self::ConnectRejected {
+                authority: authority.clone(),
+                status: *status,
+            },
+            Self::TrustWithdrawn => Self::TrustWithdrawn,
+            Self::MaxConnectionsExceeded {
+                host,
+                port,
+                current,
+                cap,
+            } => Self::MaxConnectionsExceeded {
+                host: host.clone(),
+                port: *port,
+                current: *current,
+                cap: *cap,
+            },
+            Self::ExtendedConnectUnsupported { authority } => Self::ExtendedConnectUnsupported {
+                authority: authority.clone(),
+            },
+            Self::MissingCrossClusterSni => Self::MissingCrossClusterSni,
+            Self::MissingCrossClusterTrustDomain => Self::MissingCrossClusterTrustDomain,
+            Self::MissingCrossClusterAuthorityHost => Self::MissingCrossClusterAuthorityHost,
+        }
+    }
+}
+
+/// Rebuild an [`std::io::Error`] for a coalesced create-failure broadcast.
+///
+/// `std::io::Error` is not `Clone`. A raw-OS error is rebuilt from its code so
+/// both `kind()` and `raw_os_error()` survive — the latter is what
+/// [`crate::retry::is_port_exhaustion`] walks for `EADDRNOTAVAIL`. Everything
+/// else (rustls handshake failures wrapped by `tokio_rustls`, custom errors)
+/// keeps its kind and rendered text, which is all
+/// [`HbonePoolError::error_class`] and `tls_handshake_is_capability_failure`
+/// read from it.
+fn clone_io_error(source: &std::io::Error) -> std::io::Error {
+    match source.raw_os_error() {
+        Some(code) => std::io::Error::from_raw_os_error(code),
+        None => std::io::Error::new(source.kind(), source.to_string()),
+    }
 }
 
 /// Which mesh transport a client-visible dispatch failure came from.
@@ -577,6 +685,14 @@ fn tls_handshake_is_capability_failure(error: &std::io::Error) -> bool {
     )
 }
 
+/// Per-key coalesced-creation slot for the HBONE pool (issue #5046).
+///
+/// The broadcast payload is the creator's own typed [`HbonePoolError`], shared
+/// behind an `Arc` and rebuilt per waiter with
+/// [`HbonePoolError::clone_for_broadcast`], so every waiter's classification,
+/// capability verdict and client-visible reason match the creator's exactly.
+pub(crate) type HboneCreationSlot = SharedCreationSlot<Arc<HbonePoolError>>;
+
 /// Upper bound on retired-generation records kept while waiting for their
 /// drain timers. With `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS=0` no drain
 /// task ever consumes the records, so the registry must be capped or a
@@ -590,7 +706,11 @@ const MAX_RETIRED_FINGERPRINTS_PER_GENERATION: usize = 8;
 
 pub struct HboneConnectionPool {
     entries: Arc<DashMap<String, Vec<HbonePoolEntry>>>,
-    creation_locks: DashMap<String, Arc<Mutex<()>>>,
+    /// Per-key creation slots: the serialization mutex the pool has always
+    /// used, plus the generation-scoped failure broadcast that releases every
+    /// caller queued behind a failed dial instead of letting each repeat it
+    /// (issue #5046).
+    creation_locks: DashMap<String, Arc<HboneCreationSlot>>,
     gateway_svid: SharedSvidBundle,
     crls: crate::tls::SharedCrlList,
     svid_identity_cache: ArcSwap<Option<HboneSvidIdentityCache>>,
@@ -1528,20 +1648,30 @@ impl HboneConnectionPool {
 
         let creation_started = Instant::now();
         let authority = authority_for_host_port(app_host, app_port);
-        let creation_lock = self
+        let creation_slot = self
             .creation_locks
             .entry(key.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .or_insert_with(|| Arc::new(HboneCreationSlot::new()))
             .clone();
-        let _creation_guard = tokio::time::timeout(connect_timeout, creation_lock.lock())
-            .await
-            .map_err(|_| HbonePoolError::ConnectStream {
-                authority: authority.clone(),
-                message: format!(
-                    "timed out after {}ms waiting to coalesce HBONE HTTP/2 sender creation",
-                    effective_connect_timeout_ms
-                ),
-            })?;
+        // Join the cohort BEFORE awaiting the lock: subscribing is what scopes
+        // this caller to the attempt that is in flight right now, so it can be
+        // released by that attempt's failure instead of repeating the dial
+        // (issue #5046). Every waiter keeps its OWN `connect_timeout` here.
+        let cohort = creation_slot.join();
+        let joined = tokio::time::timeout(connect_timeout, cohort.wait()).await;
+        let mut creation_lease = match joined {
+            Ok(SharedCreationRole::Creator(lease)) => lease,
+            Ok(SharedCreationRole::Failed(shared)) => return Err(shared.clone_for_broadcast()),
+            Err(_) => {
+                return Err(HbonePoolError::ConnectStream {
+                    authority: authority.clone(),
+                    message: format!(
+                        "timed out after {}ms waiting to coalesce HBONE HTTP/2 sender creation",
+                        effective_connect_timeout_ms
+                    ),
+                });
+            }
+        };
         match self.cached_sender(key, max_entries) {
             Some(CachedSender::Ready(transport)) => {
                 return Ok(transport);
@@ -1595,6 +1725,15 @@ impl HboneConnectionPool {
                 }
             }
             None => {}
+        }
+
+        // A concurrent creator for this key failed while this caller was queued
+        // for the creation lock: adopt that cohort's typed outcome instead of
+        // repeating the same dial (issue #5046). Checked AFTER the cache
+        // re-check above so a usable connection always wins over a shared
+        // failure, and before any budget is spent on a dial.
+        if let Some(shared) = creation_lease.take_broadcast_failure() {
+            return Err(shared.clone_for_broadcast());
         }
 
         let remaining = match crate::pool::remaining_connect_timeout(
@@ -1655,11 +1794,26 @@ impl HboneConnectionPool {
             Ok(Err(err)) => {
                 crate::runtime_metrics::global_ref()
                     .record_pool_failure(crate::runtime_metrics::PoolKind::Hbone);
+                // Release the whole cohort on this one physical dial: every
+                // caller that joined while it was in flight gets the same typed
+                // outcome rather than taking the lock and repeating it (issue
+                // #5046). Published while the lock is still held, so no waiter
+                // can slip past the broadcast. `record_pool_failure` stays on
+                // the creator alone — one physical dial, one pool failure —
+                // while each waiter still reports its own logical outcome.
+                creation_lease.publish_failure(Arc::new(err.clone_for_broadcast()));
                 return Err(err);
             }
             Err(_) => {
                 crate::runtime_metrics::global_ref()
                     .record_pool_failure(crate::runtime_metrics::PoolKind::Hbone);
+                // Deliberately NOT broadcast: this is the CREATOR's own connect
+                // budget expiring, not evidence about the peer. A waiter may
+                // have a longer deadline (per-port `connect_timeout_ms`
+                // overrides are not part of the pool key), and #5046 requires
+                // each waiter's original deadline to survive — so the lease
+                // drops without publishing and the next waiter is elected as a
+                // fresh creator with its own remaining budget.
                 return Err(HbonePoolError::ConnectStream {
                     authority,
                     message: format!(
@@ -3707,11 +3861,11 @@ mod tests {
         );
         let stale_key = "hbone|stale|8080|15008||oldfingerprint".to_string();
         let active_key = "hbone|active|8080|15008||oldfingerprint".to_string();
-        let active_lock = Arc::new(Mutex::new(()));
+        let active_lock = Arc::new(HboneCreationSlot::new());
         let active_ref = active_lock.clone();
 
         pool.creation_locks
-            .insert(stale_key.clone(), Arc::new(Mutex::new(())));
+            .insert(stale_key.clone(), Arc::new(HboneCreationSlot::new()));
         pool.creation_locks
             .insert(active_key.clone(), active_lock.clone());
 
@@ -3763,7 +3917,7 @@ mod tests {
     fn insert_empty_entry(pool: &HboneConnectionPool, key: &str) {
         pool.entries.insert(key.to_string(), Vec::new());
         pool.creation_locks
-            .insert(key.to_string(), Arc::new(Mutex::new(())));
+            .insert(key.to_string(), Arc::new(HboneCreationSlot::new()));
     }
 
     #[test]
@@ -4089,8 +4243,11 @@ mod tests {
             None,
             &pool_config,
         );
-        let creation_lock = Arc::new(Mutex::new(()));
-        let _held_guard = creation_lock.lock().await;
+        let creation_lock = Arc::new(HboneCreationSlot::new());
+        let _held_guard = match creation_lock.join().wait().await {
+            SharedCreationRole::Creator(lease) => lease,
+            SharedCreationRole::Failed(_) => panic!("a fresh slot must elect a creator"),
+        };
         pool.creation_locks
             .insert(key.clone(), creation_lock.clone());
 
@@ -4150,8 +4307,11 @@ mod tests {
             None,
             &pool_config,
         );
-        let creation_lock = Arc::new(Mutex::new(()));
-        let _held_guard = creation_lock.lock().await;
+        let creation_lock = Arc::new(HboneCreationSlot::new());
+        let _held_guard = match creation_lock.join().wait().await {
+            SharedCreationRole::Creator(lease) => lease,
+            SharedCreationRole::Failed(_) => panic!("a fresh slot must elect a creator"),
+        };
         pool.creation_locks
             .insert(key.clone(), creation_lock.clone());
 

@@ -2,6 +2,347 @@ use ferrum_edge::plugins::ai_response_guard::AiResponseGuard;
 use ferrum_edge::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext};
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+async fn publish_guarded_response(
+    config: serde_json::Value,
+    content_type: &str,
+    encoding: Option<&str>,
+    body: Vec<u8>,
+) -> (u16, HashMap<String, String>, bytes::Bytes) {
+    use ferrum_edge::_test_support::{
+        stamp_original_response_metadata_for_test,
+        transform_buffered_response_body_with_deadline_full_for_test,
+    };
+
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(make_plugin(config))];
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    let mut headers = HashMap::from([("content-type".to_string(), content_type.to_string())]);
+    if let Some(encoding) = encoding {
+        headers.insert("content-encoding".to_string(), encoding.to_string());
+    }
+    let mut status = 200;
+    let mut body = bytes::Bytes::from(body);
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+    ferrum_edge::plugins::normalize_response_body_for_inspection(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        &[],
+    )
+    .await;
+    assert!(matches!(
+        plugins[0]
+            .on_response_body(&mut ctx, status, &mut headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+    (status, headers, body)
+}
+
+fn gzip_response(body: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(body).unwrap();
+    encoder.finish().unwrap()
+}
+
+#[test]
+fn grpc_admission_matches_component_and_plugin_wrapper_schemas() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).unwrap();
+    let validators: Vec<_> = [
+        "AiResponseGuardConfig",
+        "PluginConfig",
+        "PluginConfigCreate",
+    ]
+    .into_iter()
+    .map(|name| {
+        let schema = json!({
+            "$ref": format!("#/components/schemas/{name}"),
+            "components": spec["components"].clone()
+        });
+        (
+            name,
+            jsonschema::draft202012::options().build(&schema).unwrap(),
+        )
+    })
+    .collect();
+    let base = json!({
+        "pii_patterns": ["email"],
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {"/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}}
+        }
+    });
+    let check = |config: serde_json::Value, schema_valid: bool, runtime_valid: bool| {
+        assert_eq!(
+            AiResponseGuard::validate_config(&config).is_ok(),
+            runtime_valid,
+            "runtime admission: {config}"
+        );
+        for (name, validator) in &validators {
+            let document = if *name == "AiResponseGuardConfig" {
+                config.clone()
+            } else {
+                json!({
+                    "plugin_name": "ai_response_guard", "scope": "global",
+                    "enabled": true, "config": config
+                })
+            };
+            assert_eq!(
+                validator.is_valid(&document),
+                schema_valid,
+                "{name} admission: {config}"
+            );
+        }
+    };
+    check(base.clone(), true, true);
+    for (key, value, valid) in [
+        ("require_json", json!(true), false),
+        ("require_json", json!(false), true),
+        ("required_fields", json!(["choices"]), false),
+        ("required_fields", json!([]), true),
+        ("pii_patterns", json!([]), false),
+    ] {
+        let mut config = base.clone();
+        config[key] = value;
+        check(config, valid, valid);
+    }
+    for (fields, schema_valid, runtime_valid) in [
+        (json!(["message"]), true, true),
+        (json!([" message "]), true, true),
+        (json!(["replies . message"]), true, true),
+        (json!([vec!["reply"; 32].join(".")]), true, true),
+        (json!([]), false, false),
+        (json!(["."]), false, false),
+        (json!(["message..text"]), false, false),
+        (json!(["message. \t .text"]), false, false),
+        (json!(["message", "message"]), false, false),
+        (json!([vec!["reply"; 33].join(".")]), false, false),
+        // JSON Schema cannot compare strings after trimming each segment.
+        (json!(["message", " message "]), true, false),
+    ] {
+        let mut config = base.clone();
+        config["grpc"]["methods"]["/test.Greeter/SayHello"]["text_fields"] = fields;
+        check(config, schema_valid, runtime_valid);
+    }
+    // Descriptor-backed construction also admits omitted and trimmed selectors.
+    assert!(AiResponseGuard::new(&base).is_ok());
+    let mut trimmed = base;
+    trimmed["grpc"]["methods"]["/test.Greeter/SayHello"]["text_fields"] = json!([" message "]);
+    assert!(AiResponseGuard::new(&trimmed).is_ok());
+}
+
+#[tokio::test]
+async fn gzip_json_reaches_decoding_and_final_guard_policy() {
+    for action in ["reject", "redact", "warn"] {
+        for text in ["Hello", "mail review@example.test"] {
+            let original = json!({"choices": [{"message": {"content": text}}]});
+            let encoded = gzip_response(&serde_json::to_vec(&original).unwrap());
+            let (status, headers, body) = publish_guarded_response(
+                json!({"action": action, "pii_patterns": ["email"]}),
+                "application/json",
+                Some("gzip"),
+                encoded.clone(),
+            )
+            .await;
+            if action == "warn" {
+                assert_eq!(status, 200);
+                assert_eq!(headers.get("content-encoding").unwrap(), "gzip");
+                assert_eq!(body.as_ref(), encoded);
+            } else if action == "reject" && text != "Hello" {
+                assert_eq!(status, 502);
+            } else {
+                assert_eq!(status, 200, "{action}: {body:?}");
+                assert!(!headers.contains_key("content-encoding"));
+                let delivered: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let expected = if text == "Hello" {
+                    "Hello"
+                } else {
+                    "mail [REDACTED:pii:email]"
+                };
+                assert_eq!(delivered["choices"][0]["message"]["content"], expected);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn encoded_response_deferral_keeps_representation_and_scan_limits() {
+    for (encoding, body, max_scan_bytes) in [
+        ("gzip", b"invalid gzip".to_vec(), 1024),
+        ("gzip", gzip_response(b"invalid JSON"), 1024),
+        ("unsupported", b"opaque response".to_vec(), 1024),
+        ("gzip", gzip_response(br#"{"text":"Hello"}"#), 4),
+    ] {
+        let (status, _, _) = publish_guarded_response(
+            json!({
+                "action": "redact", "pii_patterns": ["email"],
+                "max_scan_bytes": max_scan_bytes
+            }),
+            "application/json",
+            Some(encoding),
+            body,
+        )
+        .await;
+        assert_eq!(status, 502);
+    }
+}
+
+#[tokio::test]
+async fn final_guard_accepts_verified_placeholders_and_structural_scalars() {
+    for scan_fields in ["content", "all"] {
+        let (status, _, body) = publish_guarded_response(
+            json!({
+                "action": "redact", "scan_fields": scan_fields,
+                "blocked_patterns": [{"name": "draft", "regex": "draft"}]
+            }),
+            "application/json",
+            None,
+            br#"{"choices":[{"message":{"content":"draft"}}]}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let delivered: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            delivered["choices"][0]["message"]["content"],
+            "[REDACTED:draft]"
+        );
+    }
+    for text in ["Hello", "Address 192.0.2.2"] {
+        let (status, _, body) = publish_guarded_response(
+            json!({"action": "redact", "scan_fields": "all", "pii_patterns": ["ip_address"]}),
+            "application/json",
+            None,
+            serde_json::to_vec(&json!({
+                "id": "192.0.2.1", "choices": [{"message": {"content": text}}]
+            }))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let delivered: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(delivered["id"], "192.0.2.1");
+        assert_eq!(
+            delivered["choices"][0]["message"]["content"],
+            if text == "Hello" {
+                "Hello"
+            } else {
+                "Address [REDACTED:pii:ip_address]"
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn verified_redaction_does_not_excuse_later_changes_or_another_instance() {
+    let config = json!({
+        "action": "redact", "blocked_patterns": [{"name": "draft", "regex": "draft"}]
+    });
+    let plugin = make_plugin(config.clone());
+    let other = make_plugin(config);
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let redacted = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            br#"{"choices":[{"message":{"content":"draft"}}]}"#,
+            Some("application/json"),
+            &headers,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        plugin
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, &redacted)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        other
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, &redacted)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+    let changed = br#"{"choices":[{"message":{"content":"draft again"}}]}"#;
+    assert!(matches!(
+        plugin
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, changed)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[tokio::test]
+async fn final_guard_keeps_length_validation_after_verified_redaction() {
+    let (status, _, _) = publish_guarded_response(
+        json!({
+            "action": "redact", "max_completion_length": 5,
+            "blocked_patterns": [{"name": "draft", "regex": "draft"}]
+        }),
+        "application/json",
+        None,
+        br#"{"choices":[{"message":{"content":"draft"}}]}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, 502);
+}
+
+#[tokio::test]
+async fn final_guard_preserves_buffered_sse_structural_only_output() {
+    let original = b"data: {\"id\":\"192.0.2.1\"}\n\ndata: [DONE]\n\n";
+    let (status, _, body) = publish_guarded_response(
+        json!({"action": "redact", "scan_fields": "all", "pii_patterns": ["ip_address"]}),
+        "text/event-stream",
+        None,
+        original.to_vec(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body.as_ref(), original);
+}
+
+#[tokio::test]
+async fn final_guard_accepts_its_text_and_sse_placeholders() {
+    for (content_type, body) in [
+        ("text/plain", "draft"),
+        (
+            "text/event-stream",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"draft\"}}]}\n\ndata: [DONE]\n\n",
+        ),
+    ] {
+        let (status, _, body) = publish_guarded_response(
+            json!({
+                "action": "redact", "scan_fields": "all",
+                "blocked_patterns": [{"name": "draft", "regex": "draft"}]
+            }),
+            content_type,
+            None,
+            body.as_bytes().to_vec(),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .contains("[REDACTED:draft]")
+        );
+    }
+}
 
 fn make_plugin(config: serde_json::Value) -> AiResponseGuard {
     AiResponseGuard::new(&config).unwrap()

@@ -1,3 +1,5 @@
+use crate::plugins::utils::log_sampling::warn_sampled;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
@@ -54,6 +56,10 @@ const MAX_TOKEN_BYTES: usize = 8 * 1024;
 const MAX_INTROSPECTION_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_DISCOVERY_RESPONSE_BYTES: usize = 128 * 1024;
 const MAX_PROVIDER_CONCURRENT_INTROSPECTIONS: usize = 32;
+/// Audience used only by the construction-time `private_key_jwt` signing probe.
+/// The assertion is discarded and never sent; the value affects nothing the
+/// signature backend checks.
+const PROBE_ASSERTION_AUDIENCE: &str = "urn:ferrum-edge:client-assertion-probe";
 const MAX_GLOBAL_CONCURRENT_INTROSPECTIONS: usize = 128;
 
 static GLOBAL_INTROSPECTION_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -102,8 +108,8 @@ pub struct Oauth2Introspection {
 
 struct IntrospectionProvider {
     issuer: Option<String>,
-    introspection_endpoint: Arc<ArcSwap<Option<String>>>,
-    discovery_url: Option<String>,
+    introspection_endpoint: Arc<ArcSwap<Option<ResolvedEndpoint>>>,
+    discovery: Option<ResolvedEndpoint>,
     assertion_audience: Option<String>,
     audiences: Vec<String>,
     token_locations: Vec<TokenLocation>,
@@ -122,6 +128,26 @@ struct IntrospectionProvider {
     warmup_hostnames: Vec<String>,
     introspection_limit: Arc<Semaphore>,
     in_flight: Arc<DashMap<TokenKey, Arc<InFlightCell>>>,
+}
+
+/// An introspection endpoint together with the only rendering of it that may
+/// reach a log line.
+///
+/// `introspection_endpoint` accepts a path and a query, and operators do put
+/// reusable credentials there. The redacted form is computed once — at
+/// construction, or when discovery resolves the endpoint — so no request-path
+/// diagnostic has to re-derive it and none can accidentally use `url`
+/// (GHSA-4ghp-v85j-5hvq).
+struct ResolvedEndpoint {
+    url: String,
+    redacted: String,
+}
+
+impl ResolvedEndpoint {
+    fn new(url: String) -> Self {
+        let redacted = super::utils::redacted_endpoint_url_str(&url);
+        Self { url, redacted }
+    }
 }
 
 enum ClientAuth {
@@ -359,7 +385,9 @@ impl Oauth2Introspection {
                 parse_client_auth(prov_obj, idx, endpoint.as_ref().or(discovery.as_ref()))?;
 
             let endpoint_slot = Arc::new(ArcSwap::from_pointee(
-                endpoint.as_ref().map(|parsed| parsed.url.clone()),
+                endpoint
+                    .as_ref()
+                    .map(|parsed| ResolvedEndpoint::new(parsed.url.clone())),
             ));
             let cache = Arc::new(IntrospectionCache::new(
                 max_cache_entries,
@@ -385,7 +413,9 @@ impl Oauth2Introspection {
                 assertion_audience: issuer.clone(),
                 issuer,
                 introspection_endpoint: endpoint_slot,
-                discovery_url: discovery.as_ref().map(|parsed| parsed.url.clone()),
+                discovery: discovery
+                    .as_ref()
+                    .map(|parsed| ResolvedEndpoint::new(parsed.url.clone())),
                 audiences,
                 token_locations,
                 required_scopes,
@@ -517,9 +547,12 @@ impl Oauth2Introspection {
                 if !provider.forward_original_token {
                     self.stage_original_token_stripping(&mut attempt, ctx, &token, candidate);
                 }
+                // `and_then`, not `map`: an introspection `exp` the monotonic
+                // clock cannot express publishes no bound rather than an
+                // already-elapsed one (issue #5420).
                 let deadline = authorization
                     .expires_at_unix
-                    .map(|expiry| credential_deadline_from_unix_seconds(expiry, 0));
+                    .and_then(|expiry| credential_deadline_from_unix_seconds(expiry, 0));
                 let outcome = self
                     .resolve_identity(&authorization, consumer_index)
                     .with_credential_deadline(deadline);
@@ -625,22 +658,26 @@ impl Oauth2Introspection {
         }
 
         let guard = provider.introspection_endpoint.load();
-        let Some(endpoint) = guard.as_ref().as_ref().cloned() else {
-            warn!(
+        let Some(resolved) = guard.as_ref().as_ref() else {
+            warn_sampled!(
                 plugin = "oauth2_introspection",
-                provider_idx, "introspection endpoint unresolved"
+                provider_idx,
+                "introspection endpoint unresolved"
             );
             return Err(IntrospectionDecision::Unavailable);
         };
+        let endpoint = resolved.url.clone();
+        let redacted_endpoint = resolved.redacted.clone();
 
         let _provider_permit = provider
             .introspection_limit
             .clone()
             .try_acquire_owned()
             .map_err(|_| {
-                warn!(
+                warn_sampled!(
                     plugin = "oauth2_introspection",
-                    provider_idx, "provider introspection concurrency limit reached"
+                    provider_idx,
+                    "provider introspection concurrency limit reached"
                 );
                 IntrospectionDecision::Unavailable
             })?;
@@ -649,9 +686,10 @@ impl Oauth2Introspection {
             .clone()
             .try_acquire_owned()
             .map_err(|_| {
-                warn!(
+                warn_sampled!(
                     plugin = "oauth2_introspection",
-                    provider_idx, "global introspection concurrency limit reached"
+                    provider_idx,
+                    "global introspection concurrency limit reached"
                 );
                 IntrospectionDecision::Unavailable
             })?;
@@ -714,12 +752,16 @@ impl Oauth2Introspection {
                 .with_form_body(&params)?,
         };
 
+        // Redacted execution: the shared client's slow-call, retry, and
+        // egress-denial diagnostics must record the endpoint ORIGIN, never a
+        // credential an operator embedded in the configured path or query
+        // (GHSA-4ghp-v85j-5hvq). The wire request still uses the full URL.
         let response = self
             .http_client
-            .execute(request, "oauth2_introspection")
+            .execute_with_redacted_url(request, "oauth2_introspection", &redacted_endpoint)
             .await
             .map_err(|e| {
-                warn!(
+                warn_sampled!(
                     plugin = "oauth2_introspection",
                     provider_idx,
                     error_class = %crate::retry::classify_reqwest_error(&e),
@@ -728,7 +770,7 @@ impl Oauth2Introspection {
                 IntrospectionDecision::Unavailable
             })?;
         if !response.status().is_success() {
-            warn!(
+            warn_sampled!(
                 plugin = "oauth2_introspection",
                 provider_idx,
                 status = response.status().as_u16(),
@@ -739,7 +781,7 @@ impl Oauth2Introspection {
         let body = read_response_body_bounded(response, MAX_INTROSPECTION_RESPONSE_BYTES)
             .await
             .map_err(|e| {
-                warn!(
+                warn_sampled!(
                     plugin = "oauth2_introspection",
                     provider_idx,
                     error = %e,
@@ -748,7 +790,7 @@ impl Oauth2Introspection {
                 IntrospectionDecision::Unavailable
             })?;
         let claims: Value = serde_json::from_slice(&body).map_err(|e| {
-            warn!(
+            warn_sampled!(
                 plugin = "oauth2_introspection",
                 provider_idx,
                 error = %e,
@@ -763,7 +805,7 @@ impl Oauth2Introspection {
                 return Err(IntrospectionDecision::Inactive);
             }
             None => {
-                warn!(
+                warn_sampled!(
                     plugin = "oauth2_introspection",
                     provider_idx,
                     "token introspection response has a missing or non-boolean active member"
@@ -785,9 +827,10 @@ impl Oauth2Introspection {
                 ));
             }
             Some(_) => {
-                warn!(
+                warn_sampled!(
                     plugin = "oauth2_introspection",
-                    provider_idx, "token introspection response has a non-string token_type member"
+                    provider_idx,
+                    "token introspection response has a non-string token_type member"
                 );
                 return Err(IntrospectionDecision::Unavailable);
             }
@@ -1291,10 +1334,11 @@ impl super::Plugin for Oauth2Introspection {
             .providers
             .iter()
             .filter_map(|provider| {
-                provider.discovery_url.as_ref().map(|discovery_url| {
+                provider.discovery.as_ref().map(|discovery| {
                     (
                         Arc::clone(&provider.introspection_endpoint),
-                        discovery_url.clone(),
+                        discovery.url.clone(),
+                        discovery.redacted.clone(),
                     )
                 })
             })
@@ -1309,12 +1353,13 @@ impl super::Plugin for Oauth2Introspection {
         })?;
         let tasks = discoveries
             .into_iter()
-            .map(|(endpoint_slot, discovery_url)| {
+            .map(|(endpoint_slot, discovery_url, redacted_discovery_url)| {
                 spawn_discovery_task(
                     &runtime,
                     endpoint_slot,
                     self.http_client.clone(),
                     discovery_url,
+                    redacted_discovery_url,
                 )
             })
             .collect();
@@ -1395,7 +1440,7 @@ impl super::Plugin for Oauth2Introspection {
             hosts.extend(provider.warmup_hostnames.iter().cloned());
             let guard = provider.introspection_endpoint.load();
             if let Some(endpoint) = guard.as_ref().as_ref()
-                && let Some(host) = hostname_from_url(endpoint)
+                && let Some(host) = hostname_from_url(&endpoint.url)
                 && !hosts.iter().any(|known| known == &host)
             {
                 hosts.push(host);
@@ -1429,6 +1474,17 @@ fn apply_verify_outcome(
     }
 }
 
+/// Every key `client_auth` accepts. All six are string-typed regardless of the
+/// selected `method`.
+const CLIENT_AUTH_STRING_FIELDS: [&str; 6] = [
+    "method",
+    "client_id",
+    "client_secret",
+    "private_key_pem",
+    "private_key_jwt_alg",
+    "private_key_jwt_kid",
+];
+
 fn parse_client_auth(
     config: &Map<String, Value>,
     provider_idx: usize,
@@ -1442,16 +1498,21 @@ fn parse_client_auth(
     };
     reject_unknown_keys(
         &auth,
-        &[
-            "method",
-            "client_id",
-            "client_secret",
-            "private_key_pem",
-            "private_key_jwt_alg",
-            "private_key_jwt_kid",
-        ],
+        &CLIENT_AUTH_STRING_FIELDS,
         &format!("oauth2_introspection: provider[{provider_idx}].client_auth"),
     )?;
+    // Every accepted `client_auth` key is a string, whether or not the selected
+    // method reads it. Type-checking the whole object here — instead of only
+    // the fields the chosen branch happens to consume — keeps admission equal
+    // to the published schema, so `{"method": "none", "client_secret": 123}`
+    // cannot pass config load while every schema validator rejects it.
+    for field in CLIENT_AUTH_STRING_FIELDS {
+        if auth.get(field).is_some_and(|value| !value.is_string()) {
+            return Err(format!(
+                "oauth2_introspection: provider[{provider_idx}].client_auth.{field} must be a string"
+            ));
+        }
+    }
     let method = match auth.get("method") {
         Some(value) => value.as_str().ok_or_else(|| {
             format!(
@@ -1568,6 +1629,17 @@ fn parse_client_auth(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
+            // A PEM parse is not proof the key can sign with the selected
+            // algorithm: a P-384 key decodes as a valid EC PEM under ES256 too,
+            // and the mismatch only surfaces when the first request tries to
+            // sign — every authentication attempt then returns
+            // dependency-unavailable 503 without ever reaching the provider, on
+            // a configuration `validate` reported as good (issue #5015). Sign
+            // one throwaway assertion here: no I/O, no background task, no
+            // provider call, and the result is a field-specific configuration
+            // error instead of a permanently unusable runtime. The same probe
+            // rejects an RSA key below the signing backend's minimum modulus.
+            probe_client_assertion_signing(&client_id, &encoding_key, alg, &kid, provider_idx)?;
             Ok(ClientAuth::PrivateKeyJwt {
                 client_id,
                 encoding_key,
@@ -1587,6 +1659,27 @@ fn parse_client_auth(
             "oauth2_introspection: provider[{provider_idx}].client_auth.method is unsupported"
         )),
     }
+}
+
+/// Prove the decoded private key can actually sign with the selected algorithm.
+///
+/// `jsonwebtoken` binds the curve to the algorithm only when it signs, so a
+/// throwaway assertion is the cheapest complete check. It performs no I/O, is
+/// discarded immediately, and never leaves the process.
+fn probe_client_assertion_signing(
+    client_id: &str,
+    encoding_key: &EncodingKey,
+    alg: Algorithm,
+    kid: &Option<String>,
+    provider_idx: usize,
+) -> Result<(), String> {
+    build_client_assertion(client_id, PROBE_ASSERTION_AUDIENCE, encoding_key, alg, kid)
+        .map(|_| ())
+        .map_err(|_| {
+            format!(
+                "oauth2_introspection: provider[{provider_idx}].client_auth.private_key_pem cannot sign with private_key_jwt_alg='{alg:?}' (key type, curve, or size mismatch)"
+            )
+        })
 }
 
 fn required_auth_string(
@@ -2125,9 +2218,10 @@ fn reject_bearer(status_code: u16, body: String, error: &'static str) -> PluginR
 
 fn spawn_discovery_task(
     runtime: &tokio::runtime::Handle,
-    endpoint_slot: Arc<ArcSwap<Option<String>>>,
+    endpoint_slot: Arc<ArcSwap<Option<ResolvedEndpoint>>>,
     http_client: PluginHttpClient,
     discovery_url: String,
+    redacted_discovery_url: String,
 ) -> tokio::task::JoinHandle<()> {
     runtime.spawn(async move {
         const INITIAL_BACKOFF_SECS: u64 = 2;
@@ -2142,13 +2236,19 @@ fn spawn_discovery_task(
                 );
                 tokio::time::sleep(backoff).await;
             }
-            match discover_introspection_endpoint(&http_client, &discovery_url).await {
+            match discover_introspection_endpoint(
+                &http_client,
+                &discovery_url,
+                &redacted_discovery_url,
+            )
+            .await
+            {
                 Ok(endpoint) => {
                     info!(
                         plugin = "oauth2_introspection",
                         "OIDC discovery resolved introspection endpoint"
                     );
-                    endpoint_slot.store(Arc::new(Some(endpoint)));
+                    endpoint_slot.store(Arc::new(Some(ResolvedEndpoint::new(endpoint))));
                     return;
                 }
                 Err(error) => {
@@ -2164,15 +2264,32 @@ fn spawn_discovery_task(
     })
 }
 
+/// Resolve `introspection_endpoint` from an OIDC discovery document.
+///
+/// Every error this returns is surfaced by the retry worker's `warn!`, so none
+/// of them may carry the discovery URL: a `reqwest::Error` prints the complete
+/// request URL through `Display`, and `discovery_url` accepts a path and query
+/// an operator may have put a credential in. `execute_redacted` sanitizes the
+/// transport error to an error class plus `redacted_discovery_url`, and
+/// `BoundedReadError`'s own `Display` renders only the error class
+/// (GHSA-4ghp-v85j-5hvq).
 async fn discover_introspection_endpoint(
     http_client: &PluginHttpClient,
     discovery_url: &str,
+    redacted_discovery_url: &str,
 ) -> Result<String, String> {
-    let client = http_client
-        .get()
-        .map_err(|e| format!("discovery request failed: {e}"))?;
+    let client = http_client.get().map_err(|_| {
+        format!(
+            "discovery request failed: {} calling {redacted_discovery_url}",
+            crate::retry::ErrorClass::ConnectionPoolError
+        )
+    })?;
     let response = http_client
-        .execute(client.get(discovery_url), "oauth2_introspection_discovery")
+        .execute_redacted(
+            client.get(discovery_url),
+            "oauth2_introspection_discovery",
+            redacted_discovery_url,
+        )
         .await
         .map_err(|e| format!("discovery request failed: {e}"))?;
     if !response.status().is_success() {

@@ -535,9 +535,9 @@ impl AdminState {
         }
         match db.latest_change_sequence(namespace).await {
             Ok(sequence) if db.config_topology_epoch() == topology_epoch => {
-                Ok(PreparedLiveApply::from_covering_cursor(
-                    LiveApplyCursor::new(topology_epoch, sequence),
-                ))
+                let cursor = LiveApplyCursor::new(topology_epoch, sequence);
+                apply.record_issued_cursor(cursor);
+                Ok(PreparedLiveApply::from_covering_cursor(cursor))
             }
             Ok(_) => {
                 warn_persistence_failure_redacted("admin_write_live_apply_topology");
@@ -7792,6 +7792,31 @@ fn overlay_batch_consumers(candidate: &mut GatewayConfig, consumers: &[Consumer]
     }
 }
 
+/// Assemble the stream-listener port buckets a batch touches from the merged
+/// namespace candidate. Only those buckets are validated — legacy conflicts
+/// elsewhere in the namespace are quarantined at load time and must not block
+/// unrelated batch writes — and the bucket is re-projected with
+/// `resolve_upstream_tls` so a shared-`tcps` group compares a resolved peer
+/// against an equally resolved candidate (see
+/// `crud::validate_stream_port_candidate`).
+fn stream_listener_bucket(candidate: &GatewayConfig, ports: &HashSet<u16>) -> GatewayConfig {
+    let mut bucket = GatewayConfig {
+        proxies: candidate
+            .proxies
+            .iter()
+            .filter(|proxy| {
+                proxy.dispatch_kind.is_stream()
+                    && proxy.listen_port.is_some_and(|port| ports.contains(&port))
+            })
+            .cloned()
+            .collect(),
+        upstreams: candidate.upstreams.clone(),
+        ..Default::default()
+    };
+    bucket.resolve_upstream_tls();
+    bucket
+}
+
 fn overlay_batch_proxies(candidate: &mut GatewayConfig, proxies: &[Proxy]) {
     for proxy in proxies {
         if let Some(existing) = candidate
@@ -8003,6 +8028,19 @@ async fn handle_batch_create(
         ..Default::default()
     };
 
+    // Stream listeners are admitted as port groups against the authoritative
+    // namespace, exactly as single-resource writes do in
+    // `crud::validate_stream_port_candidate`: persistence no longer carries a
+    // unique `(namespace, listen_port)` index, so a batch landing a port a
+    // persisted proxy already owns must be refused here, on the merged
+    // candidate, not on the batch alone.
+    let batch_stream_ports: HashSet<u16> = batch
+        .proxies
+        .iter()
+        .filter(|proxy| proxy.dispatch_kind.is_stream())
+        .filter_map(|proxy| proxy.listen_port)
+        .collect();
+
     if batch_needs_consumer_snapshot(&batch) {
         match db.load_namespace_snapshot(namespace).await {
             Ok(mut candidate_config) => {
@@ -8014,6 +8052,12 @@ async fn handle_batch_create(
                 }
                 if let Err(errors) = candidate_config.validate_unique_mtls_credentials() {
                     validation_errors.extend(errors);
+                }
+                if !batch_stream_ports.is_empty() {
+                    let bucket = stream_listener_bucket(&candidate_config, &batch_stream_ports);
+                    if let Err(errors) = bucket.validate_stream_proxies() {
+                        validation_errors.extend(errors);
+                    }
                 }
                 // Match single-resource admission: legacy duplicates are
                 // already quarantined at load time and must not block
@@ -8035,12 +8079,28 @@ async fn handle_batch_create(
             }
         }
     } else if batch_needs_mtls_plugin_compat(&batch) {
-        match db.load_namespace_policy_graph(namespace).await {
+        // Stream proxies reach this branch too. Their port-bucket check needs
+        // the namespace's upstreams to re-project backend TLS, which the
+        // policy graph deliberately omits (issue #4234), so a batch carrying
+        // stream listeners takes the full snapshot exactly as single-resource
+        // stream admission does.
+        let candidate = if batch_stream_ports.is_empty() {
+            db.load_namespace_policy_graph(namespace).await
+        } else {
+            db.load_namespace_snapshot(namespace).await
+        };
+        match candidate {
             Ok(mut candidate_config) => {
                 overlay_batch_proxies(&mut candidate_config, &batch.proxies);
                 overlay_batch_plugin_configs(&mut candidate_config, &batch.plugin_configs);
                 if let Err(errors) = candidate_config.validate_mtls_auth_compatibility() {
                     validation_errors.extend(errors);
+                }
+                if !batch_stream_ports.is_empty() {
+                    let bucket = stream_listener_bucket(&candidate_config, &batch_stream_ports);
+                    if let Err(errors) = bucket.validate_stream_proxies() {
+                        validation_errors.extend(errors);
+                    }
                 }
             }
             Err(error) => {
@@ -8099,7 +8159,6 @@ async fn handle_batch_create(
         .validate_regex_listen_paths(ValidationAction::Collect)
         .validate_listen_path_encodings(ValidationAction::Collect)
         .validate_unique_listen_paths(ValidationAction::Collect)
-        .validate_stream_proxies(ValidationAction::Collect)
         .run()
     {
         Ok(errs) => validation_errors.extend(errs),
@@ -11066,7 +11125,9 @@ async fn handle_config_apply_status(
         ));
     };
     let cursor = params.cursor;
-    let cursor_state = if db.config_topology_epoch() != cursor.topology_epoch {
+    let cursor_state = if db.config_topology_epoch() != cursor.topology_epoch
+        || !apply.cursor_was_issued(cursor)
+    {
         // Replaced topology (failover/reconnect) — or a cursor this process
         // never minted. Either way liveness cannot be proven here.
         LiveApplyCursorState::Unverifiable

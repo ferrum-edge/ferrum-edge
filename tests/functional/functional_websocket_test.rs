@@ -2337,7 +2337,14 @@ async fn test_foreign_listener_on_proxy_port_is_not_gateway_readiness() {
 
     // Held for the whole test: this listener keeps accepting, so a bare TCP
     // probe would report "ready" the entire time.
-    let squatter = TcpListener::bind("127.0.0.1:0")
+    //
+    // It binds the WILDCARD, which is the address the spawned gateway itself
+    // uses (`FERRUM_PROXY_BIND_ADDRESS` defaults to `0.0.0.0`). Contesting the
+    // exact same bind is what makes the gateway's bind fail on every host: with
+    // `SO_REUSEADDR`, a `127.0.0.1` listener and a `0.0.0.0` listener can hold
+    // one port simultaneously on Darwin, which would let the gateway start and
+    // dissolve the precondition (issue #4983).
+    let squatter = TcpListener::bind("0.0.0.0:0")
         .await
         .expect("bind foreign listener");
     let contested_port = squatter.local_addr().unwrap().port();
@@ -2936,14 +2943,19 @@ async fn test_response_mock_short_circuits_websocket_handshakes_h1_h2_and_h3() {
 }
 
 /// Test HTTP/3 WebSocket (RFC 9220 Extended CONNECT) proxying through the
-/// gateway, including unmasked compliant frames, binary frames, and strict
-/// RFC 9220 rejection of masked client frames.
+/// gateway with a standards-compliant masking client: masked text frames,
+/// masked binary frames, and the RFC 6455 §5.1 refusal of an unmasked client
+/// frame.
+///
+/// RFC 9220 §3 adopts RFC 8441's Extended CONNECT mechanism and RFC 8441 §5
+/// hands the stream to RFC 6455 unchanged, so there is no HTTP/3 masking
+/// exemption — this test previously asserted the inverse (issue #5011).
 ///
 /// `Http3Client::websocket` sends `:authority` from the URL and no Host
 /// header. Issue #4416's both-absent reject must not fire on that shape.
 #[ignore]
 #[tokio::test]
-async fn test_h3_websocket_rfc9220_echo_and_masked_frame() {
+async fn test_h3_websocket_rfc6455_masked_frames_and_unmasked_refusal() {
     let backend_port = free_port().await;
     let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
     sleep(Duration::from_millis(300)).await;
@@ -2975,8 +2987,20 @@ async fn test_h3_websocket_rfc9220_echo_and_masked_frame() {
         "backend negotiated no subprotocol, so H3 200 must not invent one"
     );
 
+    // Every client frame the H3 test client sends is masked per RFC 6455 §5.1,
+    // with a fresh masking key each time, so these echoes prove the gateway
+    // unmasks H3 client frames instead of refusing them.
     ws.send_text("hello h3").await.expect("send text");
     assert_eq!(ws.recv_text().await.expect("text echo"), "Echo: hello h3");
+
+    ws.send_text("second masked h3 frame")
+        .await
+        .expect("send second text");
+    assert_eq!(
+        ws.recv_text().await.expect("second text echo"),
+        "Echo: second masked h3 frame",
+        "a rotated masking key must unmask exactly like the first frame"
+    );
 
     ws.send_binary(&[1, 2, 3, 4, 5]).await.expect("send binary");
     assert_eq!(
@@ -2984,19 +3008,30 @@ async fn test_h3_websocket_rfc9220_echo_and_masked_frame() {
         "Echo binary: 5 bytes"
     );
 
-    ws.send_masked_text("masked but rejected")
+    // The inverse of the old assertion: an UNMASKED client frame is the RFC
+    // 6455 §5.1 violation, and H3 refuses it exactly as H1/H2 do.
+    let mut unmasked_ws = client
+        .websocket(&url, WebSocketOptions::default())
         .await
-        .expect("send masked text");
-    match ws.recv_frame().await.expect("protocol close") {
+        .expect("H3 WebSocket connect for unmasked-frame refusal");
+    assert_eq!(unmasked_ws.status, StatusCode::OK);
+    unmasked_ws
+        .send_unmasked_text("unmasked and rejected")
+        .await
+        .expect("send unmasked text");
+    match unmasked_ws.recv_frame().await.expect("protocol close") {
         H3WebSocketFrame::Close(payload) => {
             assert!(
                 payload.len() >= 2,
                 "protocol close payload must include a status code"
             );
             let code = u16::from_be_bytes([payload[0], payload[1]]);
-            assert_eq!(code, 1002, "masked H3 frames must close as protocol error");
+            assert_eq!(
+                code, 1002,
+                "unmasked H3 client frames must close as protocol error"
+            );
         }
-        other => panic!("expected protocol close after masked frame, got {other:?}"),
+        other => panic!("expected protocol close after unmasked frame, got {other:?}"),
     }
 
     let preserved_id = "h3-preserved-websocket-id";

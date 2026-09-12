@@ -19,13 +19,13 @@
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use ferrum_edge::tls::lease::{
-    FencedCommit, GuardedCleanup, RenewalLeaseKeeper, TlsLeaseError, TlsLeaseStore,
+    FencedCommit, GuardedCleanup, LeaseClock, RenewalLeaseKeeper, TlsLeaseError, TlsLeaseStore,
     acme_renewal_lease_name,
 };
 
@@ -34,9 +34,56 @@ use ferrum_edge::tls::lease::{
 /// turning correct behaviour red.
 const SETTLE_BUDGET: Duration = Duration::from_secs(30);
 
+/// Each test owns one clock shared by all its replicas and blocking workers.
+/// Reading time never advances it, regardless of filesystem or runner latency.
+#[derive(Debug)]
+struct ManualClock(Mutex<DateTime<Utc>>);
+
+impl ManualClock {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(Mutex::new(
+            DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .expect("fixed test timestamp")
+                .with_timezone(&Utc),
+        )))
+    }
+
+    fn advance(&self, duration: Duration) {
+        let mut now = self.0.lock().expect("clock lock");
+        *now += chrono::TimeDelta::from_std(duration).expect("representable clock step");
+    }
+}
+
+impl LeaseClock for ManualClock {
+    fn now(&self) -> DateTime<Utc> {
+        *self.0.lock().expect("clock lock")
+    }
+}
+
+/// Keep Tokio's paused clock from auto-advancing while a preflight awaits
+/// blocking I/O. These tests must prove preflight behavior without any beat.
+struct FrozenHeartbeatTime(tokio::task::JoinHandle<()>);
+
+impl FrozenHeartbeatTime {
+    fn new() -> Self {
+        tokio::time::pause();
+        Self(tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        }))
+    }
+}
+
+impl Drop for FrozenHeartbeatTime {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// One replica's view of the shared lease table.
-fn instance(dir: &Path, holder: &str) -> Arc<TlsLeaseStore> {
-    let opened = TlsLeaseStore::open_with_holder(dir, holder.to_string());
+fn instance(dir: &Path, holder: &str, clock: &Arc<ManualClock>) -> Arc<TlsLeaseStore> {
+    let opened = TlsLeaseStore::open_with_holder_and_clock(dir, holder.to_string(), clock.clone());
     Arc::new(opened.expect("open lease store"))
 }
 
@@ -105,40 +152,6 @@ fn open_store_lock_file(dir: &Path) -> File {
         .expect("open the lease store's lock file")
 }
 
-/// Move one persisted claim just past expiry while preserving the authoritative
-/// document version, holder, acquisition timestamp, and fence.
-///
-/// The sidecar lock keeps this state-driven test mutation inside the same
-/// cross-process exclusion boundary as production lease updates. One second
-/// remains inside the 24-hour expired-record retention window, so takeover must
-/// advance from the crashed generation's fence rather than recreating it.
-fn expire_persisted_claim(dir: &Path, name: &str) {
-    let lock = hold_store_lock(dir);
-    let path = dir.join("tls-leases.json");
-    let mut document: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(&path).expect("read the authoritative lease document"),
-    )
-    .expect("parse the authoritative lease document");
-    let claim = document
-        .get_mut("leases")
-        .and_then(serde_json::Value::as_object_mut)
-        .and_then(|leases| leases.get_mut(name))
-        .and_then(serde_json::Value::as_object_mut)
-        .expect("the crashed claim remains persisted");
-    let expired_at =
-        Utc::now() - chrono::TimeDelta::try_seconds(1).expect("one second is representable");
-    claim.insert(
-        "expires_at".to_string(),
-        serde_json::Value::String(expired_at.to_rfc3339()),
-    );
-    std::fs::write(
-        path,
-        serde_json::to_vec(&document).expect("serialize the expired lease document"),
-    )
-    .expect("persist the expired lease document");
-    drop(lock);
-}
-
 /// Poll the persisted record until a heartbeat has advanced `expires_at` past
 /// `beyond`, or give up after `timeout`.
 ///
@@ -166,22 +179,12 @@ async fn wait_for_extension(
     }
 }
 
-/// Sleep until wall-clock time is past `moment`, in bounded steps, so the
-/// "operation" outlives a specific expiry rather than a guessed duration.
-async fn sleep_until_past(moment: DateTime<Utc>) {
-    loop {
-        let Ok(remaining) = (moment - Utc::now()).to_std() else {
-            return;
-        };
-        tokio::time::sleep(remaining.max(Duration::from_millis(25))).await;
-    }
-}
-
 #[test]
 fn only_one_instance_can_hold_a_renewal_claim() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let instance_a = instance(dir.path(), "replica-a");
-    let instance_b = instance(dir.path(), "replica-b");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "replica-a", &clock);
+    let instance_b = instance(dir.path(), "replica-b", &clock);
     let name = acme_renewal_lease_name("edge-cert");
     let ttl = Duration::from_secs(60);
 
@@ -200,8 +203,9 @@ fn only_one_instance_can_hold_a_renewal_claim() {
 #[test]
 fn an_expired_claim_fails_over_to_another_instance() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let instance_a = instance(dir.path(), "replica-a");
-    let instance_b = instance(dir.path(), "replica-b");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "replica-a", &clock);
+    let instance_b = instance(dir.path(), "replica-b", &clock);
     let name = acme_renewal_lease_name("edge-cert");
     let ttl = Duration::from_secs(60);
 
@@ -215,7 +219,7 @@ fn an_expired_claim_fails_over_to_another_instance() {
     let denied = instance_b.try_acquire(&name, ttl).expect("B attempts");
     assert!(denied.is_none(), "the claim is still live");
 
-    expire_persisted_claim(dir.path(), &name);
+    clock.advance(ttl + Duration::from_secs(1));
 
     let taken = instance_b.try_acquire(&name, ttl).expect("B retries");
     let lease = taken.expect("an expired claim must fail over");
@@ -229,8 +233,9 @@ fn an_expired_claim_fails_over_to_another_instance() {
 #[test]
 fn releasing_a_claim_lets_another_instance_take_it() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let instance_a = instance(dir.path(), "replica-a");
-    let instance_b = instance(dir.path(), "replica-b");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "replica-a", &clock);
+    let instance_b = instance(dir.path(), "replica-b", &clock);
     let name = acme_renewal_lease_name("edge-cert");
     let ttl = Duration::from_secs(60);
 
@@ -246,8 +251,9 @@ fn releasing_a_claim_lets_another_instance_take_it() {
 #[test]
 fn dropping_a_claim_releases_it_for_another_instance() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let instance_a = instance(dir.path(), "replica-a");
-    let instance_b = instance(dir.path(), "replica-b");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "replica-a", &clock);
+    let instance_b = instance(dir.path(), "replica-b", &clock);
     let name = acme_renewal_lease_name("edge-cert");
     let ttl = Duration::from_secs(60);
 
@@ -263,14 +269,15 @@ fn dropping_a_claim_releases_it_for_another_instance() {
 #[test]
 fn a_superseded_holder_cannot_renew_its_claim() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let instance_a = instance(dir.path(), "replica-a");
-    let instance_b = instance(dir.path(), "replica-b");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "replica-a", &clock);
+    let instance_b = instance(dir.path(), "replica-b", &clock);
     let name = acme_renewal_lease_name("edge-cert");
     let short = Duration::from_millis(150);
 
     let held = instance_a.try_acquire(&name, short).expect("A claims");
     let stale = held.expect("A must win the first claim");
-    std::thread::sleep(Duration::from_millis(400));
+    clock.advance(Duration::from_millis(400));
 
     let taken = instance_b.try_acquire(&name, short).expect("B claims");
     let fresh = taken.expect("B takes over the expired claim");
@@ -286,8 +293,9 @@ fn a_superseded_holder_cannot_renew_its_claim() {
 #[test]
 fn a_live_holder_can_extend_its_own_claim() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let instance_a = instance(dir.path(), "replica-a");
-    let instance_b = instance(dir.path(), "replica-b");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "replica-a", &clock);
+    let instance_b = instance(dir.path(), "replica-b", &clock);
     let name = acme_renewal_lease_name("edge-cert");
     let ttl = Duration::from_millis(400);
 
@@ -295,6 +303,7 @@ fn a_live_holder_can_extend_its_own_claim() {
     let lease = held.expect("A must win the first claim");
     let before = instance_a.peek(&name).expect("read").expect("present");
 
+    clock.advance(Duration::from_millis(399));
     assert!(lease.renew(Duration::from_secs(60)).expect("renew"));
 
     let after = instance_a.peek(&name).expect("read").expect("present");
@@ -306,10 +315,63 @@ fn a_live_holder_can_extend_its_own_claim() {
 }
 
 #[test]
+fn the_expiry_boundary_refuses_renewal_and_commit_before_takeover() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "replica-a", &clock);
+    let instance_b = instance(dir.path(), "replica-b", &clock);
+    let name = acme_renewal_lease_name("edge-cert");
+    let ttl = Duration::from_millis(400);
+    let lease = instance_a
+        .try_acquire(&name, ttl)
+        .expect("A claims")
+        .expect("A wins");
+    let before = instance_a.peek(&name).expect("read").expect("present");
+    assert_eq!(before.acquired_at, clock.now());
+
+    clock.advance(Duration::from_millis(399));
+    assert!(instance_a.is_owner(&name, lease.fence()).expect("live"));
+    assert!(
+        instance_b
+            .try_acquire(&name, ttl)
+            .expect("B denied")
+            .is_none()
+    );
+
+    clock.advance(Duration::from_millis(1));
+    assert_eq!(clock.now(), before.expires_at);
+    assert!(!instance_a.is_owner(&name, lease.fence()).expect("expired"));
+    assert!(!lease.renew(ttl).expect("expired renewal is answered"));
+    let mut published = false;
+    let outcome = instance_a
+        .commit_fenced(&name, lease.fence(), || published = true)
+        .expect("expired commit is answered");
+    assert_eq!(outcome, FencedCommit::NotOwner);
+    assert!(
+        !published,
+        "an expired claim must not publish before takeover"
+    );
+    assert_eq!(
+        instance_a.peek(&name).expect("read").expect("present"),
+        before
+    );
+
+    let successor = instance_b
+        .try_acquire(&name, ttl)
+        .expect("B claims")
+        .expect("the exact expiry boundary permits takeover");
+    assert!(successor.fence() > lease.fence());
+    successor.release().expect("B releases");
+    let released = instance_b.peek(&name).expect("read").expect("present");
+    assert_eq!(released.expires_at, clock.now());
+}
+
+#[test]
 fn distinct_certificates_get_independent_claims() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let instance_a = instance(dir.path(), "replica-a");
-    let instance_b = instance(dir.path(), "replica-b");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "replica-a", &clock);
+    let instance_b = instance(dir.path(), "replica-b", &clock);
     let first = acme_renewal_lease_name("cert-one");
     let second = acme_renewal_lease_name("cert-two");
     let ttl = Duration::from_secs(60);
@@ -332,14 +394,15 @@ fn distinct_certificates_get_independent_claims() {
 #[test]
 fn a_second_instance_with_the_same_identity_cannot_take_a_live_claim() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let instance_a = instance(dir.path(), "replica-a");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "replica-a", &clock);
     let name = acme_renewal_lease_name("edge-cert");
     let ttl = Duration::from_secs(60);
 
     let held = instance_a.try_acquire(&name, ttl).expect("A claims");
     let original = held.expect("A must win the first claim");
 
-    let twin = instance(dir.path(), "replica-a");
+    let twin = instance(dir.path(), "replica-a", &clock);
     let denied = twin.try_acquire(&name, ttl).expect("the twin attempts");
     assert!(
         denied.is_none(),
@@ -362,17 +425,14 @@ fn a_second_instance_with_the_same_identity_cannot_take_a_live_claim() {
 /// through immediate reclamation — and the takeover advances the fence, so the
 /// dead generation can no longer renew or release.
 ///
-/// Both halves are scheduling-independent. The live denial uses a long TTL so a
-/// loaded runner cannot expire the claim between acquire and the restart
-/// attempt (the previous 150 ms TTL + "immediate" denial raced wall-clock
-/// descheduling). Expiry is then stamped into the persisted record — still
-/// inside the retention window so the crashed fence is not pruned — rather than
-/// slept out, matching the file-seeded takeover fixtures elsewhere in this
-/// module.
+/// Both halves are scheduling-independent. The shared clock stays fixed for
+/// the live denial, then advances past expiry inside the retention window so
+/// the crashed fence is not pruned. The persisted record is left untouched.
 #[test]
 fn a_same_identity_restart_reclaims_only_after_expiry() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let instance_a = instance(dir.path(), "replica-a");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "replica-a", &clock);
     let name = acme_renewal_lease_name("edge-cert");
     let ttl = Duration::from_secs(60);
 
@@ -382,11 +442,11 @@ fn a_same_identity_restart_reclaims_only_after_expiry() {
     // A crashed holder never releases; leaking the guard reproduces that.
     std::mem::forget(crashed);
 
-    let restarted = instance(dir.path(), "replica-a");
+    let restarted = instance(dir.path(), "replica-a", &clock);
     let denied = restarted.try_acquire(&name, ttl).expect("restart attempts");
     assert!(denied.is_none(), "the claim is still live");
 
-    expire_persisted_claim(dir.path(), &name);
+    clock.advance(ttl + Duration::from_secs(1));
 
     let taken = restarted.try_acquire(&name, ttl).expect("restart retries");
     let lease = taken.expect("an expired claim must be reclaimable");
@@ -447,8 +507,9 @@ fn an_invalid_instance_id_error_does_not_echo_the_value() {
 #[test]
 fn identities_that_a_sanitizer_would_collide_stay_distinct() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let first = instance(dir.path(), "pod-a-1");
-    let second = instance(dir.path(), "pod-a-2");
+    let clock = ManualClock::new();
+    let first = instance(dir.path(), "pod-a-1", &clock);
+    let second = instance(dir.path(), "pod-a-2", &clock);
     let name = acme_renewal_lease_name("edge-cert");
     let ttl = Duration::from_secs(60);
 
@@ -472,18 +533,17 @@ fn identities_that_a_sanitizer_would_collide_stay_distinct() {
 ///
 /// The proof is state driven, not timing driven. A persisted extension is
 /// observed first (so a missing heartbeat fails on the diagnostic timeout, not
-/// on a sleep that was merely long enough), then the operation is run until
-/// wall-clock time is genuinely past the original expiry, then exclusion is
-/// re-asserted. The TTL is deliberately generous — production clamps it to at
-/// least 60 seconds — so a scheduler pause on a shared runner cannot expire a
-/// claim the heartbeat is servicing correctly.
+/// on a sleep that was merely long enough), then the lease clock is advanced
+/// past the original expiry while still inside that extension. Runner pauses
+/// cannot consume the lifetime the heartbeat is servicing.
 #[tokio::test]
 async fn a_long_operation_retains_exactly_one_owner_via_the_heartbeat() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let instance_a = instance(dir.path(), "replica-a");
-    let instance_b = instance(dir.path(), "replica-b");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "replica-a", &clock);
+    let instance_b = instance(dir.path(), "replica-b", &clock);
     let name = acme_renewal_lease_name("edge-cert");
-    // Beats every 2s; tolerates a ~4s pause between beats.
+    // Beats every 2s; lease time advances only at the explicit steps below.
     let ttl = Duration::from_secs(6);
 
     let held = instance_a.try_acquire(&name, ttl).expect("A claims");
@@ -493,6 +553,8 @@ async fn a_long_operation_retains_exactly_one_owner_via_the_heartbeat() {
         .expect("read")
         .expect("present")
         .expires_at;
+
+    clock.advance(Duration::from_secs(3));
 
     // Proof one: a beat actually reached the shared table. Without a heartbeat
     // this never happens and the test fails here.
@@ -508,11 +570,11 @@ async fn a_long_operation_retains_exactly_one_owner_via_the_heartbeat() {
     // publication, propagation, polling, and finalization — work that runs
     // until the original expiry is genuinely in the past.
     keeper
-        .guarded(sleep_until_past(original_expiry))
+        .guarded(async { clock.advance(Duration::from_secs(4)) })
         .await
         .expect("the claim survives work that outlives its original TTL");
     assert!(
-        Utc::now() > original_expiry,
+        clock.now() > original_expiry,
         "the operation must have crossed the original expiry"
     );
     keeper.ensure_owned().await.expect("still the owner");
@@ -552,7 +614,8 @@ fn takeover_document(name: &str) -> String {
 #[tokio::test]
 async fn losing_the_claim_cancels_in_flight_work() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let instance_a = instance(dir.path(), "replica-a");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "replica-a", &clock);
     let name = acme_renewal_lease_name("edge-cert");
     let ttl = Duration::from_millis(600);
 
@@ -565,8 +628,10 @@ async fn losing_the_claim_cancels_in_flight_work() {
         .expect("simulate a takeover by another instance");
 
     // Stands in for the rest of the ACME cycle: polling, finalization, download.
-    let remaining_work = tokio::time::sleep(Duration::from_secs(30));
-    let outcome = keeper.guarded(remaining_work).await;
+    let remaining_work = std::future::pending::<()>();
+    let outcome = tokio::time::timeout(SETTLE_BUDGET, keeper.guarded(remaining_work))
+        .await
+        .expect("the heartbeat must observe the takeover");
     assert!(
         outcome.is_err(),
         "guarded work must be cancelled once the claim is lost"
@@ -590,7 +655,8 @@ async fn losing_the_claim_cancels_in_flight_work() {
 #[tokio::test]
 async fn a_heartbeat_store_error_fails_closed() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let instance_a = instance(dir.path(), "replica-a");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "replica-a", &clock);
     let name = acme_renewal_lease_name("edge-cert");
     let ttl = Duration::from_millis(600);
 
@@ -602,8 +668,10 @@ async fn a_heartbeat_store_error_fails_closed() {
     // an empty document.
     std::fs::write(dir.path().join("tls-leases.json"), b"{ not json").expect("corrupt the table");
 
-    let long = tokio::time::sleep(Duration::from_secs(30));
-    let outcome = keeper.guarded(long).await;
+    let long = std::future::pending::<()>();
+    let outcome = tokio::time::timeout(SETTLE_BUDGET, keeper.guarded(long))
+        .await
+        .expect("the heartbeat must observe the store error");
     assert!(
         outcome.is_err(),
         "an unreadable lease table must cancel the renewal"
@@ -622,8 +690,9 @@ async fn a_heartbeat_store_error_fails_closed() {
 #[tokio::test]
 async fn an_abandoned_keeper_stops_heartbeating() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let instance_a = instance(dir.path(), "replica-a");
-    let instance_b = instance(dir.path(), "replica-b");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "replica-a", &clock);
+    let instance_b = instance(dir.path(), "replica-b", &clock);
     let name = acme_renewal_lease_name("edge-cert");
     let ttl = Duration::from_millis(600);
 
@@ -674,7 +743,8 @@ async fn an_abandoned_keeper_stops_heartbeating() {
 #[tokio::test]
 async fn a_target_store_mutation_cannot_run_after_ownership_is_lost() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let instance_a = instance(dir.path(), "replica-a");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "replica-a", &clock);
     let name = acme_renewal_lease_name("edge-cert");
     let ttl = Duration::from_secs(60);
 
@@ -711,7 +781,8 @@ async fn a_target_store_mutation_cannot_run_after_ownership_is_lost() {
 #[tokio::test]
 async fn a_missing_claim_refuses_the_commit() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let instance_a = instance(dir.path(), "replica-a");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "replica-a", &clock);
     let name = acme_renewal_lease_name("edge-cert");
     let ttl = Duration::from_secs(60);
 
@@ -745,8 +816,8 @@ async fn a_missing_claim_refuses_the_commit() {
 /// Every step is an explicit event or an observed state, never an interval.
 /// The commit closure announces that it is running *inside* the lease lock and
 /// then blocks until this test releases it, so the window is opened and closed
-/// deliberately. Expiry is read back from the persisted record against
-/// wall-clock time. The exclusion is then read directly off the primitive that
+/// deliberately. Only then does the shared manual clock cross the persisted
+/// expiry. The exclusion is then read directly off the primitive that
 /// enforces it — a second open file description on the store's own sidecar lock
 /// is refused *immediately* — rather than inferred from a takeover failing to
 /// happen inside some chosen window. A takeover has nothing else to block on:
@@ -754,10 +825,11 @@ async fn a_missing_claim_refuses_the_commit() {
 #[test]
 fn a_takeover_cannot_cross_a_fenced_commit() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let instance_a = instance(dir.path(), "replica-a");
-    let instance_b = instance(dir.path(), "replica-b");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "replica-a", &clock);
+    let instance_b = instance(dir.path(), "replica-b", &clock);
     let name = acme_renewal_lease_name("edge-cert");
-    // Short enough that the nominal TTL elapses while the commit below is held.
+    // The test advances this TTL only after the commit announces entry.
     let ttl = Duration::from_millis(300);
 
     let held = instance_a.try_acquire(&name, ttl).expect("A claims");
@@ -779,9 +851,7 @@ fn a_takeover_cannot_cross_a_fenced_commit() {
             // starts and ends where the test says, so "in flight" is a fact
             // rather than an assumption about scheduling.
             entered_tx.send(()).expect("the test observes commit entry");
-            release_rx
-                .recv_timeout(SETTLE_BUDGET)
-                .expect("the test releases the commit");
+            release_rx.recv().expect("the test releases the commit");
             commit_flag.store(true, Ordering::SeqCst);
             "published"
         })
@@ -793,14 +863,13 @@ fn a_takeover_cannot_cross_a_fenced_commit() {
         .recv_timeout(SETTLE_BUDGET)
         .expect("the fenced commit must start under the live claim");
 
-    // The claim's nominal TTL elapses while that lock is held. Read back from
-    // the persisted record and compared against wall-clock time, so this is an
-    // observed state rather than a slept-through duration. `peek` never takes
-    // the writer lock, so it answers while the commit holds it.
+    // Advance past expiry only after entry, while the commit holds the lock.
+    // `peek` never takes the writer lock, so it answers inside that fence.
     let claim = instance_a.peek(&name).expect("read").expect("present");
     let expiry = claim.expires_at;
+    clock.advance(ttl + Duration::from_millis(1));
     assert!(
-        wait_until(SETTLE_BUDGET, || Utc::now() > expiry),
+        clock.now() > expiry,
         "the claim's nominal TTL must elapse while the commit is in flight"
     );
 
@@ -872,8 +941,9 @@ fn a_takeover_cannot_cross_a_fenced_commit() {
 #[test]
 fn two_target_mutations_share_one_lease_fence_without_a_takeover_window() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let instance_a = instance(dir.path(), "replica-a");
-    let instance_b = instance(dir.path(), "replica-b");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "replica-a", &clock);
+    let instance_b = instance(dir.path(), "replica-b", &clock);
     let name = acme_renewal_lease_name("edge-cert");
     let ttl = Duration::from_millis(300);
 
@@ -898,7 +968,7 @@ fn two_target_mutations_share_one_lease_fence_without_a_takeover_window() {
                 .send(())
                 .expect("the test observes the first mutation");
             release_rx
-                .recv_timeout(SETTLE_BUDGET)
+                .recv()
                 .expect("the test releases the mid-publication hold");
             // Stands in for certificate-store publication.
             second_flag.store(true, Ordering::SeqCst);
@@ -932,8 +1002,9 @@ fn two_target_mutations_share_one_lease_fence_without_a_takeover_window() {
     std::mem::drop(probe);
 
     let claim = instance_a.peek(&name).expect("read").expect("present");
+    clock.advance(ttl + Duration::from_millis(1));
     assert!(
-        wait_until(SETTLE_BUDGET, || Utc::now() > claim.expires_at),
+        clock.now() > claim.expires_at,
         "the nominal TTL must elapse while the fence still covers both writes"
     );
     assert!(
@@ -968,8 +1039,9 @@ fn two_target_mutations_share_one_lease_fence_without_a_takeover_window() {
 #[test]
 fn a_target_store_error_propagates_without_disturbing_the_claim() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let instance_a = instance(dir.path(), "replica-a");
-    let instance_b = instance(dir.path(), "replica-b");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "replica-a", &clock);
+    let instance_b = instance(dir.path(), "replica-b", &clock);
     let name = acme_renewal_lease_name("edge-cert");
     let ttl = Duration::from_secs(60);
 
@@ -1014,9 +1086,9 @@ fn a_target_store_error_propagates_without_disturbing_the_claim() {
 /// The preflight has to be *authoritative and up front*, not merely a
 /// cancellation scope over the published loss signal: the takeover lands in the
 /// lease table before any heartbeat has had a reason to observe it, and a
-/// retraction hook is perfectly capable of completing inside that gap. The TTL
-/// here is deliberately long enough that **no beat can run during the test**,
-/// and the cleanup future retracts on its very first poll — so `Lost` can only
+/// retraction hook is perfectly capable of completing inside that gap. Tokio
+/// time is frozen so **no beat can run during the test**, and the cleanup
+/// future retracts on its very first poll — so `Lost` can only
 /// come from a preflight made before the future was polled at all.
 ///
 /// The preflight is a *refresh*, so this also pins that it cannot extend
@@ -1024,10 +1096,12 @@ fn a_target_store_error_propagates_without_disturbing_the_claim() {
 /// exactly as it went in.
 #[tokio::test]
 async fn losing_the_claim_cancels_dns_cleanup() {
+    let _frozen_time = FrozenHeartbeatTime::new();
     let dir = tempfile::tempdir().expect("tempdir");
-    let instance_a = instance(dir.path(), "replica-a");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "replica-a", &clock);
     let name = acme_renewal_lease_name("edge-cert");
-    // Beats every 20s: the heartbeat cannot be what notices the takeover.
+    // Frozen Tokio time prevents a heartbeat from noticing the takeover.
     let ttl = Duration::from_secs(60);
 
     let held = instance_a.try_acquire(&name, ttl).expect("A claims");
@@ -1090,6 +1164,11 @@ async fn losing_the_claim_cancels_dns_cleanup() {
         !published.load(Ordering::SeqCst),
         "no unguarded side effect may follow a cancelled cleanup"
     );
+    assert_eq!(
+        keeper.heartbeat_progress().started(),
+        0,
+        "the preflight evidence must not come from a heartbeat",
+    );
 }
 
 /// An ordinary cleanup-hook failure is *not* loss: it is reported so the caller
@@ -1097,7 +1176,8 @@ async fn losing_the_claim_cancels_dns_cleanup() {
 #[tokio::test]
 async fn an_ordinary_cleanup_failure_keeps_the_claim() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let instance_a = instance(dir.path(), "replica-a");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "replica-a", &clock);
     let name = acme_renewal_lease_name("edge-cert");
     let ttl = Duration::from_secs(60);
 
@@ -1134,26 +1214,26 @@ async fn an_ordinary_cleanup_failure_keeps_the_claim() {
 /// The evidence is taken from inside the future: the hook reads the persisted
 /// record on its very first poll, so an `expires_at` already past the one the
 /// acquisition wrote can only have been advanced *before* the hook ran. The TTL
-/// is long enough that no heartbeat can beat during the test, so the preflight
-/// is the only thing that could have advanced it.
+/// does not elapse with runner time, and Tokio time is frozen so no heartbeat
+/// can beat during the test. Only the preflight could have advanced it.
 #[tokio::test]
 async fn the_cleanup_preflight_refreshes_the_claim_before_the_hook_runs() {
+    let _frozen_time = FrozenHeartbeatTime::new();
     let dir = tempfile::tempdir().expect("tempdir");
-    let instance_a = instance(dir.path(), "replica-a");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "replica-a", &clock);
     let name = acme_renewal_lease_name("edge-cert");
-    // Beats every 20s: the heartbeat cannot be what advances the claim.
+    // Frozen Tokio time prevents a heartbeat from advancing the claim.
     let ttl = Duration::from_secs(60);
 
     let held = instance_a.try_acquire(&name, ttl).expect("A claims");
     let keeper = RenewalLeaseKeeper::start(held.expect("A wins"), ttl);
     let before = instance_a.peek(&name).expect("read").expect("present");
 
-    // `expires_at` is `now + ttl`, so a refresh advances it exactly when the
-    // refresh happens strictly later than the acquisition. Observed, not
-    // assumed: the assertion below would otherwise rest on the clock having
-    // ticked between two adjacent writes.
+    // Move strictly past acquisition without letting the runner expire it.
+    clock.advance(Duration::from_secs(1));
     assert!(
-        wait_until(SETTLE_BUDGET, || Utc::now() > before.acquired_at),
+        clock.now() > before.acquired_at,
         "the clock must advance past the acquisition"
     );
 
@@ -1188,6 +1268,11 @@ async fn the_cleanup_preflight_refreshes_the_claim_before_the_hook_runs() {
         "a refresh extends the claim; it must not bump the fence"
     );
     assert!(!keeper.is_lost(), "the claim is still held");
+    assert_eq!(
+        keeper.heartbeat_progress().started(),
+        0,
+        "the preflight evidence must not come from a heartbeat",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1216,8 +1301,9 @@ async fn the_cleanup_preflight_refreshes_the_claim_before_the_hook_runs() {
 #[tokio::test]
 async fn finish_settles_an_in_flight_heartbeat_before_release() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let instance_a = instance(dir.path(), "replica-a");
-    let instance_b = instance(dir.path(), "replica-b");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "replica-a", &clock);
+    let instance_b = instance(dir.path(), "replica-b", &clock);
     let name = acme_renewal_lease_name("edge-cert");
     // Beats every 200ms, so an extension is offered promptly once the store
     // lock is held against it.
@@ -1281,7 +1367,7 @@ async fn finish_settles_an_in_flight_heartbeat_before_release() {
 
     let released = instance_a.peek(&name).expect("read").expect("present");
     assert!(
-        released.expires_at <= Utc::now(),
+        released.expires_at <= clock.now(),
         "finish() must leave the claim released"
     );
 
@@ -1307,7 +1393,8 @@ async fn finish_settles_an_in_flight_heartbeat_before_release() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn dropping_a_keeper_never_releases_the_claim_on_a_runtime_worker() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let instance_a = instance(dir.path(), "instance-a");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "instance-a", &clock);
     let name = acme_renewal_lease_name("cert-abandoned-mid-renewal");
     let ttl = Duration::from_secs(30);
     let guard = instance_a
@@ -1324,23 +1411,22 @@ async fn dropping_a_keeper_never_releases_the_claim_on_a_runtime_worker() {
 
     // The sole worker is still able to make progress. An inline release would
     // be parked on the lock the blocker holds, and this could not complete.
-    tokio::time::timeout(Duration::from_secs(5), tokio::task::yield_now())
+    tokio::time::timeout(SETTLE_BUDGET, tokio::task::yield_now())
         .await
         .expect("a keeper drop must not park the runtime worker");
 
     // Hand the lock back; the deferred release can now land.
     std::mem::drop(blocker);
 
-    // Fail-safe either way: the claim is released promptly if the deferred work
-    // ran, and lapses at `expires_at` if it could not be scheduled. What must
-    // not happen is the runtime stalling, which the assertion above covers.
-    let instance_b = instance(dir.path(), "instance-b");
+    // Lease time stays fixed, so only a completed deferred release can make
+    // this claim reclaimable. Natural expiry cannot hide a missing release.
+    let instance_b = instance(dir.path(), "instance-b", &clock);
     let taken_over = wait_until_async(SETTLE_BUDGET, || {
         instance_a
             .peek(&name)
             .ok()
             .flatten()
-            .is_some_and(|record| record.expires_at <= Utc::now())
+            .is_some_and(|record| record.expires_at <= clock.now())
     })
     .await;
     assert!(
@@ -1366,7 +1452,8 @@ async fn dropping_a_keeper_never_releases_the_claim_on_a_runtime_worker() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn finish_still_settles_the_release_before_it_returns() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let instance_a = instance(dir.path(), "instance-a");
+    let clock = ManualClock::new();
+    let instance_a = instance(dir.path(), "instance-a", &clock);
     let name = acme_renewal_lease_name("cert-finished-cleanly");
     let ttl = Duration::from_secs(30);
     let guard = instance_a
@@ -1381,7 +1468,7 @@ async fn finish_still_settles_the_release_before_it_returns() {
     // claim is already released on return.
     let record = instance_a.peek(&name).expect("read").expect("present");
     assert!(
-        record.expires_at <= Utc::now(),
+        record.expires_at <= clock.now(),
         "finish() must not return before the release has landed"
     );
 }

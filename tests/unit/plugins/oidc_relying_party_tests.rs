@@ -1,11 +1,12 @@
+use chrono::Utc;
 use ferrum_edge::_test_support::{
     oidc_open_session_cookie_for_test, oidc_resolve_discovery_for_test,
     oidc_resolved_discovery_endpoints_for_test, oidc_sealed_due_refresh_session_cookie_for_test,
     oidc_sealed_refresh_session_cookie_for_test, oidc_sealed_session_cookie_for_test,
-    oidc_session_state_from_set_cookie_for_test,
+    oidc_session_state_from_set_cookie_for_test, request_credential_deadline_remaining,
 };
 use ferrum_edge::ConsumerIndex;
-use ferrum_edge::config::types::AuthMode;
+use ferrum_edge::config::types::{AuthMode, GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::plugins::validate_plugin_config;
 use ferrum_edge::plugins::{
     Plugin, PluginHttpClient, PluginResult, RequestContext, key_auth::KeyAuth,
@@ -18,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use url::Url;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{basic_auth, body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use super::jwks_auth_support::{
@@ -57,6 +58,51 @@ fn base_config() -> serde_json::Value {
     })
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn discovery_transport_errors_use_the_redacted_endpoint() {
+    let (logs, _guard) = super::plugin_utils::capture_logs();
+    // An unsupported scheme fails before network I/O.
+    let endpoint = concat!(
+        "unsupported://test-user:test-password@example.test/",
+        "private-path?key=test-query#test-fragment"
+    );
+    let error = oidc_resolve_discovery_for_test(&PluginHttpClient::default(), endpoint, None, None)
+        .await
+        .expect_err("unsupported transport must fail");
+    assert!(error.contains("discovery request failed"), "{error}");
+    assert!(error.contains("example.test/redacted"), "{error}");
+    let diagnostics = format!("{error}\n{}", logs.contents());
+    for component in [
+        "test-user",
+        "test-password",
+        "private-path",
+        "test-query",
+        "test-fragment",
+    ] {
+        assert!(!diagnostics.contains(component), "{diagnostics}");
+    }
+}
+
+#[test]
+fn every_oidc_provider_call_uses_the_shared_redacted_error_boundary() {
+    let source = include_str!("../../../src/plugins/oidc_relying_party.rs");
+    assert!(!source.contains(".execute("));
+    for label in ["oidc_rp_token", "oidc_rp_userinfo", "oidc_rp_discovery"] {
+        let call = source
+            .split(".execute_redacted(")
+            .skip(1)
+            .find(|call| call.split(".await").next().unwrap().contains(label))
+            .unwrap_or_else(|| panic!("{label} must redact returned errors"));
+        assert!(
+            call.split(".await")
+                .next()
+                .unwrap()
+                .contains("redacted_endpoint_url_str("),
+            "{label} must redact its endpoint label"
+        );
+    }
+}
+
 fn html_ctx() -> RequestContext {
     let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
     ctx.request_is_secure = true;
@@ -67,6 +113,45 @@ fn html_ctx() -> RequestContext {
     ctx.metadata
         .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
     ctx
+}
+
+fn callback_config() -> serde_json::Value {
+    let mut config = base_config();
+    // Callback tests exercise cookie binding, not expiry. Allow the maximum
+    // state lifetime so coverage instrumentation does not consume the budget.
+    config["behavior"]["state_ttl_secs"] = json!(3600);
+    config
+}
+
+async fn prepare_callback_jwks(server: &MockServer) {
+    // Callers hold jwks_remote_global_cache: another test must not clear the
+    // store or abort its refresh while this fixture is using it.
+    let uri = format!("{}/jwks", server.uri());
+    let store = ferrum_edge::plugins::utils::jwks_cache::cached_store(&uri)
+        .expect("callback plugin registered its JWKS store");
+    // Await real readiness, not a sleep or a callback retry (state is one-use).
+    // The default client allows 30s to connect and 60s per JWKS request. The
+    // token exchange has its own production 10s timeout; its mock has no delay.
+    // Fetch the mounted document even if wiremock reused a previous server's
+    // address and the global cache retained that fixture's keys.
+    tokio::time::timeout(Duration::from_secs(120), store.fetch_keys())
+        .await
+        .expect("callback JWKS fixture must become ready")
+        .expect("callback JWKS fixture must publish valid keys");
+    assert!(store.has_keys(), "callback JWKS fixture has no keys");
+}
+
+fn assert_callback_redirect(result: PluginResult) -> HashMap<String, String> {
+    let PluginResult::Reject {
+        status_code,
+        body,
+        headers,
+    } = result
+    else {
+        panic!("expected callback redirect, got {result:?}");
+    };
+    assert_eq!(status_code, 302, "body: {body}; headers: {headers:?}");
+    headers
 }
 
 #[derive(Clone)]
@@ -86,15 +171,15 @@ async fn issue_browser_challenge_for_context(
 ) -> BrowserChallenge {
     let PluginResult::Reject {
         status_code,
+        body,
         headers,
-        ..
     } = plugin
         .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
         .await
     else {
         panic!("expected browser challenge");
     };
-    assert_eq!(status_code, 302);
+    assert_eq!(status_code, 302, "body: {body}; headers: {headers:?}");
     let location = Url::parse(headers.get("location").expect("authorization URL"))
         .expect("authorization URL parses");
     let state = location
@@ -164,10 +249,14 @@ fn cookie_name(cookie: &str) -> &str {
 }
 
 fn assert_host_only_correlation_cookie(cookie: &str, expected_max_age: &str) {
+    assert!(
+        cookie_name(cookie).starts_with("__Host-ferrum_oidc_state_"),
+        "{cookie}"
+    );
     assert_eq!(cookie_attribute(cookie, "domain"), None, "{cookie}");
     assert_eq!(
         cookie_attribute(cookie, "path"),
-        Some(Some("/oauth/callback")),
+        Some(Some("/")),
         "{cookie}"
     );
     assert_eq!(
@@ -668,6 +757,37 @@ async fn concurrent_requests_share_one_transient_refresh_failure_and_backoff() {
         );
     }
     assert_eq!(server.received_requests().await.expect("requests").len(), 1);
+}
+
+#[tokio::test]
+async fn oidc_session_keeps_its_cap_for_a_far_future_id_token_expiry() {
+    // Issue #5420 turned the shared Unix-to-monotonic conversion into an
+    // `Option`, so this call site now forwards it unwrapped. Unlike the JWT and
+    // introspection sites, it clamps the claim expiry to the session
+    // `ttl_secs` / `idle_ttl_secs` window BEFORE converting, so its input stays
+    // representable and the published bound must be unchanged: a missing
+    // deadline here would mean the session lost its cap entirely.
+    let plugin = OidcRelyingParty::new(&base_config(), PluginHttpClient::default()).unwrap();
+    let set_cookie = oidc_sealed_session_cookie_for_test(
+        &plugin,
+        json!({"sub": "oidc-subject", "exp": i64::MAX}),
+        false,
+    )
+    .expect("session seals");
+    let mut ctx = session_ctx(&set_cookie);
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_continue(result);
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("oidc-subject"));
+
+    let remaining = request_credential_deadline_remaining(&ctx)
+        .expect("the default 1800s idle window still bounds the credential");
+    assert!(
+        remaining > Duration::from_secs(1_700) && remaining <= Duration::from_secs(1_800),
+        "the deadline must stay the idle-TTL cap, not the far-future claim: {remaining:?}"
+    );
 }
 
 #[tokio::test]
@@ -1190,7 +1310,7 @@ async fn oidc_multi_auth_preserves_selected_rejection_cookie() {
     first_config["providers"][0]["token_endpoint"] = json!(format!("{}/token", server.uri()));
     first_config["providers"][0]["required_scopes"] = json!(["admin"]);
     first_config["providers"][0]["consumer_identity_claim"] = json!("email");
-    // The selected correlation cookie starts with `ferrum_`; the shorter
+    // The selected correlation cookie starts with `__Secure-ferrum_`; the shorter
     // requester cookie name proves conflict checks use the complete name.
     first_config["session"]["cookie_name"] = json!("ferrum");
     let first =
@@ -1242,7 +1362,7 @@ async fn oidc_multi_auth_preserves_selected_rejection_cookie() {
         .expect("both response-owned cookies must reach the client");
     let cookies: Vec<&str> = set_cookie.split('\n').collect();
     assert_eq!(cookies.len(), 2);
-    assert!(cookies[0].contains("Path=/oauth/callback"));
+    assert!(cookies[0].contains("Path=/"));
     assert!(cookies[1].starts_with("ferrum="));
     assert_eq!(
         cookies
@@ -1350,8 +1470,8 @@ async fn oidc_multi_auth_keeps_later_clear_for_shared_session_cookie() {
         .expect("the selected challenge cookies must reach the client");
     let cookies: Vec<&str> = set_cookie.split('\n').collect();
     assert_eq!(cookies.len(), 2);
-    assert!(cookies[0].starts_with("ferrum_oidc_state_"));
-    assert!(cookies[0].contains("Path=/oauth/callback"));
+    assert!(cookies[0].starts_with("__Host-ferrum_oidc_state_"));
+    assert!(cookies[0].contains("Path=/"));
     assert_eq!(
         cookies[1],
         "ferrum=; Max-Age=0; Path=/; SameSite=lax; Secure; HttpOnly"
@@ -1761,6 +1881,12 @@ async fn loopback_http_challenge_remains_available_on_the_same_host() {
             Some(Some("/oauth/callback"))
         );
         assert_eq!(cookie_attribute(&challenge.cookie, "secure"), None);
+        // Without `Secure` the cookie cannot claim a prefix at all.
+        assert!(
+            cookie_name(&challenge.cookie).starts_with("ferrum_oidc_state_"),
+            "{}",
+            challenge.cookie
+        );
     }
 }
 
@@ -1843,6 +1969,7 @@ async fn correlation_cookie_ignores_configured_session_domain() {
     assert_host_only_correlation_cookie(&challenge.cookie, "600");
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn successful_callback_clears_host_only_correlation_cookie_and_preserves_session_domain() {
     let server = MockServer::start().await;
@@ -1856,21 +1983,14 @@ async fn successful_callback_clears_host_only_correlation_cookie_and_preserves_s
         .mount(&server)
         .await;
 
-    let mut config = base_config();
+    let mut config = callback_config();
     config["providers"][0]["token_endpoint"] = json!(format!("{}/token", server.uri()));
     config["providers"][0]["jwks_uri"] = json!(format!("{}/jwks", server.uri()));
     config["session"]["domain"] = json!("example.com");
     let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+    prepare_callback_jwks(&server).await;
     let challenge = issue_browser_challenge(&plugin).await;
-    let id_token = create_rs256_token(
-        &json!({
-            "iss": "https://issuer.example.com",
-            "aud": "ferrum-gateway",
-            "sub": "user-1",
-            "nonce": challenge.nonce.as_str(),
-        }),
-        private_key_pem,
-    );
+    let id_token = create_rs256_token(&oidc_id_token_claims(&challenge), private_key_pem);
     Mock::given(method("POST"))
         .and(path("/token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1886,15 +2006,7 @@ async fn successful_callback_clears_host_only_correlation_cookie_and_preserves_s
     callback
         .query_params
         .insert("code".to_string(), "authorization-code".to_string());
-    let PluginResult::Reject {
-        status_code,
-        headers,
-        ..
-    } = plugin.on_request_received(&mut callback).await
-    else {
-        panic!("expected successful callback redirect");
-    };
-    assert_eq!(status_code, 302);
+    let headers = assert_callback_redirect(plugin.on_request_received(&mut callback).await);
     let cookies: Vec<&str> = headers
         .get("set-cookie")
         .expect("session and correlation cookies")
@@ -2217,16 +2329,32 @@ async fn mount_token_and_jwks_document(
         })))
         .mount(server)
         .await;
+    prepare_callback_jwks(server).await;
 }
 
-fn plugin_pair_for_server(
+async fn plugin_pair_for_server(
     server: &MockServer,
 ) -> (serde_json::Value, OidcRelyingParty, OidcRelyingParty) {
-    let mut config = base_config();
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    plugin_pair_for_jwks(server, build_rsa_jwks_from_pem(public_key_pem)).await
+}
+
+async fn plugin_pair_for_jwks(
+    server: &MockServer,
+    jwks: serde_json::Value,
+) -> (serde_json::Value, OidcRelyingParty, OidcRelyingParty) {
+    // Construction starts background fetching, so publish the mock first.
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(jwks))
+        .mount(server)
+        .await;
+    let mut config = callback_config();
     config["providers"][0]["token_endpoint"] = json!(format!("{}/token", server.uri()));
     config["providers"][0]["jwks_uri"] = json!(format!("{}/jwks", server.uri()));
     let starter = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
     let completer = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+    prepare_callback_jwks(server).await;
     (config, starter, completer)
 }
 
@@ -2242,30 +2370,23 @@ async fn complete_callback(
     plugin.on_request_received(&mut callback).await
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn cross_replica_callback_accepts_sealed_pending_flow() {
     let server = MockServer::start().await;
-    let (_, starter, completer) = plugin_pair_for_server(&server);
+    let (_, starter, completer) = plugin_pair_for_server(&server).await;
     let challenge = issue_browser_challenge(&starter).await;
     let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
-    let id_token = create_rs256_token(
-        &json!({
-            "iss": "https://issuer.example.com",
-            "aud": "ferrum-gateway",
-            "sub": "user-1",
-            "nonce": challenge.nonce.as_str(),
-        }),
-        private_key_pem,
-    );
+    let id_token = create_rs256_token(&oidc_id_token_claims(&challenge), private_key_pem);
     mount_token_and_jwks(&server, &id_token).await;
 
     match complete_callback(&completer, &challenge, "authorization-code").await {
         PluginResult::Reject {
             status_code,
+            body,
             headers,
-            ..
         } => {
-            assert_eq!(status_code, 302);
+            assert_eq!(status_code, 302, "body: {body}; headers: {headers:?}");
             assert!(
                 headers
                     .get("set-cookie")
@@ -2277,27 +2398,53 @@ async fn cross_replica_callback_accepts_sealed_pending_flow() {
     }
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn same_instance_callback_still_completes_with_sealed_pending_flow() {
     let server = MockServer::start().await;
-    let (_, plugin, _) = plugin_pair_for_server(&server);
+    let (_, plugin, _) = plugin_pair_for_server(&server).await;
     let challenge = issue_browser_challenge(&plugin).await;
     let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
-    let id_token = create_rs256_token(
-        &json!({
-            "iss": "https://issuer.example.com",
-            "aud": "ferrum-gateway",
-            "sub": "user-1",
-            "nonce": challenge.nonce.as_str(),
-        }),
-        private_key_pem,
-    );
+    let id_token = create_rs256_token(&oidc_id_token_claims(&challenge), private_key_pem);
     mount_token_and_jwks(&server, &id_token).await;
 
     match complete_callback(&plugin, &challenge, "authorization-code").await {
-        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 302),
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => assert_eq!(status_code, 302, "body: {body}; headers: {headers:?}"),
         other => panic!("expected same-instance success, got {other:?}"),
     }
+}
+
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test]
+async fn callback_fixture_waits_for_delayed_jwks_before_issuing_state() {
+    let server = MockServer::start().await;
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(build_rsa_jwks_from_pem(public_key_pem))
+                .set_delay(Duration::from_millis(250)),
+        )
+        .mount(&server)
+        .await;
+    let mut config = callback_config();
+    config["providers"][0]["token_endpoint"] = json!(format!("{}/token", server.uri()));
+    config["providers"][0]["jwks_uri"] = json!(format!("{}/jwks", server.uri()));
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+    prepare_callback_jwks(&server).await;
+
+    let challenge = issue_browser_challenge(&plugin).await;
+    let id_token = create_rs256_token(
+        &oidc_id_token_claims(&challenge),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+    );
+    mount_token_and_jwks(&server, &id_token).await;
+    assert_callback_redirect(complete_callback(&plugin, &challenge, "authorization-code").await);
 }
 
 fn two_key_oidc_jwks() -> serde_json::Value {
@@ -2315,11 +2462,14 @@ fn two_key_oidc_jwks() -> serde_json::Value {
 }
 
 fn oidc_id_token_claims(challenge: &BrowserChallenge) -> serde_json::Value {
+    // No iat/nbf boundary is needed by these cookie/kid tests. Keep exp far
+    // beyond setup and callback work, including instrumented coverage builds.
     json!({
         "iss": "https://issuer.example.com",
         "aud": "ferrum-gateway",
         "sub": "user-1",
         "nonce": challenge.nonce.as_str(),
+        "exp": chrono::Utc::now().timestamp() + 86_400,
     })
 }
 
@@ -2339,10 +2489,11 @@ fn assert_invalid_id_token(result: PluginResult) {
     }
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn oidc_callback_rejects_id_token_without_kid() {
     let server = MockServer::start().await;
-    let (_, plugin, _) = plugin_pair_for_server(&server);
+    let (_, plugin, _) = plugin_pair_for_jwks(&server, two_key_oidc_jwks()).await;
     let challenge = issue_browser_challenge(&plugin).await;
     let id_token = create_rs256_token_no_kid(
         &oidc_id_token_claims(&challenge),
@@ -2352,10 +2503,11 @@ async fn oidc_callback_rejects_id_token_without_kid() {
     assert_invalid_id_token(complete_callback(&plugin, &challenge, "authorization-code").await);
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn oidc_callback_rejects_unknown_kid_even_when_another_published_key_verifies() {
     let server = MockServer::start().await;
-    let (_, plugin, _) = plugin_pair_for_server(&server);
+    let (_, plugin, _) = plugin_pair_for_jwks(&server, two_key_oidc_jwks()).await;
     let challenge = issue_browser_challenge(&plugin).await;
     let id_token = create_rs256_token_with_kid(
         &oidc_id_token_claims(&challenge),
@@ -2366,10 +2518,11 @@ async fn oidc_callback_rejects_unknown_kid_even_when_another_published_key_verif
     assert_invalid_id_token(complete_callback(&plugin, &challenge, "authorization-code").await);
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn oidc_callback_rejects_known_kid_signed_by_a_different_published_key() {
     let server = MockServer::start().await;
-    let (_, plugin, _) = plugin_pair_for_server(&server);
+    let (_, plugin, _) = plugin_pair_for_jwks(&server, two_key_oidc_jwks()).await;
     let challenge = issue_browser_challenge(&plugin).await;
     let id_token = create_rs256_token_with_kid(
         &oidc_id_token_claims(&challenge),
@@ -2387,7 +2540,7 @@ async fn oidc_callback_rejects_known_kid_signed_by_a_different_published_key() {
 #[tokio::test]
 async fn oidc_unknown_kid_reaches_the_shared_store_on_demand_refetch() {
     let server = MockServer::start().await;
-    let (_, plugin, _) = plugin_pair_for_server(&server);
+    let (_, plugin, _) = plugin_pair_for_jwks(&server, two_key_oidc_jwks()).await;
     let jwks_uri = format!("{}/jwks", server.uri());
     let store = ferrum_edge::plugins::utils::jwks_cache::cached_store(&jwks_uri)
         .expect("the relying party shares the process-wide JWKS store");
@@ -2414,10 +2567,11 @@ async fn oidc_unknown_kid_reaches_the_shared_store_on_demand_refetch() {
     );
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn oidc_callback_accepts_id_token_with_matching_kid() {
     let server = MockServer::start().await;
-    let (_, plugin, _) = plugin_pair_for_server(&server);
+    let (_, plugin, _) = plugin_pair_for_jwks(&server, two_key_oidc_jwks()).await;
     let challenge = issue_browser_challenge(&plugin).await;
     let id_token = create_rs256_token_with_kid(
         &oidc_id_token_claims(&challenge),
@@ -2426,15 +2580,20 @@ async fn oidc_callback_accepts_id_token_with_matching_kid() {
     );
     mount_token_and_jwks_document(&server, two_key_oidc_jwks(), &id_token).await;
     match complete_callback(&plugin, &challenge, "authorization-code").await {
-        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 302),
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => assert_eq!(status_code, 302, "body: {body}; headers: {headers:?}"),
         other => panic!("expected matching-kid callback success, got {other:?}"),
     }
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn cross_replica_callback_rejects_wrong_encryption_secret() {
     let server = MockServer::start().await;
-    let (mut config, starter, _) = plugin_pair_for_server(&server);
+    let (mut config, starter, _) = plugin_pair_for_server(&server).await;
     let challenge = issue_browser_challenge(&starter).await;
     config["session"]["encryption_secret"] = json!("abcdefghijklmnopqrstuvwxyz123456");
     let wrong_secret = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
@@ -2450,10 +2609,11 @@ async fn cross_replica_callback_rejects_wrong_encryption_secret() {
     }
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn cross_replica_callback_rejects_wrong_session_context() {
     let server = MockServer::start().await;
-    let (mut config, starter, _) = plugin_pair_for_server(&server);
+    let (mut config, starter, _) = plugin_pair_for_server(&server).await;
     let challenge = issue_browser_challenge(&starter).await;
     config["providers"][0]["client_id"] = json!("other-client");
     let other_context = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
@@ -2469,10 +2629,11 @@ async fn cross_replica_callback_rejects_wrong_session_context() {
     }
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn sealed_pending_flow_rejects_tampered_correlation_cookie() {
     let server = MockServer::start().await;
-    let (_, plugin, _) = plugin_pair_for_server(&server);
+    let (_, plugin, _) = plugin_pair_for_server(&server).await;
     let challenge = issue_browser_challenge(&plugin).await;
     let mut tampered = challenge.clone();
     let pair = cookie_pair(&challenge.cookie);
@@ -2502,6 +2663,7 @@ async fn sealed_pending_flow_rejects_tampered_correlation_cookie() {
     }
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn sealed_pending_flow_rejects_expired_state() {
     let server = MockServer::start().await;
@@ -2552,30 +2714,17 @@ async fn sealed_pending_flow_rejects_oversized_correlation_cookie() {
     }
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn same_instance_rejects_replay_after_sealed_state_is_accepted() {
     let server = MockServer::start().await;
-    let (_, plugin, _) = plugin_pair_for_server(&server);
+    let (_, plugin, _) = plugin_pair_for_server(&server).await;
     let challenge = issue_browser_challenge(&plugin).await;
     let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
-    let id_token = create_rs256_token(
-        &json!({
-            "iss": "https://issuer.example.com",
-            "aud": "ferrum-gateway",
-            "sub": "user-1",
-            "nonce": challenge.nonce.as_str(),
-        }),
-        private_key_pem,
-    );
+    let id_token = create_rs256_token(&oidc_id_token_claims(&challenge), private_key_pem);
     mount_token_and_jwks(&server, &id_token).await;
 
-    assert!(matches!(
-        complete_callback(&plugin, &challenge, "authorization-code").await,
-        PluginResult::Reject {
-            status_code: 302,
-            ..
-        }
-    ));
+    assert_callback_redirect(complete_callback(&plugin, &challenge, "authorization-code").await);
     match complete_callback(&plugin, &challenge, "authorization-code").await {
         PluginResult::Reject {
             status_code, body, ..
@@ -2587,27 +2736,15 @@ async fn same_instance_rejects_replay_after_sealed_state_is_accepted() {
     }
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn provider_authorization_code_remains_one_time_across_replicas() {
     let server = MockServer::start().await;
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
     let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
-    let mut config = base_config();
+    let mut config = callback_config();
     config["providers"][0]["token_endpoint"] = json!(format!("{}/token", server.uri()));
     config["providers"][0]["jwks_uri"] = json!(format!("{}/jwks", server.uri()));
-    let starter = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
-    let completer = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
-    let challenge = issue_browser_challenge(&starter).await;
-    let id_token = create_rs256_token(
-        &json!({
-            "iss": "https://issuer.example.com",
-            "aud": "ferrum-gateway",
-            "sub": "user-1",
-            "nonce": challenge.nonce.as_str(),
-        }),
-        private_key_pem,
-    );
-
     Mock::given(method("GET"))
         .and(path("/jwks"))
         .respond_with(
@@ -2615,6 +2752,12 @@ async fn provider_authorization_code_remains_one_time_across_replicas() {
         )
         .mount(&server)
         .await;
+    let starter = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+    let completer = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+    prepare_callback_jwks(&server).await;
+    let challenge = issue_browser_challenge(&starter).await;
+    let id_token = create_rs256_token(&oidc_id_token_claims(&challenge), private_key_pem);
+
     let exchanges = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&exchanges);
     Mock::given(method("POST"))
@@ -2636,7 +2779,11 @@ async fn provider_authorization_code_remains_one_time_across_replicas() {
         .await;
 
     match complete_callback(&completer, &challenge, "one-time-code").await {
-        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 302),
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => assert_eq!(status_code, 302, "body: {body}; headers: {headers:?}"),
         other => panic!("expected first replica success, got {other:?}"),
     }
     match complete_callback(&starter, &challenge, "one-time-code").await {
@@ -2651,36 +2798,30 @@ async fn provider_authorization_code_remains_one_time_across_replicas() {
     assert_eq!(exchanges.load(Ordering::SeqCst), 2);
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn previous_encryption_secret_accepts_pending_flow_during_rotation() {
     let server = MockServer::start().await;
     let old_secret = "01234567890123456789012345678901";
     let new_secret = "abcdefghijklmnopqrstuvwxyz123456";
-    let mut starter_config = base_config();
-    starter_config["providers"][0]["token_endpoint"] = json!(format!("{}/token", server.uri()));
-    starter_config["providers"][0]["jwks_uri"] = json!(format!("{}/jwks", server.uri()));
-    starter_config["session"]["encryption_secret"] = json!(old_secret);
+    let (starter_config, starter, _) = plugin_pair_for_server(&server).await;
+    assert_eq!(starter_config["session"]["encryption_secret"], old_secret);
     let mut completer_config = starter_config.clone();
     completer_config["session"]["encryption_secret"] = json!(new_secret);
     completer_config["session"]["encryption_secret_previous"] = json!(old_secret);
 
-    let starter = OidcRelyingParty::new(&starter_config, PluginHttpClient::default()).unwrap();
     let completer = OidcRelyingParty::new(&completer_config, PluginHttpClient::default()).unwrap();
     let challenge = issue_browser_challenge(&starter).await;
     let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
-    let id_token = create_rs256_token(
-        &json!({
-            "iss": "https://issuer.example.com",
-            "aud": "ferrum-gateway",
-            "sub": "user-1",
-            "nonce": challenge.nonce.as_str(),
-        }),
-        private_key_pem,
-    );
+    let id_token = create_rs256_token(&oidc_id_token_claims(&challenge), private_key_pem);
     mount_token_and_jwks(&server, &id_token).await;
 
     match complete_callback(&completer, &challenge, "authorization-code").await {
-        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 302),
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => assert_eq!(status_code, 302, "body: {body}; headers: {headers:?}"),
         other => panic!("expected previous-secret rotation success, got {other:?}"),
     }
 }
@@ -3000,4 +3141,1214 @@ async fn discovery_config_retains_explicit_optional_endpoints() {
     );
 
     clear_jwks_cache();
+}
+
+#[tokio::test]
+async fn generated_session_cookies_enforce_prefix_attributes_and_allow_explicit_names() {
+    // A cookie prefix is only legal when the emitted attributes satisfy it:
+    // `__Secure-` requires `Secure`, and `__Host-` additionally requires no
+    // `Domain` and `Path=/`. A prefix a browser would reject is worse than none.
+    for (secure, domain, path, explicit_name, expected_prefix) in [
+        (true, None, "/", None, "__Host-ferrum_session_"),
+        (
+            true,
+            Some("example.com"),
+            "/",
+            None,
+            "__Secure-ferrum_session_",
+        ),
+        (true, None, "/app", None, "__Secure-ferrum_session_"),
+        (false, None, "/", None, "ferrum_session_"),
+        (false, Some("example.com"), "/", None, "ferrum_session_"),
+        (false, None, "/app", None, "ferrum_session_"),
+        (true, None, "/", Some("custom_session"), "custom_session="),
+        (false, None, "/", Some("custom_session"), "custom_session="),
+    ] {
+        let mut config = base_config();
+        config["session"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cookie_name");
+        config["session"]["path"] = json!(path);
+        config["session"]["secure"] = json!(secure);
+        if let Some(domain) = domain {
+            config["session"]["domain"] = json!(domain);
+        }
+        if let Some(name) = explicit_name {
+            config["session"]["cookie_name"] = json!(name);
+        }
+        let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+        let cookie =
+            oidc_sealed_session_cookie_for_test(&plugin, json!({"sub": "alice"}), false).unwrap();
+        assert!(cookie.starts_with(expected_prefix), "{cookie}");
+        assert_eq!(cookie_attribute(&cookie, "path"), Some(Some(path)));
+        assert_eq!(cookie_attribute(&cookie, "domain"), domain.map(Some));
+        assert_eq!(
+            cookie_attribute(&cookie, "secure"),
+            secure.then_some(None),
+            "{cookie}"
+        );
+
+        // Secure correlation cookies use browser-enforced host-only scope;
+        // insecure loopback development retains callback-path scoping.
+        let challenge = issue_browser_challenge(&plugin).await;
+        if secure {
+            assert_host_only_correlation_cookie(&challenge.cookie, "600");
+        } else {
+            assert!(
+                cookie_name(&challenge.cookie).starts_with("ferrum_oidc_state_"),
+                "{}",
+                challenge.cookie
+            );
+            assert_eq!(cookie_attribute(&challenge.cookie, "domain"), None);
+            assert_eq!(
+                cookie_attribute(&challenge.cookie, "path"),
+                Some(Some("/oauth/callback"))
+            );
+            assert_eq!(cookie_attribute(&challenge.cookie, "secure"), None);
+            assert_eq!(cookie_attribute(&challenge.cookie, "httponly"), Some(None));
+        }
+    }
+}
+
+#[tokio::test]
+async fn root_scoped_secure_correlation_cookie_uses_the_host_prefix() {
+    let mut config = base_config();
+    config["providers"][0]["redirect_uri"] = json!("https://app.example.com/");
+    config["providers"][0]["callback_path"] = json!("/");
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+    let challenge = issue_browser_challenge(&plugin).await;
+
+    assert!(
+        cookie_name(&challenge.cookie).starts_with("__Host-ferrum_oidc_state_"),
+        "{}",
+        challenge.cookie
+    );
+    assert_eq!(cookie_attribute(&challenge.cookie, "domain"), None);
+    assert_eq!(cookie_attribute(&challenge.cookie, "path"), Some(Some("/")));
+    assert_eq!(cookie_attribute(&challenge.cookie, "secure"), Some(None));
+    assert_eq!(cookie_attribute(&challenge.cookie, "httponly"), Some(None));
+}
+
+#[tokio::test]
+async fn logout_requires_a_sealed_session_and_encodes_the_id_token_hint() {
+    for post_logout_uri in [None, Some("https://app.example.com/goodbye")] {
+        let mut config = base_config();
+        config["providers"][0]["end_session_endpoint"] =
+            json!("https://issuer.example.com/logout?existing=keep");
+        if let Some(uri) = post_logout_uri {
+            config["providers"][0]["post_logout_redirect_uri"] = json!(uri);
+        }
+        let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+        let cookie =
+            oidc_sealed_session_cookie_for_test(&plugin, json!({"sub": "alice"}), false).unwrap();
+        for session in [
+            None,
+            Some("ferrum_session=tampered"),
+            Some(cookie_pair(&cookie)),
+        ] {
+            let mut ctx = html_ctx();
+            ctx.path = "/oauth/logout".to_string();
+            if let Some(session) = session {
+                ctx.headers
+                    .insert("cookie".to_string(), session.to_string());
+            }
+            let PluginResult::Reject {
+                status_code,
+                body,
+                headers,
+            } = plugin.on_request_received(&mut ctx).await
+            else {
+                panic!("logout must terminate locally");
+            };
+            assert_eq!(
+                cookie_attribute(&headers["set-cookie"], "max-age"),
+                Some(Some("0"))
+            );
+            if session == Some(cookie_pair(&cookie)) {
+                assert_eq!(status_code, 302);
+                let location = Url::parse(&headers["location"]).unwrap();
+                let query: HashMap<_, _> = location.query_pairs().into_owned().collect();
+                assert_eq!(query["id_token_hint"], "test-id-token");
+                assert_eq!(query["client_id"], "ferrum-gateway");
+                assert_eq!(query["existing"], "keep");
+                assert_eq!(
+                    query.get("post_logout_redirect_uri").map(String::as_str),
+                    post_logout_uri
+                );
+            } else {
+                assert_eq!(status_code, 200);
+                assert!(body.contains("Logged out"));
+                assert!(!headers.contains_key("location"));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn logout_revokes_discovered_refresh_tokens_with_best_effort_client_auth() {
+    for (status, delay_secs) in [(200, 0), (503, 0), (200, 6)] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/discovery"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "authorization_endpoint": format!("{}/authorize", server.uri()),
+                "token_endpoint": format!("{}/token", server.uri()),
+                "jwks_uri": format!("{}/jwks", server.uri()),
+                "end_session_endpoint": format!("{}/logout", server.uri()),
+                "revocation_endpoint": format!("{}/revoke", server.uri()),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/revoke"))
+            .and(basic_auth("ferrum-gateway", "secret"))
+            .and(body_string_contains("token=refresh%2Btoken"))
+            .and(body_string_contains("token_type_hint=refresh_token"))
+            .respond_with(ResponseTemplate::new(status).set_delay(Duration::from_secs(delay_secs)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = base_config();
+        let provider = config["providers"][0].as_object_mut().unwrap();
+        for key in ["authorization_endpoint", "token_endpoint", "jwks_uri"] {
+            provider.remove(key);
+        }
+        provider.insert(
+            "discovery_url".to_string(),
+            json!(format!("{}/discovery", server.uri())),
+        );
+        let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut ctx = html_ctx();
+                if matches!(
+                    plugin
+                        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                        .await,
+                    PluginResult::Reject {
+                        status_code: 302,
+                        ..
+                    }
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("discovery must become ready");
+        let cookie = oidc_sealed_due_refresh_session_cookie_for_test(
+            &plugin,
+            json!({"sub": "alice"}),
+            "refresh+token",
+        )
+        .unwrap();
+        let mut ctx = html_ctx();
+        ctx.path = "/oauth/logout".to_string();
+        ctx.headers
+            .insert("cookie".to_string(), cookie_pair(&cookie).to_string());
+        let PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } = tokio::time::timeout(
+            Duration::from_millis(5500),
+            plugin.on_request_received(&mut ctx),
+        )
+        .await
+        .expect("revocation must not exceed its five-second bound")
+        else {
+            panic!("logout must terminate locally");
+        };
+        assert_eq!(status_code, 302);
+        let location = Url::parse(&headers["location"]).unwrap();
+        assert!(
+            location
+                .query_pairs()
+                .any(|(key, value)| key == "id_token_hint" && value == "test-id-token")
+        );
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn discovery_rejects_untrusted_revocation_endpoints() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/discovery"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "authorization_endpoint": format!("{}/authorize", server.uri()),
+            "token_endpoint": format!("{}/token", server.uri()),
+            "jwks_uri": format!("{}/jwks", server.uri()),
+            "revocation_endpoint": "https://untrusted.example.com/revoke",
+        })))
+        .mount(&server)
+        .await;
+    assert!(
+        oidc_resolve_discovery_for_test(
+            &PluginHttpClient::default(),
+            &format!("{}/discovery", server.uri()),
+            None,
+            None,
+        )
+        .await
+        .is_err()
+    );
+}
+
+/// `ferrum-edge validate` runs the shared plugin-composition gate synchronously,
+/// with no Tokio reactor on the calling thread. That gate constructs every
+/// security-composition candidate, so a valid enabled OIDC plugin used to abort
+/// the CLI with "there is no reactor running" for a configuration that starts
+/// cleanly under `run` (issue #5024).
+///
+/// This is deliberately a plain `#[test]`: a regression that reintroduces
+/// `tokio::spawn` during admission panics here instead of passing under a
+/// runtime the CLI never has.
+#[test]
+fn cli_config_validation_admits_oidc_without_a_tokio_runtime() {
+    for (case, provider) in [
+        (
+            "discovery",
+            json!({
+                "issuer": "https://issuer.example.com",
+                "discovery_url": "https://issuer.example.com/.well-known/openid-configuration",
+                "client_id": "ferrum-gateway",
+                "client_auth": {"client_secret": "0123456789abcdef"},
+                "redirect_uri": "https://app.example.com/oauth/callback",
+                "scopes": ["openid"]
+            }),
+        ),
+        (
+            "explicit",
+            json!({
+                "issuer": "https://issuer.example.com",
+                "authorization_endpoint": "https://issuer.example.com/authorize",
+                "token_endpoint": "https://issuer.example.com/token",
+                "jwks_uri": "https://issuer.example.com/jwks",
+                "client_id": "ferrum-gateway",
+                "client_auth": {"client_secret": "0123456789abcdef"},
+                "redirect_uri": "https://app.example.com/oauth/callback",
+                "scopes": ["openid"]
+            }),
+        ),
+    ] {
+        let config = GatewayConfig {
+            plugin_configs: vec![PluginConfig {
+                id: format!("oidc-{case}"),
+                plugin_name: "oidc_relying_party".to_string(),
+                namespace: "default".to_string(),
+                config: json!({
+                    "providers": [provider],
+                    "session": {"encryption_secret": "01234567890123456789012345678901"}
+                }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                trigger: None,
+                api_spec_id: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }],
+            ..GatewayConfig::default()
+        };
+
+        let errors =
+            ferrum_edge::_test_support::collect_rejecting_runtime_config_errors_for_test(&config);
+        assert!(
+            errors.is_empty(),
+            "{case} endpoints must validate without a runtime: {errors:?}"
+        );
+    }
+}
+
+/// Session lifetimes are added to a Unix timestamp on every authenticated
+/// request, so an unrepresentable `u64` must be refused at admission rather
+/// than overflowing that addition later (issue #5028).
+#[test]
+fn new_rejects_session_lifetimes_that_cannot_take_part_in_timestamp_arithmetic() {
+    const MAX_SESSION_TTL_SECS: u64 = 365 * 24 * 60 * 60;
+    for field in ["ttl_secs", "idle_ttl_secs"] {
+        for value in [json!(0), json!(MAX_SESSION_TTL_SECS + 1), json!(u64::MAX)] {
+            let mut config = base_config();
+            config["session"][field] = value.clone();
+            let error = OidcRelyingParty::new(&config, PluginHttpClient::default())
+                .err()
+                .unwrap_or_else(|| panic!("session.{field}={value} must be rejected"));
+            assert!(
+                error.contains(&format!("session.{field}")),
+                "unexpected error for session.{field}={value}: {error}"
+            );
+        }
+
+        // The largest representable value is still accepted.
+        let mut config = base_config();
+        config["session"][field] = json!(MAX_SESSION_TTL_SECS);
+        config["behavior"]["refresh_skew_secs"] = json!(1);
+        assert!(
+            validate_plugin_config("oidc_relying_party", &config).is_ok(),
+            "session.{field}={MAX_SESSION_TTL_SECS} must remain accepted"
+        );
+    }
+}
+
+/// `id_token_clock_skew_secs` is leeway added to every claims-expiry
+/// comparison; an unbounded value has the same overflow reach (issue #5028).
+#[test]
+fn new_rejects_unbounded_id_token_clock_skew() {
+    let mut config = base_config();
+    config["providers"][0]["id_token_clock_skew_secs"] = json!(3601);
+    let error = OidcRelyingParty::new(&config, PluginHttpClient::default())
+        .err()
+        .expect("an hour-plus clock skew must be rejected");
+    assert!(
+        error.contains("id_token_clock_skew_secs"),
+        "unexpected error: {error}"
+    );
+
+    let mut config = base_config();
+    config["providers"][0]["id_token_clock_skew_secs"] = json!(3600);
+    assert!(validate_plugin_config("oidc_relying_party", &config).is_ok());
+}
+
+/// A hostile or buggy provider controls `expires_in` outright. Neither an
+/// absurd nor a negative duration may reach the unchecked timestamp addition
+/// that used to panic the request path (issue #5028).
+#[tokio::test]
+async fn unrepresentable_provider_expires_in_does_not_panic_the_session_path() {
+    for expires_in in [json!(i64::MAX), json!(-1)] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "rotated-access-token",
+                "token_type": "Bearer",
+                "refresh_token": "rotated-refresh-token",
+                "expires_in": expires_in
+            })))
+            .mount(&server)
+            .await;
+
+        let plugin = OidcRelyingParty::new(
+            &refresh_config(&format!("{}/token", server.uri())),
+            PluginHttpClient::default(),
+        )
+        .expect("refresh plugin");
+        let now = chrono::Utc::now().timestamp();
+        let cookie = oidc_sealed_due_refresh_session_cookie_for_test(
+            &plugin,
+            json!({
+                "sub": "oidc-subject",
+                "email": "alice@example.test",
+                "exp": now + 3600
+            }),
+            "original-refresh-token",
+        )
+        .expect("session seals");
+        let mut ctx = ctx_with_session_cookie(&cookie);
+
+        // Completing the request at all is the assertion: the unchecked
+        // addition used to abort the worker with "attempt to add with overflow".
+        let consumers = ConsumerIndex::new(&[]);
+        assert_continue(plugin.authenticate(&mut ctx, &consumers).await);
+    }
+}
+
+/// A spent refresh token must suppress the sliding-idle cookie too. The
+/// documented multi-replica contract is that the `invalid_grant` loser emits no
+/// `Set-Cookie` at all; before issue #5025 an ordinary active-browser request
+/// whose idle window happened to be due re-sealed and published the already
+/// spent credential, overwriting the winner's rotated cookie.
+#[tokio::test]
+async fn spent_refresh_token_suppresses_the_rolling_idle_cookie() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": "invalid_grant"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let plugin = OidcRelyingParty::new(
+        &refresh_config(&format!("{}/token", server.uri())),
+        PluginHttpClient::default(),
+    )
+    .expect("valid refresh config");
+    let now = chrono::Utc::now().timestamp();
+    let cookie = oidc_sealed_refresh_session_cookie_for_test(
+        &plugin,
+        json!({
+            "sub": "oidc-subject",
+            "email": "accepted@example.test",
+            "exp": now + 3600
+        }),
+        Some("spent-refresh-token".to_string()),
+        // Both refresh AND the idle slide are due on this request.
+        true,
+        true,
+    )
+    .expect("session seals");
+    let consumer_index = ConsumerIndex::new(&[]);
+
+    let mut first = session_ctx(&cookie);
+    assert_continue(plugin.authenticate(&mut first, &consumer_index).await);
+    assert!(
+        rolling_cookie(&plugin, &mut first).await.is_none(),
+        "an idle slide must not publish a spent refresh token"
+    );
+
+    // The cached SpentCredential follower takes the same branch without a
+    // second grant.
+    let mut repeated = session_ctx(&cookie);
+    assert_continue(plugin.authenticate(&mut repeated, &consumer_index).await);
+    assert!(
+        rolling_cookie(&plugin, &mut repeated).await.is_none(),
+        "a cached spent-credential follower must not publish a cookie either"
+    );
+    assert_eq!(server.received_requests().await.expect("requests").len(), 1);
+}
+
+/// RFC 6749 §2.3.1 requires `client_secret_basic` to form-url-encode the client
+/// identifier and secret BEFORE the HTTP Basic encoding. Feeding the raw values
+/// to a generic Basic encoder made every token, refresh, and revocation POST
+/// fail against a conforming provider whenever a credential contained `:`, `+`,
+/// a space, or a non-ASCII character (issue #5026).
+#[tokio::test]
+async fn client_secret_basic_form_encodes_credentials_before_basic_encoding() {
+    // base64("audit%3Aclient+%2B:p%2Bss%3Aword+%2F") — the RFC 6749 §2.3.1 form.
+    const EXPECTED: &str = "Basic YXVkaXQlM0FjbGllbnQrJTJCOnAlMkJzcyUzQXdvcmQrJTJG";
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(header("authorization", EXPECTED))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "rotated-access-token",
+            "token_type": "Bearer",
+            "refresh_token": "rotated-refresh-token",
+            "expires_in": 3600
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut config = refresh_config(&format!("{}/token", server.uri()));
+    config["providers"][0]["client_id"] = json!("audit:client +");
+    config["providers"][0]["client_auth"] = json!({
+        "method": "client_secret_basic",
+        "client_secret": "p+ss:word /"
+    });
+    let plugin =
+        OidcRelyingParty::new(&config, PluginHttpClient::default()).expect("valid refresh config");
+    let now = chrono::Utc::now().timestamp();
+    let cookie = oidc_sealed_due_refresh_session_cookie_for_test(
+        &plugin,
+        json!({
+            "sub": "oidc-subject",
+            "email": "alice@example.test",
+            "exp": now + 3600
+        }),
+        "original-refresh-token",
+    )
+    .expect("session seals");
+    let mut ctx = session_ctx(&cookie);
+
+    let consumers = ConsumerIndex::new(&[]);
+    assert_continue(plugin.authenticate(&mut ctx, &consumers).await);
+    let set_cookie = rolling_cookie(&plugin, &mut ctx)
+        .await
+        .expect("a punctuation-bearing client secret must still authenticate the grant");
+    let state = oidc_session_state_from_set_cookie_for_test(&plugin, &set_cookie)
+        .expect("rotated session cookie must open");
+    assert_eq!(state.access_token, "rotated-access-token");
+    server.verify().await;
+}
+
+/// `session.cookie_name`, `session.path`, and `session.domain` are concatenated
+/// into `Set-Cookie` verbatim, so a delimiter or control character injects an
+/// attribute instead of producing a cookie the browser merely ignores. The
+/// demonstrated case put `;` into `session.path` and appended `Max-Age=0`,
+/// deleting every session the gateway issued (issue #5027).
+#[test]
+fn new_rejects_cookie_names_paths_and_domains_that_are_not_cookie_syntax() {
+    for (field, value) in [
+        ("cookie_name", json!("bad;cookie")),
+        ("cookie_name", json!("bad\r\ncookie")),
+        ("cookie_name", json!("bad cookie")),
+        ("cookie_name", json!("bad=cookie")),
+        ("cookie_name", json!("ünicode")),
+        ("path", json!("/; Max-Age=0")),
+        ("path", json!("relative")),
+        ("path", json!("/tab\there")),
+        ("domain", json!("https://example.test")),
+        ("domain", json!("example.test; Max-Age=0")),
+        ("domain", json!("example.test:8443")),
+        ("domain", json!("example..test")),
+        ("domain", json!("example.test.")),
+    ] {
+        let mut config = base_config();
+        config["session"][field] = value.clone();
+        let error = validate_plugin_config("oidc_relying_party", &config)
+            .err()
+            .unwrap_or_else(|| panic!("session.{field}={value} must be rejected"));
+        assert!(
+            error.contains(&format!("session.{field}")),
+            "unexpected error for session.{field}={value}: {error}"
+        );
+    }
+
+    // Valid explicit values stay supported.
+    for (field, value) in [
+        ("cookie_name", json!("custom_session")),
+        ("path", json!("/app")),
+        ("domain", json!(".example.test")),
+    ] {
+        let mut config = base_config();
+        config["session"][field] = value.clone();
+        assert!(
+            validate_plugin_config("oidc_relying_party", &config).is_ok(),
+            "session.{field}={value} must remain accepted"
+        );
+    }
+}
+
+/// A browser silently discards a `__Host-`/`__Secure-` cookie whose attributes
+/// violate the prefix rules, so admitting the combination produces a login loop
+/// with no gateway-side signal (issue #5027).
+#[test]
+fn new_rejects_explicit_cookie_prefixes_that_contradict_their_attributes() {
+    for (name, secure, domain, path) in [
+        ("__Host-invalid", false, None, "/"),
+        ("__Host-invalid", true, Some("example.test"), "/"),
+        ("__Host-invalid", true, None, "/app"),
+        ("__Secure-invalid", false, None, "/"),
+    ] {
+        let mut config = base_config();
+        config["session"]["cookie_name"] = json!(name);
+        config["session"]["secure"] = json!(secure);
+        config["session"]["path"] = json!(path);
+        if let Some(domain) = domain {
+            config["session"]["domain"] = json!(domain);
+        }
+        let error = validate_plugin_config("oidc_relying_party", &config)
+            .err()
+            .unwrap_or_else(|| panic!("{name} must be rejected for secure={secure}"));
+        assert!(error.contains("cookie_name"), "unexpected error: {error}");
+    }
+
+    let mut config = base_config();
+    config["session"]["cookie_name"] = json!("__Host-valid");
+    config["session"]["secure"] = json!(true);
+    assert!(validate_plugin_config("oidc_relying_party", &config).is_ok());
+}
+
+/// `providers[].callback_path` becomes the correlation cookie's `Path`
+/// attribute, so it carries the same delimiter rules (issue #5027).
+#[test]
+fn new_rejects_callback_and_logout_paths_that_are_not_cookie_paths() {
+    for field in ["callback_path", "logout_path"] {
+        let mut config = base_config();
+        config["providers"][0][field] = json!("/oauth/x;Max-Age=0");
+        let error = validate_plugin_config("oidc_relying_party", &config)
+            .err()
+            .unwrap_or_else(|| panic!("provider[0].{field} must be rejected"));
+        assert!(error.contains(field), "unexpected error: {error}");
+    }
+}
+
+/// `session.max_cookie_bytes` had an upper bound but no usable lower bound, so
+/// `0` started a fail-closed authentication plugin whose browser challenge can
+/// never seal even its own pending flow: every login answered 503 (issue #5029).
+#[test]
+fn new_rejects_cookie_size_caps_that_cannot_seal_a_pending_flow() {
+    for value in [json!(0), json!(1), json!(1023)] {
+        let mut config = base_config();
+        config["session"]["max_cookie_bytes"] = value.clone();
+        let error = validate_plugin_config("oidc_relying_party", &config)
+            .err()
+            .unwrap_or_else(|| panic!("max_cookie_bytes={value} must be rejected"));
+        assert!(
+            error.contains("max_cookie_bytes"),
+            "unexpected error for max_cookie_bytes={value}: {error}"
+        );
+    }
+
+    for value in [json!(1024), json!(8000)] {
+        let mut config = base_config();
+        config["session"]["max_cookie_bytes"] = value.clone();
+        assert!(
+            validate_plugin_config("oidc_relying_party", &config).is_ok(),
+            "max_cookie_bytes={value} must remain accepted"
+        );
+    }
+}
+
+/// The documented minimum must actually be able to start a login, not merely
+/// pass admission (issue #5029).
+#[tokio::test]
+async fn minimum_cookie_size_cap_can_still_seal_a_browser_challenge() {
+    let mut config = base_config();
+    config["session"]["max_cookie_bytes"] = json!(1024);
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default())
+        .expect("the documented minimum must be accepted");
+    let mut ctx = html_ctx();
+    let PluginResult::Reject {
+        status_code,
+        headers,
+        ..
+    } = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await
+    else {
+        panic!("a browser request without a session must be challenged");
+    };
+    assert_eq!(status_code, 302, "headers: {headers:?}");
+    assert!(headers.contains_key("set-cookie"));
+}
+
+/// `on_request_received` checks the callback branch before the logout branch,
+/// so a `logout_path` that routing delivers as the callback path makes logout
+/// unreachable: it answers "Missing state" and the configured handler never
+/// runs (issue #5030).
+#[test]
+fn new_rejects_logout_paths_that_collide_with_the_callback_path() {
+    for logout_path in ["/oauth/callback", "/oauth/callback/", "/oauth//callback"] {
+        let mut config = base_config();
+        config["providers"][0]["logout_path"] = json!(logout_path);
+        let error = validate_plugin_config("oidc_relying_party", &config)
+            .err()
+            .unwrap_or_else(|| panic!("logout_path={logout_path} must be rejected"));
+        assert!(
+            error.contains("logout_path"),
+            "unexpected error for logout_path={logout_path}: {error}"
+        );
+    }
+}
+
+/// Every accepted `logout_path` must actually reach local cookie deletion
+/// (issue #5030).
+#[tokio::test]
+async fn accepted_logout_paths_reach_local_cookie_deletion() {
+    let mut config = base_config();
+    config["providers"][0]["logout_path"] = json!("/oauth/sign-out");
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).expect("valid config");
+    let mut ctx = html_ctx();
+    ctx.path = "/oauth/sign-out".to_string();
+    let PluginResult::Reject {
+        status_code,
+        headers,
+        ..
+    } = plugin.on_request_received(&mut ctx).await
+    else {
+        panic!("logout must terminate locally");
+    };
+    assert_eq!(status_code, 200);
+    assert!(
+        headers
+            .get("set-cookie")
+            .is_some_and(|cookie| cookie.contains("Max-Age=0")),
+        "logout must expire the session cookie: {headers:?}"
+    );
+}
+
+/// RFC 6749 §3.1.2 forbids a fragment on the redirection endpoint: a lenient
+/// provider appends the authorization response query after it, so the browser
+/// never transmits `state`/`code` and every callback fails (issue #5031).
+#[test]
+fn new_rejects_redirect_uris_carrying_a_fragment() {
+    for redirect_uri in [
+        "https://app.example.com/oauth/callback#fragment",
+        "https://app.example.com/oauth/callback#",
+    ] {
+        let mut config = base_config();
+        config["providers"][0]["redirect_uri"] = json!(redirect_uri);
+        let error = validate_plugin_config("oidc_relying_party", &config)
+            .err()
+            .unwrap_or_else(|| panic!("{redirect_uri} must be rejected"));
+        assert!(error.contains("redirect_uri"), "unexpected error: {error}");
+    }
+
+    // A fixed query component stays supported: it is not a fragment, and the
+    // provider appends the response parameters after it.
+    let mut config = base_config();
+    config["providers"][0]["redirect_uri"] =
+        json!("https://app.example.com/oauth/callback?rp=edge");
+    assert!(validate_plugin_config("oidc_relying_party", &config).is_ok());
+}
+
+/// `EncodingKey::from_ec_pem` only proves the PEM is a well-formed EC key, not
+/// that its curve matches the selected algorithm. An ES256 client with a P-384
+/// key started cleanly and then failed to sign the first client assertion —
+/// after the browser's one-time authorization code had already been consumed
+/// and with the token endpoint never contacted (issue #5032).
+#[test]
+fn private_key_jwt_requires_a_key_that_supports_the_selected_algorithm() {
+    let p256 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .expect("P-256 key")
+        .serialize_pem();
+    let p384 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384)
+        .expect("P-384 key")
+        .serialize_pem();
+    let rsa = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)
+        .expect("RSA key")
+        .serialize_pem();
+    let ed25519 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
+        .expect("Ed25519 key")
+        .serialize_pem();
+
+    let config_for = |alg: &str, pem: &str| {
+        let mut config = base_config();
+        config["providers"][0]["client_auth"] = json!({
+            "method": "private_key_jwt",
+            "private_key_jwt_alg": alg,
+            "private_key_pem": pem
+        });
+        config
+    };
+
+    for (alg, pem, label) in [
+        ("ES256", &p384, "ES256 with a P-384 key"),
+        ("ES384", &p256, "ES384 with a P-256 key"),
+    ] {
+        let error = validate_plugin_config("oidc_relying_party", &config_for(alg, pem))
+            .err()
+            .unwrap_or_else(|| panic!("{label} must be rejected"));
+        assert!(
+            error.contains("private_key"),
+            "unexpected error for {label}: {error}"
+        );
+    }
+
+    for (alg, pem, label) in [
+        ("ES256", &p256, "ES256 with a P-256 key"),
+        ("ES384", &p384, "ES384 with a P-384 key"),
+        ("RS256", &rsa, "RS256 with an RSA key"),
+        ("EdDSA", &ed25519, "EdDSA with an Ed25519 key"),
+    ] {
+        assert!(
+            validate_plugin_config("oidc_relying_party", &config_for(alg, pem)).is_ok(),
+            "{label} must remain accepted"
+        );
+    }
+}
+
+/// An explicit optional endpoint replaces the advertised value outright, so an
+/// advertisement this deployment will never call must not fail the whole
+/// discovery fetch. Validating it first made a valid explicit override unusable
+/// and left every login answering 503 (issue #5033).
+#[tokio::test]
+async fn cross_origin_advertisements_do_not_block_their_explicit_overrides() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/discovery"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "authorization_endpoint": format!("{}/authorize", server.uri()),
+            "token_endpoint": format!("{}/token", server.uri()),
+            "jwks_uri": format!("{}/jwks", server.uri()),
+            // Advertised on a different origin than discovery_url, and never
+            // called because both are explicitly overridden below.
+            "userinfo_endpoint": "https://elsewhere.example.com/userinfo",
+            "end_session_endpoint": "https://elsewhere.example.com/end_session",
+        })))
+        .mount(&server)
+        .await;
+
+    let (userinfo, end_session) = oidc_resolve_discovery_for_test(
+        &PluginHttpClient::default(),
+        &format!("{}/discovery", server.uri()),
+        Some("https://issuer.example.com/userinfo".to_string()),
+        Some("https://issuer.example.com/end_session".to_string()),
+    )
+    .await
+    .expect("a discarded advertisement must not fail discovery");
+    assert_eq!(
+        userinfo.as_deref(),
+        Some("https://issuer.example.com/userinfo")
+    );
+    assert_eq!(
+        end_session.as_deref(),
+        Some("https://issuer.example.com/end_session")
+    );
+}
+
+/// A selected discovered optional endpoint keeps its fail-closed same-origin
+/// validation: only the discarded advertisement is skipped (issue #5033).
+#[tokio::test]
+async fn selected_discovered_optional_endpoints_stay_fail_closed() {
+    for field in ["userinfo_endpoint", "end_session_endpoint"] {
+        let server = MockServer::start().await;
+        let mut document = json!({
+            "authorization_endpoint": format!("{}/authorize", server.uri()),
+            "token_endpoint": format!("{}/token", server.uri()),
+            "jwks_uri": format!("{}/jwks", server.uri()),
+        });
+        document[field] = json!("https://elsewhere.example.com/endpoint");
+        Mock::given(method("GET"))
+            .and(path("/discovery"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(document))
+            .mount(&server)
+            .await;
+
+        assert!(
+            oidc_resolve_discovery_for_test(
+                &PluginHttpClient::default(),
+                &format!("{}/discovery", server.uri()),
+                None,
+                None,
+            )
+            .await
+            .is_err(),
+            "a selected cross-origin {field} must still fail closed"
+        );
+    }
+}
+
+/// The sealed gateway session cookie is a complete, replayable credential.
+/// Encryption hides its contents from a backend but does nothing to stop that
+/// backend from presenting the captured value to any other route governed by
+/// the same OIDC policy. It must not reach the upstream at all, while unrelated
+/// application cookies are preserved untouched (GHSA-75w5-f79c-7697).
+#[tokio::test]
+async fn the_gateway_session_cookie_is_hidden_from_the_backend_by_default() {
+    let plugin = OidcRelyingParty::new(&base_config(), PluginHttpClient::default())
+        .expect("valid oidc config");
+    let challenge = issue_browser_challenge(&plugin).await;
+    let correlation_pair = cookie_pair(&challenge.cookie);
+    let sealed = oidc_sealed_session_cookie_for_test(&plugin, json!({"sub": "alice"}), false)
+        .expect("session seals");
+    let session_pair = cookie_pair(&sealed);
+
+    for header_name in ["cookie", "Cookie"] {
+        let mut ctx = html_ctx();
+        let mut headers = HashMap::new();
+        headers.insert(
+            header_name.to_string(),
+            format!("theme=dark; {session_pair}; {correlation_pair}; cart=7"),
+        );
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        let forwarded = headers
+            .get(header_name)
+            .expect("unrelated cookies must survive");
+        assert_eq!(forwarded, "theme=dark; cart=7");
+    }
+
+    // A header that carried only this plugin's cookies is removed outright
+    // rather than forwarded empty.
+    let mut ctx = html_ctx();
+    let mut headers = HashMap::new();
+    headers.insert("cookie".to_string(), session_pair.to_string());
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(!headers.contains_key("cookie"));
+}
+
+/// The strip does not depend on the credential having been accepted: a
+/// tampered, expired, or wrong-context cookie is still a value the backend must
+/// not receive (GHSA-75w5-f79c-7697).
+#[tokio::test]
+async fn an_unusable_gateway_session_cookie_is_hidden_too() {
+    let plugin = OidcRelyingParty::new(&base_config(), PluginHttpClient::default())
+        .expect("valid oidc config");
+    let mut ctx = html_ctx();
+    let mut headers = HashMap::new();
+    headers.insert(
+        "cookie".to_string(),
+        "ferrum_session=not-a-sealed-value; theme=dark".to_string(),
+    );
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let forwarded = headers.get("cookie").map(String::as_str);
+    assert_eq!(forwarded, Some("theme=dark"));
+}
+
+/// Passthrough remains available, but only as an explicit opt-in
+/// (GHSA-75w5-f79c-7697).
+#[tokio::test]
+async fn session_cookie_passthrough_requires_an_explicit_opt_in() {
+    let mut config = base_config();
+    config["session"]["hide_session_cookie"] = json!(false);
+    let plugin =
+        OidcRelyingParty::new(&config, PluginHttpClient::default()).expect("valid oidc config");
+    let sealed = oidc_sealed_session_cookie_for_test(&plugin, json!({"sub": "alice"}), false)
+        .expect("session seals");
+    let session_pair = cookie_pair(&sealed);
+
+    let forwarded = format!("theme=dark; {session_pair}");
+    let mut ctx = html_ctx();
+    let mut headers = HashMap::new();
+    headers.insert("cookie".to_string(), forwarded.clone());
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(headers.get("cookie"), Some(&forwarded));
+}
+
+/// Hiding the credential must not disturb the verified identity and claim
+/// headers the upstream actually relies on (GHSA-75w5-f79c-7697).
+#[tokio::test]
+async fn hiding_the_session_cookie_preserves_claim_header_fan_out() {
+    let mut config = base_config();
+    config["providers"][0]["claim_headers"] = json!({"email": "X-Authenticated-Email"});
+    let plugin =
+        OidcRelyingParty::new(&config, PluginHttpClient::default()).expect("valid oidc config");
+    let sealed = oidc_sealed_session_cookie_for_test(
+        &plugin,
+        json!({"sub": "alice", "email": "alice@example.test"}),
+        false,
+    )
+    .expect("session seals");
+    let mut ctx = session_ctx(&sealed);
+    let consumers = ConsumerIndex::new(&[]);
+    assert_continue(plugin.authenticate(&mut ctx, &consumers).await);
+
+    let mut headers = ctx.headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(!headers.contains_key("cookie"));
+    assert_eq!(
+        headers.get("x-authenticated-email").map(String::as_str),
+        Some("alice@example.test")
+    );
+}
+
+/// Both advertised minimal examples must actually construct. They previously
+/// omitted the required `scopes` (including `openid`) and paired an
+/// `/oidc/callback` `redirect_uri` with the default `/oauth/callback`
+/// `callback_path`, so an operator who copied either one got a config the
+/// gateway refuses (issue #5034).
+#[test]
+fn the_documented_minimal_examples_pass_admission() {
+    for (source, doc) in [
+        ("docs/oidc_relying_party.md", DEDICATED_DOC),
+        ("docs/plugins.md", CATALOG_DOC),
+    ] {
+        let example = first_oidc_yaml_example(doc)
+            .unwrap_or_else(|| panic!("{source} must document an oidc_relying_party example"));
+        let document: serde_json::Value =
+            serde_yaml::from_str(&example).unwrap_or_else(|e| panic!("{source} example: {e}"));
+        assert_eq!(document["plugin_name"], json!("oidc_relying_party"));
+        validate_plugin_config("oidc_relying_party", &document["config"])
+            .unwrap_or_else(|e| panic!("{source} example must be admissible: {e}"));
+    }
+}
+
+const DEDICATED_DOC: &str = include_str!("../../../docs/oidc_relying_party.md");
+const CATALOG_DOC: &str = include_str!("../../../docs/plugins.md");
+
+/// Extract the first fenced YAML block whose `plugin_name` is this plugin,
+/// substituting the documented `${...}` environment placeholders with fixture
+/// values so admission exercises the shape rather than the operator's secrets.
+fn first_oidc_yaml_example(doc: &str) -> Option<String> {
+    let mut remaining = doc;
+    while let Some(start) = remaining.find("```yaml\n") {
+        let body = &remaining[start + "```yaml\n".len()..];
+        let end = body.find("\n```")?;
+        let block = &body[..end];
+        remaining = &body[end..];
+        if !block.starts_with("plugin_name: oidc_relying_party") {
+            continue;
+        }
+        return Some(
+            block
+                .replace("${OIDC_CLIENT_SECRET}", "fixture-client-secret")
+                .replace(
+                    "${OIDC_SESSION_SECRET_32_BYTES_MIN}",
+                    "01234567890123456789012345678901",
+                ),
+        );
+    }
+    None
+}
+
+/// The published `OidcRelyingPartyConfig` component and constructor admission
+/// must agree on what a valid plugin config is. The component previously
+/// accepted missing scopes, missing or conflicting endpoint sets, missing client
+/// credentials, short encryption secrets, disallowed statuses, oversized
+/// cookies, negative durations, and invalid cross-field combinations, while
+/// rejecting the runtime-supported capitalized `SameSite` and nullable optional
+/// values (issue #5035).
+///
+/// Only constraints a JSON Schema can express are listed here. Cross-object
+/// rules the constructor also enforces (`refresh_skew_secs <= ttl_secs / 2`,
+/// `callback_path` against `redirect_uri`, `logout_path` collisions, and
+/// key/algorithm pairing) stay constructor-only by design and have their own
+/// tests.
+#[test]
+fn the_config_component_agrees_with_constructor_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/OidcRelyingPartyConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("OidcRelyingPartyConfig compiles");
+
+    let case = |label: &str, config: serde_json::Value, admitted: bool| {
+        assert_eq!(
+            validator.is_valid(&config),
+            admitted,
+            "schema verdict for '{label}' disagrees with the constructor contract"
+        );
+        assert_eq!(
+            validate_plugin_config("oidc_relying_party", &config).is_ok(),
+            admitted,
+            "constructor verdict for '{label}' disagrees with the schema"
+        );
+    };
+    let drop_provider = |key: &str| {
+        let mut config = base_config();
+        config["providers"][0]
+            .as_object_mut()
+            .expect("provider object")
+            .remove(key);
+        config
+    };
+    let provider = |key: &str, value: serde_json::Value| {
+        let mut config = base_config();
+        config["providers"][0][key] = value;
+        config
+    };
+    let session = |key: &str, value: serde_json::Value| {
+        let mut config = base_config();
+        config["session"][key] = value;
+        config
+    };
+    let behavior = |key: &str, value: serde_json::Value| {
+        let mut config = base_config();
+        config["behavior"][key] = value;
+        config
+    };
+
+    let mut no_endpoints = base_config();
+    for key in ["authorization_endpoint", "token_endpoint", "jwks_uri"] {
+        no_endpoints["providers"][0]
+            .as_object_mut()
+            .expect("provider object")
+            .remove(key);
+    }
+    let discovery_conflict = provider(
+        "discovery_url",
+        json!("https://issuer.example.com/.well-known/openid-configuration"),
+    );
+    let mut same_site_none_insecure = session("same_site", json!("none"));
+    same_site_none_insecure["session"]["secure"] = json!(false);
+    let mut null_behavior = base_config();
+    null_behavior["behavior"] = json!(null);
+    let fragment_redirect = provider(
+        "redirect_uri",
+        json!("https://app.example.com/oauth/callback#x"),
+    );
+    let mut redirect_param_without_hosts = base_config();
+    redirect_param_without_hosts["behavior"]
+        .as_object_mut()
+        .expect("behavior object")
+        .remove("trusted_redirect_hosts");
+
+    case("valid base config", base_config(), true);
+    case("scopes omitted", drop_provider("scopes"), false);
+    case(
+        "scopes without openid",
+        provider("scopes", json!(["profile"])),
+        false,
+    );
+    case("no endpoint set", no_endpoints, false);
+    case(
+        "discovery plus explicit endpoints",
+        discovery_conflict,
+        false,
+    );
+    case("client_auth omitted", drop_provider("client_auth"), false);
+    case(
+        "client_auth without a secret",
+        provider("client_auth", json!({})),
+        false,
+    );
+    case(
+        "private_key_jwt without a key",
+        provider("client_auth", json!({"method": "private_key_jwt"})),
+        false,
+    );
+    case(
+        "non-string client_auth.method",
+        provider("client_auth", json!({"method": 9, "client_secret": "s"})),
+        false,
+    );
+    case("redirect_uri with a fragment", fragment_redirect, false);
+    case(
+        "clock skew above the bound",
+        provider("id_token_clock_skew_secs", json!(3601)),
+        false,
+    );
+    case(
+        "null optional endpoint",
+        provider("userinfo_endpoint", json!(null)),
+        true,
+    );
+    case(
+        "short encryption secret",
+        session("encryption_secret", json!("too-short")),
+        false,
+    );
+    case("negative ttl", session("ttl_secs", json!(-1)), false);
+    case("zero ttl", session("ttl_secs", json!(0)), false);
+    case(
+        "oversized cookie cap",
+        session("max_cookie_bytes", json!(9000)),
+        false,
+    );
+    case(
+        "zero cookie cap",
+        session("max_cookie_bytes", json!(0)),
+        false,
+    );
+    case(
+        "unsupported session store",
+        session("store", json!("redis")),
+        false,
+    );
+    case(
+        "cookie name with a delimiter",
+        session("cookie_name", json!("bad;cookie")),
+        false,
+    );
+    case(
+        "domain carrying a scheme",
+        session("domain", json!("https://example.test")),
+        false,
+    );
+    case(
+        "SameSite=None without secure",
+        same_site_none_insecure,
+        false,
+    );
+    case(
+        "capitalized SameSite",
+        session("same_site", json!("Lax")),
+        true,
+    );
+    case("null behavior object", null_behavior, true);
+    case(
+        "disallowed challenge status",
+        behavior("challenge_html_status", json!(200)),
+        false,
+    );
+    case(
+        "disallowed API challenge status",
+        behavior("challenge_api_status", json!(500)),
+        false,
+    );
+    case(
+        "state ttl above the bound",
+        behavior("state_ttl_secs", json!(3601)),
+        false,
+    );
+    case(
+        "redirect param without trusted hosts",
+        redirect_param_without_hosts,
+        false,
+    );
+    case(
+        "unknown session field",
+        session("redis_url", json!("redis://x")),
+        false,
+    );
 }

@@ -53,7 +53,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use tracing::{debug, warn};
-use url::Url;
+use url::{Host, Url};
 
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -359,10 +359,10 @@ pub(crate) struct CorsRequestState {
     matched_origin: Option<String>,
     all_wildcard: bool,
     allow_credentials: bool,
-    allowed_methods: Option<Arc<Vec<String>>>,
-    allowed_method_union: Option<Vec<String>>,
-    allowed_headers: Option<Arc<Vec<String>>>,
-    allowed_header_union: Option<Vec<String>>,
+    allowed_methods: Option<CorsTokenSet>,
+    allowed_method_union: Option<CorsTokenSet>,
+    allowed_headers: Option<CorsTokenSet>,
+    allowed_header_union: Option<CorsTokenSet>,
     exposed_headers: Option<Arc<Vec<String>>>,
     max_age: Option<Option<u64>>,
     forward_preflight: bool,
@@ -428,23 +428,104 @@ fn contains_ascii_case(values: &[String], candidate: &str) -> bool {
         .any(|value| value.eq_ignore_ascii_case(candidate))
 }
 
+#[derive(Debug, Clone, Copy)]
+enum CorsTokenKind {
+    Method,
+    Header,
+}
+
+impl CorsTokenKind {
+    fn contains(self, values: &[String], candidate: &str) -> bool {
+        match self {
+            Self::Method => values.iter().any(|value| value == candidate),
+            Self::Header => contains_ascii_case(values, candidate),
+        }
+    }
+
+    fn wildcard_covers(self, candidate: &str) -> bool {
+        match self {
+            Self::Method => true,
+            Self::Header => !candidate.eq_ignore_ascii_case("authorization"),
+        }
+    }
+}
+
+/// Keep wildcard meaning attached to the originating policy. In particular,
+/// dropping credentials during composition must not turn a sibling's literal
+/// `*` into permission for every method or header.
+#[derive(Debug, Clone)]
+struct CorsTokenSet {
+    values: Arc<Vec<String>>,
+    kind: CorsTokenKind,
+    wildcard: bool,
+}
+
+impl CorsTokenSet {
+    fn new(values: Vec<String>, kind: CorsTokenKind, allow_credentials: bool) -> Self {
+        let wildcard = !allow_credentials && values.iter().any(|value| value == "*");
+        Self {
+            values: Arc::new(values),
+            kind,
+            wildcard,
+        }
+    }
+
+    fn allows(&self, candidate: &str) -> bool {
+        self.kind.contains(&self.values, candidate)
+            || (self.wildcard && self.kind.wildcard_covers(candidate))
+    }
+
+    fn combine(&self, other: &Self, intersection: bool) -> Self {
+        let mut values = Vec::new();
+        for value in self.values.iter().chain(other.values.iter()) {
+            if (!intersection || (self.allows(value) && other.allows(value)))
+                && !self.kind.contains(&values, value)
+            {
+                values.push(value.clone());
+            }
+        }
+        Self {
+            values: Arc::new(values),
+            kind: self.kind,
+            wildcard: if intersection {
+                self.wildcard && other.wildcard
+            } else {
+                self.wildcard || other.wildcard
+            },
+        }
+    }
+
+    fn response_value(&self, allow_credentials: bool) -> Option<String> {
+        if self.values.is_empty() {
+            return None;
+        }
+        if self.wildcard || allow_credentials || !self.values.iter().any(|value| value == "*") {
+            return Some(self.values.join(", "));
+        }
+        let values: Vec<&str> = self
+            .values
+            .iter()
+            .map(String::as_str)
+            .filter(|value| *value != "*")
+            .collect();
+        if values.is_empty() {
+            None
+        } else {
+            Some(values.join(", "))
+        }
+    }
+}
+
 fn intersect_values(
-    intersection: &mut Option<Arc<Vec<String>>>,
-    union: &mut Option<Vec<String>>,
-    values: &Arc<Vec<String>>,
+    intersection: &mut Option<CorsTokenSet>,
+    union: &mut Option<CorsTokenSet>,
+    values: &CorsTokenSet,
 ) {
     match intersection.take() {
-        None => *intersection = Some(Arc::clone(values)),
+        None => *intersection = Some(values.clone()),
         Some(existing) => {
-            let union = union.get_or_insert_with(|| existing.as_ref().clone());
-            for value in values.iter() {
-                if !contains_ascii_case(union, value) {
-                    union.push(value.clone());
-                }
-            }
-            let mut narrowed = existing.as_ref().clone();
-            narrowed.retain(|value| contains_ascii_case(values, value));
-            *intersection = Some(Arc::new(narrowed));
+            *union = Some(union.as_ref().unwrap_or(&existing).combine(values, false));
+            *intersection = Some(existing.combine(values, true));
         }
     }
 }
@@ -544,8 +625,8 @@ fn origin_pattern_breadth(pattern: &OriginPattern) -> OriginPolicyBreadth {
 /// backend services do not need to implement CORS themselves.
 pub struct CorsPlugin {
     allowed_origins: AllowedOrigins,
-    allowed_methods: Arc<Vec<String>>,
-    allowed_headers: Arc<Vec<String>>,
+    allowed_methods: CorsTokenSet,
+    allowed_headers: CorsTokenSet,
     exposed_headers: Arc<Vec<String>>,
     allow_credentials: bool,
     max_age: Option<u64>,
@@ -659,8 +740,16 @@ impl CorsPlugin {
 
         Ok(Self {
             allowed_origins,
-            allowed_methods: Arc::new(allowed_methods),
-            allowed_headers: Arc::new(allowed_headers),
+            allowed_methods: CorsTokenSet::new(
+                allowed_methods,
+                CorsTokenKind::Method,
+                allow_credentials,
+            ),
+            allowed_headers: CorsTokenSet::new(
+                allowed_headers,
+                CorsTokenKind::Header,
+                allow_credentials,
+            ),
             exposed_headers: Arc::new(exposed_headers),
             allow_credentials,
             max_age,
@@ -1052,10 +1141,8 @@ impl Plugin for CorsPlugin {
         if self.unmatched_preflights == UnmatchedPreflights::Reject
             && let Some(requested_method) = ctx.headers.get("access-control-request-method")
         {
-            let method_allowed = self
-                .allowed_methods
-                .iter()
-                .any(|m| m.eq_ignore_ascii_case(requested_method));
+            let method_allowed = Method::from_bytes(requested_method.as_bytes()).is_ok()
+                && self.allowed_methods.allows(requested_method);
             if !method_allowed {
                 ctx.cors_state.response_allowed = false;
                 debug!("cors: preflight rejected for disallowed method");
@@ -1200,29 +1287,29 @@ fn finalize_cors_request(ctx: &mut RequestContext) -> PluginResult {
     // origin/credentials/exposure policy appropriate to that phase; browsers
     // do not repeat Access-Control-Request-* on the actual request.
     if state.policy_count > 1 && state.is_preflight {
-        let methods = state
-            .allowed_methods
-            .as_ref()
-            .map(|values| values.as_slice())
-            .unwrap_or_default();
-        let method_union = state.allowed_method_union.as_deref().unwrap_or_default();
         if let Some(requested_method) = ctx.headers.get("access-control-request-method")
-            && contains_ascii_case(method_union, requested_method)
-            && !contains_ascii_case(methods, requested_method)
+            && state
+                .allowed_method_union
+                .as_ref()
+                .is_some_and(|values| values.allows(requested_method))
+            && !state
+                .allowed_methods
+                .as_ref()
+                .is_some_and(|values| values.allows(requested_method))
         {
             return cors_reject("CORS method not allowed");
         }
         if let Some(requested_headers) = ctx.headers.get("access-control-request-headers") {
-            let headers = state
-                .allowed_headers
-                .as_ref()
-                .map(|values| values.as_slice())
-                .unwrap_or_default();
-            let header_union = state.allowed_header_union.as_deref().unwrap_or_default();
             for requested in requested_headers.split(',').map(str::trim) {
                 if !requested.is_empty()
-                    && contains_ascii_case(header_union, requested)
-                    && !contains_ascii_case(headers, requested)
+                    && state
+                        .allowed_header_union
+                        .as_ref()
+                        .is_some_and(|values| values.allows(requested))
+                    && !state
+                        .allowed_headers
+                        .as_ref()
+                        .is_some_and(|values| values.allows(requested))
                 {
                     return cors_reject("CORS header not allowed");
                 }
@@ -1275,26 +1362,24 @@ fn finalize_cors_response(
     if should_sanitize && (!is_rejection_path || policy_owns_rejection) {
         CorsPlugin::remove_access_control_headers(response_headers);
     }
+    // Origin absence and an unmatched origin select different representations
+    // too. Publish the cache selection inputs before either early return.
+    if should_sanitize {
+        let vary = merge_vary_tokens(
+            response_headers.get("vary").map(String::as_str),
+            cors_vary_tokens(ctx.cors_state.is_preflight),
+        );
+        response_headers.insert("vary".to_string(), vary);
+    }
     if ctx.cors_state.policy_count == 0 || !ctx.cors_state.response_allowed {
         return PluginResult::Continue;
     }
 
-    let existing_vary = response_headers.get("vary").cloned();
     let cors_headers = cors_headers(ctx, ctx.cors_state.is_preflight);
-    for (name, mut value) in cors_headers {
-        if name == "vary" {
-            let required = if ctx.cors_state.is_preflight {
-                &[
-                    "Origin",
-                    "Access-Control-Request-Method",
-                    "Access-Control-Request-Headers",
-                ][..]
-            } else {
-                &["Origin"][..]
-            };
-            value = merge_vary_tokens(existing_vary.as_deref(), required);
+    for (name, value) in cors_headers {
+        if name != "vary" {
+            response_headers.insert(name, value);
         }
-        response_headers.insert(name, value);
     }
     PluginResult::Continue
 }
@@ -1340,45 +1425,44 @@ fn cors_headers(ctx: &RequestContext, preflight: bool) -> HashMap<String, String
         if let Some(methods) = state
             .allowed_methods
             .as_ref()
-            .filter(|values| !values.is_empty())
+            .and_then(|values| values.response_value(state.allow_credentials))
         {
-            headers.insert(
-                "access-control-allow-methods".to_string(),
-                methods.join(", "),
-            );
+            headers.insert("access-control-allow-methods".to_string(), methods);
         }
         if let Some(allowed) = state
             .allowed_headers
             .as_ref()
-            .filter(|values| !values.is_empty())
+            .and_then(|values| values.response_value(state.allow_credentials))
         {
-            headers.insert(
-                "access-control-allow-headers".to_string(),
-                allowed.join(", "),
-            );
+            headers.insert("access-control-allow-headers".to_string(), allowed);
         }
         if let Some(Some(max_age)) = state.max_age {
             headers.insert("access-control-max-age".to_string(), max_age.to_string());
         }
     }
 
-    let vary_tokens = if preflight {
+    headers.insert(
+        "vary".to_string(),
+        merge_vary_tokens(None, cors_vary_tokens(preflight)),
+    );
+    headers
+}
+
+fn cors_vary_tokens(preflight: bool) -> &'static [&'static str] {
+    if preflight {
         &[
             "Origin",
             "Access-Control-Request-Method",
             "Access-Control-Request-Headers",
-        ][..]
+        ]
     } else {
-        &["Origin"][..]
-    };
-    let vary = merge_vary_tokens(headers.get("vary").map(String::as_str), vary_tokens);
-    headers.insert("vary".to_string(), vary);
-    headers
+        &["Origin"]
+    }
 }
 
 fn merge_vary_tokens(existing: Option<&str>, required: &[&str]) -> String {
     let mut merged = existing.unwrap_or_default().trim().to_string();
-    if merged == "*" {
+    if merged.split(',').any(|token| token.trim() == "*") {
         return merged;
     }
     for required in required {
@@ -1529,16 +1613,38 @@ fn validate_wildcard_origin(origin: &str) -> Result<String, String> {
         ));
     };
     if suffix.is_empty()
-        || suffix.contains('*')
-        || suffix.contains('/')
-        || suffix.contains(':')
-        || suffix.contains(char::is_whitespace)
+        || suffix.contains(['*', '/', '\\', ':', '?', '#', '@', '%'])
+        || suffix.chars().any(|c| c.is_whitespace() || c.is_control())
     {
         return Err(format!(
-            "cors: wildcard origin must be a hostname suffix without scheme, port, path, or whitespace: {origin}"
+            "cors: wildcard origin must be a hostname suffix without URL delimiters, percent-encoding, or whitespace: {origin}"
         ));
     }
-    Ok(format!(".{}", suffix.to_ascii_lowercase()))
+    // WHATWG host parsing applies IDNA once on the cold path, matching the
+    // ASCII hostname that browsers serialize in Origin. A suffix is a DNS
+    // hostname, never an IP literal; validate labels after normalization.
+    let Ok(Host::Domain(domain)) = Host::parse(suffix) else {
+        return Err(format!(
+            "cors: wildcard origin must contain a valid DNS hostname suffix: {origin}"
+        ));
+    };
+    let hostname = domain.strip_suffix('.').unwrap_or(&domain);
+    if hostname.len() > 253
+        || hostname.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+    {
+        return Err(format!(
+            "cors: wildcard origin must contain valid DNS hostname labels: {origin}"
+        ));
+    }
+    Ok(format!(".{domain}"))
 }
 
 /// Validate and canonicalize an exact origin on the config/reload path.

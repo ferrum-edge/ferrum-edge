@@ -3981,3 +3981,328 @@ async fn final_hook_malformed_json_reject_logs_detail_at_debug() {
         "expected final-hook malformed-json detail in log, got: {captured:?}"
     );
 }
+
+// ─── Prompt-character accounting: Converse tool use and Cohere documents ──
+
+/// `before_proxy` admission under a `max_prompt_characters` cap.
+async fn prompt_cap_result(body: &serde_json::Value, cap: u64) -> PluginResult {
+    let plugin = AiRequestGuard::new(&json!({"max_prompt_characters": cap})).unwrap();
+    let mut ctx = make_post_ctx(body);
+    let mut headers = make_post_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await
+}
+
+/// The same cap through the final-body pass that re-runs policy after every
+/// `transform_request_body` hook. Both passes share one counter, so a shape
+/// counted in only one of them is a bug.
+async fn final_prompt_cap_result(body: &serde_json::Value, cap: u64) -> PluginResult {
+    let plugin = AiRequestGuard::new(&json!({"max_prompt_characters": cap})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.metadata.insert(
+        plugin.final_inspection_marker_key().to_string(),
+        "true".to_string(),
+    );
+    let headers = make_post_headers();
+    let encoded = serde_json::to_vec(body).unwrap();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &encoded)
+        .await
+}
+
+/// Asserts `body` counts exactly `expected` prompt characters: admitted at that
+/// cap and refused one character below it, on both policy passes. Pinning the
+/// boundary from both sides proves the shape was counted rather than merely
+/// that some other field pushed the request over.
+async fn assert_counted_prompt_characters(body: &serde_json::Value, expected: u64, label: &str) {
+    let below = expected - 1;
+    for (cap, admitted) in [(expected, true), (below, false)] {
+        let early = prompt_cap_result(body, cap).await;
+        let final_pass = final_prompt_cap_result(body, cap).await;
+        assert!(
+            matches!(early, PluginResult::Continue) == admitted,
+            "{label}: before_proxy at cap {cap} disagreed with {expected}"
+        );
+        assert!(
+            matches!(final_pass, PluginResult::Continue) == admitted,
+            "{label}: final-body pass at cap {cap} disagreed with {expected}"
+        );
+    }
+}
+
+/// Canonical Bedrock Converse tool-use arguments are model-visible input, so
+/// they count toward `max_prompt_characters`. The Converse `ContentBlock` union
+/// spells the call as an untyped `{"toolUse": {...}}` member rather than the
+/// typed Anthropic `{"type": "tool_use", ...}` block, so a reader that matches
+/// only the typed spelling admits the whole argument payload as zero characters.
+#[tokio::test]
+async fn prompt_characters_count_bedrock_converse_tool_use_arguments() {
+    let converse = json!({
+        "messages": [
+            {"role": "user", "content": [{"text": "hi"}]},
+            {
+                "role": "assistant",
+                "content": [{
+                    "toolUse": {
+                        "toolUseId": "tooluse_0123456789abcdef",
+                        "name": "lookup_account_history",
+                        "input": {"account": "0123456789"}
+                    }
+                }]
+            }
+        ]
+    });
+
+    // "hi" (2) plus the `input` argument value "0123456789" (10). Argument
+    // member names and the sibling `toolUseId`/`name` call plumbing are not
+    // counted, matching the typed Anthropic spelling below.
+    assert_counted_prompt_characters(&converse, 12, "converse toolUse.input").await;
+
+    // The typed spelling still counts its arguments exactly once.
+    let typed = json!({
+        "messages": [{
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_0123456789abcdef",
+                "name": "lookup_account_history",
+                "input": {"account": "0123456789"}
+            }]
+        }]
+    });
+    assert_counted_prompt_characters(&typed, 10, "anthropic tool_use input").await;
+}
+
+/// Cohere v1 `documents` entries are arbitrary string-to-string maps and the
+/// provider serializes their eligible members into the prompt the model reads,
+/// so every eligible member counts. The generic content selector picks at most
+/// one recognized `text`/`content` member per object, which leaves a document's
+/// other documented members outside the cap.
+#[tokio::test]
+async fn prompt_characters_count_every_eligible_cohere_document_member() {
+    let body = json!({
+        "model": "command-r",
+        "message": "hi",
+        "documents": [{
+            "id": "doc_0",
+            "title": "Quarterly",
+            "snippet": "revenue up"
+        }]
+    });
+
+    // "hi" (2) + "Quarterly" (9) + "revenue up" (10). `id` is the citation
+    // identifier the provider keeps out of the model-visible rendering, and
+    // member names are structure rather than operator-supplied prose.
+    assert_counted_prompt_characters(&body, 21, "cohere documents[] map").await;
+}
+
+/// `_excludes` names the members Cohere drops from the model-visible rendering,
+/// so neither the control list nor the members it names are prompt text.
+#[tokio::test]
+async fn prompt_characters_skip_cohere_document_members_the_provider_excludes() {
+    let excluded = json!({
+        "documents": [{
+            "id": "0123456789",
+            "title": "abcde",
+            "url": "https://excluded.test/a/very/long/path",
+            "_excludes": ["url"]
+        }]
+    });
+    assert_counted_prompt_characters(&excluded, 5, "cohere _excludes").await;
+
+    // Without the control, the same member is ordinary model-visible text.
+    let included = json!({
+        "documents": [{"title": "abcde", "url": "1234567890"}]
+    });
+    assert_counted_prompt_characters(&included, 15, "cohere document url").await;
+}
+
+/// A `documents[]` entry carrying a `type` discriminator is a content *part*,
+/// not a document map: non-text multimodal parts stay out of prose accounting
+/// even when they sit beside a counted document, and an Anthropic text document
+/// keeps its existing `source.data` accounting.
+#[tokio::test]
+async fn prompt_characters_keep_typed_document_parts_out_of_map_accounting() {
+    let with_image = json!({
+        "documents": [
+            {"title": "abcde"},
+            {
+                "type": "image",
+                "image_url": {"url": "data:image/png;base64,QUJDREVGR0hJSktM"}
+            }
+        ]
+    });
+    assert_counted_prompt_characters(&with_image, 5, "typed image part").await;
+
+    let text_document = json!({
+        "documents": [{
+            "type": "document",
+            "source": {"type": "text", "media_type": "text/plain", "data": "abcde"}
+        }]
+    });
+    assert_counted_prompt_characters(&text_document, 5, "anthropic text document").await;
+}
+
+// ─── Numeric configuration contract parity (#5323) ───────────────────────
+
+/// The four unsigned limits the constructor reads through `Value::as_u64`.
+const UNSIGNED_LIMIT_FIELDS: [&str; 4] = [
+    "max_tokens_limit",
+    "default_max_tokens",
+    "max_messages",
+    "max_prompt_characters",
+];
+
+fn openapi_document() -> serde_json::Value {
+    serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi parses")
+}
+
+/// Compile the published `AiRequestGuardConfig` component so admission cases can
+/// be checked against the schema operator tooling actually consumes.
+fn openapi_config_validator() -> jsonschema::Validator {
+    let spec = openapi_document();
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/AiRequestGuardConfig",
+        "components": spec["components"].clone()
+    });
+    jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("AiRequestGuardConfig compiles")
+}
+
+/// Issue #5323: the published component and the constructor must reach the same
+/// verdict on the four unsigned numeric limits, so a schema-driven form cannot
+/// approve a configuration file-mode validation then refuses.
+#[test]
+fn unsigned_numeric_limits_agree_with_the_published_component() {
+    let validator = openapi_config_validator();
+
+    for field in UNSIGNED_LIMIT_FIELDS {
+        // Zero and the unsigned maximum are in contract on both surfaces; zero
+        // is a valid, maximally strict setting rather than "unset".
+        for accepted in ["0", "18446744073709551615"] {
+            let raw = format!("{{\"{field}\": {accepted}}}");
+            let config: serde_json::Value = serde_json::from_str(&raw).expect("fixture parses");
+            assert!(
+                AiRequestGuard::new(&config).is_ok(),
+                "constructor must accept {raw}"
+            );
+            assert!(validator.is_valid(&config), "schema must accept {raw}");
+        }
+
+        // Negative, fractional, and non-numeric spellings are out of contract on
+        // both surfaces.
+        for rejected in ["-1", "1.5", "\"10\"", "true", "null"] {
+            let raw = format!("{{\"{field}\": {rejected}}}");
+            let config: serde_json::Value = serde_json::from_str(&raw).expect("fixture parses");
+            assert!(
+                AiRequestGuard::new(&config).is_err(),
+                "constructor must reject {raw}"
+            );
+            assert!(!validator.is_valid(&config), "schema must reject {raw}");
+        }
+
+        // Above the unsigned maximum the constructor still refuses. A JSON
+        // parser that falls back to `f64` cannot tell this value apart from
+        // `u64::MAX`, so the published `maximum` is what an arbitrary-precision
+        // validator enforces; the declaration itself is pinned below.
+        let raw = format!("{{\"{field}\": 18446744073709551616}}");
+        let config: serde_json::Value = serde_json::from_str(&raw).expect("fixture parses");
+        assert!(
+            AiRequestGuard::new(&config).is_err(),
+            "constructor must reject {raw}"
+        );
+    }
+}
+
+/// The bounds themselves are pinned: an arbitrary-precision validator — the
+/// operator tooling this parity protects — needs `minimum`/`maximum` present,
+/// not just `type: integer`.
+#[test]
+fn published_component_declares_unsigned_bounds_on_every_numeric_limit() {
+    let spec = openapi_document();
+    let properties = &spec["components"]["schemas"]["AiRequestGuardConfig"]["properties"];
+
+    for field in UNSIGNED_LIMIT_FIELDS {
+        let property = &properties[field];
+        assert_eq!(property["type"], json!("integer"), "{field} type");
+        assert_eq!(property["format"], json!("uint64"), "{field} format");
+        assert_eq!(property["minimum"], json!(0), "{field} minimum");
+        assert_eq!(
+            property["maximum"],
+            json!(18446744073709551615u64),
+            "{field} maximum"
+        );
+    }
+}
+
+/// Both construction-time relationships are outside what JSON Schema 2020-12
+/// can express, so the component admits them and the constructor refuses them.
+/// The published description has to say so, otherwise a schema-driven form
+/// silently generates configurations the gateway then rejects.
+#[test]
+fn cross_field_relationships_are_documented_as_supplemental_validation() {
+    let validator = openapi_config_validator();
+
+    for contradiction in [
+        json!({"default_max_tokens": 11, "max_tokens_limit": 10}),
+        json!({"temperature_range": [1.0, 0.0]}),
+    ] {
+        assert!(
+            validator.is_valid(&contradiction),
+            "JSON Schema cannot compare siblings: {contradiction}"
+        );
+        assert!(
+            AiRequestGuard::new(&contradiction).is_err(),
+            "construction must refuse {contradiction}"
+        );
+    }
+
+    let spec = openapi_document();
+    let component = &spec["components"]["schemas"]["AiRequestGuardConfig"];
+    let description = component["description"].as_str().expect("description");
+    for promise in [
+        "unsigned 64-bit integers",
+        "supplemental validation",
+        "`temperature_range[0]`",
+    ] {
+        assert!(
+            description.contains(promise),
+            "component description must state {promise}"
+        );
+    }
+}
+
+/// The documented example and the empty/no-policy/unknown-key rejections must
+/// survive the numeric-bounds change on both surfaces.
+#[test]
+fn documented_example_and_rejections_survive_the_numeric_bounds() {
+    let validator = openapi_config_validator();
+    let documented = json!({
+        "supported_schema": "auto",
+        "strict_schema": true,
+        "allowed_models": ["gpt-4o-mini", "gpt-4o", "claude-sonnet-4-20250514"],
+        "blocked_models": ["o3"],
+        "max_tokens_limit": 4096,
+        "enforce_max_tokens": "clamp",
+        "default_max_tokens": 1024,
+        "max_prompt_characters": 24000,
+        "block_system_prompts": true,
+        "system_prompt_aliases": ["policy"]
+    });
+    assert!(AiRequestGuard::new(&documented).is_ok());
+    assert!(validator.is_valid(&documented));
+
+    for refused in [
+        json!({}),
+        json!({"allowed_models": []}),
+        json!({"max_messages": 10, "max_message": 10}),
+    ] {
+        assert!(
+            AiRequestGuard::new(&refused).is_err(),
+            "construction must refuse {refused}"
+        );
+        assert!(!validator.is_valid(&refused), "schema refuses {refused}");
+    }
+}

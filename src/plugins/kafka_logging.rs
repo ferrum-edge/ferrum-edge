@@ -301,6 +301,13 @@ pub fn normalize_broker_list(broker_list: &str) -> String {
 /// when unset. Returns `None` when the value is present but unrecognized —
 /// `KafkaSecurityProtocol::parse` reports that shape error with a better
 /// message, and screening must not invent a protocol-mismatch error on top.
+/// The pre-screen's reading of `security_protocol`, used only to decide which
+/// `proto://` prefixes agree with the configuration before the plugin is built.
+///
+/// Deliberately more forgiving than [`KafkaSecurityProtocol::parse`], which is
+/// the authority and requires the canonical lowercase spelling: this runs ahead
+/// of construction, and a value the constructor will reject must still reach
+/// that named diagnostic rather than fail here as an egress-screen error.
 fn configured_security_protocol(config: &Value) -> Option<String> {
     match config.get("security_protocol") {
         None | Some(Value::Null) => Some("plaintext".to_string()),
@@ -384,6 +391,78 @@ pub fn screen_kafka_broker_list_egress(
     Ok(())
 }
 
+/// Kafka's own topic-name limit (`org.apache.kafka.common.internals.Topic`,
+/// `MAX_NAME_LENGTH`).
+pub const MAX_KAFKA_TOPIC_NAME_LENGTH: usize = 249;
+
+/// librdkafka's `message.timeout.ms` upper bound (pinned CONFIGURATION.md);
+/// `0` means "no local timeout".
+pub const MAX_MESSAGE_TIMEOUT_MS: u64 = 2_147_483_647;
+
+/// One character Kafka accepts in a topic name: ASCII letters, digits, `.`,
+/// `_`, and `-`.
+fn is_kafka_topic_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+}
+
+/// Reject topic names Kafka can never create.
+///
+/// librdkafka forwards the configured topic verbatim and only learns it is
+/// invalid from broker metadata, so a deterministic syntax error used to pass
+/// admission, start a live sink, and then lose every record while requests kept
+/// succeeding (#5213). The rule is Apache Kafka's own `Topic.validate`: one to
+/// [`MAX_KAFKA_TOPIC_NAME_LENGTH`] characters drawn from ASCII letters, digits,
+/// `.`, `_`, and `-`, and never `.` or `..`.
+///
+/// This is syntax only — whether an otherwise valid topic exists, or may be
+/// auto-created, remains a runtime broker decision.
+fn validate_kafka_topic_name(topic: &str) -> Result<(), String> {
+    if topic == "." || topic == ".." {
+        return Err(format!(
+            "kafka_logging: 'topic' must not be '{topic}' (Kafka reserves '.' and '..')"
+        ));
+    }
+    if topic.chars().count() > MAX_KAFKA_TOPIC_NAME_LENGTH {
+        return Err(format!(
+            "kafka_logging: 'topic' must be at most {MAX_KAFKA_TOPIC_NAME_LENGTH} characters"
+        ));
+    }
+    if let Some(offending) = topic
+        .chars()
+        .find(|character| !is_kafka_topic_char(*character))
+    {
+        // Escape the offending character so a control byte cannot reshape the
+        // diagnostic, and name only that character rather than the whole value.
+        return Err(format!(
+            "kafka_logging: 'topic' contains unsupported character '{}' (Kafka topic \
+             names use ASCII letters, digits, '.', '_', and '-')",
+            offending.escape_debug()
+        ));
+    }
+    Ok(())
+}
+
+/// `producer_config` keys librdkafka accepts but this sink cannot honour.
+/// Values are `(librdkafka key, why it is refused)`.
+///
+/// A transactional producer requires `init_transactions` / `begin_transaction`
+/// / `commit_transaction` around every send. The logging lifecycle owns no
+/// transaction, so librdkafka rejects each record locally and the configured
+/// sink can never deliver (#5215). Refusing the property at admission is
+/// fail-closed and surfaces the limitation immediately instead of publishing a
+/// permanently unusable generation.
+const UNSUPPORTED_PRODUCER_KEYS: &[(&str, &str)] = &[
+    (
+        "transactional.id",
+        "the Kafka logging sink never begins or commits a Kafka transaction, so a \
+         transactional producer rejects every record",
+    ),
+    (
+        "delivery.report.only.error",
+        "delivery reporting is managed by the Kafka logging sink for every terminal outcome",
+    ),
+];
+
 /// `producer_config` keys that alias top-level security controls and must not
 /// silently override them after validation. Values are `(librdkafka key,
 /// authoritative top-level field)`.
@@ -425,11 +504,7 @@ enum KafkaSecurityProtocol {
 
 impl KafkaSecurityProtocol {
     fn parse(config: &Value) -> Result<Self, String> {
-        match optional_non_empty_string(config, "security_protocol")?
-            .unwrap_or_else(|| "plaintext".to_string())
-            .to_ascii_lowercase()
-            .as_str()
-        {
+        match optional_exact_string(config, "security_protocol")?.unwrap_or("plaintext") {
             "plaintext" => Ok(Self::Plaintext),
             "ssl" => Ok(Self::Ssl),
             "sasl_plaintext" => Ok(Self::SaslPlaintext),
@@ -474,8 +549,10 @@ impl KafkaSecuritySettings {
     fn parse(config: &Value, http_client: &PluginHttpClient) -> Result<Self, String> {
         let protocol = KafkaSecurityProtocol::parse(config)?;
         let sasl_mechanism = optional_non_empty_string(config, "sasl_mechanism")?;
-        let sasl_username = optional_non_empty_string(config, "sasl_username")?;
-        let sasl_password = optional_non_empty_string(config, "sasl_password")?;
+        // Credential bytes go to the broker verbatim — see
+        // `optional_credential_string` (#5216).
+        let sasl_username = optional_credential_string(config, "sasl_username")?;
+        let sasl_password = optional_credential_string(config, "sasl_password")?;
         let ssl_ca_location = optional_non_empty_string(config, "ssl_ca_location")?;
         let configured_ssl_no_verify = optional_bool(config, "ssl_no_verify")?;
         let ssl_certificate_location =
@@ -613,7 +690,17 @@ impl KafkaDeliveryMetrics {
         self.healthy.store(true, Ordering::Relaxed);
     }
 
+    /// Terminal delivery failure reported by the librdkafka delivery callback
+    /// (broker rejection, expired message, or purge-on-destroy).
+    ///
+    /// The counters beside this one retire with their generation, so the record
+    /// must also be charged to the process-cumulative per-plugin loss family;
+    /// without that, `/status` totals and the common loss alert never see the
+    /// loss at all (#5214). The callback fires at most once per record and is
+    /// mutually exclusive with the immediate-rejection path below, so each lost
+    /// record is charged exactly once.
     fn record_delivery_failed(&self, error: &KafkaError) {
+        sink_loss::record_dropped(KAFKA_PLUGIN_NAME, SinkLossReason::SinkError, 1);
         self.delivery_failed.fetch_add(1, Ordering::Relaxed);
         self.healthy.store(false, Ordering::Relaxed);
         let kind = safe_kafka_error_kind(error);
@@ -621,7 +708,19 @@ impl KafkaDeliveryMetrics {
         self.warn_delivery(kind);
     }
 
+    /// Immediate `ThreadedProducer::send` rejection: librdkafka never took the
+    /// record, so its delivery callback will not fire for it. This is the only
+    /// place that outcome can be charged to the shared loss family (#5214).
+    ///
+    /// The label is [`SinkLossReason::SinkError`], not `QueueFull`, even when
+    /// librdkafka's own queue is what refused it. `QueueFull` is one of the
+    /// four *admission-time* refusals that `accepted` plus the refusals must
+    /// account for (docs/prometheus_metrics.md), and this record was already
+    /// counted as accepted when it entered Ferrum's channel. Charging it here
+    /// would break that identity; `sink_error` is the documented reason for a
+    /// per-record delivery failure on either side of admission.
     fn record_queue_rejected(&self, error: &KafkaError) {
+        sink_loss::record_dropped(KAFKA_PLUGIN_NAME, SinkLossReason::SinkError, 1);
         self.queue_rejected.fetch_add(1, Ordering::Relaxed);
         self.healthy.store(false, Ordering::Relaxed);
         let kind = safe_kafka_error_kind(error);
@@ -1387,7 +1486,7 @@ pub fn render_prometheus() -> String {
 # TYPE ferrum_kafka_logging_in_flight gauge\n",
     );
     output.push_str(
-        "# HELP ferrum_kafka_logging_retained_bytes Ferrum userspace retained payload+key bytes awaiting librdkafka admission.\n\
+        "# HELP ferrum_kafka_logging_retained_bytes Ferrum-charged retained payload+key bytes, held from admission through librdkafka's own copy of the record until terminal delivery, terminal failure, purge, or immediate rejection.\n\
 # TYPE ferrum_kafka_logging_retained_bytes gauge\n",
     );
     output.push_str(
@@ -1494,13 +1593,19 @@ impl KafkaLogging {
         }
         let broker_list = brokers.join(",");
 
-        let topic = required_non_empty_string(config, "topic").ok_or_else(|| {
-            if config.get("topic").is_some() {
-                "kafka_logging: 'topic' must not be empty".to_string()
-            } else {
-                near_miss_hint(object, "topic", "kafka_logging: 'topic' is required")
+        // Kafka topic names are taken verbatim, so they are held to Kafka's own
+        // syntax here rather than trimmed and forwarded (#5213).
+        let topic = match optional_exact_string(config, "topic")? {
+            Some(topic) => topic.to_string(),
+            None => {
+                return Err(near_miss_hint(
+                    object,
+                    "topic",
+                    "kafka_logging: 'topic' is required",
+                ));
             }
-        })?;
+        };
+        validate_kafka_topic_name(&topic)?;
 
         let buffer_capacity = match optional_u64(config, "buffer_capacity")? {
             Some(0) => {
@@ -1563,7 +1668,7 @@ impl KafkaLogging {
             ));
         }
 
-        let key_field = match optional_non_empty_string(config, "key_field")?.as_deref() {
+        let key_field = match optional_exact_string(config, "key_field")? {
             None => KeyField::ClientIp,
             Some("client_ip") => KeyField::ClientIp,
             Some("proxy_id") => KeyField::ProxyId,
@@ -1582,12 +1687,19 @@ impl KafkaLogging {
         kafka_config.set("log.connection.close", "false");
 
         if let Some(value) = optional_u64(config, "message_timeout_ms")? {
+            // Bound it here so an out-of-range value produces a named field
+            // diagnostic instead of librdkafka's opaque `client_config_error`,
+            // and so the OpenAPI component can state the same range (#5217).
+            if value > MAX_MESSAGE_TIMEOUT_MS {
+                return Err(format!(
+                    "kafka_logging: 'message_timeout_ms' must be <= {MAX_MESSAGE_TIMEOUT_MS}"
+                ));
+            }
             kafka_config.set("message.timeout.ms", value.to_string());
         }
 
-        let compression =
-            optional_non_empty_string(config, "compression")?.unwrap_or_else(|| "lz4".to_string());
-        match compression.as_str() {
+        let compression = optional_exact_string(config, "compression")?.unwrap_or("lz4");
+        match compression {
             value @ ("none" | "gzip" | "snappy" | "lz4" | "zstd") => {
                 kafka_config.set("compression.type", value);
             }
@@ -1599,8 +1711,8 @@ impl KafkaLogging {
             }
         }
 
-        if let Some(acks) = optional_non_empty_string(config, "acks")? {
-            match acks.as_str() {
+        if let Some(acks) = optional_exact_string(config, "acks")? {
+            match acks {
                 value @ ("0" | "1" | "all" | "-1") => {
                     kafka_config.set("acks", value);
                 }
@@ -1660,6 +1772,8 @@ impl KafkaLogging {
         for (key, value) in &admitted.extra_props {
             kafka_config.set(key, value);
         }
+        // Every terminal outcome participates in delivery accounting.
+        kafka_config.set("delivery.report.only.error", "false");
 
         kafka_config.set(
             "queue.buffering.max.messages",
@@ -2172,6 +2286,102 @@ pub(crate) fn probe_downstream_lease_ownership_for_test(
     ))
 }
 
+/// Deterministic probe: terminal Kafka outcomes must also reach the
+/// process-cumulative per-plugin loss family, not only the generation counters
+/// that retire with their generation (#5214).
+///
+/// Enqueues `record_count` records against an unroutable broker and then
+/// destroys the producer, so librdkafka purges its queue and fires the delivery
+/// callback for every record it still held. `queue_max_messages` caps
+/// librdkafka's own queue so the immediate-`send`-rejection path is exercised
+/// as well.
+///
+/// Returns `(sink_error_delta, queue_full_delta, delivery_failed, queue_rejected)`.
+/// The first two are deltas on process-wide counters that a concurrently
+/// running test can only increase, so callers must treat them as lower bounds;
+/// the last two are exact for this probe's own generation. `queue_full_delta`
+/// is reported so a caller can assert that a post-admission librdkafka
+/// rejection does *not* land on the admission-time `queue_full` reason.
+#[allow(dead_code)] // reached via `_test_support` from the external test crate
+pub(crate) fn probe_terminal_loss_accounting_for_test(
+    record_count: usize,
+    queue_max_messages: Option<u32>,
+) -> Result<(u64, u64, u64, u64), String> {
+    let sink_error_before = sink_loss::dropped_total(KAFKA_PLUGIN_NAME, SinkLossReason::SinkError);
+    let queue_full_before = sink_loss::dropped_total(KAFKA_PLUGIN_NAME, SinkLossReason::QueueFull);
+
+    let metrics = Arc::new(KafkaDeliveryMetrics::new(u64::MAX - 22));
+    let mut kafka_config = ClientConfig::new();
+    // Unroutable broker: local enqueue succeeds, nothing ever drains, and
+    // producer destruction is what resolves every record terminally.
+    kafka_config.set("bootstrap.servers", "127.0.0.1:1");
+    kafka_config.set("message.timeout.ms", "300000");
+    kafka_config.set("socket.timeout.ms", "1000");
+    if let Some(cap) = queue_max_messages {
+        kafka_config.set("queue.buffering.max.messages", cap.to_string());
+    }
+    let producer: ThreadedProducer<KafkaDeliveryContext> = kafka_config
+        .create_with_context(KafkaDeliveryContext {
+            metrics: Arc::clone(&metrics),
+        })
+        // librdkafka's own error text names only the probe's fixed local
+        // configuration; it carries no credential or payload content.
+        .map_err(|error| {
+            format!(
+                "kafka_logging: terminal-loss probe could not create a librdkafka \
+                 producer for 127.0.0.1:1: {error}"
+            )
+        })?;
+
+    let byte_budget = Arc::new(KafkaByteBudget::new(1_048_576));
+    let mut batch = Vec::with_capacity(record_count);
+    for _ in 0..record_count {
+        let lease = byte_budget.try_acquire(64).ok_or_else(|| {
+            "kafka_logging: terminal-loss probe could not reserve a 64-byte lease".to_string()
+        })?;
+        batch.push(KafkaRecord {
+            payload: Arc::from("{\"probe\":true}"),
+            key: None,
+            lease,
+        });
+    }
+
+    let state = Arc::new(KafkaProducerState {
+        producer,
+        metrics: Arc::clone(&metrics),
+        flush_timeout: Duration::from_millis(500),
+        max_entry_bytes: 64,
+        buffer_max_bytes: 1_048_576,
+        byte_budget: Arc::clone(&byte_budget),
+        finalized: AtomicBool::new(false),
+    });
+    let _ = send_batch(&state, "ferrum-edge-terminal-loss-probe", &batch);
+    drop(batch);
+    // `ThreadedProducer::drop` joins the poll thread and purges queue plus
+    // in-flight, polling until every purged record's callback has run.
+    drop(state);
+
+    Ok((
+        sink_loss::dropped_total(KAFKA_PLUGIN_NAME, SinkLossReason::SinkError) - sink_error_before,
+        sink_loss::dropped_total(KAFKA_PLUGIN_NAME, SinkLossReason::QueueFull) - queue_full_before,
+        metrics.delivery_failed.load(Ordering::Relaxed),
+        metrics.queue_rejected.load(Ordering::Relaxed),
+    ))
+}
+
+/// The exact SASL credential bytes the constructor would hand librdkafka.
+///
+/// Admission alone cannot show that a padded credential survives intact, so the
+/// verbatim contract (#5216) is asserted on the parsed values themselves.
+#[allow(dead_code)] // reached via `_test_support` from the external test crate
+pub(crate) fn parsed_sasl_credentials_for_test(
+    config: &Value,
+    http_client: &PluginHttpClient,
+) -> Result<(Option<String>, Option<String>), String> {
+    let security = KafkaSecuritySettings::parse(config, http_client)?;
+    Ok((security.sasl_username, security.sasl_password))
+}
+
 #[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn serialize_http_with_config_for_test(
     config: &Value,
@@ -2311,6 +2521,16 @@ fn admit_producer_config(
                 "kafka_logging: 'producer_config.{key}' is not allowed"
             ));
         }
+        if let Some((_, rationale)) = UNSUPPORTED_PRODUCER_KEYS
+            .iter()
+            .find(|(unsupported, _)| normalized.as_str() == *unsupported)
+        {
+            // Do not echo the configured value; the property name and the fixed
+            // rationale are enough for an operator to act on.
+            return Err(format!(
+                "kafka_logging: 'producer_config.{key}' is not supported — {rationale}"
+            ));
+        }
         if let Some((_, authoritative)) = FORBIDDEN_PRODUCER_SECURITY_KEYS
             .iter()
             .find(|(forbidden, _)| normalized.as_str() == *forbidden)
@@ -2426,6 +2646,66 @@ fn required_non_empty_string(config: &Value, key: &str) -> Option<String> {
         let value = value.trim();
         (!value.is_empty()).then(|| value.to_string())
     })
+}
+
+/// Parse an enum-valued string field exactly as the OpenAPI component spells
+/// it: a non-empty string matched byte for byte against the accepted set.
+///
+/// Deliberately neither trims nor case-folds. `optional_non_empty_string`
+/// trims, which admitted `" gzip "` while still rejecting `"GZIP"` — a
+/// contract no JSON Schema `enum` can express, so machine preflight and the
+/// constructor disagreed on the same document (#5217). Accepting only the
+/// canonical spelling keeps the schema and the constructor exact in both
+/// directions and keeps operator typos loud.
+fn optional_exact_string<'a>(config: &'a Value, key: &str) -> Result<Option<&'a str>, String> {
+    match config.get(key) {
+        Some(value) => {
+            let value = value
+                .as_str()
+                .ok_or_else(|| format!("kafka_logging: '{key}' must be a string"))?;
+            if value.is_empty() {
+                return Err(format!("kafka_logging: '{key}' must not be empty"));
+            }
+            Ok(Some(value))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Parse a SASL credential field without rewriting its bytes.
+///
+/// RFC 4616 §2 permits SPACE inside a PLAIN authcid/passwd, so trimming a
+/// credential changes what the broker is asked to authenticate and turns a
+/// valid configuration into a permanent authentication failure (#5216).
+/// Unsupported shapes are rejected explicitly instead: an entirely blank value
+/// (the shape the OpenAPI `\S` pattern already refuses) and an interior NUL,
+/// which is both the SASL PLAIN field separator and the C-string terminator
+/// librdkafka would silently truncate the credential at.
+fn optional_credential_string(config: &Value, key: &str) -> Result<Option<String>, String> {
+    match config.get(key) {
+        Some(value) => {
+            let value = value
+                .as_str()
+                .ok_or_else(|| format!("kafka_logging: '{key}' must be a string"))?;
+            if value.is_empty() {
+                return Err(format!("kafka_logging: '{key}' must not be empty"));
+            }
+            if value.trim().is_empty() {
+                return Err(format!(
+                    "kafka_logging: '{key}' must not be entirely whitespace"
+                ));
+            }
+            if value.contains('\0') {
+                // Never echo the value itself — it is credential material.
+                return Err(format!(
+                    "kafka_logging: '{key}' must not contain a NUL byte (it would \
+                     truncate the credential librdkafka authenticates with)"
+                ));
+            }
+            Ok(Some(value.to_string()))
+        }
+        None => Ok(None),
+    }
 }
 
 fn optional_non_empty_string(config: &Value, key: &str) -> Result<Option<String>, String> {

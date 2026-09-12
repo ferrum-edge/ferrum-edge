@@ -2276,7 +2276,7 @@ async fn functional_protocol_validation_h2_single_header_size_limit_rejects_from
     let req = Request::builder()
         .method("GET")
         .uri("http://example.com/")
-        .header("host", "example.com")
+        .header("host", "x")
         .header("x-over", "value-that-exceeds")
         .body(Full::new(Bytes::new()))
         .expect("build request");
@@ -2294,13 +2294,9 @@ async fn functional_protocol_validation_h2_single_header_size_limit_rejects_from
     let body_str = String::from_utf8_lossy(&body);
 
     assert_eq!(status, 431, "body={body_str}");
-    assert!(
-        body_str.contains("Request header"),
-        "unexpected body: {body_str}"
-    );
-    assert!(
-        body_str.contains("exceeds maximum size of 12 bytes"),
-        "unexpected body: {body_str}"
+    assert_eq!(
+        body_str,
+        r#"{"error":"Request header 'x-over' exceeds maximum size of 12 bytes"}"#
     );
 
     drop(sender);

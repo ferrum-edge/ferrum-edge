@@ -116,9 +116,22 @@
 //! matched proxy's `backend_read_timeout_ms` when positive, else a finite
 //! 60s default, always capped by a hard maximum. A zero primary
 //! `backend_read_timeout_ms` therefore never disables the mirror deadline.
+//! That deadline is ABSOLUTE for the whole detached mirror: the shared
+//! `PluginHttpClient` may replay a safe method under
+//! `FERRUM_PLUGIN_HTTP_MAX_RETRIES`, and every attempt plus every
+//! `FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS` delay between attempts spends the same
+//! budget. No attempt starts after it, and the `max_in_flight` permit and the
+//! retained-byte lease are released when it expires rather than after
+//! `retries × mirror_timeout_ms`.
 //! Mirror response bodies are always drained under `max_response_body_bytes`
-//! and a short drain timeout so HTTP/1.1 keep-alive pools can reclaim sockets
-//! even when `Content-Length` is advertised. A finalized body is copied once
+//! and a short drain timeout — itself clamped to whatever remains of the
+//! absolute deadline — so HTTP/1.1 keep-alive pools can reclaim sockets
+//! even when `Content-Length` is advertised. A deadline that expires after
+//! response headers but before the body completes is a drain *timeout*, not a
+//! transport failure: reqwest's timeout classification is preserved through
+//! the bounded-read error so timeout alerting does not undercount it.
+//!
+//! A finalized body is copied once
 //! into an owned `bytes::Bytes` for each selected mirror instance; that
 //! detached-task copy is admitted under both `max_in_flight` and a per-instance
 //! `max_retained_request_body_bytes` budget, and its lease releases when the
@@ -213,7 +226,7 @@
 //! | `max_in_flight` | u64 | `256` | Maximum concurrent detached mirror tasks per plugin instance (minimum 1, maximum 1048576). Requests that arrive while every permit is in use are still served normally but are not mirrored — saturation drops the new mirror attempt without affecting the primary request. Values above the cap are rejected at construction rather than panicking Tokio's semaphore. |
 //! | `max_retained_request_body_bytes` | u64 | `67108864` (64 MiB) | Aggregate retained request-body budget for in-flight mirrors on this instance. Charged at admission (before the body is read: every admitted request reserves the whole `max_mirrored_request_body_bytes` ceiling) and reconciled to the observed length; exhaustion drops the new mirror attempt without affecting the primary request. Size against `max_in_flight × max_mirrored_request_body_bytes` when mirroring at high concurrency. |
 //! | `max_mirrored_request_body_bytes` | u64 | `10485760` (10 MiB) | Positive plugin-local ceiling on one mirrored request body, applied even when the global request-body limit is unlimited (`0`). An explicit value above `max_retained_request_body_bytes` is rejected at construction; the default clamps down to it instead, so a smaller aggregate budget alone never fails construction. Applies only to requests this instance admitted. |
-//! | `mirror_timeout_ms` | u64 | (proxy / 60000) | Finite mirror request deadline in milliseconds (minimum 1, maximum 300000). When omitted, uses the matched proxy `backend_read_timeout_ms` when positive, otherwise 60000. Zero primary timeout never disables this deadline. |
+//! | `mirror_timeout_ms` | u64 | (proxy / 60000) | Finite, absolute mirror deadline in milliseconds (minimum 1, maximum 300000) covering every shared-client attempt, every retry delay, and the response drain. When omitted, uses the matched proxy `backend_read_timeout_ms` when positive, otherwise 60000. Zero primary timeout never disables this deadline. |
 //! | `forward_sensitive_headers` | bool | `false` | Dangerous opt-in. When `true`, selected origin-bound credential headers may cross to the mirror origin, but only exact names listed in `forward_sensitive_header_allowlist` (fail-closed: both fields required together, allowlist must be non-empty). |
 //! | `forward_sensitive_header_allowlist` | string[] | `[]` | Lowercased exact allowlist of denied sensitive header names to forward when `forward_sensitive_headers` is `true`. Each entry must be a valid HTTP header name (≤256 chars) that the deny-by-default policy actually strips (a built-in credential or a `sensitive_header_patterns` match); at most 64 entries; non-sensitive names are rejected at construction. |
 //! | `sensitive_header_patterns` | string[] | `[]` | Additional lowercased substrings (matched against the header name; each ≤128 chars, at most 64 entries) that extend the built-in deny-by-default credential set. Covers HTTP headers and native gRPC metadata. |
@@ -254,6 +267,8 @@
 //! **Wrap / exhaustion:** the phase is bounded to `0..1000` at every successful
 //! update, so integer wraparound of an unbounded counter cannot occur, cannot
 //! panic, and cannot bias a complete sampling cycle.
+
+use crate::plugins::utils::log_sampling::warn_sampled;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -337,7 +352,9 @@ const DEFAULT_MIRROR_TIMEOUT_MS: u64 = 60_000;
 /// Hard ceiling on every mirror request deadline (plugin or proxy derived).
 const MAX_MIRROR_TIMEOUT_MS: u64 = 300_000;
 /// Bound on post-header body discard so a slow CL body cannot pin the task
-/// for the full request budget after headers arrive.
+/// for the full request budget after headers arrive. Further clamped to
+/// whatever is left of the absolute mirror deadline, so the drain can never
+/// extend `mirror_timeout_ms`.
 const MIRROR_RESPONSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const MIRROR_TASK_INCOMPLETE_ERROR: &str =
     "mirror task ended before publishing a result (cancelled or failed)";
@@ -353,6 +370,19 @@ const MIRROR_BODY_BUDGET_DROP_ERROR: &str =
 /// send the operator to a knob that cannot fix it.
 const MIRROR_BODY_CEILING_DROP_ERROR: &str =
     "mirror request dropped because the collected body exceeded max_mirrored_request_body_bytes";
+/// Published when the ABSOLUTE mirror deadline expires: one budget spanning
+/// every shared-client attempt and every retry delay between them. Distinct
+/// wording from a single attempt's redacted transport timeout so an operator
+/// can tell "the whole `mirror_timeout_ms` budget is gone" from "this attempt
+/// timed out"; both settle as a request timeout. Carries no URL, query, or
+/// credential material.
+const MIRROR_REQUEST_DEADLINE_ERROR: &str =
+    "mirror request deadline expired before a response was received";
+/// Published whenever the response-body drain ends on a DEADLINE rather than a
+/// stream fault: the short post-header drain cap, the remaining absolute mirror
+/// budget, or the reqwest request deadline expiring after headers but before
+/// the body completes. All three are configured deadlines, so all three settle
+/// as a drain timeout instead of masquerading as a reset or malformed response.
 const MIRROR_DRAIN_TIMEOUT_ERROR: &str = "mirror response body drain timed out";
 const MIRROR_DRAIN_TRANSPORT_ERROR: &str = "mirror response body stream failed";
 
@@ -1381,11 +1411,17 @@ enum MirrorDrainOutcome {
     TransportFailure,
 }
 
-/// Discard a mirror response body under the configured byte cap and drain
-/// timeout so pooled HTTP/1.1 connections can be reclaimed.
+/// Discard a mirror response body under the configured byte cap and the
+/// caller-supplied drain budget so pooled HTTP/1.1 connections can be
+/// reclaimed.
+///
+/// `drain_timeout` is [`MIRROR_RESPONSE_DRAIN_TIMEOUT`] clamped to what remains
+/// of the absolute mirror deadline, so draining a slow body can never extend
+/// `mirror_timeout_ms`.
 async fn drain_mirror_response_body(
     response: reqwest::Response,
     max_bytes: usize,
+    drain_timeout: Duration,
 ) -> (Option<u64>, MirrorDrainOutcome) {
     // Record the advertised `Content-Length` independently, then always drain.
     // The advertised value is never used to short-circuit the drain: a body
@@ -1397,7 +1433,7 @@ async fn drain_mirror_response_body(
     // drain timeout, so an oversized or slow body cannot pin the task.
     let advertised = response.content_length();
     match tokio::time::timeout(
-        MIRROR_RESPONSE_DRAIN_TIMEOUT,
+        drain_timeout,
         measure_response_body_bounded(response, max_bytes),
     )
     .await
@@ -1410,6 +1446,15 @@ async fn drain_mirror_response_body(
                 observed: read_so_far as u64,
             },
         ),
+        // A deadline that expires after response headers but before the body
+        // completes surfaces here as a stream error that still carries
+        // reqwest's timeout classification. Folding it into `TransportFailure`
+        // would report a configured deadline as a reset or malformed response
+        // and leave both timeout counters at zero, so timeout alerting
+        // undercounts exactly the events the deadline caused.
+        Ok(Err(BoundedReadError::Stream(err))) if err.is_timeout() => {
+            (advertised, MirrorDrainOutcome::Timeout)
+        }
         Ok(Err(BoundedReadError::Stream(_))) => (advertised, MirrorDrainOutcome::TransportFailure),
     }
 }
@@ -2601,9 +2646,11 @@ impl Plugin for RequestMirror {
                 // Refused before the body was collected. The primary request
                 // was unaffected and stayed streaming; publish the attributable
                 // failure now that the target URL is known.
-                warn!(
+                warn_sampled!(
                     "request_mirror: dropped mirror request for {} {} at pre-buffer admission: {}",
-                    method, mirror_url_for_log, reason
+                    method,
+                    mirror_url_for_log,
+                    reason
                 );
                 ctx.push_mirror_result_rx(completed_mirror_result(mirror_failure_meta(
                     self.plugin_config_id.clone(),
@@ -2621,9 +2668,10 @@ impl Plugin for RequestMirror {
                 Ok(permit) => (permit, None),
                 Err(_) => {
                     self.metrics.bump_concurrency_drop();
-                    warn!(
+                    warn_sampled!(
                         "request_mirror: dropping mirror request for {} {} because max_in_flight limit was reached",
-                        method, mirror_url_for_log
+                        method,
+                        mirror_url_for_log
                     );
                     ctx.push_mirror_result_rx(completed_mirror_result(mirror_failure_meta(
                         self.plugin_config_id.clone(),
@@ -2682,9 +2730,11 @@ impl Plugin for RequestMirror {
             Ok(lease) => lease,
             Err(reason) => {
                 self.metrics.bump_budget_drop();
-                warn!(
+                warn_sampled!(
                     "request_mirror: dropped mirror request for {} {} after body collection: {}",
-                    method, mirror_url_for_log, reason
+                    method,
+                    mirror_url_for_log,
+                    reason
                 );
                 drop(permit);
                 ctx.push_mirror_result_rx(completed_mirror_result(mirror_failure_meta(
@@ -2739,6 +2789,19 @@ impl Plugin for RequestMirror {
             // outcome. Settled below once a terminal metric is recorded.
             let mut task_guard = MirrorTaskGuard::new(metrics);
             let start = std::time::Instant::now();
+            // ONE absolute deadline for the whole detached mirror. The shared
+            // `PluginHttpClient` replays GET/HEAD/OPTIONS on transport failure
+            // under `FERRUM_PLUGIN_HTTP_MAX_RETRIES`, sleeping
+            // `FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS` between attempts; the
+            // per-attempt reqwest deadline below is applied to each cloned
+            // attempt, so without this outer bound retries and their delays
+            // would multiply the operator's `mirror_timeout_ms` and hold the
+            // `max_in_flight` permit plus the retained-byte lease long past it,
+            // dropping otherwise eligible shadow requests. Cancelling this
+            // future also cancels an in-progress retry delay, so no attempt
+            // ever starts after the deadline. Safe-method retry rules are
+            // unchanged inside the budget.
+            let deadline = tokio::time::Instant::now() + mirror_timeout;
 
             // Native gRPC must speak HTTP/2 (h2c prior knowledge on cleartext,
             // ALPN h2 on TLS). Ordinary HTTP mirrors keep the default client so
@@ -2752,7 +2815,7 @@ impl Plugin for RequestMirror {
                 Ok(client) => client,
                 Err(_) => {
                     task_guard.settle(MirrorTaskOutcome::RequestFailure);
-                    warn!(
+                    warn_sampled!(
                         "request_mirror: plugin HTTP client unavailable; failing closed for {}",
                         mirror_url_for_log
                     );
@@ -2778,8 +2841,9 @@ impl Plugin for RequestMirror {
                 ),
             };
 
-            // Always apply a finite deadline — never leave detached mirror work
-            // unbounded when the primary proxy timeout is zero/absent.
+            // Per-attempt cap — never leave one detached attempt unbounded when
+            // the primary proxy timeout is zero/absent. `deadline` above is the
+            // authority for the operation as a whole.
             req_builder = req_builder.timeout(mirror_timeout);
 
             // Forward sanitized headers from the original (transformed) request.
@@ -2803,14 +2867,22 @@ impl Plugin for RequestMirror {
             // output, so stringifying it into `mirror_error` would leak those
             // secrets to every logging sink. `execute_redacted` reduces the
             // transport error to an `ErrorClass` plus the stripped URL.
-            let response = if is_native_grpc {
-                http_client
-                    .execute_http2_redacted(req_builder, "request_mirror", &mirror_url_for_log)
-                    .await
-            } else {
-                http_client
-                    .execute_redacted(req_builder, "request_mirror", &mirror_url_for_log)
-                    .await
+            let dispatch = async {
+                if is_native_grpc {
+                    http_client
+                        .execute_http2_redacted(req_builder, "request_mirror", &mirror_url_for_log)
+                        .await
+                } else {
+                    http_client
+                        .execute_redacted(req_builder, "request_mirror", &mirror_url_for_log)
+                        .await
+                }
+            };
+            let response = match tokio::time::timeout_at(deadline, dispatch).await {
+                Ok(response) => response,
+                // The absolute budget is gone. The sanitized marker below is a
+                // fixed string, so it can never render the full mirror URL.
+                Err(_) => Err(MIRROR_REQUEST_DEADLINE_ERROR.to_string()),
             };
             let (status_code, response_size, advertised_size, error_msg) = match response {
                 Ok(resp) => {
@@ -2819,8 +2891,15 @@ impl Plugin for RequestMirror {
                     // keep-alive pools reclaim the socket even when
                     // Content-Length is known. Report advertised and observed
                     // sizes independently when CL was present.
+                    // Keep the short post-header drain cap, but spend only what
+                    // is left of the absolute deadline so the drain cannot
+                    // extend `mirror_timeout_ms` either.
+                    let now = tokio::time::Instant::now();
+                    let remaining = deadline.saturating_duration_since(now);
+                    let drain_budget = MIRROR_RESPONSE_DRAIN_TIMEOUT.min(remaining);
                     let (advertised, drain) =
-                        drain_mirror_response_body(resp, max_response_body_bytes).await;
+                        drain_mirror_response_body(resp, max_response_body_bytes, drain_budget)
+                            .await;
                     let (size, body_error) = match drain {
                         MirrorDrainOutcome::Complete { observed } => {
                             task_guard.settle(MirrorTaskOutcome::Completed);
@@ -2828,16 +2907,19 @@ impl Plugin for RequestMirror {
                         }
                         MirrorDrainOutcome::Truncated { observed } => {
                             task_guard.settle(MirrorTaskOutcome::DrainTruncation);
-                            warn!(
+                            warn_sampled!(
                                 "request_mirror: response from {} truncated at {} bytes \
                                      (max_response_body_bytes = {}; advertised = {:?})",
-                                mirror_url_for_log, observed, max_response_body_bytes, advertised
+                                mirror_url_for_log,
+                                observed,
+                                max_response_body_bytes,
+                                advertised
                             );
                             (Some(observed), None)
                         }
                         MirrorDrainOutcome::Timeout => {
                             task_guard.settle(MirrorTaskOutcome::DrainTimeout);
-                            warn!(
+                            warn_sampled!(
                                 "request_mirror: response body drain timed out for {}",
                                 mirror_url_for_log
                             );
@@ -2855,15 +2937,19 @@ impl Plugin for RequestMirror {
                     // (ErrorClass + stripped URL); it never contains the query
                     // string. Use the same string for the log line and the
                     // structured `mirror_error` field. Classify the mirror
-                    // deadline firing (never-responding target) as a timeout.
-                    if redacted_error_is_timeout(&err) {
+                    // deadline firing (never-responding target) as a timeout —
+                    // whether it was one attempt's reqwest deadline or the
+                    // absolute budget above.
+                    if err == MIRROR_REQUEST_DEADLINE_ERROR || redacted_error_is_timeout(&err) {
                         task_guard.settle(MirrorTaskOutcome::RequestTimeout);
                     } else {
                         task_guard.settle(MirrorTaskOutcome::RequestFailure);
                     }
-                    warn!(
+                    warn_sampled!(
                         "request_mirror: failed to mirror {} {} → {}",
-                        method, mirror_url_for_log, err
+                        method,
+                        mirror_url_for_log,
+                        err
                     );
                     (None, None, None, Some(err))
                 }

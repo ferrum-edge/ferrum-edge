@@ -195,6 +195,7 @@ async fn send_batch(cfg: &HttpFlushConfig, batch: &[QueuedSummaryPayload]) -> Re
     // the complete URL. The request itself still goes to `endpoint_url`.
     handle_http_batch_response_redacted(
         "HTTP logging",
+        "http_logging",
         entry_count,
         cfg.http_client
             .execute_redacted(req, "http_logging", &cfg.endpoint_url_for_logs)

@@ -467,6 +467,16 @@ fn harness_capture_diagnostics_scrub_secrets_and_bound_output() {
         "credential-bearing Redis URL should retain a redacted host form: {scrubbed_sensitive}"
     );
 
+    for delimiter_secret in ["/", ":", "@"] {
+        let scrubbed_delimiter =
+            scrub_gateway_capture_for_diagnostics(&sensitive, &[delimiter_secret]);
+        assert!(
+            !scrubbed_delimiter.contains("user:s3cret@"),
+            "URL userinfo must be redacted before replacing delimiter secret {delimiter_secret:?}: \
+             {scrubbed_delimiter}"
+        );
+    }
+
     let oversized = format!("{}{}", "x".repeat(20_000), sensitive);
     let scrubbed_oversized =
         scrub_gateway_capture_for_diagnostics(&oversized, &[jwt_secret, observability, short_hmac]);

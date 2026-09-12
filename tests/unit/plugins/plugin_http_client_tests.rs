@@ -1343,3 +1343,196 @@ async fn redacted_transport_failure_slow_and_retry_warnings_hide_the_url() {
     );
     assert_url_sentinels_absent(&captured, "transport failure diagnostics");
 }
+
+// ---------------------------------------------------------------------------
+// Default-redacted diagnostics — advisory GHSA-4ghp-v85j-5hvq
+//
+// The helpers above prove redaction for callers that pass their own redacted
+// label. These prove the DEFAULT: a caller that passes nothing still gets a
+// diagnostic reduced to `scheme://host[:port]/redacted`, so an endpoint
+// credential in the userinfo, path, or query cannot reach process logs through
+// a plugin that simply used `execute`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn execute_without_a_redacted_label_still_hides_the_url_in_slow_and_retry_warnings() {
+    let (logs, guard) = super::plugin_utils::capture_logs();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let client = PluginHttpClient::from_pool_config_with_settings(
+        &ferrum_edge::config::PoolConfig::default(),
+        0, // every call is "slow"
+        1, // one retry, so the retry warning is emitted too
+        1,
+    );
+
+    // GET so the retry path is eligible, and no `redacted_url` anywhere.
+    let request = live(&client).get(sentinel_url(&format!("http://{addr}")));
+    let _ = client.execute(request, "default_redaction_test").await;
+
+    drop(guard);
+    let captured = logs.contents();
+    assert!(
+        captured.contains("Retrying plugin HTTP call")
+            || captured.contains("Slow plugin HTTP call"),
+        "retry and/or slow-call diagnostics must have been emitted: {captured}"
+    );
+    assert!(
+        captured.contains(&format!("http://{addr}/redacted")),
+        "the diagnostic must still identify the endpoint origin: {captured}"
+    );
+    assert_url_sentinels_absent(&captured, "default (unlabelled) transport diagnostics");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn execute_without_a_redacted_label_hides_the_url_in_egress_denial() {
+    use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
+
+    let (logs, guard) = super::plugin_utils::capture_logs();
+    let policy = BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).unwrap();
+    let client = PluginHttpClient::default_with_backend_allow_ips(policy);
+
+    let request = live(&client)
+        .post(sentinel_url("http://169.254.169.254"))
+        .body("rows");
+    let response = client
+        .execute(request, "default_redaction_test")
+        .await
+        .expect("a denied literal IP is surfaced as a 502, not an error");
+    assert_eq!(response.status(), 502);
+
+    drop(guard);
+    let captured = logs.contents();
+    assert!(
+        captured.contains("denied literal-IP endpoint"),
+        "the denial diagnostic must have been emitted: {captured}"
+    );
+    assert_url_sentinels_absent(&captured, "default (unlabelled) egress denial diagnostic");
+}
+
+// ---------------------------------------------------------------------------
+// Body-inclusive external-I/O accounting — issue #5059
+// ---------------------------------------------------------------------------
+
+/// Serve one HTTP/1.1 response whose HEADERS are written immediately and whose
+/// BODY is written `body_delay` later, on a connection the client must hold
+/// open the whole time.
+async fn spawn_delayed_body_origin(body_delay: Duration) -> std::net::SocketAddr {
+    use super::plugin_utils::read_http11_request_headers;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+
+        const BODY: &[u8] = br#"{"result":true}"#;
+
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        if !read_http11_request_headers(&mut socket).await {
+            return;
+        }
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            BODY.len()
+        );
+        if socket.write_all(head.as_bytes()).await.is_err() {
+            return;
+        }
+        let _ = socket.flush().await;
+        tokio::time::sleep(body_delay).await;
+        let _ = socket.write_all(BODY).await;
+        let _ = socket.flush().await;
+    });
+    addr
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tracked_through_body_charges_the_body_wait_and_trips_the_slow_threshold() {
+    let (logs, guard) = super::plugin_utils::capture_logs();
+
+    let body_delay = Duration::from_millis(200);
+    let addr = spawn_delayed_body_origin(body_delay).await;
+    let client = PluginHttpClient::from_pool_config_with_threshold(
+        &ferrum_edge::config::PoolConfig::default(),
+        50,
+    );
+
+    let accumulator = AtomicU64::new(0);
+    let request = live(&client).post(sentinel_url(&format!("http://{addr}")));
+    let body = client
+        .execute_redacted_tracked_through_body(
+            request,
+            "through_body_test",
+            &format!("http://{addr}/redacted"),
+            &accumulator,
+            |response| async move {
+                assert_eq!(response.status(), 200);
+                response.bytes().await.expect("body streams to completion")
+            },
+        )
+        .await
+        .expect("a delayed body is not a transport failure");
+    assert_eq!(body.as_ref(), br#"{"result":true}"#.as_slice());
+
+    // The header round trip alone is sub-millisecond on loopback, so anything
+    // near the body delay can only have come from the body wait.
+    let charged = Duration::from_nanos(accumulator.load(Ordering::Relaxed));
+    assert!(
+        charged >= body_delay.mul_f64(0.75),
+        "the decision body wait must be charged as external I/O, got {charged:?}"
+    );
+
+    drop(guard);
+    let captured = logs.contents();
+    assert!(
+        captured.contains("Slow plugin HTTP call"),
+        "a body-delayed call must cross the slow-call threshold: {captured}"
+    );
+    assert_url_sentinels_absent(&captured, "body-inclusive slow-call diagnostic");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tracked_through_body_charges_header_time_exactly_once() {
+    let header_delay = Duration::from_millis(200);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/decide"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(header_delay)
+                .set_body_string("{}"),
+        )
+        .mount(&server)
+        .await;
+
+    let client = PluginHttpClient::default();
+    let accumulator = AtomicU64::new(0);
+    let request = live(&client).post(format!("{}/decide", server.uri()));
+    let _ = client
+        .execute_redacted_tracked_through_body(
+            request,
+            "through_body_test",
+            "http://origin/redacted",
+            &accumulator,
+            |response| async move { response.bytes().await.expect("body reads") },
+        )
+        .await
+        .expect("the mock responds");
+
+    // One header span plus a negligible body read: a double-charged header
+    // would land at roughly twice the delay.
+    let charged = Duration::from_nanos(accumulator.load(Ordering::Relaxed));
+    assert!(
+        charged >= header_delay.mul_f64(0.75),
+        "the header wait must be charged, got {charged:?}"
+    );
+    assert!(
+        charged < header_delay.mul_f64(1.8),
+        "the header wait must be charged exactly once, got {charged:?}"
+    );
+}

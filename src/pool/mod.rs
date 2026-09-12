@@ -585,6 +585,188 @@ impl<M: PoolManager> Drop for PendingCreationGuard<'_, M> {
     }
 }
 
+/// Per-key creation slot for the mesh HBONE / sidecar mesh-mTLS pools
+/// (issue #5046).
+///
+/// Those two pools do not run through [`GenericPool`]: they keep several
+/// transports per key (`http2_connections_per_host`), re-check their own cache
+/// under the lock, and apply a post-dial SVID/CRL publication check, so the
+/// `PendingCreation` election above does not fit them. What they were missing
+/// is the other half of the #2950 pattern: when the caller holding a key's
+/// creation mutex failed its dial, every caller queued behind it took the
+/// mutex in turn and repeated the same failed dial.
+///
+/// This slot adds exactly that half and nothing else:
+///
+/// * `lock` is the pool's existing per-key creation mutex with unchanged
+///   serialization semantics. The SUCCESS path — cache re-check, growing the
+///   pool up to `http2_connections_per_host`, the post-dial publication check
+///   — is untouched, so a healthy pool behaves exactly as before. Successful
+///   transports are deliberately NOT shared through this slot: that would
+///   collapse a cold burst onto one connection and hand a transport to a
+///   caller that never observed the creator's trust/SVID/CRL generation.
+/// * `failures` broadcasts one creator's typed failure to the cohort that
+///   joined the attempt while it was still in flight.
+///
+/// Cohort membership is generation-scoped by the `watch` channel itself:
+/// [`SharedCreationSlot::join`] marks the currently published value as seen,
+/// so a caller only ever consumes a failure published AFTER it joined — a
+/// failure from an attempt it actually overlapped. A caller that arrives after
+/// a failure was published dials again, so there is no durable negative cache.
+/// A creator that is cancelled, panics, or gives up against its own deadline
+/// publishes nothing and the next waiter is elected as a fresh creator.
+pub struct SharedCreationSlot<T> {
+    lock: tokio::sync::Mutex<()>,
+    failures: watch::Sender<Option<T>>,
+}
+
+impl<T> SharedCreationSlot<T> {
+    pub fn new() -> Self {
+        let (failures, _initial_rx) = watch::channel(None);
+        Self {
+            lock: tokio::sync::Mutex::new(()),
+            failures,
+        }
+    }
+
+    /// Join this key's creation cohort.
+    ///
+    /// MUST be called before awaiting the creation lock: subscribing is what
+    /// scopes the caller to attempts that are still in flight, and a caller
+    /// that subscribed only after acquiring the lock could never observe the
+    /// failure of the attempt it was queued behind.
+    pub fn join(&self) -> SharedCreationJoin<'_, T> {
+        SharedCreationJoin {
+            slot: self,
+            failures: self.failures.subscribe(),
+        }
+    }
+
+    /// Take this key's creation lock only if nobody holds it right now.
+    ///
+    /// For opportunistic pool growth (issue #5043): a caller that already has
+    /// a usable connection must never queue behind a cold dial or another
+    /// grower, so `None` means "serve on what exists" rather than "wait".
+    pub fn try_claim(&self) -> Option<SharedCreationLease<'_, T>> {
+        let guard = self.lock.try_lock().ok()?;
+        Some(SharedCreationLease {
+            slot: self,
+            failures: self.failures.subscribe(),
+            _guard: guard,
+        })
+    }
+}
+
+impl<T> Default for SharedCreationSlot<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Membership in one key's creation cohort, taken before the creation lock is
+/// awaited.
+pub struct SharedCreationJoin<'a, T> {
+    slot: &'a SharedCreationSlot<T>,
+    failures: watch::Receiver<Option<T>>,
+}
+
+impl<'a, T: Clone> SharedCreationJoin<'a, T> {
+    /// Wait for this key's creation lock, returning early with the shared
+    /// typed failure when a concurrent creator fails first.
+    ///
+    /// Cancel-safe: the caller wraps this in its OWN
+    /// `tokio::time::timeout(...)`, so every waiter keeps its original
+    /// deadline and dropping the future only leaves the cohort.
+    pub async fn wait(mut self) -> SharedCreationRole<'a, T> {
+        let mut acquire = std::pin::pin!(self.slot.lock.lock());
+        // `changed()` can only fail once the sender is dropped, which cannot
+        // happen while this join borrows the slot. The flag keeps a defensive
+        // `Err` from spinning the select instead of waiting for the lock.
+        let mut broadcast_open = true;
+        let guard = loop {
+            tokio::select! {
+                // Failure branch first: a creator publishes while it still
+                // holds the lock and releases immediately after, so both
+                // branches become ready in the same poll and the cohort must
+                // observe the failure rather than start a redundant dial.
+                biased;
+                changed = self.failures.changed(), if broadcast_open => {
+                    if changed.is_err() {
+                        // Unreachable while this join borrows the slot that
+                        // owns the sender; disable the branch rather than
+                        // spinning the select on a dead channel.
+                        broadcast_open = false;
+                    } else {
+                        let published = self.failures.borrow_and_update().clone();
+                        if let Some(failure) = published {
+                            return SharedCreationRole::Failed(failure);
+                        }
+                    }
+                }
+                guard = acquire.as_mut() => break guard,
+            }
+        };
+        let mut lease = SharedCreationLease {
+            slot: self.slot,
+            failures: self.failures,
+            _guard: guard,
+        };
+        // A failure published while this caller was queued is still its
+        // cohort's outcome even when the lock branch won the race above.
+        match lease.take_broadcast_failure() {
+            Some(failure) => SharedCreationRole::Failed(failure),
+            None => SharedCreationRole::Creator(lease),
+        }
+    }
+}
+
+/// Outcome of joining one key's creation cohort.
+pub enum SharedCreationRole<'a, T> {
+    /// This caller holds the creation lock and must perform the dial.
+    Creator(SharedCreationLease<'a, T>),
+    /// A concurrent creator for the same key failed while this caller waited;
+    /// its typed failure is the whole cohort's outcome.
+    Failed(T),
+}
+
+/// The creation lock for one key, held by the elected creator.
+///
+/// Dropping the lease releases the lock WITHOUT publishing anything, which is
+/// exactly the cancellation / panic / creator-deadline behaviour the pools
+/// want: the next waiter is elected as a fresh creator.
+pub struct SharedCreationLease<'a, T> {
+    slot: &'a SharedCreationSlot<T>,
+    failures: watch::Receiver<Option<T>>,
+    _guard: tokio::sync::MutexGuard<'a, ()>,
+}
+
+impl<T: Clone> SharedCreationLease<'_, T> {
+    /// Take a failure published by a concurrent creator while this caller was
+    /// queued for the lock, if any.
+    ///
+    /// Pools call this AFTER their own cache re-check so an available
+    /// connection always wins over a shared failure.
+    pub fn take_broadcast_failure(&mut self) -> Option<T> {
+        if self.failures.has_changed().unwrap_or(false) {
+            self.failures.borrow_and_update().clone()
+        } else {
+            None
+        }
+    }
+
+    /// Publish this creator's typed failure to every caller that joined the
+    /// attempt while it was in flight.
+    ///
+    /// Called while the lock is still held so no waiter can begin a redundant
+    /// dial before the broadcast lands. Deliberately NOT called for a deadline
+    /// the pool raises against the creator's OWN connect budget: a waiter may
+    /// have a longer budget, and #5046 requires each waiter's original
+    /// deadline to survive.
+    pub fn publish_failure(&self, failure: T) {
+        self.slot.failures.send_replace(Some(failure));
+    }
+}
+
 pub struct GenericPool<M: PoolManager> {
     manager: Arc<M>,
     entries: Arc<DashMap<String, PoolEntry<M::Connection>>>,

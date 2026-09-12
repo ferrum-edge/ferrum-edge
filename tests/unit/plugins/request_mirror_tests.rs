@@ -5279,9 +5279,52 @@ async fn advisory_repeated_authorize_replaces_same_instance_admission() {
 
 #[tokio::test]
 async fn advisory_multiple_instances_stage_and_take_independently() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    // #4985: instance a really dispatches, so its lease release must be proven
+    // by an OWNED loopback fixture rather than by whatever an ambient `.local`
+    // name resolves to. `.local` resolution and connection completion are
+    // environment-dependent, so the old fixture could legitimately still be in
+    // flight when the ownership assertion fired.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mirror_addr = listener.local_addr().unwrap();
+    let (served_tx, served_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        // Drain the whole 2048-byte mirrored upload before answering so the
+        // client never races a half-read close.
+        let mut buf = [0u8; 512];
+        let mut seen: Vec<u8> = Vec::new();
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    seen.extend_from_slice(&buf[..n]);
+                    let headers_end = seen.windows(4).position(|w| w == b"\r\n\r\n");
+                    if let Some(end) = headers_end
+                        && seen.len() >= end + 4 + 2048
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await;
+        let _ = stream.flush().await;
+        let _ = served_tx.send(());
+        // Hold the socket open until the client is done with the response.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    });
+
     let a = RequestMirror::new_with_config_id(
         &json!({
-            "mirror_host": "mirror-a.local",
+            "mirror_host": mirror_addr.ip().to_string(),
+            "mirror_port": mirror_addr.port(),
             "percentage": 100.0,
             "mirror_request_body": true,
             "max_retained_request_body_bytes": 8192,
@@ -5291,9 +5334,12 @@ async fn advisory_multiple_instances_stage_and_take_independently() {
         Some("advisory-mirror-a"),
     )
     .expect("instance a must construct");
+    // Instance b is never dispatched in this test: it only stages, so it needs
+    // no destination of its own.
     let b = RequestMirror::new_with_config_id(
         &json!({
-            "mirror_host": "mirror-b.local",
+            "mirror_host": "127.0.0.1",
+            "mirror_port": mirror_addr.port(),
             "percentage": 100.0,
             "mirror_request_body": true,
             "max_retained_request_body_bytes": 8192,
@@ -5371,10 +5417,16 @@ async fn advisory_multiple_instances_stage_and_take_independently() {
         "context drop must release the remaining sibling lease exactly once"
     );
 
-    // a may still hold bytes in its detached task until it settles.
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    // a may still hold bytes in its detached task until it settles. Wait for
+    // the owned fixture to prove the dispatch actually landed before asserting
+    // the lease is back — no ambient DNS and no bare sleep.
+    tokio::time::timeout(std::time::Duration::from_secs(10), served_rx)
+        .await
+        .expect("instance a's mirror request must reach the loopback fixture")
+        .expect("the loopback fixture must signal that it answered");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
         while request_mirror_retained_request_body_bytes_for_test(&a) != 0 {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
     })
     .await
@@ -6151,4 +6203,242 @@ async fn test_finalized_egress_refuses_body_inflated_past_mirror_ceiling() {
             .is_some_and(|error| error.contains("max_mirrored_request_body_bytes")),
         "expected a post-transform ceiling refusal, got {result:?}"
     );
+}
+
+/// #5150: `mirror_timeout_ms` is ONE absolute budget for the whole detached
+/// mirror. The shared `PluginHttpClient` replays safe methods on transport
+/// failure, so before the fix `FERRUM_PLUGIN_HTTP_MAX_RETRIES` plus
+/// `FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS` multiplied the configured deadline and
+/// held the sole `max_in_flight` permit far past it, dropping otherwise
+/// eligible shadow requests. A never-responding target must now make exactly
+/// one attempt and release admission at the deadline.
+#[tokio::test]
+async fn mirror_deadline_is_absolute_across_shared_client_retries() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let accepted_server = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            accepted_server.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                // Never answer: each attempt must burn the deadline.
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            });
+        }
+    });
+
+    // Two retries with an 80 ms delay: the pre-fix schedule was three attempts
+    // spanning roughly 100 + 80 + 100 + 80 + 100 ms.
+    let retrying_client = PluginHttpClient::from_pool_config_with_settings(
+        &ferrum_edge::config::PoolConfig::default(),
+        60_000,
+        2,
+        80,
+    );
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "mirror_request_body": false,
+            "mirror_timeout_ms": 100,
+            "max_in_flight": 1
+        }),
+        retrying_client,
+    )
+    .unwrap();
+
+    // GET is on the shared client's safe-method replay list, so this is the
+    // shape that previously extended the deadline.
+    let mut ctx = make_ctx_with_proxy_timeout(0);
+    ctx.method = "GET".to_string();
+    let mut headers = HashMap::new();
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
+
+    let meta = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ctx.collect_mirror_result(),
+    )
+    .await
+    .expect("the absolute deadline must settle the mirror")
+    .expect("mirror meta");
+    assert!(
+        meta.mirror_error.is_some(),
+        "a never-responding target must publish an error: {meta:?}"
+    );
+
+    let m = request_mirror_metrics_snapshot_for_test(&plugin);
+    assert_eq!(m.dispatched, 1, "{m:?}");
+    assert_eq!(
+        m.request_timeouts, 1,
+        "an expired absolute deadline is a request timeout: {m:?}"
+    );
+    assert_eq!(m.completed, 0, "{m:?}");
+    assert_eq!(
+        m.cancellations, 0,
+        "a settled task is not a cancellation: {m:?}"
+    );
+
+    // Well past the pre-fix retry schedule: no attempt may start after the
+    // deadline, so the fixture must still have seen exactly one connection.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "retries must not start after the absolute mirror deadline"
+    );
+
+    // Admission was released at the deadline, so the sole permit is free again
+    // rather than held for retries x mirror_timeout_ms.
+    let mut ctx2 = make_ctx_with_proxy_timeout(0);
+    ctx2.method = "GET".to_string();
+    let mut h2 = HashMap::new();
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx2, &mut h2).await);
+    let after = request_mirror_metrics_snapshot_for_test(&plugin);
+    assert_eq!(
+        after.dispatched, 2,
+        "the released permit must admit the next mirror: {after:?}"
+    );
+    assert_eq!(
+        after.concurrency_drops, 0,
+        "the deadline must return the max_in_flight permit: {after:?}"
+    );
+}
+
+/// #5151: a deadline that expires after response headers but before the body
+/// completes is a drain TIMEOUT, not a generic stream failure. Both timeout
+/// counters previously stayed at zero while `drain_failures` rose, so operators
+/// could not tell a configured deadline from a reset or malformed response.
+#[tokio::test]
+async fn mirror_response_body_deadline_is_counted_as_a_drain_timeout() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 2048];
+        let _ = stream.read(&mut buf).await;
+        // Headers land immediately; the advertised body never does.
+        let _ = stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n")
+            .await;
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    });
+
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "mirror_request_body": false,
+            "mirror_timeout_ms": 120
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx_with_proxy_timeout(0);
+    let mut headers = HashMap::new();
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
+    let meta = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ctx.collect_mirror_result(),
+    )
+    .await
+    .expect("the drain budget must settle the mirror")
+    .expect("mirror meta");
+
+    assert_eq!(
+        meta.mirror_response_advertised_size_bytes,
+        Some(2),
+        "the advertised length is still recorded: {meta:?}"
+    );
+    let error = meta.mirror_error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("drain timed out"),
+        "the result must name the deadline, not a stream fault: {meta:?}"
+    );
+
+    let m = request_mirror_metrics_snapshot_for_test(&plugin);
+    assert_eq!(
+        m.drain_timeouts, 1,
+        "a body-phase deadline is a drain timeout: {m:?}"
+    );
+    assert_eq!(
+        m.drain_failures, 0,
+        "a configured deadline is not a transport failure: {m:?}"
+    );
+    // Exactly one terminal counter increments per dispatched mirror.
+    assert_eq!(m.dispatched, 1, "{m:?}");
+    assert_eq!(m.completed, 0, "{m:?}");
+    assert_eq!(m.request_timeouts, 0, "headers arrived in time: {m:?}");
+    assert_eq!(m.request_failures, 0, "{m:?}");
+    assert_eq!(m.drain_truncations, 0, "{m:?}");
+    assert_eq!(m.cancellations, 0, "{m:?}");
+}
+
+/// #5151 companion: a genuinely truncated response body is still a drain
+/// FAILURE. Reclassifying every stream error as a timeout would be the mirror
+/// image of the original defect.
+#[tokio::test]
+async fn mirror_response_body_reset_is_still_a_drain_failure() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 2048];
+        let _ = stream.read(&mut buf).await;
+        // Advertise ten bytes, send two, then close: an incomplete message,
+        // not a deadline.
+        let _ = stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nab")
+            .await;
+        let _ = stream.shutdown().await;
+    });
+
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "mirror_request_body": false,
+            "mirror_timeout_ms": 5000
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx_with_proxy_timeout(0);
+    let mut headers = HashMap::new();
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
+    let meta = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ctx.collect_mirror_result(),
+    )
+    .await
+    .expect("an incomplete body must settle well inside the deadline")
+    .expect("mirror meta");
+    assert_eq!(
+        meta.mirror_error.as_deref(),
+        Some("mirror response body stream failed"),
+        "a reset is not a deadline: {meta:?}"
+    );
+
+    let m = request_mirror_metrics_snapshot_for_test(&plugin);
+    assert_eq!(
+        m.drain_failures, 1,
+        "a real stream fault stays a failure: {m:?}"
+    );
+    assert_eq!(m.drain_timeouts, 0, "{m:?}");
+    assert_eq!(m.completed, 0, "{m:?}");
+    assert_eq!(m.cancellations, 0, "{m:?}");
 }

@@ -900,6 +900,10 @@ fn test_registry_stale_eviction() {
         0.0,
     );
 
+    // A completed export collects the entry's counters (issue #5276); only then
+    // does idle age make it evictable.
+    registry.render_prometheus().unwrap();
+
     // Evict with zero TTL should remove everything
     let evicted = registry.evict_stale(0);
     assert_eq!(evicted, 1);
@@ -3852,6 +3856,10 @@ fn test_eviction_releases_budget_capacity() {
     let saturated_bytes = registry.retained_bytes_for_tests();
     assert!(saturated_bytes > 0);
 
+    // Acknowledge collection first: idle age alone no longer deletes billing
+    // rows (issue #5276).
+    registry.render_prometheus().unwrap();
+
     // Evict everything (ttl of 0 nanos makes every entry stale).
     registry.evict_stale(0);
     assert_eq!(registry.entries.len(), 0);
@@ -4739,4 +4747,238 @@ async fn explicit_zero_tier_records_a_call_in_the_shared_registry() {
         .collect();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].call_count.load(Ordering::Relaxed), 1);
+}
+
+// --- Issue #5238: each render cache honors `cache_invalidation_min_age_ms`
+//     against its OWN timestamp ---
+
+/// A JSON-only collector must get the documented minimum-age protection even
+/// when no Prometheus scrape has ever populated the other cache.
+#[test]
+fn test_json_cache_honors_min_age_without_a_prometheus_scrape() {
+    let registry = ChargebackRegistry::new();
+    // Long render TTL and a long invalidation floor: nothing below may rebuild
+    // the JSON document.
+    registry.configure(600, 3600, 600_000, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    let s = scope();
+    record_payment(&registry, &s, "Payments", 1.0);
+
+    let first = registry.render_json().unwrap();
+    let repeat = registry.render_json().unwrap();
+    assert_eq!(first, repeat, "an unchanged registry reuses its cache");
+
+    // A billed request lands while the JSON document is far younger than the
+    // configured floor. Before the fix this cleared the JSON cache because the
+    // ABSENT Prometheus cache was treated as aged.
+    record_payment(&registry, &s, "Payments", 1.0);
+    let after_record = registry.render_json().unwrap();
+    assert_eq!(
+        after_record, first,
+        "a JSON document younger than cache_invalidation_min_age_ms must survive a record"
+    );
+
+    // With no floor the same record may invalidate, and the document rebuilds.
+    registry.configure(600, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    record_payment(&registry, &s, "Payments", 1.0);
+    let rebuilt = registry.render_json().unwrap();
+    assert_ne!(
+        rebuilt, first,
+        "a zero minimum age lets a record invalidate the JSON cache"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&rebuilt).unwrap();
+    assert_eq!(
+        parsed["consumers"]["alice"]["proxies"]["payments"]["total_calls"],
+        3
+    );
+}
+
+/// The Prometheus cache keeps the same protection, independently of JSON.
+#[test]
+fn test_prometheus_cache_honors_min_age_without_a_json_scrape() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(600, 3600, 600_000, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    let s = scope();
+    record_payment(&registry, &s, "Payments", 1.0);
+
+    let first = registry.render_prometheus().unwrap();
+    record_payment(&registry, &s, "Payments", 1.0);
+    let after_record = registry.render_prometheus().unwrap();
+    assert_eq!(
+        after_record, first,
+        "a Prometheus document younger than the floor must survive a record"
+    );
+}
+
+/// Interleaved collectors must not steal one another's protection: neither
+/// format's cache lifetime may depend on whether the other is being scraped.
+#[test]
+fn test_render_caches_age_out_independently_per_format() {
+    let registry = ChargebackRegistry::new();
+    // Zero floor: every record invalidates whatever cache is populated, which
+    // isolates the cross-format defect from minimum-age timing.
+    registry.configure(600, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    let s = scope();
+    record_payment(&registry, &s, "Payments", 1.0);
+
+    let prom_first = registry.render_prometheus().unwrap();
+    let json_first = registry.render_json().unwrap();
+
+    record_payment(&registry, &s, "Payments", 1.0);
+    let prom_second = registry.render_prometheus().unwrap();
+    let json_second = registry.render_json().unwrap();
+    assert_ne!(
+        prom_first, prom_second,
+        "prometheus must observe the record made after its cache was built"
+    );
+    assert_ne!(
+        json_first, json_second,
+        "json must observe the record made after its cache was built"
+    );
+
+    // Both documents are brand new now. Raising the floor must protect BOTH,
+    // regardless of scrape order.
+    registry.configure(600, 3600, 600_000, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    record_payment(&registry, &s, "Payments", 1.0);
+    assert_eq!(registry.render_json().unwrap(), json_second);
+    assert_eq!(registry.render_prometheus().unwrap(), prom_second);
+}
+
+// --- Issue #5276: idle-age eviction requires collection acknowledgement ---
+
+/// An idle entry no completed export has collected must survive eviction, and
+/// must be reported as uncollected rather than silently deleted.
+#[test]
+fn test_uncollected_idle_entry_is_retained_by_eviction() {
+    let registry = ChargebackRegistry::new();
+    // Zero stale TTL: every entry is idle, so the eviction pass each export
+    // runs before rendering also refreshes the uncollected count.
+    registry.configure(600, 0, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    record_identity(&registry, "user-a");
+    assert_eq!(registry.entries.len(), 1);
+
+    // Idle under a zero TTL, but nothing has exported it yet.
+    let evicted = registry.evict_stale(0);
+    assert_eq!(evicted, 0, "an uncollected row must not be evicted");
+    assert_eq!(registry.entries.len(), 1);
+    assert_eq!(registry.reserved_entries_for_tests(), 1);
+
+    let document = registry.render_json().unwrap();
+    let rendered: serde_json::Value = serde_json::from_str(&document).unwrap();
+    let status = &rendered["registry"];
+    assert_eq!(status["uncollected_retained_entries"], 1);
+    let row = &rendered["consumers"]["user-a"]["proxies"]["proxy-a"];
+    assert_eq!(row["total_calls"], 1, "the retained row stays billable");
+
+    // The export above collected it, so the next pass may reclaim it.
+    assert_eq!(registry.evict_stale(0), 1);
+    assert!(registry.entries.is_empty());
+    assert_eq!(registry.reserved_entries_for_tests(), 0);
+}
+
+/// A charge recorded AFTER the last export is uncollected again, so the row
+/// must survive the next eviction even though an earlier export saw an older
+/// value.
+#[test]
+fn test_charges_recorded_after_the_last_export_survive_eviction() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(600, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    record_identity(&registry, "user-a");
+    registry.render_prometheus().unwrap();
+
+    // The second call postdates the collection watermark.
+    record_identity(&registry, "user-a");
+    assert_eq!(registry.evict_stale(0), 0);
+    let calls = registry
+        .entries
+        .iter()
+        .next()
+        .map(|entry| entry.call_count.load(Ordering::Relaxed));
+    assert_eq!(calls, Some(2), "the second billed call is retained");
+
+    // Collect again, and the row becomes reclaimable.
+    registry.render_json().unwrap();
+    assert_eq!(registry.evict_stale(0), 1);
+}
+
+/// Both export formats acknowledge collection, so a JSON-only collector and a
+/// Prometheus-only collector each keep the registry draining normally.
+#[test]
+fn test_either_export_format_acknowledges_collection() {
+    for json_collector in [true, false] {
+        let registry = ChargebackRegistry::new();
+        registry.configure(600, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+        record_identity(&registry, "user-a");
+        if json_collector {
+            registry.render_json().unwrap();
+        } else {
+            registry.render_prometheus().unwrap();
+        }
+        let evicted = registry.evict_stale(0);
+        assert_eq!(
+            evicted, 1,
+            "a completed export acknowledges collection (json={json_collector})"
+        );
+    }
+}
+
+/// A render that fails closed on a non-finite monetary value never reached a
+/// collector, so it must not acknowledge collection.
+#[test]
+fn test_failed_render_does_not_acknowledge_collection() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(600, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    // Two calls at `f64::MAX` overflow `checked_mul_quantity` to infinity, so
+    // both renders fail closed before any document is produced.
+    let poison = f64::MAX;
+    registry.record_http(
+        &scope(),
+        "alice",
+        "proxy-poison",
+        "API",
+        200,
+        poison,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
+    let key = make_key_with_prices(
+        "alice",
+        "proxy-poison",
+        200,
+        ProtocolFamily::Http,
+        poison,
+        0.0,
+        0.0,
+    );
+    // Release the shard guard before eviction takes the same shard's write lock.
+    let entry = registry.entries.get(&key).unwrap();
+    entry.call_count.store(2, Ordering::Relaxed);
+    drop(entry);
+
+    assert!(registry.render_prometheus().is_err());
+    assert!(registry.render_json().is_err());
+    let evicted = registry.evict_stale(0);
+    assert_eq!(evicted, 0, "a failed export acknowledges nothing");
+    assert_eq!(registry.entries.len(), 1);
+}
+
+/// The uncollected count is exported as a fixed-cardinality, identity-free
+/// Prometheus gauge alongside the other registry saturation series.
+#[test]
+fn test_uncollected_retained_entries_is_exported_without_identities() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(0, 0, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    record_identity(&registry, "user-a");
+    record_identity(&registry, "user-b");
+
+    let prometheus = registry.render_prometheus().unwrap();
+    let gauge = "ferrum_api_chargeback_uncollected_retained_entries";
+    let line = prometheus
+        .lines()
+        .find(|l| l.starts_with(gauge))
+        .unwrap_or_else(|| panic!("missing {gauge}\n{prometheus}"));
+    assert!(line.ends_with(" 2"), "both idle rows are uncollected");
+    assert!(prometheus.contains(&format!("# TYPE {gauge} gauge")));
+    assert!(!line.contains("consumer="), "the gauge carries no labels");
 }

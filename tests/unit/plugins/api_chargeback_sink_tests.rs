@@ -860,7 +860,8 @@ async fn openapi_schema_matches_runtime_admission_boundaries() {
         "inverted retry bounds remain schema-admitted when OpenAPI cannot compare fields"
     );
     let retry_err = validate_plugin_config("api_chargeback_sink", &inverted_retry)
-        .expect_err("inverted retry bounds must fail runtime admission");
+        .err()
+        .unwrap_or_else(|| panic!("inverted retry bounds must fail runtime admission"));
     assert!(
         retry_err.contains("retry.max_delay_ms must be >= retry.initial_delay_ms"),
         "unexpected retry admission error: {retry_err}"
@@ -882,7 +883,8 @@ async fn openapi_schema_matches_runtime_admission_boundaries() {
         "cumulative delay budget remains schema-admitted when OpenAPI cannot compute the schedule"
     );
     let budget_err = validate_plugin_config("api_chargeback_sink", &over_budget)
-        .expect_err("over-budget retry must fail runtime admission");
+        .err()
+        .unwrap_or_else(|| panic!("over-budget retry must fail runtime admission"));
     assert!(
         budget_err.contains("600000"),
         "unexpected cumulative budget error: {budget_err}"
@@ -1225,7 +1227,8 @@ fn spool_rejects_empty_spool_oversized_batch() {
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
     let err = spool
         .write_events(std::slice::from_ref(&event))
-        .expect_err("one-byte-over batch must be rejected on an empty spool");
+        .err()
+        .unwrap_or_else(|| panic!("one-byte-over batch must be rejected on an empty spool"));
     assert!(
         err.contains("exceeds spool.max_bytes")
             || err.contains("cannot fit within spool.max_bytes"),
@@ -1324,7 +1327,8 @@ fn spool_quota_uses_compressed_encoded_size() {
     let over_spool = SpoolManager::for_tests(over, "node-a").unwrap();
     let err = over_spool
         .write_events(std::slice::from_ref(&event))
-        .expect_err("compressed one-byte-over must reject");
+        .err()
+        .unwrap_or_else(|| panic!("compressed one-byte-over must reject"));
     assert!(err.contains("exceeds spool.max_bytes") || err.contains("cannot fit"));
 }
 
@@ -1702,7 +1706,8 @@ fn replaced_namespace_coordination_inode_refuses_spool_mutation() {
 
     let error = spool
         .write_events(&[sample_event("replaced-quota-lock")])
-        .expect_err("a replaced coordination inode must fail closed");
+        .err()
+        .unwrap_or_else(|| panic!("a replaced coordination inode must fail closed"));
 
     assert!(error.contains("coordination"), "unexpected error: {error}");
     assert_eq!(spool.scan_stats_for_tests().unwrap(), SpoolStats::default());
@@ -1720,7 +1725,8 @@ fn hard_linked_namespace_coordination_inode_refuses_spool_mutation() {
 
     let error = spool
         .write_events(&[sample_event("hard-linked-quota-lock")])
-        .expect_err("a hard-linked coordination inode must fail closed");
+        .err()
+        .unwrap_or_else(|| panic!("a hard-linked coordination inode must fail closed"));
 
     assert!(error.contains("hard link"), "unexpected error: {error}");
     assert_eq!(spool.scan_stats_for_tests().unwrap(), SpoolStats::default());
@@ -1874,7 +1880,9 @@ fn independent_managers_cannot_over_admit_streamed_dead_letter_appends() {
         first_result.is_ok(),
         "first append failed: {first_result:?}"
     );
-    let error = second_result.expect_err("second protected append must fail closed");
+    let error = second_result
+        .err()
+        .unwrap_or_else(|| panic!("second protected append must fail closed"));
     assert!(
         error.contains("cannot fit within spool.max_bytes"),
         "{error}"
@@ -2014,7 +2022,8 @@ fn spool_walk_refuses_a_probe_that_fails_for_a_reason_other_than_not_found() {
 
     let error = manager
         .scan_stats_for_tests()
-        .expect_err("an EACCES probe must refuse the walk, not be skipped");
+        .err()
+        .unwrap_or_else(|| panic!("an EACCES probe must refuse the walk, not be skipped"));
     fs::set_permissions(&day, fs::Permissions::from_mode(0o700)).unwrap();
 
     assert!(
@@ -2196,7 +2205,8 @@ fn quota_eviction_fails_closed_when_the_inventory_never_stabilizes() {
 
     let error = spool
         .evict_until_can_admit_for_tests(file_len)
-        .expect_err("a perpetually mutating namespace must refuse admission");
+        .err()
+        .unwrap_or_else(|| panic!("a perpetually mutating namespace must refuse admission"));
     set_spool_write_hook_for_tests(None);
 
     assert!(
@@ -2476,7 +2486,8 @@ fn failed_atomic_spool_write_removes_tmp_and_does_not_publish() {
         b"{\"ok\":true}\n",
         SpoolFinalOwnership::Unique,
     )
-    .expect_err("rename onto a directory must fail the atomic publish");
+    .err()
+    .unwrap_or_else(|| panic!("rename onto a directory must fail the atomic publish"));
     assert!(
         err.contains("failed to rename spool temp file"),
         "unexpected error: {err}"
@@ -3119,7 +3130,8 @@ fn durable_config_rejects_wait_for_async_insert_zero_without_lossy_opt_in() {
         "wait_for_async_insert": "0"
     });
     let err = validate_plugin_config("api_chargeback_sink", &config)
-        .expect_err("wait_for_async_insert=0 must be rejected in durable mode");
+        .err()
+        .unwrap_or_else(|| panic!("wait_for_async_insert=0 must be rejected in durable mode"));
     assert!(
         err.contains("wait_for_async_insert"),
         "error should name the setting: {err}"
@@ -3165,7 +3177,8 @@ fn durable_config_rejects_wait_for_async_insert_zero_without_lossy_opt_in() {
 
     config["clickhouse"]["allow_lossy_async_insert_typo"] = json!(true);
     let unknown = validate_plugin_config("api_chargeback_sink", &config)
-        .expect_err("unknown clickhouse keys must stay rejected");
+        .err()
+        .unwrap_or_else(|| panic!("unknown clickhouse keys must stay rejected"));
     assert!(
         unknown.contains("unknown field") || unknown.contains("allow_lossy_async_insert_typo"),
         "unknown-key rejection must mention the field: {unknown}"
@@ -3516,7 +3529,8 @@ async fn replay_keeps_original_when_dead_letter_metadata_cannot_be_written() {
 
     let error = replay_spool_once_for_tests(&spool, &server.uri())
         .await
-        .expect_err("dead-letter metadata failure must stop the replay tick");
+        .err()
+        .unwrap_or_else(|| panic!("dead-letter metadata failure must stop the replay tick"));
 
     assert!(error.contains("failed to create spool temp file"));
     assert!(
@@ -3570,7 +3584,8 @@ async fn dead_letter_recovery_reuses_quota_held_by_a_partially_published_payload
 
     replay_spool_once_for_tests(&spool, &server.uri())
         .await
-        .expect_err("blocked metadata publication must retain the source");
+        .err()
+        .unwrap_or_else(|| panic!("blocked metadata publication must retain the source"));
     let payload_path = dead_letter_payload_path(&source);
     assert!(source.exists());
     assert!(payload_path.exists());
@@ -3605,7 +3620,8 @@ async fn dead_letter_payload_publish_refuses_symlink_and_restores_the_source_cla
 
     let error = replay_spool_once_for_tests(&spool, &server.uri())
         .await
-        .expect_err("a planted dead-letter symlink must fail closed");
+        .err()
+        .unwrap_or_else(|| panic!("a planted dead-letter symlink must fail closed"));
 
     assert!(error.contains("symlink"), "unexpected error: {error}");
     assert!(source.exists(), "the authoritative source must be restored");
@@ -3690,7 +3706,10 @@ async fn dead_letter_payload_admits_each_append_before_exceeding_spool_quota() {
 
     let error = replay_spool_once_for_tests(&spool, &server.uri())
         .await
-        .expect_err("the uncompressed dead-letter copy must not exceed spool.max_bytes");
+        .err()
+        .unwrap_or_else(|| {
+            panic!("the uncompressed dead-letter copy must not exceed spool.max_bytes")
+        });
     set_spool_write_hook_for_tests(None);
 
     assert!(
@@ -3853,7 +3872,8 @@ fn tampered_dead_letter_source_credit_record_grants_no_capacity() {
     .unwrap();
 
     let error = publish_dead_letter_payload_for_claim_for_tests(&spool, &claim, &row)
-        .expect_err("a credit no durable record witnesses must not be spent");
+        .err()
+        .unwrap_or_else(|| panic!("a credit no durable record witnesses must not be spent"));
 
     assert!(
         error.contains("cannot fit within spool.max_bytes"),
@@ -3899,7 +3919,10 @@ fn replaced_dead_letter_source_credit_path_grants_no_capacity() {
     fs::write(&credit_path, b"replacement credit domain").unwrap();
 
     let error = publish_dead_letter_payload_for_claim_for_tests(&spool, &claim, &row)
-        .expect_err("a replaced credit pathname must invalidate the old locked descriptor");
+        .err()
+        .unwrap_or_else(|| {
+            panic!("a replaced credit pathname must invalidate the old locked descriptor")
+        });
     assert!(
         error.contains("cannot fit within spool.max_bytes"),
         "unexpected quota diagnostic: {error}"
@@ -3935,7 +3958,10 @@ fn resized_pinned_source_invalidates_dead_letter_credit() {
     let expanded_rejection = padded_dead_letter_row("dl-resized-rejection", 7000);
     let error =
         publish_dead_letter_payload_for_claim_for_tests(&spool, &claim, &expanded_rejection)
-            .expect_err("a stale source length must not raise the admission ceiling");
+            .err()
+            .unwrap_or_else(|| {
+                panic!("a stale source length must not raise the admission ceiling")
+            });
 
     assert!(
         error.contains("exceeds spool.max_bytes"),
@@ -4023,7 +4049,8 @@ fn independent_managers_cannot_double_spend_the_dead_letter_source_credit() {
     publish_dead_letter_payload_for_claim_for_tests(&first, &claim_a, &row)
         .expect("the credited handoff must complete");
     let error = publish_dead_letter_payload_for_claim_for_tests(&second, &claim_b, &row)
-        .expect_err("an uncredited concurrent handoff must fail closed");
+        .err()
+        .unwrap_or_else(|| panic!("an uncredited concurrent handoff must fail closed"));
 
     assert!(
         error.contains("cannot fit within spool.max_bytes"),
@@ -4356,7 +4383,8 @@ fn renamed_aside_dead_letter_source_credit_path_grants_no_capacity() {
         "a replaced credit pathname must invalidate the old locked descriptor"
     );
     let error = publish_dead_letter_payload_for_claim_for_tests(&spool, &claim, &row)
-        .expect_err("capacity without a live coordination inode must fail closed");
+        .err()
+        .unwrap_or_else(|| panic!("capacity without a live coordination inode must fail closed"));
     assert!(
         error.contains("cannot fit within spool.max_bytes"),
         "unexpected quota diagnostic: {error}"
@@ -4507,7 +4535,8 @@ fn oversized_dead_letter_source_credit_record_grants_no_capacity() {
         "an over-bound credit body must grant no capacity"
     );
     let error = publish_dead_letter_payload_for_claim_for_tests(&spool, &claim, &row)
-        .expect_err("oversized credit body must not admit the rejected copy");
+        .err()
+        .unwrap_or_else(|| panic!("oversized credit body must not admit the rejected copy"));
     assert!(
         error.contains("cannot fit within spool.max_bytes"),
         "unexpected quota diagnostic: {error}"
@@ -4702,7 +4731,8 @@ async fn replay_stops_on_retryable_redirect_auth_408_429_and_5xx_without_removin
 
         let err = replay_spool_once_for_tests(&spool, &server.uri())
             .await
-            .expect_err("retryable status must fail the replay tick");
+            .err()
+            .unwrap_or_else(|| panic!("retryable status must fail the replay tick"));
         assert!(
             err.contains(&format!("clickhouse returned HTTP {status}")),
             "unexpected error: {err}"
@@ -4730,7 +4760,8 @@ async fn replay_stops_on_network_failure_without_removing_file() {
 
     let err = replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/")
         .await
-        .expect_err("unreachable ClickHouse must be retryable");
+        .err()
+        .unwrap_or_else(|| panic!("unreachable ClickHouse must be retryable"));
     assert!(
         err.contains("network") || err.contains("timeout") || err.contains("tls"),
         "unexpected error class: {err}"
@@ -4930,7 +4961,8 @@ async fn replay_keeps_spool_on_ambiguous_non_empty_200_acknowledgement() {
 
     let err = replay_spool_once_for_tests(&spool, &server.uri())
         .await
-        .expect_err("ambiguous acknowledgement must be retryable");
+        .err()
+        .unwrap_or_else(|| panic!("ambiguous acknowledgement must be retryable"));
     assert!(
         err.contains("ambiguous") || err.contains("non-empty"),
         "unexpected error: {err}"
@@ -4975,7 +5007,8 @@ async fn replay_retries_after_ambiguous_acknowledgement_without_double_billing_i
 
     let first = replay_spool_once_for_tests(&spool, &server.uri())
         .await
-        .expect_err("first ambiguous ACK must keep the file");
+        .err()
+        .unwrap_or_else(|| panic!("first ambiguous ACK must keep the file"));
     assert!(first.contains("ambiguous") || first.contains("non-empty"));
     assert!(path.exists());
 
@@ -5324,7 +5357,8 @@ fn spool_before_write_gate_timeout_names_unreachable_gate_state() {
     let gate = SpoolBeforeWriteGate::new();
     let error = gate
         .wait_until_parked(1, Duration::from_millis(20))
-        .expect_err("an unreachable BeforeWrite gate must fail closed");
+        .err()
+        .unwrap_or_else(|| panic!("an unreachable BeforeWrite gate must fail closed"));
     assert!(
         error.contains("did not reach parked>=1"),
         "timeout must name the missed parked threshold: {error}"
@@ -5938,10 +5972,12 @@ fn spool_path_component_rejects_or_encodes_escape_forms() {
         assert!(!encoded.contains('/') && !encoded.contains('\\') && !encoded.contains('\0'));
     }
     let nul_err = SpoolManager::encode_spool_path_component_for_tests("x\0y")
-        .expect_err("NUL must be rejected");
+        .err()
+        .unwrap_or_else(|| panic!("NUL must be rejected"));
     assert!(nul_err.contains("NUL"));
     let empty_err = SpoolManager::encode_spool_path_component_for_tests("   ")
-        .expect_err("a whitespace-only component must not become a path segment");
+        .err()
+        .unwrap_or_else(|| panic!("a whitespace-only component must not become a path segment"));
     assert!(empty_err.contains("must not be empty"), "{empty_err}");
     assert_eq!(
         SpoolManager::encode_spool_path_component_for_tests("edge-0").unwrap(),
@@ -6063,7 +6099,8 @@ fn spool_metadata_owner_mismatch_fails_closed_without_mutating_records() {
 
     let err = spool
         .list_replayable_spool_files_for_tests()
-        .expect_err("mismatched ownership metadata must fail closed");
+        .err()
+        .unwrap_or_else(|| panic!("mismatched ownership metadata must fail closed"));
     assert!(
         err.contains("does not match this sink identity"),
         "unexpected error: {err}"
@@ -6135,7 +6172,8 @@ fn oversized_namespace_metadata_fails_closed_without_mutating_records() {
 
     let err = spool
         .list_replayable_spool_files_for_tests()
-        .expect_err("an oversized ownership manifest must fail closed");
+        .err()
+        .unwrap_or_else(|| panic!("an oversized ownership manifest must fail closed"));
     assert!(err.contains("artifact bound"), "unexpected error: {err}");
     assert!(
         record.exists(),
@@ -6180,7 +6218,8 @@ fn foreign_owner_tagged_records_are_never_replayed_or_evicted() {
     // Quota pressure must fail closed rather than delete another owner's data.
     let err = spool
         .write_events(std::slice::from_ref(&event))
-        .expect_err("eviction must not be able to reclaim another owner's bytes");
+        .err()
+        .unwrap_or_else(|| panic!("eviction must not be able to reclaim another owner's bytes"));
     assert!(
         err.contains("owned by another identity"),
         "unexpected error: {err}"
@@ -6235,7 +6274,8 @@ fn spool_walk_bounds_empty_directory_entries() {
     }
     let error = spool
         .list_owned_spool_files_with_entry_limit_for_tests(5)
-        .expect_err("empty directories must count toward the traversal bound");
+        .err()
+        .unwrap_or_else(|| panic!("empty directories must count toward the traversal bound"));
     assert!(
         error.contains("max entry count (5)"),
         "unexpected error: {error}"
@@ -6289,7 +6329,8 @@ fn namespace_root_symlink_swap_fails_closed() {
 
     let error = spool
         .list_replayable_spool_files_for_tests()
-        .expect_err("a swapped namespace-root symlink must fail closed");
+        .err()
+        .unwrap_or_else(|| panic!("a swapped namespace-root symlink must fail closed"));
     assert!(
         error.contains("symlinked spool path") || error.contains("canonical target"),
         "unexpected error: {error}"
@@ -6328,7 +6369,8 @@ fn spool_scan_survives_directory_cycles_and_bounds_depth() {
     fs::write(&record, b"{}\n").unwrap();
     let err = spool
         .list_owned_spool_files_for_tests()
-        .expect_err("traversal beyond the depth bound must fail closed");
+        .err()
+        .unwrap_or_else(|| panic!("traversal beyond the depth bound must fail closed"));
     assert!(err.contains("max depth"), "unexpected error: {err}");
 }
 
@@ -6425,7 +6467,8 @@ fn admission_eviction_never_unlinks_a_live_peer_generation_temp() {
     let gen2 = SpoolManager::for_tests_with_owner(settings.clone(), &spec, 22).unwrap();
     let err = gen2
         .write_events(std::slice::from_ref(&event))
-        .expect_err("admission must fail closed rather than evict a live peer temp");
+        .err()
+        .unwrap_or_else(|| panic!("admission must fail closed rather than evict a live peer temp"));
     assert!(
         err.contains("cannot fit within spool.max_bytes"),
         "unexpected error: {err}"
@@ -6473,7 +6516,10 @@ fn admission_eviction_never_unlinks_a_fresh_peer_process_temp() {
 
     let err = spool
         .write_events(std::slice::from_ref(&event))
-        .expect_err("a peer process's fresh temp must not be evicted to admit a write");
+        .err()
+        .unwrap_or_else(|| {
+            panic!("a peer process's fresh temp must not be evicted to admit a write")
+        });
     assert!(
         err.contains("cannot fit within spool.max_bytes"),
         "unexpected error: {err}"
@@ -6517,7 +6563,8 @@ fn compressed_spool_record_expanding_past_its_bound_fails_closed() {
     let bomb_path = temp.path().join("01ARZ3NDEKTSV4RRFFQ69G5FB3.ndjson.zst");
     fs::write(&bomb_path, &bomb).unwrap();
     let err = decode_spool_file_for_tests(&bomb_path)
-        .expect_err("a high-ratio archive must not expand without bound");
+        .err()
+        .unwrap_or_else(|| panic!("a high-ratio archive must not expand without bound"));
     assert!(
         err.contains("decompression bound"),
         "unexpected error: {err}"
@@ -6549,7 +6596,8 @@ fn spool_replay_caps_large_encoded_and_decoded_artifacts_absolutely() {
     oversized.set_len(hard_limit.saturating_add(1)).unwrap();
     drop(oversized);
     let err = decode_spool_file_for_tests(&oversized_path)
-        .expect_err("an oversized raw artifact must fail before allocation");
+        .err()
+        .unwrap_or_else(|| panic!("an oversized raw artifact must fail before allocation"));
     assert!(
         err.contains("hard") && err.contains("artifact bound"),
         "unexpected error: {err}"
@@ -6612,7 +6660,8 @@ fn atomic_spool_write_fault_injection_surfaces_before_success() {
             fault,
             SpoolFinalOwnership::Unique,
         )
-        .expect_err("an injected durable-write fault must fail the write");
+        .err()
+        .unwrap_or_else(|| panic!("an injected durable-write fault must fail the write"));
         assert!(
             err.contains("injected fault"),
             "unexpected error for {fault:?}: {err}"
@@ -6658,7 +6707,8 @@ fn rollback_before_rename_preserves_a_peer_published_shared_final() {
             fault,
             SpoolFinalOwnership::Shared,
         )
-        .expect_err("an injected pre-rename fault must fail the write");
+        .err()
+        .unwrap_or_else(|| panic!("an injected pre-rename fault must fail the write"));
         assert!(
             err.contains("injected fault"),
             "unexpected error for {fault:?}: {err}"
@@ -6701,7 +6751,8 @@ fn rollback_after_rename_never_unlinks_a_shared_final() {
         SpoolFsFault::PeerRepublishThenDirSync,
         SpoolFinalOwnership::Shared,
     )
-    .expect_err("an injected directory-sync fault must fail the write");
+    .err()
+    .unwrap_or_else(|| panic!("an injected directory-sync fault must fail the write"));
     assert!(err.contains("injected fault"), "unexpected error: {err}");
     assert!(
         !err.contains("rollback cleanup also failed"),
@@ -6729,7 +6780,8 @@ fn rollback_after_rename_never_unlinks_a_shared_final() {
         SpoolFsFault::DirSync,
         SpoolFinalOwnership::Shared,
     )
-    .expect_err("an injected directory-sync fault must fail the write");
+    .err()
+    .unwrap_or_else(|| panic!("an injected directory-sync fault must fail the write"));
     assert!(err.contains("injected fault"), "unexpected error: {err}");
     assert!(
         !quiet_tmp.exists(),
@@ -6760,7 +6812,8 @@ fn rollback_after_rename_removes_a_unique_final() {
         SpoolFsFault::DirSync,
         SpoolFinalOwnership::Unique,
     )
-    .expect_err("an injected directory-sync fault must fail the write");
+    .err()
+    .unwrap_or_else(|| panic!("an injected directory-sync fault must fail the write"));
     assert!(err.contains("injected fault"), "unexpected error: {err}");
     assert!(
         !err.contains("rollback cleanup also failed"),
@@ -6798,7 +6851,8 @@ fn rollback_after_rename_preserves_a_peer_replacement_at_a_unique_final() {
         SpoolFsFault::PeerRepublishThenDirSync,
         SpoolFinalOwnership::Unique,
     )
-    .expect_err("an injected directory-sync fault must fail the write");
+    .err()
+    .unwrap_or_else(|| panic!("an injected directory-sync fault must fail the write"));
     assert!(err.contains("injected fault"), "unexpected error: {err}");
     assert!(
         !err.contains("rollback cleanup also failed"),
@@ -6834,7 +6888,8 @@ fn shared_manifest_rollback_leaves_live_storage_unprepared() {
 
     let err = faulted
         .write_events(&[sample_event("evt-manifest-unsynced")])
-        .expect_err("an unsynced manifest publish must fail the write");
+        .err()
+        .unwrap_or_else(|| panic!("an unsynced manifest publish must fail the write"));
     assert!(err.contains("injected fault"), "unexpected error: {err}");
     let replayable = faulted.list_replayable_spool_files_for_tests().unwrap();
     assert!(
@@ -6848,7 +6903,8 @@ fn shared_manifest_rollback_leaves_live_storage_unprepared() {
     // durable write keeps the batch uncommitted.
     let err = faulted
         .write_events(&[sample_event("evt-manifest-unsynced-2")])
-        .expect_err("a retry under the same fault must not silently succeed");
+        .err()
+        .unwrap_or_else(|| panic!("a retry under the same fault must not silently succeed"));
     assert!(err.contains("injected fault"), "unexpected error: {err}");
     assert_eq!(
         disk_owned_bytes(&default_test_namespace_root(temp.path())),
@@ -6867,7 +6923,8 @@ fn injected_file_sync_failure_keeps_the_spool_batch_uncommitted() {
             .unwrap();
     let err = faulted
         .write_events(&[sample_event("evt-not-durable")])
-        .expect_err("a failed durable handoff must be reported to the caller");
+        .err()
+        .unwrap_or_else(|| panic!("a failed durable handoff must be reported to the caller"));
     assert!(err.contains("injected fault"), "unexpected error: {err}");
 
     let root = default_test_namespace_root(temp.path());
@@ -6893,7 +6950,8 @@ fn injected_rename_failure_keeps_the_spool_batch_uncommitted() {
             .unwrap();
     let err = faulted
         .write_events(&[sample_event("evt-no-rename")])
-        .expect_err("a failed rename must be reported to the caller");
+        .err()
+        .unwrap_or_else(|| panic!("a failed rename must be reported to the caller"));
     assert!(err.contains("injected fault"), "unexpected error: {err}");
     assert_eq!(
         disk_owned_bytes(&default_test_namespace_root(temp.path())),
@@ -6913,7 +6971,10 @@ fn injected_directory_open_failure_rolls_back_the_publish() {
             .unwrap();
     let err = faulted
         .write_events(&[sample_event("evt-dir-open")])
-        .expect_err("a directory-open failure must not be reported as a durable commit");
+        .err()
+        .unwrap_or_else(|| {
+            panic!("a directory-open failure must not be reported as a durable commit")
+        });
     assert!(err.contains("injected fault"), "unexpected error: {err}");
     assert_eq!(
         disk_owned_bytes(&default_test_namespace_root(temp.path())),
@@ -6933,7 +6994,10 @@ fn injected_directory_sync_failure_rolls_back_the_publish() {
             .unwrap();
     let err = faulted
         .write_events(&[sample_event("evt-dir-sync")])
-        .expect_err("a directory-sync failure must not be reported as a durable commit");
+        .err()
+        .unwrap_or_else(|| {
+            panic!("a directory-sync failure must not be reported as a durable commit")
+        });
     assert!(err.contains("injected fault"), "unexpected error: {err}");
     assert_eq!(
         disk_owned_bytes(&default_test_namespace_root(temp.path())),
@@ -6971,7 +7035,8 @@ async fn replay_claim_is_excluded_from_eviction_and_released_on_retryable() {
     // Quota pressure while the file is claimed must fail closed, never evict it.
     let err = spool
         .write_events(&[sample_event("evt-new")])
-        .expect_err("an in-flight claim is never an eviction candidate");
+        .err()
+        .unwrap_or_else(|| panic!("an in-flight claim is never an eviction candidate"));
     assert!(err.contains("in-flight"), "unexpected error: {err}");
     assert!(claim_path.exists(), "in-flight claim must survive eviction");
     // Retryable delivery releases the claim back to a durable replayable name.
@@ -6983,7 +7048,8 @@ async fn replay_claim_is_excluded_from_eviction_and_released_on_retryable() {
 
     let err = replay_spool_once_for_tests(&spool, &server.uri())
         .await
-        .expect_err("503 must remain retryable");
+        .err()
+        .unwrap_or_else(|| panic!("503 must remain retryable"));
     assert!(!err.is_empty());
     assert!(
         oldest.exists(),
@@ -7099,15 +7165,21 @@ fn managed_path_containment_rejects_escape_and_absolute_replacement() {
 
     // `..` walking off the front of the candidate is rejected before any
     // filesystem call.
-    let popped = within_root("spool/../../etc/passwd").expect_err("escape refused");
+    let popped = within_root("spool/../../etc/passwd")
+        .err()
+        .unwrap_or_else(|| panic!("escape refused"));
     assert!(popped.contains("escapes root"), "{popped}");
 
     // A sibling tree that merely shares a parent is outside the root.
-    let sibling = within_root("other/a.ndjson").expect_err("sibling refused");
+    let sibling = within_root("other/a.ndjson")
+        .err()
+        .unwrap_or_else(|| panic!("sibling refused"));
     assert!(sibling.contains("outside root"), "{sibling}");
 
     // An absolute component replaces the join instead of extending it.
-    let absolute = within_root("/etc/shadow").expect_err("absolute refused");
+    let absolute = within_root("/etc/shadow")
+        .err()
+        .unwrap_or_else(|| panic!("absolute refused"));
     assert!(absolute.contains("outside root"), "{absolute}");
 }
 
@@ -7130,7 +7202,8 @@ fn claiming_a_foreign_or_non_replayable_spool_file_is_refused() {
     // A claim marker is not itself a replay candidate.
     let non_replayable = spool
         .claim_replay_file_for_tests(&claim)
-        .expect_err("an in-flight claim must not be re-claimed");
+        .err()
+        .unwrap_or_else(|| panic!("an in-flight claim must not be re-claimed"));
     assert!(
         non_replayable.contains("refusing to claim non-replayable spool file"),
         "{non_replayable}"
@@ -7145,14 +7218,16 @@ fn claiming_a_foreign_or_non_replayable_spool_file_is_refused() {
     fs::write(&foreign, b"{}\n").unwrap();
     let refused = spool
         .claim_replay_file_for_tests(&foreign)
-        .expect_err("a foreign-tagged record must not be claimable");
+        .err()
+        .unwrap_or_else(|| panic!("a foreign-tagged record must not be claimable"));
     assert!(refused.contains("owned by another identity"), "{refused}");
     assert!(foreign.exists(), "a foreign record must not be touched");
 
     // Releasing a path that carries no claim marker is refused rather than
     // renaming an arbitrary managed file.
     let not_a_claim = SpoolManager::claim_restore_path_for_tests(&foreign)
-        .expect_err("only claim markers can be restored");
+        .err()
+        .unwrap_or_else(|| panic!("only claim markers can be restored"));
     assert!(
         not_a_claim.contains("missing a claim marker"),
         "{not_a_claim}"
@@ -8479,7 +8554,8 @@ fn chargeback_insert_body_is_refused_rather_than_serialized_under_a_saturated_ce
         .collect();
 
     let error = probe_charge_body_materialization_for_tests(ceiling, &events)
-        .expect_err("a 1 KiB ceiling cannot admit an eight-row insert body");
+        .err()
+        .unwrap_or_else(|| panic!("a 1 KiB ceiling cannot admit an eight-row insert body"));
     assert!(
         error.contains("ceiling"),
         "the refusal must name the ceiling: {error}"
@@ -8548,7 +8624,8 @@ async fn spool_replay_refuses_before_decoding_when_the_ceiling_cannot_hold_the_a
     let ceiling = leaked_chargeback_test_ceiling(encoded_len - 1);
     let error = replay_spool_once_with_ceiling_for_tests(&spool, "http://127.0.0.1:1/", 4, ceiling)
         .await
-        .expect_err("a ceiling below the artifact size must defer replay");
+        .err()
+        .unwrap_or_else(|| panic!("a ceiling below the artifact size must defer replay"));
 
     assert!(
         error.contains("ceiling"),
@@ -8781,7 +8858,8 @@ async fn spool_replay_releases_its_reservations_on_success_and_on_retryable_fail
     let path = spool.write_events(&spool_replay_events(4)).unwrap();
     replay_spool_once_with_ceiling_for_tests(&spool, "http://127.0.0.1:1/", 4, ceiling)
         .await
-        .expect_err("unreachable ClickHouse must be retryable");
+        .err()
+        .unwrap_or_else(|| panic!("unreachable ClickHouse must be retryable"));
     assert_eq!(
         ceiling.used(),
         0,
@@ -8837,7 +8915,8 @@ fn spool_artifact_materialization_fails_closed_on_row_count_row_bytes_and_replay
     let too_many = vec![sample_event("bound-row-count"); max_rows + 1];
     let error = spool
         .probe_spool_artifact_materialization_for_tests(&too_many)
-        .expect_err("row-count overflow must refuse before serialization");
+        .err()
+        .unwrap_or_else(|| panic!("row-count overflow must refuse before serialization"));
     assert!(
         error.contains("refusing to spool") && error.contains("row"),
         "unexpected row-count refusal: {error}"
@@ -8851,7 +8930,8 @@ fn spool_artifact_materialization_fails_closed_on_row_count_row_bytes_and_replay
     oversized.request_id = Some("x".repeat(200 * 1024));
     let error = spool
         .probe_spool_artifact_materialization_for_tests(&[oversized])
-        .expect_err("an oversize conservative row bound must refuse");
+        .err()
+        .unwrap_or_else(|| panic!("an oversize conservative row bound must refuse"));
     assert!(
         error.contains("refusing to spool a row") && error.contains("byte"),
         "unexpected row-byte refusal: {error}"
@@ -8863,7 +8943,10 @@ fn spool_artifact_materialization_fails_closed_on_row_count_row_bytes_and_replay
     let tight_spool = ceiling_spool(&tempfile::tempdir().unwrap(), tight);
     let error = tight_spool
         .probe_spool_artifact_materialization_for_tests(&[sample_event("bound-replay-ceiling")])
-        .expect_err("artifacts that cannot stream under the ceiling must be refused");
+        .err()
+        .unwrap_or_else(|| {
+            panic!("artifacts that cannot stream under the ceiling must be refused")
+        });
     assert!(
         error.contains("streaming replay") || error.contains("retained bytes"),
         "unexpected replay-ceiling refusal: {error}"
@@ -8929,7 +9012,10 @@ fn streaming_replay_batch_range_probe_releases_on_second_index_refusal() {
     let ceiling = leaked_chargeback_test_ceiling(128usize.saturating_add(index_bytes));
 
     let error = probe_streaming_replay_batch_range_errors_for_tests(ceiling)
-        .expect_err("the second line index must be refused after both payloads are charged");
+        .err()
+        .unwrap_or_else(|| {
+            panic!("the second line index must be refused after both payloads are charged")
+        });
 
     assert!(
         error.contains("ceiling") || error.contains("retained"),
@@ -8948,7 +9034,8 @@ fn streaming_reader_rejects_a_directory_descriptor_as_non_regular() {
     let ceiling = leaked_chargeback_test_ceiling(8 * 1024 * 1024);
 
     let error = probe_streaming_replay_path_swap_for_tests(&directory, &replacement, ceiling)
-        .expect_err("a directory descriptor must fail before streaming preflight");
+        .err()
+        .unwrap_or_else(|| panic!("a directory descriptor must fail before streaming preflight"));
 
     assert!(
         error.contains("not a regular file"),
@@ -9179,7 +9266,10 @@ async fn streaming_replay_defers_when_the_second_batch_index_is_starved() {
 
     let error = replay_spool_once_with_ceiling_for_tests(&spool, &server.uri(), 4, ceiling)
         .await
-        .expect_err("the second batch body may fit while its fixed index is refused");
+        .err()
+        .unwrap_or_else(|| {
+            panic!("the second batch body may fit while its fixed index is refused")
+        });
 
     assert!(narrowed.load(Ordering::SeqCst));
     assert!(
@@ -9241,7 +9331,8 @@ async fn dead_letter_publish_refuses_a_final_planted_after_writer_open() {
 
     let error = replay_spool_once_for_tests(&spool, &server.uri())
         .await
-        .expect_err("a post-open non-file final must fail dead-letter publication");
+        .err()
+        .unwrap_or_else(|| panic!("a post-open non-file final must fail dead-letter publication"));
     set_spool_write_hook_for_tests(None);
 
     assert!(planted.load(Ordering::SeqCst));
@@ -9324,7 +9415,8 @@ async fn dead_letter_publish_refuses_a_completed_temp_path_replacement() {
 
     let error = replay_spool_once_for_tests(&spool, &server.uri())
         .await
-        .expect_err("a replaced completed dead-letter temp must fail publication");
+        .err()
+        .unwrap_or_else(|| panic!("a replaced completed dead-letter temp must fail publication"));
     set_spool_write_hook_for_tests(None);
 
     assert!(replaced.load(Ordering::SeqCst));
@@ -9401,7 +9493,8 @@ async fn dead_letter_handoff_publishes_nothing_when_the_source_path_becomes_a_di
 
     let error = replay_spool_once_for_tests(&spool, &server.uri())
         .await
-        .expect_err("the dead-letter handoff must refuse a replaced claim pathname");
+        .err()
+        .unwrap_or_else(|| panic!("the dead-letter handoff must refuse a replaced claim pathname"));
 
     assert!(changed.load(Ordering::SeqCst));
     assert!(
@@ -9586,7 +9679,8 @@ async fn claim_substituted_after_the_validated_replay_open_is_never_mutated() {
 
     let error = replay_spool_once_for_tests(&spool, &server.uri())
         .await
-        .expect_err("a substituted claim pathname must fail the tick");
+        .err()
+        .unwrap_or_else(|| panic!("a substituted claim pathname must fail the tick"));
     drop(clear);
 
     assert!(fired.load(Ordering::SeqCst));
@@ -9675,7 +9769,10 @@ async fn claim_substituted_before_finalization_publishes_nothing_and_never_mutat
 
     let error = replay_spool_once_for_tests(&spool, &server.uri())
         .await
-        .expect_err("the terminal claim operation must refuse a substituted claim pathname");
+        .err()
+        .unwrap_or_else(|| {
+            panic!("the terminal claim operation must refuse a substituted claim pathname")
+        });
     drop(clear);
 
     assert!(fired.load(Ordering::SeqCst));
@@ -9772,7 +9869,8 @@ async fn wrong_type_claim_before_finalization_publishes_nothing_and_never_mutate
 
     let error = replay_spool_once_for_tests(&spool, &server.uri())
         .await
-        .expect_err("finalization must refuse a wrong-type claim pathname");
+        .err()
+        .unwrap_or_else(|| panic!("finalization must refuse a wrong-type claim pathname"));
     drop(clear);
 
     assert!(fired.load(Ordering::SeqCst));
@@ -9864,7 +9962,10 @@ async fn wrong_type_claim_during_dead_letter_append_is_unauthorized_not_retryabl
 
     let error = replay_spool_once_for_tests(&spool, &server.uri())
         .await
-        .expect_err("a wrong-type claim during dead-letter append must fail the tick");
+        .err()
+        .unwrap_or_else(|| {
+            panic!("a wrong-type claim during dead-letter append must fail the tick")
+        });
     drop(clear);
 
     assert!(fired.load(Ordering::SeqCst));
@@ -9954,7 +10055,10 @@ async fn substituted_claim_during_dead_letter_open_is_unauthorized_not_retryable
 
     let error = replay_spool_once_for_tests(&spool, &server.uri())
         .await
-        .expect_err("a substituted claim during dead-letter open must fail the tick");
+        .err()
+        .unwrap_or_else(|| {
+            panic!("a substituted claim during dead-letter open must fail the tick")
+        });
     drop(clear);
 
     assert!(fired.load(Ordering::SeqCst));
@@ -10038,7 +10142,8 @@ async fn finalize_authorization_precedes_generic_publication_failure() {
 
     let error = replay_spool_once_for_tests(&spool, &server.uri())
         .await
-        .expect_err("a blocked metadata store must still fail the tick");
+        .err()
+        .unwrap_or_else(|| panic!("a blocked metadata store must still fail the tick"));
     drop(clear);
 
     assert!(fired.load(Ordering::SeqCst));
@@ -10116,7 +10221,10 @@ async fn substituted_claim_before_metadata_publish_is_unauthorized_not_retryable
 
     let error = replay_spool_once_for_tests(&spool, &server.uri())
         .await
-        .expect_err("a substituted claim at metadata publication must fail the tick");
+        .err()
+        .unwrap_or_else(|| {
+            panic!("a substituted claim at metadata publication must fail the tick")
+        });
     drop(clear);
 
     assert!(fired.load(Ordering::SeqCst));
@@ -10216,7 +10324,8 @@ async fn wrong_type_claim_before_terminal_removal_is_unauthorized_not_retryable(
 
     let error = replay_spool_once_for_tests(&spool, &server.uri())
         .await
-        .expect_err("a wrong-type claim at terminal removal must fail the tick");
+        .err()
+        .unwrap_or_else(|| panic!("a wrong-type claim at terminal removal must fail the tick"));
     drop(clear);
 
     assert!(fired.load(Ordering::SeqCst));
@@ -10316,7 +10425,8 @@ fn claim_renewal_refuses_a_substituted_pathname_as_unauthorized() {
     let renewed_suffix = format!("-{far_future}.inflight");
     match spool
         .probe_renew_claim_at_for_tests(&mut claim, far_future)
-        .expect_err("a substituted claim pathname must not be renewed")
+        .err()
+        .unwrap_or_else(|| panic!("a substituted claim pathname must not be renewed"))
     {
         ClaimMutationOutcomeForTests::Unauthorized(message) => {
             assert!(
@@ -10418,7 +10528,8 @@ async fn initial_ceiling_release_never_promotes_a_substituted_claim() {
 
     let error = replay_spool_once_with_ceiling_for_tests(&spool, "http://127.0.0.1:1/", 4, ceiling)
         .await
-        .expect_err("the bound initial release must refuse a substituted claim");
+        .err()
+        .unwrap_or_else(|| panic!("the bound initial release must refuse a substituted claim"));
     drop(peer_hold);
     drop(clear);
 
@@ -10853,7 +10964,8 @@ async fn spool_replay_defers_when_ceiling_cannot_hold_stream_and_batch() {
 
     let error = replay_spool_once_with_ceiling_for_tests(&spool, "http://127.0.0.1:1/", 4, ceiling)
         .await
-        .expect_err("a ceiling that cannot hold one row and batch must defer");
+        .err()
+        .unwrap_or_else(|| panic!("a ceiling that cannot hold one row and batch must defer"));
     assert!(
         error.contains("ceiling") || error.contains("streaming"),
         "unexpected deferral diagnostic: {error}"
@@ -10890,7 +11002,8 @@ async fn spool_replay_defers_when_a_peer_reservation_starves_batch_admission() {
 
     let error = replay_spool_once_with_ceiling_for_tests(&spool, &server.uri(), 4, ceiling)
         .await
-        .expect_err("a peer-saturated ceiling must defer before delivery");
+        .err()
+        .unwrap_or_else(|| panic!("a peer-saturated ceiling must defer before delivery"));
     assert!(
         error.contains("ceiling") || error.contains("deferred"),
         "unexpected peer-starvation diagnostic: {error}"
@@ -10928,7 +11041,10 @@ async fn spool_replay_defers_when_a_peer_reservation_starves_dead_letter_tally()
 
     let error = replay_spool_once_with_ceiling_for_tests(&spool, "http://127.0.0.1:1/", 4, ceiling)
         .await
-        .expect_err("a peer-saturated ceiling must defer before isolation state exists");
+        .err()
+        .unwrap_or_else(|| {
+            panic!("a peer-saturated ceiling must defer before isolation state exists")
+        });
     assert!(
         error.contains("ceiling") || error.contains("deferred"),
         "unexpected tally-starvation diagnostic: {error}"
@@ -10967,7 +11083,8 @@ async fn dead_letter_publish_faults_restore_the_authoritative_source() {
     fs::write(&payload_temp, b"blocker").unwrap();
     let error = replay_spool_once_for_tests(&blocked, &server.uri())
         .await
-        .expect_err("a blocked dead-letter temp must fail closed");
+        .err()
+        .unwrap_or_else(|| panic!("a blocked dead-letter temp must fail closed"));
     assert!(
         error.contains("failed to create dead-letter payload temp")
             || error.contains("dead-letter"),
@@ -10988,7 +11105,10 @@ async fn dead_letter_publish_faults_restore_the_authoritative_source() {
     fs::create_dir(&payload_final).unwrap();
     let error = replay_spool_once_for_tests(&occupied, &server.uri())
         .await
-        .expect_err("a directory planted at the dead-letter payload path must fail closed");
+        .err()
+        .unwrap_or_else(|| {
+            panic!("a directory planted at the dead-letter payload path must fail closed")
+        });
     assert!(
         error.contains("failed to replace prior dead-letter payload")
             || error.contains("dead-letter")
@@ -11040,7 +11160,8 @@ async fn dead_letter_publish_faults_restore_the_authoritative_source() {
     )
     .unwrap();
     let empty_error = probe_empty_dead_letter_publish_for_tests(&empty_probe, &source)
-        .expect_err("empty dead-letter payloads must not publish");
+        .err()
+        .unwrap_or_else(|| panic!("empty dead-letter payloads must not publish"));
     assert!(
         empty_error.contains("refusing to publish an empty dead-letter payload"),
         "unexpected empty-publish diagnostic: {empty_error}"
@@ -11133,7 +11254,8 @@ fn namespace_coordination_lock_rejects_nonempty_and_repairs_insecure_mode() {
     fs::write(&lock, b"not-empty").unwrap();
     let error = spool
         .write_events(&[sample_event("nonempty-quota-lock")])
-        .expect_err("a non-empty coordination lock must fail closed");
+        .err()
+        .unwrap_or_else(|| panic!("a non-empty coordination lock must fail closed"));
     assert!(
         error.contains("not empty") || error.contains("coordination"),
         "unexpected nonempty-lock diagnostic: {error}"
@@ -11163,7 +11285,8 @@ fn namespace_coordination_lock_open_refuses_a_directory_replacement() {
 
     let error = spool
         .write_events(&[sample_event("directory-quota-lock")])
-        .expect_err("a directory planted as the coordination lock must fail closed");
+        .err()
+        .unwrap_or_else(|| panic!("a directory planted as the coordination lock must fail closed"));
     assert!(
         error.contains("coordination")
             || error.contains("Is a directory")
@@ -11237,7 +11360,8 @@ fn probe_helpers_fail_closed_on_ceiling_starvation_and_invalid_rows() {
     // the undersized-reservation probe body runs.
     let exhausted = leaked_chargeback_test_ceiling(1);
     let capacity_error = probe_preallocated_payload_capacity_guard_for_tests(exhausted)
-        .expect_err("a one-byte ceiling must refuse the preallocated probe");
+        .err()
+        .unwrap_or_else(|| panic!("a one-byte ceiling must refuse the preallocated probe"));
     assert!(
         capacity_error.contains("ceiling") || capacity_error.contains("retained"),
         "unexpected capacity-guard diagnostic: {capacity_error}"
@@ -11247,7 +11371,8 @@ fn probe_helpers_fail_closed_on_ceiling_starvation_and_invalid_rows() {
     // Materialize the 64-byte probe body, then refuse the line-index reservation.
     let range_ceiling = leaked_chargeback_test_ceiling(64);
     let range_error = probe_streaming_replay_batch_range_errors_for_tests(range_ceiling)
-        .expect_err("a 64-byte ceiling must refuse the batch index reservation");
+        .err()
+        .unwrap_or_else(|| panic!("a 64-byte ceiling must refuse the batch index reservation"));
     assert!(
         range_error.contains("ceiling") || range_error.contains("retained"),
         "unexpected range-probe diagnostic: {range_error}"
@@ -11261,7 +11386,8 @@ fn probe_helpers_fail_closed_on_ceiling_starvation_and_invalid_rows() {
         .write_events(&[sample_event("evt-dead-letter-probe-bounds")])
         .unwrap();
     let empty_error = publish_dead_letter_payload_for_tests(&spool, &source, b"")
-        .expect_err("empty dead-letter probe rows must fail closed");
+        .err()
+        .unwrap_or_else(|| panic!("empty dead-letter probe rows must fail closed"));
     assert!(
         empty_error.contains("outside the hard row bound"),
         "unexpected empty-row diagnostic: {empty_error}"
@@ -11269,7 +11395,8 @@ fn probe_helpers_fail_closed_on_ceiling_starvation_and_invalid_rows() {
     let (row_limit, _, _, _) = spool_streaming_limits_for_tests();
     let oversized = vec![b'x'; row_limit + 1];
     let oversized_error = publish_dead_letter_payload_for_tests(&spool, &source, &oversized)
-        .expect_err("oversized dead-letter probe rows must fail closed");
+        .err()
+        .unwrap_or_else(|| panic!("oversized dead-letter probe rows must fail closed"));
     assert!(
         oversized_error.contains("outside the hard row bound"),
         "unexpected oversized-row diagnostic: {oversized_error}"
@@ -11279,7 +11406,8 @@ fn probe_helpers_fail_closed_on_ceiling_starvation_and_invalid_rows() {
         .try_acquire(ceiling.max())
         .expect("spool ceiling must fill completely");
     let materialize_error = publish_dead_letter_payload_for_tests(&spool, &source, b"{\"a\":1}")
-        .expect_err("a saturated ceiling must refuse dead-letter materialization");
+        .err()
+        .unwrap_or_else(|| panic!("a saturated ceiling must refuse dead-letter materialization"));
     assert!(
         materialize_error.contains("ceiling")
             || materialize_error.contains("retained")
@@ -11295,7 +11423,10 @@ fn probe_helpers_fail_closed_on_ceiling_starvation_and_invalid_rows() {
         .try_acquire(ceiling.max().saturating_sub(leave))
         .expect("index-starvation hold must fit");
     let index_error = publish_dead_letter_payload_for_tests(&spool, &source, row)
-        .expect_err("a ceiling that only fits the row must refuse the index reservation");
+        .err()
+        .unwrap_or_else(|| {
+            panic!("a ceiling that only fits the row must refuse the index reservation")
+        });
     assert!(
         index_error.contains("reserve")
             || index_error.contains("ceiling")
@@ -11331,7 +11462,8 @@ fn stale_dead_letter_claim_cannot_delete_completed_handoff() {
     fs::remove_file(&stale_claim_path).expect("completed handoff removes source claim");
 
     let error = publish_dead_letter_payload_for_tests(&spool, &stale_claim_path, row)
-        .expect_err("stale claim must not reopen dead-letter writer");
+        .err()
+        .unwrap_or_else(|| panic!("stale claim must not reopen dead-letter writer"));
     assert!(
         error.contains("no longer resolves to the authoritative claimed artifact"),
         "unexpected stale-claim diagnostic: {error}"
@@ -11387,7 +11519,8 @@ fn substituted_regular_file_at_claim_cannot_clear_completed_dead_letter_siblings
 
     let error =
         probe_empty_dead_letter_publish_with_identity_for_tests(&spool, &claim_path, &pinned)
-            .expect_err("a substituted claim must be refused before publication");
+            .err()
+            .unwrap_or_else(|| panic!("a substituted claim must be refused before publication"));
     assert!(
         error.contains("no longer resolves to the authoritative claimed artifact"),
         "unexpected claim-authorization diagnostic: {error}"
@@ -11432,7 +11565,8 @@ fn exact_live_claim_identity_still_clears_prior_dead_letter_siblings() {
     // intended partial-handoff replacement must go ahead.
     let error =
         probe_empty_dead_letter_publish_with_identity_for_tests(&spool, &claim_path, &pinned)
-            .expect_err("empty publish must still be refused");
+            .err()
+            .unwrap_or_else(|| panic!("empty publish must still be refused"));
     assert!(
         error.contains("refusing to publish an empty"),
         "unexpected empty-publish diagnostic: {error}"
@@ -11483,7 +11617,8 @@ fn substituted_regular_file_at_claim_cannot_replace_dead_letter_artifacts() {
         row,
         Some(prior_payload),
     )
-    .expect_err("a substituted claim must not authorize payload replacement");
+    .err()
+    .unwrap_or_else(|| panic!("a substituted claim must not authorize payload replacement"));
     assert!(
         payload_error.contains("no longer resolves to the authoritative claimed artifact"),
         "unexpected payload authorization diagnostic: {payload_error}"
@@ -11498,7 +11633,8 @@ fn substituted_regular_file_at_claim_cannot_replace_dead_letter_artifacts() {
         row,
         2,
     )
-    .expect_err("a substituted claim must not authorize metadata replacement");
+    .err()
+    .unwrap_or_else(|| panic!("a substituted claim must not authorize metadata replacement"));
     assert!(
         meta_error.contains("no longer resolves to the authoritative claimed artifact"),
         "unexpected metadata authorization diagnostic: {meta_error}"
@@ -11545,7 +11681,8 @@ fn directory_at_claim_cannot_publish_or_clear_dead_letter_siblings() {
     // Opening must reject the entire publication transaction before any
     // destructive sibling cleanup.
     let empty_error = probe_empty_dead_letter_publish_for_tests(&spool, &claim_path)
-        .expect_err("a directory claim must be refused before publication");
+        .err()
+        .unwrap_or_else(|| panic!("a directory claim must be refused before publication"));
     assert!(
         empty_error.contains("no longer resolves to the authoritative claimed artifact"),
         "unexpected claim-authorization diagnostic: {empty_error}"
@@ -11562,7 +11699,8 @@ fn directory_at_claim_cannot_publish_or_clear_dead_letter_siblings() {
     );
 
     let payload_error = publish_dead_letter_payload_for_tests(&spool, &claim_path, row)
-        .expect_err("a directory claim must not authorize payload publication");
+        .err()
+        .unwrap_or_else(|| panic!("a directory claim must not authorize payload publication"));
     assert!(
         payload_error.contains("no longer resolves to the authoritative claimed artifact"),
         "unexpected payload authorization diagnostic: {payload_error}"
@@ -11575,7 +11713,8 @@ fn directory_at_claim_cannot_publish_or_clear_dead_letter_siblings() {
     );
 
     let meta_error = write_dead_letter_meta_for_tests(&spool, &claim_path, &payload_path, row, 1)
-        .expect_err("a directory claim must not authorize metadata publication");
+        .err()
+        .unwrap_or_else(|| panic!("a directory claim must not authorize metadata publication"));
     assert!(
         meta_error.contains("no longer resolves to the authoritative claimed artifact"),
         "unexpected metadata authorization diagnostic: {meta_error}"
@@ -11609,7 +11748,8 @@ fn dead_letter_open_fails_closed_when_prior_rejected_payload_is_a_directory() {
     fs::create_dir(&payload_path).unwrap();
 
     let error = publish_dead_letter_payload_for_tests(&spool, &claim_path, row)
-        .expect_err("directory at prior rejected payload must fail open cleanup");
+        .err()
+        .unwrap_or_else(|| panic!("directory at prior rejected payload must fail open cleanup"));
     assert!(
         error.contains("failed to remove prior partial dead-letter payload"),
         "unexpected prior-payload cleanup diagnostic: {error}"
@@ -11648,7 +11788,8 @@ fn dead_letter_open_fails_closed_when_prior_rejected_meta_is_a_directory() {
     fs::create_dir(&meta_path).unwrap();
 
     let error = publish_dead_letter_payload_for_tests(&spool, &claim_path, row)
-        .expect_err("directory at prior rejected meta must fail open cleanup");
+        .err()
+        .unwrap_or_else(|| panic!("directory at prior rejected meta must fail open cleanup"));
     assert!(
         error.contains("failed to remove prior partial dead-letter metadata"),
         "unexpected prior-meta cleanup diagnostic: {error}"
@@ -11775,7 +11916,8 @@ fn dead_letter_meta_publish_fails_closed_when_prior_meta_is_a_directory() {
     fs::create_dir(&meta_path).unwrap();
 
     let error = write_dead_letter_meta_for_tests(&spool, &claim_path, &payload_path, row, 1)
-        .expect_err("directory at prior meta must fail metadata replace");
+        .err()
+        .unwrap_or_else(|| panic!("directory at prior meta must fail metadata replace"));
     assert!(
         error.contains("failed to replace dead-letter metadata"),
         "unexpected meta-replace diagnostic: {error}"
@@ -11843,7 +11985,10 @@ fn directory_at_claim_publishes_no_dead_letter_evidence_at_all() {
     // a "constructive evidence is harmless" exception would have admitted.
     let before = spool.cached_stats_for_tests();
     let payload_error = publish_dead_letter_payload_for_tests(&spool, &claim_path, row)
-        .expect_err("a wrong-type claim pathname must authorize no payload publication");
+        .err()
+        .unwrap_or_else(|| {
+            panic!("a wrong-type claim pathname must authorize no payload publication")
+        });
     assert!(
         payload_error.contains("no longer resolves to the authoritative claimed artifact"),
         "unexpected payload authorization diagnostic: {payload_error}"
@@ -11858,7 +12003,10 @@ fn directory_at_claim_publishes_no_dead_letter_evidence_at_all() {
     );
 
     let meta_error = write_dead_letter_meta_for_tests(&spool, &claim_path, &payload_path, row, 1)
-        .expect_err("a wrong-type claim pathname must authorize no metadata publication");
+        .err()
+        .unwrap_or_else(|| {
+            panic!("a wrong-type claim pathname must authorize no metadata publication")
+        });
     assert!(
         meta_error.contains("no longer resolves to the authoritative claimed artifact"),
         "unexpected metadata authorization diagnostic: {meta_error}"
@@ -11921,7 +12069,8 @@ fn wrong_type_claim_between_open_and_append_admits_no_bytes_and_evicts_nothing()
         DeadLetterHandoffStageForTests::BeforeAppend,
         &plant_directory_at_claim,
     )
-    .expect_err("a claim replaced between open and append must admit no rows");
+    .err()
+    .unwrap_or_else(|| panic!("a claim replaced between open and append must admit no rows"));
     drop(claim);
     assert!(
         error.contains("no longer resolves to the authoritative claimed artifact"),
@@ -11987,7 +12136,8 @@ fn wrong_type_claim_between_append_and_publish_never_clobbers_the_final_name() {
                 .expect("the peer publishes its own rejected payload");
         },
     )
-    .expect_err("a claim replaced between append and publish must publish nothing");
+    .err()
+    .unwrap_or_else(|| panic!("a claim replaced between append and publish must publish nothing"));
     drop(claim);
     assert!(
         error.contains("no longer resolves to the authoritative claimed artifact"),
@@ -12025,7 +12175,8 @@ fn decode_spool_helper_and_path_swap_probe_fail_closed_on_missing_inputs() {
     ));
     let _ = fs::remove_file(&missing);
     let decode_error = decode_spool_file_for_tests(&missing)
-        .expect_err("a missing spool path must fail closed before allocation");
+        .err()
+        .unwrap_or_else(|| panic!("a missing spool path must fail closed before allocation"));
     assert!(
         decode_error.contains("failed to open") || decode_error.contains("No such file"),
         "unexpected missing-decode diagnostic: {decode_error}"
@@ -12039,7 +12190,10 @@ fn decode_spool_helper_and_path_swap_probe_fail_closed_on_missing_inputs() {
         fs::write(&source, b"{\"event_id\":\"validated-row\"}\n").unwrap();
         let ceiling = leaked_chargeback_test_ceiling(8 * 1024 * 1024);
         let error = probe_streaming_replay_path_swap_for_tests(&source, &replacement, ceiling)
-            .expect_err("a missing replacement path must fail the identity probe setup");
+            .err()
+            .unwrap_or_else(|| {
+                panic!("a missing replacement path must fail the identity probe setup")
+            });
         assert!(
             error.contains("failed to replace preflight path"),
             "unexpected path-swap setup diagnostic: {error}"
@@ -12079,7 +12233,10 @@ async fn streaming_replay_refuses_a_post_preflight_path_swap_without_mutating_it
         .await;
     let error = replay_spool_once_for_tests(&spool, &server.uri())
         .await
-        .expect_err("a post-preflight substitute must not be quarantined or delivered");
+        .err()
+        .unwrap_or_else(|| {
+            panic!("a post-preflight substitute must not be quarantined or delivered")
+        });
     drop(clear);
 
     assert!(
@@ -12146,7 +12303,10 @@ async fn streaming_replay_defers_when_ceiling_starves_between_preflight_and_reop
 
     let error = replay_spool_once_with_ceiling_for_tests(&spool, "http://127.0.0.1:1/", 4, ceiling)
         .await
-        .expect_err("ceiling starvation between passes must defer without quarantine");
+        .err()
+        .unwrap_or_else(|| {
+            panic!("ceiling starvation between passes must defer without quarantine")
+        });
     assert!(
         error.contains("ceiling") || error.contains("deferred"),
         "unexpected between-pass deferral diagnostic: {error}"
@@ -12204,7 +12364,10 @@ async fn streaming_replay_never_uses_a_quarantine_target_for_a_substituted_claim
 
     let error = replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/")
         .await
-        .expect_err("a substituted artifact must fail before quarantine is authorized");
+        .err()
+        .unwrap_or_else(|| {
+            panic!("a substituted artifact must fail before quarantine is authorized")
+        });
     drop(clear);
     assert!(
         error.contains("no longer resolves to the authoritative claimed artifact"),
@@ -12255,7 +12418,8 @@ fn insert_query_params_reject_credential_bearing_names() {
         let mut config = valid_config(temp.path());
         config["clickhouse"]["insert_query_params"] = json!({ name: CH_VALUE_SENTINEL });
         let err = validate_plugin_config("api_chargeback_sink", &config)
-            .expect_err("credential-bearing parameter names must be rejected");
+            .err()
+            .unwrap_or_else(|| panic!("credential-bearing parameter names must be rejected"));
         assert!(
             err.contains("names a credential"),
             "rejection must explain the contract for {name}: {err}"
@@ -12415,7 +12579,8 @@ fn spool_write_is_refused_rather_than_materialized_under_a_saturated_ceiling() {
 
     let error = spool
         .write_events(&spool_replay_events(8))
-        .expect_err("a saturated ceiling must refuse the spool artifact");
+        .err()
+        .unwrap_or_else(|| panic!("a saturated ceiling must refuse the spool artifact"));
 
     assert!(
         error.contains("ceiling"),
@@ -12910,7 +13075,8 @@ fn compact_snapshot_recovery_is_refused_rather_than_built_under_a_saturated_ceil
         .collect();
 
     let error = probe_compact_recovery_retry_for_tests(ceiling, events)
-        .expect_err("a saturated ceiling must refuse the recovery payload");
+        .err()
+        .unwrap_or_else(|| panic!("a saturated ceiling must refuse the recovery payload"));
     assert!(error.contains("ceiling"), "{error}");
     assert_eq!(ceiling.used(), 0);
     assert!(ceiling.rejections() > 0);
@@ -12939,7 +13105,10 @@ fn a_zstd_artifact_without_a_frame_content_size_still_decodes_via_the_ratio_clam
     let bomb_path = temp.path().join("01ARZ3NDEKTSV4RRFFQ69G5FC2.ndjson.zst");
     fs::write(&bomb_path, &bomb).unwrap();
     let err = decode_spool_file_for_tests(&bomb_path)
-        .expect_err("the ratio clamp must still bound a header-less high-ratio archive");
+        .err()
+        .unwrap_or_else(|| {
+            panic!("the ratio clamp must still bound a header-less high-ratio archive")
+        });
     assert!(
         err.contains("decompression bound"),
         "unexpected error: {err}"
@@ -12984,7 +13153,8 @@ fn a_declared_zstd_size_cannot_bypass_the_decompression_ratio_limit() {
     let path = temp.path().join("01ARZ3NDEKTSV4RRFFQ69G5FC3.ndjson.zst");
     fs::write(&path, encoded).unwrap();
     let err = decode_spool_file_for_tests(&path)
-        .expect_err("a declared size must not bypass the decompression-ratio limit");
+        .err()
+        .unwrap_or_else(|| panic!("a declared size must not bypass the decompression-ratio limit"));
     assert!(
         err.contains("decompression bound"),
         "unexpected error: {err}"
@@ -13511,4 +13681,666 @@ async fn large_spool_status_and_prometheus_use_cached_gauges_without_inventory()
         "observing stale last-good must not walk"
     );
     drop(plugin);
+}
+
+/// Owned `.ndjson` spool artifacts under a test spool root, in ULID order.
+fn owned_spool_artifacts(spool_dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![spool_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) == Some("ndjson") {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Total decoded JSONEachRow rows across every owned artifact.
+fn spool_row_count(spool_dir: &Path) -> usize {
+    owned_spool_artifacts(spool_dir)
+        .iter()
+        .map(|path| {
+            decode_spool_file_for_tests(path)
+                .expect("owned spool artifact decodes")
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+        })
+        .sum()
+}
+
+/// Cumulative process-wide ClickHouse export failures.
+fn export_failures_total() -> u64 {
+    let status: Value = serde_json::from_str(&render_status_json()).expect("status json");
+    status["totals"]["export"]["failures_total"]
+        .as_u64()
+        .unwrap_or(0)
+}
+
+/// `(received_total, persisted_total, dropped_total, pending)` process ledger.
+fn per_event_ledger() -> (u64, u64, u64, u64) {
+    let status: Value = serde_json::from_str(&render_status_json()).expect("status json");
+    let ledger = &status["totals"]["per_event"];
+    (
+        ledger["received_total"].as_u64().unwrap_or(0),
+        ledger["persisted_total"].as_u64().unwrap_or(0),
+        ledger["dropped_total"].as_u64().unwrap_or(0),
+        ledger["pending"].as_u64().unwrap_or(0),
+    )
+}
+
+/// Issue #5264: `snapshot.max_entries` admits up to 1,000,000 identities while
+/// one spool artifact holds at most 10,000 rows, so a single-artifact handoff
+/// refused every emission from a large accumulator forever. Recovery must split
+/// the batch into bounded artifacts instead.
+#[test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+fn compact_snapshot_recovery_chunks_more_rows_than_one_artifact_admits() {
+    const ROWS: usize = 10_001;
+    let ceiling = leaked_chargeback_test_ceiling(64 * 1024 * 1024);
+    let temp = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 64 * 1024 * 1024);
+    let spool = SpoolManager::for_tests_with_ceiling(settings, "node-a", ceiling).unwrap();
+    let events: Vec<ChargeEvent> = (0..ROWS)
+        .map(|index| sample_event(&format!("chunked-{index:06}")))
+        .collect();
+    let recovery = compact_recovery_probe_for_tests(ceiling, events, spool)
+        .expect("compact recovery must fit below the test ceiling");
+
+    assert!(
+        recovery.try_spool_for_tests(),
+        "a snapshot above the per-artifact row bound must still reach the spool"
+    );
+    assert_eq!(recovery.pending_len_for_tests(), 0);
+    let artifacts = owned_spool_artifacts(temp.path());
+    assert_eq!(
+        artifacts.len(),
+        2,
+        "{ROWS} rows must split into two bounded artifacts: {artifacts:?}"
+    );
+    assert_eq!(spool_row_count(temp.path()), ROWS);
+    drop(recovery);
+    assert_eq!(ceiling.used(), 0);
+}
+
+/// Issue #5264: when one artifact of a chunked handoff is refused, the durable
+/// prefix must be released and only the undelivered remainder retried, so a
+/// partial failure neither loses nor re-charges a billing row.
+#[test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+fn compact_snapshot_recovery_retains_only_rows_no_artifact_accepted() {
+    const DURABLE_ROWS: usize = 10_000;
+    let ceiling = leaked_chargeback_test_ceiling(64 * 1024 * 1024);
+    let temp = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 64 * 1024 * 1024);
+    let spool = SpoolManager::for_tests_with_ceiling(settings, "node-a", ceiling).unwrap();
+    let mut events: Vec<ChargeEvent> = (0..DURABLE_ROWS)
+        .map(|index| sample_event(&format!("prefix-{index:06}")))
+        .collect();
+    // The second artifact holds exactly one row whose conservative JSON bound
+    // exceeds the hard per-row limit, so that chunk is refused after the first
+    // one has already landed.
+    let mut refused = sample_event("refused-row");
+    refused.consumer_id = "c".repeat(400_000);
+    events.push(refused);
+    let recovery = compact_recovery_probe_for_tests(ceiling, events, spool)
+        .expect("compact recovery must fit below the test ceiling");
+
+    assert!(
+        !recovery.try_spool_for_tests(),
+        "a refused chunk must report the handoff as incomplete"
+    );
+    assert_eq!(
+        recovery.pending_len_for_tests(),
+        1,
+        "only the row no artifact accepted may stay pending"
+    );
+    assert_eq!(owned_spool_artifacts(temp.path()).len(), 1);
+    assert_eq!(spool_row_count(temp.path()), DURABLE_ROWS);
+    drop(recovery);
+    assert_eq!(ceiling.used(), 0);
+}
+
+/// Issue #5264: the periodic snapshot tick itself must chunk. With a healthy
+/// filesystem and 10,001 dirty identities the previous single-artifact write
+/// failed permanently, stranding billing data in memory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn snapshot_tick_above_the_artifact_row_bound_reaches_the_spool() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_emit_snapshot_tick_for_test,
+        api_chargeback_sink_snapshot_accumulator_for_test,
+    };
+
+    const IDENTITIES: usize = 10_001;
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("chunked-tick-spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let mut config = valid_config(&spool_dir);
+    config["mode"] = json!("snapshot");
+    config["spool"]["max_bytes"] = json!(64u64 * 1024 * 1024);
+    config["snapshot"] = json!({
+        "interval_secs": 3600,
+        "cleanup_interval_secs": 3600,
+        "stale_entry_ttl_secs": 7200,
+        "max_entries": 20_000,
+        "max_retained_bytes": 33_554_432
+    });
+
+    let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+        .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+    plugin.commit_background_tasks();
+    let accumulator =
+        api_chargeback_sink_snapshot_accumulator_for_test(&plugin).expect("snapshot accumulator");
+    for index in 0..IDENTITIES {
+        accumulator.record_for_test(
+            "ferrum",
+            &format!("consumer-{index:06}"),
+            "proxy-a",
+            "Payments",
+            200,
+            "http",
+            unit_call_charge(0.01),
+        );
+    }
+
+    assert_eq!(
+        api_chargeback_sink_emit_snapshot_tick_for_test(&plugin),
+        Some(Ok(IDENTITIES)),
+        "every dirty identity must reach the durable spool"
+    );
+    assert_eq!(owned_spool_artifacts(&spool_dir).len(), 2);
+    assert_eq!(spool_row_count(&spool_dir), IDENTITIES);
+    // The baseline advanced with the durable write, so the next tick has
+    // nothing left to emit and cannot double-charge the same identities.
+    assert_eq!(
+        api_chargeback_sink_emit_snapshot_tick_for_test(&plugin),
+        Some(Ok(0))
+    );
+    drop(plugin);
+}
+
+/// Issue #5266: a snapshot row is durable before its optional low-latency
+/// delivery is attempted, so a failed delivery must never report billing loss
+/// for a row the spool still owns and can replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn durably_spooled_snapshot_rows_are_never_counted_as_dropped() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_emit_snapshot_tick_for_test,
+        api_chargeback_sink_snapshot_accumulator_for_test,
+    };
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("false-loss-spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let mut config = valid_config(&spool_dir);
+    config["mode"] = json!("snapshot");
+    config["clickhouse"]["url"] = json!(server.uri());
+    config["batch"]["size"] = json!(1);
+    config["batch"]["flush_interval_ms"] = json!(50);
+
+    let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+        .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+    plugin.commit_background_tasks();
+
+    let before = per_event_ledger();
+    let failures_before = export_failures_total();
+    let accumulator =
+        api_chargeback_sink_snapshot_accumulator_for_test(&plugin).expect("snapshot accumulator");
+    accumulator.record_for_test(
+        "ferrum",
+        "alice",
+        "proxy-a",
+        "Payments",
+        200,
+        "http",
+        unit_call_charge(0.01),
+    );
+    assert_eq!(
+        api_chargeback_sink_emit_snapshot_tick_for_test(&plugin),
+        Some(Ok(1))
+    );
+
+    let settled = per_event_ledger();
+    assert_eq!(settled.0 - before.0, 1, "one row entered the ledger");
+    assert_eq!(
+        settled.1 - before.1,
+        1,
+        "the durable spool write settles the row"
+    );
+    assert_eq!(settled.2, before.2, "a spooled row is not a loss");
+
+    // Drive the delivery attempt to its terminal failure, which drops the
+    // accounting owner the snapshot handed to the queue.
+    wait_for_requests(&server, 1).await;
+    let mut failures = export_failures_total();
+    for _ in 0..200 {
+        if failures > failures_before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        failures = export_failures_total();
+    }
+    assert!(
+        failures > failures_before,
+        "the ClickHouse delivery attempt must reach a terminal failure"
+    );
+    // Keep sampling past the failure: the owner is released only after the
+    // snapshot hook declines to re-own an already durable batch.
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let observed = per_event_ledger();
+        assert_eq!(
+            observed.2, before.2,
+            "failed delivery of an already durable row must not report loss: {observed:?}"
+        );
+    }
+    assert!(
+        spool_row_count(&spool_dir) >= 1,
+        "the charge must remain durable and replayable"
+    );
+    drop(plugin);
+}
+
+/// GHSA-wq9r-g773-7c4q: the JWT-authenticated status surface must not hand any
+/// role the ClickHouse URL path — the admin plugin-config projection already
+/// withholds it from non-admin readers. The durable spool owner keeps binding
+/// that path, so the redaction cannot orphan existing artifacts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn status_redacts_the_clickhouse_endpoint_path_without_moving_spool_ownership() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_emit_snapshot_tick_for_test,
+        api_chargeback_sink_snapshot_accumulator_for_test,
+    };
+
+    fn spool_one_snapshot_row(plugin: &ApiChargebackSink) {
+        let accumulator = api_chargeback_sink_snapshot_accumulator_for_test(plugin)
+            .expect("snapshot accumulator");
+        accumulator.record_for_test(
+            "ferrum",
+            "alice",
+            "proxy-a",
+            "Payments",
+            200,
+            "http",
+            unit_call_charge(0.01),
+        );
+        assert_eq!(
+            api_chargeback_sink_emit_snapshot_tick_for_test(plugin),
+            Some(Ok(1))
+        );
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("marked-endpoint-spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let mut config = valid_config(&spool_dir);
+    config["mode"] = json!("snapshot");
+    config["clickhouse"]["url"] = json!("http://127.0.0.1:8123/path-credential-marker");
+    let plugin = ApiChargebackSink::new_with_config_id(
+        &config,
+        PluginHttpClient::default(),
+        "ferrum",
+        Some("endpoint-redaction"),
+    )
+    .expect("construct sink");
+    plugin.start_background_tasks().expect("start sink");
+    plugin.commit_background_tasks();
+    spool_one_snapshot_row(&plugin);
+
+    let status = render_status_json();
+    assert!(
+        !status.contains("path-credential-marker"),
+        "status must not disclose the ClickHouse URL path: {status}"
+    );
+    let parsed: Value = serde_json::from_str(&status).expect("status json");
+    let instance = parsed["instances"]
+        .as_array()
+        .expect("instances array")
+        .iter()
+        .find(|entry| entry["plugin_config_id"] == json!("endpoint-redaction"))
+        .expect("published sink instance");
+    assert_eq!(
+        instance["clickhouse"]["endpoint"],
+        json!("http://127.0.0.1:8123/redacted"),
+        "status must render the structural endpoint form: {instance}"
+    );
+    let owner_root = find_spool_namespace_root(&spool_dir).expect("owner namespace root");
+    let owner_name = owner_root
+        .file_name()
+        .expect("owner directory")
+        .to_string_lossy()
+        .into_owned();
+    drop(plugin);
+
+    // A different ClickHouse path must still be a different durable owner.
+    let other_dir = temp.path().join("other-endpoint-spool");
+    fs::create_dir_all(&other_dir).unwrap();
+    let mut other_config = valid_config(&other_dir);
+    other_config["mode"] = json!("snapshot");
+    other_config["clickhouse"]["url"] = json!("http://127.0.0.1:8123/other-path");
+    let other = ApiChargebackSink::new_with_config_id(
+        &other_config,
+        PluginHttpClient::default(),
+        "ferrum",
+        Some("endpoint-redaction"),
+    )
+    .expect("construct sink");
+    other.start_background_tasks().expect("start sink");
+    other.commit_background_tasks();
+    spool_one_snapshot_row(&other);
+    let other_root = find_spool_namespace_root(&other_dir).expect("owner namespace root");
+    let other_name = other_root
+        .file_name()
+        .expect("owner directory")
+        .to_string_lossy()
+        .into_owned();
+    assert_ne!(
+        owner_name, other_name,
+        "the durable spool owner must keep binding the ClickHouse URL path"
+    );
+    drop(other);
+}
+
+/// Issue #5265: a label longer than the bounded charge-event budget used to
+/// pass admission and then make every per-event export fail after the request
+/// had already succeeded, silently disabling billing export.
+#[tokio::test]
+async fn oversized_billing_labels_are_refused_at_admission() {
+    let temp = tempfile::tempdir().unwrap();
+    for field in ["currency", "pricing_version"] {
+        let mut rejected = valid_config(temp.path());
+        rejected[field] = json!("a".repeat(513));
+        let error = ApiChargebackSink::new(&rejected, PluginHttpClient::default(), "ferrum")
+            .err()
+            .unwrap_or_else(|| panic!("an unexportable label must be refused"));
+        assert!(
+            error.contains(&format!("{field} must be at most 512 UTF-8 bytes")),
+            "unexpected error for {field}: {error}"
+        );
+
+        let mut accepted = valid_config(temp.path());
+        accepted[field] = json!("a".repeat(512));
+        ApiChargebackSink::new(&accepted, PluginHttpClient::default(), "ferrum")
+            .expect("a label at the bound stays admissible");
+    }
+}
+
+/// Issue #5265: every admitted label combination must still export an ordinary
+/// billable event, including both labels at their combined maximum.
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn maximum_length_billing_labels_still_export_per_event_charges() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!(server.uri());
+    config["batch"]["size"] = json!(1);
+    config["currency"] = json!("c".repeat(512));
+    config["pricing_version"] = json!("v".repeat(512));
+
+    let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+        .expect("maximum-length labels stay admissible");
+    plugin.start_background_tasks().expect("start sink");
+    plugin.commit_background_tasks();
+    plugin.log(&grpc_summary("proxy-a", "0")).await;
+
+    let requests = wait_for_requests(&server, 1).await;
+    let event: Value = requests[0].body_json().expect("charge event JSON");
+    assert_eq!(event["currency"], json!("c".repeat(512)));
+    assert_eq!(event["pricing_version"], json!("v".repeat(512)));
+    drop(plugin);
+}
+
+/// Issue #5268: an incomplete ClickHouse client certificate pair is a pure
+/// configuration shape, so cold admission must reject it instead of letting a
+/// deterministic pairing error abort serving startup later.
+#[tokio::test]
+async fn cold_admission_rejects_an_incomplete_clickhouse_client_certificate_pair() {
+    let temp = tempfile::tempdir().unwrap();
+    for field in ["client_cert_file", "client_key_file"] {
+        let mut config = valid_config(temp.path());
+        config["clickhouse"]["tls"] = json!({});
+        config["clickhouse"]["tls"][field] = json!("/nonexistent/ferrum-audit-identity");
+        let error = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+            .err()
+            .unwrap_or_else(|| panic!("an unpaired client identity must be refused"));
+        assert!(
+            error.contains("client_cert_file and client_key_file must be set together"),
+            "unexpected error for {field}: {error}"
+        );
+        assert!(
+            !error.contains("failed to read"),
+            "cold admission must stay free of filesystem side effects: {error}"
+        );
+    }
+
+    let mut paired = valid_config(temp.path());
+    paired["clickhouse"]["tls"] = json!({
+        "client_cert_file": "/nonexistent/ferrum-audit.pem",
+        "client_key_file": "/nonexistent/ferrum-audit.key"
+    });
+    ApiChargebackSink::new(&paired, PluginHttpClient::default(), "ferrum")
+        .expect("a complete pair defers file reads to activation");
+
+    let mut neither = valid_config(temp.path());
+    neither["clickhouse"]["tls"] = json!({ "verify_hostname": true });
+    ApiChargebackSink::new(&neither, PluginHttpClient::default(), "ferrum")
+        .expect("no client identity at all stays valid");
+}
+
+/// Issue #5269: the component must represent constructor acceptance for runtime
+/// defaults, nullable optionals, spool settings that are unused while spooling
+/// is disabled, and every field bound JSON Schema can express.
+#[tokio::test]
+async fn openapi_component_matches_constructor_defaults_and_field_bounds() {
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    let spec: Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
+    let sink_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/ApiChargebackSinkConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&sink_schema)
+        .expect("ApiChargebackSinkConfig schema compiles");
+    let tiers = || json!([{"status_codes": [200], "price_per_call": 0.01}]);
+    let url = "https://clickhouse.example:8443";
+    let nul_dir = format!("/var/lib/ferrum{}spool", char::from(0u8));
+    let long_query_params = {
+        let mut params = serde_json::Map::new();
+        params.insert("a".repeat(129), json!("1"));
+        Value::Object(params)
+    };
+
+    let accepted = [
+        (
+            "snapshot relying on the enabled-spool default",
+            json!({"mode": "snapshot", "clickhouse": {"url": url}, "pricing_tiers": tiers()}),
+        ),
+        (
+            "snapshot with an empty spool object",
+            json!({
+                "mode": "snapshot",
+                "spool": {},
+                "clickhouse": {"url": url},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "null optional ClickHouse credentials",
+            json!({
+                "clickhouse": {"url": url, "username": null, "password_ref": null},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "snapshot byte budget at the runtime minimum",
+            json!({
+                "clickhouse": {"url": url},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers(),
+                "snapshot": {"max_retained_bytes": 9440}
+            }),
+        ),
+        (
+            "settings unused while the spool is disabled",
+            json!({
+                "clickhouse": {"url": url},
+                "spool": {
+                    "enabled": false,
+                    "dir": "",
+                    "max_bytes": 0,
+                    "replay_interval_secs": 0,
+                    "delivery_queue_capacity": 0
+                },
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "complete ClickHouse client identity",
+            json!({
+                "clickhouse": {
+                    "url": url,
+                    "tls": {
+                        "client_cert_file": "/nonexistent/c.pem",
+                        "client_key_file": "/nonexistent/c.key"
+                    }
+                },
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+    ];
+    for (label, config) in &accepted {
+        assert!(
+            validator.validate(config).is_ok(),
+            "{label} must be schema-valid: {config}"
+        );
+        assert!(
+            validate_plugin_config("api_chargeback_sink", config).is_ok(),
+            "{label} must pass runtime admission: {config}"
+        );
+    }
+
+    let rejected = [
+        (
+            "snapshot byte budget below the runtime minimum",
+            json!({
+                "clickhouse": {"url": url},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers(),
+                "snapshot": {"max_retained_bytes": 9439}
+            }),
+        ),
+        (
+            "duplicate status codes within one tier",
+            json!({
+                "clickhouse": {"url": url},
+                "spool": {"enabled": false},
+                "pricing_tiers": [{"status_codes": [200, 200], "price_per_call": 0.01}]
+            }),
+        ),
+        (
+            "client certificate without its key",
+            json!({
+                "clickhouse": {"url": url, "tls": {"client_cert_file": "/nonexistent/c.pem"}},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "client key without its certificate",
+            json!({
+                "clickhouse": {"url": url, "tls": {"client_key_file": "/nonexistent/c.key"}},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "currency above the label bound",
+            json!({
+                "clickhouse": {"url": url},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers(),
+                "currency": "a".repeat(513)
+            }),
+        ),
+        (
+            "pricing_version above the label bound",
+            json!({
+                "clickhouse": {"url": url},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers(),
+                "pricing_version": "a".repeat(513)
+            }),
+        ),
+        (
+            "credential-bearing insert query parameter",
+            json!({
+                "clickhouse": {"url": url, "insert_query_params": {"password": "x"}},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "insert query parameter name above the bound",
+            json!({
+                "clickhouse": {"url": url, "insert_query_params": long_query_params},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "NUL byte in an enabled spool directory",
+            json!({
+                "clickhouse": {"url": url},
+                "spool": {"enabled": true, "dir": nul_dir},
+                "pricing_tiers": tiers()
+            }),
+        ),
+    ];
+    for (label, config) in &rejected {
+        assert!(
+            validator.validate(config).is_err(),
+            "{label} must be schema-invalid: {config}"
+        );
+        assert!(
+            validate_plugin_config("api_chargeback_sink", config).is_err(),
+            "{label} must be runtime-rejected: {config}"
+        );
+    }
 }

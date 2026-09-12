@@ -136,12 +136,12 @@ fn reject_unknown_keys(
 fn parse_status_code(config: &Map<String, Value>) -> Result<u16, String> {
     match config.get("status_code") {
         None => Ok(503),
-        Some(Value::Number(value)) => {
-            let Some(code) = value.as_u64() else {
-                return Err(
-                    "request_termination: 'status_code' must be an integer from 200 to 599"
-                        .to_string(),
-                );
+        Some(value) => {
+            let Some(code) = json_u64(value) else {
+                return Err(format!(
+                    "request_termination: 'status_code' must be an integer from 200 to 599, \
+                     got: {value}"
+                ));
             };
             if !(200..=599).contains(&code) {
                 return Err(format!(
@@ -152,9 +152,6 @@ fn parse_status_code(config: &Map<String, Value>) -> Result<u16, String> {
             u16::try_from(code)
                 .map_err(|_| "request_termination: 'status_code' is too large".to_string())
         }
-        Some(other) => Err(format!(
-            "request_termination: 'status_code' must be an integer from 200 to 599, got: {other}"
-        )),
     }
 }
 
@@ -236,7 +233,10 @@ fn parse_trigger(config: &Map<String, Value>) -> Result<Trigger, String> {
         // no control characters, since CR/LF never survive request-line
         // parsing. A prefix that is neither rooted at '/' nor exactly "*" can
         // never prefix any live request path, so reject it here instead of
-        // letting the plugin silently never fire.
+        // letting the plugin silently never fire. A query delimiter, fragment
+        // delimiter, or literal space is likewise unreachable: `ctx.path` is
+        // `Uri::path()`, which has already been split from the query and cannot
+        // contain those bytes.
         if path != "*" && !path.starts_with('/') {
             return Err(
                 "request_termination: 'trigger.path_prefix' must start with '/' or be \"*\" (asterisk-form OPTIONS target)"
@@ -260,6 +260,11 @@ fn parse_trigger(config: &Map<String, Value>) -> Result<Trigger, String> {
                 "request_termination: 'trigger.path_prefix' must already be a canonical policy \
                  path ({reason}); request paths are canonicalized before plugins run, so a \
                  non-canonical prefix can never match"
+            ));
+        }
+        if let Some(reason) = unreachable_parsed_path_prefix_reason(path) {
+            return Err(format!(
+                "request_termination: 'trigger.path_prefix' {reason}"
             ));
         }
         return Ok(Trigger::PathPrefix(path.to_string()));
@@ -295,6 +300,44 @@ fn parse_trigger(config: &Map<String, Value>) -> Result<Trigger, String> {
     }
 
     Err("request_termination: 'trigger' must set 'path_prefix' or 'header'".to_string())
+}
+
+fn json_u64(value: &Value) -> Option<u64> {
+    let Value::Number(n) = value else {
+        return None;
+    };
+    n.as_u64().or_else(|| {
+        let n = n.as_f64()?;
+        (n.is_finite() && n.fract() == 0.0 && n >= 0.0).then_some(n as u64)
+    })
+}
+
+/// Why a configured path prefix can never prefix `Uri::path()` even when it is
+/// already a canonical policy-path spelling. `*` is the asterisk-form target
+/// and is not a URI path.
+fn unreachable_parsed_path_prefix_reason(path: &str) -> Option<&'static str> {
+    if path == "*" {
+        return None;
+    }
+    if path.contains('?') {
+        return Some(
+            "must not contain a query delimiter ('?'); request paths are the parsed URI path, \
+             so a prefix with a query can never match",
+        );
+    }
+    if path.contains(' ') {
+        return Some(
+            "must not contain a literal space; request-target parsing rejects spaces, so the \
+             prefix can never match",
+        );
+    }
+    if path.contains('#') {
+        return Some(
+            "must not contain a fragment delimiter ('#'); request paths are the parsed URI path, \
+             so a prefix with a fragment can never match",
+        );
+    }
+    None
 }
 
 /// Render the default response body for a given content type. Performed once

@@ -662,6 +662,52 @@ async fn test_otel_tracing_exports_stream_disconnect_span() {
 }
 
 #[tokio::test]
+async fn test_workload_metrics_exporters_preserve_composed_custom_tags() {
+    let first_server = wiremock::MockServer::start().await;
+    let second_server = wiremock::MockServer::start().await;
+    let mut plugins = Vec::new();
+    for (server, tag) in [(&first_server, "first"), (&second_server, "second")] {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(server)
+            .await;
+        plugins.push(
+            WorkloadMetrics::new(&json!({
+                "sampling_percentage": 100,
+                "custom_tags": {tag: tag},
+                "batch_size": 1,
+                "tracing_provider": {
+                    "kind": "opentelemetry",
+                    "config": {"endpoint": format!("{}/v1/traces", server.uri())}
+                }
+            }))
+            .unwrap(),
+        );
+    }
+    plugins.push(WorkloadMetrics::new(&json!({"custom_tags": {"third": "metrics-only"}})).unwrap());
+    let mut ctx = make_ctx();
+    let mut headers = HashMap::new();
+    for plugin in &plugins {
+        plugin.on_request_received(&mut ctx).await;
+    }
+    for plugin in &plugins {
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+    }
+    let summary = make_summary(ctx.metadata);
+    for plugin in &plugins {
+        plugin.log(&summary).await;
+    }
+    for server in [&first_server, &second_server] {
+        let payload = received_json(server).await;
+        let span = &payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(otlp_string_attr(span, "first"), Some("first"));
+        assert_eq!(otlp_string_attr(span, "second"), Some("second"));
+        assert_eq!(otlp_string_attr(span, "third"), Some("metrics-only"));
+    }
+}
+
+#[tokio::test]
 async fn test_workload_metrics_opentelemetry_exporter_payload() {
     let mock_server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -1690,8 +1736,13 @@ async fn test_otel_tracing_ws_disconnect_uses_new_span_id() {
     let payload = received_json(&mock_server).await;
     let span = otlp_span(&payload);
     assert_eq!(span["name"], "WEBSOCKET chat");
-    // Span id in payload is base64; parent should reference handshake span.
-    assert!(span.get("parentSpanId").is_some());
+    // OTLP/JSON IDs are hex: the parent must be the handshake span verbatim,
+    // and the session span must have minted a different span id.
+    let parent = span["parentSpanId"].as_str();
+    let session = span["spanId"].as_str();
+    assert_eq!(parent, Some(handshake_span.as_str()));
+    assert_ne!(session, Some(handshake_span.as_str()));
+    assert_eq!(span["traceId"], "abcdef1234567890abcdef1234567890");
     assert!(
         span["startTimeUnixNano"]
             .as_str()
@@ -2002,7 +2053,10 @@ async fn test_otel_tracing_http_4xx_is_not_error() {
     plugin.log(&summary).await;
     let payload = received_json(&mock_server).await;
     let span = otlp_span(&payload);
-    assert_eq!(span["status"]["code"], 1);
+    assert_eq!(
+        span["status"]["code"], 0,
+        "a completed 4xx is UNSET, not explicit OK"
+    );
     assert_eq!(span["name"], "GET api");
 }
 
@@ -2279,7 +2333,437 @@ async fn test_otel_tracing_gateway_4xx_reject_is_not_span_error() {
     let payload = received_json(&mock_server).await;
     let span = otlp_span(&payload);
     assert_eq!(
-        span["status"]["code"], 1,
-        "gateway 4xx rejects must not be OTLP ERROR spans"
+        span["status"]["code"], 0,
+        "gateway 4xx rejects must stay UNSET, neither ERROR nor explicit OK"
     );
+}
+
+/// #5240: OTLP/JSON requires hexadecimal ID fields. A conforming collector
+/// rejects the batch when the exporter base64-encodes them, so ordinary
+/// requests are proxied while every span is lost.
+#[tokio::test]
+async fn test_otel_tracing_otlp_json_ids_are_hex_for_generated_roots_and_trusted_parents() {
+    for (trace_id, span_id, parent) in [
+        ("abcdef1234567890abcdef1234567890", "1234567890abcdef", ""),
+        (
+            "4bf92f3577b34da6a3ce929d0e0e4736",
+            "fedcba0987654321",
+            "00f067aa0ba902b7",
+        ),
+    ] {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let plugin = new_otel(&json!({
+            "endpoint": format!("{}/v1/traces", mock_server.uri()),
+            "batch_size": 1,
+            "flush_interval_ms": 100
+        }));
+        let mut metadata = make_trace_metadata();
+        metadata.insert("trace_id".to_string(), trace_id.to_string());
+        metadata.insert("span_id".to_string(), span_id.to_string());
+        if !parent.is_empty() {
+            metadata.insert("parent_span_id".to_string(), parent.to_string());
+        }
+        plugin.log(&make_summary(metadata)).await;
+
+        let payload = received_json(&mock_server).await;
+        let span = otlp_span(&payload);
+        assert_eq!(span["traceId"], trace_id);
+        assert_eq!(span["spanId"], span_id);
+        if parent.is_empty() {
+            assert!(span.get("parentSpanId").is_none());
+        } else {
+            assert_eq!(span["parentSpanId"], parent);
+        }
+    }
+}
+
+/// #5240: the same hex mapping on stream teardown spans.
+#[tokio::test]
+async fn test_otel_tracing_stream_span_otlp_json_ids_are_hex() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = new_otel(&json!({
+        "endpoint": format!("{}/v1/traces", mock_server.uri()),
+        "batch_size": 1,
+        "flush_interval_ms": 100
+    }));
+    plugin
+        .on_stream_disconnect(&make_stream_summary(make_trace_metadata()))
+        .await;
+
+    let payload = received_json(&mock_server).await;
+    let span = otlp_span(&payload);
+    assert_eq!(span["traceId"], "abcdef1234567890abcdef1234567890");
+    assert_eq!(span["spanId"], "1234567890abcdef");
+}
+
+/// #5241: OTLP/HTTP publishes an exact retryable status set. Retrying 408 or
+/// 500 burns the configured retry budget on a batch the collector already
+/// refused.
+#[test]
+fn test_otel_tracing_only_otlp_retryable_statuses_are_retried() {
+    for (status, retryable) in [
+        (400, false),
+        (404, false),
+        (408, false),
+        (429, true),
+        (500, false),
+        (501, false),
+        (502, true),
+        (503, true),
+        (504, true),
+    ] {
+        assert_eq!(
+            ferrum_edge::_test_support::otel_tracing_status_is_retryable_for_test("otlp", status),
+            Some(retryable),
+            "OTLP retry classification for {status}"
+        );
+    }
+    // Zipkin and Datadog publish no retryable-status contract and keep the
+    // historical rule; the OTLP allowlist must not silently retarget them.
+    for provider in ["zipkin", "datadog"] {
+        let classify = ferrum_edge::_test_support::otel_tracing_status_is_retryable_for_test;
+        assert_eq!(classify(provider, 500), Some(true), "{provider} 500");
+        assert_eq!(classify(provider, 408), Some(true), "{provider} 408");
+        assert_eq!(classify(provider, 400), Some(false), "{provider} 400");
+    }
+}
+
+/// #5242: collector backpressure must control retry timing. `Retry-After` is
+/// honored in both wire forms and a missing header backs off exponentially
+/// instead of resending on a fixed interval.
+#[test]
+fn test_otel_tracing_retry_after_and_backoff_are_deterministic() {
+    let parse = ferrum_edge::_test_support::otel_tracing_parse_retry_after_for_test;
+    // delay-seconds
+    assert_eq!(parse("2", 1_000), Some(2_000));
+    assert_eq!(parse(" 30 ", 1_000), Some(30_000));
+    // HTTP-date, resolved against a fixed clock: 784111777 is the instant the
+    // date names, so the same header is a 60 s wait or "retry now".
+    let http_date = "Sun, 06 Nov 1994 08:49:37 GMT";
+    assert_eq!(parse(http_date, 784_111_717), Some(60_000));
+    assert_eq!(parse(http_date, 784_111_837), Some(0));
+    // unusable values carry no instruction
+    assert_eq!(parse("later", 0), None);
+    assert_eq!(parse("", 0), None);
+    assert_eq!(parse("-5", 0), None);
+
+    let delay = ferrum_edge::_test_support::otel_tracing_retry_delay_ms_for_test;
+    // A collector instruction wins outright and is used as given.
+    assert_eq!(delay(100, 1, Some(2_000), 0), 2_000);
+    assert_eq!(delay(100, 3, Some(2_000), u64::MAX), 2_000);
+    // …clamped so one throttled batch cannot hold the drain open.
+    assert_eq!(delay(100, 1, Some(3_600_000), 0), 60_000);
+    // Without one, the configured delay doubles per attempt within jitter.
+    for entropy in [0, 1, 7, u64::MAX] {
+        for (attempt, centre) in [(1u32, 1_000u64), (2, 2_000), (3, 4_000)] {
+            let lower = centre * 3 / 4;
+            let upper = centre * 5 / 4;
+            let observed = delay(1_000, attempt, None, entropy);
+            assert!(
+                (lower..=upper).contains(&observed),
+                "attempt {attempt} entropy {entropy} produced {observed}"
+            );
+        }
+    }
+    // The exponential ladder is clamped to the same ceiling.
+    for entropy in [0, 1, u64::MAX] {
+        let observed = delay(60_000, 9, None, entropy);
+        assert!(
+            (45_000..=60_000).contains(&observed),
+            "clamped backoff produced {observed}"
+        );
+    }
+    // An explicitly disabled delay stays disabled.
+    assert_eq!(delay(0, 1, None, u64::MAX), 0);
+    assert_eq!(delay(0, 4, None, u64::MAX), 0);
+}
+
+/// #5243: an `authorization` value that cannot become an HTTP header value
+/// builds no export request at all, so every span is lost while the plugin
+/// reports healthy. It must fail admission instead.
+#[tokio::test]
+async fn test_otel_tracing_rejects_unusable_authorization_header_values() {
+    for value in [
+        "Bearer bad\nvalue",
+        "Bearer bad\rvalue",
+        "Bearer bad\u{0}value",
+    ] {
+        let error = OtelTracing::new_with_http_client(
+            &json!({"endpoint": "http://localhost:4318/v1/traces", "authorization": value}),
+            PluginHttpClient::default(),
+        )
+        .err()
+        .expect("unusable authorization value must be rejected");
+        assert!(error.contains("authorization"), "got: {error}");
+        assert!(
+            !error.contains("Bearer"),
+            "the rejected credential must not be echoed; got: {error}"
+        );
+    }
+
+    // The same rejection applies in propagation-only mode: the value cannot
+    // become latent until an endpoint is added later.
+    let error = OtelTracing::new_with_http_client(
+        &json!({"authorization": "Bearer bad\nvalue"}),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("propagation-only mode must reject it too");
+    assert!(error.contains("authorization"), "got: {error}");
+
+    // Ordinary bearer values stay admitted.
+    OtelTracing::new_with_http_client(
+        &json!({"endpoint": "http://localhost:4318/v1/traces", "authorization": "Bearer abc.def"}),
+        PluginHttpClient::default(),
+    )
+    .expect("a valid bearer value stays admitted");
+}
+
+/// GHSA-45mw-qr4f-3vfv: a mis-templated setting can nest a credential inside
+/// an object or array. Constructor diagnostics reach file validation and
+/// plugin-cache warnings without the admin redactor, so they name the field
+/// and the expected type only.
+#[tokio::test]
+async fn test_otel_tracing_config_errors_never_echo_rejected_values() {
+    const SENTINEL: &str = "inert-sentinel-not-a-credential";
+    let cases = [
+        ("authorization", json!({"value": SENTINEL})),
+        ("authorization", json!([SENTINEL])),
+        ("authorization", json!({"nested": {"deep": SENTINEL}})),
+        ("authorization", json!(7)),
+        ("endpoint", json!({"url": SENTINEL})),
+        ("service_name", json!([SENTINEL])),
+        ("deployment_environment", json!({"env": SENTINEL})),
+        ("generate_trace_id", json!({"on": SENTINEL})),
+        ("batch_size", json!({"size": SENTINEL})),
+        ("trace_context_trust", json!({"trust": SENTINEL})),
+        ("root_sampling", json!([SENTINEL])),
+        ("root_sampling_ratio", json!({"ratio": SENTINEL})),
+    ];
+    for (key, value) in cases {
+        let mut config = json!({});
+        config
+            .as_object_mut()
+            .expect("config object")
+            .insert(key.to_string(), value);
+        let error = OtelTracing::new_with_http_client(&config, PluginHttpClient::default())
+            .err()
+            .unwrap_or_else(|| panic!("{key} must be rejected"));
+        assert!(error.contains(key), "{key} must be named: {error}");
+        assert!(
+            !error.contains(SENTINEL),
+            "{key} diagnostic leaked the rejected value: {error}"
+        );
+    }
+
+    // Explicit null and blank cases keep their own field-specific errors.
+    for value in [json!(null), json!("   ")] {
+        let error = OtelTracing::new_with_http_client(
+            &json!({"authorization": value}),
+            PluginHttpClient::default(),
+        )
+        .err()
+        .expect("null/blank authorization must be rejected");
+        assert!(error.contains("authorization"), "got: {error}");
+    }
+}
+
+/// #5245: a truncated transfer is a failure whatever status line was
+/// committed. Only the 4xx early return hid it.
+#[tokio::test]
+async fn test_otel_tracing_truncated_4xx_body_is_an_error_span() {
+    for (status, streamed, completed, expected) in [
+        (404u16, false, true, 0),
+        (404, true, false, 2),
+        (200, true, false, 2),
+        (200, false, true, 0),
+    ] {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let plugin = new_otel(&json!({
+            "endpoint": format!("{}/v1/traces", mock_server.uri()),
+            "batch_size": 1,
+            "flush_interval_ms": 100
+        }));
+        let mut summary = make_summary(make_trace_metadata());
+        summary.response_status_code = status;
+        summary.response_streamed = streamed;
+        summary.body_completed = completed;
+        summary.proxy_name = Some("api".to_string());
+        plugin.log(&summary).await;
+
+        let payload = received_json(&mock_server).await;
+        let span = otlp_span(&payload);
+        assert_eq!(
+            span["status"]["code"], expected,
+            "status {status} streamed {streamed} completed {completed}"
+        );
+    }
+}
+
+/// #5245: a classified body error on a 4xx is an error span too.
+#[tokio::test]
+async fn test_otel_tracing_body_error_on_4xx_is_an_error_span() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = new_otel(&json!({
+        "endpoint": format!("{}/v1/traces", mock_server.uri()),
+        "batch_size": 1,
+        "flush_interval_ms": 100
+    }));
+    let mut summary = make_summary(make_trace_metadata());
+    summary.response_status_code = 404;
+    summary.body_completed = false;
+    summary.body_error_class = Some(ferrum_edge::retry::ErrorClass::ConnectionReset);
+    plugin.log(&summary).await;
+
+    let payload = received_json(&mock_server).await;
+    assert_eq!(otlp_span(&payload)["status"]["code"], 2);
+}
+
+/// #5246: OTel reserves `Ok` for a status the instrumented application
+/// asserts. Gateway instrumentation only observes, so ordinary responses are
+/// `Unset` and errors stay `Error`.
+#[tokio::test]
+async fn test_otel_tracing_ordinary_http_spans_are_unset_not_ok() {
+    for (status, expected) in [(200u16, 0), (302, 0), (404, 0), (500, 2)] {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let plugin = new_otel(&json!({
+            "endpoint": format!("{}/v1/traces", mock_server.uri()),
+            "batch_size": 1,
+            "flush_interval_ms": 100
+        }));
+        let mut summary = make_summary(make_trace_metadata());
+        summary.response_status_code = status;
+        summary.body_completed = true;
+        summary.proxy_name = Some("api".to_string());
+        plugin.log(&summary).await;
+
+        let payload = received_json(&mock_server).await;
+        let span = otlp_span(&payload);
+        assert_eq!(span["status"]["code"], expected, "HTTP {status}");
+    }
+}
+
+/// #5248: the plugin requires and implements `on_ws_disconnect`, so the
+/// Complete Execution Order row and the machine-readable parity metadata must
+/// list it. The registry and the doc table agree with each other, which is why
+/// a shared omission survived.
+#[tokio::test]
+async fn test_otel_tracing_parity_metadata_lists_its_ws_disconnect_hook() {
+    let plugin = new_otel(&json!({}));
+    assert!(plugin.requires_ws_disconnect_hooks());
+
+    let meta = ferrum_edge::plugins::builtin_parity::BUILTIN_PLUGIN_PARITY_META
+        .iter()
+        .find(|meta| meta.name == "otel_tracing")
+        .expect("otel_tracing parity metadata");
+    assert!(
+        meta.active_phases.contains("on_ws_disconnect"),
+        "active phases omit the implemented hook: {}",
+        meta.active_phases
+    );
+}
+
+/// #5249: `max_attribute_bytes` bounds request-derived attribute values.
+/// Configured service identity is retained as configured, in both the span and
+/// the resource attribute sets.
+#[tokio::test]
+async fn test_otel_tracing_max_attribute_bytes_bounds_request_derived_values_only() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let long_service = "s".repeat(100);
+    let long_environment = "d".repeat(100);
+    let service = long_service.as_str();
+    let environment = long_environment.as_str();
+    let plugin = new_otel(&json!({
+        "endpoint": format!("{}/v1/traces", mock_server.uri()),
+        "service_name": service,
+        "deployment_environment": environment,
+        "max_attribute_bytes": 64,
+        "batch_size": 1,
+        "flush_interval_ms": 100
+    }));
+    let mut summary = make_summary(make_trace_metadata());
+    summary.request_user_agent = Some("u".repeat(200));
+    plugin.log(&summary).await;
+
+    let payload = received_json(&mock_server).await;
+    let span = otlp_span(&payload);
+    assert_eq!(otlp_string_attr(span, "service.name"), Some(service));
+    let resource_service = otlp_resource_string_attr(&payload, "service.name");
+    assert_eq!(resource_service, Some(service));
+    let resource_env = otlp_resource_string_attr(&payload, "deployment.environment");
+    assert_eq!(resource_env, Some(environment));
+    // The request-derived attribute in the same span stays bounded.
+    let user_agent = otlp_string_attr(span, "user_agent.original");
+    assert_eq!(user_agent.map(str::len), Some(64));
+}
+
+/// #5250: `buffer_capacity` bounds the exporter's queue, not the total number
+/// of pending spans: the flush worker holds its in-flight batch outside it.
+#[tokio::test]
+async fn test_otel_tracing_pending_spans_can_exceed_buffer_capacity() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // No timer flush can fire, so the single batch below is proof that both
+    // spans were retained at once.
+    let plugin = new_otel(&json!({
+        "endpoint": format!("{}/v1/traces", mock_server.uri()),
+        "buffer_capacity": 1,
+        "batch_size": 2,
+        "flush_interval_ms": 600000
+    }));
+
+    plugin.log(&make_summary(make_trace_metadata())).await;
+    // Let the worker drain the one-slot queue into its own batch before the
+    // second span is admitted; otherwise the send races the worker's first poll.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut second = make_trace_metadata();
+    second.insert("span_id".to_string(), "fedcba0987654321".to_string());
+    plugin.log(&make_summary(second)).await;
+
+    let payload = received_json(&mock_server).await;
+    let spans = payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .expect("OTLP spans");
+    assert_eq!(spans.len(), 2, "buffer_capacity 1 retained two spans");
 }

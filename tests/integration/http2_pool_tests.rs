@@ -296,13 +296,57 @@ fn multi_address_dns_cache(dns_addr: SocketAddr) -> DnsCache {
     })
 }
 
-async fn bind_dual_loopback_listeners() -> (
+/// Secondary IPv4 loopback aliases this fixture will try, in order.
+///
+/// The multi-address candidate loop is an A-record fixture: one hostname must
+/// resolve to two IPv4 addresses that share one port, so the second address
+/// cannot be IPv6 (`do_resolve` returns the first record type that answers, it
+/// never merges A with AAAA) and cannot be the wildcard (which would swallow
+/// the first address's port). Linux assigns all of `127.0.0.0/8` to `lo`, so
+/// `127.0.0.2` is always available there; macOS assigns only `127.0.0.1` to
+/// `lo0` unless an operator adds an alias, so the whole fixture is skipped
+/// there with an explicit reason rather than failing as a pool defect
+/// (issue #4983).
+const SECONDARY_LOOPBACK_CANDIDATES: [Ipv4Addr; 4] = [
+    Ipv4Addr::new(127, 0, 0, 2),
+    Ipv4Addr::new(127, 0, 0, 3),
+    Ipv4Addr::new(127, 0, 0, 4),
+    Ipv4Addr::new(127, 0, 0, 5),
+];
+
+/// The message a skipped multi-address case prints, so a green run on a host
+/// without a loopback alias is never mistaken for coverage.
+fn report_missing_secondary_loopback(test: &str) {
+    eprintln!(
+        "skipping {test}: this host has no secondary IPv4 loopback alias (tried \
+         {SECONDARY_LOOPBACK_CANDIDATES:?}); add one (macOS: `sudo ifconfig lo0 alias \
+         127.0.0.2`) to run the multi-address candidate cases"
+    );
+}
+
+/// The first secondary IPv4 loopback address this host actually assigns.
+async fn secondary_loopback_address() -> Option<Ipv4Addr> {
+    for candidate in SECONDARY_LOOPBACK_CANDIDATES {
+        if let Ok(probe) = tokio::net::TcpListener::bind((candidate, 0)).await {
+            drop(probe);
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// `(healthy, failing, failing_ip, shared_port)`.
+type DualLoopbackListeners = (
     tokio::net::TcpListener,
     tokio::net::TcpListener,
     Ipv4Addr,
     u16,
-) {
-    let failing_ip = Ipv4Addr::new(127, 0, 0, 2);
+);
+
+/// Two listeners sharing one port on two distinct IPv4 loopback addresses, or
+/// `None` when this host assigns only `127.0.0.1`.
+async fn bind_dual_loopback_listeners() -> Option<DualLoopbackListeners> {
+    let failing_ip = secondary_loopback_address().await?;
     for _ in 0..10 {
         let healthy = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -312,7 +356,7 @@ async fn bind_dual_loopback_listeners() -> (
             .expect("healthy loopback listener address")
             .port();
         if let Ok(failing) = tokio::net::TcpListener::bind((failing_ip, port)).await {
-            return (healthy, failing, failing_ip, port);
+            return Some((healthy, failing, failing_ip, port));
         }
     }
     panic!("could not reserve one TCP port on both test loopback addresses");
@@ -492,8 +536,13 @@ async fn test_http2_pool_get_sender_connects() {
 
 #[tokio::test]
 async fn test_http2_pool_fails_over_after_tcp_success_but_tls_failure() {
-    let (healthy_listener, failing_listener, failing_ip, port) =
-        bind_dual_loopback_listeners().await;
+    let dual_loopback = bind_dual_loopback_listeners().await;
+    let Some((healthy_listener, failing_listener, failing_ip, port)) = dual_loopback else {
+        report_missing_secondary_loopback(
+            "test_http2_pool_fails_over_after_tcp_success_but_tls_failure",
+        );
+        return;
+    };
     let failing_attempts = Arc::new(AtomicUsize::new(0));
     let task_attempts = Arc::clone(&failing_attempts);
     let _failing_task = tokio::spawn(async move {
@@ -547,8 +596,13 @@ async fn test_http2_pool_fails_over_after_tcp_success_but_tls_failure() {
 
 #[tokio::test]
 async fn test_http2_pool_preserves_http1_downgrade_before_later_candidate_failure() {
-    let (later_failure_listener, http1_listener, http1_ip, port) =
-        bind_dual_loopback_listeners().await;
+    let dual_loopback = bind_dual_loopback_listeners().await;
+    let Some((later_failure_listener, http1_listener, http1_ip, port)) = dual_loopback else {
+        report_missing_secondary_loopback(
+            "test_http2_pool_preserves_http1_downgrade_before_later_candidate_failure",
+        );
+        return;
+    };
     let later_attempts = Arc::new(AtomicUsize::new(0));
     let task_attempts = Arc::clone(&later_attempts);
     let _later_failure_task = tokio::spawn(async move {
@@ -602,7 +656,13 @@ async fn test_http2_pool_preserves_http1_downgrade_before_later_candidate_failur
 
 #[tokio::test]
 async fn test_http2_pool_sni_override_skips_http1_candidate_for_later_h2() {
-    let (h2_listener, http1_listener, http1_ip, port) = bind_dual_loopback_listeners().await;
+    let dual_loopback = bind_dual_loopback_listeners().await;
+    let Some((h2_listener, http1_listener, http1_ip, port)) = dual_loopback else {
+        report_missing_secondary_loopback(
+            "test_http2_pool_sni_override_skips_http1_candidate_for_later_h2",
+        );
+        return;
+    };
     let http1_attempts = Arc::new(AtomicUsize::new(0));
     let _http1_task = start_tls_backend_on_counted(
         http1_listener,
@@ -659,7 +719,13 @@ async fn test_http2_pool_sni_override_skips_http1_candidate_for_later_h2() {
 /// alter both.
 #[tokio::test]
 async fn test_http2_pool_sni_override_exhausts_all_http1_candidates() {
-    let (second_listener, first_listener, first_ip, port) = bind_dual_loopback_listeners().await;
+    let dual_loopback = bind_dual_loopback_listeners().await;
+    let Some((second_listener, first_listener, first_ip, port)) = dual_loopback else {
+        report_missing_secondary_loopback(
+            "test_http2_pool_sni_override_exhausts_all_http1_candidates",
+        );
+        return;
+    };
     let first_attempts = Arc::new(AtomicUsize::new(0));
     let second_attempts = Arc::new(AtomicUsize::new(0));
     let _first_task = start_tls_backend_on_counted(
@@ -722,8 +788,13 @@ async fn test_http2_pool_sni_override_exhausts_all_http1_candidates() {
 
 #[tokio::test]
 async fn test_grpc_h2c_pool_fails_over_after_tcp_success_but_h2_failure() {
-    let (healthy_listener, failing_listener, failing_ip, port) =
-        bind_dual_loopback_listeners().await;
+    let dual_loopback = bind_dual_loopback_listeners().await;
+    let Some((healthy_listener, failing_listener, failing_ip, port)) = dual_loopback else {
+        report_missing_secondary_loopback(
+            "test_grpc_h2c_pool_fails_over_after_tcp_success_but_h2_failure",
+        );
+        return;
+    };
     let failing_attempts = Arc::new(AtomicUsize::new(0));
     let task_attempts = Arc::clone(&failing_attempts);
     let _failing_task = tokio::spawn(async move {
@@ -859,7 +930,13 @@ async fn test_grpc_h2c_accepts_settings_with_zero_concurrent_streams() {
 
 #[tokio::test]
 async fn test_grpc_tls_pool_fails_over_when_first_peer_omits_h2_alpn() {
-    let (healthy_listener, non_h2_listener, non_h2_ip, port) = bind_dual_loopback_listeners().await;
+    let dual_loopback = bind_dual_loopback_listeners().await;
+    let Some((healthy_listener, non_h2_listener, non_h2_ip, port)) = dual_loopback else {
+        report_missing_secondary_loopback(
+            "test_grpc_tls_pool_fails_over_when_first_peer_omits_h2_alpn",
+        );
+        return;
+    };
     let non_h2_attempts = Arc::new(AtomicUsize::new(0));
     let _non_h2_task = start_tls_backend_on_counted(
         non_h2_listener,

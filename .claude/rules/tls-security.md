@@ -41,7 +41,7 @@ paths:
 - TLS/DTLS-terminating client-facing protocols must complete frontend crypto and plugin admission before dialing a backend.
 - Frontend handshake failures and plugin rejects must not trip backend circuit breakers.
 - Frontend TLS/DTLS handshakes are bounded by `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`, default 10s. `0` disables.
-- DTLS demux state is capped before per-peer channel/task allocation and released on handshake timeout.
+- DTLS demux state is capped before per-peer channel/task allocation and released on handshake timeout. The cap is BOTH listener-wide (`FERRUM_UDP_MAX_SESSIONS`) and per effective source IP (`FERRUM_UDP_MAX_SESSIONS_PER_IP`, the same gateway-wide counter the TCP/UDP listeners use); the per-source slot is taken on the ClientHello admission path and released at accept handoff, where the listener's session reservation takes over, so an established DTLS session is charged once rather than twice. Handshake-timeout warnings are rate-limited through `AtomicLogRateLimiter` and report the count they withheld — do not restore one `warn!` per peer on an unauthenticated path.
 
 ## TLS Rotation Model
 

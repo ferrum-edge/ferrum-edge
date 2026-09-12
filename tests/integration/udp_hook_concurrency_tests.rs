@@ -399,11 +399,31 @@ async fn slow_udp_datagram_hook_for_client_a_does_not_block_client_b() {
     let backend_port = backend.local_addr().expect("backend addr").port();
     let _backend = spawn_udp_echo_backend(Arc::clone(&backend)).await;
 
-    // Bind client A first so we know its source IP for the gated plugin.
-    // Client B uses a distinct loopback address (127.0.0.2): `UdpDatagramContext`
-    // exposes client IP only, while sessions are keyed by full SocketAddr, so two
-    // sockets on 127.0.0.1 would share an IP identity and poison seen_fast/seen_slow
-    // even though their per-session hook workers remain independent.
+    // Client B needs a distinct loopback ADDRESS, not merely a distinct port:
+    // `UdpDatagramContext` exposes client IP only, while sessions are keyed by
+    // full SocketAddr, so two sockets on 127.0.0.1 would share an IP identity
+    // and poison seen_fast/seen_slow even though their per-session hook workers
+    // remain independent. Linux assigns all of 127.0.0.0/8 to `lo`; macOS
+    // assigns only 127.0.0.1 to `lo0` unless an operator adds an alias
+    // (issue #4983), so report the missing prerequisite instead of failing as a
+    // hook-concurrency defect — and do it before a gateway is spawned.
+    let mut client_b_socket = None;
+    for candidate in ["127.0.0.2:0", "127.0.0.3:0", "127.0.0.4:0", "127.0.0.5:0"] {
+        if let Ok(socket) = UdpSocket::bind(candidate).await {
+            client_b_socket = Some(socket);
+            break;
+        }
+    }
+    let Some(client_b) = client_b_socket else {
+        eprintln!(
+            "skipping slow_udp_datagram_hook_for_client_a_does_not_block_client_b: this \
+             host assigns no secondary IPv4 loopback address, so the two clients cannot be \
+             told apart by IP"
+        );
+        return;
+    };
+
+    // Bind client A after B so we know its source IP for the gated plugin.
     let client_a = UdpSocket::bind("127.0.0.1:0").await.expect("client A bind");
     let client_a_ip = Arc::from(
         client_a
@@ -417,7 +437,6 @@ async fn slow_udp_datagram_hook_for_client_a_does_not_block_client_b() {
     let gateway = spawn_udp_gateway_with_retry(backend_port, Arc::clone(&client_a_ip)).await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), gateway.listen_port);
 
-    let client_b = UdpSocket::bind("127.0.0.2:0").await.expect("client B bind");
     assert_ne!(
         client_a
             .local_addr()

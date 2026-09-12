@@ -1009,9 +1009,12 @@ fn h3_plugin_reject_commit_is_not_deferred_to_send_helpers() {
     );
 
     // The terminal provider path shares one finalizer across three writable
-    // rejection exits. Expand that shared boundary when comparing call sites,
-    // and exclude the separate final-body and finalized-egress plugin
-    // rejections, which commit before a non-plugin-aware sender.
+    // rejection exits. Expand that shared boundary when comparing call sites.
+    // The separate final-body and finalized-egress rejections keep one
+    // committed boundary each, and both now hand the wire write to the
+    // plugin-aware sender so a browser-framed or native gRPC terminate keeps
+    // its client wire shape (issue #5174). They therefore pair with a plugin
+    // reject send and are counted here rather than excluded.
     let shared_terminal_reject_sends = source
         .matches("let rejection = finalize_h3_terminal_body_read_rejection(")
         .count();
@@ -1023,16 +1026,23 @@ fn h3_plugin_reject_commit_is_not_deferred_to_send_helpers() {
         .split("let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();")
         .next()
         .expect("bounded terminal provider dispatch");
-    let non_plugin_terminal_boundaries = terminal_dispatch
+    let terminal_dispatch_boundaries = terminal_dispatch
         .matches("run_h3_reject_response_committed_hooks(")
         .count();
     assert_eq!(
-        non_plugin_terminal_boundaries, 2,
+        terminal_dispatch_boundaries, 2,
         "the final-body and finalized-egress plugin rejections each need a committed boundary"
     );
+    let terminal_dispatch_plugin_sends = terminal_dispatch
+        .matches("send_h3_plugin_reject_flavor_aware(")
+        .count();
+    assert_eq!(
+        terminal_dispatch_plugin_sends,
+        terminal_dispatch_boundaries + 1,
+        "each terminal-dispatch boundary precedes a plugin-aware send, plus the shared finalizer"
+    );
     let effective_plugin_committed_boundaries =
-        committed_boundaries - shared_terminal_commit_definitions - non_plugin_terminal_boundaries
-            + shared_terminal_reject_sends;
+        committed_boundaries - shared_terminal_commit_definitions + shared_terminal_reject_sends;
     assert_eq!(
         effective_plugin_committed_boundaries,
         plugin_reject_sends + direct_recv_halt_plugin_rejects + 1,

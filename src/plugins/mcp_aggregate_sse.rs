@@ -1,9 +1,23 @@
-//! Multiplexed aggregate-router SSE session broker for `mcp_gateway`.
+//! Aggregate-router SSE session broker for `mcp_gateway`.
 //!
-//! One downstream MCP session holds at most one live `text/event-stream`
-//! listener. Every JSON-RPC event published for that session is routed onto
-//! that one listener and identified by a bounded, type-sensitive request/stream
-//! identity, so many concurrent MCP request streams share one connection.
+//! Two surfaces share one bounded per-session state machine:
+//!
+//! * The POST-attached response streams MCP Streamable HTTP requires. A POST
+//!   that carried a JSON-RPC request is answered on that POST — with
+//!   `application/json` when the gateway already holds the result, or with its
+//!   own self-terminating event stream
+//!   ([`AggregateSseStream::post_attached_response`]) when the result had to be
+//!   fetched.
+//! * The session's `GET` event stream. One downstream MCP session holds at most
+//!   one live `text/event-stream` listener. A freshly attached listener carries
+//!   server-to-client traffic only: it NEVER receives the response to a request
+//!   that arrived on a POST. A `GET` bearing `Last-Event-ID` is the single
+//!   exception the transport allows, because that is resumption of a stream an
+//!   earlier POST began, and it is served from the same retained-event ring.
+//!
+//! Both surfaces route by the same bounded, type-sensitive request/stream
+//! identity, so per-session concurrency, duplicate-id refusal, response/request
+//! correlation, and `notifications/cancelled` behave identically on either one.
 //!
 //! Design invariants — each one is load bearing:
 //!
@@ -19,10 +33,12 @@
 //! * Retained event bytes have exactly ONE budget. Every event is retained
 //!   once, in a single ring that serves both pre-listener staging and
 //!   `Last-Event-ID` replay; delivery clones a `Bytes` handle, never the
-//!   payload. A response that has selected its POST-side `202` reserves one
-//!   event/count window before that response can enter final header policy;
-//!   direct publishers account for those reservations, so the later committed
-//!   hook cannot lose the event to a capacity race.
+//!   payload. A staged publication reserves one event/count window before it
+//!   can become visible; direct publishers account for those reservations, so a
+//!   later commit cannot lose the event to a capacity race. A POST-attached
+//!   response enters the ring ALREADY DELIVERED — the client has the bytes — so
+//!   it only ever occupies the `Last-Event-ID` replay window, and a ring too
+//!   small to keep it costs resumability rather than delivery.
 //! * An undelivered event is never evicted. When the ring cannot admit one, the
 //!   publish fails closed and the caller answers the POST inline, so a JSON-RPC
 //!   response is never silently dropped. A refused publish still TERMINALIZES
@@ -31,10 +47,10 @@
 //!   exactly once instead of leaking.
 //! * An open request stream is owned by an RAII lease
 //!   ([`AggregateSseStream`]) held privately on the request context. Every exit
-//!   path — publish, cancellation, inline fallback, backend error, policy
-//!   replacement, transport disconnect, task cancellation — releases the
-//!   identity exactly once through that lease, with no detached task and
-//!   without the lease retaining the broker generation.
+//!   path — POST-attached delivery, publish, cancellation, inline fallback,
+//!   backend error, policy replacement, transport disconnect, task
+//!   cancellation — releases the identity exactly once through that lease, with
+//!   no detached task and without the lease retaining the broker generation.
 //! * Session ids, JSON-RPC ids, `Last-Event-ID` values and event payloads are
 //!   never logged and never reach a diagnostic. Every reason is a fixed,
 //!   low-cardinality token derived from the error variant.
@@ -648,6 +664,60 @@ impl SessionInner {
         Ok(event_id)
     }
 
+    /// Retain an ALREADY-DELIVERED POST-attached event for `Last-Event-ID`
+    /// replay, and return the id it was framed under.
+    ///
+    /// The bytes have already been written to the POST that carried the
+    /// request, so this ring entry is replay history only. The event is marked
+    /// delivered and the attached listener's cursor is advanced past it, which
+    /// is what keeps a plain `GET` listener from ever receiving a response to a
+    /// request that arrived on a POST. Only an explicit resumption cursor older
+    /// than the event replays it — the one placement Streamable HTTP permits.
+    ///
+    /// Retention is best effort BY DESIGN, unlike [`Self::retain_event`]: the
+    /// client already holds these bytes, so a ring too small to keep them costs
+    /// resumability, never delivery. A refused retention advances
+    /// `evicted_through`, so a later cursor that would have needed this event
+    /// fails closed as `LastEventIdTooOld` instead of silently resuming across
+    /// a gap.
+    fn retain_delivered_event(&mut self, bounds: &AggregateSseBounds, encoded: &[u8]) -> u64 {
+        let event_id = self.last_event_id.saturating_add(1);
+        let framed = frame_sse_event(event_id, encoded);
+        self.last_event_id = event_id;
+        self.delivered_through = self.delivered_through.max(event_id);
+        if let Some(listener) = self.listener.as_mut() {
+            listener.cursor = listener.cursor.max(event_id);
+        }
+        self.last_activity = Instant::now();
+        self.trim_for_admission(
+            bounds,
+            self.reserved_events.saturating_add(1),
+            self.reserved_bytes.saturating_add(framed.len()),
+        );
+        let projected_events = self
+            .history
+            .len()
+            .saturating_add(self.reserved_events)
+            .saturating_add(1);
+        let projected_bytes = self
+            .history_bytes
+            .saturating_add(self.reserved_bytes)
+            .saturating_add(framed.len());
+        if projected_events > bounds.max_retained_events
+            || projected_bytes > bounds.max_retained_bytes
+        {
+            self.evicted_through = self.evicted_through.max(event_id);
+            return event_id;
+        }
+        self.history_bytes = self.history_bytes.saturating_add(framed.len());
+        self.history.push_back(RetainedEvent { event_id, framed });
+        // Apply the replay policy immediately: with `max_replay_events: 0` this
+        // event is history the moment the POST carried it, so it must not
+        // linger in the ring.
+        self.trim(bounds);
+        event_id
+    }
+
     /// Move an OPEN identity to a terminal phase and return its capacity.
     ///
     /// Idempotent by construction: an unknown or already-terminal identity is
@@ -915,6 +985,60 @@ impl SessionState {
         if inner.terminalize_stream(identity, StreamPhase::Completed, max_open) {
             inner.last_activity = Instant::now();
         }
+    }
+
+    /// Settle an open identity and REPORT the phase it was in.
+    ///
+    /// The POST-attached delivery path needs the distinction that
+    /// [`Self::settle_stream`] deliberately discards: an ordinary terminal
+    /// response and a response the client already cancelled produce different
+    /// POST bodies, and only the phase held under this lock tells them apart.
+    /// The identity is terminal afterwards either way — an `Ok` completes it
+    /// here, and every `Err` names a phase that already terminalized it and
+    /// returned its capacity.
+    fn settle_open_stream(&self, identity: &StreamIdentity) -> Result<(), AggregateSseError> {
+        let max_open = self.bounds.max_streams_per_session;
+        let mut inner = self.lock();
+        if inner.closed {
+            return Err(AggregateSseError::StaleSession);
+        }
+        match inner.streams.get(identity).copied() {
+            Some(StreamPhase::Open) => {}
+            Some(StreamPhase::Completed) => return Err(AggregateSseError::StreamCompleted),
+            Some(StreamPhase::Cancelled) => return Err(AggregateSseError::StreamCancelled),
+            None => return Err(AggregateSseError::UnknownStream),
+        }
+        inner.terminalize_stream(identity, StreamPhase::Completed, max_open);
+        inner.last_activity = Instant::now();
+        Ok(())
+    }
+
+    /// Complete an open identity because its response is being written to the
+    /// POST that carried the request, and retain that event for resumption.
+    ///
+    /// Phase check, retention, cursor advance and terminalization all happen in
+    /// ONE critical section, so a concurrent cancel or a duplicate response can
+    /// never interleave and the attached listener can never observe the event
+    /// as new work. No waker is taken: nothing became deliverable here.
+    fn deliver_on_post(
+        &self,
+        identity: &StreamIdentity,
+        encoded: &[u8],
+    ) -> Result<u64, AggregateSseError> {
+        let max_open = self.bounds.max_streams_per_session;
+        let mut inner = self.lock();
+        if inner.closed {
+            return Err(AggregateSseError::StaleSession);
+        }
+        match inner.streams.get(identity).copied() {
+            Some(StreamPhase::Open) => {}
+            Some(StreamPhase::Completed) => return Err(AggregateSseError::StreamCompleted),
+            Some(StreamPhase::Cancelled) => return Err(AggregateSseError::StreamCancelled),
+            None => return Err(AggregateSseError::UnknownStream),
+        }
+        let event_id = inner.retain_delivered_event(&self.bounds, encoded);
+        inner.terminalize_stream(identity, StreamPhase::Completed, max_open);
+        Ok(event_id)
     }
 
     fn poll_next_frame(&self, epoch: u64, waker: &Waker) -> NextFrame {
@@ -1559,6 +1683,74 @@ impl AggregateSseStream {
         }
         self.0.session.settle_stream(&self.0.identity);
     }
+
+    /// Settle this identity because the POST is answering with the ordinary
+    /// `application/json` representation, REPORTING a cancellation the caller
+    /// still has to honour.
+    ///
+    /// Same one-shot terminal claim as every other exit; the only difference
+    /// from [`Self::settle_inline`] is that the phase is returned instead of
+    /// discarded, so a result the client withdrew while the gateway was
+    /// producing it is not written to the POST as though it were wanted.
+    pub fn settle_for_inline_response(&self) -> Result<(), AggregateSseError> {
+        if self.0.settled.swap(true, Ordering::AcqRel) {
+            return Err(AggregateSseError::StreamCompleted);
+        }
+        self.0.session.settle_open_stream(&self.0.identity)
+    }
+
+    /// Frame this identity's terminal JSON-RPC response as the COMPLETE
+    /// POST-attached `text/event-stream` body and settle the identity.
+    ///
+    /// This is MCP Streamable HTTP delivery: the answer to a POST that carried
+    /// a request stays on that POST. The event is additionally retained as
+    /// already-delivered replay history, so a client whose POST stream broke can
+    /// resume it with `Last-Event-ID`; a plain `GET` listener never sees it.
+    ///
+    /// The identity is terminal on every outcome. `Err(StreamCancelled)` means
+    /// the client withdrew the request and the response must not be sent at
+    /// all; every other `Err` means the caller answers this POST with the
+    /// ordinary inline JSON response instead.
+    pub fn post_attached_response(&self, encoded: &[u8]) -> Result<Bytes, AggregateSseError> {
+        if self.0.settled.swap(true, Ordering::AcqRel) {
+            // A second terminal attempt on one lease is a duplicate response.
+            return Err(AggregateSseError::StreamCompleted);
+        }
+        if let Err(refusal) = self.validate_post_attached_payload(encoded) {
+            // The identity is terminal whatever happens, so release it here and
+            // report the phase in preference to the payload: a response the
+            // client already cancelled must be reported as cancelled, not as an
+            // envelope the gateway declined to frame.
+            return Err(match self.0.session.settle_open_stream(&self.0.identity) {
+                Ok(()) => refusal,
+                Err(phase) => phase,
+            });
+        }
+        let event_id = self.0.session.deliver_on_post(&self.0.identity, encoded)?;
+        Ok(frame_post_attached_response(event_id, encoded))
+    }
+
+    /// Whether these governed bytes may be framed as this identity's event.
+    fn validate_post_attached_payload(&self, encoded: &[u8]) -> Result<(), AggregateSseError> {
+        let max_event_bytes = self.0.session.bounds.max_event_bytes;
+        if encoded.len() > max_event_bytes {
+            return Err(AggregateSseError::EventTooLarge);
+        }
+        // The HTTP request and its terminal JSON-RPC body must name the same
+        // type-sensitive identity. A body naming a different id is not this
+        // request's answer, so it is never framed as one — the caller replaces
+        // it with a correlated gateway error instead.
+        if !response_matches_stream_identity(
+            encoded,
+            &self.0.identity,
+            self.0.session.bounds.max_stream_id_bytes,
+        ) {
+            return Err(AggregateSseError::ResponseEnvelopeInvalid);
+        }
+        // Only a correctly correlated response may use the inline framing
+        // fallback (for example, pretty-printed JSON containing newlines).
+        validate_event_bytes(encoded, max_event_bytes)
+    }
 }
 
 /// Clone-safe, RAII-owned publication staged between final body policy and the
@@ -1885,6 +2077,39 @@ fn frame_sse_event(event_id: u64, data: &[u8]) -> Bytes {
     out.extend_from_slice(data);
     out.extend_from_slice(b"\n\n");
     Bytes::from(out)
+}
+
+/// Frame the complete POST-attached `text/event-stream` body for one JSON-RPC
+/// response.
+///
+/// MCP Streamable HTTP answers a POST that carried a request either with
+/// `application/json` or with an event stream on that same POST, and the server
+/// closes that stream once the response has been sent. The whole representation
+/// is therefore known when it is framed: an opening comment so a client sees an
+/// established stream, one `message` event carrying the exact governed bytes,
+/// then end of body.
+///
+/// The event id is the session-wide cursor the retained ring assigned, so a
+/// client whose POST stream broke can hand it back as `Last-Event-ID` on a
+/// resuming `GET`. Ids are unique across every stream in the session because
+/// they all come from that one counter.
+fn frame_post_attached_response(event_id: u64, data: &[u8]) -> Bytes {
+    let framed = frame_sse_event(event_id, data);
+    let mut out = Vec::with_capacity(SSE_GREETING.len() + framed.len());
+    out.extend_from_slice(SSE_GREETING);
+    out.extend_from_slice(&framed);
+    Bytes::from(out)
+}
+
+/// The complete POST-attached body for a request whose response must NOT be
+/// sent: an event stream that opens and closes carrying no `message` event,
+/// which is exactly what a cancelled JSON-RPC request looks like on the wire.
+///
+/// Deliberately not an empty body: the representation stays a well-formed,
+/// non-empty `text/event-stream` so no downstream framing decision can mistake
+/// it for the gateway's own long-lived listener response.
+pub fn post_attached_stream_without_response() -> Bytes {
+    Bytes::from_static(SSE_GREETING)
 }
 
 /// Returns true when request headers carry a usable `text/event-stream` Accept.

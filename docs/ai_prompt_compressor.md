@@ -60,6 +60,8 @@ Image-generation paths, arbitrary JSON carrying a `prompt`, provider-native
 markers, mixed `messages`+`prompt` bodies, malformed content parts, and other
 ambiguous shapes pass through unchanged. A fixed request family is the explicit
 opt-in for a compatible custom endpoint path; shape validation still applies.
+For example, `request_family: chat_completions` admits a compatible `/custom`
+endpoint whose body would pass through unchanged under `auto`.
 
 Only the decoded values of targeted fields are intentionally compressed. When a
 normal admitted field rewrite succeeds (including below-floor marker cleanup),
@@ -78,11 +80,11 @@ rewrite nor value cleanup retain their original bytes.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `compress_roles` | string[] | `["user"]` | Message roles whose `content` is compressed (case-insensitive). Must be non-empty. When it contains `user`, the legacy top-level `prompt` is compressed too. |
+| `compress_roles` | string[] | `["user"]` | Message roles whose `content` is compressed (trimmed and case-insensitive). Must be non-empty, with no blank entries. When it contains `user`, the legacy top-level `prompt` is compressed too. |
 | `target_ratio` | number | `0.5` | Fraction of word-tokens to keep. `0.5` targets ~50% reduction; `0.3` is more aggressive. Must be strictly between `0` and `1`. |
 | `min_content_tokens` | integer | `200` | Estimated-token floor per content string. Range `0..=131072`; content below this is passed through unchanged so short prompts are not mangled. |
 | `max_scan_bytes` | integer | `1048576` | Skip statistical compression when the request body exceeds this many bytes. Range `1..=1048576`; the upper bound is immutable. Configured preserve-marker sanitation remains active up to the hard maximum. |
-| `preserve_tag` | string | _(unset)_ | Optional marker name. Text wrapped in `<TAG>…</TAG>` is copied through verbatim and all markers are stripped. Nested spans are flattened; unmatched open text is preserved to the end; unmatched closes are stripped. May contain at most 64 ASCII letters, digits, `-`, and `_`. |
+| `preserve_tag` | string | _(unset)_ | Optional marker name. Text wrapped in `<TAG>…</TAG>` is copied through verbatim and all markers are stripped. Nested spans are flattened; unmatched open text is preserved to the end; unmatched closes are stripped. Must contain 1–64 ASCII letters, digits, `-`, and `_`. |
 | `request_family` | string | `auto` | `auto` requires the body shape to agree with a standard `/chat/completions` or `/completions` path. Use `chat_completions` or `text_completions` only as an explicit assertion for a compatible custom endpoint. Fixed `text_completions` configurations must include `user` in `compress_roles` because the top-level prompt is user text. |
 
 Token counts are **estimated** with a ~4-characters-per-token heuristic; the

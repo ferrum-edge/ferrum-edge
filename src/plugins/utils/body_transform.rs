@@ -455,6 +455,11 @@ pub enum BodyOperation {
 /// - `value` (for add/update): a JSON value or string (required — missing ⇒ error)
 /// - `new_key` (for rename): new dot-notation field path (required — missing ⇒ error)
 ///
+/// Operation-incompatible properties are rejected by PRESENCE, not by parsed
+/// value: `value` on remove/rename and `new_key` on add/update/remove fail even
+/// when authored as an explicit JSON `null`. Explicit `null` remains a valid
+/// body `value` on add/update — that sets the target field to JSON null.
+///
 /// Returns `Err` with a descriptive message if any body rule is malformed.
 /// Rules whose `target` is not `"body"` are silently skipped (they are
 /// validated by the caller — the request/response transformer plugins).
@@ -468,9 +473,9 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
 
     let mut rules = Vec::new();
     for (idx, r) in arr.iter().enumerate() {
-        if !r.is_object() {
+        let Some(rule_obj) = r.as_object() else {
             return Err(format!("rule[{idx}]: rule must be an object"));
-        }
+        };
         let target = match r.get("target") {
             Some(Value::String(s)) => s.as_str(),
             None => {
@@ -540,6 +545,11 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
             }
         });
 
+        // Presence, not the parsed option: an explicit `new_key: null` is still
+        // an incompatible property on add/update/remove, exactly as the
+        // header/query constructors treat it. Parsing alone would collapse
+        // "absent" and "explicitly null" and silently admit the second.
+        let new_key_present = rule_obj.contains_key("new_key");
         let new_key = match r.get("new_key") {
             Some(Value::String(s)) => Some(s.clone()),
             Some(Value::Null) | None => None,
@@ -560,7 +570,7 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
                         "rule[{idx}]: body '{op_str}' operation requires a 'value'"
                     ));
                 }
-                if new_key.is_some() {
+                if new_key_present {
                     return Err(format!(
                         "rule[{idx}]: 'new_key' must not be set for body '{op_str}' operation"
                     ));
@@ -598,7 +608,7 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
                         "rule[{idx}]: 'value' must not be set for body 'remove' operation"
                     ));
                 }
-                if new_key.is_some() {
+                if new_key_present {
                     return Err(format!(
                         "rule[{idx}]: 'new_key' must not be set for body 'remove' operation"
                     ));

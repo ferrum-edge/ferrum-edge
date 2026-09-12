@@ -1590,12 +1590,12 @@ async fn live_stale_primary_is_quarantined_and_the_client_converges_on_the_fresh
 // mesh proxy runtime is a second, independent gate: slice→config preparation
 // or `ProxyState::update_config` can still refuse it, leaving the previous
 // generation serving. These tests drive the runtime seam
-// (`install_slice` → `record_applied_slice` / `record_rejected_slice`) that the
+// (`install_slice` → `record_applied_slice_with_token` / `record_rejected_slice`) that the
 // mesh apply loop uses, rather than `MeshRevisionGate::admit` in isolation,
 // because the defect they cover lives in the relationship between the two
 // gates and not in the comparison contract.
 
-/// `record_applied_slice` fans the accepted slice's (here empty) runtime
+/// `record_applied_slice_with_token` fans the accepted slice's (here empty) runtime
 /// overlay out to process-global RTDS consumers, so every lifecycle test below
 /// serialises against `mesh_runtime_overlay_consumers_tests` through the
 /// documented process-wide guard. Integration tests share one process per
@@ -1616,7 +1616,8 @@ fn a_runtime_rejected_candidate_rolls_the_watermark_back_and_reopens_recovery() 
     // The proxy is serving revision N.
     let applied = slice_at("v-10", Some(revision("db", 10)));
     assert!(state.install_slice(applied.clone()).installed());
-    state.record_applied_slice(&applied);
+    let token = state.begin_revision_apply(&applied);
+    state.record_applied_slice_with_token(&applied, token);
     assert_eq!(state.accepted_revision(), Some(revision("db", 10)));
     assert_eq!(state.applied_revision(), Some(revision("db", 10)));
 
@@ -1650,7 +1651,8 @@ fn a_runtime_rejected_candidate_rolls_the_watermark_back_and_reopens_recovery() 
     // again, so a control plane can still recover the data plane.
     let recovery = slice_at("v-11", Some(revision("db", 11)));
     assert!(state.install_slice(recovery.clone()).installed());
-    state.record_applied_slice(&recovery);
+    let token = state.begin_revision_apply(&recovery);
+    state.record_applied_slice_with_token(&recovery, token);
     assert_eq!(installed_version(&state).as_deref(), Some("v-11"));
     assert_eq!(state.applied_revision(), Some(revision("db", 11)));
 
@@ -1676,7 +1678,8 @@ fn a_late_rejection_cannot_roll_back_a_newer_candidate() {
     let state = MeshRuntimeState::new();
     let applied = slice_at("v-10", Some(revision("db", 10)));
     assert!(state.install_slice(applied.clone()).installed());
-    state.record_applied_slice(&applied);
+    let token = state.begin_revision_apply(&applied);
+    state.record_applied_slice_with_token(&applied, token);
 
     // The apply task picks up N+10 and starts preparing it.
     assert!(
@@ -1737,7 +1740,8 @@ fn a_runtime_rejected_bootstrap_candidate_returns_to_no_baseline() {
     // different ordering domain.
     let recovery = slice_at("v-1", Some(revision("db", 1)));
     assert!(state.install_slice(recovery.clone()).installed());
-    state.record_applied_slice(&recovery);
+    let token = state.begin_revision_apply(&recovery);
+    state.record_applied_slice_with_token(&recovery, token);
     assert_eq!(state.applied_revision(), Some(revision("db", 1)));
 }
 
@@ -1751,14 +1755,16 @@ fn an_equal_revision_replay_commits_the_applied_watermark() {
     let state = MeshRuntimeState::new();
     let first = slice_at("v-10", Some(revision("db", 10)));
     assert!(state.install_slice(first.clone()).installed());
-    state.record_applied_slice(&first);
+    let token = state.begin_revision_apply(&first);
+    state.record_applied_slice_with_token(&first, token);
 
     let replay = slice_at("v-10-replay", Some(revision("db", 10)));
     assert!(
         state.install_slice(replay.clone()).installed(),
         "an equal revision MUST install — every ordinary reconnect replays one"
     );
-    state.record_applied_slice(&replay);
+    let token = state.begin_revision_apply(&replay);
+    state.record_applied_slice_with_token(&replay, token);
     assert_eq!(state.applied_revision(), Some(revision("db", 10)));
     assert_eq!(state.accepted_revision(), Some(revision("db", 10)));
 
@@ -1888,7 +1894,8 @@ async fn a_conversion_invalid_first_slice_does_not_pin_the_startup_watermark() {
     // `serve_mesh_runtime` commits the generation once it is actually live.
     {
         let _overlay_guard = overlay_consumer_guard();
-        state.record_applied_slice(&corrected);
+        let token = state.begin_revision_apply(&corrected);
+        state.record_applied_slice_with_token(&corrected, token);
     }
     assert_eq!(state.applied_revision(), Some(revision("db", 100)));
 
@@ -2084,7 +2091,8 @@ fn rollback_restores_the_applied_revision_and_its_bound_content_together() {
     let state = MeshRuntimeState::new();
     let applied = slice_with_content("v-10", Some(revision("db", 10)), "good");
     assert!(state.install_slice(applied.clone()).installed());
-    state.record_applied_slice(&applied);
+    let token = state.begin_revision_apply(&applied);
+    state.record_applied_slice_with_token(&applied, token);
     assert_eq!(state.applied_revision(), Some(revision("db", 10)));
 
     // A newer candidate is received and then REFUSED by the proxy runtime.
@@ -2165,7 +2173,8 @@ fn kubernetes_minimum_scope_watermark_cannot_displace_accepted_content() {
     let state = MeshRuntimeState::new();
     let from_a = slice_with_content("cp-a", Some(publish(&replica_a)), "authz-withdrawn");
     assert!(state.install_slice(from_a.clone()).installed());
-    state.record_applied_slice(&from_a);
+    let token = state.begin_revision_apply(&from_a);
+    state.record_applied_slice_with_token(&from_a, token);
 
     let from_b = slice_with_content("cp-b", Some(publish(&replica_b)), "authz-still-live");
     let install = state.install_slice(from_b);
@@ -2203,7 +2212,8 @@ fn reset_clears_the_applied_watermark_so_a_rejection_cannot_resurrect_it() {
     let state = MeshRuntimeState::new();
     let applied = slice_at("v-10", Some(revision("db", 10)));
     assert!(state.install_slice(applied.clone()).installed());
-    state.record_applied_slice(&applied);
+    let token = state.begin_revision_apply(&applied);
+    state.record_applied_slice_with_token(&applied, token);
 
     let cleared = state
         .reset_accepted_revision()
@@ -2252,7 +2262,8 @@ fn control_character_authorities_are_refused_and_never_reach_a_watermark() {
     let state = MeshRuntimeState::new();
     let applied = slice_at("v-10", Some(revision("db", 10)));
     assert!(state.install_slice(applied.clone()).installed());
-    state.record_applied_slice(&applied);
+    let token = state.begin_revision_apply(&applied);
+    state.record_applied_slice_with_token(&applied, token);
 
     assert_eq!(
         state
@@ -2297,7 +2308,8 @@ fn output_copies_of_the_authority_are_bounded_but_ordering_stays_exact() {
     let state = MeshRuntimeState::new();
     let applied = slice_at("v-7", Some(long.clone()));
     assert!(state.install_slice(applied.clone()).installed());
-    state.record_applied_slice(&applied);
+    let token = state.begin_revision_apply(&applied);
+    state.record_applied_slice_with_token(&applied, token);
 
     // Ordering keeps the RAW value: a different authority that shares the
     // first 64 characters must not be mistaken for the accepted one.
@@ -2977,7 +2989,8 @@ fn recording_an_applied_slice_publishes_an_applied_runtime_verdict() {
         ..MeshSlice::default()
     };
     state.install_slice(slice.clone());
-    state.record_applied_slice(&slice);
+    let token = state.begin_revision_apply(&slice);
+    state.record_applied_slice_with_token(&slice, token);
 
     assert!(verdicts.has_changed().expect("publisher is alive"));
     let verdict = verdicts

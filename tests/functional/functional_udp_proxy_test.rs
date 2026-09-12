@@ -15,9 +15,7 @@
 //! All tests are marked `#[ignore]` — run with:
 //!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_udp_proxy --ignored --nocapture
 
-use crate::common::{
-    configure_coverage_gateway_command, explicit_test_binary, shutdown_gateway_child,
-};
+use crate::common::{GatewayChildGuard, configure_coverage_gateway_command, explicit_test_binary};
 use std::io::Write;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -124,8 +122,11 @@ fn gateway_binary_path() -> String {
     }
 }
 
-fn shutdown_gateway(gateway: &mut std::process::Child) {
-    shutdown_gateway_child(gateway);
+/// Shut a spawned gateway down early. The guard would do this on drop; calling
+/// it explicitly keeps the graceful teardown at the point the test intends,
+/// and is idempotent so the drop path cannot reap the child twice.
+fn shutdown_gateway(gateway: &mut GatewayChildGuard) {
+    gateway.shutdown();
 }
 
 /// Extra env vars for DTLS frontend configuration.
@@ -137,7 +138,7 @@ struct GatewayDtlsEnv {
 fn start_gateway(
     config_path: &str,
     http_port: u16,
-) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+) -> Result<GatewayChildGuard, Box<dyn std::error::Error>> {
     start_gateway_with_dtls(config_path, http_port, None)
 }
 
@@ -145,7 +146,7 @@ fn start_gateway_with_extra_env(
     config_path: &str,
     http_port: u16,
     extra_env: &[(&str, &str)],
-) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+) -> Result<GatewayChildGuard, Box<dyn std::error::Error>> {
     let admin_port = http_port + 1000;
     let mut cmd = std::process::Command::new(gateway_binary_path());
     cmd.arg("run");
@@ -161,14 +162,16 @@ fn start_gateway_with_extra_env(
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    Ok(cmd.spawn()?)
+    // Owned at the instant of spawn: every path out of a fixture from here on,
+    // panic included, kills and reaps this child (issue #4991).
+    Ok(GatewayChildGuard::new(cmd.spawn()?))
 }
 
 fn start_gateway_with_dtls(
     config_path: &str,
     http_port: u16,
     dtls_env: Option<&GatewayDtlsEnv>,
-) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+) -> Result<GatewayChildGuard, Box<dyn std::error::Error>> {
     start_gateway_with_dtls_and_env(config_path, http_port, dtls_env, &[])
 }
 
@@ -177,7 +180,7 @@ fn start_gateway_with_dtls_and_env(
     http_port: u16,
     dtls_env: Option<&GatewayDtlsEnv>,
     extra_env: &[(&str, &str)],
-) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+) -> Result<GatewayChildGuard, Box<dyn std::error::Error>> {
     // Use http_port + 1000 as admin port to avoid collisions
     let admin_port = http_port + 1000;
     let mut cmd = std::process::Command::new(gateway_binary_path());
@@ -200,7 +203,7 @@ fn start_gateway_with_dtls_and_env(
     }
 
     configure_coverage_gateway_command(&mut cmd);
-    Ok(cmd.spawn()?)
+    Ok(GatewayChildGuard::new(cmd.spawn()?))
 }
 
 fn write_config(path: &std::path::Path, content: &str) {
@@ -927,10 +930,19 @@ plugin_configs: []
     response_server.abort();
 }
 
+/// Backend response size for the amplification-guard pair.
+///
+/// It only has to exceed the finite default allowance — a 4-byte request buys
+/// 8x, i.e. 32 bytes — while still fitting in one UDP datagram on every
+/// supported host. The fixtures used 16 KiB, which exceeds Darwin's default
+/// `net.inet.udp.maxdgram` of 9216 and made the backend's own `send_to` fail
+/// (issue #4983). 4 KiB is still a 1024x amplification of the probe.
+const AMPLIFICATION_PROBE_RESPONSE_BYTES: usize = 4096;
+
 /// Issue #4515: a hand-authored `udp` proxy that names NO amplification factor
 /// is bounded, not an open reflector. `Proxy::normalize_fields()` projects the
 /// finite default (`8.0`) onto every configuration source, so a 4-byte request
-/// buys a 32-byte reply budget and a 16 KiB backend response is dropped.
+/// buys a 32-byte reply budget and a far larger backend response is dropped.
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_without_explicit_factor_bounds_amplification_by_default() {
@@ -938,7 +950,7 @@ async fn test_udp_proxy_without_explicit_factor_bounds_amplification_by_default(
     let proxy_port = 19841u16;
     let gateway_http_port = 18224u16;
 
-    let large_response = vec![b'z'; 16384];
+    let large_response = vec![b'z'; AMPLIFICATION_PROBE_RESPONSE_BYTES];
     let response_server =
         start_udp_fixed_response_server(backend_port, large_response.clone()).await;
 
@@ -978,7 +990,7 @@ plugin_configs: []
     assert!(
         dropped.is_err(),
         "a udp proxy with no explicit factor must still bound the reply: a 4-byte request \
-         cannot draw a 16 KiB response"
+         cannot draw a {AMPLIFICATION_PROBE_RESPONSE_BYTES}-byte response"
     );
 
     shutdown_gateway(&mut gateway);
@@ -994,7 +1006,7 @@ async fn test_udp_proxy_zero_factor_sentinel_disables_the_amplification_guard() 
     let proxy_port = 19843u16;
     let gateway_http_port = 18225u16;
 
-    let large_response = vec![b'z'; 16384];
+    let large_response = vec![b'z'; AMPLIFICATION_PROBE_RESPONSE_BYTES];
     let response_server =
         start_udp_fixed_response_server(backend_port, large_response.clone()).await;
 
@@ -1505,8 +1517,7 @@ plugin_configs: []
     .await;
 
     let completed = matches!(outcome, Ok(Ok(_)));
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    shutdown_gateway(&mut gateway);
     echo_server.abort();
 
     assert!(
@@ -1686,7 +1697,7 @@ plugin_configs:
         "100% abort fault must drop the UDP datagram (no echo)"
     );
 
-    shutdown_gateway_child(&mut gateway);
+    shutdown_gateway(&mut gateway);
     echo_server.abort();
     println!("test_udp_proxy_fault_injection_abort_drops_datagram PASSED");
 }
@@ -1737,8 +1748,19 @@ plugin_configs:
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
     sleep(Duration::from_secs(3)).await;
 
+    // UDP sessions are keyed by the full client `SocketAddr`, so two ephemeral
+    // ports on the SAME loopback address are already two peers — which is what
+    // per-session isolation is about. The fixture used to bind `127.0.0.2` for
+    // peer B, which needs a secondary loopback alias that macOS does not
+    // configure (issue #4983); the port alone carries the peer identity this
+    // test asserts on.
     let client_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let client_b = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+    let client_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    assert_ne!(
+        client_a.local_addr().unwrap(),
+        client_b.local_addr().unwrap(),
+        "peer A and peer B must be distinct UDP sessions"
+    );
     let gateway_addr = format!("127.0.0.1:{proxy_port}");
 
     client_a.send_to(b"peer-a", &gateway_addr).await.unwrap();
@@ -1764,7 +1786,7 @@ plugin_configs:
         .expect("peer A recv");
     assert_eq!(&buf[..n], b"peer-a");
 
-    shutdown_gateway_child(&mut gateway);
+    shutdown_gateway(&mut gateway);
     echo_server.abort();
     println!("test_udp_proxy_fault_injection_delay_isolates_peers PASSED");
 }

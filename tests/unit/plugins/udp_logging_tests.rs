@@ -642,6 +642,87 @@ async fn test_udp_logging_rejects_multiple_unknown_keys_sorted() {
 }
 
 #[test]
+fn test_udp_logging_shared_validation_enforces_byte_limits() {
+    let base = json!({"host": "127.0.0.1", "port": 45123});
+    let invalid = [
+        json!({"max_entry_bytes": 0}),
+        json!({"max_entry_bytes": 1023}),
+        json!({"max_entry_bytes": 1048577}),
+        json!({"max_entry_bytes": null}),
+        json!({"max_entry_bytes": "65536"}),
+        json!({"buffer_max_bytes": 2050}),
+        json!({"buffer_max_bytes": null}),
+        json!({"buffer_max_bytes": "16777216"}),
+        json!({"buffer_max_bytes": 268435457}),
+        json!({"max_entry_bytes": 2048, "buffer_max_bytes": 1024}),
+    ];
+    for extra in invalid {
+        let mut config = base.clone();
+        for (key, value) in extra.as_object().expect("override object") {
+            config
+                .as_object_mut()
+                .expect("config object")
+                .insert(key.clone(), value.clone());
+        }
+        let shared = validate_plugin_config("udp_logging", &config)
+            .expect_err("shared validation must reject invalid byte limits");
+        assert!(
+            shared.contains("max_entry_bytes") || shared.contains("buffer_max_bytes"),
+            "shared validation {config} got: {shared}"
+        );
+        let constructed = UdpLogging::new(&config, test_client())
+            .err()
+            .unwrap_or_else(|| panic!("constructor must reject {config}"));
+        assert!(
+            constructed.contains("max_entry_bytes") || constructed.contains("buffer_max_bytes"),
+            "constructor {config} got: {constructed}"
+        );
+    }
+
+    for extra in [
+        json!({}),
+        json!({"max_entry_bytes": 1024, "buffer_max_bytes": 2050}),
+        json!({"max_entry_bytes": 65536, "buffer_max_bytes": 16777216}),
+        json!({"max_entry_bytes": 1048576, "buffer_max_bytes": 268435456}),
+    ] {
+        let mut config = base.clone();
+        for (key, value) in extra.as_object().expect("override object") {
+            config
+                .as_object_mut()
+                .expect("config object")
+                .insert(key.clone(), value.clone());
+        }
+        validate_plugin_config("udp_logging", &config)
+            .unwrap_or_else(|err| panic!("valid byte pair must validate: {config} {err}"));
+        UdpLogging::new(&config, test_client())
+            .unwrap_or_else(|err| panic!("valid byte pair must construct: {config} {err}"));
+    }
+}
+
+#[test]
+fn test_udp_logging_split_retry_counts_each_lost_record_once() {
+    let recovered =
+        ferrum_edge::_test_support::udp_logging_split_retry_lost_record_count_for_test(&[
+            &["reject", "transport"],
+            &["reject", "ok"],
+        ]);
+    assert_eq!(
+        recovered, 1,
+        "local reject plus later transport success must count the lost record once"
+    );
+
+    let exhausted =
+        ferrum_edge::_test_support::udp_logging_split_retry_lost_record_count_for_test(&[
+            &["reject", "transport"],
+            &["reject", "transport"],
+        ]);
+    assert_eq!(
+        exhausted, 2,
+        "local reject plus terminal transport failure must count two lost records"
+    );
+}
+
+#[test]
 fn test_udp_logging_disabled_skips_construction_validation() {
     let mut gateway = GatewayConfig {
         plugin_configs: vec![PluginConfig {
@@ -1611,12 +1692,31 @@ async fn test_dtls_connection_send_rejects_oversized_plaintext() {
         .expect_err("oversized plaintext must fail");
     assert!(err.to_string().contains("max_plaintext"), "got: {err}");
 
-    // Exact in-limit boundary must complete successfully.
-    let exact = vec![b'y'; max];
+    // An in-limit payload must actually reach the wire. Sized under the
+    // smallest default UDP datagram ceiling among supported hosts — Darwin's
+    // `net.inet.udp.maxdgram` is 9216, where the ~16 KiB record the plaintext
+    // ceiling admits is rejected by the socket with EMSGSIZE (issue #4983).
+    // That is a host property, not a DTLS one, so proving transport and
+    // proving the size gate are two separate assertions.
+    const PORTABLE_IN_LIMIT_BYTES: usize = 8 * 1024;
+    let in_limit = vec![b'z'; PORTABLE_IN_LIMIT_BYTES.min(max)];
     client
-        .send(&exact)
+        .send(&in_limit)
         .await
-        .expect("exact max_plaintext send must succeed");
+        .expect("an in-limit send within every host's datagram ceiling must succeed");
+
+    // The exact ceiling is admitted by the size gate on every host. Where the
+    // host can carry the resulting datagram it also completes; where it cannot,
+    // the failure must come from the socket, never from `max_plaintext`. A
+    // connected-socket send error is per-datagram and retains the association,
+    // so the close assertions below still hold either way.
+    let exact = vec![b'y'; max];
+    if let Err(error) = client.send(&exact).await {
+        assert!(
+            !error.to_string().contains("max_plaintext"),
+            "the exact ceiling must not be rejected by the plaintext size gate: {error}"
+        );
+    }
 
     // Connection close must propagate as a send failure (not hang).
     server_conn.close().await;
@@ -1704,6 +1804,10 @@ fn test_udp_logging_openapi_dtls_policy_contract() {
         validator.is_valid(&json!({"host": "2001:db8::10", "port": 9514})),
         "unbracketed IPv6 accepted by parse_socket_host must validate"
     );
+    assert!(
+        validator.is_valid(&json!({"host": " localhost ", "port": 9514})),
+        "OpenAPI must allow host values runtime trims"
+    );
 
     for invalid in [
         json!({"host": "127.0.0.1", "port": 9514, "dtls_no_verify": true}),
@@ -1714,6 +1818,15 @@ fn test_udp_logging_openapi_dtls_policy_contract() {
         json!({"host": "udp://logs.example.com", "port": 9514}),
         json!({"host": "logs.example.com:9514", "port": 9514}),
         json!({"host": "", "port": 9514}),
+        json!({"host": "[localhost]", "port": 9514}),
+        json!({"host": "127.0.0.1", "port": 9514, "dtls": true, "dtls_ca_cert_path": " "}),
+        json!({
+            "host": "127.0.0.1",
+            "port": 9514,
+            "schema": {"static_fields": {"audit": "ok"}},
+            "schema_ref": "audit"
+        }),
+        json!({"host": "127.0.0.1", "port": 9514, "buffer_max_bytes": 2050}),
     ] {
         assert!(
             !validator.is_valid(&invalid),
@@ -1753,6 +1866,11 @@ fn test_udp_logging_docs_dns_and_delivery_contract() {
         "File mode",
         "Database mode",
         "DP mode",
+        "`schema`",
+        "`schema_ref`",
+        "docs/log_schema.md",
+        "268435456",
+        "counted once",
     ] {
         assert!(
             section.contains(needle),

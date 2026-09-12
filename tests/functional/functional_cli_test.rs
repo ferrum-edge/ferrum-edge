@@ -679,7 +679,7 @@ async fn functional_cli_file_admission_validate_and_run_agree() {
                         started = true;
                         break;
                     }
-                    Err(error) if error.listener_addr_in_use && attempt < attempts => {}
+                    Err(error) if error.is_retryable_port_race(attempt, attempts) => {}
                     Err(error) => panic!("{name}: {error}"),
                 }
             }
@@ -3457,7 +3457,8 @@ async fn start_gateway_with_one_pool_shard(
     mode: &str,
     cp_address: Option<&str>,
 ) -> (crate::common::TestGateway, Option<String>) {
-    for attempt in 1..=crate::scaffolding::ports::BIND_DROP_SPAWN_ATTEMPTS {
+    let attempts = crate::scaffolding::ports::BIND_DROP_SPAWN_ATTEMPTS;
+    for attempt in 1..=attempts {
         let mut builder = crate::common::TestGateway::builder()
             .skip_auto_build()
             .clear_env()
@@ -3483,9 +3484,7 @@ async fn start_gateway_with_one_pool_shard(
         drop(reservation);
         match builder.spawn_classified().await {
             Ok(gateway) => return (gateway, address),
-            Err(error)
-                if error.listener_addr_in_use
-                    && attempt < crate::scaffolding::ports::BIND_DROP_SPAWN_ATTEMPTS => {}
+            Err(error) if error.is_retryable_port_race(attempt, attempts) => {}
             Err(error) => panic!("{mode} with one pool shard: {error}"),
         }
     }

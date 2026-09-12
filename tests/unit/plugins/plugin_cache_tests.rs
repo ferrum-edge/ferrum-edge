@@ -1357,6 +1357,7 @@ fn test_global_plugins_returned_for_all_proxies() {
 }
 
 #[test]
+#[serial_test::serial(prometheus_global_registry)]
 fn test_prometheus_metrics_requires_global_and_unique_registry_owner() {
     let scoped = make_config(
         vec![make_proxy("p1", "/api", vec!["prometheus"])],
@@ -1803,6 +1804,7 @@ fn test_api_chargeback_allows_one_instance_per_proxy_with_mixed_currency() {
 }
 
 #[test]
+#[serial_test::serial(prometheus_global_registry)]
 fn test_single_prometheus_metrics_instance_is_shared_once_across_protocols() {
     let config = make_config(
         vec![
@@ -13142,6 +13144,7 @@ fn disabled_size_limiting_instance_publishes_no_ceiling() {
 }
 
 #[test]
+#[serial_test::serial(prometheus_global_registry)]
 fn candidate_and_runtime_reject_every_runtime_composition_rule() {
     let scoped = |id, name| make_plugin_config(id, name, PluginScope::Proxy, Some("p1"), true);
     let pair = |name| vec![scoped("a", name), scoped("b", name)];

@@ -114,10 +114,11 @@ pub(crate) struct RejectedPluginConfig {
 ///
 /// Constructors that need node-local resources (the `geo_restriction` MMDB, the
 /// `body_validator` / `ai_response_guard` / `ai_transcript_audit` descriptor
-/// sets, `udp_logging` DTLS material, `oidc_relying_party` discovery, and the
-/// `transaction_log_schema` registry) are already routed to their shape-only
-/// entry points inside `validate_plugin_config_with_http_client`, so this never
-/// requires a data-plane file to exist on the admitting node.
+/// sets, `udp_logging` DTLS material, `oidc_relying_party` discovery, the
+/// `transaction_log_schema` registry, and the `serverless_function` cloud
+/// credentials) are already routed to their shape-only entry points inside
+/// `validate_plugin_config_with_http_client`, so this never requires a
+/// data-plane file or credential to exist on the admitting node.
 /// `adaptive_concurrency` construction is pure shape parsing plus a fresh
 /// limiter, so it needs no special case.
 pub(crate) fn collect_rejecting_plugin_config_errors(

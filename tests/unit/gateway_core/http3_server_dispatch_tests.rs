@@ -164,9 +164,7 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
         "mesh force-buffer must not drain under the client RPC deadline wrapper"
     );
     assert_eq!(
-        mesh_collection
-            .matches("release_cross_protocol_circuit_breaker_probe_on_admission_reject(")
-            .count(),
+        mesh_collection.matches("cb_probe.release_neutral(").count(),
         3,
         "mesh upload collection must release the HALF_OPEN probe on each terminal reject branch"
     );
@@ -179,7 +177,7 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
         .next()
         .expect("bounded mesh collection Ok(None) branch");
     let oversize_release = oversize
-        .find("release_cross_protocol_circuit_breaker_probe_on_admission_reject(")
+        .find("cb_probe.release_neutral()")
         .expect("Ok(None) must release HALF_OPEN probe");
     let oversize_write = oversize
         .find("write_plain_gateway_error(")
@@ -206,7 +204,7 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
         "the mesh force-buffer must bind the captured winner rather than a unit variant"
     );
     let deadline_release = deadline_compact
-        .find("release_cross_protocol_circuit_breaker_probe_on_admission_reject(")
+        .find("cb_probe.release_neutral()")
         .expect("DeadlineExceeded must release HALF_OPEN probe");
     let auth_record = deadline_compact
         .find("record_authorization_termination_once(")
@@ -246,7 +244,7 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
         .next()
         .expect("bounded mesh collection TimedOut/Read branch");
     let timeout_release = timeout
-        .find("release_cross_protocol_circuit_breaker_probe_on_admission_reject(")
+        .find("cb_probe.release_neutral()")
         .expect("TimedOut/Read must release HALF_OPEN probe");
     let timeout_write = timeout
         .find("write_plain_gateway_error(")
@@ -1321,7 +1319,8 @@ fn h3_aggregate_sse_writer_streams_under_a_hard_listener_bound() {
             .matches("await_post_deadline_terminal_response_write(")
             .count(),
         2,
-        "pre-commit authorization terminal and listener-lifetime FIN must both use the bounded grace"
+        "exactly two bounded-grace writes: the pre-commit authorization terminal, and the \
+         single post-pump FIN every pump exit settles at"
     );
 
     // Dropping the body is what returns the session's single-listener slot, so

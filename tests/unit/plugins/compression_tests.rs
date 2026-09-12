@@ -1063,9 +1063,14 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
         !store_resp.contains_key("content-encoding"),
         "default/identity store must remain uncoded"
     );
-    assert_eq!(
-        store_resp.get("vary").map(String::as_str),
-        Some("Accept-Encoding"),
+    // `response_caching` publishes its own downstream Vary contract on the miss,
+    // so the negotiation dimension is merged into that list rather than
+    // replacing it.
+    assert!(
+        store_resp.get("vary").is_some_and(|vary| {
+            vary.split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("Accept-Encoding"))
+        }),
         "identity-first store must nominate Vary before response_caching inserts"
     );
     cache
@@ -1174,9 +1179,12 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
         gzip_resp.get("content-encoding").map(String::as_str),
         Some("gzip")
     );
-    assert_eq!(
-        gzip_resp.get("vary").map(String::as_str),
-        Some("Accept-Encoding")
+    assert!(
+        gzip_resp.get("vary").is_some_and(|vary| {
+            vary.split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("Accept-Encoding"))
+        }),
+        "the gzip store must keep the negotiation dimension in the merged Vary"
     );
     // Body bytes after transform_response_body would be compressed; the cache
     // stores whatever final body the gateway supplies. Use distinct bytes so
@@ -2226,8 +2234,11 @@ fn test_response_buffering_skips_range_responses_via_metadata_marker() {
         .insert("ferrum:range_response".to_string(), "true".to_string());
 
     // Live headers look like a plain compressible 200 (Content-Range stripped).
+    // The length is deliberately above the default `min_content_length` (256)
+    // and carries no `Content-Encoding`, so neither header-knowable exclusion
+    // (issue #5094) can be what decides either assertion below.
     let mut resp_headers = HashMap::new();
-    resp_headers.insert("content-length".to_string(), "100".to_string());
+    resp_headers.insert("content-length".to_string(), "5000".to_string());
     assert!(!plugin.should_buffer_response_body_for_content_type(
         &ctx,
         Some("text/html"),
@@ -3061,11 +3072,25 @@ async fn test_gzip_request_decompression() {
     encoder.write_all(original).unwrap();
     let compressed = encoder.finish().unwrap();
 
+    // `before_proxy` owns the decode: it claims request-decode ownership,
+    // validates the body, and hands the plaintext to the ownership-scoped
+    // transform. The context-FREE hook is inert by design (issue #5093), so it
+    // is not the one asked here.
+    let mut ctx = make_request_ctx_with_body("gzip", &compressed);
     let mut headers = HashMap::new();
     headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
 
     let decompressed = plugin
-        .transform_request_body(&compressed, Some("application/json"), &headers)
+        .transform_request_body_with_context(
+            &mut ctx,
+            &compressed,
+            Some("application/json"),
+            &headers,
+        )
         .await
         .expect("should decompress");
 
@@ -3096,10 +3121,16 @@ async fn test_before_proxy_strips_client_supplied_internal_marker() {
         "no real content-encoding was present; metadata must not be set"
     );
 
-    // transform_request_body should NOT attempt decompression on a plaintext
-    // body when only the client-supplied marker was present (now removed).
+    // The production transform must NOT attempt decompression on a plaintext
+    // body when only the client-supplied marker was present (now removed): no
+    // instance claimed the decode, so no instance may rewrite the bytes.
     let result = plugin
-        .transform_request_body(b"plaintext body", Some("application/json"), &headers)
+        .transform_request_body_with_context(
+            &mut ctx,
+            b"plaintext body",
+            Some("application/json"),
+            &headers,
+        )
         .await;
     assert!(result.is_none());
 }
@@ -3117,11 +3148,23 @@ async fn test_brotli_request_decompression() {
     let params = brotli::enc::BrotliEncoderParams::default();
     brotli::BrotliCompress(&mut &original[..], &mut compressed, &params).unwrap();
 
+    // Same ownership handoff as the gzip case: the decode happens once, in
+    // `before_proxy`, and the context-aware transform publishes the plaintext.
+    let mut ctx = make_request_ctx_with_body("br", &compressed);
     let mut headers = HashMap::new();
     headers.insert("content-encoding".to_string(), "br".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
 
     let decompressed = plugin
-        .transform_request_body(&compressed, Some("application/json"), &headers)
+        .transform_request_body_with_context(
+            &mut ctx,
+            &compressed,
+            Some("application/json"),
+            &headers,
+        )
         .await
         .expect("should decompress");
 
@@ -3132,11 +3175,29 @@ async fn test_brotli_request_decompression() {
 async fn test_request_decompression_disabled_by_default() {
     let plugin = make_plugin(json!({})); // decompress_request defaults false
 
+    let compressed = gzip_bytes(b"some compressed data");
+    let mut ctx = make_request_ctx_with_body("gzip", &compressed);
     let mut headers = HashMap::new();
     headers.insert("content-encoding".to_string(), "gzip".to_string());
 
+    // Nothing is claimed and no representation metadata is stripped, so the
+    // backend receives the client's encoded request exactly as sent.
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+
     let result = plugin
-        .transform_request_body(b"some compressed data", Some("application/json"), &headers)
+        .transform_request_body_with_context(
+            &mut ctx,
+            &compressed,
+            Some("application/json"),
+            &headers,
+        )
         .await;
     assert!(result.is_none());
 }
@@ -3156,12 +3217,25 @@ async fn test_request_decompression_zip_bomb_protection() {
     encoder.write_all(&big_body).unwrap();
     let compressed = encoder.finish().unwrap();
 
+    let mut ctx = make_request_ctx_with_body("gzip", &compressed);
     let mut headers = HashMap::new();
     headers.insert("content-encoding".to_string(), "gzip".to_string());
 
-    // Should fail (return None) due to size limit
+    // The ceiling is enforced where the decode now lives. The request is
+    // refused as a representation fault, nothing is claimed, and no plaintext
+    // is staged — so the ownership-scoped transform has nothing to publish and
+    // the over-expanded bytes never reach a backend.
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 400),
+        other => panic!("expected Reject for an oversize gzip body, got {other:?}"),
+    }
     let result = plugin
-        .transform_request_body(&compressed, Some("application/json"), &headers)
+        .transform_request_body_with_context(
+            &mut ctx,
+            &compressed,
+            Some("application/json"),
+            &headers,
+        )
         .await;
     assert!(result.is_none());
 }
@@ -3596,37 +3670,100 @@ async fn test_out_of_range_q_value_is_ignored() {
     assert_eq!(selected, None);
 }
 
-// ──────────────── #60: multi-member gzip request decompression ────────────────
+// ──────────────── Single-member gzip request normalization (#5362) ────────────
 
-/// Concatenated multi-member gzip is rejected by the shared content-coding
-/// decoder (trailing bytes after the first member). Fail closed rather than
-/// silently truncating to the first member.
+/// Drive the live normalization hook: the context-free transform is inert and
+/// cannot prove that the charged decoder rejected the representation.
 #[tokio::test]
 async fn test_multi_member_gzip_request_decompression_fails_closed() {
-    use flate2::write::GzEncoder;
-    use std::io::Write;
+    let mut compressed = gzip_bytes(b"first gzip member payload; ");
+    compressed.extend_from_slice(&gzip_bytes(b"second gzip member payload!"));
+    assert_gzip_normalization_rejected(&compressed).await;
+}
 
-    let part_a = b"first gzip member payload; ";
-    let part_b = b"second gzip member payload!";
-
-    let mut compressed = Vec::new();
-    for part in [part_a.as_slice(), part_b.as_slice()] {
-        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(part).unwrap();
-        compressed.extend_from_slice(&encoder.finish().unwrap());
+#[tokio::test]
+async fn test_gzip_request_with_trailing_data_fails_closed() {
+    for suffix in [vec![0], b"trailing bytes".to_vec(), gzip_bytes(b"")] {
+        let mut compressed = gzip_bytes(b"ordinary upload");
+        compressed.extend_from_slice(&suffix);
+        assert_gzip_normalization_rejected(&compressed).await;
     }
+}
 
-    let plugin = make_plugin(json!({"decompress_request": true}));
-    let mut headers = HashMap::new();
-    headers.insert("content-encoding".to_string(), "gzip".to_string());
+async fn assert_gzip_normalization_rejected(compressed: &[u8]) {
+    for coding in ["gzip", "x-gzip"] {
+        let plugins: Vec<Arc<dyn Plugin>> =
+            vec![Arc::new(make_plugin(json!({"decompress_request": true})))];
+        let mut ctx = make_request_ctx_with_body(coding, compressed);
+        ctx.headers
+            .insert("content-length".to_string(), compressed.len().to_string());
+        let mut headers = std::mem::take(&mut ctx.headers);
+        let original_headers = headers.clone();
+        let mut body = compressed.to_vec();
 
-    let result = plugin
-        .transform_request_body(&compressed, Some("application/octet-stream"), &headers)
+        let result = apply_buffered_request_body_normalization_before_before_proxy_for_test(
+            &plugins,
+            &mut ctx,
+            &mut headers,
+            &mut body,
+        )
         .await;
-    assert!(
-        result.is_none(),
-        "concatenated multi-member gzip must fail closed instead of truncating"
-    );
+
+        match result {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 400);
+                assert_eq!(body, r#"{"error":"Malformed compressed request body"}"#);
+            }
+            other => panic!("expected normalization rejection for {coding}, got {other:?}"),
+        }
+        assert_eq!(body, compressed);
+        assert_eq!(headers, original_headers);
+        assert!(!ctx.metadata.contains_key("compression:request_decoded"));
+        assert!(!ctx.metadata.contains_key("compression:request_encoding"));
+    }
+}
+
+#[tokio::test]
+async fn test_single_member_gzip_request_normalization_decodes_with_charged_decoder() {
+    for plaintext in [b"ordinary upload".as_slice(), b"".as_slice()] {
+        for coding in ["gzip", "x-gzip"] {
+            // Also exercise a decoded body exactly at the configured ceiling.
+            let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(make_plugin(json!({
+                "decompress_request": true,
+                "max_decompressed_request_size": plaintext.len().max(1),
+            })))];
+            let compressed = gzip_bytes(plaintext);
+            let mut ctx = make_request_ctx_with_body(coding, &compressed);
+            ctx.headers
+                .insert("content-length".to_string(), compressed.len().to_string());
+            let mut headers = std::mem::take(&mut ctx.headers);
+            let mut body = compressed;
+
+            let result = apply_buffered_request_body_normalization_before_before_proxy_for_test(
+                &plugins,
+                &mut ctx,
+                &mut headers,
+                &mut body,
+            )
+            .await;
+
+            assert!(matches!(result, PluginResult::Continue));
+            assert_eq!(body, plaintext);
+            assert!(!headers.contains_key("content-encoding"));
+            assert!(!headers.contains_key("content-length"));
+            // `parse_content_codings` canonicalizes `x-gzip` to `gzip`, so the
+            // handoff marker carries the canonical member for both spellings.
+            assert_eq!(
+                headers
+                    .get("x-ferrum-original-content-encoding")
+                    .map(String::as_str),
+                Some("gzip")
+            );
+            assert!(ctx.metadata.contains_key("compression:request_decoded"));
+        }
+    }
 }
 
 // ──────── #59: malformed compressed request body is rejected, not forwarded ────
@@ -3792,7 +3929,12 @@ async fn test_request_cache_control_no_transform_still_decompresses_request_body
     );
 
     let transformed = plugin
-        .transform_request_body(&compressed, Some("application/octet-stream"), &headers)
+        .transform_request_body_with_context(
+            &mut ctx,
+            &compressed,
+            Some("application/octet-stream"),
+            &headers,
+        )
         .await;
     assert_eq!(
         transformed.as_deref(),
@@ -3842,7 +3984,12 @@ async fn test_original_request_no_transform_marker_restores_header_and_decompres
     );
 
     let transformed = plugin
-        .transform_request_body(&compressed, Some("application/octet-stream"), &headers)
+        .transform_request_body_with_context(
+            &mut ctx,
+            &compressed,
+            Some("application/octet-stream"),
+            &headers,
+        )
         .await;
     assert_eq!(
         transformed.as_deref(),
@@ -3962,10 +4109,17 @@ async fn test_decompressed_payload_that_is_itself_gzip_is_accepted() {
         "one transport gzip layer is valid even when the payload is itself gzip"
     );
 
-    // And the body transform yields exactly the inner .gz file bytes (one layer
-    // removed), not a rejection or truncation.
+    // And the ownership-scoped body transform yields exactly the inner .gz file
+    // bytes (one layer removed), not a rejection or truncation. Exactly one
+    // layer: a second decode here would deliver the archive's CONTENTS instead
+    // of the archive (issue #5093).
     let decoded = plugin
-        .transform_request_body(&outer_gz, Some("application/octet-stream"), &headers)
+        .transform_request_body_with_context(
+            &mut ctx,
+            &outer_gz,
+            Some("application/octet-stream"),
+            &headers,
+        )
         .await
         .expect("one gzip layer should decode to the inner .gz bytes");
     assert_eq!(decoded, inner_gz);
@@ -6554,5 +6708,687 @@ fn test_shared_paths_reconcile_aborted_gateway_encoding() {
             .count()
             == 2,
         "both H3 cross-protocol buffered paths must reach the shared encoding-reconciliation funnel"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// content_types admission must describe the rules the matcher can actually
+// match (issue #5096).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn content_type_rules_that_can_never_match_are_rejected_with_an_indexed_diagnostic() {
+    // The matcher trims the response token and cuts it at the first `;`, then
+    // compares it to the stored rule verbatim. A rule carrying whitespace or
+    // parameters is therefore unmatchable by construction — previously admitted,
+    // leaving the instance unable to compress anything while still stripping
+    // `Accept-Encoding` from backend requests.
+    for (index, rule) in [
+        " ",
+        "\t",
+        "application/json ",
+        " application/json",
+        "application/json; charset=utf-8",
+        "application/json;charset=utf-8",
+        "application/json, text/plain",
+        "application/",
+        "/json",
+        "application",
+        "application/json/extra",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let err = match CompressionPlugin::new(&json!({ "content_types": [rule] })) {
+            Ok(_) => panic!("rule {index} ({rule:?}) must be rejected, but admission succeeded"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("content_types[0]"),
+            "rule {index} ({rule:?}) needs an indexed diagnostic, got: {err}"
+        );
+        assert!(
+            err.contains("type/subtype"),
+            "rule {index} ({rule:?}) must explain the required shape, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn content_type_rules_that_the_matcher_can_match_are_admitted() {
+    // Every default entry, plus the structured-suffix and vendor-tree shapes an
+    // operator is most likely to add, must survive admission.
+    let plugin = CompressionPlugin::new(&json!({
+        "content_types": [
+            "application/json",
+            "application/xhtml+xml",
+            "image/svg+xml",
+            "application/vnd.api+json",
+            "text/csv",
+            "APPLICATION/JSON"
+        ]
+    }));
+    assert!(plugin.is_ok(), "usable media-type rules must be admitted");
+}
+
+#[tokio::test]
+async fn an_admitted_content_type_rule_matches_its_intended_representation() {
+    // The whole point of the admission change: a rule that survives must be able
+    // to compress the representation the operator wrote it for, including when
+    // the response carries parameters the matcher strips.
+    let plugin = make_plugin(json!({
+        "content_types": ["application/vnd.api+json"],
+        "min_content_length": 10
+    }));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut req_headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert(
+        "content-type".to_string(),
+        "application/vnd.api+json; charset=utf-8".to_string(),
+    );
+    resp_headers.insert("content-length".to_string(), "1095".to_string());
+
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        resp_headers.get("content-encoding").map(String::as_str),
+        Some("gzip"),
+        "an admitted rule must match the representation it names"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The fixed negotiation 406 belongs to the CHAIN, not to whichever instance
+// happened to run first (issue #5092).
+// ---------------------------------------------------------------------------
+
+/// Drive the full response decision for a configured chain: `before_proxy` for
+/// every instance (where each registers its outstanding decision), then the
+/// `after_proxy` chain over one backend response.
+async fn negotiate_chain(
+    plugins: &[Arc<dyn Plugin>],
+    accept_encoding: &str,
+    content_type: &str,
+    body_len: usize,
+) -> (PluginResult, HashMap<String, String>) {
+    let mut ctx = make_ctx(Some(accept_encoding));
+    let mut req_headers = HashMap::new();
+    assert!(matches!(
+        run_before_proxy_chain(plugins, &mut ctx, &mut req_headers).await,
+        PluginResult::Continue
+    ));
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), content_type.to_string());
+    resp_headers.insert("content-length".to_string(), body_len.to_string());
+    stamp_original_response_metadata_for_test(&mut ctx, 200, &resp_headers);
+    let result = run_after_proxy_chain(plugins, &mut ctx, 200, &mut resp_headers).await;
+    (result, resp_headers)
+}
+
+fn compression_instances(configs: &[serde_json::Value]) -> Vec<Arc<dyn Plugin>> {
+    configs
+        .iter()
+        .map(|config| Arc::new(make_plugin(config.clone())) as Arc<dyn Plugin>)
+        .collect()
+}
+
+/// Assert the configured-order union serves this response: the second instance
+/// must encode with `expected` even though the first cannot.
+async fn assert_union_serves(
+    first: serde_json::Value,
+    second: serde_json::Value,
+    accept: &str,
+    expected: &str,
+) {
+    let plugins = compression_instances(&[first, second]);
+    let (result, resp_headers) = negotiate_chain(&plugins, accept, "application/json", 1095).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "{accept}: a capable sibling must serve, got {result:?}"
+    );
+    assert_eq!(
+        resp_headers.get("content-encoding").map(String::as_str),
+        Some(expected),
+        "{accept}: the capable sibling must own the single coding layer"
+    );
+}
+
+/// Assert the whole chain fails closed: no instance can produce an acceptable
+/// representation and the client excluded identity.
+async fn assert_chain_refuses(first: serde_json::Value, second: serde_json::Value, accept: &str) {
+    let plugins = compression_instances(&[first, second]);
+    let (result, resp_headers) = negotiate_chain(&plugins, accept, "application/json", 1095).await;
+    match result {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 406, "{accept}");
+            assert!(!headers.contains_key("content-encoding"));
+            assert_eq!(
+                headers.get("vary").map(String::as_str),
+                Some("Accept-Encoding")
+            );
+        }
+        other => panic!("{accept}: expected 406, got {other:?}"),
+    }
+    assert!(
+        !resp_headers.contains_key("content-encoding"),
+        "{accept}: a refused negotiation commits nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_capable_later_sibling_serves_instead_of_an_earlier_instances_406() {
+    // `algorithms` union, both orderings. The client excluded identity, so the
+    // instance that cannot produce the requested coding used to answer 406
+    // before the sibling that can was ever consulted — making an otherwise
+    // successful response depend on configured order.
+    assert_union_serves(
+        json!({"algorithms": ["gzip"]}),
+        json!({"algorithms": ["br"]}),
+        "br, identity;q=0",
+        "br",
+    )
+    .await;
+    assert_union_serves(
+        json!({"algorithms": ["br"]}),
+        json!({"algorithms": ["gzip"]}),
+        "gzip, identity;q=0",
+        "gzip",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_content_type_ineligible_instance_hands_off_instead_of_refusing() {
+    // The same defect with `content_types` rather than `algorithms`: both
+    // instances support gzip, but only the second whitelists the response media
+    // type. The first must not answer 406 on the second's behalf.
+    let plugins = compression_instances(&[
+        json!({"content_types": ["text/html"], "min_content_length": 10}),
+        json!({"content_types": ["application/json"], "min_content_length": 10}),
+    ]);
+    let (result, resp_headers) =
+        negotiate_chain(&plugins, "gzip, identity;q=0", "application/json", 1095).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "content-type handoff must not 406, got {result:?}"
+    );
+    assert_eq!(
+        resp_headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+}
+
+#[tokio::test]
+async fn a_min_content_length_ineligible_instance_hands_off_instead_of_refusing() {
+    // Size eligibility is per instance too: the strict instance declines this
+    // 1095-byte response, the permissive sibling encodes it.
+    let plugins = compression_instances(&[
+        json!({"min_content_length": 100_000}),
+        json!({"min_content_length": 10}),
+    ]);
+    let (result, resp_headers) =
+        negotiate_chain(&plugins, "gzip, identity;q=0", "application/json", 1095).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "min_content_length handoff must not 406, got {result:?}"
+    );
+    assert_eq!(
+        resp_headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+}
+
+#[tokio::test]
+async fn a_committed_coding_is_never_turned_back_into_a_406_by_a_later_sibling() {
+    // The first instance commits gzip; the second sees ownership taken and
+    // therefore cannot encode. Under `identity;q=0` that "cannot encode" used to
+    // read as "no acceptable representation" and replaced a perfectly good
+    // compressed response with 406.
+    let plugins = compression_instances(&[
+        json!({"algorithms": ["gzip"], "min_content_length": 10}),
+        json!({"algorithms": ["gzip"], "min_content_length": 10}),
+    ]);
+    let (result, resp_headers) =
+        negotiate_chain(&plugins, "gzip, identity;q=0", "application/json", 1095).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a committed coding must survive its siblings, got {result:?}"
+    );
+    assert_eq!(
+        resp_headers.get("content-encoding").map(String::as_str),
+        Some("gzip"),
+        "exactly one coding layer stays committed"
+    );
+}
+
+#[tokio::test]
+async fn the_chain_still_fails_closed_when_no_instance_can_serve() {
+    // Deferring the terminal must not lose it. No instance in either chain can
+    // produce an acceptable representation, so the LAST one to decide answers
+    // 406 and no compression metadata is committed.
+    assert_chain_refuses(
+        json!({"algorithms": ["gzip"]}),
+        json!({"algorithms": ["br"]}),
+        "zstd, identity;q=0",
+    )
+    .await;
+    assert_chain_refuses(
+        json!({"content_types": ["text/html"]}),
+        json!({"content_types": ["text/csv"]}),
+        "gzip, identity;q=0",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_single_instance_still_refuses_immediately() {
+    // The one-instance chain is the last decider on its first decision, so the
+    // deferral must not delay (or lose) the terminal there.
+    let plugins = compression_instances(&[json!({"algorithms": ["gzip"]})]);
+    let accept = "br, identity;q=0";
+    let (result, _) = negotiate_chain(&plugins, accept, "application/json", 1095).await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 406),
+        other => panic!("expected 406 from a single-instance chain, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_sibling_handoff_emits_exactly_one_coding_layer_end_to_end() {
+    // Round-trip proof rather than a header assertion: the body the client
+    // receives must decode to the origin bytes with exactly one `br` layer
+    // removed, even though the first instance could not produce that coding.
+    let plugins = compression_instances(&[
+        json!({"algorithms": ["gzip"], "min_content_length": 10}),
+        json!({"algorithms": ["br"], "min_content_length": 10}),
+    ]);
+    let original = compressible_json_body();
+
+    let mut ctx = make_ctx(Some("br, identity;q=0"));
+    let mut req_headers = HashMap::new();
+    assert!(matches!(
+        run_before_proxy_chain(&plugins, &mut ctx, &mut req_headers).await,
+        PluginResult::Continue
+    ));
+
+    let mut status = 200u16;
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), original.len().to_string());
+    stamp_original_response_metadata_for_test(&mut ctx, status, &resp_headers);
+    assert!(matches!(
+        run_after_proxy_chain(&plugins, &mut ctx, status, &mut resp_headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        resp_headers.get("content-encoding").map(String::as_str),
+        Some("br")
+    );
+
+    let mut body = bytes::Bytes::from(original.clone());
+    transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut resp_headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+    let mut decoded = Vec::new();
+    brotli::BrotliDecompress(&mut &body[..], &mut decoded).unwrap();
+    assert_eq!(decoded, original, "exactly one br layer must be present");
+}
+
+// ---------------------------------------------------------------------------
+// Request normalization happens exactly once, on every frontend (issue #5093).
+// ---------------------------------------------------------------------------
+
+/// A real gzip archive carried under gzip transport encoding: the shape that
+/// makes a second decode silently CORRUPT rather than merely wasteful, because
+/// the normalized bytes are themselves a valid gzip stream.
+fn gzip_archive_under_gzip_transport() -> (Vec<u8>, Vec<u8>) {
+    let document = br#"{"audit":"ordinary file content"}"#;
+    let archive = gzip_bytes(document);
+    let wire = gzip_bytes(&archive);
+    (archive, wire)
+}
+
+#[test]
+fn request_decompression_requires_the_ownership_context() {
+    // The capability that forces the H1/H2 ladder onto the context-aware
+    // transform. Without it the ladder computes `needs_final_request_body_context`
+    // as false for a compression-only chain and dispatches the context-free hook.
+    assert!(
+        make_plugin(json!({"decompress_request": true})).needs_final_request_body_context(),
+        "request decompression must always receive the request context"
+    );
+    assert!(
+        !make_plugin(json!({"decompress_request": false})).needs_final_request_body_context(),
+        "a response-only instance needs no final-body context"
+    );
+}
+
+#[tokio::test]
+async fn a_normalized_upload_still_reports_as_this_plugins_buffered_body() {
+    // The post-`before_proxy` recomputation asks this predicate again, with the
+    // live context whose `Content-Encoding` normalization already removed. A
+    // `false` there is what dropped the context requirement and re-opened the
+    // context-free path.
+    let (_, wire) = gzip_archive_under_gzip_transport();
+    let plugins: Vec<Arc<dyn Plugin>> =
+        vec![Arc::new(make_plugin(json!({"decompress_request": true})))];
+
+    let mut ctx = make_request_ctx_with_body("gzip", &wire);
+    assert!(
+        plugins[0].should_buffer_request_body(&ctx),
+        "a decodable upload must buffer before normalization"
+    );
+
+    let mut headers = std::mem::take(&mut ctx.headers);
+    let mut body = wire.clone();
+    let result = apply_buffered_request_body_normalization_before_before_proxy_for_test(
+        &plugins,
+        &mut ctx,
+        &mut headers,
+        &mut body,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Continue));
+    ctx.headers = headers.clone();
+
+    assert!(
+        !ctx.headers.contains_key("content-encoding"),
+        "normalization strips the public coding header"
+    );
+    assert!(
+        plugins[0].should_buffer_request_body(&ctx),
+        "the buffered body is still this plugin's after its own normalization"
+    );
+}
+
+#[tokio::test]
+async fn an_uploaded_gzip_file_survives_gzip_transport_encoding_exactly_once() {
+    // The #5093 corruption: the normalizer removes the transport gzip layer and
+    // leaves the ARCHIVE, whose bytes are themselves valid gzip. A second decode
+    // then hands the backend the archive's CONTENTS instead of the archive.
+    let (archive, wire) = gzip_archive_under_gzip_transport();
+    let plugins: Vec<Arc<dyn Plugin>> =
+        vec![Arc::new(make_plugin(json!({"decompress_request": true})))];
+
+    let mut ctx = make_request_ctx_with_body("gzip", &wire);
+    ctx.headers
+        .insert("content-type".to_string(), "application/gzip".to_string());
+    let mut headers = std::mem::take(&mut ctx.headers);
+    let mut body = wire.clone();
+    assert!(matches!(
+        apply_buffered_request_body_normalization_before_before_proxy_for_test(
+            &plugins,
+            &mut ctx,
+            &mut headers,
+            &mut body,
+        )
+        .await,
+        PluginResult::Continue
+    ));
+    ctx.headers = headers.clone();
+    assert_eq!(
+        body, archive,
+        "normalization removes exactly the declared transport coding"
+    );
+    assert_eq!(
+        headers
+            .get("x-ferrum-original-content-encoding")
+            .map(String::as_str),
+        Some("gzip"),
+        "the internal handoff marker records the coding that was removed"
+    );
+
+    // The context-FREE compatibility transform is exactly what the H1/H2 ladder
+    // used to dispatch. It must never rewrite the body: it cannot see ownership
+    // or the "already normalized" marker, and the internal handoff header it
+    // used to read is present precisely BECAUSE normalization succeeded.
+    assert!(
+        plugins[0]
+            .transform_request_body(&body, Some("application/gzip"), &headers)
+            .await
+            .is_none(),
+        "the context-free transform must never re-decode a normalized body"
+    );
+
+    // The context-aware production loop leaves the normalized bytes alone.
+    let delivered = run_request_body_transform_loop(&plugins, &mut ctx, &headers, body).await;
+    assert_eq!(
+        delivered, archive,
+        "the backend receives the uploaded file, not the file's contents"
+    );
+}
+
+#[tokio::test]
+async fn multiple_instances_never_decode_a_normalized_upload_again() {
+    // Same guarantee with siblings: a second `decompress_request` instance must
+    // not decode the owner's normalized bytes through either transform variant.
+    let (archive, wire) = gzip_archive_under_gzip_transport();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(make_plugin(json!({"decompress_request": true}))),
+        Arc::new(make_plugin(json!({"decompress_request": true}))),
+    ];
+
+    let mut ctx = make_request_ctx_with_body("gzip", &wire);
+    let mut headers = std::mem::take(&mut ctx.headers);
+    let mut body = wire.clone();
+    assert!(matches!(
+        apply_buffered_request_body_normalization_before_before_proxy_for_test(
+            &plugins,
+            &mut ctx,
+            &mut headers,
+            &mut body,
+        )
+        .await,
+        PluginResult::Continue
+    ));
+    ctx.headers = headers.clone();
+    assert_eq!(body, archive);
+
+    for plugin in &plugins {
+        assert!(
+            plugin
+                .transform_request_body(&body, Some("application/gzip"), &headers)
+                .await
+                .is_none(),
+            "no instance may re-decode through the context-free transform"
+        );
+    }
+    let delivered = run_request_body_transform_loop(&plugins, &mut ctx, &headers, body).await;
+    assert_eq!(delivered, archive);
+}
+
+#[tokio::test]
+async fn an_ordinary_json_upload_is_normalized_once_and_left_alone() {
+    // The common case the second decode merely wasted a codec job on: the
+    // repeated decode failed, so the bytes survived, but it still burned a
+    // blocking worker and logged a decode failure on every successful upload.
+    let document = br#"{"hello":"ordinary upload"}"#;
+    let wire = gzip_bytes(document);
+    let plugins: Vec<Arc<dyn Plugin>> =
+        vec![Arc::new(make_plugin(json!({"decompress_request": true})))];
+
+    let mut ctx = make_request_ctx_with_body("gzip", &wire);
+    let mut headers = std::mem::take(&mut ctx.headers);
+    let mut body = wire.clone();
+    assert!(matches!(
+        apply_buffered_request_body_normalization_before_before_proxy_for_test(
+            &plugins,
+            &mut ctx,
+            &mut headers,
+            &mut body,
+        )
+        .await,
+        PluginResult::Continue
+    ));
+    ctx.headers = headers.clone();
+    assert_eq!(body, document);
+
+    assert!(
+        plugins[0]
+            .transform_request_body(&body, Some("application/json"), &headers)
+            .await
+            .is_none(),
+        "a successful upload must not attempt a second decode"
+    );
+    let delivered = run_request_body_transform_loop(&plugins, &mut ctx, &headers, body).await;
+    assert_eq!(delivered, document);
+}
+
+// ---------------------------------------------------------------------------
+// Response buffering is only forced for responses this instance could actually
+// encode (issue #5094).
+// ---------------------------------------------------------------------------
+
+/// The response-buffer refinement decision for one instance over one response.
+fn refines_to_buffer(
+    plugin: &CompressionPlugin,
+    ctx: &RequestContext,
+    response_headers: &HashMap<String, String>,
+) -> bool {
+    plugin.should_buffer_response_body_for_content_type(
+        ctx,
+        response_headers.get("content-type").map(String::as_str),
+        200,
+        response_headers,
+    )
+}
+
+fn eligible_response_headers() -> HashMap<String, String> {
+    HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-length".to_string(), "1095".to_string()),
+    ])
+}
+
+#[tokio::test]
+async fn an_already_encoded_origin_response_is_not_collected_for_compression() {
+    // `after_proxy` skips an already-coded response as a protocol hard skip, so
+    // collecting its complete body first only delays the client's first byte and
+    // pins a retained body for the whole backend transfer.
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut req_headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+    let eligible = eligible_response_headers();
+    assert!(
+        refines_to_buffer(&plugin, &ctx, &eligible),
+        "an eligible response is still collected"
+    );
+
+    let mut encoded = eligible.clone();
+    encoded.insert("content-encoding".to_string(), "gzip".to_string());
+    assert!(
+        !refines_to_buffer(&plugin, &ctx, &encoded),
+        "an already-encoded origin response must stream"
+    );
+    assert!(
+        plugin.should_release_response_body_before_content_type_rewrite(&ctx, 200, &encoded),
+        "a body already collected for it is released"
+    );
+}
+
+#[tokio::test]
+async fn a_response_below_min_content_length_is_not_collected_for_compression() {
+    let plugin = make_plugin(json!({"min_content_length": 256}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut req_headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+    let mut tiny = eligible_response_headers();
+    tiny.insert("content-length".to_string(), "2".to_string());
+    assert!(
+        !refines_to_buffer(&plugin, &ctx, &tiny),
+        "a known Content-Length below the minimum must stream"
+    );
+    assert!(
+        plugin.should_release_response_body_before_content_type_rewrite(&ctx, 200, &tiny),
+        "a body already collected for it is released"
+    );
+
+    let mut at_minimum = eligible_response_headers();
+    at_minimum.insert("content-length".to_string(), "256".to_string());
+    assert!(
+        refines_to_buffer(&plugin, &ctx, &at_minimum),
+        "exactly the minimum is still eligible"
+    );
+
+    // Unknown length (chunked / streamed) keeps its existing behavior: the size
+    // gate cannot be evaluated, so the body is still collected.
+    let mut chunked = eligible_response_headers();
+    chunked.remove("content-length");
+    assert!(
+        refines_to_buffer(&plugin, &ctx, &chunked),
+        "an unknown Content-Length must not be treated as below the minimum"
+    );
+}
+
+#[tokio::test]
+async fn the_new_exclusions_are_per_instance_so_a_broader_sibling_still_collects() {
+    // The shared refinement ORs across plugins; a strict instance declining must
+    // not speak for a sibling whose `min_content_length` admits the response.
+    let strict = make_plugin(json!({"min_content_length": 100_000}));
+    let permissive = make_plugin(json!({"min_content_length": 10}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut req_headers = HashMap::new();
+    strict.before_proxy(&mut ctx, &mut req_headers).await;
+    permissive.before_proxy(&mut ctx, &mut req_headers).await;
+
+    let eligible = eligible_response_headers();
+    assert!(!refines_to_buffer(&strict, &ctx, &eligible));
+    assert!(refines_to_buffer(&permissive, &ctx, &eligible));
+}
+
+#[tokio::test]
+async fn a_committed_gateway_coding_keeps_its_body_on_the_buffered_path() {
+    // On paths where `after_proxy` runs BEFORE the refinement (the H3
+    // cross-protocol bridge), the `Content-Encoding` the refinement would read is
+    // the gateway's OWN commitment and `Content-Length` has already been removed.
+    // Releasing the body there would leave a committed coding with nothing to
+    // encode, so both new exclusions must stand down once the gateway committed.
+    let plugin = make_plugin(json!({"min_content_length": 10}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut req_headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+    let mut resp_headers = eligible_response_headers();
+    stamp_original_response_metadata_for_test(&mut ctx, 200, &resp_headers);
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        resp_headers.get("content-encoding").map(String::as_str),
+        Some("gzip"),
+        "the gateway committed its own coding"
+    );
+
+    assert!(
+        refines_to_buffer(&plugin, &ctx, &resp_headers),
+        "a committed gateway coding must keep the body it will encode"
+    );
+    assert!(
+        !plugin.should_release_response_body_before_content_type_rewrite(&ctx, 200, &resp_headers),
+        "and must not release it either"
     );
 }
