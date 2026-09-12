@@ -315,7 +315,8 @@ ferrum-edge health -p 9001
 # TLS-only admin API (explicit)
 ferrum-edge health --tls
 
-# TLS with self-signed cert
+# Self-signed or private-CA Admin HTTPS is not trusted by default — add
+# --tls-no-verify for lab use only, or trust the CA in your probe environment.
 ferrum-edge health --tls --tls-no-verify
 
 # Auto-detected TLS when FERRUM_ADMIN_HTTP_PORT=0
@@ -363,10 +364,10 @@ ferrum-edge version [OPTIONS]
 
 ```bash
 $ ferrum-edge version
-ferrum-edge 0.9.0 (aarch64-apple-darwin)
+ferrum-edge 0.9.4 (aarch64-apple-darwin)
 
 $ ferrum-edge version --json
-{"version":"0.9.0","target":"aarch64-apple-darwin"}
+{"version":"0.9.4","target":"aarch64-apple-darwin"}
 ```
 
 ## ambient-udp-preflight
