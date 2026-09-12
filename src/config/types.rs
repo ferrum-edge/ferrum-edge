@@ -2199,7 +2199,13 @@ pub struct CircuitBreakerConfig {
     pub failure_threshold: u32,
     #[serde(default = "default_success_threshold")]
     pub success_threshold: u32,
-    #[serde(default = "default_circuit_timeout")]
+    /// Seconds the circuit stays open before transitioning to half-open.
+    ///
+    /// `cooldown_seconds` is accepted as a serde input alias (Admin API, file
+    /// config, database rows, and batch/restore payloads). Serialization always
+    /// emits `timeout_seconds`. Supplying both spellings in one object is a
+    /// duplicate-field error.
+    #[serde(default = "default_circuit_timeout", alias = "cooldown_seconds")]
     pub timeout_seconds: u64,
     #[serde(default = "default_failure_status_codes")]
     pub failure_status_codes: Vec<u16>,

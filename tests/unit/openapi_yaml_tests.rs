@@ -657,6 +657,43 @@ fn typed_component_properties_match_serde_field_inventories() {
 }
 
 #[test]
+fn circuit_breaker_config_documents_cooldown_seconds_input_alias() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let timeout_seconds = spec
+        .pointer("/components/schemas/CircuitBreakerConfig/properties/timeout_seconds")
+        .expect("CircuitBreakerConfig.timeout_seconds");
+    let timeout_description = timeout_seconds["description"]
+        .as_str()
+        .expect("timeout_seconds description");
+    assert!(
+        timeout_description.contains("cooldown_seconds"),
+        "timeout_seconds must document the cooldown_seconds input alias: {timeout_description}"
+    );
+    assert!(
+        timeout_description.contains("never returned"),
+        "timeout_seconds must say the alias is never returned: {timeout_description}"
+    );
+    // The alias is a real accepted input key, so the schema lists it (the
+    // serde/OpenAPI field-inventory parity test requires that) as a
+    // write-only, deprecated property pointing back at `timeout_seconds`.
+    let alias = spec
+        .pointer("/components/schemas/CircuitBreakerConfig/properties/cooldown_seconds")
+        .expect("CircuitBreakerConfig.cooldown_seconds is documented as an input alias");
+    assert_eq!(alias["writeOnly"], serde_json::Value::Bool(true));
+    assert_eq!(alias["deprecated"], serde_json::Value::Bool(true));
+    assert_eq!(alias["type"], timeout_seconds["type"]);
+    assert_eq!(alias["format"], timeout_seconds["format"]);
+    let alias_description = alias["description"]
+        .as_str()
+        .expect("cooldown_seconds description");
+    assert!(
+        alias_description.contains("alias for `timeout_seconds`"),
+        "cooldown_seconds must point back at timeout_seconds: {alias_description}"
+    );
+}
+
+#[test]
 fn mtls_auth_schemas_match_runtime_contract() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
