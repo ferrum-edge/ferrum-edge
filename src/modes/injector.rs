@@ -51,7 +51,11 @@ const DEFAULT_INJECTOR_LISTEN_ADDR: &str = "0.0.0.0:9443";
 const DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB: usize = 4;
 const MAX_INJECTOR_ADMISSION_REVIEW_BODY_SIZE_MIB: usize = 64;
 const MIB_BYTES: usize = 1024 * 1024;
-const DEFAULT_SIDECAR_IMAGE: &str = "ferrum-edge:latest";
+/// Helm chart default repository (`charts/*/values.yaml` `image.repository`).
+const DEFAULT_SIDECAR_IMAGE_REPOSITORY: &str = "ferrumedge/ferrum-edge";
+/// Build-pinned sidecar image. The tag spelling matches the `v*` release tag
+/// published by `.github/workflows/release.yml` (`TAG_NAME`), never `latest`.
+const DEFAULT_SIDECAR_IMAGE: &str = concat!("ferrumedge/ferrum-edge:v", env!("CARGO_PKG_VERSION"));
 const DEFAULT_INJECTOR_TRUST_DOMAIN: &str = "cluster.local";
 const ISTIO_EXCLUDE_OUTBOUND_PORTS_ANNOTATION: &str =
     "traffic.sidecar.istio.io/excludeOutboundPorts";
@@ -187,8 +191,7 @@ impl InjectorConfig {
             .unwrap_or_else(|| DEFAULT_INJECTOR_LISTEN_ADDR.to_string())
             .parse::<SocketAddr>()
             .map_err(|e| format!("Invalid FERRUM_INJECTOR_LISTEN_ADDR: {e}"))?;
-        let sidecar_image = resolve_ferrum_var("FERRUM_INJECTOR_SIDECAR_IMAGE")
-            .unwrap_or_else(|| DEFAULT_SIDECAR_IMAGE.to_string());
+        let sidecar_image = resolve_sidecar_image()?;
         let sidecar_env = sidecar_env_from_runtime();
         let jwt_secret_ref = jwt_secret_ref_from_runtime()?;
         let sidecar_resources = container_resources_from_runtime(
@@ -282,6 +285,67 @@ impl InjectorConfig {
             http_header_read_timeout_seconds: env_config.http_header_read_timeout_seconds,
             admission_review_max_body_bytes,
         })
+    }
+}
+
+/// Resolve the sidecar/init image: an explicit pin, or the build-pinned default.
+///
+/// `latest` and untagged references (Docker's implicit `latest`) are refused
+/// fail-closed. A digest-only reference is a pin, not a moving tag, and is
+/// accepted here; iptables capture still requires a `-ebpf-tools` tag.
+fn resolve_sidecar_image() -> Result<String, String> {
+    match resolve_ferrum_var("FERRUM_INJECTOR_SIDECAR_IMAGE") {
+        Some(raw) => {
+            let image = raw.trim();
+            if image.is_empty() {
+                return Err(
+                    "FERRUM_INJECTOR_SIDECAR_IMAGE is empty; pin an immutable tag \
+                     (for example ferrumedge/ferrum-edge:vX.Y.Z) or a digest. \
+                     Untagged references pull 'latest' and are refused"
+                        .to_string(),
+                );
+            }
+            validate_pinned_sidecar_image(image)?;
+            Ok(image.to_string())
+        }
+        None => {
+            warn!(
+                sidecar_image = %DEFAULT_SIDECAR_IMAGE,
+                "FERRUM_INJECTOR_SIDECAR_IMAGE is unset; using the build-pinned default. \
+                 Production deployments should set FERRUM_INJECTOR_SIDECAR_IMAGE explicitly"
+            );
+            Ok(DEFAULT_SIDECAR_IMAGE.to_string())
+        }
+    }
+}
+
+/// Refuse a moving `latest` channel or an untagged name (implicit `latest`).
+///
+/// Digest-only references (`repository@sha256:...`) are treated as pinned.
+fn validate_pinned_sidecar_image(image: &str) -> Result<(), String> {
+    let reference = image.split('@').next().unwrap_or_default();
+    let digest = image.split_once('@').map(|(_, digest)| digest.trim());
+    let has_digest = digest.is_some_and(|digest| !digest.is_empty());
+    let tag = reference
+        .rsplit('/')
+        .next()
+        .and_then(|component| component.rsplit_once(':'))
+        .map(|(_, tag)| tag)
+        .filter(|tag| !tag.is_empty());
+    match tag {
+        Some(tag) if tag.eq_ignore_ascii_case("latest") => Err(format!(
+            "FERRUM_INJECTOR_SIDECAR_IMAGE tag 'latest' is forbidden; pin an immutable \
+             tag (for example {DEFAULT_SIDECAR_IMAGE_REPOSITORY}:vX.Y.Z) or a digest. \
+             Production deployments must not rely on a moving latest channel"
+        )),
+        Some(_) => Ok(()),
+        None if has_digest => Ok(()),
+        None => Err(
+            "FERRUM_INJECTOR_SIDECAR_IMAGE is missing a tag; untagged references pull \
+             'latest' and are refused. Pin an immutable tag (for example \
+             ferrumedge/ferrum-edge:vX.Y.Z) or a digest"
+                .to_string(),
+        ),
     }
 }
 
@@ -4072,6 +4136,7 @@ mod tests {
                 ("FERRUM_INJECTOR_TLS_CERT_PATH", None),
                 ("FERRUM_INJECTOR_TLS_KEY_PATH", None),
                 ("FERRUM_INJECTOR_ALLOW_PLAINTEXT", Some("true")),
+                ("FERRUM_INJECTOR_SIDECAR_IMAGE", None),
             ],
             || {
                 let env = EnvConfig::default();
@@ -4080,6 +4145,8 @@ mod tests {
                 assert_eq!(config.capture_mode, CaptureMode::Explicit);
                 assert_eq!(config.ip6tables_mode, Ip6TablesMode::Auto);
                 assert_eq!(config.trust_domain, DEFAULT_INJECTOR_TRUST_DOMAIN);
+                assert_eq!(config.sidecar_image, DEFAULT_SIDECAR_IMAGE);
+                assert!(!config.sidecar_image.contains("latest"));
                 assert!(config.tls_cert_path.is_none());
                 assert!(config.allow_plaintext);
             },

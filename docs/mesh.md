@@ -6721,7 +6721,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 |---|---|---|
 | `FERRUM_INJECTOR_LISTEN_ADDR` | `0.0.0.0:9443` | Webhook listen address |
 | `FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB` | `4` | Maximum AdmissionReview request body size, in MiB, accepted before JSON parsing. Values must be 1..64 |
-| `FERRUM_INJECTOR_SIDECAR_IMAGE` | `ferrum-edge:latest` | Sidecar and capture-init image; iptables capture requires a `-ebpf-tools` tag, optionally pinned with `@sha256:digest` |
+| `FERRUM_INJECTOR_SIDECAR_IMAGE` | `ferrumedge/ferrum-edge:v<CARGO_PKG_VERSION>` | Sidecar and capture-init image. Unset uses the Helm chart repository plus this binary's `v*` release tag. Production deployments should set this explicitly. `latest` and untagged references (implicit `latest`) are refused at startup. iptables capture requires a `-ebpf-tools` tag, optionally pinned with `@sha256:digest` |
 | `FERRUM_INJECTOR_REQUIRE_ANNOTATION` | `true` | Require opt-in annotation |
 | `FERRUM_INJECTOR_TLS_CERT_PATH` | (none) | Webhook TLS certificate. Required (with the key) unless `FERRUM_INJECTOR_ALLOW_PLAINTEXT=true` |
 | `FERRUM_INJECTOR_TLS_KEY_PATH` | (none) | Webhook TLS private key. Required (with the cert) unless `FERRUM_INJECTOR_ALLOW_PLAINTEXT=true` |
@@ -6731,6 +6731,14 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_MESH_PROXY_UID` | `1337` | Proxy user ID in injected sidecars |
 | `FERRUM_MESH_IP6TABLES_ENABLED` | `auto` | IPv6 iptables fan-out: `auto`, `true` (required/all-or-nothing), or `false` |
 | `FERRUM_MESH_CAPTURE_IPV6_ENABLED` | derived | Whether the Sidecar TCP capture listeners must serve IPv6 captured traffic. Derived from `FERRUM_MESH_IP6TABLES_ENABLED` plus the include/exclude CIDR families when unset; set to `true` by the injector whenever the rendered init-container plan emits `ip6tables` rules |
+
+The compiled-in default is `ferrumedge/ferrum-edge:v<CARGO_PKG_VERSION>`, the
+same Docker Hub repository the Helm charts use (`image.repository`) plus the
+`v*` image tag the release workflow publishes. Helm always sets
+`FERRUM_INJECTOR_SIDECAR_IMAGE` from the chart image; the binary default is the
+bare-binary path. An unset value logs one WARN at injector startup. An explicit
+`latest` tag or an untagged name (Docker's implicit `latest`) fails closed at
+startup. A digest-only pin (`repository@sha256:…`) is accepted here.
 
 For iptables injection, the image must provide `/bin/sh`, `ip`, `iptables`, and
 `ip6tables`. The binary rejects a non-tools image at injector startup and at
