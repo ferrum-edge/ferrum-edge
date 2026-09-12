@@ -189,9 +189,10 @@ async fn connection_pool_key_direct_backend_format() {
         key.contains("||||||||1|svidg=static|rcfg="),
         "key should carry empty dns/subset/ca/mtls/sni/sans, verify=1, SVID generation, and rcfg: {key}"
     );
-    // Defaults: adaptive window on → fixed windows omitted from rcfg.
+    // Defaults (issue #5464): adaptive window off → the fixed 8 MiB stream /
+    // 32 MiB connection windows are part of the client behavior.
     assert!(
-        key.ends_with("|rcfg=i90;ka60;h2=1;h2i30;h2t45;aw1;mf1048576"),
+        key.ends_with("|rcfg=i90;ka60;h2=1;h2i30;h2t45;aw0;sw8388608;cw33554432;mf1048576"),
         "default client-behavior suffix mismatch: {key}"
     );
 }
