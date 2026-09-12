@@ -29,7 +29,6 @@
 use std::collections::HashMap;
 
 use chrono::Utc;
-use dashmap::DashMap;
 use ferrum_edge::config::types::{
     GatewayConfig, LoadBalancerAlgorithm, Proxy, SubsetDefinition, Upstream, UpstreamPortOverride,
     UpstreamTarget,
@@ -38,6 +37,7 @@ use ferrum_edge::config::types::{
     UPSTREAM_TARGET_SERVICE_NAME_TAG, UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG,
     UPSTREAM_TARGET_SERVICE_PORT_TAG,
 };
+use ferrum_edge::health_check::ActiveUnhealthyTargets;
 use ferrum_edge::load_balancer::{
     HealthContext, LoadBalancerCache, STICKY_SESSION_TOKEN_LEN, is_sticky_session_token,
     sticky_session_token,
@@ -408,7 +408,7 @@ fn unhealthy_pinned_backend_is_not_selected() {
     let snapshot = cache.load();
     let token = token_for(NAMESPACE, UPSTREAM_ID, &pinned);
 
-    let active_unhealthy = DashMap::new();
+    let active_unhealthy = ActiveUnhealthyTargets::new();
     active_unhealthy.insert(format!("{NAMESPACE}|{UPSTREAM_ID}::10.1.0.10:8080"), 0u64);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,

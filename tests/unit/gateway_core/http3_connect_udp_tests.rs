@@ -8,13 +8,13 @@
 //! [`CapsuleDecoder`], and frames target datagrams with
 //! [`encode_udp_datagram_capsule`].
 
-use dashmap::DashMap;
 use ferrum_edge::_test_support::{
     H3AuthorizedHeadersWrite, await_authorized_headers_write_for_test,
     await_deadline_first_for_test, request_received_at_for_test,
     set_request_credential_deadline_for_test,
 };
 use ferrum_edge::config::types::{GatewayConfig, HttpFlavor, Proxy, Upstream};
+use ferrum_edge::health_check::ActiveUnhealthyTargets;
 use ferrum_edge::http3::connect_udp::{
     AdmittedConnectUdpDestination, CONNECT_UDP_MAX_PAYLOAD_BYTES,
     CONNECT_UDP_NON_FRAGMENTATION_ENFORCEABLE, CapsuleDecodeError, CapsuleDecoder, CapsuleEvent,
@@ -231,7 +231,7 @@ fn lb_cache(upstreams: Vec<Upstream>) -> LoadBalancerCache {
     LoadBalancerCache::new(&config)
 }
 
-fn all_healthy<'a>(active: &'a DashMap<String, u64>) -> HealthContext<'a> {
+fn all_healthy<'a>(active: &'a ActiveUnhealthyTargets) -> HealthContext<'a> {
     HealthContext {
         active_unhealthy: active,
         proxy_passive: None,
@@ -522,7 +522,7 @@ fn dns_sd_standby_tier_is_not_admitted_while_primary_is_healthy() {
     let cache = lb_cache(vec![upstream]);
     let guard = cache.load();
     let proxy = upstream_proxy("dns-sd-pool");
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
     let health = all_healthy(&active);
 
     assert!(
@@ -558,7 +558,7 @@ fn untagged_upstream_is_unaffected_by_srv_priority_admission() {
     )]);
     let guard = cache.load();
     let proxy = upstream_proxy("udp-pool");
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
     let health = all_healthy(&active);
 
     for host in ["relay-a.internal", "relay-b.internal"] {

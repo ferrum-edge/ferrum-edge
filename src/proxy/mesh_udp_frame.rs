@@ -28,11 +28,20 @@
 //! frame is treated as end-of-session and ALSO returns `Ok(None)` — a partial
 //! datagram is NEVER emitted (a truncated datagram would be wrong on the wire).
 //!
+//! Frames are concatenable, so a relay that finds several datagrams ALREADY
+//! ready (queued or readable) coalesces them with [`FrameBatch`] and hands the
+//! tunnel one write — one h2 DATA frame — instead of one per datagram. Batching
+//! never waits: an isolated datagram is written immediately. Besides the
+//! per-frame savings this is what keeps small-datagram bursts under hyper/h2's
+//! per-connection small-DATA-frame budget (see [`MAX_BATCH_WIRE_BYTES`]).
+//!
 //! This module is transport-agnostic (`AsyncRead`/`Write`, not HBONE-specific)
 //! and fully unit-testable without a live tunnel.
 
+use std::time::Duration;
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Largest UDP payload a single frame can carry: the maximum UDP datagram size
 /// (`udp_batch::MAX_DGRAM_SIZE` = 65535). A `u16` length prefix exactly covers
@@ -42,6 +51,180 @@ pub const MAX_FRAME_PAYLOAD: usize = 65535;
 
 /// Bytes of the length prefix (`u16`, big-endian).
 const LEN_PREFIX: usize = 2;
+
+/// Wire-byte bound for one [`FrameBatch`]: already-ready datagrams are
+/// concatenated up to this many framed bytes and handed to the tunnel as ONE
+/// write. It matches the 16 KiB HTTP/2 DATA chunk both mesh tunnels emit
+/// (`hbone_pool::MAX_HBONE_WRITE_CHUNK`, h2's default `max_frame_size`), so a
+/// full batch is one DATA frame instead of one DATA frame per datagram. A
+/// datagram larger than the bound still travels alone (the first datagram
+/// always joins); only FOLLOWING datagrams are held for the next batch.
+///
+/// Coalescing is also what keeps a small-datagram burst below hyper/h2's
+/// small-DATA-frame budget (h2 0.4.16, `too_many_data_frames` →
+/// `ENHANCE_YOUR_CALM` GOAWAY): frames under 256 payload bytes consume the
+/// peer's per-connection budget until the relay task drains them, and a burst
+/// of ~130 unread 64-byte frames kills the whole (pooled) HBONE connection.
+/// A coalesced frame ≥ 256 bytes replenishes it instead.
+pub const MAX_BATCH_WIRE_BYTES: usize = 16 * 1024;
+
+/// Datagram-count bound for one [`FrameBatch`]. Bounds the cooperative work of
+/// one drain/write iteration independently of datagram size (a zero-length
+/// datagram is 2 wire bytes, so the byte bound alone would admit 8,192).
+pub const MAX_BATCH_DATAGRAMS: usize = 1024;
+
+/// Bounded batch of framed datagrams destined for ONE tunnel write.
+///
+/// Callers drain only already-ready datagrams into it (`try_recv` on a queue or
+/// socket): the first datagram always joins, further ones join while
+/// [`FrameBatch::accepts`] holds, and nothing ever waits for a batch to fill —
+/// an isolated datagram is written immediately, exactly as before batching.
+/// Datagram boundaries are recorded so a partial tunnel write reports exactly
+/// which leading datagrams were committed to the tunnel.
+pub struct FrameBatch {
+    buf: BytesMut,
+    /// Wire offset just past each datagram, in FIFO order.
+    ends: Vec<usize>,
+    payload_bytes: usize,
+}
+
+/// Why a [`FrameBatch::write_to`] did not commit the whole batch, plus the exact
+/// leading prefix that WAS handed to the tunnel before it failed.
+#[derive(Debug)]
+pub struct BatchWriteFailure {
+    /// Leading datagrams whose every wire byte was accepted by the tunnel.
+    pub committed_datagrams: usize,
+    /// Payload bytes (excluding length prefixes) of `committed_datagrams`.
+    pub committed_payload_bytes: usize,
+    pub kind: BatchWriteFailureKind,
+}
+
+#[derive(Debug)]
+pub enum BatchWriteFailureKind {
+    /// The tunnel write returned an error (or wrote zero bytes).
+    Io(std::io::Error),
+    /// The write stalled past the caller's deadline.
+    Stalled,
+}
+
+impl FrameBatch {
+    /// A batch pre-sized for `MAX_BATCH_WIRE_BYTES` plus one maximal datagram,
+    /// so steady-state batching never reallocates.
+    pub fn new() -> Self {
+        Self {
+            buf: BytesMut::with_capacity(MAX_BATCH_WIRE_BYTES + LEN_PREFIX + MAX_FRAME_PAYLOAD),
+            ends: Vec::with_capacity(64),
+            payload_bytes: 0,
+        }
+    }
+
+    /// Forget the batched datagrams; capacity is retained.
+    pub fn clear(&mut self) {
+        self.buf.clear();
+        self.ends.clear();
+        self.payload_bytes = 0;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    /// Number of datagrams in the batch.
+    pub fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    /// Framed wire bytes in the batch.
+    pub fn wire_bytes(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Sum of the batched datagram payload lengths (excluding prefixes).
+    pub fn payload_bytes(&self) -> usize {
+        self.payload_bytes
+    }
+
+    /// Whether a datagram of `payload_len` may join without breaching the batch
+    /// bounds. The first datagram always fits, whatever its size.
+    pub fn accepts(&self, payload_len: usize) -> bool {
+        self.ends.is_empty()
+            || (self.ends.len() < MAX_BATCH_DATAGRAMS
+                && self.buf.len() + LEN_PREFIX + payload_len <= MAX_BATCH_WIRE_BYTES)
+    }
+
+    /// Append one datagram. Fails only for an oversize payload (see
+    /// [`encode_datagram`]); the batch is left unchanged in that case.
+    pub fn push(&mut self, payload: &[u8]) -> std::io::Result<()> {
+        encode_datagram(&mut self.buf, payload)?;
+        self.ends.push(self.buf.len());
+        self.payload_bytes += payload.len();
+        Ok(())
+    }
+
+    /// Write the whole batch to `writer` as one contiguous run of framed bytes,
+    /// bounded by `deadline` for the batch as a whole. On failure the returned
+    /// [`BatchWriteFailure`] reports the exact leading prefix of datagrams the
+    /// tunnel accepted (a datagram is committed only once ALL its wire bytes
+    /// were written; a datagram split by the failure is not counted — the peer's
+    /// decoder never emits a partial frame either).
+    pub async fn write_to<W: AsyncWrite + Unpin>(
+        &self,
+        writer: &mut W,
+        deadline: Duration,
+    ) -> Result<(), BatchWriteFailure> {
+        let total = self.buf.len();
+        let mut written = 0usize;
+        let sleep = tokio::time::sleep(deadline);
+        tokio::pin!(sleep);
+        while written < total {
+            let outcome = tokio::select! {
+                biased;
+                res = writer.write(&self.buf[written..]) => Some(res),
+                _ = &mut sleep => None,
+            };
+            match outcome {
+                Some(Ok(0)) => {
+                    return Err(self.failure(
+                        written,
+                        BatchWriteFailureKind::Io(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "tunnel accepted zero bytes",
+                        )),
+                    ));
+                }
+                Some(Ok(n)) => written += n,
+                Some(Err(e)) => return Err(self.failure(written, BatchWriteFailureKind::Io(e))),
+                None => return Err(self.failure(written, BatchWriteFailureKind::Stalled)),
+            }
+        }
+        Ok(())
+    }
+
+    fn failure(&self, written: usize, kind: BatchWriteFailureKind) -> BatchWriteFailure {
+        let mut committed_datagrams = 0usize;
+        let mut committed_payload_bytes = 0usize;
+        let mut start = 0usize;
+        for &end in &self.ends {
+            if end > written {
+                break;
+            }
+            committed_datagrams += 1;
+            committed_payload_bytes += end - start - LEN_PREFIX;
+            start = end;
+        }
+        BatchWriteFailure {
+            committed_datagrams,
+            committed_payload_bytes,
+            kind,
+        }
+    }
+}
+
+impl Default for FrameBatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Encode one datagram into `out` as `[u16 len big-endian][payload]`, appending
 /// to whatever is already buffered (so multiple datagrams can be batched into

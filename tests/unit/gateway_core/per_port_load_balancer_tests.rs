@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
 use chrono::Utc;
-use dashmap::DashMap;
 use ferrum_edge::config::types::{
     GatewayConfig, HealthCheckConfig, LoadBalancerAlgorithm, PassiveHealthCheck, Proxy,
     ResolvedSubsetTrafficPolicy, SubsetDefinition, SubsetTrafficPolicy, Upstream,
     UpstreamPortOverride, UpstreamTarget,
 };
+use ferrum_edge::health_check::ActiveUnhealthyTargets;
 use ferrum_edge::health_check::HealthChecker;
 use ferrum_edge::load_balancer::{
     HashOnStrategy, HealthContext, LoadBalancerCache, target_host_port_key, target_key,
@@ -371,7 +371,7 @@ fn port_subset_fully_unhealthy_intersection_returns_none() {
     };
     let cache = LoadBalancerCache::new(&config);
     let snapshot = cache.load();
-    let active_unhealthy = DashMap::new();
+    let active_unhealthy = ActiveUnhealthyTargets::new();
     active_unhealthy.insert("ferrum|u1::a:8080".to_string(), 0);
     active_unhealthy.insert("ferrum|u1::b:8080".to_string(), 0);
     let health = HealthContext {
@@ -562,7 +562,7 @@ fn port_retry_selection_does_not_escape_selected_port() {
     };
     let cache = LoadBalancerCache::new(&config);
     let snapshot = cache.load();
-    let active_unhealthy = DashMap::new();
+    let active_unhealthy = ActiveUnhealthyTargets::new();
     active_unhealthy.insert(target_key("ferrum|u1", &targets[0]), 0);
     active_unhealthy.insert(target_key("ferrum|u1", &targets[3]), 0);
     let health = HealthContext {
@@ -964,7 +964,7 @@ fn port_passive_ejection_cap_uses_only_targets_on_selected_port() {
         },
     );
 
-    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    let active_unhealthy: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
         proxy_passive: Some(proxy_state),
@@ -1068,7 +1068,7 @@ fn port_passive_ejection_cap_uses_only_targets_on_selected_port_vec_path() {
         },
     );
 
-    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    let active_unhealthy: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
         proxy_passive: Some(proxy_state),
@@ -1390,7 +1390,7 @@ fn upstream_with_subset_cap(
 /// Build a passive-health context that has the given targets passive-ejected
 /// (oldest-first by ascending timestamp) for proxy `p1`, under `cap`.
 fn passive_ctx_ejecting<'a>(
-    active_unhealthy: &'a DashMap<String, u64>,
+    active_unhealthy: &'a ActiveUnhealthyTargets,
     ejected: &[&UpstreamTarget],
     cap: Option<u8>,
 ) -> HealthContext<'a> {
@@ -1464,7 +1464,7 @@ fn subset_ejection_cap_denominator_is_subset_pool_not_full_upstream() {
     let cache = LoadBalancerCache::new(&config);
     let snapshot = cache.load();
 
-    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    let active_unhealthy: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     // Eject BOTH subset targets; v1-a has the oldest timestamp so it is the one
     // re-admitted under the subset cap.
     let health = passive_ctx_ejecting(&active_unhealthy, &[&targets[0], &targets[1]], Some(50));
@@ -1529,7 +1529,7 @@ fn subset_ejection_cap_denominator_is_subset_pool_vec_fallback() {
     let cache = LoadBalancerCache::new(&config);
     let snapshot = cache.load();
 
-    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    let active_unhealthy: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     let health = passive_ctx_ejecting(&active_unhealthy, &[&targets[0], &targets[1]], Some(50));
 
     let selection = LoadBalancerCache::select_target_subset_from(
@@ -1594,7 +1594,7 @@ fn port_subset_ejection_cap_denominator_is_subset_intersect_port() {
     let cache = LoadBalancerCache::new(&config);
     let snapshot = cache.load();
 
-    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    let active_unhealthy: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     // Eject the two subset∩port targets (v1p-a oldest).
     let health = passive_ctx_ejecting(&active_unhealthy, &[&targets[0], &targets[1]], Some(50));
 
@@ -1655,7 +1655,7 @@ fn upstream_retry_excludes_previous_target_before_ejection_cap() {
     let cache = LoadBalancerCache::new(&config);
     let snapshot = cache.load();
 
-    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    let active_unhealthy: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     let health = passive_ctx_ejecting(
         &active_unhealthy,
         &[&targets[0], &targets[1], &targets[2]],
@@ -1711,7 +1711,7 @@ fn port_retry_excludes_previous_target_before_ejection_cap() {
     let cache = LoadBalancerCache::new(&config);
     let snapshot = cache.load();
 
-    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    let active_unhealthy: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     let health = passive_ctx_ejecting(
         &active_unhealthy,
         &[&targets[0], &targets[1], &targets[2]],
@@ -1767,7 +1767,7 @@ fn subset_retry_excludes_previous_target_before_ejection_cap() {
     let cache = LoadBalancerCache::new(&config);
     let snapshot = cache.load();
 
-    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    let active_unhealthy: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     // Eject all three (v1-a oldest, v1-c newest).
     let health = passive_ctx_ejecting(
         &active_unhealthy,
@@ -1843,7 +1843,7 @@ fn port_subset_retry_excludes_previous_target_before_ejection_cap() {
     let cache = LoadBalancerCache::new(&config);
     let snapshot = cache.load();
 
-    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    let active_unhealthy: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     // Eject the three subset∩port targets (v1p-a oldest, v1p-c newest).
     let health = passive_ctx_ejecting(
         &active_unhealthy,
@@ -2050,7 +2050,7 @@ fn per_port_lane_filters_ejected_targets_when_health_context_provided() {
     let cache = LoadBalancerCache::new(&config);
     let snapshot = cache.load();
 
-    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    let active_unhealthy: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     // Active-unhealthy keys use the namespaced upstream-scoped format
     // "namespace|upstream_id::host:port".
     // This is how HTTP dispatch records active ejection state (via `target_key`).
@@ -2122,7 +2122,7 @@ fn per_port_selection_ignores_ejection_without_health_context() {
 
     // Record ejection for "a" using the namespaced upstream-scoped key format,
     // then call the primitive with `None` so this map is never consulted.
-    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    let active_unhealthy: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     active_unhealthy.insert("ferrum|u1::a:9000".to_string(), 0);
 
     let dispatch_port =
@@ -2350,7 +2350,7 @@ fn port_subset_selection_unchanged_after_alloc_free_mask_refactor() {
     let cache = LoadBalancerCache::new(&config);
     let snapshot = cache.load();
 
-    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    let active_unhealthy: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     // v1p-a ejected under a 100% cap ⇒ stays out; only v1p-b is healthy.
     let health = passive_ctx_ejecting(&active_unhealthy, &[&targets[0]], Some(100));
 

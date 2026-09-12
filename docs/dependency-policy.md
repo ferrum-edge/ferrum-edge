@@ -683,6 +683,34 @@ Never refresh a checksum by copying a digest from an unpinned adjacent path
 without official release provenance, and never pipe a remote install script to
 a shell as a shortcut.
 
+## Kafka native TLS build contract
+
+`rdkafka` enables `cmake-build`, `zstd`, and `ssl-vendored` unconditionally
+(issue #5212). `ssl-vendored` selects `openssl-sys/vendored` and `openssl-src`;
+the native CMake build enables TLS and SCRAM and links OpenSSL statically.
+Regenerate the root, fuzz, and mesh benchmark lockfiles with Cargo when changing
+these features and run the blocking advisory/license checks. Do not replace this with system `ssl`:
+the distroless runtime has no promised shared `libssl` installation.
+
+Build-matrix review for this feature:
+
+| Producer | Build implications |
+| --- | --- |
+| GNU x86_64 sysroot | The pinned AlmaLinux producer installs Perl, make, GCC, and CMake already; OpenSSL comes from the locked source crate. |
+| ARM64 Cross | `Cross.toml` already supplies Perl/make and the target C compiler/archiver. `rdkafka-sys` registers the OpenSSL dependency with CMake, which consumes the target build's root. No Cross command, image, or passthrough change is needed. |
+| Native macOS / Linux | Vendored OpenSSL needs Perl, make, and a C compiler, available in the existing native build environments. |
+| Windows MSVC | Vendored OpenSSL uses Perl and nmake; the [hosted Windows image](https://github.com/actions/runner-images/blob/main/images/windows/Windows2025-Readme.md) supplies Perl and Visual Studio, and the producers already install NASM. Keep the Windows build in the merge-group/release matrix. |
+| Docker | The Rust builder includes the native toolchain; only static OpenSSL code goes into the distroless runtime. |
+| musl | The locked `openssl-src` supports x86_64/aarch64 musl target configuration. Ferrum currently publishes GNU Linux binaries, not musl gateway binaries; a musl feature-graph resolve is not a claim of a tested release target. |
+| FIPS | Audit the locked graph for every claimed FIPS profile. OpenSSL is outside the approved module; the existing FIPS admission policy rejects the entire `kafka_logging` plugin, including plaintext. Enabling its build capability does not extend the FIPS support claim. |
+
+`unit_plugins_b_tests` requires offline TLS/SCRAM admission through librdkafka.
+The Service Integration lane runs verified TLS and SCRAM-SHA-256 against a real
+Redpanda broker, including gateway-executable validation and HTTP-to-Kafka
+delivery, invalid trust, and invalid credentials. TLS capability absence fails
+these tests. The ordinary restrictive-egress and FIPS refusal tests remain in
+force.
+
 ## FIPS build profile
 
 Ferrum ships two mutually exclusive cryptographic-backend cargo features
