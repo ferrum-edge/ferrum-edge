@@ -29,7 +29,7 @@
 //! will itself bind), use [`PortReservation::drop_and_take_port`] explicitly
 //! so the reasoning is captured in the test source.
 
-use crate::scaffolding::port_registry::{PortLease, TestSocket, process_registry};
+use super::port_registry::{PortLease, TestSocket, process_registry};
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
