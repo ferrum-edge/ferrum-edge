@@ -292,6 +292,8 @@ fn start_gateway_with_extra_env(
 
 /// Write a YAML config file with a gRPC proxy pointing to the given backend port.
 fn write_grpc_config(config_path: &std::path::Path, backend_port: u16) {
+    let unavailable_port =
+        crate::scaffolding::ports::unbound_tcp_port().expect("lease unavailable gRPC backend port");
     let config = format!(
         r#"
 version: "1"
@@ -314,7 +316,7 @@ proxies:
     listen_path: "/grpc-down"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: 19999
+    backend_port: {unavailable_port}
     strip_listen_path: true
 
 consumers: []

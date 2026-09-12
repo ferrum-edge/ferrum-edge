@@ -176,10 +176,103 @@ fn functional_and_integration_sockets_use_the_registry() {
                         );
                     }
                 }
+                assert!(
+                    !uses_literal_socket_port(&source),
+                    "{} uses a literal socket port instead of a registry lease",
+                    path.display()
+                );
             }
         }
     }
     let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
     inspect(&tests.join("functional"));
     inspect(&tests.join("integration"));
+}
+
+/// Catch fixed ports even when a fixture uses the registry's socket API.
+/// Config-only examples are allowed; a matching bind/connect is not.
+fn uses_literal_socket_port(source: &str) -> bool {
+    use regex::{Regex, RegexSet};
+    use std::sync::LazyLock;
+
+    static DIRECT: LazyLock<RegexSet> = LazyLock::new(|| {
+        RegexSet::new([
+            r"\bbind_test\s*\(\s*[1-9][0-9_]*",
+            r#"\bbind_test\s*\(\s*(?:format!\s*\(\s*)?"[^"\n]*:[1-9][0-9_]*""#,
+            r#"\bbind_test\s*\(\s*\(\s*[^,\n]+,\s*[1-9][0-9_]*\b"#,
+            r#"\bbind_test\s*\(\s*format!\s*\(\s*"[^"\n]*"\s*,\s*[1-9][0-9_]*"#,
+            r"\bstart_\w*server(?:_on)?\s*\(\s*[1-9][0-9_]*",
+        ])
+        .unwrap()
+    });
+    static CONFIG: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?m)^\s*"?(?:port|backend_port|listen_port)"?\s*:\s*([0-9_]+)"#).unwrap()
+    });
+    static CALL: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)\b(?:bind_test|connect|start_\w*server(?:_on)?)\s*\(([^;]*?)\)").unwrap()
+    });
+    static NUMBER: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\b[1-9][0-9_]{3,}(?:u16)?\b").unwrap());
+
+    if DIRECT.is_match(source) {
+        return true;
+    }
+    let config_ports: BTreeSet<u16> = CONFIG
+        .captures_iter(source)
+        .filter_map(|capture| capture[1].replace('_', "").parse().ok())
+        .filter(|port| *port >= 1000)
+        .collect();
+    CALL.captures_iter(source).any(|call| {
+        NUMBER.find_iter(&call[1]).any(|number| {
+            number
+                .as_str()
+                .trim_end_matches("u16")
+                .replace('_', "")
+                .parse::<u16>()
+                .is_ok_and(|port| config_ports.contains(&port))
+        })
+    })
+}
+
+#[test]
+fn literal_socket_port_guard_rejects_fixed_bind_and_config_handoffs() {
+    for source in [
+        r#"TcpListener::bind_test("127.0.0.1:30031").await;"#,
+        r#"TcpListener::bind_test("[::1]:30031").await;"#,
+        r#"UdpSocket::bind_test(("127.0.0.1", 30_031)).await;"#,
+        "TcpSocket::bind_test(30031);",
+        "start_identifying_server(\n    30031,\n    \"healthy-server\",\n);",
+        "start_status_server(30032, \"unhealthy-server\", 500);",
+        "start_echo_server_on(8080);",
+        r#"TcpListener::bind_test(format!("127.0.0.1:{}", 30031)).await;"#,
+        "backend_port: 30031\nTcpStream::connect((\"127.0.0.1\", 30031)).await;",
+        "listen_port: 30_031\nTcpStream::connect(\"127.0.0.1:30031\").await;",
+        "port: 30031\nTcpStream::connect(\n    format!(\"127.0.0.1:{}\", 30031),\n).await;",
+    ] {
+        assert!(
+            uses_literal_socket_port(source),
+            "missed fixed port: {source}"
+        );
+    }
+}
+
+#[test]
+fn literal_socket_port_guard_allows_leases_and_config_only_examples() {
+    for source in [
+        r#"TcpListener::bind_test("127.0.0.1:0").await;"#,
+        r#"TcpListener::bind_test("[::1]:0").await;"#,
+        r#"UdpSocket::bind_test(("127.0.0.1", 0)).await;"#,
+        r#"UdpSocket::bind_test(("::1", 0)).await;"#,
+        r#"TcpListener::bind_test(format!("127.0.0.1:{port}")).await;"#,
+        "start_identifying_server(listener, \"healthy-server\");",
+        "start_status_server(listener, \"unhealthy-server\", 500);",
+        "backend_port: 30031\nlisten_port: 40123\nport: 8080",
+        "backend_port: 30031\nTcpStream::connect((\"127.0.0.1\", port)).await;",
+        r#"TcpStream::connect("127.0.0.1:6379").await;"#,
+    ] {
+        assert!(
+            !uses_literal_socket_port(source),
+            "rejected safe source: {source}"
+        );
+    }
 }

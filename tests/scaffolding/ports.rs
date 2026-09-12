@@ -104,6 +104,21 @@ pub async fn reserve_port() -> io::Result<PortReservation> {
     })
 }
 
+/// Reserve a listener in a bounded range outside the host's ephemeral source
+/// ports when a fixture must release and rebind the socket during startup.
+pub fn reserve_port_in_range(ports: std::ops::Range<u16>) -> io::Result<PortReservation> {
+    let (lease, listener) = process_registry()?.lease_with(ports, |port| {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port))?;
+        Ok((port, listener))
+    })?;
+    listener.set_nonblocking(true)?;
+    Ok(PortReservation {
+        port: lease.port,
+        listener: TcpListener::from_std(listener)?,
+        lease: Arc::new(lease),
+    })
+}
+
 /// Reserve a pair of ports (common for gateway proxy/admin or frontend/backend).
 /// Returns both reservations live; callers can pass each listener into a
 /// scripted backend or release it separately.

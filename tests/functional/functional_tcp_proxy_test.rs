@@ -1171,6 +1171,9 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_tcp_proxy_backend_unreachable() {
+    let backend_port = crate::scaffolding::ports::unbound_port()
+        .await
+        .expect("lease unreachable backend port");
     let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry(
         |proxy_port| {
             format!(
@@ -1181,7 +1184,7 @@ proxies:
     listen_port: {proxy_port}
     backend_scheme: tcp
     backend_host: "127.0.0.1"
-    backend_port: 19899
+    backend_port: {backend_port}
     backend_connect_timeout_ms: 1000
 
 consumers: []
