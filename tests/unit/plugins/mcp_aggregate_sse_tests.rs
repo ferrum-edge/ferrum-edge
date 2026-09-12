@@ -1535,6 +1535,7 @@ async fn aborting_a_staged_reservation_returns_ring_capacity_to_the_next_request
     let tuned = AggregateSseBounds {
         max_streams_per_session: 1,
         max_retained_events: 1,
+        max_event_bytes: payload.len(),
         max_retained_bytes: payload.len() + 64,
         max_replay_events: 1,
         ..bounds()
@@ -1586,6 +1587,7 @@ async fn a_staged_post_attached_reservation_never_spends_a_deliverable_promise()
     let tuned = AggregateSseBounds {
         max_streams_per_session: 2,
         max_retained_events: 1,
+        max_event_bytes: payload.len(),
         max_retained_bytes: 64 * 1024,
         max_replay_events: 1,
         ..bounds()
