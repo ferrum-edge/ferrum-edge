@@ -185,12 +185,13 @@ pub async fn unbound_udp_port() -> io::Result<u16> {
 /// the kernel level without issue (different protocol numbers), so a UDP
 /// bind at the same port generally succeeds on the first try.
 pub async fn reserve_colocated_tcp_udp() -> io::Result<(PortReservation, UdpPortReservation)> {
-    let (lease, (tcp, udp)) = process_registry()?.lease_with(std::iter::repeat_n(0, 256), |_| {
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let port = tcp.local_addr()?.port();
-        let udp = std::net::UdpSocket::bind(("127.0.0.1", port))?;
-        Ok((port, (tcp, udp)))
-    })?;
+    let (lease, (tcp, udp)) =
+        process_registry()?.lease_with(std::iter::repeat_n(0, 256), |_| {
+            let tcp = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let port = tcp.local_addr()?.port();
+            let udp = std::net::UdpSocket::bind(("127.0.0.1", port))?;
+            Ok((port, (tcp, udp)))
+        })?;
     tcp.set_nonblocking(true)?;
     udp.set_nonblocking(true)?;
     let lease = Arc::new(lease);
@@ -295,9 +296,8 @@ fn bind_unlistened_tcp_port() -> io::Result<(u16, socket2::Socket)> {
 /// with the same budget as [`reserve_port`]; this is reservation retry, not
 /// a whole-scenario retry-until-green loop.
 pub fn reserve_refused_tcp_port() -> io::Result<RefusedTcpPort> {
-    let (lease, socket) = process_registry()?.lease_with(std::iter::repeat_n(0, 256), |_| {
-        bind_unlistened_tcp_port()
-    })?;
+    let (lease, socket) = process_registry()?
+        .lease_with(std::iter::repeat_n(0, 256), |_| bind_unlistened_tcp_port())?;
     Ok(RefusedTcpPort {
         port: lease.port,
         _socket: socket,

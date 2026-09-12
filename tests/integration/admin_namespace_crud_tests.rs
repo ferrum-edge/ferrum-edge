@@ -253,7 +253,9 @@ fn file_mode_state() -> AdminState {
 async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr parses");
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let listener = tokio::net::TcpListener::bind_test(addr).await.expect("bind");
+    let listener = tokio::net::TcpListener::bind_test(addr)
+        .await
+        .expect("bind");
     let actual = listener.local_addr().expect("local addr");
     tokio::spawn(async move {
         let _ = serve_admin_on_listener(

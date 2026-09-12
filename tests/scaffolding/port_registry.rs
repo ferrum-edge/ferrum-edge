@@ -88,7 +88,10 @@ impl PortRegistry {
         let mut occupied = BTreeSet::new();
         for entry in fs::read_dir(&self.root)? {
             let path = entry?.path();
-            if path.extension().is_none_or(|extension| extension != "ports") {
+            if path
+                .extension()
+                .is_none_or(|extension| extension != "ports")
+            {
                 continue;
             }
             if path != self.owner {
@@ -111,7 +114,10 @@ impl PortRegistry {
     }
 
     fn write_ports(&self, ports: &BTreeSet<u16>) -> io::Result<()> {
-        fs::write(&self.owner, serde_json::to_vec(ports).map_err(io::Error::other)?)
+        fs::write(
+            &self.owner,
+            serde_json::to_vec(ports).map_err(io::Error::other)?,
+        )
     }
 
     /// Lease the first available candidate, retaining its bound socket until the
@@ -135,7 +141,9 @@ impl PortRegistry {
                 Err(error) => return Err(error),
             };
             if port == 0 {
-                return Err(io::Error::other("a test port lease must have a nonzero port"));
+                return Err(io::Error::other(
+                    "a test port lease must have a nonzero port",
+                ));
             }
             if occupied.contains(&port) {
                 rejected.push(socket);

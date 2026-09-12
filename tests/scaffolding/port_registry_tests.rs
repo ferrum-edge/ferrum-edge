@@ -23,7 +23,10 @@ fn multi_port_allocation_is_distinct_and_exhaustion_is_explicit() {
     let leases: Vec<_> = (0..3).map(|_| lease(&registry).unwrap()).collect();
     let ports: BTreeSet<_> = leases.iter().map(|lease| lease.port).collect();
     assert_eq!(ports.len(), 3);
-    assert_eq!(lease(&registry).err().unwrap().kind(), io::ErrorKind::AddrInUse);
+    assert_eq!(
+        lease(&registry).err().unwrap().kind(),
+        io::ErrorKind::AddrInUse
+    );
 }
 
 #[test]
@@ -73,12 +76,21 @@ fn cross_process_leases_survive_handoff_and_reclaim_after_exit() {
     let deadline = Instant::now() + Duration::from_secs(15);
     let ready = directory.path().join("ready");
     while !ready.exists() {
-        assert!(child.0.try_wait().unwrap().is_none(), "allocator child exited early");
-        assert!(Instant::now() < deadline, "allocator child did not report its lease");
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "allocator child exited early"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "allocator child did not report its lease"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(std::fs::read_to_string(ready).unwrap(), "41002");
-    assert!(lease(&registry).is_err(), "child's unbound port must remain leased");
+    assert!(
+        lease(&registry).is_err(),
+        "child's unbound port must remain leased"
+    );
 
     std::fs::write(directory.path().join("exit"), b"exit without destructors").unwrap();
     loop {
@@ -89,7 +101,11 @@ fn cross_process_leases_survive_handoff_and_reclaim_after_exit() {
         assert!(Instant::now() < deadline, "allocator child did not exit");
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert_eq!(lease(&registry).unwrap().port, 41_002, "reclaim dead owner's lease");
+    assert_eq!(
+        lease(&registry).unwrap().port,
+        41_002,
+        "reclaim dead owner's lease"
+    );
 }
 
 #[test]
@@ -100,14 +116,20 @@ fn port_registry_child() {
     let root = std::path::PathBuf::from(root);
     let registry = PortRegistry::new(&root).unwrap();
     let held = lease(&registry).unwrap();
-    assert_eq!(held.port, 41_002, "must skip both ports held by the other process");
+    assert_eq!(
+        held.port, 41_002,
+        "must skip both ports held by the other process"
+    );
     let port = held.retain_for_process();
     drop(held);
     std::fs::write(root.join("ready.tmp"), port.to_string()).unwrap();
     std::fs::rename(root.join("ready.tmp"), root.join("ready")).unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     while !root.join("exit").exists() {
-        assert!(Instant::now() < deadline, "parent did not release allocator child");
+        assert!(
+            Instant::now() < deadline,
+            "parent did not release allocator child"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
     // Model nextest termination: no Rust destructors, but the kernel releases
@@ -123,10 +145,16 @@ async fn socket_handoff_and_wildcard_listener_share_the_registry() {
         .await
         .unwrap();
     let udp = super::ports::reserve_udp_port().await.unwrap();
-    assert_ne!(udp.port, port, "TCP and UDP allocations share the lease namespace");
+    assert_ne!(
+        udp.port, port,
+        "TCP and UDP allocations share the lease namespace"
+    );
     drop(wildcard);
     let next = super::ports::unbound_port().await.unwrap();
-    assert_ne!(next, port, "dropping a native listener must preserve the handoff lease");
+    assert_ne!(
+        next, port,
+        "dropping a native listener must preserve the handoff lease"
+    );
 }
 
 #[test]

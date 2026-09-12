@@ -1647,8 +1647,8 @@ plugin_configs: []
     /// relayed for it. A refused connection is closed at accept, so the echo
     /// round-trip fails (EOF or write error) rather than returning bytes.
     async fn try_relay(source_ip: &str, proxy_port: u16) -> Option<tokio::net::TcpStream> {
-        let socket = tokio::net::TcpSocket::bind_test(format!("{source_ip}:0"))
-            .expect("bind client source");
+        let socket =
+            tokio::net::TcpSocket::bind_test(format!("{source_ip}:0")).expect("bind client source");
         let mut stream = socket
             .connect(
                 format!("127.0.0.1:{proxy_port}")
