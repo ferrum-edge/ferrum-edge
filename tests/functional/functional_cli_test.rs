@@ -6,6 +6,8 @@
 //! Marked with `#[ignore]` — run with:
 //!   cargo test --test functional_tests -- --ignored functional_cli
 
+use crate::common::GatewayChildGuard;
+use crate::scaffolding::harness::wait_for_spawned_gateway;
 use crate::scaffolding::port_registry::TestSocket;
 
 use std::process::{Command, Stdio};
@@ -1858,6 +1860,8 @@ async fn functional_cli_validate_conf_mode_beats_explicit_spec() {
 #[tokio::test]
 async fn functional_cli_run_starts_and_stops() {
     let temp_dir = TempDir::new().unwrap();
+    let http_port = ephemeral_port().await;
+    let admin_port = ephemeral_port().await;
     let spec_path = temp_dir.path().join("config.yaml");
     std::fs::write(
         &spec_path,
@@ -1865,7 +1869,7 @@ async fn functional_cli_run_starts_and_stops() {
     )
     .unwrap();
 
-    let mut child = Command::new(binary_path())
+    let mut gateway = Command::new(binary_path())
         .args([
             "run",
             "--spec",
@@ -1873,16 +1877,19 @@ async fn functional_cli_run_starts_and_stops() {
             "--mode",
             "file",
         ])
-        .env("FERRUM_PROXY_HTTP_PORT", ephemeral_port().await.to_string())
-        .env("FERRUM_ADMIN_HTTP_PORT", ephemeral_port().await.to_string())
+        .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
+        .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
+        .map(GatewayChildGuard::new)
         .expect("Failed to start ferrum-edge run");
 
-    // Wait for startup
-    sleep(Duration::from_secs(2)).await;
+    let child = gateway.child_mut();
+    wait_for_spawned_gateway(child, http_port, None)
+        .await
+        .expect("CLI gateway readiness");
 
     // Check it's still running
     assert!(
@@ -1891,7 +1898,7 @@ async fn functional_cli_run_starts_and_stops() {
     );
 
     // Health check via admin API
-    let health_url = "http://127.0.0.1:18991/health";
+    let health_url = format!("http://127.0.0.1:{admin_port}/health");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
@@ -1930,6 +1937,7 @@ async fn functional_cli_run_starts_and_stops() {
 #[tokio::test]
 async fn functional_cli_run_with_verbose() {
     let temp_dir = TempDir::new().unwrap();
+    let http_port = ephemeral_port().await;
     let spec_path = temp_dir.path().join("config.yaml");
     std::fs::write(
         &spec_path,
@@ -1938,7 +1946,7 @@ async fn functional_cli_run_with_verbose() {
     .unwrap();
 
     // Start with -v (info level) and capture stderr for log output
-    let mut child = Command::new(binary_path())
+    let mut gateway = Command::new(binary_path())
         .args([
             "run",
             "--spec",
@@ -1947,15 +1955,19 @@ async fn functional_cli_run_with_verbose() {
             "file",
             "-v",
         ])
-        .env("FERRUM_PROXY_HTTP_PORT", ephemeral_port().await.to_string())
+        .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", ephemeral_port().await.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
+        .map(GatewayChildGuard::new)
         .expect("Failed to start ferrum-edge run -v");
 
-    sleep(Duration::from_secs(2)).await;
+    let child = gateway.child_mut();
+    wait_for_spawned_gateway(child, http_port, None)
+        .await
+        .expect("verbose CLI gateway readiness");
 
     // Just verify it started successfully with -v
     assert!(
@@ -1984,6 +1996,7 @@ async fn functional_cli_run_with_verbose() {
 #[tokio::test]
 async fn functional_cli_reload_sends_sighup() {
     let temp_dir = TempDir::new().unwrap();
+    let http_port = ephemeral_port().await;
     let spec_path = temp_dir.path().join("config.yaml");
     std::fs::write(
         &spec_path,
@@ -1992,7 +2005,7 @@ async fn functional_cli_reload_sends_sighup() {
     .unwrap();
 
     // Start a gateway to reload
-    let mut child = Command::new(binary_path())
+    let mut gateway = Command::new(binary_path())
         .args([
             "run",
             "--spec",
@@ -2000,15 +2013,19 @@ async fn functional_cli_reload_sends_sighup() {
             "--mode",
             "file",
         ])
-        .env("FERRUM_PROXY_HTTP_PORT", ephemeral_port().await.to_string())
+        .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", ephemeral_port().await.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
+        .map(GatewayChildGuard::new)
         .expect("Failed to start gateway for reload test");
 
-    sleep(Duration::from_secs(2)).await;
+    let child = gateway.child_mut();
+    wait_for_spawned_gateway(child, http_port, None)
+        .await
+        .expect("reload CLI gateway readiness");
 
     let pid = child.id();
 

@@ -15,6 +15,7 @@
 //! All tests are marked `#[ignore]` — run with:
 //!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_udp_proxy --ignored --nocapture
 
+use crate::scaffolding::harness::{StreamListener, wait_for_spawned_gateway};
 use crate::scaffolding::ports::{bind_dtls, unbound_tcp_port, unbound_udp_port};
 
 use crate::scaffolding::port_registry::TestSocket;
@@ -252,7 +253,13 @@ plugin_configs: []
 
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
-    sleep(Duration::from_secs(3)).await;
+    wait_for_spawned_gateway(
+        gateway.child_mut(),
+        gateway_http_port,
+        Some(StreamListener::Udp(proxy_port)),
+    )
+    .await
+    .expect("UDP gateway readiness");
 
     // Send datagrams through the proxy
     let client = UdpSocket::bind_test("127.0.0.1:0").await.unwrap();
@@ -329,7 +336,13 @@ plugin_configs: []
 
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
-    sleep(Duration::from_secs(3)).await;
+    wait_for_spawned_gateway(
+        gateway.child_mut(),
+        gateway_http_port,
+        Some(StreamListener::Udp(proxy_port)),
+    )
+    .await
+    .expect("UDP gateway readiness");
 
     let client = UdpSocket::bind_test("127.0.0.1:0").await.unwrap();
     client
@@ -422,7 +435,13 @@ plugin_configs: []
 
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
-    sleep(Duration::from_secs(3)).await;
+    wait_for_spawned_gateway(
+        gateway.child_mut(),
+        gateway_http_port,
+        Some(StreamListener::Udp(proxy_port)),
+    )
+    .await
+    .expect("UDP gateway readiness");
 
     let client = UdpSocket::bind_test("127.0.0.1:0").await.unwrap();
     client
@@ -507,7 +526,13 @@ plugin_configs: []
 
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
-    sleep(Duration::from_secs(3)).await;
+    wait_for_spawned_gateway(
+        gateway.child_mut(),
+        gateway_http_port,
+        Some(StreamListener::Udp(proxy_port)),
+    )
+    .await
+    .expect("UDP gateway readiness");
 
     // Create multiple clients
     let num_clients = 5;
@@ -580,7 +605,13 @@ plugin_configs: []
 
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
-    sleep(Duration::from_secs(3)).await;
+    wait_for_spawned_gateway(
+        gateway.child_mut(),
+        gateway_http_port,
+        Some(StreamListener::Udp(proxy_port)),
+    )
+    .await
+    .expect("UDP gateway readiness");
 
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
     let established = UdpSocket::bind_test("127.0.0.1:0").await.unwrap();
@@ -666,7 +697,13 @@ plugin_configs: []
         &[("FERRUM_UDP_MAX_SESSIONS", "1")],
     )
     .expect("Failed to start");
-    sleep(Duration::from_secs(3)).await;
+    wait_for_spawned_gateway(
+        gateway.child_mut(),
+        gateway_http_port,
+        Some(StreamListener::Udp(proxy_port)),
+    )
+    .await
+    .expect("UDP gateway readiness");
 
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
     let client1 = UdpSocket::bind_test("127.0.0.1:0").await.unwrap();
@@ -758,7 +795,13 @@ plugin_configs: []
         &[("FERRUM_UDP_CLEANUP_INTERVAL_SECONDS", "3")],
     )
     .expect("Failed to start");
-    sleep(Duration::from_secs(3)).await;
+    wait_for_spawned_gateway(
+        gateway.child_mut(),
+        gateway_http_port,
+        Some(StreamListener::Udp(proxy_port)),
+    )
+    .await
+    .expect("UDP gateway readiness");
 
     // Send initial datagram to create a session
     let client = UdpSocket::bind_test("127.0.0.1:0").await.unwrap();
@@ -833,7 +876,13 @@ plugin_configs: []
 
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
-    sleep(Duration::from_secs(3)).await;
+    wait_for_spawned_gateway(
+        gateway.child_mut(),
+        gateway_http_port,
+        Some(StreamListener::Udp(proxy_port)),
+    )
+    .await
+    .expect("UDP gateway readiness");
 
     let client = UdpSocket::bind_test("127.0.0.1:0").await.unwrap();
     client
@@ -898,7 +947,13 @@ plugin_configs: []
 
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
-    sleep(Duration::from_secs(3)).await;
+    wait_for_spawned_gateway(
+        gateway.child_mut(),
+        gateway_http_port,
+        Some(StreamListener::Udp(proxy_port)),
+    )
+    .await
+    .expect("UDP gateway readiness");
 
     let client = UdpSocket::bind_test("127.0.0.1:0").await.unwrap();
     client
@@ -979,7 +1034,13 @@ plugin_configs: []
 
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
-    sleep(Duration::from_secs(3)).await;
+    wait_for_spawned_gateway(
+        gateway.child_mut(),
+        gateway_http_port,
+        Some(StreamListener::Udp(proxy_port)),
+    )
+    .await
+    .expect("UDP gateway readiness");
 
     let client = UdpSocket::bind_test("127.0.0.1:0").await.unwrap();
     client
@@ -1036,7 +1097,13 @@ plugin_configs: []
 
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
-    sleep(Duration::from_secs(3)).await;
+    wait_for_spawned_gateway(
+        gateway.child_mut(),
+        gateway_http_port,
+        Some(StreamListener::Udp(proxy_port)),
+    )
+    .await
+    .expect("UDP gateway readiness");
 
     let client = UdpSocket::bind_test("127.0.0.1:0").await.unwrap();
     client
@@ -1100,7 +1167,13 @@ plugin_configs: []
 
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
-    sleep(Duration::from_secs(3)).await;
+    wait_for_spawned_gateway(
+        gateway.child_mut(),
+        gateway_http_port,
+        Some(StreamListener::Udp(proxy_port)),
+    )
+    .await
+    .expect("UDP gateway readiness");
 
     // Client sends plain UDP to the gateway
     let client = UdpSocket::bind_test("127.0.0.1:0").await.unwrap();
@@ -1169,7 +1242,13 @@ plugin_configs: []
 
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
-    sleep(Duration::from_secs(3)).await;
+    wait_for_spawned_gateway(
+        gateway.child_mut(),
+        gateway_http_port,
+        Some(StreamListener::Udp(proxy_port)),
+    )
+    .await
+    .expect("UDP gateway readiness");
 
     // Launch 3 concurrent clients
     let mut handles = Vec::new();
@@ -1250,7 +1329,13 @@ plugin_configs: []
         Some(&dtls_env),
     )
     .expect("Failed to start");
-    sleep(Duration::from_secs(3)).await;
+    wait_for_spawned_gateway(
+        gateway.child_mut(),
+        gateway_http_port,
+        Some(StreamListener::Udp(proxy_port)),
+    )
+    .await
+    .expect("UDP gateway readiness");
 
     // Connect as a DTLS client to the gateway (with retries for CI timing)
     let dtls_client = connect_dtls_client_with_retry(proxy_port, 5).await;
@@ -1331,7 +1416,13 @@ plugin_configs: []
         Some(&dtls_env),
     )
     .expect("Failed to start");
-    sleep(Duration::from_secs(3)).await;
+    wait_for_spawned_gateway(
+        gateway.child_mut(),
+        gateway_http_port,
+        Some(StreamListener::Udp(proxy_port)),
+    )
+    .await
+    .expect("UDP gateway readiness");
 
     let dtls_client = connect_dtls_client_with_retry(proxy_port, 5).await;
     dtls_client
@@ -1413,7 +1504,13 @@ plugin_configs: []
         Some(&dtls_env),
     )
     .expect("Failed to start");
-    sleep(Duration::from_secs(3)).await;
+    wait_for_spawned_gateway(
+        gateway.child_mut(),
+        gateway_http_port,
+        Some(StreamListener::Udp(proxy_port)),
+    )
+    .await
+    .expect("UDP gateway readiness");
 
     // Connect as DTLS client (with retries for CI timing)
     let dtls_client = connect_dtls_client_with_retry(proxy_port, 5).await;
@@ -1488,7 +1585,13 @@ plugin_configs: []
         &[("FERRUM_TLS_MIN_VERSION", "1.3")],
     )
     .expect("Failed to start gateway");
-    sleep(Duration::from_secs(3)).await;
+    wait_for_spawned_gateway(
+        gateway.child_mut(),
+        gateway_http_port,
+        Some(StreamListener::Udp(proxy_port)),
+    )
+    .await
+    .expect("UDP gateway readiness");
 
     // A client with no DTLS 1.3 suites can only offer DTLS 1.2.
     let no_dtls13: &[dimpl::crypto::Dtls13CipherSuite] = &[];
@@ -1683,7 +1786,13 @@ plugin_configs:
 
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
-    sleep(Duration::from_secs(3)).await;
+    wait_for_spawned_gateway(
+        gateway.child_mut(),
+        gateway_http_port,
+        Some(StreamListener::Udp(proxy_port)),
+    )
+    .await
+    .expect("UDP gateway readiness");
 
     let client = UdpSocket::bind_test("127.0.0.1:0").await.unwrap();
     client
@@ -1749,7 +1858,13 @@ plugin_configs:
 
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
-    sleep(Duration::from_secs(3)).await;
+    wait_for_spawned_gateway(
+        gateway.child_mut(),
+        gateway_http_port,
+        Some(StreamListener::Udp(proxy_port)),
+    )
+    .await
+    .expect("UDP gateway readiness");
 
     // UDP sessions are keyed by the full client `SocketAddr`, so two ephemeral
     // ports on the SAME loopback address are already two peers — which is what
@@ -1923,7 +2038,13 @@ plugin_configs: []
         &[("FERRUM_POOL_WARMUP_ENABLED", "false")],
     )
     .expect("Failed to start");
-    sleep(Duration::from_secs(3)).await;
+    wait_for_spawned_gateway(
+        gateway.child_mut(),
+        gateway_http_port,
+        Some(StreamListener::Udp(proxy_port)),
+    )
+    .await
+    .expect("UDP gateway readiness");
 
     const SESSIONS: usize = 30;
     // Held open for the whole loop: a released session would decrement the gauge
@@ -2019,7 +2140,13 @@ plugin_configs: []
         ],
     )
     .expect("Failed to start");
-    sleep(Duration::from_secs(3)).await;
+    wait_for_spawned_gateway(
+        gateway.child_mut(),
+        gateway_http_port,
+        Some(StreamListener::Udp(proxy_port)),
+    )
+    .await
+    .expect("UDP gateway readiness");
 
     const ATTEMPTS: usize = 8;
     const LIMIT: usize = 4;

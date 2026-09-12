@@ -8,6 +8,7 @@
 //!
 //! Run with: cargo test --test functional_load_balancer_test -- --ignored --nocapture
 
+use crate::scaffolding::harness::wait_for_spawned_gateway;
 use crate::scaffolding::port_registry::TestSocket;
 use crate::scaffolding::ports::{reserve_port, unbound_port};
 
@@ -16,7 +17,7 @@ use std::io::Write;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::time::sleep;
 
 // ============================================================================
@@ -243,16 +244,13 @@ async fn wait_for_owned_gateway(
     {
         return false;
     }
-    for _ in 0..30 {
-        if child.try_wait().ok().flatten().is_some() {
-            return false;
+    match wait_for_spawned_gateway(child, proxy_port, None).await {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("Gateway listener readiness failed: {error}");
+            false
         }
-        if TcpStream::connect(("127.0.0.1", proxy_port)).await.is_ok() {
-            return true;
-        }
-        sleep(Duration::from_millis(200)).await;
     }
-    false
 }
 
 /// Start the gateway with port allocation retry logic.
