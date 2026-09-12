@@ -168,6 +168,7 @@ fn test_parse_validate_with_spec() {
             assert!(args.settings.is_none());
             assert!(args.mode.is_none());
             assert_eq!(args.verbose, 0);
+            assert!(!args.allow_empty_namespace);
         }
         _ => panic!("Expected Validate command"),
     }
@@ -201,6 +202,25 @@ fn test_parse_validate_with_mode_verbose() {
         Some(Command::Validate(args)) => {
             assert_eq!(args.mode.as_deref(), Some("file"));
             assert_eq!(args.verbose, 2);
+        }
+        _ => panic!("Expected Validate command"),
+    }
+}
+
+#[test]
+fn test_parse_validate_allow_empty_namespace() {
+    let cli = Cli::try_parse_from([
+        "ferrum-edge",
+        "validate",
+        "--allow-empty-namespace",
+        "-m",
+        "file",
+    ])
+    .unwrap();
+    match cli.command {
+        Some(Command::Validate(args)) => {
+            assert!(args.allow_empty_namespace);
+            assert_eq!(args.mode.as_deref(), Some("file"));
         }
         _ => panic!("Expected Validate command"),
     }
@@ -876,6 +896,7 @@ fn test_validate_explicit_spec_does_not_override_conf_file_mode() {
                 mode: None,
                 verbose: 0,
                 fips_mode: None,
+                allow_empty_namespace: false,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             ferrum_edge::cli::infer_file_mode_from_conf_mode(Some("cp"));
@@ -909,6 +930,7 @@ fn test_apply_validate_overrides_sets_spec_path() {
                 mode: None,
                 verbose: 0,
                 fips_mode: None,
+                allow_empty_namespace: false,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             assert_eq!(
@@ -934,6 +956,7 @@ fn test_apply_validate_overrides_sets_mode() {
                 mode: Some("file".to_string()),
                 verbose: 0,
                 fips_mode: None,
+                allow_empty_namespace: false,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "file");
@@ -954,6 +977,7 @@ fn test_apply_validate_overrides_explicit_mode_not_overridden_by_spec() {
                 mode: Some("database".to_string()),
                 verbose: 0,
                 fips_mode: None,
+                allow_empty_namespace: false,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             ferrum_edge::cli::infer_file_mode();
@@ -979,6 +1003,7 @@ fn test_apply_validate_overrides_verbose_levels() {
                     mode: Some("file".to_string()),
                     verbose: level,
                     fips_mode: None,
+                    allow_empty_namespace: false,
                 };
                 ferrum_edge::cli::apply_validate_overrides(&args);
                 assert_eq!(std::env::var("FERRUM_LOG_LEVEL").unwrap(), expected);
@@ -1007,6 +1032,7 @@ fn test_apply_validate_overrides_no_verbose_does_not_set_log_level() {
                 mode: Some("file".to_string()),
                 verbose: 0,
                 fips_mode: None,
+                allow_empty_namespace: false,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             assert!(std::env::var("FERRUM_LOG_LEVEL").is_err());
@@ -1027,6 +1053,7 @@ fn test_validate_mode_and_spec_sets_env_before_infer() {
                 mode: Some("file".to_string()),
                 verbose: 0,
                 fips_mode: None,
+                allow_empty_namespace: false,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             assert_eq!(
@@ -1053,6 +1080,7 @@ fn test_apply_validate_overrides_mode_wins_over_env() {
                 mode: Some("file".to_string()),
                 verbose: 0,
                 fips_mode: None,
+                allow_empty_namespace: false,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             assert_eq!(
@@ -1082,6 +1110,7 @@ fn test_apply_validate_overrides_verbose_wins_over_env() {
                 mode: None,
                 verbose: 2,
                 fips_mode: None,
+                allow_empty_namespace: false,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             assert_eq!(
@@ -1697,5 +1726,25 @@ fn cli_md_documents_fips_mode_on_run_validate_and_precedence() {
         precedence_section.contains("`--fips-mode`")
             && precedence_section.contains("`FERRUM_FIPS_MODE`"),
         "precedence must pair the CLI flag with FERRUM_FIPS_MODE"
+    );
+}
+
+/// `ValidateArgs` exposes `--allow-empty-namespace`; the canonical CLI
+/// reference must document the flag, the fail-closed empty-filter exit, and
+/// the namespace summary lines.
+#[test]
+fn cli_md_documents_validate_allow_empty_namespace() {
+    let validate_section = cli_md_section(CLI_MD, "## validate", "## reload");
+    assert!(
+        validate_section.contains("`--allow-empty-namespace`"),
+        "validate options table must document --allow-empty-namespace"
+    );
+    assert!(
+        validate_section.contains("Namespace:"),
+        "validate sample output must print the active namespace"
+    );
+    assert!(
+        validate_section.contains("exit code 1"),
+        "validate docs must document the empty-filter failure exit code"
     );
 }
