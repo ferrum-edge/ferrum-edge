@@ -1238,6 +1238,7 @@ jobs:
               integration::datagram_client_address_datapath_tests
               integration::gateway_api_udproute_datapath_tests
               integration::gateway_hbone_pool_tests
+              integration::hbone_pool_width_tests
               integration::gateway_mesh_trust_retirement_tests
               integration::gateway_listener_observability_tests
               integration::replay_authority_readiness_tests
