@@ -101,7 +101,16 @@ fn batch_create_admission_uses_point_uniqueness_instead_of_namespace_snapshot() 
 
     assert!(
         handler.contains("if batch_needs_consumer_snapshot(&batch)"),
-        "full consumer snapshot is only for mTLS/HMAC credential candidates"
+        "full consumer snapshot is only for mTLS/HMAC credential or mTLS plugin candidates"
+    );
+    let snapshot_gate = handler
+        .split("fn batch_needs_consumer_snapshot(batch: &RestorePayload) -> bool {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("consumer snapshot gate body");
+    assert!(
+        snapshot_gate.contains("plugin.plugin_name == \"mtls_auth\""),
+        "an mTLS plugin batch must load consumers before enabling the policy"
     );
     let snapshot = handler
         .find("load_namespace_snapshot(namespace)")
