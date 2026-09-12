@@ -1938,7 +1938,7 @@ fn proxy_ws_origin_star_is_rejected_on_admin_and_validate_admission() {
 
     let cli = include_str!("../../../src/cli.rs");
     let execute_validate = cli
-        .split("pub fn execute_validate()")
+        .split("pub fn execute_validate(")
         .nth(1)
         .expect("execute_validate")
         .split("pub fn execute_health(")
