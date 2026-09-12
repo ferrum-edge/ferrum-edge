@@ -416,6 +416,17 @@ fn resource_exhausted_subscribe_status_is_classified_as_an_admission_refusal() {
     );
 }
 
+/// ConfigSync uses the same status code when the namespace snapshot exceeds
+/// the wire bound. That is a delivery failure, not admission saturation, and
+/// must allow the max-stale fail-closed policy to activate.
+#[test]
+fn oversized_config_status_is_not_an_admission_refusal() {
+    let error = anyhow::Error::from(tonic::Status::resource_exhausted(
+        "Configuration exceeds the ConfigSync message size limit",
+    ));
+    assert!(subscribe_admission_refusal(&error).is_none());
+}
+
 /// Every other gRPC status stays an ordinary connection error, so the stale
 /// fence keeps latching on a control plane that is genuinely unusable.
 #[test]

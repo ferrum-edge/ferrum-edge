@@ -11,9 +11,10 @@ The `ferrum-edge` binary must be on your shell's `PATH` to be invoked by name. A
 sudo cp target/release/ferrum-edge /usr/local/bin/
 
 # From a pre-built release download (Linux x86_64 example)
-# Pin an explicit tag. GitHub /releases/latest skips prereleases.
+# Pin an immutable semver tag (vX.Y.Z from the Releases page). Do not rely on a moving
+# "latest" channel: README forbids it, and GitHub /releases/latest also skips prerelease tags.
 set -euo pipefail
-TAG=latest  # or replace with another explicit tag shown on the Releases page
+TAG=v0.9.4  # replace with the desired vX.Y.Z tag from the Releases page
 BASE="https://github.com/ferrum-edge/ferrum-edge/releases/download/${TAG}"
 curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64"
 curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64.sha256"
@@ -315,7 +316,8 @@ ferrum-edge health -p 9001
 # TLS-only admin API (explicit)
 ferrum-edge health --tls
 
-# TLS with self-signed cert
+# Self-signed or private-CA Admin HTTPS is not trusted by default — add
+# --tls-no-verify for lab use only, or trust the CA in your probe environment.
 ferrum-edge health --tls --tls-no-verify
 
 # Auto-detected TLS when FERRUM_ADMIN_HTTP_PORT=0
@@ -363,10 +365,10 @@ ferrum-edge version [OPTIONS]
 
 ```bash
 $ ferrum-edge version
-ferrum-edge 0.9.0 (aarch64-apple-darwin)
+ferrum-edge 0.9.4 (aarch64-apple-darwin)
 
 $ ferrum-edge version --json
-{"version":"0.9.0","target":"aarch64-apple-darwin"}
+{"version":"0.9.4","target":"aarch64-apple-darwin"}
 ```
 
 ## ambient-udp-preflight

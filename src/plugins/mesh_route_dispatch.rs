@@ -2200,16 +2200,17 @@ fn is_false(value: &bool) -> bool {
 /// - a doubled separator collapses when BOTH sides carry a `/` — Envoy's
 ///   documented `prefix: /prefix` + `prefix_rewrite: /` case, where
 ///   `/prefix/etc` must forward as `/etc` rather than `//etc`;
-/// - a suffix that opens with a `.` keeps its own segment boundary. Fusing it
-///   into the replacement's last segment would relabel the traversal operand
-///   the client wrote immediately after the matched prefix as ordinary segment
-///   text (`/api../admin` → `/v2../admin`), so the `canonicalize_policy_path`
-///   check the caller runs before publishing the override would no longer see
-///   the `..` and would forward what it must refuse. Synthesizing the
-///   separator keeps that composition `/v2/../admin`, which is rejected with
-///   400 exactly as it was before literal substitution. A dot-leading suffix
-///   that is not itself a dot segment (`..hidden`) still forwards — as its
-///   own segment, which is where the client wrote it.
+/// - a suffix that opens with a complete `.` or `..` segment keeps its
+///   segment boundary. Fusing it into the replacement's last segment would
+///   relabel the traversal operand the client wrote immediately after the
+///   matched prefix as ordinary segment text (`/api../admin` →
+///   `/v2../admin`), so the `canonicalize_policy_path` check the caller
+///   runs before publishing the override would no longer see the `..`
+///   and would forward what it must refuse. Synthesizing the separator
+///   keeps that composition `/v2/../admin`, which is rejected with 400
+///   exactly as it was before literal substitution. Every other
+///   dot-leading tail stays literal (`/prefix/old..hidden` →
+///   `/new..hidden`, `/prefix/old.env` → `/new.env`).
 ///
 /// When `match_prefix` is `None` (exact / regex match, or no `match.uri`)
 /// the whole path is replaced.
@@ -2236,27 +2237,29 @@ fn rewrite_request_path(
             _ => return replacement.to_string(),
         },
     };
-    // Join `replacement` + `tail` without doubling a `/` and — outside the
-    // dot-leading case above — without synthesizing one at a boundary that had
-    // none: inserting a separator would move the request into a different path
-    // segment than the literal prefix substitution Istio `HTTPRewrite` and
-    // Envoy `prefix_rewrite` specify.
+    // Join `replacement` + `tail` without doubling a `/`. Preserve a missing
+    // boundary only when the tail opens with a complete dot segment; otherwise
+    // inserting a separator would change literal prefix-substitution semantics.
     let mut out = String::with_capacity(replacement.len() + tail.len() + 1);
     out.push_str(replacement);
     let replacement_slash = replacement.ends_with('/');
     match tail.strip_prefix('/') {
         // Both sides carry the separator — drop the duplicate.
         Some(rest) if replacement_slash => out.push_str(rest),
-        // Neither side carries it and the suffix opens a dot-leading segment:
-        // preserve the boundary so the caller's canonical check still sees a
-        // whole `.` / `..` segment instead of a fused ordinary one.
-        None if !replacement_slash && tail.starts_with('.') => {
+        // Keep a complete traversal operand visible to the caller's canonical
+        // check, without turning ordinary names such as `.env` into segments.
+        None if !replacement_slash && tail_opens_dot_segment(tail) => {
             out.push('/');
             out.push_str(tail);
         }
         _ => out.push_str(tail),
     }
     out
+}
+
+#[inline]
+fn tail_opens_dot_segment(tail: &str) -> bool {
+    tail == "." || tail == ".." || tail.starts_with("./") || tail.starts_with("../")
 }
 
 /// Re-sync the forwarded `Host` header to the original client value, undoing a
@@ -2321,11 +2324,21 @@ fn build_redirect_response(
                 None => authority.to_string(),
             },
         );
-    let path = redirect
+    let mut path = redirect
         .uri
         .as_deref()
         .map(|uri| rewrite_request_path(&ctx.path, uri, redirect.match_prefix.as_deref()))
         .unwrap_or_else(|| ctx.path.clone());
+    if redirect.uri.is_some() {
+        // Redirect URIs may carry their own query; canonicalize only the path
+        // component so query text cannot conceal a terminal dot segment.
+        let path_end = path.find('?').unwrap_or(path.len());
+        match crate::policy_path::canonicalize_policy_path(&path[..path_end]) {
+            Ok(std::borrow::Cow::Borrowed(_)) => {}
+            Ok(std::borrow::Cow::Owned(canonical)) => path.replace_range(..path_end, &canonical),
+            Err(rejection) => return crate::proxy::reject_route_override_path(rejection),
+        }
+    }
 
     // Istio/Envoy preserve the original request query string on redirect by
     // default (Envoy `RedirectAction.strip_query` defaults to `false`), unless
@@ -5714,9 +5727,10 @@ mod tests {
             rewrite_request_path("/apiusers", "/v2", Some("/Api")),
             "/v2users"
         );
-        // A dot-leading suffix is the exception: fusing it would relabel the
-        // client's `..` as ordinary segment text, so the boundary is kept and
-        // the caller's canonical check still refuses the composition.
+        // A complete `.` / `..` suffix is the exception: fusing it would
+        // relabel the client's traversal operand as ordinary segment text,
+        // so the boundary is kept and the caller's canonical check still
+        // refuses the composition.
         assert_eq!(
             rewrite_request_path("/api../admin", "/v2", Some("/api")),
             "/v2/../admin"
@@ -5725,9 +5739,11 @@ mod tests {
             rewrite_request_path("/api./users", "/v2", Some("/api")),
             "/v2/./users"
         );
+        // Other dot-leading tails stay literal (`..hidden` is not a
+        // complete dot segment).
         assert_eq!(
             rewrite_request_path("/api..hidden/users", "/v2", Some("/api")),
-            "/v2/..hidden/users"
+            "/v2..hidden/users"
         );
         // A trailing separator on the replacement already supplies the
         // boundary, so nothing is synthesized on top of it.

@@ -542,13 +542,16 @@ async fn test_client_level_pool_settings_share_and_isolate() {
     );
 }
 
-/// Issue #4769: twelve proxies have six effective reqwest configurations.
+/// Issue #4769: thirteen proxies have seven effective reqwest configurations.
 /// Exercise real client insertion in both orders, so implicit window settings
 /// cannot inherit whichever incompatible client happened to be created first.
+/// The shipped default is fixed windows (issue #5464), so `default` is its own
+/// group and the adaptive cases anchor on an explicit `adaptive` proxy.
 #[tokio::test]
 async fn test_resolved_window_matrix_creates_one_pool_per_effective_configuration() {
     let cases = [
-        ("default", None, None, None, None, 0),
+        ("default", None, None, None, None, 6),
+        ("adaptive", Some(true), None, None, None, 0),
         ("implicit-small-stream", None, Some(65_535), None, None, 1),
         (
             "explicit-small-stream",
@@ -657,7 +660,7 @@ async fn test_resolved_window_matrix_creates_one_pool_per_effective_configuratio
                 assert!(stats.entries_per_host.contains_key(expected_key), "{name}");
             }
         }
-        assert_eq!(pool.get_stats().total_pools, 6);
+        assert_eq!(pool.get_stats().total_pools, 7);
     }
 }
 

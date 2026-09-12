@@ -709,7 +709,7 @@ that includes the identity / federation alerts when
 | Alert | Severity | Expression |
 |---|---|---|
 | `FerrumMeshCertificateExpiringSoon` | warning | `min by (spiffe_id, source) (ferrum_mesh_cert_expiry_seconds) < observability.alerts.certExpiringSeconds` (default 7d) |
-| `FerrumMeshSvidExpiringCritical` | critical | `min by (spiffe_id, source) (ferrum_mesh_cert_expiry_seconds) < observability.alerts.svidExpiringCriticalSeconds` (default 1h) |
+| `FerrumMeshSvidExpiringCritical` | critical | `min by (spiffe_id, source) (ferrum_mesh_cert_expiry_seconds) < observability.alerts.svidExpiringCriticalSeconds` (default 10m) |
 | `FerrumMeshCertificateRotationFailures` | critical | `sum by (spiffe_id, source) (increase(ferrum_mesh_cert_rotation_failures_total[10m])) > 0` |
 | `FerrumMeshCaUnhealthy` | critical | `min by (ca_type) (ferrum_mesh_ca_health) == 0` |
 | `FerrumMeshFederationBundleStale` | warning | `max by (trust_domain) (ferrum_mesh_federation_bundle_age_seconds) > observability.alerts.federationBundleStaleSeconds` (default 5m, or `2 * poll_interval`) |

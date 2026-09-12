@@ -20,7 +20,7 @@ FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS=45
 # HTTP/2 flow control tuning
 FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE=8388608       # 8 MiB
 FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE=33554432   # 32 MiB
-FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=true                  # default
+FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=false                 # default (issue #5464)
 FERRUM_POOL_HTTP2_MAX_FRAME_SIZE=1048576                # default: 1 MiB
 FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS=1000
 ```
@@ -36,12 +36,13 @@ proxies:
     pool_http2_keep_alive_timeout_seconds: 5
     pool_http2_initial_stream_window_size: 16777216   # 16 MiB
     pool_http2_initial_connection_window_size: 67108864  # 64 MiB
-    # Keep adaptive on explicitly when also setting fixed windows; otherwise
-    # an explicit window override auto-disables adaptive so fixed sizes apply.
-    pool_http2_adaptive_window: true
+    # Adaptive is off by default (issue #5464). Set it explicitly only when a
+    # backend connection is known to carry few streams; an explicit window
+    # override without an explicit adaptive setting auto-disables adaptive.
+    pool_http2_adaptive_window: false
 ```
 
-**Adaptive vs fixed window precedence:** shipped default is adaptive on (`true`). Hyper/reqwest adaptive windowing overrides `initial_stream_window_size` / `initial_connection_window_size`. Setting an explicit stream or connection window (global env/`ferrum.conf` or per-proxy `pool_http2_initial_*_window_size`) without also setting adaptive explicitly auto-disables adaptive at that config layer so the fixed windows take effect. Setting adaptive explicitly (including `true` alongside window overrides) remains authoritative. Direct `PoolConfig` construction for tests/code paths is unchanged — precedence applies only during env and per-proxy resolution.
+**Adaptive vs fixed window precedence:** shipped default is adaptive off (`false`, issue #5464), so the fixed 8 MiB / 32 MiB windows apply. When adaptive is enabled, hyper/reqwest adaptive windowing **replaces** `initial_stream_window_size` / `initial_connection_window_size`: both restart at 65535 bytes and the connection window grows only as the link is measured, which fragments hundreds of concurrent streams into sub-256-byte DATA frames and can trip h2's small-frame flood budget (`GOAWAY ENHANCE_YOUR_CALM too_many_data_frames`). Setting an explicit stream or connection window (global env/`ferrum.conf` or per-proxy `pool_http2_initial_*_window_size`) without also setting adaptive explicitly auto-disables adaptive at that config layer so the fixed windows take effect. Setting adaptive explicitly (including `true` alongside window overrides) remains authoritative. Direct `PoolConfig` construction for tests/code paths is unchanged — precedence applies only during env and per-proxy resolution.
 
 `pool_max_requests_per_connection` is accepted on proxies for backward compatibility, but it is currently a no-op at runtime. The shared reqwest/hyper HTTP client pool does not expose a stable per-connection request cap, so Ferrum validates and persists the field without applying it. DestinationRule `connectionPool.http.maxRequestsPerConnection` no longer projects into this proxy field; it is reported as deferred in Istio status instead. Values must be between 0 and 2,147,483,647; `0` preserves Istio's explicit unlimited value, and omitting the field preserves Ferrum's current unlimited behavior.
 
@@ -56,9 +57,9 @@ proxies:
 | `FERRUM_POOL_TCP_KEEPALIVE_SECONDS` | `60` | TCP keep-alive interval in seconds. Any `u64`, including `0` |
 | `FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS` | `30` | HTTP/2 keep-alive ping interval in seconds. Any `u64`, including `0` |
 | `FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS` | `45` | HTTP/2 keep-alive timeout in seconds. Any `u64`, including `0`; values below 10 warn |
-| `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` | `8388608` | Backend HTTP/2 per-stream flow-control window (bytes). Default: 8 MiB. Must be between 65535 and 134217728 (128 MiB). Inert while adaptive windowing remains enabled |
-| `FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE` | `33554432` | Backend HTTP/2 connection-level flow-control window (bytes). Default: 32 MiB. Must be between 65535 and 134217728 (128 MiB). Inert while adaptive windowing remains enabled |
-| `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` | `true` | Enable adaptive flow-control (BDP probing). Overrides fixed initial windows while enabled. Explicit window overrides auto-disable adaptive unless adaptive is also set explicitly. Accepted: `true`/`false`/`1`/`0` |
+| `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` | `8388608` | Backend HTTP/2 per-stream flow-control window (bytes). Default: 8 MiB. Must be between 65535 and 134217728 (128 MiB). Applies while adaptive windowing is off (the default); enabling adaptive replaces it with BDP probing that starts at 65535 bytes |
+| `FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE` | `33554432` | Backend HTTP/2 connection-level flow-control window (bytes). Default: 32 MiB. Must be between 65535 and 134217728 (128 MiB). Same adaptive-vs-fixed precedence as the stream window; h2 sizes its small-DATA-frame flood budget to half this window |
+| `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` | `false` | Enable adaptive flow-control (BDP probing) on backend HTTP/2 connections. Off by default (issue #5464): when enabled it replaces the fixed initial windows with a 65535-byte start that can trip h2's small-frame budget under high stream concurrency. Explicit window overrides auto-disable adaptive unless adaptive is also set explicitly. Accepted: `true`/`false`/`1`/`0` |
 | `FERRUM_POOL_HTTP2_MAX_FRAME_SIZE` | `1048576` | Maximum backend HTTP/2 frame payload (bytes). Must be between 16384 and 1048576. Default: 1 MiB |
 | `FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS` | `1000` | Max concurrent HTTP/2 streams per backend connection. When set, must be ≥ 1 |
 
@@ -120,7 +121,7 @@ Request-only policy fields stay out of the key and are applied at dispatch time 
 | `backend_read_timeout_ms` | **Yes** — always the requesting proxy's value | Applied per-request as a header-wait around `send()` plus an idle-between-frames bound on streaming bodies (`IdleReadTimeoutBody`). Not a reqwest total timeout: that clock would kill legitimate SSE. |
 | `backend_connect_timeout_ms` | **Yes** — always the requesting proxy's value | Applied per-request via `RequestBuilder::connect_timeout()` at dispatch time. The per-request `connect_timeout` API ships in a vendored copy of reqwest 0.13.3 with [seanmonstar/reqwest#3017](https://github.com/seanmonstar/reqwest/pull/3017) applied — see [`docs/upstream-reqwest-patches/001-per-request-connect-timeout/`](upstream-reqwest-patches/001-per-request-connect-timeout/README.md) for the lifecycle. Once the upstream PR merges in a release we consume, the vendored crate is dropped; the call sites already use the upstream API shape. |
 
-**Client-baked settings (reqwest `rcfg` key segment).** Divergent per-proxy values of `pool_idle_timeout_seconds`, TCP keepalive, and the H2 client knobs listed above produce distinct pool entries. Identical endpoint + identical effective `rcfg` values continue to share one client. Adaptive window (`aw=1`) overrides fixed initial windows in reqwest/hyper, so `sw`/`cw` are omitted from the key whenever adaptive is enabled (divergent fixed windows with adaptive on do not fragment). `pool_max_idle_per_host` remains global-only by deliberate tradeoff — per-proxy values would over-fragment without a per-request escape hatch. Secrets never appear in pool keys.
+**Client-baked settings (reqwest `rcfg` key segment).** Divergent per-proxy values of `pool_idle_timeout_seconds`, TCP keepalive, and the H2 client knobs listed above produce distinct pool entries. Identical endpoint + identical effective `rcfg` values continue to share one client. Adaptive window (`aw=1`) replaces fixed initial windows in reqwest/hyper, so `sw`/`cw` are omitted from the key whenever adaptive is enabled (divergent fixed windows with adaptive on do not fragment); under the shipped fixed-window default (`aw=0`) the key carries `sw`/`cw`. `pool_max_idle_per_host` remains global-only by deliberate tradeoff — per-proxy values would over-fragment without a per-request escape hatch. Secrets never appear in pool keys.
 
 The reqwest suffix is encoded from the same resolved `PoolConfig::for_proxy`
 used to construct its client. A fixed window with no explicit adaptive setting

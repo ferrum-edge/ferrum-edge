@@ -1431,10 +1431,13 @@ async fn rewritten_path_matrix(flavor: CoordinateFlavor) {
             ("/api/users", true, 200, Some("/base/v2/users")),
             ("/slash/users", true, 200, Some("/base/v2/users")),
             (
+                // `..hidden` is not a complete `.` / `..` segment, so the
+                // unmatched tail stays literal rather than gaining a
+                // synthesized separator.
                 "/api..hidden/users",
                 true,
                 200,
-                Some("/base/v2/..hidden/users"),
+                Some("/base/v2..hidden/users"),
             ),
             ("/other/users", true, 200, Some("/base/other/users")),
         ] {
