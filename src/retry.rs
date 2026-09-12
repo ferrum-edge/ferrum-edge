@@ -1125,6 +1125,69 @@ pub fn error_is_tls_close_without_notify(error: &(dyn StdError + 'static)) -> bo
     false
 }
 
+/// Operator-facing reason when a TLS handshake failed because the backend
+/// spoke plaintext HTTP while `backend_scheme` is `https` (the HTTP-family
+/// default when omitted). Issue #5460.
+///
+/// Not a new [`ErrorClass`]: the failure stays [`ErrorClass::TlsError`] so
+/// retry, circuit-breaker, and the client-facing
+/// `X-Gateway-Error: connection_failure` contract are unchanged. Logs attach
+/// this token as `error_reason`.
+pub const ERROR_REASON_HTTPS_TO_PLAINTEXT: &str = "https_to_plaintext_backend";
+
+/// Characteristic TLS-handshake wording when a plaintext HTTP/1.x peer
+/// answers an `https` dial (OpenSSL `wrong version number`, rustls
+/// `InvalidContentType` / `UnknownProtocolVersion`, an HTTP/1.x status line
+/// arriving as a TLS record).
+pub fn https_to_plaintext_from_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("wrong version number")
+        || lower.contains("invalid tls record")
+        || lower.contains("invalid content type")
+        || message.contains("InvalidContentType")
+        || message.contains("UnknownProtocolVersion")
+        || lower.contains("http/1.0 ")
+        || lower.contains("http/1.1 ")
+}
+
+/// Typed rustls variants that characteristically mean the peer sent
+/// plaintext (or otherwise non-TLS) bytes during the handshake.
+fn rustls_error_looks_like_https_to_plaintext(err: &rustls::Error) -> bool {
+    matches!(
+        err,
+        rustls::Error::InvalidMessage(
+            rustls::InvalidMessage::InvalidContentType
+                | rustls::InvalidMessage::UnknownProtocolVersion
+                | rustls::InvalidMessage::InvalidCcs,
+        ),
+    )
+}
+
+/// True when a backend dial/handshake error is the HTTPS-to-plaintext
+/// mismatch (issue #5460). Prefers a typed `rustls::Error` in the chain,
+/// then falls back to Display wording for OpenSSL / stringly wrappers.
+pub fn error_looks_like_https_to_plaintext(error: &(dyn StdError + 'static)) -> bool {
+    if let Some(rustls_err) = rustls_error_from_chain(error)
+        && rustls_error_looks_like_https_to_plaintext(rustls_err)
+    {
+        return true;
+    }
+    let mut current = Some(error);
+    while let Some(err) = current {
+        if https_to_plaintext_from_message(&err.to_string()) {
+            return true;
+        }
+        if let Some(io_err) = err.downcast_ref::<std::io::Error>()
+            && let Some(inner) = io_err.get_ref()
+        {
+            current = Some(inner as &(dyn StdError + 'static));
+            continue;
+        }
+        current = err.source();
+    }
+    false
+}
+
 /// Tightened substring fallback for boxed/reqwest errors when the typed
 /// walk is exhausted.
 ///

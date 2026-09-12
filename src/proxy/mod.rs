@@ -93,6 +93,7 @@ pub mod host_udp_capture;
 #[path = "host_udp_capture_live_tests.rs"]
 mod host_udp_capture_live_tests;
 pub mod http2_pool;
+pub(crate) mod https_to_plaintext;
 /// Unbuffered rustls server handshake used to hand a frontend-TLS TCP socket
 /// to the kernel TLS ULP (issue #3619). Linux-only: every other platform keeps
 /// the buffered tokio-rustls accept and the userspace relay.
@@ -3387,6 +3388,11 @@ fn http2_pool_sender_error_response(
     if matches!(h2_error_class, retry::ErrorClass::PortExhaustion) {
         state.overload.record_port_exhaustion();
     }
+    https_to_plaintext::maybe_warn_https_to_plaintext_backend(
+        proxy,
+        &format!("{}:{}", proxy.backend_host, proxy.backend_port),
+        err,
+    );
     error!(proxy_id = %proxy.id, error = %msg, "HTTP/2 pool connection failed");
     // Derive status/body/connection_error from the class so a gateway-side
     // egress denial (DispatchPolicyRejected) stays non-retryable and
@@ -15043,6 +15049,11 @@ async fn handle_websocket_request_authenticated(
                 // `retry_on_connect_failure` and do NOT charge passive
                 // health as a connect-class failure.
                 let ws_error_class = retry::classify_boxed_setup_error(e.as_ref());
+                https_to_plaintext::maybe_warn_https_to_plaintext_backend(
+                    proxy,
+                    &current_backend_url,
+                    e.as_ref(),
+                );
                 let ws_is_pre_wire = !retry::request_reached_wire(ws_error_class);
                 // A gateway-side egress-policy rejection (denied literal-IP
                 // backend) never reached a backend: it must be non-retryable AND
@@ -36729,6 +36740,11 @@ async fn handle_proxy_request_inner(
             }
             Err(e) => {
                 let grpc_error_class = retry::classify_grpc_proxy_error(&e);
+                https_to_plaintext::maybe_warn_https_to_plaintext_backend(
+                    proxy,
+                    &format!("{}:{}", proxy.backend_host, proxy.backend_port),
+                    &e,
+                );
                 let grpc_backend_connection_error = matches!(
                     &e,
                     GrpcProxyError::BackendUnavailable { kind, message, .. }
@@ -41541,6 +41557,11 @@ pub(crate) async fn proxy_to_backend_retry(
             // `retry_on_connect_failure` another chance against the next
             // upstream target. A post-wire read/write timeout is 504, not a
             // generic 502 (#3922).
+            https_to_plaintext::maybe_warn_https_to_plaintext_backend(
+                proxy,
+                strip_query_params(backend_url),
+                &e,
+            );
             let error_kind = retry::error_class_log_kind(error_class);
             error!(
                 proxy_id = %proxy.id,
@@ -45618,6 +45639,11 @@ async fn proxy_to_backend(
             // direct H2, gRPC, and H3 paths. Post-wire read/write deadline
             // expiry is 504 with a timeout-specific body (#3922); genuine
             // connect/refused failures stay 502.
+            https_to_plaintext::maybe_warn_https_to_plaintext_backend(
+                proxy,
+                strip_query_params(backend_url),
+                &e,
+            );
             let error_kind = retry::error_class_log_kind(error_class);
             error!(
                 proxy_id = %proxy.id,

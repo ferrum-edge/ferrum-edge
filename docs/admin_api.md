@@ -576,7 +576,12 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
     "strip_listen_path": true
   }' \
   http://localhost:9000/proxies
+```
 
+Plaintext backends need `backend_scheme: http`. Omitting `backend_scheme` on
+`POST /proxies` stores `https` (the HTTP-family default).
+
+```bash
 # Get a proxy
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/proxies/{proxy_id}
 

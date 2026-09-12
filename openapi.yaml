@@ -4816,6 +4816,10 @@ paths:
           description: |
             Proxy created. In database mode a covering `config_changes`
             generation is already live on this process.
+
+            HTTP-family `backend_scheme` defaults to `https` when omitted and
+            the stored scheme is returned on this response. Plaintext backends
+            must set `backend_scheme: http`.
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
@@ -8940,7 +8944,9 @@ components:
           description: >-
             Wire-level scheme the proxy uses to talk to its backend.
             Optional for HTTP-family proxies — defaults to `https` when
-            omitted. **Required for stream-family proxies** (`tcp`, `tcps`,
+            omitted. Plaintext backends must set `backend_scheme: http`;
+            otherwise an HTTPS dial of an HTTP origin fails with a generic
+            502. **Required for stream-family proxies** (`tcp`, `tcps`,
             `udp`, `dtls`); validation rejects stream proxies that omit it.
 
             gRPC and WebSocket are no longer schemes — they are detected
@@ -9464,6 +9470,8 @@ components:
         - Stream-family proxies (`tcp`/`tcps`/`udp`/`dtls`): `listen_path`
           MUST be null/omitted, and `listen_port` MUST be set,
           and `backend_scheme` MUST be set explicitly.
+        - HTTP-family `backend_scheme` defaults to `https` when omitted.
+          Plaintext backends must set `backend_scheme: http`.
         - Unknown fields are rejected. Backend H3 selection is runtime
           capability-driven for `Https` backends — there is no scheme for it.
         - `backend_host` and `backend_port` may be omitted when `upstream_id`
