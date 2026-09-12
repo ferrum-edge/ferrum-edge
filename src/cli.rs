@@ -115,6 +115,17 @@ pub struct ValidateArgs {
     /// Increase log verbosity (-v=info, -vv=debug, -vvv=trace).
     #[arg(short = 'v', long = "verbose", action = ArgAction::Count)]
     pub verbose: u8,
+
+    /// Accept a document that contains namespaced resources but none survive
+    /// `FERRUM_NAMESPACE` filtering.
+    ///
+    /// Without this flag, `validate` in file mode and mesh file protocol fails
+    /// closed (exit 1) when the spec is non-empty and the active namespace
+    /// filter leaves zero resources. Operators validating a multi-namespace
+    /// document against one namespace can pass this flag to keep exit 0 and
+    /// emit a warning instead. Runtime (`run`) is unchanged.
+    #[arg(long = "allow-empty-namespace")]
+    pub allow_empty_namespace: bool,
 }
 
 #[derive(clap::Args)]
@@ -924,7 +935,7 @@ fn report_field(env_key: &str, rendered: &str) -> String {
 }
 
 /// Validate configuration without starting the gateway.
-pub fn execute_validate() -> Result<(), String> {
+pub fn execute_validate(args: &ValidateArgs) -> Result<(), String> {
     use crate::config::{EnvConfig, OperatingMode, file_loader};
     use crate::modes::mesh::MeshConfigProtocol;
     use crate::modes::startup_security::{StartupSecurityScope, load_startup_security};
@@ -937,6 +948,10 @@ pub fn execute_validate() -> Result<(), String> {
     println!(
         "  Mode: {}",
         report_field("FERRUM_MODE", &format!("{:?}", env_config.mode))
+    );
+    println!(
+        "  Namespace: {}",
+        report_field("FERRUM_NAMESPACE", &env_config.namespace)
     );
 
     if env_config.mode == OperatingMode::File {
@@ -983,13 +998,29 @@ pub fn execute_validate() -> Result<(), String> {
             "Spec ({}): OK",
             report_field("FERRUM_FILE_CONFIG_PATH", config_path)
         );
-        // The counts below are cardinalities of the *loaded spec document*, not
-        // renderings of any environment value, so there is nothing key-tied to
-        // withhold and nothing an external source could have supplied.
+        // The counts below are cardinalities of the *loaded, namespace-filtered
+        // spec document*, not renderings of any environment value, so there
+        // is nothing key-tied to withhold and nothing an external source could
+        // have supplied. The active namespace is printed above with Mode.
         println!("  Proxies: {}", config.proxies.len());
         println!("  Consumers: {}", config.consumers.len());
         println!("  Upstreams: {}", config.upstreams.len());
         println!("  Plugin configs: {}", config.plugin_configs.len());
+
+        report_empty_namespace_filter(
+            &ValidateNamespaceFilter {
+                active_namespace: env_config.namespace.clone(),
+                document_namespaces: config.known_namespaces.clone(),
+                document_had_namespaced_resources: !config.known_namespaces.is_empty(),
+                count_fields: vec![
+                    ("proxies", config.proxies.len()),
+                    ("consumers", config.consumers.len()),
+                    ("upstreams", config.upstreams.len()),
+                    ("plugin_configs", config.plugin_configs.len()),
+                ],
+            },
+            args.allow_empty_namespace,
+        )?;
     }
 
     // Env-level TLS/security surfaces that `run` hard-fails on must also fail
@@ -1019,26 +1050,50 @@ pub fn execute_validate() -> Result<(), String> {
             })?;
             match runtime.config_protocol {
                 MeshConfigProtocol::File => {
-                    crate::modes::mesh::config_consumer::file_source::load_mesh_slice_from_file(
-                        std::path::Path::new(path),
-                        runtime.mesh_slice_request(),
-                    )
-                    .map_err(|e| format!("Mesh spec validation failed: {e}"))?;
+                    let (slice, document) =
+                        crate::modes::mesh::validate::load_localized_slice_for_validate(
+                            std::path::Path::new(path),
+                            runtime.mesh_slice_request(),
+                        )
+                        .map_err(|e| format!("Mesh spec validation failed: {e}"))?;
+                    let surviving =
+                        crate::modes::mesh::validate::MeshValidateInventory::from_slice(&slice);
+                    let had_namespaced = document.document_resource_count > 0;
+                    println!(
+                        "Mesh spec ({}): OK",
+                        report_field("FERRUM_MESH_FILE_CONFIG_PATH", path)
+                    );
+                    println!("  Workloads: {}", surviving.workloads);
+                    println!("  Services: {}", surviving.services);
+                    println!("  Policies: {}", surviving.policies);
+                    report_empty_namespace_filter(
+                        &ValidateNamespaceFilter {
+                            active_namespace: env_config.namespace.clone(),
+                            document_namespaces: document.document_namespaces,
+                            document_had_namespaced_resources: had_namespaced,
+                            count_fields: vec![
+                                ("workloads", surviving.workloads),
+                                ("services", surviving.services),
+                                ("policies", surviving.policies),
+                            ],
+                        },
+                        args.allow_empty_namespace,
+                    )?;
                 }
                 MeshConfigProtocol::StockXds => {
                     crate::modes::mesh::config_consumer::stock_xds_client::load_stock_policy_baseline(
                         std::path::Path::new(path),
                     )
                     .map_err(|e| format!("Mesh spec validation failed: {e}"))?;
+                    println!(
+                        "Mesh spec ({}): OK",
+                        report_field("FERRUM_MESH_FILE_CONFIG_PATH", path)
+                    );
                 }
                 MeshConfigProtocol::Native | MeshConfigProtocol::Xds => {
                     return Err("internal mesh validation protocol mismatch".to_string());
                 }
             }
-            println!(
-                "Mesh spec ({}): OK",
-                report_field("FERRUM_MESH_FILE_CONFIG_PATH", path)
-            );
         }
         println!("Mesh runtime: OK");
     }
@@ -1070,6 +1125,73 @@ pub fn execute_validate() -> Result<(), String> {
 
     println!("\nValidation passed.");
     Ok(())
+}
+
+/// Namespace-filter snapshot used by `ferrum-edge validate` (issues #5450 / #5451).
+///
+/// Filtering itself is unchanged: this is assembled from the already-loaded
+/// file-mode `GatewayConfig` or the mesh file-protocol `MeshSlice`. A document
+/// with no namespaced resources is not a mismatch even when the surviving
+/// counts are zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidateNamespaceFilter {
+    pub active_namespace: String,
+    pub document_namespaces: Vec<String>,
+    pub document_had_namespaced_resources: bool,
+    pub count_fields: Vec<(&'static str, usize)>,
+}
+
+impl ValidateNamespaceFilter {
+    /// True when the document had at least one namespaced resource and none
+    /// survived the active `FERRUM_NAMESPACE` filter.
+    pub fn is_empty_mismatch(&self) -> bool {
+        self.document_had_namespaced_resources && self.surviving_count() == 0
+    }
+
+    pub fn surviving_count(&self) -> usize {
+        self.count_fields.iter().map(|(_, count)| *count).sum()
+    }
+
+    /// Operator-facing diagnostic naming the active namespace, the namespaces
+    /// present in the document, and the post-filter counts.
+    pub fn diagnostic(&self) -> String {
+        let counts = self
+            .count_fields
+            .iter()
+            .map(|(name, count)| format!("{name}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let namespaces = if self.document_namespaces.is_empty() {
+            "(none)".to_string()
+        } else {
+            self.document_namespaces.join(", ")
+        };
+        format!(
+            "namespace filter mismatch: active namespace '{}' left 0 surviving resources \
+             ({counts}); document namespaces: {namespaces}",
+            report_field("FERRUM_NAMESPACE", &self.active_namespace)
+        )
+    }
+}
+
+fn report_empty_namespace_filter(
+    report: &ValidateNamespaceFilter,
+    allow_empty: bool,
+) -> Result<(), String> {
+    if !report.is_empty_mismatch() {
+        return Ok(());
+    }
+    let diagnostic = report.diagnostic();
+    if allow_empty {
+        println!("WARNING: {diagnostic}");
+        println!("  Continuing because --allow-empty-namespace was set.");
+        Ok(())
+    } else {
+        Err(format!(
+            "{diagnostic}. Set FERRUM_NAMESPACE to a namespace present in the document, \
+             or pass --allow-empty-namespace to accept an empty filtered document."
+        ))
+    }
 }
 
 const HEALTH_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);

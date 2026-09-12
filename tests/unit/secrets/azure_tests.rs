@@ -4,32 +4,7 @@ use ferrum_edge::secrets::{
     azure_apply_tls_version_option, azure_parse_keyvault_reference, resolve_secret,
 };
 
-use crate::unit::env_lock::ENV_LOCK;
-
-fn with_env_vars_async<F, Fut>(vars: &[(&str, &str)], f: F)
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = ()>,
-{
-    let _guard = ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for (k, v) in vars {
-        unsafe {
-            std::env::set_var(k, v);
-        }
-    }
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(f());
-    for (k, _) in vars {
-        unsafe {
-            std::env::remove_var(k);
-        }
-    }
-}
+use crate::unit::env_lock::with_env_vars_async;
 
 #[test]
 fn test_azure_ref_conflict_with_direct_value() {

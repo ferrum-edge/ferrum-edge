@@ -6,7 +6,7 @@
 
 use ferrum_edge::config::EnvConfig;
 
-use crate::unit::env_lock::ENV_LOCK;
+use crate::unit::env_lock::with_env_vars;
 
 const TLS_OFFLOAD_NOT_IMPLEMENTED: &str =
     "FERRUM_TLS_OFFLOAD_THREADS must remain 0; TLS handshake offload is not implemented";
@@ -15,31 +15,6 @@ const FILE_MODE: &[(&str, &str)] = &[
     ("FERRUM_MODE", "file"),
     ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
 ];
-
-fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
-    let _guard = ENV_LOCK.lock().unwrap();
-    // SAFETY: We hold ENV_LOCK, so no other test is reading or writing env.
-    unsafe {
-        std::env::remove_var("FERRUM_TLS_OFFLOAD_THREADS");
-    }
-    for (k, v) in vars {
-        // SAFETY: We hold ENV_LOCK preventing concurrent env access.
-        unsafe {
-            std::env::set_var(k, v);
-        }
-    }
-    f();
-    for (k, _) in vars {
-        // SAFETY: We hold ENV_LOCK preventing concurrent env access.
-        unsafe {
-            std::env::remove_var(k);
-        }
-    }
-    // SAFETY: restore the reserved var to unset after the test body.
-    unsafe {
-        std::env::remove_var("FERRUM_TLS_OFFLOAD_THREADS");
-    }
-}
 
 #[test]
 fn tls_offload_threads_unset_defaults_to_zero() {

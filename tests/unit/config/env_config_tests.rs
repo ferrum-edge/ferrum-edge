@@ -9,28 +9,11 @@ use ferrum_edge::config::{DbTlsMode, EnvConfig, OperatingMode};
 use ferrum_edge::dp_config_freshness::StaleAction;
 use ferrum_edge::ebpf::NodeAgentProxyMode;
 
-// Shared process-wide env lock: serializes against the identity guardrail
-// tests that also mutate `FERRUM_MESH_PRODUCTION_MODE` (see tests/unit/env_lock.rs).
-use crate::unit::env_lock::ENV_LOCK;
-
-/// Helper to set env vars, run a closure, then clean them up.
-/// Holds a mutex to prevent concurrent env var mutations.
-fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
-    let _guard = ENV_LOCK.lock().unwrap();
-    for (k, v) in vars {
-        // SAFETY: We hold a mutex preventing concurrent access.
-        unsafe {
-            std::env::set_var(k, v);
-        }
-    }
-    f();
-    for (k, _) in vars {
-        // SAFETY: We hold a mutex preventing concurrent access.
-        unsafe {
-            std::env::remove_var(k);
-        }
-    }
-}
+// Shared process-wide env isolation: serializes against the identity
+// guardrail tests that also mutate `FERRUM_MESH_PRODUCTION_MODE` and
+// hides ambient `FERRUM_*` from a locally running gateway
+// (see tests/unit/env_lock.rs).
+use crate::unit::env_lock::with_env_vars;
 
 /// A Workload API socket path whose every directory component the production
 /// socket contract admits on this host.

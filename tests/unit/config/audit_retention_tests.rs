@@ -14,24 +14,7 @@ use ferrum_edge::admin::audit::{
 use ferrum_edge::config::EnvConfig;
 use std::sync::Arc;
 
-use crate::unit::env_lock::ENV_LOCK;
-
-fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
-    let _guard = ENV_LOCK.lock().unwrap();
-    for (k, v) in vars {
-        // SAFETY: We hold a mutex preventing concurrent access.
-        unsafe {
-            std::env::set_var(k, v);
-        }
-    }
-    f();
-    for (k, _) in vars {
-        // SAFETY: We hold a mutex preventing concurrent access.
-        unsafe {
-            std::env::remove_var(k);
-        }
-    }
-}
+use crate::unit::env_lock::with_env_vars;
 
 const DB_LOADER_SOURCE: &str = include_str!("../../../src/config/db_loader.rs");
 const MONGO_INDEX_PLAN_SOURCE: &str = include_str!("../../../src/config/mongo_index_plan.rs");

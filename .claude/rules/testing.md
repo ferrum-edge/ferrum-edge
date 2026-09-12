@@ -33,6 +33,17 @@ paths:
 - Sharing `SCCACHE_DIR` is safe. The repo `.cargo/config.toml` already uses `sccache`.
 - Within one workspace, run fmt, clippy, and tests sequentially because they share that workspace target dir.
 
+## Environment Isolation
+
+Unit tests that use `tests/unit/env_lock.rs` (`EnvGuard`, `with_env_vars`,
+`without_env_vars`, `with_env_vars_async`, `StreamAuthMaxLifetimeGuard`) isolate
+every ambient `FERRUM_*` variable for the duration of the guard: they snapshot
+the process environment, remove those keys, then restore them on drop while
+holding the process-wide `ENV_LOCK`. Running a local gateway in the same shell
+does not poison `cargo test --test unit_tests` (or the other unit targets). A
+test that needs a specific `FERRUM_*` value must set it explicitly inside the
+guard; do not rely on host environment.
+
 ## Test Placement
 
 - Prefer external tests under `tests/` over new inline `#[cfg(test)] mod tests` in production source files.

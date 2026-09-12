@@ -168,3 +168,120 @@ fn set_env(key: &str, value: &str) {
     // helper hold the process-wide env lock.
     unsafe { std::env::set_var(key, value) };
 }
+
+/// Namespaced-resource inventory for `ferrum-edge validate -m mesh`.
+///
+/// Document counts are collected from the localized mesh section BEFORE
+/// `MeshSlice::from_gateway_config` narrows it, so a namespace-filter mismatch
+/// can be reported without changing how filtering works. Slice counts are the
+/// post-filter serving view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshValidateInventory {
+    pub document_namespaces: Vec<String>,
+    pub document_resource_count: usize,
+    pub workloads: usize,
+    pub services: usize,
+    pub policies: usize,
+}
+
+impl MeshValidateInventory {
+    pub fn from_mesh_config(mesh: &crate::modes::mesh::config::MeshConfig) -> Self {
+        use std::collections::BTreeSet;
+
+        let mut namespaces = BTreeSet::new();
+        let mut document_resource_count = 0usize;
+        let mut consider = |namespace: &str| {
+            if namespace.is_empty() {
+                return;
+            }
+            namespaces.insert(namespace.to_string());
+            document_resource_count += 1;
+        };
+
+        for workload in &mesh.workloads {
+            consider(&workload.namespace);
+        }
+        for service in &mesh.services {
+            consider(&service.namespace);
+        }
+        for entry in &mesh.service_entries {
+            consider(&entry.namespace);
+        }
+        for policy in &mesh.mesh_policies {
+            consider(&policy.namespace);
+        }
+        for peer_auth in &mesh.peer_authentications {
+            consider(&peer_auth.namespace);
+        }
+        for request_auth in &mesh.request_authentications {
+            consider(&request_auth.namespace);
+        }
+        for telemetry in &mesh.telemetry_resources {
+            consider(&telemetry.namespace);
+        }
+        for destination_rule in &mesh.destination_rules {
+            consider(&destination_rule.namespace);
+        }
+        for cors in &mesh.virtual_service_cors_policies {
+            consider(&cors.namespace);
+        }
+        for proxy_config in &mesh.proxy_configs {
+            consider(&proxy_config.namespace);
+        }
+
+        Self {
+            document_namespaces: namespaces.into_iter().collect(),
+            document_resource_count,
+            workloads: mesh.workloads.len(),
+            services: mesh.services.len() + mesh.service_entries.len(),
+            policies: mesh.mesh_policies.len()
+                + mesh.peer_authentications.len()
+                + mesh.request_authentications.len()
+                + mesh.telemetry_resources.len()
+                + mesh.destination_rules.len()
+                + mesh.virtual_service_cors_policies.len()
+                + mesh.proxy_configs.len(),
+        }
+    }
+
+    pub fn from_slice(slice: &crate::modes::mesh::slice::MeshSlice) -> Self {
+        Self {
+            document_namespaces: Vec::new(),
+            document_resource_count: 0,
+            workloads: slice.workloads.len(),
+            services: slice.services.len() + slice.service_entries.len(),
+            policies: slice.mesh_policies.len()
+                + slice.peer_authentications.len()
+                + slice.request_authentications.len()
+                + slice.telemetry_resources.len()
+                + slice.destination_rules.len()
+                + slice.virtual_service_cors_policies.len()
+                + slice.proxy_configs.len(),
+        }
+    }
+
+    pub fn surviving(&self) -> usize {
+        self.workloads + self.services + self.policies
+    }
+}
+
+/// Localized-slice load used only by `ferrum-edge validate`.
+///
+/// Same parse → normalize → `from_gateway_config` pipeline as runtime file
+/// protocol (`load_mesh_slice_from_file`); the extra inventory is collected from
+/// the document before slice narrowing.
+pub fn load_localized_slice_for_validate(
+    path: &Path,
+    request: crate::modes::mesh::slice::MeshSliceRequest,
+) -> Result<(crate::modes::mesh::slice::MeshSlice, MeshValidateInventory), anyhow::Error> {
+    use crate::modes::mesh::config_consumer::file_source::{
+        normalized_mesh_gateway_config, read_mesh_config_document,
+    };
+    use crate::modes::mesh::slice::MeshSlice;
+
+    let mesh = read_mesh_config_document(path)?;
+    let document = MeshValidateInventory::from_mesh_config(&mesh);
+    let config = normalized_mesh_gateway_config(mesh)?;
+    let slice = MeshSlice::from_gateway_config(&config, request);
+    Ok((slice, document))
+}
