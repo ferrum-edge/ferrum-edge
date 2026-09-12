@@ -2452,29 +2452,55 @@ fn unserved_namespace_warned() -> std::sync::MutexGuard<'static, HashSet<(String
 /// limited to one line per [`UNSERVED_NAMESPACE_WARN_WINDOW_MS`] once the
 /// bounded dedup set is full. Called only after the dispatcher returned `2xx`:
 /// a rejected write is not the silent-success condition being reported.
+/// Outcome of consulting the bounded `(namespace, resource kind)` dedup set in
+/// [`note_unserved_namespace_mutation`].
+enum UnservedWarnAdmission {
+    /// Newly seen and remembered: emit the WARN.
+    First,
+    /// Already reported for this process: emit nothing.
+    AlreadyWarned,
+    /// The set is at capacity and could not remember this key: rate limit.
+    SetFull,
+}
+
 fn note_unserved_namespace_mutation(marker: &UnservedNamespaceMutation) {
     let total = UNSERVED_NAMESPACE_MUTATION_COUNT
         .fetch_add(1, Ordering::Relaxed)
         .saturating_add(1);
     let key = (marker.namespace.clone(), marker.resource_kind);
-    let first_for_key = {
+    let admission = {
         let mut warned = unserved_namespace_warned();
-        // Short-circuit order matters: the cap is checked before the insert so a
-        // caller cycling namespace values cannot grow the set, and `insert`
-        // answers "newly seen" for the keys that do fit.
-        warned.len() < UNSERVED_NAMESPACE_WARN_MAX_KEYS && warned.insert(key)
-    };
-    if !first_for_key {
-        let now = crate::socket_opts::monotonic_now_ms();
-        let last = UNSERVED_NAMESPACE_WARN_LAST_MS.load(Ordering::Relaxed);
-        if last != 0 && now.saturating_sub(last) < UNSERVED_NAMESPACE_WARN_WINDOW_MS {
-            return;
+        if warned.contains(&key) {
+            UnservedWarnAdmission::AlreadyWarned
+        } else if warned.len() < UNSERVED_NAMESPACE_WARN_MAX_KEYS {
+            // The cap is checked before the insert so a caller cycling
+            // namespace values cannot grow the set without bound.
+            warned.insert(key);
+            UnservedWarnAdmission::First
+        } else {
+            UnservedWarnAdmission::SetFull
         }
-        if UNSERVED_NAMESPACE_WARN_LAST_MS
-            .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-        {
-            return;
+    };
+    match admission {
+        UnservedWarnAdmission::First => {}
+        // This `(namespace, resource kind)` pair was already reported: stay
+        // silent for the rest of the process lifetime, which is the dedup.
+        UnservedWarnAdmission::AlreadyWarned => return,
+        // The bounded set cannot remember any more keys, so fall back to one
+        // line per window: the condition stays visible without flooding the
+        // log when a client cycles through many namespaces.
+        UnservedWarnAdmission::SetFull => {
+            let now = crate::socket_opts::monotonic_now_ms();
+            let last = UNSERVED_NAMESPACE_WARN_LAST_MS.load(Ordering::Relaxed);
+            if last != 0 && now.saturating_sub(last) < UNSERVED_NAMESPACE_WARN_WINDOW_MS {
+                return;
+            }
+            if UNSERVED_NAMESPACE_WARN_LAST_MS
+                .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+            {
+                return;
+            }
         }
     }
     UNSERVED_NAMESPACE_WARN_EMITTED.fetch_add(1, Ordering::Relaxed);
