@@ -27237,6 +27237,46 @@ pub(crate) async fn enforce_buffered_final_client_visible_response_header_policy
     true
 }
 
+/// Whether the staged MCP POST-attached SSE publication describes EXACTLY the
+/// response that is about to reach the client.
+///
+/// The reservation promised one `200 text/event-stream` body. Only those bytes,
+/// under that status and representation, may enter `Last-Event-ID` replay
+/// history: anything a later policy, header phase, committed hook, or the
+/// pre-commit authorization gate replaced or refused fails this check and is
+/// aborted instead. Fail-closed in every direction — an absent or renamed
+/// content type, a rewritten body, or a deliverable (non-POST-attached)
+/// reservation all read as "not accepted".
+pub(crate) fn mcp_sse_publication_matches_response(
+    publication: &crate::plugins::mcp_aggregate_sse::AggregateSsePublication,
+    response_status: u16,
+    response_headers: &HashMap<String, String>,
+    response_body: &[u8],
+) -> bool {
+    response_status == 200
+        && response_headers_select_event_stream(response_headers)
+        && publication.matches_post_attached_body(response_body)
+}
+
+/// Settle a staged MCP POST-attached SSE publication exactly once.
+///
+/// `accepted` is [`mcp_sse_publication_matches_response`] plus whatever else the
+/// transport knows about the write. Committing is what makes the event
+/// resumable; aborting releases the reservation and returns the request stream's
+/// per-session capacity. Both are idempotent, and dropping the lease without
+/// calling either aborts, so no path can leak capacity or a payload.
+pub(crate) fn settle_mcp_sse_publication(
+    publication: crate::plugins::mcp_aggregate_sse::AggregateSsePublication,
+    accepted: bool,
+) -> bool {
+    if accepted {
+        publication.commit().is_ok()
+    } else {
+        publication.abort();
+        false
+    }
+}
+
 /// Re-close policy over a representation selected by a legacy final-body hook.
 pub(crate) async fn enforce_late_buffered_final_response_policy(
     plugins: &[Arc<dyn Plugin>],
@@ -38974,17 +39014,23 @@ async fn handle_proxy_request_inner(
         // derivation below must not describe this as a streamed response.
         is_streaming_response = false;
     }
+    // Retention boundary for an MCP POST-attached SSE response (issue #5441).
+    // Everything that can still replace or refuse this response has now run:
+    // the late final body/header policy, the committed hooks, and the
+    // authoritative pre-commit authorization gate above. Only now may the
+    // staged event become `Last-Event-ID` replay history, and only if the bytes
+    // that reach the client are still exactly the ones it promised.
     if let Some(publication) = ctx.mcp_sse_publication.take() {
-        let accepted = response_status == 200
-            && response_headers
-                .get("content-type")
-                .is_some_and(|value| value.starts_with("text/event-stream"))
-            && matches!(&response_body, ResponseBody::Buffered(body) if publication.matches_post_attached_body(body));
-        if accepted {
-            let _ = publication.commit();
-        } else {
-            publication.abort();
+        let mut accepted = false;
+        if let ResponseBody::Buffered(ref body) = response_body {
+            accepted = mcp_sse_publication_matches_response(
+                &publication,
+                response_status,
+                &response_headers,
+                body,
+            );
         }
+        settle_mcp_sse_publication(publication, accepted);
     }
     // Whether the gate above could ever have fired for this request. The
     // buffered terminal-log arm below uses this to decide whether it may await

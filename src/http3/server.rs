@@ -7396,7 +7396,6 @@ async fn handle_h3_request(
         response_headers
             .entry("content-type".to_string())
             .or_insert_with(|| "application/json".to_string());
-
         let status_code = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
         let resp_builder =
             apply_response_headers(Response::builder().status(status_code), &response_headers);
@@ -9675,14 +9674,23 @@ async fn handle_h3_request(
                 }
             }};
         }
-        let mcp_publication_accepted =
-            ctx.mcp_sse_publication.as_ref().is_some_and(|publication| {
-                response_status == 200
-                    && response_headers
-                        .get("content-type")
-                        .is_some_and(|value| value.starts_with("text/event-stream"))
-                    && publication.matches_post_attached_body(&response_body)
-            });
+        // Retention boundary for an MCP POST-attached SSE response (issue
+        // #5441). The predicate is read here, while the body still exists, but
+        // the publication is settled only after the write below: on native H3
+        // the bytes reach the client through this send loop, so a response the
+        // transport never delivered must not become replayable either. Taking
+        // the lease now also means every remaining exit — a write error, the
+        // deadline terminal, a panic — drops it, and the drop aborts.
+        let mcp_publication = ctx.mcp_sse_publication.take();
+        let mut mcp_publication_accepted = false;
+        if let Some(publication) = mcp_publication.as_ref() {
+            mcp_publication_accepted = crate::proxy::mcp_sse_publication_matches_response(
+                publication,
+                response_status,
+                &response_headers,
+                &response_body,
+            );
+        }
         let response_headers_sent = await_buffered_h3_write!(stream.send_response(resp));
         if response_headers_sent
             && !response_body.is_empty()
@@ -9690,12 +9698,11 @@ async fn handle_h3_request(
         {
             bytes_received = response_body_bytes;
         }
-        if let Some(publication) = ctx.mcp_sse_publication.take() {
-            if mcp_publication_accepted && bytes_received == response_body_bytes {
-                let _ = publication.commit();
-            } else {
-                publication.abort();
-            }
+        if let Some(publication) = mcp_publication {
+            crate::proxy::settle_mcp_sse_publication(
+                publication,
+                mcp_publication_accepted && bytes_received == response_body_bytes,
+            );
         }
 
         // Backend trailers survive to here only when no response-body plugin

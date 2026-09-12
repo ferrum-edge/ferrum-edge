@@ -711,11 +711,8 @@ async fn reserved_publication_is_invisible_and_protects_commit_capacity() {
         "a reservation must not become listener-visible before commit"
     );
 
-    assert_eq!(
-        publish(&broker, "sess-reserved", 2).unwrap_err(),
-        SseError::RetentionOverflow,
-        "an assigned POST cursor serializes later publication until commit"
-    );
+    publish(&broker, "sess-reserved", 2)
+        .expect("one direct publication fits beside the promised event");
     let third = broker.open_stream("sess-reserved", &number_id(3)).unwrap();
     let third_payload = encode(&json!({"jsonrpc": "2.0", "id": 3, "result": {}}));
     assert_eq!(
@@ -727,9 +724,9 @@ async fn reserved_publication_is_invisible_and_protects_commit_capacity() {
     reserved
         .commit()
         .expect("a successful reservation must remain commit-capable");
-    let seen = drain_until(&mut body, &["\"id\":1"], 5).await;
+    let seen = drain_until(&mut body, &["\"id\":2", "\"id\":1"], 5).await;
+    assert!(seen.contains("\"id\":2"));
     assert!(seen.contains("\"id\":1"));
-    assert!(!seen.contains("\"id\":2"));
     assert!(!seen.contains("\"id\":3"));
 }
 
@@ -1223,6 +1220,194 @@ async fn a_post_attached_event_replays_only_for_an_explicit_cursor() {
     let seen = drain_until(&mut resumed_body, &[r#""id":2"#], 4).await;
     assert!(seen.contains(r#""id":2"#), "resumption replays: {seen:?}");
     assert!(!seen.contains(r#""id":1"#));
+}
+
+/// Issue #5441: staging a POST-attached response frames the bytes the client
+/// receives but retains NOTHING. Only the pipeline's commit — which runs after
+/// the authoritative final response policy and the pre-commit authorization
+/// gate have accepted those exact bytes — makes the event replayable.
+#[tokio::test]
+async fn a_staged_post_attached_response_is_replayable_only_after_it_commits() {
+    let broker = broker();
+    broker.ensure_session("sess-staged").unwrap();
+    let stream = broker.open_stream("sess-staged", &number_id(1)).unwrap();
+    let payload = encode(&json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
+    let (framed, publication) = stream
+        .reserve_post_attached_response(&payload)
+        .expect("a correlated response stages its own POST stream");
+    let framed = String::from_utf8(framed.to_vec()).expect("the POST body is UTF-8");
+    assert!(framed.contains("id: 1\nevent: message\ndata: "));
+    assert!(framed.contains(r#""id":1"#));
+
+    // Before the commit the only copy of these bytes is the POST body above.
+    let early = broker.attach_listener("sess-staged", Some("0")).unwrap();
+    let mut early_body = early.take_body().expect("body claimed once");
+    let greeting = frame_text(next_frame(&mut early_body).await);
+    assert_eq!(greeting, ": mcp-sse\n\n");
+    assert!(
+        stays_idle(&mut early_body).await,
+        "a staged response must not be replayable before it commits"
+    );
+    drop(early_body);
+
+    assert_eq!(publication.commit().unwrap(), 1);
+    let resumed = broker.attach_listener("sess-staged", Some("0")).unwrap();
+    let mut resumed_body = resumed.take_body().expect("body claimed once");
+    let seen = drain_until(&mut resumed_body, &[r#""id":1"#], 4).await;
+    assert!(
+        seen.contains(r#""id":1"#),
+        "a committed response resumes: {seen:?}"
+    );
+}
+
+/// A response a later policy replaced or refused aborts its reservation: the
+/// bytes never enter replay history, and the identity's per-session capacity
+/// comes back exactly once.
+#[tokio::test]
+async fn a_refused_post_attached_response_aborts_and_never_enters_replay() {
+    let broker = broker();
+    broker.ensure_session("sess-refused").unwrap();
+    let stream = broker.open_stream("sess-refused", &number_id(1)).unwrap();
+    let payload = encode(&json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
+    let (_framed, publication) = stream.reserve_post_attached_response(&payload).unwrap();
+
+    publication.abort();
+    // Idempotent across context clones, and a refused response can never be
+    // resurrected by a later commit.
+    publication.abort();
+    let recommitted = publication.commit();
+    assert_eq!(recommitted.unwrap_err(), SseError::StreamCompleted);
+
+    // Terminalized exactly once: the identity is refused rather than reopened.
+    assert_eq!(
+        broker
+            .open_stream("sess-refused", &number_id(1))
+            .unwrap_err(),
+        SseError::StreamCompleted
+    );
+
+    let resumed = broker.attach_listener("sess-refused", Some("0")).unwrap();
+    let mut body = resumed.take_body().expect("body claimed once");
+    let greeting = frame_text(next_frame(&mut body).await);
+    assert_eq!(greeting, ": mcp-sse\n\n");
+    assert!(
+        stays_idle(&mut body).await,
+        "a refused response must never become replay history"
+    );
+}
+
+/// Dropping the last handle is the same release: a request that ended before
+/// the commit boundary — a transport disconnect, an early error return — leaks
+/// neither the reservation nor the stream identity.
+#[tokio::test]
+async fn dropping_a_staged_post_attached_publication_releases_it() {
+    let broker = broker();
+    broker.ensure_session("sess-dropped").unwrap();
+    let stream = broker.open_stream("sess-dropped", &number_id(1)).unwrap();
+    let payload = encode(&json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
+    let (_framed, publication) = stream.reserve_post_attached_response(&payload).unwrap();
+    drop(publication);
+
+    assert_eq!(
+        broker
+            .open_stream("sess-dropped", &number_id(1))
+            .unwrap_err(),
+        SseError::StreamCompleted
+    );
+    let resumed = broker.attach_listener("sess-dropped", Some("0")).unwrap();
+    let mut body = resumed.take_body().expect("body claimed once");
+    let greeting = frame_text(next_frame(&mut body).await);
+    assert_eq!(greeting, ": mcp-sse\n\n");
+    assert!(stays_idle(&mut body).await);
+}
+
+/// A POST-attached cursor is assigned when the response is STAGED, because the
+/// framed body the client receives has to carry it. Two concurrent requests on
+/// one session can therefore commit out of order, and replay must still ascend
+/// — the retained ring is partitioned, never scanned.
+#[tokio::test]
+async fn concurrent_post_attached_publications_keep_replay_ordered() {
+    let broker = broker();
+    broker.ensure_session("sess-order").unwrap();
+    let first = broker.open_stream("sess-order", &number_id(1)).unwrap();
+    let second = broker.open_stream("sess-order", &number_id(2)).unwrap();
+    let first_payload = encode(&json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
+    let second_payload = encode(&json!({"jsonrpc": "2.0", "id": 2, "result": {}}));
+    let (first_framed, first_publication) = first
+        .reserve_post_attached_response(&first_payload)
+        .unwrap();
+    let (second_framed, second_publication) = second
+        .reserve_post_attached_response(&second_payload)
+        .unwrap();
+    let first_framed = String::from_utf8_lossy(&first_framed).into_owned();
+    let second_framed = String::from_utf8_lossy(&second_framed).into_owned();
+    assert!(first_framed.contains("id: 1\nevent: message"));
+    assert!(second_framed.contains("id: 2\nevent: message"));
+
+    // The second response clears its policy pass first.
+    assert_eq!(second_publication.commit().unwrap(), 2);
+    assert_eq!(first_publication.commit().unwrap(), 1);
+
+    let resumed = broker.attach_listener("sess-order", Some("0")).unwrap();
+    let mut body = resumed.take_body().expect("body claimed once");
+    let seen = drain_until(&mut body, &[r#""id":2"#], 4).await;
+    let first_at = seen.find(r#""id":1"#).expect("earlier cursor replays");
+    let second_at = seen.find(r#""id":2"#).expect("later cursor replays");
+    assert!(
+        first_at < second_at,
+        "replay must ascend by event id: {seen:?}"
+    );
+}
+
+/// Staging reports the stream PHASE in preference to a payload refusal, and a
+/// second terminal attempt on one lease is a duplicate response rather than a
+/// second reservation.
+#[test]
+fn staging_a_post_attached_response_reports_the_phase_before_the_payload() {
+    let broker = broker();
+    broker.ensure_session("sess-stage-refuse").unwrap();
+    let wrong = encode(&json!({"jsonrpc": "2.0", "id": 9, "result": {}}));
+
+    let cancelled = broker
+        .open_stream("sess-stage-refuse", &number_id(1))
+        .unwrap();
+    broker
+        .cancel_stream("sess-stage-refuse", &number_id(1))
+        .unwrap();
+    let cancelled_refusal = cancelled.reserve_post_attached_response(&wrong);
+    assert_eq!(
+        cancelled_refusal.unwrap_err(),
+        SseError::StreamCancelled,
+        "a cancellation outranks a refused payload"
+    );
+
+    let mismatched = broker
+        .open_stream("sess-stage-refuse", &number_id(2))
+        .unwrap();
+    let mismatch_refusal = mismatched.reserve_post_attached_response(&wrong);
+    assert_eq!(
+        mismatch_refusal.unwrap_err(),
+        SseError::ResponseEnvelopeInvalid
+    );
+    assert_eq!(
+        broker
+            .open_stream("sess-stage-refuse", &number_id(2))
+            .unwrap_err(),
+        SseError::StreamCompleted
+    );
+
+    let open = broker
+        .open_stream("sess-stage-refuse", &number_id(3))
+        .unwrap();
+    let payload = encode(&json!({"jsonrpc": "2.0", "id": 3, "result": {}}));
+    let (_framed, publication) = open.reserve_post_attached_response(&payload).unwrap();
+    let duplicate = open.reserve_post_attached_response(&payload);
+    assert_eq!(
+        duplicate.unwrap_err(),
+        SseError::StreamCompleted,
+        "one lease stages one terminal response"
+    );
+    assert_eq!(publication.commit().unwrap(), 1);
 }
 
 /// Settling for an inline JSON answer reports a cancellation the caller has to

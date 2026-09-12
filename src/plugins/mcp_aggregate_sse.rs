@@ -657,12 +657,89 @@ impl SessionInner {
         if projected_bytes > bounds.max_retained_bytes {
             return Err(AggregateSseError::RetentionOverflow);
         }
-        self.history_bytes = self.history_bytes.saturating_add(framed.len());
-        self.history.push_back(RetainedEvent { event_id, framed });
+        self.insert_retained_event(event_id, framed);
         self.last_event_id = event_id;
         self.last_activity = Instant::now();
         Ok(event_id)
     }
+
+    /// Insert one admitted event at its ORDERED position in the ring.
+    ///
+    /// `history` ids ascend, and both `replayable_prefix` and `event_after`
+    /// depend on that: they partition the ring rather than scanning it. A
+    /// POST-attached publication assigns its cursor when it reserves — the
+    /// framed body the client receives has to carry that id before any policy
+    /// can accept the body — so an unrelated response on the same session may
+    /// legitimately reach history first. Inserting in id order is what keeps the
+    /// ring sorted through that window; for every other caller the id is the
+    /// highest yet assigned and this is a `push_back`.
+    fn insert_retained_event(&mut self, event_id: u64, framed: Bytes) {
+        let index = self
+            .history
+            .partition_point(|event| event.event_id < event_id);
+        self.history_bytes = self.history_bytes.saturating_add(framed.len());
+        self.history.insert(index, RetainedEvent { event_id, framed });
+    }
+
+    /// Retain an ALREADY-DELIVERED POST-attached event under the cursor its
+    /// reservation assigned.
+    ///
+    /// The bytes have already been written to the POST that carried the
+    /// request, so this ring entry is replay history only. The event is marked
+    /// delivered and the attached listener's cursor is advanced past it, which
+    /// is what keeps a plain `GET` listener from ever receiving a response to a
+    /// request that arrived on a POST. Only an explicit resumption cursor older
+    /// than the event replays it — the one placement Streamable HTTP permits.
+    ///
+    /// Retention is best effort BY DESIGN, unlike [`Self::retain_event`]: the
+    /// client already holds these bytes, so a ring too small to keep them costs
+    /// resumability, never delivery. A refused retention advances
+    /// `evicted_through`, so a later cursor that would have needed this event
+    /// fails closed as `LastEventIdTooOld` instead of silently resuming across
+    /// a gap.
+    ///
+    /// This runs at COMMIT time, after the reservation's own capacity has been
+    /// released, so the admission projection re-adds exactly one event and this
+    /// framing's bytes on top of whatever OTHER reservations are outstanding.
+    fn retain_delivered_event(
+        &mut self,
+        bounds: &AggregateSseBounds,
+        event_id: u64,
+        encoded: &[u8],
+    ) {
+        let framed = frame_sse_event(event_id, encoded);
+        self.delivered_through = self.delivered_through.max(event_id);
+        if let Some(listener) = self.listener.as_mut() {
+            listener.cursor = listener.cursor.max(event_id);
+        }
+        self.last_activity = Instant::now();
+        self.trim_for_admission(
+            bounds,
+            self.reserved_events.saturating_add(1),
+            self.reserved_bytes.saturating_add(framed.len()),
+        );
+        let projected_events = self
+            .history
+            .len()
+            .saturating_add(self.reserved_events)
+            .saturating_add(1);
+        let projected_bytes = self
+            .history_bytes
+            .saturating_add(self.reserved_bytes)
+            .saturating_add(framed.len());
+        if projected_events > bounds.max_retained_events
+            || projected_bytes > bounds.max_retained_bytes
+        {
+            self.evicted_through = self.evicted_through.max(event_id);
+            return;
+        }
+        self.insert_retained_event(event_id, framed);
+        // Apply the replay policy immediately: with `max_replay_events: 0` this
+        // event is history the moment the POST carried it, so it must not
+        // linger in the ring.
+        self.trim(bounds);
+    }
+
     /// Move an OPEN identity to a terminal phase and return its capacity.
     ///
     /// Idempotent by construction: an unknown or already-terminal identity is
@@ -800,11 +877,6 @@ impl SessionState {
                 Some(StreamPhase::Cancelled) => return Err(AggregateSseError::StreamCancelled),
                 None => return Err(AggregateSseError::UnknownStream),
             }
-            if inner.reserved_events != 0 {
-                inner.terminalize_stream(identity, StreamPhase::Completed, max_open);
-                inner.last_activity = Instant::now();
-                return Err(AggregateSseError::RetentionOverflow);
-            }
             match inner.retain_event(&self.bounds, encoded) {
                 Ok(event_id) => {
                     inner.terminalize_stream(identity, StreamPhase::Completed, max_open);
@@ -828,11 +900,16 @@ impl SessionState {
     /// visible to the listener. Every direct publisher includes this promise in
     /// its own admission calculation, so a successful reservation remains
     /// commit-capable even if unrelated responses publish first.
+    ///
+    /// This is the DELIVERABLE reservation: the event does not exist yet, its id
+    /// is assigned when it commits, and committing wakes the attached listener
+    /// exactly as a direct publication does. The POST-attached reservation is
+    /// [`Self::reserve_post_attached_terminal`] and is deliberately different.
     fn reserve_terminal(
         &self,
         identity: &StreamIdentity,
         reserved_bytes: usize,
-    ) -> Result<u64, AggregateSseError> {
+    ) -> Result<(), AggregateSseError> {
         let max_open = self.bounds.max_streams_per_session;
         let mut inner = self.lock();
         if inner.closed {
@@ -844,14 +921,7 @@ impl SessionState {
             Some(StreamPhase::Cancelled) => return Err(AggregateSseError::StreamCancelled),
             None => return Err(AggregateSseError::UnknownStream),
         }
-        // Keep event-id assignment and publication ordered. A concurrent
-        // response falls back to inline JSON while this very short-lived
-        // pre-commit reservation crosses policy and authorization.
-        if inner.reserved_events != 0 {
-            inner.terminalize_stream(identity, StreamPhase::Completed, max_open);
-            return Err(AggregateSseError::RetentionOverflow);
-        }
-        let incoming_events = 1;
+        let incoming_events = inner.reserved_events.saturating_add(1);
         let incoming_bytes = inner.reserved_bytes.saturating_add(reserved_bytes);
         inner.trim_for_admission(&self.bounds, incoming_events, incoming_bytes);
         if inner.history.len().saturating_add(incoming_events) > self.bounds.max_retained_events
@@ -864,23 +934,63 @@ impl SessionState {
         inner.reserved_events = incoming_events;
         inner.reserved_bytes = incoming_bytes;
         inner.last_activity = Instant::now();
-        inner.last_event_id = inner.last_event_id.saturating_add(1);
-        Ok(inner.last_event_id)
+        Ok(())
     }
 
-    /// Commit a previously reserved payload after the POST-side response has
-    /// survived every rejecting header/body phase. Capacity failure is excluded
-    /// by `reserve_terminal` plus reservation-aware direct publication; the
-    /// `Result` remains defensive for teardown/cancellation races.
+    /// Reserve the POST-attached delivery of an already-governed response and
+    /// ASSIGN the cursor its framing must carry, returning that id.
+    ///
+    /// The client-visible body is `id: N` plus the event, so `N` has to exist
+    /// before the body does — which is before any final policy or authorization
+    /// decision can accept those bytes. The id is therefore taken here and the
+    /// event is inserted in id order when it commits
+    /// ([`SessionInner::insert_retained_event`]); a response that reserved later
+    /// may legitimately reach history first, and a reservation that aborts
+    /// simply leaves an unused id, which `Last-Event-ID` resumption tolerates
+    /// because it always resumes at the first RETAINED event after a cursor.
+    ///
+    /// Unlike [`Self::reserve_terminal`] this cannot fail for capacity: the
+    /// bytes go out on the POST that carried the request whatever the ring can
+    /// hold, so retention is best effort and a ring too small costs
+    /// resumability, never delivery. The identity stays OPEN until the
+    /// publication commits or aborts, so a `notifications/cancelled` landing in
+    /// the policy window still suppresses retention.
+    fn reserve_post_attached_terminal(
+        &self,
+        identity: &StreamIdentity,
+        reserved_bytes: usize,
+    ) -> Result<u64, AggregateSseError> {
+        let mut inner = self.lock();
+        if inner.closed {
+            return Err(AggregateSseError::StaleSession);
+        }
+        match inner.streams.get(identity).copied() {
+            Some(StreamPhase::Open) => {}
+            Some(StreamPhase::Completed) => return Err(AggregateSseError::StreamCompleted),
+            Some(StreamPhase::Cancelled) => return Err(AggregateSseError::StreamCancelled),
+            None => return Err(AggregateSseError::UnknownStream),
+        }
+        let event_id = inner.last_event_id.saturating_add(1);
+        inner.last_event_id = event_id;
+        inner.reserved_events = inner.reserved_events.saturating_add(1);
+        inner.reserved_bytes = inner.reserved_bytes.saturating_add(reserved_bytes);
+        inner.last_activity = Instant::now();
+        Ok(event_id)
+    }
+
+    /// Commit a previously reserved DELIVERABLE payload after the POST-side
+    /// response has survived every rejecting header/body phase. Capacity failure
+    /// is excluded by `reserve_terminal` plus reservation-aware direct
+    /// publication; the `Result` remains defensive for teardown/cancellation
+    /// races.
     fn commit_reserved_terminal(
         &self,
         identity: &StreamIdentity,
-        event_id: u64,
         encoded: &[u8],
         reserved_bytes: usize,
     ) -> Result<u64, AggregateSseError> {
         let max_open = self.bounds.max_streams_per_session;
-        {
+        let (outcome, waker) = {
             let mut inner = self.lock();
             inner.reserved_events = inner.reserved_events.saturating_sub(1);
             inner.reserved_bytes = inner.reserved_bytes.saturating_sub(reserved_bytes);
@@ -893,31 +1003,62 @@ impl SessionState {
                 Some(StreamPhase::Cancelled) => return Err(AggregateSseError::StreamCancelled),
                 None => return Err(AggregateSseError::UnknownStream),
             }
-            let framed = frame_sse_event(event_id, encoded);
-            if inner.history.len() < self.bounds.max_retained_events
-                && inner.history_bytes.saturating_add(framed.len())
-                    <= self.bounds.max_retained_bytes
-            {
-                inner.history_bytes = inner.history_bytes.saturating_add(framed.len());
-                inner.history.push_back(RetainedEvent { event_id, framed });
-                inner.delivered_through = inner.delivered_through.max(event_id);
-                if let Some(listener) = inner.listener.as_mut() {
-                    listener.cursor = listener.cursor.max(event_id);
-                }
-                inner.trim(&self.bounds);
-                {
+            match inner.retain_event(&self.bounds, encoded) {
+                Ok(event_id) => {
                     inner.terminalize_stream(identity, StreamPhase::Completed, max_open);
-                    Ok(event_id)
+                    let waker = inner.take_waker();
+                    (Ok(event_id), waker)
                 }
-            } else {
-                // This means reservation accounting drifted. Stay
-                // fail-closed and return the identity capacity rather than
-                // panicking on a production request path.
-                inner.terminalize_stream(identity, StreamPhase::Completed, max_open);
-                inner.last_activity = Instant::now();
-                Err(AggregateSseError::RetentionOverflow)
+                Err(error) => {
+                    // This means reservation accounting drifted. Stay
+                    // fail-closed and return the identity capacity rather than
+                    // panicking on a production request path.
+                    inner.terminalize_stream(identity, StreamPhase::Completed, max_open);
+                    inner.last_activity = Instant::now();
+                    (Err(error), None)
+                }
             }
+        };
+        if let Some(waker) = waker {
+            waker.wake();
         }
+        outcome
+    }
+
+    /// Commit a POST-attached reservation once the authoritative final
+    /// response-header/body policy and the pre-commit authorization gate have
+    /// accepted the exact bytes the client receives.
+    ///
+    /// The event enters the ring ALREADY DELIVERED: the delivery watermark and
+    /// the attached listener's cursor advance past it, and NO waker is taken
+    /// because nothing became deliverable — the client already holds these bytes
+    /// on its own POST. Retention itself is best effort
+    /// ([`SessionInner::retain_delivered_event`]), so this returns the assigned
+    /// id whenever the identity was still live; only a cancellation or session
+    /// teardown refuses it.
+    fn commit_post_attached_terminal(
+        &self,
+        identity: &StreamIdentity,
+        event_id: u64,
+        encoded: &[u8],
+        reserved_bytes: usize,
+    ) -> Result<u64, AggregateSseError> {
+        let max_open = self.bounds.max_streams_per_session;
+        let mut inner = self.lock();
+        inner.reserved_events = inner.reserved_events.saturating_sub(1);
+        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(reserved_bytes);
+        if inner.closed {
+            return Err(AggregateSseError::StaleSession);
+        }
+        match inner.streams.get(identity).copied() {
+            Some(StreamPhase::Open) => {}
+            Some(StreamPhase::Completed) => return Err(AggregateSseError::StreamCompleted),
+            Some(StreamPhase::Cancelled) => return Err(AggregateSseError::StreamCancelled),
+            None => return Err(AggregateSseError::UnknownStream),
+        }
+        inner.retain_delivered_event(&self.bounds, event_id, encoded);
+        inner.terminalize_stream(identity, StreamPhase::Completed, max_open);
+        Ok(event_id)
     }
 
     /// Release a reservation whose POST-side response was replaced or whose
@@ -976,6 +1117,7 @@ impl SessionState {
         inner.last_activity = Instant::now();
         Ok(())
     }
+
     fn poll_next_frame(&self, epoch: u64, waker: &Waker) -> NextFrame {
         let mut inner = self.lock();
         if inner.closed {
@@ -1589,17 +1731,89 @@ impl AggregateSseStream {
         // width. Unrelated direct publications may advance the id before this
         // response commits; the fixed ceiling keeps that harmless.
         let reserved_bytes = encoded.len().saturating_add(SSE_FRAME_OVERHEAD_BYTES);
+        self.0
+            .session
+            .reserve_terminal(&self.0.identity, reserved_bytes)?;
+        Ok(AggregateSsePublication::deliverable(
+            Arc::clone(&self.0.session),
+            self.0.identity.clone(),
+            Bytes::copy_from_slice(encoded),
+            reserved_bytes,
+        ))
+    }
+
+    /// Stage this identity's terminal JSON-RPC response as the COMPLETE
+    /// POST-attached `text/event-stream` body WITHOUT retaining it for replay,
+    /// returning that body and the reservation that owns it.
+    ///
+    /// This is the security boundary the two-phase split exists for. The bytes
+    /// the client receives are produced here, but nothing enters `Last-Event-ID`
+    /// history until the proxy/H3 pipeline commits the reservation — which it
+    /// does only after the authoritative final response-header/body policy and
+    /// the pre-commit authorization gate have accepted exactly these bytes. A
+    /// replaced or refused response aborts instead, and dropping the last handle
+    /// aborts too, so a retained replay copy can never outlive a response the
+    /// client never received.
+    ///
+    /// The identity is terminal on every outcome. `Err(StreamCancelled)` means
+    /// the client withdrew the request and the response must not be sent at
+    /// all; every other `Err` means the caller answers this POST with the
+    /// ordinary inline JSON response instead. The PHASE outranks a payload
+    /// refusal: a response the client already cancelled is reported as
+    /// cancelled, not as an envelope the gateway declined to frame.
+    pub fn reserve_post_attached_response(
+        &self,
+        encoded: &[u8],
+    ) -> Result<(Bytes, AggregateSsePublication), AggregateSseError> {
+        if self.0.settled.swap(true, Ordering::AcqRel) {
+            // A second terminal attempt on one lease is a duplicate response.
+            return Err(AggregateSseError::StreamCompleted);
+        }
+        if let Err(refusal) = self.validate_post_attached_payload(encoded) {
+            // The identity is terminal whatever happens, so release it here and
+            // report the phase in preference to the payload.
+            return Err(match self.0.session.settle_open_stream(&self.0.identity) {
+                Ok(()) => refusal,
+                Err(phase) => phase,
+            });
+        }
+        let reserved_bytes = encoded.len().saturating_add(SSE_FRAME_OVERHEAD_BYTES);
         let event_id = self
             .0
             .session
-            .reserve_terminal(&self.0.identity, reserved_bytes)?;
-        Ok(AggregateSsePublication::new(
+            .reserve_post_attached_terminal(&self.0.identity, reserved_bytes)?;
+        let body = frame_post_attached_response(event_id, encoded);
+        let publication = AggregateSsePublication::post_attached(
             Arc::clone(&self.0.session),
             self.0.identity.clone(),
             Bytes::copy_from_slice(encoded),
             reserved_bytes,
             event_id,
-        ))
+            body.clone(),
+        );
+        Ok((body, publication))
+    }
+
+    /// Whether these governed bytes may be framed as this identity's event.
+    fn validate_post_attached_payload(&self, encoded: &[u8]) -> Result<(), AggregateSseError> {
+        let max_event_bytes = self.0.session.bounds.max_event_bytes;
+        if encoded.len() > max_event_bytes {
+            return Err(AggregateSseError::EventTooLarge);
+        }
+        // The HTTP request and its terminal JSON-RPC body must name the same
+        // type-sensitive identity. A body naming a different id is not this
+        // request's answer, so it is never framed as one — the caller replaces
+        // it with a correlated gateway error instead.
+        if !response_matches_stream_identity(
+            encoded,
+            &self.0.identity,
+            self.0.session.bounds.max_stream_id_bytes,
+        ) {
+            return Err(AggregateSseError::ResponseEnvelopeInvalid);
+        }
+        // Only a correctly correlated response may use the inline framing
+        // fallback (for example, pretty-printed JSON containing newlines).
+        validate_event_bytes(encoded, max_event_bytes)
     }
 
     /// The JSON-RPC `id` wire token of the request that opened this stream.
@@ -1636,21 +1850,26 @@ impl AggregateSseStream {
         self.0.session.settle_open_stream(&self.0.identity)
     }
 
-    /// Frame this identity's terminal JSON-RPC response as the COMPLETE
-    /// POST-attached `text/event-stream` body and settle the identity.
+    /// Stage AND immediately commit this identity's terminal JSON-RPC response
+    /// as the COMPLETE POST-attached `text/event-stream` body.
     ///
     /// This is MCP Streamable HTTP delivery: the answer to a POST that carried
     /// a request stays on that POST. The event is additionally retained as
     /// already-delivered replay history, so a client whose POST stream broke can
     /// resume it with `Last-Event-ID`; a plain `GET` listener never sees it.
     ///
+    /// Single-phase, so it is the LIBRARY primitive and the broker contract
+    /// suite's shape. The ferrum-edge pipeline uses
+    /// [`Self::reserve_post_attached_response`] instead, because the retention
+    /// decision belongs after the response's final policy and authorization
+    /// boundaries rather than in the hook that frames the bytes.
+    ///
     /// The identity is terminal on every outcome. `Err(StreamCancelled)` means
     /// the client withdrew the request and the response must not be sent at
     /// all; every other `Err` means the caller answers this POST with the
     /// ordinary inline JSON response instead.
     pub fn post_attached_response(&self, encoded: &[u8]) -> Result<Bytes, AggregateSseError> {
-        let publication = self.reserve_encoded(encoded)?;
-        let body = publication.post_attached_body();
+        let (body, publication) = self.reserve_post_attached_response(encoded)?;
         publication.commit()?;
         Ok(body)
     }
@@ -1670,8 +1889,17 @@ struct PublicationLease {
     identity: StreamIdentity,
     encoded: Bytes,
     reserved_bytes: usize,
-    event_id: u64,
+    /// The POST-attached framing this reservation already handed the client,
+    /// with the cursor it was assigned. `None` for a DELIVERABLE reservation,
+    /// whose id is assigned when it commits and whose commit wakes the listener.
+    post_attached: Option<PostAttachedFraming>,
     finished: AtomicBool,
+}
+
+/// The exact `text/event-stream` body a POST-attached reservation produced.
+struct PostAttachedFraming {
+    event_id: u64,
+    body: Bytes,
 }
 
 impl Drop for PublicationLease {
@@ -1692,44 +1920,82 @@ impl fmt::Debug for AggregateSsePublication {
 }
 
 impl AggregateSsePublication {
-    fn new(
+    /// A reservation whose event does not exist yet: committing assigns its id,
+    /// retains it, and WAKES the attached listener, exactly as a direct
+    /// publication would.
+    fn deliverable(
         session: Arc<SessionState>,
         identity: StreamIdentity,
         encoded: Bytes,
         reserved_bytes: usize,
-        event_id: u64,
     ) -> Self {
         Self(Arc::new(PublicationLease {
             session,
             identity,
             encoded,
             reserved_bytes,
-            event_id,
+            post_attached: None,
             finished: AtomicBool::new(false),
         }))
     }
 
-    /// Make the reserved event visible. Capacity is already promised; errors
-    /// are limited to cancellation/session teardown or defensive accounting
-    /// failure and never panic the proxy path.
+    /// A reservation whose bytes are already going out on the POST that carried
+    /// the request: committing retains them as ALREADY-DELIVERED replay history
+    /// under the cursor the framing published, and wakes nobody.
+    fn post_attached(
+        session: Arc<SessionState>,
+        identity: StreamIdentity,
+        encoded: Bytes,
+        reserved_bytes: usize,
+        event_id: u64,
+        body: Bytes,
+    ) -> Self {
+        Self(Arc::new(PublicationLease {
+            session,
+            identity,
+            encoded,
+            reserved_bytes,
+            post_attached: Some(PostAttachedFraming { event_id, body }),
+            finished: AtomicBool::new(false),
+        }))
+    }
+
+    /// Make the reserved event replayable. Capacity is already promised (or, for
+    /// a POST-attached reservation, best effort by design); errors are limited
+    /// to cancellation/session teardown or defensive accounting failure and
+    /// never panic the proxy path.
     pub fn commit(&self) -> Result<u64, AggregateSseError> {
         if self.0.finished.swap(true, Ordering::AcqRel) {
             return Err(AggregateSseError::StreamCompleted);
         }
+        if let Some(framing) = self.0.post_attached.as_ref() {
+            return self.0.session.commit_post_attached_terminal(
+                &self.0.identity,
+                framing.event_id,
+                &self.0.encoded,
+                self.0.reserved_bytes,
+            );
+        }
         self.0.session.commit_reserved_terminal(
             &self.0.identity,
-            self.0.event_id,
             &self.0.encoded,
             self.0.reserved_bytes,
         )
     }
 
-    pub fn post_attached_body(&self) -> Bytes {
-        frame_post_attached_response(self.0.event_id, &self.0.encoded)
-    }
-
+    /// Whether `body` is byte-for-byte the POST-attached representation this
+    /// reservation promised.
+    ///
+    /// This is the commit predicate the proxy and native-H3 pipelines apply to
+    /// the response that is actually going to the client, so a later policy that
+    /// rewrote, replaced, or refused the representation can never retain the
+    /// staged bytes. A DELIVERABLE reservation promised no POST body and is
+    /// always refused here, which keeps the pipeline gate fail-closed.
     pub fn matches_post_attached_body(&self, body: &[u8]) -> bool {
-        self.post_attached_body().as_ref() == body
+        self.0
+            .post_attached
+            .as_ref()
+            .is_some_and(|framing| framing.body.as_ref() == body)
     }
 
     /// Settle the identity without publication because final policy replaced

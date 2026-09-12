@@ -1,8 +1,9 @@
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
     build_aggregate_sse_reject_for_test, drop_mcp_sse_stream_for_test,
-    mcp_aggregate_sse_listener_is_staged_for_test, mcp_sse_stream_is_open_for_test,
-    reject_headers_select_event_stream_for_test, take_mcp_aggregate_sse_listener_for_test,
+    mcp_aggregate_sse_listener_is_staged_for_test, mcp_sse_publication_is_staged_for_test,
+    mcp_sse_stream_is_open_for_test, reject_headers_select_event_stream_for_test,
+    settle_mcp_sse_publication_for_test, take_mcp_aggregate_sse_listener_for_test,
 };
 use ferrum_edge::config::types::{BackendScheme, BackendTlsConfig};
 use ferrum_edge::plugins::{
@@ -9756,6 +9757,25 @@ fn post_stream_event_id(body: &str) -> String {
         .to_string()
 }
 
+/// The proxy pipeline's RETENTION boundary for a POST-attached SSE response.
+///
+/// `mcp_gateway` only STAGES the response: the framed bytes go back on the POST
+/// immediately, but nothing becomes `Last-Event-ID` replay history until the
+/// proxy (or the native-H3 writer) commits the staged reservation, which it does
+/// only after the authoritative final response-header/body policy and the
+/// pre-commit authorization gate have accepted exactly those bytes. These tests
+/// drive the plugin without the proxy, so they have to run that step themselves
+/// — through the same predicate and settle call the pipeline uses. Returns
+/// `true` when the response was retained.
+fn commit_post_stream(
+    ctx: &mut ferrum_edge::plugins::RequestContext,
+    status: u16,
+    body: &str,
+    headers: &HashMap<String, String>,
+) -> bool {
+    settle_mcp_sse_publication_for_test(ctx, status, headers, body.as_bytes())
+}
+
 /// Assert the response really is an established event stream on the POST, with
 /// no representation length invented for a body the client streams.
 fn assert_post_attached_stream(status: u16, body: &str, headers: &HashMap<String, String>) {
@@ -10396,6 +10416,12 @@ async fn aggregate_sse_deferred_call_answers_its_own_post_event_stream() {
         final_response_body(&plugin, &mut call_ctx, 200, &response_headers, &upstream).await;
     let (status, stream_body, stream_headers) = post_stream(delivered);
     assert_post_attached_stream(status, &stream_body, &stream_headers);
+    assert!(
+        mcp_sse_publication_is_staged_for_test(&call_ctx),
+        "the POST-attached response is staged, not retained, until the pipeline commits it"
+    );
+    let retained = commit_post_stream(&mut call_ctx, status, &stream_body, &stream_headers);
+    assert!(retained, "the pipeline commits the staged response");
     // Streaming, not a buffered JSON document: the client must not be told the
     // stream is cacheable or proxy-buffered.
     assert_eq!(
@@ -10454,6 +10480,8 @@ async fn aggregate_sse_post_stream_is_resumable_only_by_an_explicit_cursor() {
             final_response_body(&plugin, &mut call_ctx, 200, &response_headers, &upstream).await;
         let (status, body, headers) = post_stream(delivered);
         assert_post_attached_stream(status, &body, &headers);
+        let retained = commit_post_stream(&mut call_ctx, status, &body, &headers);
+        assert!(retained, "the pipeline commits the staged response");
         cursors.push(post_stream_event_id(&body));
     }
 
@@ -10545,6 +10573,8 @@ async fn aggregate_sse_post_stream_carries_the_transformed_bytes() {
         final_response_body(&plugin, &mut call_ctx, 200, &redacted_headers, &redacted).await;
     let (status, body, headers) = post_stream(delivered);
     assert_post_attached_stream(status, &body, &headers);
+    let retained = commit_post_stream(&mut call_ctx, status, &body, &headers);
+    assert!(retained, "the pipeline commits the staged response");
     let message = post_stream_message(&body);
     assert_eq!(
         message["result"]["structuredContent"]["conditions"],
@@ -10554,6 +10584,83 @@ async fn aggregate_sse_post_stream_carries_the_transformed_bytes() {
         !body.contains("Partly cloudy"),
         "the pre-policy payload must never be framed"
     );
+}
+
+/// Issue #5441: the pipeline's retention boundary. A representation a phase
+/// AFTER the plugin replaced — the late final body/header policy, a committed
+/// hook, or the authoritative pre-commit authorization terminal — is not the one
+/// the reservation promised, so it is aborted and never becomes `Last-Event-ID`
+/// replay history. The client got the terminal; nothing can resume the answer it
+/// was not allowed to receive.
+#[tokio::test]
+async fn aggregate_sse_post_stream_replaced_after_staging_is_never_replayable() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = sse_tool_plugin(&server);
+    let session_id = initialize(&plugin).await;
+    let _ = aggregate_tool_names(&plugin, &session_id, 1).await;
+
+    let mut call_ctx = route_tool_call(&plugin, &session_id, 560).await;
+    let upstream = weather_tool_result(560);
+    let response_headers = known_json_response_headers(&upstream);
+    let delivered =
+        final_response_body(&plugin, &mut call_ctx, 200, &response_headers, &upstream).await;
+    let (status, body, headers) = post_stream(delivered);
+    assert_post_attached_stream(status, &body, &headers);
+    assert!(mcp_sse_publication_is_staged_for_test(&call_ctx));
+
+    // The pre-commit authorization gate replaced the response after the plugin
+    // staged it, so the bytes the reservation promised never reach the client.
+    let terminal_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let terminal_body = "{\"error\":\"unauthorized\"}";
+    let retained = commit_post_stream(&mut call_ctx, 401, terminal_body, &terminal_headers);
+    assert!(!retained, "a replaced response is not retained");
+    assert!(!mcp_sse_publication_is_staged_for_test(&call_ctx));
+
+    // A cursor older than anything the session published replays nothing: the
+    // refused answer is not in the ring under any id.
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    headers.insert("last-event-id".to_string(), "0".to_string());
+    let resumed = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(reject_raw(resumed).0, 200);
+    let mut listener_body = sse_body(&mut ctx);
+    let seen = sse_drain_until(&mut listener_body, &["Partly cloudy"], 2).await;
+    assert!(seen.contains(": mcp-sse"));
+    assert!(
+        !seen.contains("Partly cloudy"),
+        "an aborted publication must never be replayable: {seen:?}"
+    );
+}
+
+/// The same boundary keeps a body a later phase REWROTE out of replay: only the
+/// exact staged octets under `200 text/event-stream` are retained.
+#[tokio::test]
+async fn aggregate_sse_post_stream_rewritten_after_staging_is_never_replayable() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = sse_tool_plugin(&server);
+    let session_id = initialize(&plugin).await;
+    let _ = aggregate_tool_names(&plugin, &session_id, 1).await;
+
+    let mut call_ctx = route_tool_call(&plugin, &session_id, 570).await;
+    let upstream = weather_tool_result(570);
+    let response_headers = known_json_response_headers(&upstream);
+    let delivered =
+        final_response_body(&plugin, &mut call_ctx, 200, &response_headers, &upstream).await;
+    let (status, body, headers) = post_stream(delivered);
+    assert_post_attached_stream(status, &body, &headers);
+
+    let rewritten = format!("{body}: tampered\n\n");
+    let retained = commit_post_stream(&mut call_ctx, status, &rewritten, &headers);
+    assert!(!retained, "rewritten bytes are not retained");
+
+    let (mut ctx, mut resume_headers) = sse_get(&session_id);
+    resume_headers.insert("last-event-id".to_string(), "0".to_string());
+    let resumed = plugin.before_proxy(&mut ctx, &mut resume_headers).await;
+    assert_eq!(reject_raw(resumed).0, 200);
+    let mut listener_body = sse_body(&mut ctx);
+    let seen = sse_drain_until(&mut listener_body, &["Partly cloudy"], 2).await;
+    assert!(!seen.contains("Partly cloudy"), "replayed: {seen:?}");
+    assert!(!seen.contains("tampered"));
 }
 
 /// A non-200 final response keeps its own failure semantics on the POST:
@@ -10621,6 +10728,10 @@ async fn aggregate_sse_cancellation_marks_an_open_routed_request_and_suppresses_
         final_response_body(&plugin, &mut call_ctx, 200, &response_headers, &upstream).await;
     let (status, body, headers) = post_stream(suppressed);
     assert_post_attached_stream(status, &body, &headers);
+    assert!(
+        !mcp_sse_publication_is_staged_for_test(&call_ctx),
+        "a cancelled request stages nothing for replay"
+    );
     assert_eq!(body, ": mcp-sse\n\n");
     assert!(
         !body.contains("event: message"),
@@ -10797,6 +10908,8 @@ async fn aggregate_sse_tiny_replay_window_still_delivers_but_refuses_a_stale_cur
             final_response_body(&plugin, &mut call_ctx, 200, &response_headers, &upstream).await;
         let (status, body, headers) = post_stream(delivered);
         assert_post_attached_stream(status, &body, &headers);
+        let retained = commit_post_stream(&mut call_ctx, status, &body, &headers);
+        assert!(retained, "the pipeline commits the staged response");
         assert_eq!(post_stream_message(&body)["id"], json!(id));
         cursors.push(post_stream_event_id(&body));
     }

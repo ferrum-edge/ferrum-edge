@@ -2424,13 +2424,17 @@ impl McpGateway {
     /// the event carries precisely the bytes an inline JSON answer would have
     /// carried.
     ///
-    /// The stream is the POST's own response, so there is no cross-connection
-    /// visibility to guard and no two-phase reservation: a later header or
-    /// response policy that replaces this representation simply replaces what
-    /// the client receives, exactly as it would replace any other governed
-    /// response. The event is retained as already-delivered replay history so a
-    /// broken POST stream can be resumed with `Last-Event-ID`; a freshly
-    /// attached `GET` listener starts past it and never sees it.
+    /// The stream is the POST's own response, so the framed bytes are handed
+    /// back from this hook immediately. RETENTION is not: the event is STAGED as
+    /// a private reservation on the request context, and only the proxy /
+    /// native-H3 pipeline commits it, after the authoritative final
+    /// response-header/body policy and the pre-commit authorization gate have
+    /// accepted exactly these bytes. A later phase that replaces or refuses the
+    /// representation aborts the reservation instead, so `Last-Event-ID` replay
+    /// can never expose a response the client was never allowed to receive. Once
+    /// committed the event is already-delivered replay history, so a broken POST
+    /// stream can be resumed with `Last-Event-ID` while a freshly attached `GET`
+    /// listener starts past it and never sees it.
     fn deliver_deferred_response_on_post(
         &self,
         ctx: &mut RequestContext,
@@ -2457,9 +2461,8 @@ impl McpGateway {
             Self::note_sse_delivery(ctx, "inline");
             return None;
         }
-        match stream.reserve_encoded(body) {
-            Ok(publication) => {
-                let framed = publication.post_attached_body();
+        match stream.reserve_post_attached_response(body) {
+            Ok((framed, publication)) => {
                 ctx.mcp_sse_publication = Some(publication);
                 Self::note_route_decision(ctx, "sse_post_stream");
                 Self::note_sse_delivery(ctx, "post_stream");

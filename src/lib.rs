@@ -699,6 +699,40 @@ pub mod _test_support {
         ctx.mcp_sse_stream.is_some()
     }
 
+    /// Run the proxy pipeline's POST-attached SSE retention boundary over a
+    /// finalized response.
+    ///
+    /// Plugin-level tests drive `mcp_gateway` directly, without the proxy, so
+    /// the reservation `deliver_deferred_response_on_post` stages on the request
+    /// context would otherwise only ever be aborted and nothing would enter
+    /// replay history. This is the SAME predicate and the SAME settle call
+    /// `handle_proxy_request_inner` and the native-H3 writer use, so a test
+    /// cannot assert replay behaviour the pipeline would not actually produce.
+    /// Returns `true` when the response was accepted and retained.
+    pub fn settle_mcp_sse_publication_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        response_body: &[u8],
+    ) -> bool {
+        let Some(publication) = ctx.mcp_sse_publication.take() else {
+            return false;
+        };
+        let accepted = crate::proxy::mcp_sse_publication_matches_response(
+            &publication,
+            response_status,
+            response_headers,
+            response_body,
+        );
+        crate::proxy::settle_mcp_sse_publication(publication, accepted)
+    }
+
+    /// Whether a request context is still holding a staged POST-attached SSE
+    /// publication. Used to prove an inline fallback released the reservation.
+    pub fn mcp_sse_publication_is_staged_for_test(ctx: &crate::plugins::RequestContext) -> bool {
+        ctx.mcp_sse_publication.is_some()
+    }
+
     /// Drop just the multiplexed stream lease, modelling a request that ended
     /// without producing a response — a backend failure, a replaced rejection,
     /// or a client transport disconnect. The identity must terminalize and its
