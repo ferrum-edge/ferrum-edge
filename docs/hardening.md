@@ -12,9 +12,12 @@ Companion documents:
 - [Support policy](support_policy.md) — what a version number promises today.
 - [SECURITY.md](../SECURITY.md) — vulnerability reporting and the supply-chain gate.
 
-> **Build-out status.** Ferrum Edge is pre-1.0 (`0.9.0`) and no `v*` release has
-> been tagged. Read [support_policy.md](support_policy.md) before treating any
-> item here as a stability commitment.
+> **Build-out status.** Ferrum Edge is pre-1.0 and publishes semver releases on
+> the `v0.9.x` channel (see the [Releases
+> page](https://github.com/ferrum-edge/ferrum-edge/releases) for the current
+> tag; latest at time of writing: **v0.9.4**). Read
+> [support_policy.md](support_policy.md) before treating any item here as a
+> stability commitment.
 
 ## 1. Admin plane
 

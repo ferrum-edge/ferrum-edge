@@ -101,6 +101,8 @@ All fields are optional. Include only the resource types you need to create. Res
 
 Each resource in the arrays uses the same schema as the individual `POST` endpoint for that resource type. The `id`, `created_at`, and `updated_at` fields are auto-generated if omitted. Plugin configs use `plugin_name` (not `name`). A proxy that sets `upstream_id` may omit `backend_host` and `backend_port`; the upstream's targets supply the dial address.
 
+Consumer `credentials` map each built-in type (`keyauth`, `basicauth`, `jwt`, `hmac_auth`, `mtls_auth`) to a **non-empty array of credential objects** — for example `keyauth: [{ "key": "..." }]`, `basicauth: [{ "password": "..." }]`, and `hmac_auth: [{ "secret": "..." }]` (32+ characters). Plain strings are rejected with `400`.
+
 Plaintext Basic-auth passwords are hashed during batch preparation. This requires `FERRUM_BASIC_AUTH_HMAC_SECRET` to be configured with at least 32 bytes; a missing or weak operator secret returns `500 Internal Server Error` before any batch resource is persisted. Invalid Basic credential shapes remain request errors and return `400`.
 
 #### Consumers
@@ -112,14 +114,14 @@ Plaintext Basic-auth passwords are hashed during batch preparation. This require
       "username": "user-1",
       "custom_id": "tenant-1",
       "credentials": {
-        "keyauth": "api-key-abc123"
+        "keyauth": [{ "key": "api-key-abc123" }]
       }
     },
     {
       "username": "user-2",
       "custom_id": "tenant-2",
       "credentials": {
-        "keyauth": "api-key-def456"
+        "keyauth": [{ "key": "api-key-def456" }]
       }
     }
   ]
@@ -193,11 +195,11 @@ Create consumers, proxies, and plugin configs in a single request:
   "consumers": [
     {
       "username": "tenant-1",
-      "credentials": {"keyauth": "key-001"}
+      "credentials": {"keyauth": [{ "key": "key-001" }]}
     },
     {
       "username": "tenant-2",
-      "credentials": {"keyauth": "key-002"}
+      "credentials": {"keyauth": [{ "key": "key-002" }]}
     }
   ],
   "proxies": [
@@ -261,9 +263,9 @@ curl -X POST http://localhost:9000/batch \
   -H "Content-Type: application/json" \
   -d '{
     "consumers": [
-      {"username": "alice", "credentials": {"keyauth": "alice-api-key-2024"}},
-      {"username": "bob", "credentials": {"keyauth": "bob-api-key-2024"}},
-      {"username": "charlie", "credentials": {"keyauth": "charlie-api-key-2024"}}
+      {"username": "alice", "credentials": {"keyauth": [{ "key": "alice-api-key-2024" }]}},
+      {"username": "bob", "credentials": {"keyauth": [{ "key": "bob-api-key-2024" }]}},
+      {"username": "charlie", "credentials": {"keyauth": [{ "key": "charlie-api-key-2024" }]}}
     ]
   }'
 ```
@@ -286,7 +288,7 @@ curl -X POST http://localhost:9000/batch \
       {
         "username": "mobile-app",
         "custom_id": "mobile-team",
-        "credentials": {"keyauth": "mobile-secret-key"}
+        "credentials": {"keyauth": [{ "key": "mobile-secret-key" }]}
       }
     ],
     "proxies": [
@@ -404,7 +406,7 @@ for i in range(0, len(tenants), CHUNK_SIZE):
 
         consumers.append({
             "username": consumer_name,
-            "credentials": {"keyauth": t["api_key"]},
+            "credentials": {"keyauth": [{"key": t["api_key"]}]},
         })
         proxies.append({
             "id": proxy_id,
