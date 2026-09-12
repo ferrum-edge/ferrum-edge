@@ -78,6 +78,7 @@ fn create_test_proxy(port: u16, ca_path: &str, san_allow_list: Vec<String>) -> P
     resolved_tls.recompute_san_digest();
 
     Proxy {
+        labels: Default::default(),
         id: "h2-san-test".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,

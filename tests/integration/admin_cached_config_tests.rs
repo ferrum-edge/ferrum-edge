@@ -86,6 +86,7 @@ fn generate_expired_test_token(config: &TestConfig) -> String {
 
 fn create_test_proxy(id: &str, listen_path: &str, host: &str, port: u16) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("Test Proxy {}", id)),
@@ -162,6 +163,7 @@ fn create_test_gateway_config() -> GatewayConfig {
             create_test_proxy("proxy-2", "/api/v2", "backend2.example.com", 9090),
         ],
         consumers: vec![Consumer {
+            labels: Default::default(),
             id: "consumer-1".to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
             username: "alice".to_string(),
@@ -172,6 +174,7 @@ fn create_test_gateway_config() -> GatewayConfig {
             updated_at: Utc::now(),
         }],
         plugin_configs: vec![PluginConfig {
+            labels: Default::default(),
             id: "plugin-cfg-1".to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "rate_limiting".to_string(),
@@ -194,6 +197,7 @@ fn create_test_gateway_config() -> GatewayConfig {
 
 fn create_test_upstream(id: &str, name: &str) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(name.to_string()),
@@ -1493,6 +1497,7 @@ fn create_pagination_test_config() -> GatewayConfig {
             8080,
         ));
         consumers.push(Consumer {
+            labels: Default::default(),
             id: format!("consumer-{}", i),
             namespace: ferrum_edge::config::types::default_namespace(),
             username: format!("user-{}", i),
@@ -1503,6 +1508,7 @@ fn create_pagination_test_config() -> GatewayConfig {
             updated_at: Utc::now(),
         });
         plugin_configs.push(PluginConfig {
+            labels: Default::default(),
             id: format!("plugin-cfg-{}", i),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "rate_limiting".to_string(),

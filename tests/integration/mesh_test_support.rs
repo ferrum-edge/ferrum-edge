@@ -335,6 +335,7 @@ pub fn mesh_slice_with(
 pub fn http_proxy(id: &str, host: &str, backend_port: u16) -> Proxy {
     let now = Utc::now();
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(id.to_string()),
@@ -405,6 +406,7 @@ pub fn http_proxy(id: &str, host: &str, backend_port: u16) -> Proxy {
 pub fn http_upstream(id: &str, host: &str, port: u16) -> Upstream {
     let now = Utc::now();
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(id.to_string()),

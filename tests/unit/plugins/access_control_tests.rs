@@ -31,6 +31,7 @@ fn create_stream_context(
 
 fn make_consumer_with_groups(username: &str, groups: Vec<&str>) -> Consumer {
     Consumer {
+        labels: Default::default(),
         id: format!("consumer-{}", username),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),
@@ -641,6 +642,7 @@ async fn test_access_control_stream_connect_allowed_consumer() {
     .unwrap();
 
     let mut ctx = create_stream_context(Some(Arc::new(Consumer {
+        labels: Default::default(),
         id: "consumer-1".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "stream-user".to_string(),

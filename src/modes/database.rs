@@ -4246,6 +4246,7 @@ mod tests {
             added_or_modified_consumers: vec![],
             removed_consumer_ids: vec![],
             added_or_modified_plugin_configs: vec![crate::config::types::PluginConfig {
+                labels: Default::default(),
                 id: "plugin-a".to_string(),
                 plugin_name: "rate_limiting".to_string(),
                 namespace: crate::config::types::default_namespace(),

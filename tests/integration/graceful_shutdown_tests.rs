@@ -39,6 +39,7 @@ use ferrum_edge::proxy::{ProxyState, start_proxy_listener_with_bound_listener};
 
 fn create_test_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("Graceful Shutdown Test {}", id)),

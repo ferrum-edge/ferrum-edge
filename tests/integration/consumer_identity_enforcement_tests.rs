@@ -34,6 +34,7 @@ async fn sqlite_store() -> (DatabaseStore, TempDir) {
 
 fn consumer_in(namespace: &str, id: &str, username: &str, custom_id: Option<&str>) -> Consumer {
     Consumer {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: namespace.to_string(),
         username: username.to_string(),

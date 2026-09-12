@@ -780,6 +780,7 @@ fn auto_inject_openapi_validator(
     validate_openapi_validator_config_budget(&auto_config)?;
     let now = Utc::now();
     plugins.push(PluginConfig {
+        labels: Default::default(),
         id: String::new(),
         plugin_name: "openapi_validator".to_string(),
         namespace: namespace.to_string(),

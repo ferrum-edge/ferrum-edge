@@ -45,6 +45,8 @@ use crate::cni::spec::{
 };
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
+#[cfg(any(test, target_os = "linux"))]
+use crate::ebpf::NODE_WAYPOINT_INGRESS_REDIRECT_RULE_PRIORITY;
 use crate::ebpf::cgroup;
 use crate::ebpf::ingress_topology::{
     IngressTopologyMonitor, IngressTopologyOutcome, IngressTopologyStatus,
@@ -59,9 +61,8 @@ use crate::ebpf::{
     NODE_AGENT_CAPTURE_STATE_INTERFACE_TOPOLOGY_UNAVAILABLE,
     NODE_AGENT_CAPTURE_STATE_NODE_GLOBAL_FALLBACK, NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED,
     NODE_AGENT_CAPTURE_STATE_READY, NODE_AGENT_CAPTURE_STATE_UNAVAILABLE,
-    NODE_WAYPOINT_INGRESS_REDIRECT_MARK, NODE_WAYPOINT_INGRESS_REDIRECT_RULE_PRIORITY,
-    NODE_WAYPOINT_INGRESS_REDIRECT_TABLE, NodeAgentMetrics, NodeAgentProxyMode, PodAttachmentState,
-    PodInfo, TcAttachDirection,
+    NODE_WAYPOINT_INGRESS_REDIRECT_MARK, NODE_WAYPOINT_INGRESS_REDIRECT_TABLE, NodeAgentMetrics,
+    NodeAgentProxyMode, PodAttachmentState, PodInfo, TcAttachDirection,
 };
 use crate::modes::node_agent_cni_server::{
     self, CniWorkItem, CniWorkReceiver, cni_work_channel, spawn_cni_listener,

@@ -61,6 +61,7 @@ impl Drop for ProxyEnvGuard {
 fn minimal_proxy() -> Proxy {
     let now = Utc::now();
     Proxy {
+        labels: Default::default(),
         id: "test-proxy".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,

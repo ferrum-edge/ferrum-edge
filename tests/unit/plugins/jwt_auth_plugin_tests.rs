@@ -616,6 +616,7 @@ fn make_consumer_with_jwt_secrets(secrets: &[&str]) -> Consumer {
     credentials.insert("jwt".to_string(), Value::Array(arr));
 
     Consumer {
+        labels: Default::default(),
         id: "test-consumer".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "testuser".to_string(),

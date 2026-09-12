@@ -314,6 +314,7 @@ async fn mesh_multicluster_load_balancer_fails_over_local_to_remote() {
     // is us-east-1, so the local target is the preferred (same-region) tier and
     // the remote target is the fallback tier.
     let upstream = Upstream {
+        labels: Default::default(),
         id: upstream_id.to_string(),
         name: None,
         namespace: "default".to_string(),

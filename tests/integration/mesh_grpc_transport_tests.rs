@@ -163,6 +163,7 @@ fn svid_slot(bundle: SvidBundle) -> SharedSvidBundle {
 fn grpc_proxy_for_test() -> Proxy {
     let now = Utc::now();
     Proxy {
+        labels: Default::default(),
         id: "mesh-mtls-grpc".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("Mesh mTLS gRPC".to_string()),

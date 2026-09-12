@@ -31,6 +31,7 @@ use tokio::net::TcpListener;
 
 fn proxy_for_backend(port: u16) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: "dr-connection-pool-audit".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,

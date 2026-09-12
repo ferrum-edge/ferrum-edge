@@ -5856,6 +5856,7 @@ async fn multipart_encoding_header_content_plugin_cache_rebuild_replaces_and_del
             consumers: vec![],
             plugin_configs: vec![PluginConfig {
                 id: "ov1".to_string(),
+                labels: Default::default(),
                 namespace: ferrum_edge::config::types::default_namespace(),
                 plugin_name: "openapi_validator".to_string(),
                 config,

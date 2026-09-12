@@ -69,6 +69,7 @@ fn create_test_env_config() -> EnvConfig {
 
 fn create_test_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("Resilience Proxy {}", id)),

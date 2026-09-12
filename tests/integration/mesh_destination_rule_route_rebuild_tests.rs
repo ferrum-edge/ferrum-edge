@@ -126,6 +126,7 @@ fn unrelated_http_proxy() -> Proxy {
 fn unrelated_consumer(id: &str, username: &str) -> Consumer {
     let now = Utc::now();
     Consumer {
+        labels: Default::default(),
         id: id.to_string(),
         username: username.to_string(),
         namespace: "default".to_string(),
@@ -151,6 +152,7 @@ fn lb_hash_on_for_port(state: &ProxyState, port: u16) -> HashOnStrategy {
 fn sd_upstream() -> Upstream {
     let now = Utc::now();
     Upstream {
+        labels: Default::default(),
         id: "reviews-u".to_string(),
         namespace: "default".to_string(),
         name: Some("reviews.default.svc.cluster.local".to_string()),

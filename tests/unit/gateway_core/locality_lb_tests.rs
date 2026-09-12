@@ -56,6 +56,7 @@ fn make_upstream(
 ) -> Upstream {
     let now = Utc::now();
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         name: Some(id.to_string()),
         namespace: "ferrum".to_string(),

@@ -2580,6 +2580,7 @@ pub(crate) struct RouteProxySpec {
 pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
     let now = Utc::now();
     Proxy {
+        labels: Default::default(),
         id: spec.id,
         name: None,
         namespace: spec.namespace,
@@ -2673,6 +2674,7 @@ pub(crate) fn route_request_transformer_plugin_for_proxy(
 ) -> PluginConfig {
     let now = Utc::now();
     PluginConfig {
+        labels: Default::default(),
         id: format!("istio-vs-req-xform-{proxy_id}"),
         plugin_name: "request_transformer".to_string(),
         namespace: namespace.to_string(),
@@ -2699,6 +2701,7 @@ pub(crate) fn route_response_transformer_plugin_for_proxy(
 ) -> PluginConfig {
     let now = Utc::now();
     PluginConfig {
+        labels: Default::default(),
         id: format!("istio-vs-resp-xform-{proxy_id}"),
         plugin_name: "response_transformer".to_string(),
         namespace: namespace.to_string(),
@@ -2726,6 +2729,7 @@ pub(crate) fn request_termination_plugin_for_proxy(
 ) -> PluginConfig {
     let now = Utc::now();
     PluginConfig {
+        labels: Default::default(),
         id: format!("istio-vs-rt-{proxy_id}"),
         plugin_name: "request_termination".to_string(),
         namespace: namespace.to_string(),
@@ -3547,6 +3551,7 @@ pub(crate) fn mesh_route_dispatch_plugin_from_rules(
     }
     let now = Utc::now();
     Some(PluginConfig {
+        labels: Default::default(),
         id: format!("istio-vs-mrd-{proxy_id}"),
         plugin_name: "mesh_route_dispatch".to_string(),
         namespace: namespace.to_string(),
@@ -3920,6 +3925,7 @@ pub(crate) fn upstream_for_route_with_session(
         .iter()
         .any(|backend| backend.weight != first_weight);
     let mut upstream = Upstream {
+        labels: Default::default(),
         id: id.clone(),
         name: Some(id),
         namespace,

@@ -8,6 +8,7 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 
 fn create_test_proxy() -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: "test".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,

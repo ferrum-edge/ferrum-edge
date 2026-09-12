@@ -4318,6 +4318,7 @@ paths:
             schema:
               $ref: "#/components/schemas/BatchCreateRequest"
       parameters:
+        - $ref: "#/components/parameters/ProvisionedBy"
         - $ref: "#/components/parameters/LiveApplyMode"
       responses:
         "202":
@@ -4576,6 +4577,7 @@ paths:
         (generated via `GET /backup?resources=proxies`, etc.).
       tags: [Backup & Restore]
       parameters:
+        - $ref: "#/components/parameters/ProvisionedBy"
         - $ref: "#/components/parameters/LiveApplyMode"
         - name: confirm
           in: query
@@ -4815,6 +4817,7 @@ paths:
             schema:
               $ref: "#/components/schemas/ProxyCreate"
       parameters:
+        - $ref: "#/components/parameters/ProvisionedBy"
         - $ref: "#/components/parameters/LiveApplyMode"
       responses:
         "202":
@@ -5074,6 +5077,7 @@ paths:
             schema:
               $ref: "#/components/schemas/ConsumerCreate"
       parameters:
+        - $ref: "#/components/parameters/ProvisionedBy"
         - $ref: "#/components/parameters/LiveApplyMode"
       responses:
         "202":
@@ -5658,6 +5662,7 @@ paths:
             schema:
               $ref: "#/components/schemas/PluginConfigCreate"
       parameters:
+        - $ref: "#/components/parameters/ProvisionedBy"
         - $ref: "#/components/parameters/LiveApplyMode"
       responses:
         "202":
@@ -5867,6 +5872,7 @@ paths:
             schema:
               $ref: "#/components/schemas/UpstreamCreate"
       parameters:
+        - $ref: "#/components/parameters/ProvisionedBy"
         - $ref: "#/components/parameters/LiveApplyMode"
       responses:
         "202":
@@ -6840,6 +6846,7 @@ paths:
         contract, worked examples, and curl recipes.
       tags: [API Specs]
       parameters:
+        - $ref: "#/components/parameters/ProvisionedBy"
         - $ref: "#/components/parameters/LiveApplyMode"
         - name: X-Ferrum-Namespace
           in: header
@@ -7096,6 +7103,7 @@ paths:
         This mutation requires the `admin` role.
       tags: [API Specs]
       parameters:
+        - $ref: "#/components/parameters/ProvisionedBy"
         - $ref: "#/components/parameters/LiveApplyMode"
         - name: X-Ferrum-Namespace
           in: header
@@ -7414,6 +7422,23 @@ components:
 
   # ── Reusable parameters ────────────────────────────────────────────
   parameters:
+    ProvisionedBy:
+      name: X-Ferrum-Provisioned-By
+      in: header
+      required: false
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 512
+      description: >-
+        Optional application identifier, stored as labels.provisioned-by on
+        created core resources when that label is absent. Must occur once, be
+        nonblank, and contain no control characters (512 UTF-8 bytes maximum).
+        Covers CRUD creates, batch, non-spec-owned restore rows, and all
+        API-spec-generated resources, including generated validators. Existing
+        labels and spec-owned restore graphs retain their recorded origin.
+        API-spec replacement preserves existing labels by resource identity and
+        stamps newly generated resources. This header grants no authority.
     ResourceId:
       name: id
       in: path
@@ -8916,9 +8941,34 @@ components:
           minimum: 0
 
     # ── Proxy ───────────────────────────────────────────────────────
+    ResourceLabels:
+      type: object
+      maxProperties: 64
+      propertyNames:
+        type: string
+        minLength: 1
+        maxLength: 128
+      additionalProperties:
+        type: string
+        maxLength: 512
+      description: >-
+        Informational operator metadata. Keys must be nonblank; keys and values
+        cannot contain control characters. Runtime length limits are UTF-8 bytes
+        (128 per key, 512 per value). Independent of target tags, routing, access
+        control and api_spec_id. Omitted labels on resource PUT preserve the
+        current map; an explicit map replaces it and {} clears it. Labels are
+        retained in GET/list, backup/restore, file configuration and CP/DP sync.
+        The provisioned-by label identifies the application that provisioned a
+        resource; it is caller-supplied information, not proof of ownership.
+      examples:
+        - provisioned-by: ferrum-nexus
+          team: platform
+
     Proxy:
       type: object
       properties:
+        labels:
+          $ref: "#/components/schemas/ResourceLabels"
         id:
           type: string
           description: >-
@@ -9743,6 +9793,8 @@ components:
       type: object
       required: [username]
       properties:
+        labels:
+          $ref: "#/components/schemas/ResourceLabels"
         id:
           type: string
           description: >-
@@ -10788,6 +10840,8 @@ components:
       type: object
       required: [plugin_name, scope]
       properties:
+        labels:
+          $ref: "#/components/schemas/ResourceLabels"
         id:
           type: string
           description: >-
@@ -12614,6 +12668,8 @@ components:
       type: object
       required: [targets]
       properties:
+        labels:
+          $ref: "#/components/schemas/ResourceLabels"
         id:
           type: string
           description: >-

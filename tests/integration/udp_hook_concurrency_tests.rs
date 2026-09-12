@@ -127,6 +127,7 @@ impl Plugin for GatedClientADatagramHook {
 
 fn udp_proxy(listen_port: u16, backend_port: u16) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: PROXY_ID.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("udp hook concurrency".to_string()),

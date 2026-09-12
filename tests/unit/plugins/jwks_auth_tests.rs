@@ -77,6 +77,7 @@ async fn jwks_marks_forwarded_custom_query_locations_for_opa_redaction() {
 fn create_consumer(username: &str) -> ferrum_edge::config::types::Consumer {
     use chrono::Utc;
     ferrum_edge::config::types::Consumer {
+        labels: Default::default(),
         id: format!("{}-id", username),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),
@@ -94,6 +95,7 @@ fn create_consumer_with_custom_id(
 ) -> ferrum_edge::config::types::Consumer {
     use chrono::Utc;
     ferrum_edge::config::types::Consumer {
+        labels: Default::default(),
         id: format!("{}-id", username),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),

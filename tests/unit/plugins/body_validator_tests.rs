@@ -17,6 +17,7 @@ fn body_validator_plugin_config(
     config: serde_json::Value,
 ) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: "ferrum".to_string(),
         plugin_name: "body_validator".to_string(),

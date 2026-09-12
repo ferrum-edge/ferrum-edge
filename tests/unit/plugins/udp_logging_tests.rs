@@ -726,6 +726,7 @@ fn test_udp_logging_split_retry_counts_each_lost_record_once() {
 fn test_udp_logging_disabled_skips_construction_validation() {
     let mut gateway = GatewayConfig {
         plugin_configs: vec![PluginConfig {
+            labels: Default::default(),
             id: "udp-disabled".to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "udp_logging".to_string(),
@@ -761,6 +762,7 @@ async fn test_udp_logging_optional_fail_open_omits_unknown_key_instance() {
     .expect("proxy");
 
     let bad_plugin = PluginConfig {
+        labels: Default::default(),
         id: "udp-typo".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "udp_logging".to_string(),
@@ -1023,6 +1025,7 @@ async fn test_udp_logging_dtls_validates_configured_ca_when_no_verify_is_true() 
 fn test_udp_logging_file_dependency_phase_reports_bad_dtls_material() {
     let config = GatewayConfig {
         plugin_configs: vec![PluginConfig {
+            labels: Default::default(),
             id: "udp-deps".to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "udp_logging".to_string(),
@@ -1114,6 +1117,7 @@ fn test_udp_logging_file_dependency_duplicate_sources_materialize_once() {
     let config = GatewayConfig {
         plugin_configs: vec![
             PluginConfig {
+                labels: Default::default(),
                 id: "udp-deps-a".to_string(),
                 namespace: ferrum_edge::config::types::default_namespace(),
                 plugin_name: "udp_logging".to_string(),
@@ -1128,6 +1132,7 @@ fn test_udp_logging_file_dependency_duplicate_sources_materialize_once() {
                 updated_at: Utc::now(),
             },
             PluginConfig {
+                labels: Default::default(),
                 id: "udp-deps-b".to_string(),
                 namespace: ferrum_edge::config::types::default_namespace(),
                 plugin_name: "udp_logging".to_string(),

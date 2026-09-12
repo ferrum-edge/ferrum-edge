@@ -66,6 +66,7 @@ fn ctx() -> RequestContext {
 
 fn mesh_route_plugin_config(config: serde_json::Value) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: "mesh-route".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "mesh_route_dispatch".to_string(),

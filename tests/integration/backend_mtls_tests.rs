@@ -28,6 +28,7 @@ use crate::scaffolding::ports::reserve_port;
 /// Create a test proxy with mTLS configuration
 fn create_test_mtls_proxy() -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: "mtls-test".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("mTLS Test Proxy".to_string()),

@@ -353,6 +353,7 @@ fn mtls_dns_policy_gate_skips_consumers_until_san_dns_is_effective() {
     let now = chrono::Utc::now();
     let mut config = GatewayConfig {
         plugin_configs: vec![PluginConfig {
+            labels: Default::default(),
             id: "dns-mtls".to_string(),
             namespace: "ferrum".to_string(),
             plugin_name: "mtls_auth".to_string(),

@@ -2773,6 +2773,7 @@ fn node_waypoint_udp_listener_proxy(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         name: Some(format!(
             "mesh node-waypoint {protocol_label} listener :{listen_port}"
@@ -2857,6 +2858,7 @@ fn node_waypoint_udp_listener_upstream(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         name: Some(id.to_string()),
         namespace: namespace.to_string(),
@@ -4375,6 +4377,7 @@ fn materialize_east_west_gateway_proxies(
 fn east_west_gateway_proxy(gateway: &EastWestGateway, listen_port: u16) -> Proxy {
     let now = chrono::Utc::now();
     Proxy {
+        labels: Default::default(),
         id: mesh_east_west_proxy_id(&gateway.namespace, &gateway.name),
         name: Some(format!("mesh east-west {}", gateway.name)),
         namespace: gateway.namespace.clone(),
@@ -4552,6 +4555,7 @@ fn build_east_west_service_proxies_and_upstreams(
             );
 
             let upstream = Upstream {
+                labels: Default::default(),
                 id: upstream_id.clone(),
                 name: Some(upstream_id.clone()),
                 namespace: namespace.to_string(),
@@ -4950,6 +4954,7 @@ fn east_west_service_proxy(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         name: Some(format!("mesh east-west svc {sni_hostname}")),
         namespace: namespace.to_string(),
@@ -6878,6 +6883,7 @@ fn mesh_ingress_unix_upstream(
         h2c.to_string(),
     );
     Upstream {
+        labels: Default::default(),
         id: upstream_id.to_string(),
         name: Some(upstream_id.to_string()),
         namespace: namespace.to_string(),
@@ -6941,6 +6947,7 @@ fn mesh_inbound_loopback_proxy_to(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         name: Some(format!("mesh inbound {id}")),
         namespace: namespace.to_string(),
@@ -7036,6 +7043,7 @@ pub(crate) fn mesh_inbound_tcp_relay_proxy(route: &MeshInboundTcpRoute) -> Proxy
     .replace(['/', '.'], "-");
     let now = chrono::Utc::now();
     Proxy {
+        labels: Default::default(),
         id: id.clone(),
         name: Some(format!("mesh raw-tcp inbound {id}")),
         namespace: route.namespace.clone(),
@@ -7165,6 +7173,7 @@ pub(crate) fn mesh_ingress_relay_proxy(host: &str, port: u16) -> Proxy {
 fn mesh_inbound_connect_relay_proxy(id: &str, host: &str, port: u16) -> Proxy {
     let now = chrono::Utc::now();
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         name: Some("mesh inbound connect relay".to_string()),
         namespace: String::new(),
@@ -8359,6 +8368,7 @@ fn mesh_outbound_tcp_relay_proxy_with_id(
 ) -> Proxy {
     let now = chrono::Utc::now();
     Proxy {
+        labels: Default::default(),
         name: Some(format!("mesh egress {id}")),
         id,
         namespace: namespace.to_string(),
@@ -9724,6 +9734,7 @@ fn mesh_outbound_route_proxy(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         name: Some(format!("mesh outbound {id}")),
         namespace: namespace.to_string(),
@@ -9835,6 +9846,7 @@ fn mesh_outbound_route_upstream(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: upstream_id.to_string(),
         // DR-matchable service host (see the materializer call site).
         name: Some(service_fqdn.to_string()),
@@ -10000,6 +10012,7 @@ fn synthesize_mesh_outbound_cors_plugins(
             });
             let now = chrono::Utc::now();
             synthesized.push(PluginConfig {
+                labels: Default::default(),
                 id: plugin_id,
                 plugin_name: "cors".to_string(),
                 namespace: service.namespace.clone(),
@@ -12470,6 +12483,7 @@ fn build_egress_upstream(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: upstream_id.to_string(),
         name: Some(upstream_id.to_string()),
         namespace: namespace.to_string(),
@@ -12663,6 +12677,7 @@ fn egress_gateway_proxy(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         name: Some(format!("mesh egress {host}")),
         namespace: namespace.to_string(),
@@ -12758,6 +12773,7 @@ fn stream_egress_gateway_proxy(
 ) -> Proxy {
     let protocol_label = egress_app_protocol_label(protocol);
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         name: Some(format!(
             "mesh egress {protocol_label} {representative_host}:{listen_port}"
@@ -13679,6 +13695,7 @@ fn ensure_global_plugin_inner(
 ) {
     let now = chrono::Utc::now();
     let mesh_plugin = PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         plugin_name: plugin_name.to_string(),
         namespace: namespace.to_string(),
@@ -23884,6 +23901,7 @@ mod tests {
 
     fn global_mesh_authz_plugin(id: &str, config: serde_json::Value) -> PluginConfig {
         PluginConfig {
+            labels: Default::default(),
             id: id.to_string(),
             plugin_name: "mesh_authz".to_string(),
             namespace: "default".to_string(),
@@ -24252,6 +24270,7 @@ mod tests {
         udp_proxy.id = "operator-udp".to_string();
         udp_proxy.name = Some("operator udp".to_string());
         let proxy_plugin = PluginConfig {
+            labels: Default::default(),
             id: "operator-udp-plugin".to_string(),
             plugin_name: "udp_logging".to_string(),
             namespace: "default".to_string(),
@@ -24412,6 +24431,7 @@ mod tests {
         other_proxy.namespace = "tenant-b".to_string();
 
         let plugin = |id: &str, namespace: &str| PluginConfig {
+            labels: Default::default(),
             id: id.to_string(),
             plugin_name: "tcp_logging".to_string(),
             namespace: namespace.to_string(),
@@ -27079,6 +27099,7 @@ mod tests {
     fn destination_rule_test_upstream(id: &str, host: &str) -> Upstream {
         let now = chrono::Utc::now();
         Upstream {
+            labels: Default::default(),
             id: id.to_string(),
             namespace: "default".to_string(),
             name: Some(id.to_string()),
@@ -30346,6 +30367,7 @@ mod tests {
         let now = chrono::Utc::now();
         let mut config = GatewayConfig {
             plugin_configs: vec![crate::config::types::PluginConfig {
+                labels: Default::default(),
                 id: MESH_OUTBOUND_REGISTRY_PLUGIN_ID.to_string(),
                 plugin_name: "mesh_outbound_registry".to_string(),
                 namespace: "default".to_string(),
@@ -30385,6 +30407,7 @@ mod tests {
         let mut config = GatewayConfig {
             plugin_configs: vec![
                 PluginConfig {
+                    labels: Default::default(),
                     id: MESH_OUTBOUND_REGISTRY_PLUGIN_ID.to_string(),
                     plugin_name: "mesh_outbound_registry".to_string(),
                     namespace: runtime.namespace.clone(),
@@ -30399,6 +30422,7 @@ mod tests {
                     updated_at: now,
                 },
                 PluginConfig {
+                    labels: Default::default(),
                     id: MESH_OUTBOUND_REGISTRY_PLUGIN_ID.to_string(),
                     plugin_name: "mesh_outbound_registry".to_string(),
                     namespace: "tenant-b".to_string(),
@@ -30444,6 +30468,7 @@ mod tests {
         let now = chrono::Utc::now();
         let mut config = GatewayConfig {
             plugin_configs: vec![crate::config::types::PluginConfig {
+                labels: Default::default(),
                 id: MESH_OUTBOUND_REGISTRY_PLUGIN_ID.to_string(),
                 plugin_name: "mesh_outbound_registry".to_string(),
                 namespace: "default".to_string(),
@@ -30501,6 +30526,7 @@ mod tests {
         let now = chrono::Utc::now();
         let mut config = GatewayConfig {
             plugin_configs: vec![crate::config::types::PluginConfig {
+                labels: Default::default(),
                 id: "operator-mesh-authz".to_string(),
                 plugin_name: "mesh_authz".to_string(),
                 namespace: "default".to_string(),
@@ -30653,6 +30679,7 @@ mod tests {
         let now = chrono::Utc::now();
         let mut config = GatewayConfig {
             plugin_configs: vec![crate::config::types::PluginConfig {
+                labels: Default::default(),
                 id: "operator-mesh-authz".to_string(),
                 plugin_name: "mesh_authz".to_string(),
                 namespace: "default".to_string(),
@@ -32100,6 +32127,7 @@ mod tests {
         let loaded_at = config.loaded_at;
         let before = chrono::Utc::now();
         config.upstreams.push(Upstream {
+            labels: Default::default(),
             id: "reviews".to_string(),
             namespace: "default".to_string(),
             name: Some("reviews".to_string()),
@@ -32170,6 +32198,7 @@ mod tests {
 
         let generation = chrono::Utc::now() - chrono::Duration::seconds(10);
         let fault_config = crate::config::types::PluginConfig {
+            labels: Default::default(),
             id: "fault-checkout".to_string(),
             plugin_name: "fault_injection".to_string(),
             namespace: "default".to_string(),
@@ -32279,6 +32308,7 @@ mod tests {
         let generation = chrono::Utc::now() - chrono::Duration::seconds(10);
         let accepted = GatewayConfig {
             plugin_configs: vec![crate::config::types::PluginConfig {
+                labels: Default::default(),
                 id: "fault-checkout".to_string(),
                 plugin_name: "fault_injection".to_string(),
                 namespace: "default".to_string(),
@@ -32328,6 +32358,7 @@ mod tests {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Upstream {
         Upstream {
+            labels: Default::default(),
             id: id.to_string(),
             namespace: "default".to_string(),
             name: Some(id.to_string()),
@@ -32817,6 +32848,7 @@ mod tests {
 
         let mut config_a = GatewayConfig::default();
         config_a.upstreams.push(Upstream {
+            labels: Default::default(),
             id: "reviews".to_string(),
             namespace: "default".to_string(),
             name: Some("reviews".to_string()),
@@ -34327,6 +34359,7 @@ mod tests {
                 let runtime =
                     MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
                 let existing = PluginConfig {
+                    labels: Default::default(),
                     id: "operator-mesh-authz".to_string(),
                     plugin_name: "mesh_authz".to_string(),
                     namespace: "ferrum".to_string(),
@@ -34371,6 +34404,7 @@ mod tests {
         // Re-injection against prior materializer output updates the existing
         // `(namespace, id)` row instead of duplicating it.
         let existing = PluginConfig {
+            labels: Default::default(),
             id: MESH_REQUEST_AUTH_PLUGIN_ID.to_string(),
             plugin_name: "jwks_auth".to_string(),
             namespace: "default".to_string(),

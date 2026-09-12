@@ -100,6 +100,7 @@ impl Plugin for RejectingStreamOrderingProbe {
 
 fn fault_plugin_config(config: serde_json::Value) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: PLUGIN_CONFIG_ID.to_string(),
         plugin_name: "fault_injection".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -117,6 +118,7 @@ fn fault_plugin_config(config: serde_json::Value) -> PluginConfig {
 
 fn udp_proxy(listen_port: u16, backend_port: u16) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: PROXY_ID.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("udp fault injection".to_string()),

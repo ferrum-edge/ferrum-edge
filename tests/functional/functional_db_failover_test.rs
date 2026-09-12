@@ -109,6 +109,7 @@ fn kill_child(mut child: Child) {
 
 fn seeded_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         name: Some(id.to_string()),

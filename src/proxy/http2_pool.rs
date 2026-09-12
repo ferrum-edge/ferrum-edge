@@ -2016,6 +2016,7 @@ mod tests {
     fn http2_pool_test_proxy() -> Proxy {
         let now = Utc::now();
         Proxy {
+            labels: Default::default(),
             id: "p-h2".to_string(),
             namespace: crate::config::types::default_namespace(),
             name: None,

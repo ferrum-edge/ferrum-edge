@@ -126,6 +126,7 @@ fn trust_view_with_jwt(td: &str, key_id: &str, public_key_pem: &str) -> TrustBun
 fn proxy_for_test() -> Proxy {
     let now = Utc::now();
     Proxy {
+        labels: Default::default(),
         id: "gateway-mesh-trust".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("Gateway mesh trust".to_string()),

@@ -30,6 +30,7 @@ const UNKNOWN: ProtocolSupport = ProtocolSupport::Unknown;
 fn minimal_proxy() -> Proxy {
     let now = Utc::now();
     Proxy {
+        labels: Default::default(),
         id: "capability-commit".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,

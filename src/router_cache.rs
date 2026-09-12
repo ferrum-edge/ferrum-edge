@@ -4888,6 +4888,7 @@ mod tests {
         };
         let now = chrono::Utc::now();
         Proxy {
+            labels: Default::default(),
             id: id.to_string(),
             namespace: crate::config::types::default_namespace(),
             name: None,

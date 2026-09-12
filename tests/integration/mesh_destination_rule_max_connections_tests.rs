@@ -131,6 +131,7 @@ fn runtime() -> MeshRuntimeConfig {
 fn ws_upstream(id: &str) -> Upstream {
     let now = Utc::now();
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: "default".to_string(),
         name: Some(id.to_string()),

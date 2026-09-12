@@ -36,6 +36,7 @@ use ferrum_edge::proxy::ProxyState;
 /// Create a test proxy configured for gRPC backend.
 fn create_grpc_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("gRPC Test Proxy {}", id)),
@@ -297,6 +298,7 @@ fn attach_grpc_web_deadline_plugins(
     ];
     vec![
         PluginConfig {
+            labels: Default::default(),
             id: "grpc-web-bridge".to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "grpc_web".to_string(),
@@ -311,6 +313,7 @@ fn attach_grpc_web_deadline_plugins(
             updated_at: Utc::now(),
         },
         PluginConfig {
+            labels: Default::default(),
             id: "grpc-deadline".to_string(),
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "grpc_deadline".to_string(),
@@ -329,6 +332,7 @@ fn attach_grpc_web_deadline_plugins(
 
 fn create_test_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("gRPC Test Upstream {id}")),
@@ -362,6 +366,7 @@ fn create_test_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
 
 fn security_headers_plugin(id: &str) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "security_headers".to_string(),
@@ -1575,6 +1580,7 @@ fn test_plugin_config(
     config: serde_json::Value,
 ) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: plugin_name.to_string(),
@@ -2242,6 +2248,7 @@ async fn hmac_auth_reuses_prebuffered_native_grpc_body_for_primary_dispatch() {
 
     let secret = "0123456789abcdef0123456789abcdef";
     let consumer = Consumer {
+        labels: Default::default(),
         id: "grpc-hmac-consumer".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "grpc-hmac-user".to_string(),
@@ -2317,6 +2324,7 @@ async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambigu
 
     let secret = "0123456789abcdef0123456789abcdef";
     let consumer = Consumer {
+        labels: Default::default(),
         id: "grpc-hmac-cd-consumer".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: "grpc-hmac-cd-user".to_string(),
@@ -3179,6 +3187,7 @@ async fn grpc_buffered_trailer_writeback_honors_hook_removal_and_duplicate_keys(
         plugin_config_id: "rt-trailer-remove".to_string(),
     }];
     let plugin = PluginConfig {
+        labels: Default::default(),
         id: "rt-trailer-remove".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "response_transformer".to_string(),
@@ -3313,6 +3322,7 @@ async fn grpc_buffered_security_removal_wins_over_cookie_rehome_and_trailer_repl
     let mut proxy = create_grpc_proxy("grpc-security-removal", "/grpc", backend_addr.port());
     proxy.response_body_mode = ResponseBodyMode::Buffer;
     let transformer = PluginConfig {
+        labels: Default::default(),
         id: "grpc-cookie-transformer".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "response_transformer".to_string(),
@@ -3526,6 +3536,7 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
         },
     ];
     let plugin = PluginConfig {
+        labels: Default::default(),
         id: "grpc-web-bridge".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "grpc_web".to_string(),
@@ -3544,6 +3555,7 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
     sibling.config = serde_json::json!({"expose_headers": ["x-grpc-web-sibling"]});
     sibling.priority_override = Some(270);
     let cookie_transformer = PluginConfig {
+        labels: Default::default(),
         id: "grpc-web-cookie-transformer".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "response_transformer".to_string(),
@@ -3910,6 +3922,7 @@ async fn grpc_web_server_streaming_reaches_h1_and_h2_before_backend_eof() {
         plugin_config_id: "grpc-web-cadence".to_string(),
     }];
     let plugin = PluginConfig {
+        labels: Default::default(),
         id: "grpc-web-cadence".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "grpc_web".to_string(),
@@ -4128,6 +4141,7 @@ async fn grpc_web_preserves_ascii_custom_trailers_on_h1_and_h2_binary_and_text()
         plugin_config_id: "grpc-web-custom-trailers".to_string(),
     }];
     let plugin = PluginConfig {
+        labels: Default::default(),
         id: "grpc-web-custom-trailers".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "grpc_web".to_string(),
@@ -4204,6 +4218,7 @@ async fn grpc_web_text_keeps_security_policy_in_initial_headers() {
         },
     ];
     let grpc_web = PluginConfig {
+        labels: Default::default(),
         id: "grpc-web-text-bridge".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "grpc_web".to_string(),
@@ -4333,6 +4348,7 @@ async fn grpc_web_gateway_backend_error_is_grpc_web_shaped() {
         plugin_config_id: "grpc-web-bridge".to_string(),
     }];
     let plugin = PluginConfig {
+        labels: Default::default(),
         id: "grpc-web-bridge".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "grpc_web".to_string(),
@@ -4583,6 +4599,7 @@ async fn grpc_web_backend_path_policy_reject_is_grpc_web_shaped() {
         },
     ];
     let grpc_web = PluginConfig {
+        labels: Default::default(),
         id: "grpc-web-method-policy-bridge".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "grpc_web".to_string(),
@@ -4597,6 +4614,7 @@ async fn grpc_web_backend_path_policy_reject_is_grpc_web_shaped() {
         updated_at: Utc::now(),
     };
     let method_router = PluginConfig {
+        labels: Default::default(),
         id: "grpc-web-method-policy-router".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "grpc_method_router".to_string(),
@@ -4686,6 +4704,7 @@ async fn grpc_retry_does_not_dial_path_changing_target() {
     }];
 
     let method_router = PluginConfig {
+        labels: Default::default(),
         id: "grpc-retry-method-policy-router".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "grpc_method_router".to_string(),

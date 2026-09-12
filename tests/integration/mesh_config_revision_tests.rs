@@ -351,6 +351,7 @@ fn full_load_consumer_config(namespace: &str, generation: &str, timestamp: i64) 
     GatewayConfig {
         version: ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string(),
         consumers: vec![Consumer {
+            labels: Default::default(),
             id: format!("{namespace}-{generation}"),
             username: format!("{namespace}-{generation}"),
             namespace: namespace.to_string(),

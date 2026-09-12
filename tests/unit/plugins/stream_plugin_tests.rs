@@ -24,6 +24,7 @@ fn empty_consumer_index() -> Arc<ferrum_edge::ConsumerIndex> {
 
 fn test_consumer(username: &str) -> ferrum_edge::config::types::Consumer {
     ferrum_edge::config::types::Consumer {
+        labels: Default::default(),
         id: format!("consumer-{username}"),
         namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),

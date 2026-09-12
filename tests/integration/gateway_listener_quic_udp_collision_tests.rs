@@ -57,6 +57,7 @@ fn port_scoped_https_proxy(id: &str, backend_port: u16, listen_port: u16) -> Pro
 
 fn stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,

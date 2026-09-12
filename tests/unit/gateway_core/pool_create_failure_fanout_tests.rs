@@ -63,6 +63,7 @@ impl PoolManager for FanoutTestManager {
 fn test_proxy() -> Proxy {
     let now = Utc::now();
     Proxy {
+        labels: Default::default(),
         id: "pool-fanout-test".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,

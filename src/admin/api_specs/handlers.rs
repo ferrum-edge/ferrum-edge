@@ -2769,6 +2769,15 @@ pub async fn handle_post_api_spec(
         Err(e) => return Ok(error_response(e)),
     };
 
+    let provisioner = match crate::admin::provisioning::provisioner(req.headers()) {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(json_resp(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({"error": error}),
+            ));
+        }
+    };
     let declared_format = parse_content_type(req.headers());
     let max_mib = state.admin_spec_max_body_size_mib;
 
@@ -2783,6 +2792,8 @@ pub async fn handle_post_api_spec(
             Ok(v) => v,
             Err(e) => return Ok(error_response(e)),
         };
+
+    stamp_bundle_labels(&mut bundle, provisioner.as_deref());
 
     // Assign IDs for POST: mint UUIDs for every empty ID, re-link references.
     assign_ids_for_post(&mut bundle);
@@ -2957,6 +2968,15 @@ pub async fn handle_put_api_spec(
         Err(e) => return Ok(error_response(classify_db_error(e))),
     }
 
+    let provisioner = match crate::admin::provisioning::provisioner(req.headers()) {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(json_resp(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({"error": error}),
+            ));
+        }
+    };
     let declared_format = parse_content_type(req.headers());
     let max_mib = state.admin_spec_max_body_size_mib;
 
@@ -3065,6 +3085,9 @@ pub async fn handle_put_api_spec(
             ))));
         }
     };
+    // Replacement must not reattribute existing resources to the editor. Carry
+    // missing labels from the same resource identity before stamping new rows.
+    preserve_bundle_labels(&mut bundle, &previous_bundle, provisioner.as_deref());
     let existing_upstream_id: Option<&str> = existing_spec_upstream.as_ref().map(|u| u.id.as_str());
 
     let ValidatedBundle { bundle, metadata } = match validate_bundle(
@@ -3690,8 +3713,50 @@ pub async fn handle_delete_api_spec(
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Provisioning metadata and tests
 // ---------------------------------------------------------------------------
+
+fn stamp_bundle_labels(bundle: &mut ExtractedBundle, provisioner: Option<&str>) {
+    crate::admin::provisioning::stamp(&mut bundle.proxy.labels, provisioner);
+    if let Some(upstream) = &mut bundle.upstream {
+        crate::admin::provisioning::stamp(&mut upstream.labels, provisioner);
+    }
+    for plugin in &mut bundle.plugins {
+        crate::admin::provisioning::stamp(&mut plugin.labels, provisioner);
+    }
+}
+
+fn preserve_bundle_labels(
+    bundle: &mut ExtractedBundle,
+    previous: &ExtractedBundle,
+    provisioner: Option<&str>,
+) {
+    fn preserve(
+        labels: &mut std::collections::BTreeMap<String, String>,
+        previous: &std::collections::BTreeMap<String, String>,
+    ) {
+        for (key, value) in previous {
+            labels.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    preserve(&mut bundle.proxy.labels, &previous.proxy.labels);
+    if let Some(upstream) = &mut bundle.upstream {
+        if let Some(old) = &previous.upstream
+            && upstream.id == old.id
+        {
+            preserve(&mut upstream.labels, &old.labels);
+        } else {
+            crate::admin::provisioning::stamp(&mut upstream.labels, provisioner);
+        }
+    }
+    for plugin in &mut bundle.plugins {
+        if let Some(old) = previous.plugins.iter().find(|old| old.id == plugin.id) {
+            preserve(&mut plugin.labels, &old.labels);
+        } else {
+            crate::admin::provisioning::stamp(&mut plugin.labels, provisioner);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

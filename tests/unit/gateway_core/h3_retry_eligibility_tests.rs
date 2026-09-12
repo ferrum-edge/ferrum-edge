@@ -58,6 +58,7 @@ fn unix_target(idx: usize) -> UpstreamTarget {
 fn rr_upstream(targets: Vec<UpstreamTarget>) -> Upstream {
     let now = Utc::now();
     Upstream {
+        labels: Default::default(),
         id: UPSTREAM_ID.to_string(),
         namespace: NAMESPACE.to_string(),
         name: Some(UPSTREAM_ID.to_string()),

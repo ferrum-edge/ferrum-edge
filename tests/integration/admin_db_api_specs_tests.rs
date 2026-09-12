@@ -136,6 +136,7 @@ fn make_plugin(
     api_spec_id: Option<&str>,
 ) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: namespace.to_string(),
         plugin_name: "rate_limiting".to_string(),
@@ -1814,6 +1815,7 @@ async fn replace_api_spec_bundle_does_not_delete_same_api_spec_id_in_other_names
         .expect("initial submit failed");
 
     let other_plugin = PluginConfig {
+        labels: Default::default(),
         id: other_plugin_id.clone(),
         namespace: other_ns.to_string(),
         plugin_name: "cors".to_string(),
@@ -2228,6 +2230,7 @@ async fn delete_api_spec_does_not_delete_same_api_spec_id_in_other_namespace() {
         .expect("submit failed");
 
     let other_plugin = PluginConfig {
+        labels: Default::default(),
         id: other_plugin_id.clone(),
         namespace: other_ns.to_string(),
         plugin_name: "cors".to_string(),
@@ -2300,6 +2303,7 @@ async fn delete_api_spec_cleans_orphaned_proxy_group_plugin() {
     let spec_id = uid("spec");
 
     let proxy_group_plugin = PluginConfig {
+        labels: Default::default(),
         id: proxy_group_plugin_id.clone(),
         namespace: ns.to_string(),
         plugin_name: "cors".to_string(),
@@ -2421,6 +2425,7 @@ async fn delete_api_spec_rejects_removing_last_global_tcp_throttle_target() {
     let now = chrono::Utc::now();
     store
         .create_plugin_config(&PluginConfig {
+            labels: Default::default(),
             id: uid("global-tcp-throttle"),
             namespace: ns.to_string(),
             plugin_name: "tcp_connection_throttle".to_string(),
@@ -4127,6 +4132,7 @@ async fn replace_with_changed_resources_keeps_manual_proxy_plugin_association() 
     // direct admin API).
     let manual_plugin_id = uid("proxy-group-plugin");
     let manual_plugin = PluginConfig {
+        labels: Default::default(),
         id: manual_plugin_id.clone(),
         namespace: ns.to_string(),
         plugin_name: "cors".to_string(),
@@ -4231,6 +4237,7 @@ async fn replace_removes_removed_spec_declared_external_proxy_plugin_association
     let group_plugin_id = uid("group-plugin");
 
     let group_plugin = PluginConfig {
+        labels: Default::default(),
         id: group_plugin_id.clone(),
         namespace: ns.to_string(),
         plugin_name: "rate_limiting".to_string(),
@@ -4600,6 +4607,7 @@ async fn delete_api_spec_rolls_back_when_spec_owned_upstream_id_fails_to_decode(
     let now = chrono::Utc::now();
     store
         .create_plugin_config(&PluginConfig {
+            labels: Default::default(),
             id: mesh_plugin_id.clone(),
             namespace: ns.to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),

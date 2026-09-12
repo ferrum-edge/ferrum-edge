@@ -208,6 +208,7 @@ fn passive_health_check_skip_serializing_none_fields() {
 
 fn make_upstream(subsets: Option<Vec<SubsetDefinition>>) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: "u1".into(),
         namespace: "ferrum".into(),
         name: Some("test-upstream".into()),

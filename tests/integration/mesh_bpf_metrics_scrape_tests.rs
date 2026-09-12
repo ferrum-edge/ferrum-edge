@@ -67,6 +67,7 @@ fn bpf_metrics_plugin_config(prefix: Option<&str>) -> PluginConfig {
         None => json!({}),
     };
     PluginConfig {
+        labels: Default::default(),
         id: TEST_PLUGIN_ID.to_string(),
         plugin_name: PLUGIN_NAME.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),

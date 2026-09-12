@@ -110,6 +110,7 @@ pub fn create_test_consumer() -> Consumer {
     );
 
     Consumer {
+        labels: Default::default(),
         id: "test-consumer".to_string(),
         namespace: default_namespace(),
         username: "testuser".to_string(),
@@ -232,6 +233,7 @@ pub fn assert_reject_body(result: PluginResult, expected_body: &str) {
 #[allow(dead_code)]
 pub fn create_test_proxy() -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: "test-proxy".to_string(),
         namespace: default_namespace(),
         name: Some("Test Proxy".to_string()),
@@ -858,6 +860,7 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
 #[allow(dead_code)]
 pub(crate) fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         name: Some(format!("Proxy {}", id)),
@@ -941,6 +944,7 @@ pub(crate) fn make_plugin_config(
     // Some plugins now require non-empty config to be created successfully.
     let config = minimal_plugin_config(plugin_name);
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         plugin_name: plugin_name.to_string(),
@@ -965,6 +969,7 @@ pub(crate) fn make_plugin_config_with_json(
     proxy_id: Option<&str>,
 ) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         plugin_name: plugin_name.to_string(),

@@ -1098,6 +1098,7 @@ fn inject_gateway_workload_metrics_if_svid(
 
     let timestamp = gateway_managed_plugin_timestamp();
     config.plugin_configs.push(PluginConfig {
+        labels: Default::default(),
         id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
         plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
         namespace: namespace.to_string(),
@@ -62842,6 +62843,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "mrd-p".to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),
             namespace: "ferrum".to_string(),
@@ -62908,6 +62910,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "mrd-p".to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),
             namespace: "ferrum".to_string(),
@@ -62966,6 +62969,7 @@ mod tests {
         let proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "mrd-p".to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),
             namespace: "ferrum".to_string(),
@@ -63023,6 +63027,7 @@ mod tests {
         let proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "mrd-p".to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),
             namespace: "ferrum".to_string(),
@@ -63062,6 +63067,7 @@ mod tests {
         let now = chrono::Utc::now();
         let upstream = upstream_with_targets("real-upstream", &[("backend.test", 8080)]);
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "mrd-p".to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),
             namespace: "ferrum".to_string(),
@@ -63096,6 +63102,7 @@ mod tests {
         proxy.namespace = "tenant-a".to_string();
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "mrd-p".to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),
             namespace: "tenant-a".to_string(),
@@ -63137,6 +63144,7 @@ mod tests {
         tenant_b.namespace = "tenant-b".to_string();
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "global-mrd".to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),
             namespace: "tenant-a".to_string(),
@@ -63174,6 +63182,7 @@ mod tests {
     fn validate_global_mesh_route_dispatch_without_http_proxies_rejects_dangling_reference() {
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "global-mrd".to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),
             namespace: "tenant-a".to_string(),
@@ -63208,6 +63217,7 @@ mod tests {
     fn validate_global_mesh_route_dispatch_without_http_proxies_uses_own_namespace() {
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "global-mrd".to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),
             namespace: "tenant-a".to_string(),
@@ -63246,6 +63256,7 @@ mod tests {
         let proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "mrd-p".to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),
             namespace: "ferrum".to_string(),
@@ -65222,6 +65233,7 @@ mod tests {
         let mut config = make_validation_config(vec![]);
         config.plugin_configs = vec![
             PluginConfig {
+                labels: Default::default(),
                 id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
                 plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
                 namespace: "ferrum".to_string(),
@@ -65236,6 +65248,7 @@ mod tests {
                 updated_at: timestamp,
             },
             PluginConfig {
+                labels: Default::default(),
                 id: "operator-metrics".to_string(),
                 plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
                 namespace: "ferrum".to_string(),
@@ -65285,6 +65298,7 @@ mod tests {
         let mut config = make_validation_config(vec![]);
         config.plugin_configs = vec![
             PluginConfig {
+                labels: Default::default(),
                 id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
                 plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
                 namespace: "ferrum".to_string(),
@@ -65299,6 +65313,7 @@ mod tests {
                 updated_at: timestamp,
             },
             PluginConfig {
+                labels: Default::default(),
                 id: "operator-disabled".to_string(),
                 plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
                 namespace: "ferrum".to_string(),
@@ -65313,6 +65328,7 @@ mod tests {
                 updated_at: timestamp,
             },
             PluginConfig {
+                labels: Default::default(),
                 id: "operator-enabled".to_string(),
                 plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
                 namespace: "ferrum".to_string(),
@@ -65367,6 +65383,7 @@ mod tests {
         let timestamp = gateway_managed_plugin_timestamp();
         let mut config = make_validation_config(vec![]);
         config.plugin_configs = vec![PluginConfig {
+            labels: Default::default(),
             id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
             plugin_name: "key_auth".to_string(),
             namespace: "ferrum".to_string(),
@@ -65401,6 +65418,7 @@ mod tests {
         let mut config = make_validation_config(vec![]);
         config.plugin_configs = vec![
             PluginConfig {
+                labels: Default::default(),
                 id: "tenant-b-metrics".to_string(),
                 plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
                 namespace: "tenant-b".to_string(),
@@ -65417,6 +65435,7 @@ mod tests {
                 updated_at: timestamp,
             },
             PluginConfig {
+                labels: Default::default(),
                 id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
                 plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
                 namespace: "ferrum".to_string(),
@@ -65469,6 +65488,7 @@ mod tests {
         let timestamp = gateway_managed_plugin_timestamp();
         let mut config = make_validation_config(vec![]);
         config.plugin_configs = vec![PluginConfig {
+            labels: Default::default(),
             id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
             plugin_name: "key_auth".to_string(),
             namespace: "ferrum".to_string(),
@@ -65506,6 +65526,7 @@ mod tests {
         )))));
         let timestamp = gateway_managed_plugin_timestamp();
         let managed = |namespace: &str, spiffe_id: &str| PluginConfig {
+            labels: Default::default(),
             id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
             plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
             namespace: namespace.to_string(),
@@ -65839,6 +65860,7 @@ mod tests {
         let proxy = make_validation_proxy("p1", "/api");
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "mrd-p1".to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),
             namespace: "ferrum".to_string(),
@@ -65882,6 +65904,7 @@ mod tests {
         let proxy = make_validation_proxy("p1", "/api");
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "mrd-p1".to_string(),
             plugin_name: "mesh_route_dispatch".to_string(),
             namespace: "ferrum".to_string(),
@@ -65953,6 +65976,7 @@ mod tests {
         }];
         let now = chrono::Utc::now();
         let plugin = PluginConfig {
+            labels: Default::default(),
             id: "pc1".to_string(),
             plugin_name: "correlation_id".to_string(),
             namespace: "ferrum".to_string(),
@@ -67185,6 +67209,7 @@ mod tests {
         // single field read.
         use crate::config::types::{Upstream, UpstreamPortOverride};
         let mut upstream = Upstream {
+            labels: Default::default(),
             id: "u1".to_string(),
             namespace: "ferrum".to_string(),
             name: Some("u1".to_string()),
@@ -67245,6 +67270,7 @@ mod tests {
         let mut config_no_overrides = GatewayConfig {
             proxies: vec![proxy_with_port_overrides_for_test(5000, &[])],
             upstreams: vec![Upstream {
+                labels: Default::default(),
                 id: "u1".to_string(),
                 namespace: "ferrum".to_string(),
                 name: Some("u1".to_string()),
@@ -67862,6 +67888,7 @@ mod tests {
         // `dispatch_port_override_fallback`, independently of the per-port map.
         use crate::config::types::{Upstream, UpstreamPortOverride};
         let mut upstream = Upstream {
+            labels: Default::default(),
             id: "u1".to_string(),
             namespace: "ferrum".to_string(),
             name: Some("u1".to_string()),
@@ -67929,6 +67956,7 @@ mod tests {
         // `connectionPool.http` sets DIFFERENT values plus an unrelated field. At
         // runtime the named targetPort resolves to workload port 8080.
         let mut upstream = Upstream {
+            labels: Default::default(),
             id: "u1".to_string(),
             namespace: "ferrum".to_string(),
             name: Some("u1".to_string()),

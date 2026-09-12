@@ -261,6 +261,7 @@ fn make_minimal_proxy(id: &str) -> ferrum_edge::config::types::Proxy {
     };
     let now = Utc::now();
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,

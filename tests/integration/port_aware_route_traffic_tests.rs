@@ -40,6 +40,7 @@ const HOST: &str = "app.example.com";
 
 fn port_scoped_proxy(id: &str, backend_port: u16, listen_port: Option<u16>) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("Port Aware {id}")),

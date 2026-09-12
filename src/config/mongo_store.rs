@@ -17239,6 +17239,7 @@ mod inner {
         fn proxy_bson_round_trip() {
             let now = chrono::Utc::now();
             let proxy = Proxy {
+                labels: Default::default(),
                 id: "test-proxy".to_string(),
                 namespace: crate::config::types::default_namespace(),
                 name: Some("My Proxy".to_string()),
@@ -17329,6 +17330,7 @@ mod inner {
         fn consumer_bson_round_trip() {
             let now = chrono::Utc::now();
             let consumer = Consumer {
+                labels: Default::default(),
                 id: "consumer-1".to_string(),
                 namespace: crate::config::types::default_namespace(),
                 username: "alice".to_string(),
@@ -17358,6 +17360,7 @@ mod inner {
         fn plugin_config_bson_round_trip() {
             let now = chrono::Utc::now();
             let pc = PluginConfig {
+                labels: Default::default(),
                 id: "plugin-1".to_string(),
                 namespace: crate::config::types::default_namespace(),
                 plugin_name: "rate_limiting".to_string(),
@@ -17393,6 +17396,7 @@ mod inner {
         fn upstream_bson_round_trip() {
             let now = chrono::Utc::now();
             let upstream = Upstream {
+                labels: Default::default(),
                 id: "upstream-1".to_string(),
                 namespace: crate::config::types::default_namespace(),
                 name: Some("my-upstream".to_string()),
@@ -17465,6 +17469,7 @@ mod inner {
         fn proxy_to_doc_sets_id_field() {
             let now = chrono::Utc::now();
             let proxy = Proxy {
+                labels: Default::default(),
                 id: "unique-id-123".to_string(),
                 namespace: crate::config::types::default_namespace(),
                 name: None,
@@ -17585,6 +17590,7 @@ mod inner {
         fn proxy_to_doc_strips_null_index_fields() {
             let now = chrono::Utc::now();
             let proxy = Proxy {
+                labels: Default::default(),
                 id: "http-proxy".to_string(),
                 namespace: crate::config::types::default_namespace(),
                 name: None,        // must NOT appear in the document
@@ -17673,6 +17679,7 @@ mod inner {
         fn consumer_to_doc_strips_null_custom_id() {
             let now = chrono::Utc::now();
             let consumer = Consumer {
+                labels: Default::default(),
                 id: "c-1".to_string(),
                 namespace: crate::config::types::default_namespace(),
                 username: "alice".to_string(),
@@ -17698,6 +17705,7 @@ mod inner {
                 serde_json::json!([{"secret": secret}, {"secret": secret}]),
             );
             let consumer = Consumer {
+                labels: Default::default(),
                 id: "hmac-consumer".to_string(),
                 namespace: "tenant-a".to_string(),
                 username: "alice".to_string(),
@@ -17725,6 +17733,7 @@ mod inner {
         fn upstream_to_doc_strips_null_name() {
             let now = chrono::Utc::now();
             let upstream = Upstream {
+                labels: Default::default(),
                 id: "u-1".to_string(),
                 namespace: crate::config::types::default_namespace(),
                 name: None, // must NOT appear in the document
@@ -17775,6 +17784,7 @@ mod inner {
             );
 
             let consumer = Consumer {
+                labels: Default::default(),
                 id: "consumer-with-creds".to_string(),
                 namespace: crate::config::types::default_namespace(),
                 username: "alice".to_string(),
@@ -17796,6 +17806,7 @@ mod inner {
         fn proxy_with_plugin_associations_round_trip() {
             let now = chrono::Utc::now();
             let proxy = Proxy {
+                labels: Default::default(),
                 id: "proxy-with-plugins".to_string(),
                 namespace: crate::config::types::default_namespace(),
                 name: None,

@@ -371,6 +371,7 @@ fn assert_kind_conflict(body: &Value, id: &str, existing: Collection, requested:
 fn https_proxy_referencing_ca(id: &str, ca_id: &str) -> Proxy {
     let now = Utc::now();
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("referenced-ca-proxy".to_string()),

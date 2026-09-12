@@ -4277,6 +4277,7 @@ mod tests {
 
     fn make_proxy(id: &str) -> Proxy {
         Proxy {
+            labels: Default::default(),
             id: id.to_string(),
             namespace: default_namespace(),
             name: None,
@@ -4345,6 +4346,7 @@ mod tests {
 
     fn make_consumer(id: &str) -> Consumer {
         Consumer {
+            labels: Default::default(),
             id: id.to_string(),
             namespace: default_namespace(),
             username: format!("user_{id}"),

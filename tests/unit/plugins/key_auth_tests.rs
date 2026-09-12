@@ -28,6 +28,7 @@ fn create_unicode_key_consumer() -> Consumer {
         Value::Array(vec![Value::Object(keyauth)]),
     );
     Consumer {
+        labels: Default::default(),
         id: "consumer-unimap".to_string(),
         namespace: default_namespace(),
         username: "ユーザー".to_string(),
@@ -573,6 +574,7 @@ async fn test_key_auth_empty_key_does_not_match_any_consumer() {
         Value::Array(vec![Value::Object(keyauth)]),
     );
     let consumer = Consumer {
+        labels: Default::default(),
         id: "empty-key-consumer".to_string(),
         namespace: default_namespace(),
         username: "ghost".to_string(),

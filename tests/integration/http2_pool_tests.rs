@@ -41,6 +41,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn create_test_proxy() -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: "h2-test".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,

@@ -29,6 +29,7 @@ async fn sqlite_store() -> (DatabaseStore, TempDir) {
 
 fn test_upstream(id: &str, host: &str, port: u16) -> Upstream {
     Upstream {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         name: None,
@@ -70,6 +71,7 @@ fn test_upstream(id: &str, host: &str, port: u16) -> Upstream {
 
 fn test_plugin_config(id: &str) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         plugin_name: "stdout_logging".to_string(),
@@ -87,6 +89,7 @@ fn test_plugin_config(id: &str) -> PluginConfig {
 
 fn test_proxy(id: &str, listen_path: &str, plugins: Vec<PluginAssociation>) -> Proxy {
     Proxy {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         name: Some(format!("Test Proxy {}", id)),
@@ -1037,6 +1040,7 @@ fn scale_proxy_plugin_config(
     config: serde_json::Value,
 ) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         id: id.to_string(),
         namespace: default_namespace(),
         plugin_name: plugin_name.to_string(),

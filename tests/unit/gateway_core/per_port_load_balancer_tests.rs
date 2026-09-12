@@ -85,6 +85,7 @@ fn upstream_with_overrides(
 ) -> Upstream {
     let now = Utc::now();
     Upstream {
+        labels: Default::default(),
         id: "u1".to_string(),
         namespace: "ferrum".to_string(),
         name: Some("u1".to_string()),
