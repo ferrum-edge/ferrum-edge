@@ -2363,6 +2363,7 @@ fn test_proxy_allowed_ws_origins_accepts_http_ws_and_ports() {
         "http://localhost:8080".into(),
         "wss://app.example.com".into(),
         "https://[::1]".into(),
+        "null".into(),
     ];
     assert!(proxy.validate_fields().is_ok());
 }
@@ -2387,7 +2388,7 @@ fn test_proxy_allowed_ws_origins_star_does_not_fail_load_validation() {
 #[test]
 fn test_proxy_allowed_ws_origins_load_warns_once_per_proxy() {
     let mut proxy = make_proxy("star-proxy", "/api");
-    proxy.allowed_ws_origins = vec!["*".into(), "NULL".into()];
+    proxy.allowed_ws_origins = vec!["*".into(), "not an origin".into()];
     let config = GatewayConfig {
         proxies: vec![proxy],
         consumers: vec![],

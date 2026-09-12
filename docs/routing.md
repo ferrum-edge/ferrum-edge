@@ -355,7 +355,8 @@ values (case-insensitive; default ports normalized). Missing or disallowed origi
 receive **403 Forbidden** with body `{"error":"WebSocket Origin not allowed"}` before
 backend dispatch. When `allowed_ws_origins` is **empty** (the default), no Origin check
 runs and any browser origin may upgrade. Entries are literal origins of the form
-`scheme://host[:port]`. `*` is **not** a wildcard: Admin API create/update (POST/PUT/PATCH
+`scheme://host[:port]`, plus the literal opaque origin `null` (sent by sandboxed frames and
+`data:`/`file:` documents). `*` is **not** a wildcard: Admin API create/update (POST/PUT/PATCH
 proxies, batch, restore) and `ferrum-edge validate` reject it with a validation error that
 states empty list = allow all origins. Existing file/database/CP rows that still contain
 `*` keep loading and emit one warning per proxy; they do **not** allow all origins at
