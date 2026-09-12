@@ -273,7 +273,10 @@ paths:
         Readiness + diagnostics. Also accessible at `/status`.
 
         **Unauthenticated** callers receive only `status` and `ready` (suitable
-        for readiness probes). The **detailed** diagnostics — `mode`, `database`
+        for readiness probes). The **detailed** diagnostics — `mode`, the
+        `namespace` data-plane serving report (issue #5447: the one namespace
+        this process routes, its closed-set `serving_scope`, and whether
+        everything else is unrouted here), `database`
         connectivity/pool stats, `fips` deployment-mode metadata,
         `cached_config` proxy/consumer counts,
         `database_polling` degradation, `config_rejected`, mesh state,
@@ -4326,6 +4329,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -4604,6 +4609,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -4819,6 +4826,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -4902,6 +4911,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -4974,6 +4985,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
         "400":
           description: Deletion would leave an invalid plugin-composition graph, or an API-spec-owned proxy has foreign/missing ownership metadata or another restore-snapshot shape that atomic compensation cannot reproduce safely, or `cleanup_orphaned_upstream` was duplicated or supplied with a value other than the exact strings `true` or `false`
           content:
@@ -5066,6 +5079,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -5143,6 +5158,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -5186,6 +5203,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -5259,6 +5278,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -5316,6 +5337,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -5373,6 +5396,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -5427,6 +5452,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -5636,6 +5663,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -5726,6 +5755,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -5763,6 +5794,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
         "400":
           description: Deletion would expose an invalid plugin-composition graph, including unsupported TCP connection-throttle attachments
           content:
@@ -5839,6 +5872,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -5908,6 +5943,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -5949,6 +5986,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -6044,6 +6083,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -6130,6 +6171,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -6172,6 +6215,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -6848,6 +6893,8 @@ paths:
               description: URL of the newly created spec (`/api-specs/{id}`)
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -7080,6 +7127,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -7199,6 +7248,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -7388,6 +7439,17 @@ components:
         wire). Resources from other namespaces are not visible to this
         request and uniqueness constraints apply per-namespace.
 
+        **Admin is multi-namespace; one process's data plane is not**
+        (issue #5447). Writing a resource under a namespace this process does
+        not route succeeds and stays Admin-visible, but the local router never
+        matches it — so the proxy answers `404`. That is by design for a control
+        plane (`cp` stores every namespace in its scope and each data plane
+        subscribes to its own), and a silent misconfiguration for a
+        single-process deployment. Read the `namespace` object on the
+        authenticated `GET /status` to discover the namespace this process
+        serves, and watch for the `X-Ferrum-Namespace-Unserved: true` response
+        header on accepted mutations.
+
     CleanupOrphanedUpstream:
       name: cleanup_orphaned_upstream
       in: query
@@ -7512,6 +7574,40 @@ components:
       schema:
         type: string
         pattern: '^[0-9]+:[0-9]+$'
+
+    X-Ferrum-Namespace-Unserved:
+      description: |
+        Present with value `true` when an **accepted** mutation (`2xx` on
+        `POST`/`PUT`/`PATCH`/`DELETE`) targeted a namespace-scoped resource in a
+        namespace this process's data plane does not route (issue #5447).
+
+        The Admin API is deliberately multi-namespace, but a proxy data plane
+        serves exactly one namespace (`FERRUM_NAMESPACE`), so a process that is
+        both Admin and data plane — `database` mode, the only writable one, plus
+        any future serving mode with a writable admin — commits the resource,
+        keeps it Admin-visible, and never matches it in the local router. The
+        write succeeds and the data plane answers `404`. This header is that
+        signal, so a provisioning client can detect the mismatch without probing
+        the proxy.
+
+        Absent when the requested namespace is the one this process serves, on
+        every non-`2xx` response (a rejected write never reached the store), on
+        reads, on global admin surfaces that `X-Ferrum-Namespace` does not
+        select, and in `cp` mode — a control plane stores every namespace in its
+        scope on purpose and routes none itself, so nothing is unserved there.
+        `file`, `dp`, and `mesh` serve one namespace but reject admin mutations
+        outright, so the condition cannot arise there either. A deferred `202`
+        never carries it: `?apply=async` is a no-op for a namespace this process
+        does not serve, so such a write returns its synchronous success status
+        (and no `X-Ferrum-Config-Cursor`).
+
+        Routing, filtering, admission, and status codes are unchanged; this is a
+        marker only. Discover the active namespace up front with the `namespace`
+        object on the authenticated `GET /status` (or `GET /health`).
+      required: false
+      schema:
+        type: string
+        enum: ["true"]
 
   # ── Reusable responses ─────────────────────────────────────────────
   responses:
@@ -14088,7 +14184,7 @@ components:
       type: object
       description: |
         Tiered: unauthenticated callers receive only `status` and `ready`. The
-        remaining detailed fields (`timestamp`, `mode`, `database`,
+        remaining detailed fields (`timestamp`, `mode`, `namespace`, `database`,
         `admin_writes_enabled`, `fips`, `cached_config`, `database_polling`,
         `config_rejected`, `mesh`, `listener_failures`, `gateway_listeners`,
         `logging`, `log_sink_record_loss`,
@@ -14206,6 +14302,8 @@ components:
             - cp
             - dp
             - file
+        namespace:
+          $ref: "#/components/schemas/NamespaceServingReport"
         database:
           type: object
           description: |
@@ -14449,6 +14547,59 @@ components:
           $ref: "#/components/schemas/CpDpTrustReloadSnapshot"
         replay_authority:
           $ref: "#/components/schemas/SharedReplayAuthorityHealth"
+
+    NamespaceServingReport:
+      type: object
+      description: |
+        Which namespace **this process's data plane** routes, and how that
+        relates to the deliberately multi-namespace Admin API (issue #5447).
+
+        The Admin API accepts any valid `X-Ferrum-Namespace`, but a proxy data
+        plane projects every configuration snapshot down to one namespace
+        (`FERRUM_NAMESPACE`) before serving it. Without this block a client that
+        provisions under its own namespace cannot tell from a `201` whether the
+        resource will ever be routed here; it discovers the mismatch as a
+        data-plane `404`. Read it once at startup and provision into `active`.
+
+        Authenticated detail tier only: the namespace name is operator-supplied
+        deployment topology. Every field is a namespace identifier, a closed-set
+        label, or a boolean — never a resource id, count, or listing of other
+        tenants.
+      required: [active, serving_scope, data_plane_single_namespace]
+      properties:
+        active:
+          type: [string, "null"]
+          description: >-
+            The one namespace this process's data plane routes
+            (`FERRUM_NAMESPACE`). `null` when this process has no data plane —
+            `cp` (which distributes every namespace in `FERRUM_CP_NAMESPACES` to
+            subscribing data planes) and `node_agent`.
+          examples:
+            - ferrum
+          maxLength: 254
+        serving_scope:
+          type: string
+          enum: [single-namespace-data-plane, control-plane, no-data-plane]
+          description: |
+            Closed-set label for how the data plane is scoped:
+
+            - `single-namespace-data-plane` — this process routes traffic for
+              `active` only (`database`, `file`, `dp`, `mesh`). A resource
+              written under any other namespace is stored and Admin-visible but
+              never matched by the local router.
+            - `control-plane` — `cp`: stores and distributes every namespace in
+              its scope and routes no traffic itself, so multi-namespace Admin
+              writes are the intended usage and nothing is unserved here.
+            - `no-data-plane` — an admin surface with neither a local proxy nor a
+              control-plane scope (`node_agent`).
+        data_plane_single_namespace:
+          type: boolean
+          description: >-
+            `true` when everything outside `active` is unrouted by this process,
+            i.e. `serving_scope` is `single-namespace-data-plane`. This is the
+            field to branch on: when it is `true`, an accepted mutation under a
+            different `X-Ferrum-Namespace` also carries
+            `X-Ferrum-Namespace-Unserved: true`.
 
     SharedReplayAuthorityHealth:
       type: object
