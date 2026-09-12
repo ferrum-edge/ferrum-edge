@@ -140,7 +140,9 @@ fn test_default_config() {
     assert_eq!(config.tcp_keepalive_seconds, 60);
     assert_eq!(config.http2_keep_alive_interval_seconds, 30);
     assert_eq!(config.http2_keep_alive_timeout_seconds, 45);
-    assert!(config.http2_adaptive_window);
+    // Issue #5464: fixed windows by default; hyper's adaptive mode would reset
+    // both windows to 65,535 and starve h2's small-frame budget.
+    assert!(!config.http2_adaptive_window);
     assert_eq!(config.http2_initial_stream_window_size, 8_388_608);
     assert_eq!(config.http2_initial_connection_window_size, 33_554_432);
     assert_eq!(config.http2_max_frame_size, 1_048_576);
@@ -149,12 +151,13 @@ fn test_default_config() {
 }
 
 #[test]
-fn test_from_env_default_keeps_adaptive_window() {
-    // No window/adaptive env overrides: shipped adaptive-on contract stays intact.
+fn test_from_env_default_keeps_fixed_windows() {
+    // No window/adaptive env overrides: the shipped fixed-window contract stays
+    // intact (issue #5464).
     with_env_vars(&[], || {
         let config = parse_pool().expect("unset pool settings must parse");
         assert_eq!(config, PoolConfig::default());
-        assert!(config.http2_adaptive_window);
+        assert!(!config.http2_adaptive_window);
         assert_eq!(config.http2_initial_stream_window_size, 8_388_608);
         assert_eq!(config.http2_initial_connection_window_size, 33_554_432);
     });
@@ -162,8 +165,8 @@ fn test_from_env_default_keeps_adaptive_window() {
 
 #[test]
 fn test_from_env_explicit_stream_window_disables_inherited_adaptive() {
-    // Explicit global window without an explicit adaptive setting must not stay
-    // inert under the shipped adaptive-on default.
+    // Explicit global window without an explicit adaptive setting must land on
+    // fixed windows regardless of the adaptive default.
     with_env_vars(
         &[("FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE", "16777216")],
         || {
@@ -288,9 +291,11 @@ fn test_no_overrides() {
 
 #[test]
 fn test_proxy_explicit_stream_window_disables_inherited_adaptive() {
-    // Global adaptive default true + per-proxy window override → adaptive off.
-    let global = PoolConfig::default();
-    assert!(global.http2_adaptive_window);
+    // Global adaptive on + per-proxy window override → adaptive off.
+    let global = PoolConfig {
+        http2_adaptive_window: true,
+        ..PoolConfig::default()
+    };
     let mut proxy = create_test_proxy();
     proxy.pool_http2_initial_stream_window_size = Some(16_777_216);
 
@@ -301,7 +306,10 @@ fn test_proxy_explicit_stream_window_disables_inherited_adaptive() {
 
 #[test]
 fn test_proxy_explicit_connection_window_disables_inherited_adaptive() {
-    let global = PoolConfig::default();
+    let global = PoolConfig {
+        http2_adaptive_window: true,
+        ..PoolConfig::default()
+    };
     let mut proxy = create_test_proxy();
     proxy.pool_http2_initial_connection_window_size = Some(67_108_864);
 
@@ -326,12 +334,26 @@ fn test_proxy_explicit_adaptive_remains_authoritative_with_windows() {
 
 #[test]
 fn test_proxy_explicit_adaptive_false_overrides_global_default() {
-    let global = PoolConfig::default();
+    let global = PoolConfig {
+        http2_adaptive_window: true,
+        ..PoolConfig::default()
+    };
     let mut proxy = create_test_proxy();
     proxy.pool_http2_adaptive_window = Some(false);
 
     let config = global.for_proxy(&proxy);
     assert!(!config.http2_adaptive_window);
+}
+
+#[test]
+fn test_proxy_explicit_adaptive_true_overrides_global_default() {
+    let global = PoolConfig::default();
+    assert!(!global.http2_adaptive_window);
+    let mut proxy = create_test_proxy();
+    proxy.pool_http2_adaptive_window = Some(true);
+
+    let config = global.for_proxy(&proxy);
+    assert!(config.http2_adaptive_window);
 }
 
 #[test]
@@ -615,7 +637,7 @@ fn test_from_env_explicit_defaults_match_today() {
                 "FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE",
                 "33554432",
             ),
-            ("FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW", "true"),
+            ("FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW", "false"),
             ("FERRUM_POOL_HTTP2_MAX_FRAME_SIZE", "1048576"),
             ("FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS", "1000"),
         ],

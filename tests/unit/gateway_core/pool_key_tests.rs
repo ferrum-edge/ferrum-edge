@@ -692,8 +692,8 @@ async fn connection_pool_key_client_level_settings_partition() {
     );
 
     let mut stream_window = minimal_proxy();
-    // Adaptive defaults to true and overrides fixed windows — disable it so
-    // the window override is material to create_client behavior.
+    // Adaptive replaces fixed windows when on — pin it off so the window
+    // override is material to create_client behavior regardless of default.
     stream_window.pool_http2_adaptive_window = Some(false);
     stream_window.pool_http2_initial_stream_window_size = Some(65_535);
     let mut other_window = minimal_proxy();

@@ -9106,7 +9106,8 @@ components:
           description: |
             HTTP/2 initial per-stream flow-control window size in bytes (overrides global).
             Larger values improve single-stream throughput. Range: 65535–134217728 (128 MiB). Default: 8388608 (8 MiB).
-            While adaptive windowing remains enabled, hyper/reqwest BDP probing overrides this fixed size.
+            Applies while adaptive windowing is off (the default); enabling adaptive replaces this fixed size
+            with hyper/reqwest BDP probing that starts at 65535 bytes.
             Setting this (or the connection window) without also setting pool_http2_adaptive_window
             explicitly auto-disables adaptive at this proxy so the fixed window takes effect.
         pool_http2_initial_connection_window_size:
@@ -9122,8 +9123,10 @@ components:
           type: [boolean, "null"]
           description: |
             Enable adaptive flow-control (BDP probing) for HTTP/2 connections (overrides global).
-            Enabled by default — BDP probing dynamically sizes flow-control windows for optimal throughput. Default: true.
-            While enabled, adaptive windowing overrides fixed initial stream/connection window sizes.
+            Default: false — the fixed initial stream/connection windows apply. While enabled, adaptive
+            windowing replaces those fixed sizes: hyper restarts both at 65535 bytes and grows the connection
+            window only as the link is measured, which fragments hundreds of concurrent streams into tiny
+            DATA frames and can trip h2's small-frame flood budget (GOAWAY ENHANCE_YOUR_CALM).
             An explicit adaptive choice remains authoritative even alongside window overrides; omit this
             field when setting explicit windows to auto-disable adaptive so fixed sizes apply.
         pool_http2_max_frame_size:
