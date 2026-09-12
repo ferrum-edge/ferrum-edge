@@ -844,7 +844,10 @@ paths:
             result = plugin.before_proxy(&mut ctx, &mut headers).await;
         }
         if allowed {
-            assert!(matches!(result, PluginResult::Continue), "{path}: {result:?}");
+            assert!(
+                matches!(result, PluginResult::Continue),
+                "{path}: {result:?}"
+            );
             assert_eq!(
                 ctx.metadata
                     .get("openapi_validator.matched_operation")
