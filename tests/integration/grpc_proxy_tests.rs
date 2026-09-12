@@ -5105,7 +5105,6 @@ async fn grpc_streaming_late_upload_overflow_during_response_records_neutral() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
-        half_open_probe_dwell_seconds: None,
     });
     let cb_config = proxy.circuit_breaker.clone().unwrap();
     let backend_host = proxy.backend_host.clone();
@@ -5245,7 +5244,6 @@ async fn grpc_streaming_clean_probe_heals_breaker_at_body_completion() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
-        half_open_probe_dwell_seconds: None,
     });
     let cb_config = proxy.circuit_breaker.clone().unwrap();
     let backend_host = proxy.backend_host.clone();
@@ -5338,7 +5336,6 @@ async fn grpc_streaming_closed_state_backend_failure_trips_breaker_at_header_tim
         failure_status_codes: vec![503],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
-        half_open_probe_dwell_seconds: None,
     });
     let cb_config = proxy.circuit_breaker.clone().unwrap();
     let backend_host = proxy.backend_host.clone();

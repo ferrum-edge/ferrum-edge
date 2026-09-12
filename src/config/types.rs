@@ -2207,18 +2207,6 @@ pub struct CircuitBreakerConfig {
     pub half_open_max_requests: u32,
     #[serde(default = "default_trip_on_connection_errors")]
     pub trip_on_connection_errors: bool,
-    /// Seconds a HALF_OPEN probe slot may stay unsettled before the breaker
-    /// reclaims it (defence in depth for a probe that is never released).
-    ///
-    /// Omitted derives `max(timeout_seconds * 2, 60)`. A configured value is
-    /// clamped to at least `timeout_seconds` and at least 1 second.
-    ///
-    /// The dwell MUST exceed the longest legitimate backend dispatch a probe
-    /// can take (backend connect + read timeouts): reclaiming a slot while a
-    /// real probe is still in flight lets a second probe reach a backend the
-    /// breaker is protecting.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub half_open_probe_dwell_seconds: Option<u64>,
 }
 
 impl Default for CircuitBreakerConfig {
@@ -2230,7 +2218,6 @@ impl Default for CircuitBreakerConfig {
             failure_status_codes: default_failure_status_codes(),
             half_open_max_requests: default_half_open_max(),
             trip_on_connection_errors: default_trip_on_connection_errors(),
-            half_open_probe_dwell_seconds: None,
         }
     }
 }
@@ -9828,16 +9815,6 @@ impl CircuitBreakerConfig {
             errors.push(e);
         }
         if let Err(e) = validate_status_codes("failure_status_codes", &self.failure_status_codes) {
-            errors.push(e);
-        }
-        if let Some(dwell) = self.half_open_probe_dwell_seconds
-            && let Err(e) = validate_u64_range(
-                "half_open_probe_dwell_seconds",
-                dwell,
-                1,
-                MAX_TIMEOUT_SECONDS,
-            )
-        {
             errors.push(e);
         }
 

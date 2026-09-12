@@ -1053,6 +1053,12 @@ Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses a
 
 **Availability:** Built into every default Ferrum Edge binary. `rdkafka` / librdkafka is an unconditional dependency — there is no `kafka` Cargo feature to enable or disable.
 
+TLS (`ssl`, `sasl_ssl`) and SCRAM support are compiled in through `rdkafka`'s
+`ssl-vendored` feature. OpenSSL is statically linked, including in the distroless
+images; no runtime `libssl` is needed. FIPS enforcement still rejects
+`kafka_logging` because this transport is outside Ferrum's selected FIPS module
+(see [FIPS mode](fips.md#deliberately-unsupported-in-fips-mode)).
+
 **Admission:** Kafka is `KeepLastKnownGood`: invalid startup configuration is rejected, and an invalid reload candidate is not published, so the previously accepted producer generation continues serving. This prevents a misspelled security control or conflicting TLS/CRL setting from silently removing the configured audit sink.
 
 > **Requires a fully-open backend egress policy.** librdkafka resolves bootstrap hostnames itself and dials brokers advertised by cluster metadata, and the pinned `rdkafka 0.39` exposes no connect/resolve callback, so Ferrum cannot screen those addresses. `kafka_logging` therefore **fails closed** and is refused whenever the backend egress policy can deny any address — which includes the default posture. `broker_list` is parsed with librdkafka's exact `[proto://]host[:port]` grammar, so protocol-prefixed denied literals (e.g. `PLAINTEXT://169.254.169.254:9092`) are rejected too. See [Backend Egress / SSRF Protection](configuration.md#kafka_logging-requires-a-fully-open-egress-policy).

@@ -43,6 +43,8 @@
 //! Docker-enabled runner where a
 //! container that fails to start is a HARD failure (see
 //! `common::containers::fail_in_ci_else_skip`).
+//! Kafka TLS acceptance always requires its broker, including locally, so a
+//! missing build capability or failed fixture cannot turn into a passing skip.
 //!
 //! Run per backend (see also the consolidated CI job):
 //!   cargo test --test service_integration consul
