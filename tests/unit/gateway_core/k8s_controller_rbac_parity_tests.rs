@@ -1,5 +1,5 @@
-//! Every CRD the Gateway API controller watches must be granted by the chart's
-//! control-plane ClusterRole.
+//! Every resource the Gateway API and Istio controllers watch must be granted
+//! by the chart's control-plane ClusterRole.
 //!
 //! A watched-but-ungranted kind is not a quiet degradation: the watcher starts
 //! unconditionally once the CRD group is discovered, the API server rejects
@@ -12,7 +12,9 @@
 //!
 //! Static `include_str!` / const inspection only — no Kubernetes runtime.
 
-use ferrum_edge::k8s_controller::watcher::{GATEWAY_API_CRDS, K8S_NAMESPACE_RESOURCES};
+use ferrum_edge::k8s_controller::watcher::{
+    GATEWAY_API_CRDS, ISTIO_CORE_RESOURCES, K8S_NAMESPACE_RESOURCES,
+};
 
 const CONTROL_PLANE_RBAC: &str =
     include_str!("../../../charts/ferrum-mesh/templates/control-plane-rbac.yaml");
@@ -50,6 +52,40 @@ fn rule_grants(group: &str, plural: &str) -> bool {
                         .is_some_and(|resource| resource == plural)
                 })
         })
+}
+
+fn watch_rule_grants_in(rbac: &str, group: &str, plural: &str) -> bool {
+    let expected_group = format!("[\"{group}\"]");
+    rbac.split("  - apiGroups: ").skip(1).any(|rule| {
+        let Some((declared_group, body)) = rule.split_once('\n') else {
+            return false;
+        };
+        declared_group.trim() == expected_group
+            && body
+                .lines()
+                .any(|line| line.trim() == format!("- {plural}"))
+            && body
+                .lines()
+                .any(|line| line.trim() == "verbs: [\"get\", \"list\", \"watch\"]")
+    })
+}
+
+#[test]
+fn every_istio_core_watch_is_granted_by_the_istio_rbac_toggle() {
+    let istio_rbac = CONTROL_PLANE_RBAC
+        .split_once("{{- if .Values.controlPlane.rbac.istio }}")
+        .and_then(|(_, remainder)| remainder.split_once("{{- end }}"))
+        .map(|(block, _)| block)
+        .expect("control-plane RBAC must contain a bounded Istio block");
+
+    for resource in ISTIO_CORE_RESOURCES {
+        assert!(
+            watch_rule_grants_in(istio_rbac, resource.group, resource.plural),
+            "the Istio RBAC toggle must grant list/watch on {} ({}) or its watcher 403-loops",
+            resource.plural,
+            resource.group
+        );
+    }
 }
 
 #[test]

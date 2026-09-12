@@ -641,6 +641,20 @@ impl<T> SharedCreationSlot<T> {
             failures: self.failures.subscribe(),
         }
     }
+
+    /// Take this key's creation lock only if nobody holds it right now.
+    ///
+    /// For opportunistic pool growth (issue #5043): a caller that already has
+    /// a usable connection must never queue behind a cold dial or another
+    /// grower, so `None` means "serve on what exists" rather than "wait".
+    pub fn try_claim(&self) -> Option<SharedCreationLease<'_, T>> {
+        let guard = self.lock.try_lock().ok()?;
+        Some(SharedCreationLease {
+            slot: self,
+            failures: self.failures.subscribe(),
+            _guard: guard,
+        })
+    }
 }
 
 impl<T> Default for SharedCreationSlot<T> {

@@ -584,7 +584,6 @@ fn test_proxy_circuit_breaker_validated() {
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
-        half_open_probe_dwell_seconds: None,
     });
     let errs = proxy.validate_fields().unwrap_err();
     assert!(
@@ -637,31 +636,11 @@ fn test_proxy_circuit_breaker_invalid_status_codes() {
         failure_status_codes: vec![999], // Invalid HTTP status code
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
-        half_open_probe_dwell_seconds: None,
     });
     let errs = proxy.validate_fields().unwrap_err();
     assert!(
         errs.iter()
             .any(|e| e.contains("failure_status_codes") && e.contains("999"))
-    );
-}
-
-#[test]
-fn test_proxy_circuit_breaker_probe_dwell_validated() {
-    let mut proxy = make_proxy("test", "/api");
-    proxy.circuit_breaker = Some(CircuitBreakerConfig {
-        failure_threshold: 5,
-        success_threshold: 3,
-        timeout_seconds: 30,
-        failure_status_codes: vec![500],
-        half_open_max_requests: 1,
-        trip_on_connection_errors: true,
-        half_open_probe_dwell_seconds: Some(0), // Invalid: must be >= 1
-    });
-    let errs = proxy.validate_fields().unwrap_err();
-    assert!(
-        errs.iter()
-            .any(|e| e.contains("circuit_breaker.half_open_probe_dwell_seconds"))
     );
 }
 

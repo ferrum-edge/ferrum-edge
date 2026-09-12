@@ -224,6 +224,12 @@ Hosted Redpanda covers the broker-dependent acceptance contract from #2548 /
 
 - successful acknowledgement with delivered count, zero failure/rejection, key +
   consume-back of a known path marker
+- verified `ssl` and `sasl_ssl` / `SCRAM-SHA-256` delivery through separate TLS
+  advertised listeners, with an unrelated CA and incorrect password preventing
+  delivery; fresh certificates are generated per fixture
+- Cargo-built gateway artifact `validate` and HTTP-to-Kafka TLS produce/consume
+  for both protocols, using the shared subprocess harness. These TLS acceptance
+  tests require Docker and never skip a missing TLS capability or failed fixture
 - unknown-topic rejection after local admission
 - broker-side oversized-message rejection (`max.message.bytes` on the topic)
 - delivery timeout via `acks=all` against a docker-paused broker (Redpanda
@@ -238,7 +244,7 @@ Hosted Redpanda covers the broker-dependent acceptance contract from #2548 /
   healthy generation)
 
 Deterministic unit coverage remains the home for cases that do not need a
-broker (and must stay OpenSSL/librdkafka-host independent):
+broker:
 
 - unknown root keys / producer_config security aliases
 - gateway CRL conflict, match, file-URI normalize, non-file fail-closed,
@@ -247,6 +253,9 @@ broker (and must stay OpenSSL/librdkafka-host independent):
 - reserve-before-serialize
 - exact-once finalize without pending broker I/O
 - docs feature-contract (no undeclared `kafka` Cargo feature)
+- minimal SSL and SASL/SSL constructor admission through the compiled native
+  configuration API, including PLAIN and both SCRAM mechanisms; built-in TLS
+  and SCRAM capabilities are required, never skipped
 
 The optional ignored harness in
 `tests/integration/kafka_logging_broker_tests.rs` remains for developers with

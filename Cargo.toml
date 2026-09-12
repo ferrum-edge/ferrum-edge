@@ -317,7 +317,9 @@ maxminddb = "0.28"
 redis = { version = "1", features = ["tokio-rustls-comp", "tls-rustls-insecure", "connection-manager"] }
 
 # Kafka (kafka_logging plugin)
-rdkafka = { version = "0.39", features = ["cmake-build", "zstd"] }
+# TLS must work in default/release artifacts, including distroless images with
+# no runtime libssl. FIPS enforcement rejects this OpenSSL-backed plugin.
+rdkafka = { version = "0.39", features = ["cmake-build", "zstd", "ssl-vendored"] }
 
 # MongoDB (NoSQL database backend). Its default `rustls-tls` feature selects
 # ring, so retain the non-crypto defaults explicitly and select the TLS provider

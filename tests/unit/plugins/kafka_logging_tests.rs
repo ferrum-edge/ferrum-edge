@@ -711,8 +711,8 @@ async fn test_kafka_logging_rejects_conflicting_crl_override() {
 async fn test_kafka_logging_allows_matching_crl_override() {
     let client =
         default_http_client().with_tls_crl_source(Some("/etc/ferrum/gateway.crl".to_string()));
-    // Matching CRL overrides are admitted without constructing a producer
-    // (CI librdkafka builds may lack OpenSSL).
+    // Pure admission checks matching overrides without requiring a producer
+    // or an actual CRL file at the fixture path.
     kafka_logging_validate_producer_admission_for_test(
         &json!({
             "broker_list": "localhost:9092",
@@ -1933,12 +1933,9 @@ async fn kafka_enum_fields_accept_only_their_canonical_spelling() {
         );
     }
 
-    // `ssl` / `sasl_ssl` are canonical spellings too, but the default build
-    // links librdkafka without TLS (issue #5212), so their admission is
-    // decided by librdkafka's client-config validation rather than by the
-    // spelling check this test pins.
     for (field, value) in [
         ("security_protocol", "plaintext"),
+        ("security_protocol", "ssl"),
         ("key_field", "none"),
         ("key_field", "proxy_id"),
         ("acks", "all"),
@@ -1949,6 +1946,52 @@ async fn kafka_enum_fields_accept_only_their_canonical_spelling() {
         config[field] = json!(value);
         KafkaLogging::new(&config, &default_http_client())
             .unwrap_or_else(|error| panic!("'{field}: {value}' must be admitted: {error}"));
+    }
+}
+
+/// Native TLS/SCRAM are required in the default artifact (#5212). Validate
+/// through the real constructor, which calls librdkafka's native config API;
+/// a feature-list assertion or a capability skip would miss a broken build.
+#[tokio::test]
+async fn kafka_tls_protocols_pass_offline_native_validation() {
+    let native = rdkafka::ClientConfig::new()
+        .set("builtin.features", "ssl,sasl_scram")
+        .create_native_config();
+    assert!(
+        native.is_ok(),
+        "TLS and SCRAM must be compiled into librdkafka"
+    );
+    for mechanism in [
+        None,
+        Some("PLAIN"),
+        Some("SCRAM-SHA-256"),
+        Some("SCRAM-SHA-512"),
+    ] {
+        let mut config = json!({
+            "broker_list": "127.0.0.1:9092",
+            "topic": "audit-logs",
+            "security_protocol": "ssl"
+        });
+        if let Some(mechanism) = mechanism {
+            config["security_protocol"] = json!("sasl_ssl");
+            config["sasl_mechanism"] = json!(mechanism);
+            config["sasl_username"] = json!("ferrum-test");
+            config["sasl_password"] = json!("fixture-password");
+        }
+        let plugin = KafkaLogging::new(&config, &default_http_client())
+            .unwrap_or_else(|error| panic!("TLS/{mechanism:?} must validate offline: {error}"));
+        assert_eq!(plugin.snapshot().admitted_total, 0);
+
+        let restricted =
+            PluginHttpClient::default_with_backend_allow_ips(default_production_policy());
+        let error = KafkaLogging::new(&config, &restricted)
+            .err()
+            .expect("TLS support must not bypass restrictive egress policy");
+        assert!(
+            error.contains("denied by backend egress policy")
+                || error.contains("cannot be admitted"),
+            "{error}"
+        );
     }
 }
 

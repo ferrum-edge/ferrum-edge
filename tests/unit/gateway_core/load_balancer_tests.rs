@@ -1,10 +1,10 @@
 //! Tests for load balancer module
 
 use chrono::Utc;
-use dashmap::DashMap;
 use ferrum_edge::config::types::{
     GatewayConfig, LoadBalancerAlgorithm, Upstream, UpstreamPortOverride, UpstreamTarget,
 };
+use ferrum_edge::health_check::ActiveUnhealthyTargets;
 use ferrum_edge::load_balancer::{
     HealthContext, LoadBalancer, LoadBalancerCache, target_host_port_key, target_key,
 };
@@ -14,7 +14,7 @@ use std::net::IpAddr;
 const TEST_UPSTREAM: &str = "test-upstream";
 
 /// Helper to build a HealthContext for tests that only need active unhealthy filtering.
-fn active_health_ctx(active: &DashMap<String, u64>) -> HealthContext<'_> {
+fn active_health_ctx(active: &ActiveUnhealthyTargets) -> HealthContext<'_> {
     HealthContext {
         active_unhealthy: active,
         proxy_passive: None,
@@ -155,7 +155,7 @@ fn test_unhealthy_targets_filtered() {
         None,
     );
 
-    let unhealthy: DashMap<String, u64> = DashMap::new();
+    let unhealthy: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     unhealthy.insert(format!("{}::host0:8080", TEST_UPSTREAM), 0);
 
     let mut seen = std::collections::HashSet::new();
@@ -183,7 +183,7 @@ fn test_all_unhealthy_falls_back_to_all() {
         None,
     );
 
-    let unhealthy: DashMap<String, u64> = DashMap::new();
+    let unhealthy: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     unhealthy.insert(format!("{}::host0:8080", TEST_UPSTREAM), 0);
     unhealthy.insert(format!("{}::host1:8080", TEST_UPSTREAM), 0);
 
@@ -399,7 +399,7 @@ fn test_least_latency_with_unhealthy_targets() {
     }
 
     // Mark host0 (fastest) as unhealthy
-    let unhealthy: DashMap<String, u64> = DashMap::new();
+    let unhealthy: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     unhealthy.insert(format!("{}::host0:8080", TEST_UPSTREAM), 0);
 
     // Should select host1 (next lowest latency) among healthy targets
@@ -430,7 +430,7 @@ fn test_least_latency_fallback_when_all_unhealthy() {
         lb.record_latency(&targets[1], 5_000);
     }
 
-    let unhealthy: DashMap<String, u64> = DashMap::new();
+    let unhealthy: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     unhealthy.insert(format!("{}::host0:8080", TEST_UPSTREAM), 0);
     unhealthy.insert(format!("{}::host1:8080", TEST_UPSTREAM), 0);
 
@@ -853,7 +853,7 @@ fn test_least_latency_target_unhealthy_at_startup_then_recovers() {
     );
 
     // Mark host2 as unhealthy from the start
-    let unhealthy: DashMap<String, u64> = DashMap::new();
+    let unhealthy: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     unhealthy.insert(format!("{}::host2:8080", TEST_UPSTREAM), 0);
 
     // Complete warm-up for host0 and host1 only (host2 is unhealthy, gets no traffic)
@@ -1536,7 +1536,7 @@ fn retry_exclusion_returns_none_when_only_alternate_is_unhealthy() {
         ..GatewayConfig::default()
     });
     let snapshot = cache.load();
-    let unhealthy: DashMap<String, u64> = DashMap::new();
+    let unhealthy: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     unhealthy.insert(target_key("ferrum|u1", &targets[1]), 1);
 
     let retry = LoadBalancerCache::select_next_target_from(
@@ -1570,7 +1570,7 @@ fn port_retry_exclusion_returns_none_when_only_alternate_is_unhealthy() {
         ..GatewayConfig::default()
     });
     let snapshot = cache.load();
-    let unhealthy: DashMap<String, u64> = DashMap::new();
+    let unhealthy: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     unhealthy.insert(target_key("ferrum|u1", &targets[1]), 1);
 
     let retry = LoadBalancerCache::select_next_target_for_port_from(
@@ -1784,7 +1784,7 @@ fn test_random_filters_unhealthy() {
     let targets = make_targets(3);
     let lb = LoadBalancer::new(TEST_UPSTREAM, LoadBalancerAlgorithm::Random, &targets, None);
 
-    let unhealthy: DashMap<String, u64> = DashMap::new();
+    let unhealthy: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     unhealthy.insert(format!("{}::host0:8080", TEST_UPSTREAM), 0);
 
     for _ in 0..100 {
@@ -1801,7 +1801,7 @@ fn test_random_all_unhealthy_falls_back() {
     let targets = make_targets(2);
     let lb = LoadBalancer::new(TEST_UPSTREAM, LoadBalancerAlgorithm::Random, &targets, None);
 
-    let unhealthy: DashMap<String, u64> = DashMap::new();
+    let unhealthy: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     unhealthy.insert(format!("{}::host0:8080", TEST_UPSTREAM), 0);
     unhealthy.insert(format!("{}::host1:8080", TEST_UPSTREAM), 0);
 
@@ -2015,7 +2015,7 @@ fn test_consistent_hash_with_unhealthy_target() {
     let initial = lb.select("test-key", None).unwrap();
 
     // Mark a different target as unhealthy
-    let unhealthy: DashMap<String, u64> = DashMap::new();
+    let unhealthy: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     let unhealthy_host = if initial.target.host == "host0" {
         "host1"
     } else {
@@ -2073,7 +2073,7 @@ fn test_passive_health_filters_targets() {
         Some(&config),
     );
 
-    let active: DashMap<String, u64> = DashMap::new();
+    let active: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     // Passive health is keyed by the namespace-qualified proxy identity.
     let proxy_key = "ferrum|test-proxy";
     let proxy_passive = checker.passive_health.get(proxy_key).map(|e| e.clone());
@@ -2199,7 +2199,7 @@ fn ejection_cap_readmits_when_too_many_passively_ejected() {
         },
     );
 
-    let active: DashMap<String, u64> = DashMap::new();
+    let active: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
 
     let ctx = HealthContext {
         active_unhealthy: &active,
@@ -2265,7 +2265,7 @@ fn ejection_cap_zero_percent_readmits_all() {
         );
     }
 
-    let active: DashMap<String, u64> = DashMap::new();
+    let active: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     // Passive health is keyed by the namespace-qualified proxy identity.
     let proxy_key = "ferrum|test-proxy";
     let proxy_passive = checker.passive_health.get(proxy_key).map(|e| e.clone());
@@ -2328,7 +2328,7 @@ fn ejection_cap_rounds_down_like_envoy_for_small_pools() {
         Some(&config),
     );
 
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
     let proxy_passive = checker
         .passive_health
         .get("ferrum|test-proxy")
@@ -2384,7 +2384,7 @@ fn ejection_cap_matches_envoy_integer_boundary() {
         Some(&config),
     );
 
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
     let proxy_passive = checker
         .passive_health
         .get("ferrum|test-proxy")
@@ -2420,7 +2420,7 @@ fn ejection_cap_does_not_affect_active_health_ejections() {
     );
 
     // Actively eject host0 (genuine unreachable — not subject to cap)
-    let active: DashMap<String, u64> = DashMap::new();
+    let active: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     let key = ferrum_edge::load_balancer::target_key(TEST_UPSTREAM, &targets[0]);
     active.insert(key, 1);
 
@@ -2554,7 +2554,7 @@ fn passthrough_ejection_cap_scoped_to_candidate_pool_not_whole_upstream() {
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
-    let active: DashMap<String, u64> = DashMap::new();
+    let active: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     let in_pool: std::net::SocketAddr = "10.0.0.1:8080".parse().unwrap();
 
     // Helper: passthrough-select the in-subset orig-dst with the given passive
@@ -2841,7 +2841,7 @@ fn subset_routing_intersects_with_health() {
     );
 
     // Mark v1-a as actively unhealthy
-    let active: DashMap<String, u64> = DashMap::new();
+    let active: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     let key = target_host_port_key(&targets[0]); // v1-a:8080
     let full_key = format!("{}::{}", TEST_UPSTREAM, key);
     active.insert(full_key, 1);
@@ -2885,7 +2885,7 @@ fn subset_routing_all_unhealthy_returns_none() {
     );
 
     // Mark both v1-a and v1-b as actively unhealthy
-    let active: DashMap<String, u64> = DashMap::new();
+    let active: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     for t in &targets[0..2] {
         let key = format!("{}::{}", TEST_UPSTREAM, target_host_port_key(t));
         active.insert(key, 1);
@@ -3282,7 +3282,7 @@ fn family_eligibility_skips_active_unhealthy_same_family_target() {
         &targets,
         None,
     );
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
     active.insert(target_key(TEST_UPSTREAM, &targets[0]), 1);
     let ctx = active_health_ctx(&active);
     for _ in 0..12 {
@@ -3331,7 +3331,7 @@ fn family_eligibility_skips_passively_ejected_same_family_target() {
         false,
         Some(&config),
     );
-    let active: DashMap<String, u64> = DashMap::new();
+    let active: ActiveUnhealthyTargets = ActiveUnhealthyTargets::new();
     let proxy_passive = checker
         .passive_health
         .get("ferrum|test-proxy")
@@ -3398,7 +3398,7 @@ fn family_eligibility_vec_fallback_honors_health_and_family() {
         &targets,
         None,
     );
-    let active = DashMap::new();
+    let active = ActiveUnhealthyTargets::new();
     active.insert(
         target_key(TEST_UPSTREAM, &family_ip_target("10.244.2.9")),
         1,

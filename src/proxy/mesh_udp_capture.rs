@@ -816,6 +816,59 @@ const EGRESS_TUNNEL_WRITE_DEADLINE: std::time::Duration = std::time::Duration::f
 #[cfg(target_os = "linux")]
 static NEXT_SESSION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// What ended one [`drain_queued_datagrams`] pass.
+#[derive(Debug, PartialEq, Eq)]
+pub enum QueueDrain {
+    /// The queue had no further ready datagram (or the batch is full and the
+    /// next datagram is parked in `held`).
+    Idle,
+    /// Every producer handle is gone and the queue is empty: the session's
+    /// capture side has shut down.
+    Disconnected,
+}
+
+/// Drain datagrams that are ALREADY queued into `batch` without waiting.
+///
+/// `first` opens the batch unconditionally (a single datagram always travels,
+/// whatever its size). Further datagrams are taken with `try_recv` while
+/// [`FrameBatch::accepts`] holds; the first one that does not fit is parked in
+/// `held` so the caller opens the next batch with it, preserving FIFO order.
+/// Every dequeued datagram — batched or held — has its byte reservation
+/// released from `queued_bytes` right here, regardless of the later write
+/// outcome, so the per-session queued-byte cap keeps tracking the live queue
+/// depth exactly as the one-datagram loop did.
+///
+/// Never blocks and never spins: the pass ends at the first empty `try_recv`,
+/// at the batch bound, or when the queue is disconnected.
+pub fn drain_queued_datagrams(
+    rx: &mut tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    first: bytes::Bytes,
+    batch: &mut super::mesh_udp_frame::FrameBatch,
+    held: &mut Option<bytes::Bytes>,
+    queued_bytes: &std::sync::atomic::AtomicUsize,
+) -> QueueDrain {
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    batch.clear();
+    // A captured datagram cannot exceed MAX_FRAME_PAYLOAD, so a push failure is
+    // unreachable for real traffic; the caller skips an empty batch.
+    let _ = batch.push(&first);
+    loop {
+        match rx.try_recv() {
+            Ok(payload) => {
+                queued_bytes.fetch_sub(payload.len(), std::sync::atomic::Ordering::Relaxed);
+                if !batch.accepts(payload.len()) {
+                    *held = Some(payload);
+                    return QueueDrain::Idle;
+                }
+                let _ = batch.push(&payload);
+            }
+            Err(TryRecvError::Empty) => return QueueDrain::Idle,
+            Err(TryRecvError::Disconnected) => return QueueDrain::Disconnected,
+        }
+    }
+}
+
 /// Per-(client, orig-dst) capture session (Stage 4). `last_activity` is
 /// monotonic millis from [`crate::socket_opts::monotonic_now_ms`] (never goes
 /// backwards under NTP slew, so idle expiry always fires). `tx` hands captured
@@ -1779,11 +1832,18 @@ async fn run_udp_egress_session(
         }
     };
 
-    // Egress loop: drain captured datagrams, frame each, write onto the tunnel.
+    // Egress loop: drain captured datagrams, frame them, write onto the tunnel.
     // Idle expiry is enforced by the shared watchdog (NOT a per-`recv` timeout,
-    // which would ignore return-path activity); each framed `write_all` is bounded
+    // which would ignore return-path activity); each batched write is bounded
     // by `write_deadline` so a stalled HBONE peer tears the session down instead
     // of leaking this task (codex r2 P2).
+    //
+    // Datagrams ALREADY queued when one is dequeued are drained with `try_recv`
+    // into a bounded `FrameBatch` and written as one tunnel write (one h2 DATA
+    // frame instead of one per datagram). Nothing waits for a batch to fill: an
+    // isolated datagram is written at once and the drain stops at the first
+    // empty `try_recv`. A datagram that does not fit the batch bound is held and
+    // opens the next batch, preserving FIFO order.
     let egress_activity = last_activity.clone();
     let egress_bytes_sent = std::sync::Arc::clone(&bytes_sent);
     // Moved into the egress loop: it is the sole drainer, so it owns releasing
@@ -1795,47 +1855,83 @@ async fn run_udp_egress_session(
     }
 
     let egress_loop = async move {
-        use tokio::io::AsyncWriteExt;
-        let mut frame =
-            bytes::BytesMut::with_capacity(2 + super::mesh_udp_frame::MAX_FRAME_PAYLOAD);
+        use super::mesh_udp_frame::{BatchWriteFailureKind, FrameBatch};
+        let mut batch = FrameBatch::new();
+        // A dequeued datagram not admitted to the just-written batch.
+        let mut held: Option<bytes::Bytes> = None;
         let completion = loop {
-            let Some(payload) = rx.recv().await else {
-                break EgressCompletion::SenderClosed;
+            let first = match held.take() {
+                Some(payload) => payload,
+                None => {
+                    let Some(payload) = rx.recv().await else {
+                        break EgressCompletion::SenderClosed;
+                    };
+                    // This datagram has left the queue: release its byte
+                    // reservation so the per-session queued-byte cap tracks the
+                    // live queue depth (codex r3). Released for EVERY dequeued
+                    // datagram regardless of the write outcome below.
+                    egress_queued_bytes
+                        .fetch_sub(payload.len(), std::sync::atomic::Ordering::Relaxed);
+                    payload
+                }
             };
-            // This datagram has left the queue: release its byte reservation so
-            // the per-session queued-byte cap tracks the live queue depth (codex
-            // r3). Released for EVERY dequeued datagram regardless of the
-            // write outcome below.
-            egress_queued_bytes.fetch_sub(payload.len(), std::sync::atomic::Ordering::Relaxed);
             egress_activity.store(
                 crate::socket_opts::monotonic_now_ms(),
                 std::sync::atomic::Ordering::Relaxed,
             );
-            frame.clear();
-            if super::mesh_udp_frame::encode_datagram(&mut frame, &payload).is_err() {
-                // A captured datagram cannot exceed MAX_FRAME_PAYLOAD, so this is
-                // unreachable for real traffic; skip rather than tear down.
+            // Observed the queue closed while draining: finish writing the
+            // batch it interrupted, then end the session.
+            let sender_closed =
+                drain_queued_datagrams(&mut rx, first, &mut batch, &mut held, &egress_queued_bytes)
+                    == QueueDrain::Disconnected;
+            if batch.is_empty() {
+                if sender_closed {
+                    break EgressCompletion::SenderClosed;
+                }
                 continue;
             }
-            match tokio::time::timeout(write_deadline, tunnel_write.write_all(&frame)).await {
-                Ok(Ok(())) => {
-                    egress_bytes_sent
-                        .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                }
-                Ok(Err(e)) => {
-                    debug!(error = %e, "Mesh UDP egress: tunnel write failed; ending session");
-                    break EgressCompletion::TunnelEnded;
-                }
-                Err(_) => {
-                    // The HBONE peer stopped reading / flow-control is exhausted;
-                    // the write stalled past the deadline. Tear the session down
-                    // rather than leak a task pinned on a never-completing write.
-                    debug!(
-                        write_deadline_ms = write_deadline.as_millis() as u64,
-                        "Mesh UDP egress: tunnel write stalled past deadline; ending session"
+            match batch.write_to(&mut tunnel_write, write_deadline).await {
+                Ok(()) => {
+                    egress_bytes_sent.fetch_add(
+                        batch.payload_bytes() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
                     );
+                }
+                Err(failure) => {
+                    // Only the datagrams the tunnel fully accepted count as
+                    // sent; the rest of the batch (and any held datagram) is
+                    // dropped with the session.
+                    egress_bytes_sent.fetch_add(
+                        failure.committed_payload_bytes as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    match failure.kind {
+                        BatchWriteFailureKind::Io(e) => {
+                            debug!(
+                                error = %e,
+                                batched = batch.len(),
+                                committed = failure.committed_datagrams,
+                                "Mesh UDP egress: tunnel write failed; ending session"
+                            );
+                        }
+                        BatchWriteFailureKind::Stalled => {
+                            // The HBONE peer stopped reading / flow-control is
+                            // exhausted; the write stalled past the deadline.
+                            // Tear the session down rather than leak a task
+                            // pinned on a never-completing write.
+                            debug!(
+                                write_deadline_ms = write_deadline.as_millis() as u64,
+                                batched = batch.len(),
+                                committed = failure.committed_datagrams,
+                                "Mesh UDP egress: tunnel write stalled past deadline; ending session"
+                            );
+                        }
+                    }
                     break EgressCompletion::TunnelEnded;
                 }
+            }
+            if sender_closed {
+                break EgressCompletion::SenderClosed;
             }
         };
         // Return the write half to the selected branch. Half-closing it inside

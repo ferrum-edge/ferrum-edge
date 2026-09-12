@@ -436,3 +436,62 @@ fn clone_for_broadcast_preserves_port_exhaustion_evidence() {
         );
     }
 }
+
+// ===== opportunistic growth: try_claim never queues (issue #5043) =====
+
+#[tokio::test]
+async fn try_claim_takes_a_free_slot_and_declines_a_held_one() {
+    let slot = FailureSlot::new();
+
+    let held = slot
+        .try_claim()
+        .expect("a free slot is claimed immediately");
+    assert!(
+        slot.try_claim().is_none(),
+        "a second claimant must be told 'not now' instead of waiting"
+    );
+    // The cold path's blocking join must also see the lock as held: the
+    // grower is a real creator for the key while it dials.
+    let cold = slot.join();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), cold.wait())
+            .await
+            .is_err(),
+        "a blocking joiner waits behind the claimed lock"
+    );
+
+    drop(held);
+    assert!(
+        slot.try_claim().is_some(),
+        "dropping the lease frees the slot for the next opportunistic claim"
+    );
+}
+
+#[tokio::test]
+async fn try_claim_lease_does_not_broadcast_unless_asked() {
+    let slot = Arc::new(FailureSlot::new());
+    // A cold-path caller joins while a grower holds the lock.
+    let grower = slot.try_claim().expect("claimed");
+    let waiter = {
+        let slot = Arc::clone(&slot);
+        tokio::spawn(async move {
+            match slot.join().wait().await {
+                SharedCreationRole::Creator(_) => Ok(()),
+                SharedCreationRole::Failed(shared) => Err(shared.clone_for_broadcast()),
+            }
+        })
+    };
+    // Let the waiter queue behind the held lock before it is released.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Dropping the lease without publishing (the growth path's failure
+    // handling) elects the waiter as a fresh creator rather than failing it.
+    drop(grower);
+    let outcome = tokio::time::timeout(Duration::from_secs(2), waiter)
+        .await
+        .expect("waiter resolves")
+        .expect("waiter task");
+    assert!(
+        outcome.is_ok(),
+        "a growth dial that gives up must not fail the cold cohort: {outcome:?}"
+    );
+}
