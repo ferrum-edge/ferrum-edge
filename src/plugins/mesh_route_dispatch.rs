@@ -2200,16 +2200,17 @@ fn is_false(value: &bool) -> bool {
 /// - a doubled separator collapses when BOTH sides carry a `/` — Envoy's
 ///   documented `prefix: /prefix` + `prefix_rewrite: /` case, where
 ///   `/prefix/etc` must forward as `/etc` rather than `//etc`;
-/// - a suffix that opens with a `.` keeps its own segment boundary. Fusing it
-///   into the replacement's last segment would relabel the traversal operand
-///   the client wrote immediately after the matched prefix as ordinary segment
-///   text (`/api../admin` → `/v2../admin`), so the `canonicalize_policy_path`
-///   check the caller runs before publishing the override would no longer see
-///   the `..` and would forward what it must refuse. Synthesizing the
-///   separator keeps that composition `/v2/../admin`, which is rejected with
-///   400 exactly as it was before literal substitution. A dot-leading suffix
-///   that is not itself a dot segment (`..hidden`) still forwards — as its
-///   own segment, which is where the client wrote it.
+/// - a suffix that opens with a complete `.` or `..` segment keeps its
+///   segment boundary. Fusing it into the replacement's last segment would
+///   relabel the traversal operand the client wrote immediately after the
+///   matched prefix as ordinary segment text (`/api../admin` →
+///   `/v2../admin`), so the `canonicalize_policy_path` check the caller
+///   runs before publishing the override would no longer see the `..`
+///   and would forward what it must refuse. Synthesizing the separator
+///   keeps that composition `/v2/../admin`, which is rejected with 400
+///   exactly as it was before literal substitution. Every other
+///   dot-leading tail stays literal (`/prefix/old..hidden` →
+///   `/new..hidden`, `/prefix/old.env` → `/new.env`).
 ///
 /// When `match_prefix` is `None` (exact / regex match, or no `match.uri`)
 /// the whole path is replaced.
@@ -5726,9 +5727,10 @@ mod tests {
             rewrite_request_path("/apiusers", "/v2", Some("/Api")),
             "/v2users"
         );
-        // A dot-leading suffix is the exception: fusing it would relabel the
-        // client's `..` as ordinary segment text, so the boundary is kept and
-        // the caller's canonical check still refuses the composition.
+        // A complete `.` / `..` suffix is the exception: fusing it would
+        // relabel the client's traversal operand as ordinary segment text,
+        // so the boundary is kept and the caller's canonical check still
+        // refuses the composition.
         assert_eq!(
             rewrite_request_path("/api../admin", "/v2", Some("/api")),
             "/v2/../admin"
@@ -5737,9 +5739,11 @@ mod tests {
             rewrite_request_path("/api./users", "/v2", Some("/api")),
             "/v2/./users"
         );
+        // Other dot-leading tails stay literal (`..hidden` is not a
+        // complete dot segment).
         assert_eq!(
             rewrite_request_path("/api..hidden/users", "/v2", Some("/api")),
-            "/v2/..hidden/users"
+            "/v2..hidden/users"
         );
         // A trailing separator on the replacement already supplies the
         // boundary, so nothing is synthesized on top of it.
