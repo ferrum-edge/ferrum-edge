@@ -8977,8 +8977,8 @@ impl DatabaseStore {
         self.copy_namespace_pk_rows_tx(
             tx,
             "consumers",
-            "id, namespace, username, custom_id, credentials, acl_groups, created_at, updated_at",
-            "id, ?, username, custom_id, credentials, acl_groups, created_at, updated_at",
+            "labels, id, namespace, username, custom_id, credentials, acl_groups, created_at, updated_at",
+            "labels, id, ?, username, custom_id, credentials, acl_groups, created_at, updated_at",
             current_name,
             new_name,
         )
@@ -13180,7 +13180,7 @@ mod proxy_insert_sql_drift_tests {
         // VALUES list has one `?` per column; we lifted this row count from
         // the actual INSERT in submit_api_spec_bundle. Update if columns
         // change there.
-        let values_clause = "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+        let values_clause = "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                                      ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         let placeholders = values_clause.matches('?').count();

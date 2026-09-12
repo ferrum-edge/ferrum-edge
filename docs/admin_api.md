@@ -2267,7 +2267,8 @@ map of strings, for example:
 ```
 
 Labels appear on GET/list, backup/restore, file configuration, and CP/DP
-configuration. Empty maps are omitted from responses. A resource PUT without
+configuration, and survive namespace renames. Empty maps are omitted from
+responses. A resource PUT without
 `labels` preserves the current map; a supplied map replaces it, and `{}` clears
 it. At most 64 labels are allowed, with nonblank keys up to 128 UTF-8 bytes and
 values up to 512 bytes; neither may contain control characters.
