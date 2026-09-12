@@ -2294,4 +2294,8 @@ This schema change follows the build-out policy: the SQL baseline includes the
 labels column for PostgreSQL, MySQL and SQLite; initialize/rebuild the development
 database from that baseline when deploying it. MongoDB stores labels through its
 existing BSON resource serialization. Upgrade the gateway and file validator
-before upgrading clients that emit labels in resource bodies.
+before upgrading clients that emit labels in resource bodies. In control-plane
+deployments, upgrade every data plane before the control plane: `config_json`
+is parsed with `deny_unknown_fields`, so a data plane that predates this field
+rejects a namespace snapshot as soon as any resource in it carries a non-empty
+`labels` map, and it does not converge until it is upgraded.

@@ -9,6 +9,8 @@ pub const PROVISIONED_BY_LABEL: &str = "provisioned-by";
 pub const PROVISIONED_BY_HEADER: &str = "x-ferrum-provisioned-by";
 
 /// This is caller-supplied metadata, never authorization or deletion authority.
+/// The stored value is trimmed so one client name never becomes several
+/// label values that differ only in surrounding whitespace.
 pub fn provisioner(headers: &HeaderMap) -> Result<Option<String>, String> {
     let mut values = headers.get_all(PROVISIONED_BY_HEADER).iter();
     let Some(value) = values.next() else {
@@ -23,7 +25,7 @@ pub fn provisioner(headers: &HeaderMap) -> Result<Option<String>, String> {
     if value.trim().is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
         return Err("X-Ferrum-Provisioned-By must be nonblank, at most 512 bytes, and contain no control characters".to_string());
     }
-    Ok(Some(value.to_string()))
+    Ok(Some(value.trim().to_string()))
 }
 
 /// Keep an imported resource's recorded origin and every operator label.

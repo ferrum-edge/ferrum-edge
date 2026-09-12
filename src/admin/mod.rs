@@ -3783,10 +3783,22 @@ async fn handle_admin_request_inner(
                 | ["batch"]
                 | ["restore"]
         );
+    // The header lives in the request line, so it is validated before the
+    // shared body read below. The route's own role gate is replayed here first
+    // so a malformed header can never preempt the `403` the arm would return
+    // (the same rule pagination follows above); the in-arm gates remain
+    // authoritative and simply re-run idempotently.
     let provisioner = if labels_create_route {
+        if let Some(Some(role)) = body_consuming_route_role(&method, segments_peek.as_slice())
+            && let Some(resp) = require_admin_role(&auth, role)
+        {
+            drop(req.into_body());
+            return Ok(resp);
+        }
         match provisioning::provisioner(req.headers()) {
             Ok(value) => value,
             Err(error) => {
+                drop(req.into_body());
                 return Ok(json_response(
                     StatusCode::BAD_REQUEST,
                     &json!({"error": error}),

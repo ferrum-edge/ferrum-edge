@@ -3739,6 +3739,10 @@ fn preserve_bundle_labels(
             labels.entry(key.clone()).or_insert_with(|| value.clone());
         }
     }
+    // The spec's proxy identity always matches on PUT, so the proxy is
+    // preserve-only: a spec created before labels existed keeps an unknown
+    // origin on its proxy rather than being reattributed to the editor. Only
+    // newly generated upstreams and plugins are stamped below.
     preserve(&mut bundle.proxy.labels, &previous.proxy.labels);
     if let Some(upstream) = &mut bundle.upstream {
         if let Some(old) = &previous.upstream
