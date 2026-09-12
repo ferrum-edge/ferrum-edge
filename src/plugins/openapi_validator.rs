@@ -2934,10 +2934,8 @@ fn xml_direct_text_children(node: roxmltree::Node<'_, '_>) -> Result<String, Str
             return Err(XML_PI_IN_VALUE_DETAIL.to_string());
         }
     }
-    if !text.trim().is_empty() {
-        if saw_comment {
-            return Err(XML_COMMENT_IN_VALUE_DETAIL.to_string());
-        }
+    if !text.trim().is_empty() && saw_comment {
+        return Err(XML_COMMENT_IN_VALUE_DETAIL.to_string());
     }
     Ok(text)
 }
