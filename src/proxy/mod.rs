@@ -79,6 +79,7 @@ pub const PARSE_HINT_INVALID_REQUEST_TARGET_UTF8_FOR_TEST: u8 =
 /// Hyper's client handshake proves only the client half, so both h2c transports
 /// — the pooled gRPC path and the Unix-socket path — establish through here.
 pub(crate) mod h2c_preface;
+pub mod hbone_admission_fence;
 pub mod hbone_pool;
 mod hbone_proxy;
 #[allow(unused_imports)]
@@ -6837,6 +6838,13 @@ pub struct ProxyState {
     /// effective-mode snapshot. Captured traffic selects before the handshake;
     /// direct traffic checks the resolved app-port mode after routing.
     pub mesh_inbound_tls_policy: SharedMeshInboundTlsPolicy,
+    /// Registry of live admitted HBONE tunnels and the sweep that re-applies
+    /// their CONNECT admission gates on every epoch publication and inbound
+    /// PeerAuthentication swap (issue #5042 step 1). Publication paths must
+    /// schedule it through [`Self::publish_mesh_inbound_tls_policy`] and
+    /// [`Self::publish_request_epoch_with_gateway_trust`]; storing into the
+    /// slots directly would leave admitted tunnels unfenced.
+    pub hbone_admission_fence: Arc<hbone_admission_fence::HboneAdmissionFence>,
     /// Whether the current mesh inbound TLS posture is actually terminating
     /// inbound TLS with a SPIFFE peer verifier. This is operator status, not a
     /// dispatch hot-path flag: it distinguishes inbound trust from the outbound
@@ -8725,6 +8733,13 @@ impl ProxyState {
         let published = self
             .request_epoch
             .update_config_with_trust(staging, build, mirror)?;
+        if published.is_some() {
+            // Every published generation may carry a new authorize chain, a
+            // changed mesh termination inventory, or a withdrawn proxy. Live
+            // HBONE tunnels admitted under the previous generation are re-judged
+            // against this one off the request path (issue #5042 step 1).
+            self.hbone_admission_fence.request_sweep();
+        }
         if published.is_some() || fenced {
             self.commit_gateway_trust_generation_locked(commit);
         } else {
@@ -8746,6 +8761,18 @@ impl ProxyState {
             );
         }
         Ok(published)
+    }
+
+    /// Publish the effective mesh inbound TLS / PeerAuthentication snapshot.
+    ///
+    /// This is the ONE way the policy slot changes: the store is followed by an
+    /// HBONE admission-fence sweep, so a live tunnel whose transport no longer
+    /// satisfies its application port's mode (for example PERMISSIVE → STRICT
+    /// for a plaintext-admitted tunnel) is revoked instead of outliving the
+    /// posture that admitted it (issue #5042 step 1).
+    pub fn publish_mesh_inbound_tls_policy(&self, policy: MeshInboundTlsPolicy) {
+        self.mesh_inbound_tls_policy.store(Arc::new(policy));
+        self.hbone_admission_fence.request_sweep();
     }
 
     /// Install a freshly loaded source/CA-backed gateway SVID as the live
@@ -9908,6 +9935,10 @@ impl ProxyState {
                 max: udp_max_sessions_per_ip,
             },
         );
+        let hbone_admission_fence = Arc::new(hbone_admission_fence::HboneAdmissionFence::new(
+            Arc::clone(&request_epoch),
+            Arc::clone(&mesh_inbound_tls_policy),
+        ));
 
         let state = Self {
             config: config_arc,
@@ -10013,6 +10044,7 @@ impl ProxyState {
             mesh_trust_registry,
             mesh_inbound_tls,
             mesh_inbound_tls_policy,
+            hbone_admission_fence,
             mesh_inbound_spiffe_verifier_active,
             mesh_outbound_enforcement,
             backend_svid_rotation_tx,
@@ -21001,12 +21033,38 @@ fn mesh_inbound_peer_auth_transport_mismatch(
     is_tls: bool,
     has_verified_peer_certificate: bool,
 ) -> Option<MeshInboundPeerAuthTransportMismatch> {
-    let resolved_app_port = mesh_inbound_peer_auth_app_port(proxy, upstream_target);
     if !mesh_inbound_requires_post_route_transport_gate(mesh_direction) {
         return None;
     }
-
     let policy = state.mesh_inbound_tls_policy.load();
+    mesh_inbound_peer_auth_transport_mismatch_for_policy(
+        &policy,
+        mesh_direction,
+        pre_handshake_app_port,
+        proxy,
+        upstream_target,
+        is_tls,
+        has_verified_peer_certificate,
+    )
+}
+
+/// [`mesh_inbound_peer_auth_transport_mismatch`] against an explicit policy
+/// snapshot. The HBONE admission fence re-applies this gate to live tunnels
+/// after a PeerAuthentication swap, so it must share one decision function
+/// with the request path rather than a second reading of the mode table.
+fn mesh_inbound_peer_auth_transport_mismatch_for_policy(
+    policy: &MeshInboundTlsPolicy,
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    pre_handshake_app_port: Option<u16>,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+    is_tls: bool,
+    has_verified_peer_certificate: bool,
+) -> Option<MeshInboundPeerAuthTransportMismatch> {
+    if !mesh_inbound_requires_post_route_transport_gate(mesh_direction) {
+        return None;
+    }
+    let resolved_app_port = mesh_inbound_peer_auth_app_port(proxy, upstream_target);
     let required_mode = policy
         .modes_by_port
         .get(&resolved_app_port)

@@ -372,6 +372,10 @@ async fn test_http3_proxy_state_creation() {
         ),
     );
     mesh_mtls_pool.attach_mesh_trust_registry(mesh_trust_registry.clone());
+    let mesh_inbound_tls_policy = Arc::new(arc_swap::ArcSwap::from_pointee(
+        ferrum_edge::proxy::MeshInboundTlsPolicy::default(),
+    ));
+    let request_epoch_for_fence = request_epoch.clone();
     let proxy_state = ProxyState {
         config: gateway_config,
         request_epoch,
@@ -483,9 +487,13 @@ async fn test_http3_proxy_state_creation() {
         gateway_trust_publication_lock: Arc::new(std::sync::Mutex::new(())),
         gateway_trust_authority_unresolved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         mesh_inbound_tls: empty_mesh_inbound_tls(),
-        mesh_inbound_tls_policy: Arc::new(arc_swap::ArcSwap::from_pointee(
-            ferrum_edge::proxy::MeshInboundTlsPolicy::default(),
-        )),
+        mesh_inbound_tls_policy: mesh_inbound_tls_policy.clone(),
+        hbone_admission_fence: Arc::new(
+            ferrum_edge::proxy::hbone_admission_fence::HboneAdmissionFence::new(
+                request_epoch_for_fence,
+                mesh_inbound_tls_policy,
+            ),
+        ),
         mesh_inbound_spiffe_verifier_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         mesh_outbound_enforcement: ferrum_edge::modes::mesh::outbound_enforcement::empty_slot(),
         backend_svid_rotation_tx,
@@ -701,6 +709,10 @@ async fn test_http3_full_integration() {
         ),
     );
     mesh_mtls_pool.attach_mesh_trust_registry(mesh_trust_registry.clone());
+    let mesh_inbound_tls_policy = Arc::new(arc_swap::ArcSwap::from_pointee(
+        ferrum_edge::proxy::MeshInboundTlsPolicy::default(),
+    ));
+    let request_epoch_for_fence = request_epoch.clone();
     let proxy_state = ProxyState {
         config: gateway_config,
         request_epoch,
@@ -812,9 +824,13 @@ async fn test_http3_full_integration() {
         gateway_trust_publication_lock: Arc::new(std::sync::Mutex::new(())),
         gateway_trust_authority_unresolved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         mesh_inbound_tls: empty_mesh_inbound_tls(),
-        mesh_inbound_tls_policy: Arc::new(arc_swap::ArcSwap::from_pointee(
-            ferrum_edge::proxy::MeshInboundTlsPolicy::default(),
-        )),
+        mesh_inbound_tls_policy: mesh_inbound_tls_policy.clone(),
+        hbone_admission_fence: Arc::new(
+            ferrum_edge::proxy::hbone_admission_fence::HboneAdmissionFence::new(
+                request_epoch_for_fence,
+                mesh_inbound_tls_policy,
+            ),
+        ),
         mesh_inbound_spiffe_verifier_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         mesh_outbound_enforcement: ferrum_edge::modes::mesh::outbound_enforcement::empty_slot(),
         backend_svid_rotation_tx,

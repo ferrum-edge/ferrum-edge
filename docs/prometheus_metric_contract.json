@@ -2971,6 +2971,20 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_mesh_hbone_tunnel_revocations_total",
+    "type": "counter",
+    "help": "Live HBONE tunnels revoked by the admission fence because a later policy generation would no longer admit their CONNECT.",
+    "labels": [
+      "proxy_id",
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_mesh_inbound_plaintext_allowed",
     "type": "gauge",
     "help": "1 when the mesh inbound listener was allowed to come up without enforced mTLS (dev opt-out posture; production mode refuses this). 0 otherwise.",

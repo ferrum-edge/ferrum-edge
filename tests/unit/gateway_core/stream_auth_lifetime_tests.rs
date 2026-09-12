@@ -792,7 +792,7 @@ fn an_authorization_bound_tcp_relay_refuses_the_unbounded_fast_path() {
         "the copy_bidirectional_with_sizes fast path must refuse an authorization bound"
     );
     assert!(src.contains("copy_bidirectional_with_sizes"));
-    assert!(src.contains("drain_remaining_or_authorization_expire"));
+    assert!(src.contains("drain_remaining_or_terminate"));
     let tls = src
         .split("ClientRelayStream::Tls(tls_stream) => {")
         .nth(1)

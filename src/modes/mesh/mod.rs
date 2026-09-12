@@ -18676,18 +18676,19 @@ async fn apply_mesh_inbound_tls_reload(
             proxy_state
                 .mesh_inbound_tls
                 .store(Arc::new(tls_config.clone()));
-            proxy_state.mesh_inbound_tls_policy.store(Arc::new(
-                crate::proxy::MeshInboundTlsPolicy {
-                    default: tls_config.clone(),
-                    by_port: tls_by_port,
-                    default_mode: effective_inbound_mtls_mode_for_topology(mtls_mode, topology),
-                    modes_by_port: effective_inbound_mtls_modes_for_topology(
-                        &snapshot.port_modes,
-                        topology,
-                    ),
-                    app_port_by_orig_dst_port: snapshot.app_port_by_orig_dst_port.clone(),
-                },
-            ));
+            // Store + HBONE admission-fence sweep: a live tunnel whose transport
+            // no longer satisfies the swapped app-port mode is revoked
+            // (issue #5042 step 1).
+            proxy_state.publish_mesh_inbound_tls_policy(crate::proxy::MeshInboundTlsPolicy {
+                default: tls_config.clone(),
+                by_port: tls_by_port,
+                default_mode: effective_inbound_mtls_mode_for_topology(mtls_mode, topology),
+                modes_by_port: effective_inbound_mtls_modes_for_topology(
+                    &snapshot.port_modes,
+                    topology,
+                ),
+                app_port_by_orig_dst_port: snapshot.app_port_by_orig_dst_port.clone(),
+            });
             proxy_state.mesh_inbound_spiffe_verifier_active.store(
                 mesh_inbound_spiffe_verifier_active(
                     has_termination_listener,
