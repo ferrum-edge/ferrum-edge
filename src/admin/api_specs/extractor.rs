@@ -1214,7 +1214,17 @@ fn extract_operation_schemas(
             let mut seen_templates = HashSet::new();
             for base in &effective_bases {
                 let spec_template = join_server_base_and_path(base, path_template)?;
-                let effective_template = format!("{listen_prefix}{spec_template}");
+                // Mounting follows the server-base join rule: the Paths-key root
+                // `/` yields the listen prefix itself, never a trailing slash.
+                let (effective_template, regex_tail) =
+                    if !listen_prefix.is_empty() && spec_template == "/" {
+                        (listen_prefix.to_string(), "")
+                    } else {
+                        (
+                            format!("{listen_prefix}{spec_template}"),
+                            spec_template.as_str(),
+                        )
+                    };
                 if !seen_templates.insert(effective_template.clone()) {
                     continue;
                 }
@@ -1229,7 +1239,7 @@ fn extract_operation_schemas(
                 );
                 entry.insert(
                     "path_regex".to_string(),
-                    Value::String(path_template_to_regex(&spec_template, listen_prefix)?),
+                    Value::String(path_template_to_regex(regex_tail, listen_prefix)?),
                 );
                 if let Some((required, content)) = &request_body {
                     entry.insert("request_required".to_string(), Value::Bool(*required));

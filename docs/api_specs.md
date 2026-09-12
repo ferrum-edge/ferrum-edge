@@ -128,7 +128,7 @@ Set `x-ferrum-validate: true` to generate a proxy-scoped `openapi_validator` plu
 
 Operation matching uses the full canonical inbound path (`ctx.path`, without the query string), before backend listen-path stripping. Generated `path_template` / `path_regex` include the literal `x-ferrum-proxy.listen_path` prefix followed by the effective server/`basePath` pathname and Paths key. For example, listen path `/p2/oas2` plus Paths key `/items` matches `/p2/oas2/items`; a server pathname `/v1` makes that `/p2/oas2/v1/items`. Do not repeat the listen prefix in Paths keys or server/basePath unless the intended inbound path contains it twice.
 
-Trailing slashes on the listen prefix are trimmed before joining; `/p2/oas2/` plus `/items/{id}` generates `^/p2/oas2/items/[^/]+$`. Paths-key trailing slashes are preserved, so `/` with no server base is mounted as `/p2/oas2/`. Root (`/`), host-only, exact (`=...`), and regex (`~...`) listen routes add no prefix. For exact and regex routes, the spec must describe the full inbound paths. `strip_listen_path` affects forwarding only: generated matchers are the same whether it is `true` or `false`. Hand-authored plugin operations and `bypass.paths` retain full-path matching as written; bypass patterns are not prefixed. Unmatched requests still return HTTP 400 with the default blocking configuration.
+Trailing slashes on the listen prefix are trimmed before joining; `/p2/oas2/` plus `/items/{id}` generates `^/p2/oas2/items/[^/]+$`. The Paths-key root `/` follows the server-base join rule and yields the listen prefix itself (`/p2/oas2`); any other Paths-key trailing slash is preserved (`/items/` is mounted as `/p2/oas2/items/`). Root (`/`), host-only, exact (`=...`), and regex (`~...`) listen routes add no prefix. For exact and regex routes, the spec must describe the full inbound paths. `strip_listen_path` affects forwarding only: generated matchers are the same whether it is `true` or `false`. Hand-authored plugin operations and `bypass.paths` retain full-path matching as written; bypass patterns are not prefixed. Unmatched requests still return HTTP 400 with the default blocking configuration.
 
 ```yaml
 x-ferrum-validate:
@@ -647,7 +647,7 @@ paths:
                     type: boolean
 ```
 
-Submitting this spec creates one generated `openapi_validator` plugin attached to `orders-contract` for `POST /orders/`. A request body missing `id` is rejected with HTTP 400 in `block` mode.
+Submitting this spec creates one generated `openapi_validator` plugin attached to `orders-contract` for `POST /orders`. A request body missing `id` is rejected with HTTP 400 in `block` mode.
 
 ### 5. Updating a spec via PUT — what survives
 

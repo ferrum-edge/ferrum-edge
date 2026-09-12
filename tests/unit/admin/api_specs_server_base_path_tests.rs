@@ -111,8 +111,8 @@ fn listen_path_prefixes_generated_operations_for_all_spec_versions() {
                     vec![
                         (
                             "GET".to_string(),
-                            "/p2/oas2/".to_string(),
-                            "^/p2/oas2/$".to_string()
+                            "/p2/oas2".to_string(),
+                            "^/p2/oas2$".to_string()
                         ),
                         (
                             "POST".to_string(),

@@ -49,7 +49,7 @@ paths:
 
 The importer generates a proxy-scoped `openapi_validator` plugin, resolves local Path Item and schema `$ref`s, converts Swagger 2.0 and OpenAPI 3.0 schemas to Draft 7-compatible JSON Schema, and keeps OpenAPI 3.1+ schemas on Draft 2020-12.
 
-This example validates `POST /orders/`: the Paths key `/` is mounted under `listen_path: /orders`.
+This example validates `POST /orders`: the Paths key `/` is mounted under `listen_path: /orders`, and the Paths-key root yields the listen prefix itself.
 
 ### Schema Object `$ref` siblings
 
@@ -66,7 +66,7 @@ Previously each adjacent key was inserted into the materialized target, so `{$re
 
 The plugin matches the full canonical inbound request path (`ctx.path`, without the query string), including the proxy's listen prefix. It does not strip that prefix during matching. The importer generates `path_template` and `path_regex` by joining the effective server pathname and OpenAPI Paths key, then prepending the literal `x-ferrum-proxy.listen_path` prefix. For example, `/p2/oas2` plus `/items` generates `/p2/oas2/items` and `^/p2/oas2/items$`; with server pathname `/v1`, it generates `/p2/oas2/v1/items`.
 
-Trailing slashes on the listen prefix are removed before joining: `/p2/oas2/` plus `/items/{id}` produces `/p2/oas2/items/{id}` and `^/p2/oas2/items/[^/]+$`. The listen prefix is always literal in the regex. A Paths-key trailing slash is preserved; with no server base, Paths key `/` produces `/p2/oas2/`. Root (`/`) and host-only proxies add no prefix. Exact (`=...`) and regex (`~...`) listen routes also add no prefix; their spec's server/basePath and Paths keys must describe the full inbound paths.
+Trailing slashes on the listen prefix are removed before joining: `/p2/oas2/` plus `/items/{id}` produces `/p2/oas2/items/{id}` and `^/p2/oas2/items/[^/]+$`. The listen prefix is always literal in the regex. The Paths-key root `/` follows the same rule as a server base: with no server base it yields the listen prefix itself (`/p2/oas2`, regex `^/p2/oas2$`). Any other Paths-key trailing slash is preserved (`/items/` produces `/p2/oas2/items/`). Root (`/`) and host-only proxies add no prefix. Exact (`=...`) and regex (`~...`) listen routes also add no prefix; their spec's server/basePath and Paths keys must describe the full inbound paths.
 
 `strip_listen_path` controls backend forwarding only and does not change generated operation paths. With no `backend_path`, `/p2/oas2/items` forwards as `/items` when stripping is enabled and as `/p2/oas2/items` when disabled. Hand-authored `operations` and `bypass.paths` continue to match full inbound paths as written; the importer does not prepend a prefix to bypass patterns. With `x-ferrum-validate` enabled, `operations` is regenerated even when supplied in `x-ferrum-plugins`.
 
