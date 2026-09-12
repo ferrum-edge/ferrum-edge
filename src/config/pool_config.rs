@@ -64,10 +64,23 @@ pub struct PoolConfig {
     /// measured bandwidth-delay product, scaling up automatically on fast
     /// links and staying conservative on slow ones.
     ///
-    /// When enabled, adaptive windowing **overrides** the fixed
+    /// When enabled, adaptive windowing **replaces** the fixed
     /// [`Self::http2_initial_stream_window_size`] /
-    /// [`Self::http2_initial_connection_window_size`] values at the HTTP/2
-    /// builder (hyper/reqwest semantics). Default: `true`.
+    /// [`Self::http2_initial_connection_window_size`] values: hyper's builder
+    /// resets both to the 65,535-byte spec default and grows the connection
+    /// window from there as it measures the link, so the two settings are
+    /// mutually exclusive rather than additive. Default: `false` (issue
+    /// #5464) — the fixed windows above apply, as Envoy and ztunnel do.
+    ///
+    /// Why fixed by default: a 64 KiB connection window shared by hundreds of
+    /// concurrent streams forces the peer to fragment every response into
+    /// sub-256-byte DATA frames, and h2's small-frame flood budget (sized to
+    /// half the configured connection window, so ~32 KiB under adaptive
+    /// versus 16 MiB with the 32 MiB fixed window) then closes the connection
+    /// with `GOAWAY ENHANCE_YOUR_CALM too_many_data_frames`. Fixed windows
+    /// also skip adaptive's multi-RTT ramp on high-latency cross-cluster
+    /// links. Measured on loopback the two are within noise for small
+    /// responses.
     ///
     /// Precedence is resolved at configuration load time: an explicit stream or
     /// connection window override from env/`ferrum.conf` or a per-proxy field
@@ -104,7 +117,7 @@ impl Default for PoolConfig {
             http2_keep_alive_timeout_seconds: 45, // More reasonable timeout comparable to HTTP read timeout
             http2_initial_stream_window_size: 8_388_608, // 8 MiB
             http2_initial_connection_window_size: 33_554_432, // 32 MiB
-            http2_adaptive_window: true,
+            http2_adaptive_window: false,
             http2_max_frame_size: 1_048_576, // 1 MiB
             http2_max_concurrent_streams: Some(1000),
         }
