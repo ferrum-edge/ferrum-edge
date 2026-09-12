@@ -819,7 +819,7 @@ proxies:
 |-------|------|---------|-------------|
 | `failure_threshold` | integer | `5` | Failures before opening the circuit |
 | `success_threshold` | integer | `3` | Successes in half-open to close the circuit |
-| `timeout_seconds` | integer | `30` | How long the circuit stays open before half-open |
+| `timeout_seconds` | integer | `30` | How long the circuit stays open before half-open. `cooldown_seconds` is accepted as an input alias and is never returned; supplying both spellings in one object is rejected. |
 | `failure_status_codes` | array | `[500, 502, 503, 504]` | HTTP status codes from real backend responses that count as failures |
 | `half_open_max_requests` | integer | `1` | Max concurrent requests in half-open state |
 | `trip_on_connection_errors` | boolean | `true` | Whether connection-level errors trip the breaker independently of `failure_status_codes` |

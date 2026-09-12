@@ -12106,7 +12106,11 @@ components:
           type: integer
           format: uint64
           default: 30
-          description: Seconds to wait in open state before transitioning to half-open
+          description: >
+            Seconds to wait in open state before transitioning to half-open.
+            `cooldown_seconds` is accepted as an input alias on Admin API, file
+            config, database rows, and batch/restore payloads, and is never
+            returned.
         failure_status_codes:
           type: array
           items:

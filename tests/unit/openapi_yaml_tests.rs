@@ -657,6 +657,34 @@ fn typed_component_properties_match_serde_field_inventories() {
 }
 
 #[test]
+fn circuit_breaker_config_documents_cooldown_seconds_input_alias() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let timeout_seconds = spec
+        .pointer("/components/schemas/CircuitBreakerConfig/properties/timeout_seconds")
+        .expect("CircuitBreakerConfig.timeout_seconds");
+    let timeout_description = timeout_seconds["description"]
+        .as_str()
+        .expect("timeout_seconds description");
+    assert!(
+        timeout_description.contains("cooldown_seconds"),
+        "timeout_seconds must document the cooldown_seconds input alias: {timeout_description}"
+    );
+    assert!(
+        timeout_description.contains("never returned"),
+        "timeout_seconds must say the alias is never returned: {timeout_description}"
+    );
+    let circuit_properties = spec
+        .pointer("/components/schemas/CircuitBreakerConfig/properties")
+        .and_then(serde_json::Value::as_object)
+        .expect("CircuitBreakerConfig properties");
+    assert!(
+        !circuit_properties.contains_key("cooldown_seconds"),
+        "cooldown_seconds is an input alias, not a schema property"
+    );
+}
+
+#[test]
 fn mtls_auth_schemas_match_runtime_contract() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
