@@ -171,8 +171,8 @@ fn native_protocol_still_requires_cp_urls() {
 
     apply_validate_overrides(&validate_args(Some(&gateway)));
     prepare_validate_file_source().expect("gateway spec is not a mesh slice");
-    let error = execute_validate(&validate_args(None))
-        .expect_err("native protocol still needs CP URLs");
+    let error =
+        execute_validate(&validate_args(None)).expect_err("native protocol still needs CP URLs");
     assert!(
         error.contains("FERRUM_DP_CP_GRPC_URLS"),
         "native mesh validate must keep CP requirements, got: {error}"
@@ -186,8 +186,8 @@ fn xds_protocol_still_requires_cp_urls() {
     install_internal_ca(&guard);
     guard.set("FERRUM_MESH_CONFIG_PROTOCOL", "xds");
 
-    let error = execute_validate(&validate_args(None))
-        .expect_err("xds protocol still needs CP URLs");
+    let error =
+        execute_validate(&validate_args(None)).expect_err("xds protocol still needs CP URLs");
     assert!(
         error.contains("FERRUM_DP_CP_GRPC_URLS"),
         "xds mesh validate must keep CP requirements, got: {error}"
@@ -260,8 +260,8 @@ fn gateway_spec_does_not_infer_file_protocol() {
         std::env::var("FERRUM_MESH_CONFIG_PROTOCOL").is_err(),
         "inference must not set file protocol for a gateway document"
     );
-    let error = execute_validate(&validate_args(None))
-        .expect_err("default native still needs CP URLs");
+    let error =
+        execute_validate(&validate_args(None)).expect_err("default native still needs CP URLs");
     assert!(
         error.contains("FERRUM_DP_CP_GRPC_URLS"),
         "non-mesh document must not skip CP requirements, got: {error}"
@@ -279,8 +279,8 @@ fn malformed_slice_fails_under_explicit_file_protocol() {
 
     apply_validate_overrides(&validate_args(Some(&bad)));
     prepare_validate_file_source().expect("path mapping does not require a successful parse");
-    let error = execute_validate(&validate_args(None))
-        .expect_err("malformed mesh document must fail");
+    let error =
+        execute_validate(&validate_args(None)).expect_err("malformed mesh document must fail");
     assert!(
         error.contains("Mesh spec validation failed") || error.contains("invalid mesh"),
         "malformed document must surface the file parser diagnostic, got: {error}"
@@ -306,8 +306,8 @@ proxies: []
 
     apply_validate_overrides(&validate_args(Some(&bad)));
     prepare_validate_file_source().expect("explicit file protocol maps --spec");
-    let error = execute_validate(&validate_args(None))
-        .expect_err("unknown fields must fail closed");
+    let error =
+        execute_validate(&validate_args(None)).expect_err("unknown fields must fail closed");
     assert!(
         error.contains("proxies") && error.contains("Mesh spec validation failed"),
         "unknown fields must keep the file-source diagnostic, got: {error}"
@@ -325,8 +325,7 @@ fn file_protocol_still_requires_workload_identity() {
 
     apply_validate_overrides(&validate_args(Some(&slice)));
     prepare_validate_file_source().expect("path mapping succeeds before identity");
-    let error = execute_validate(&validate_args(None))
-        .expect_err("missing identity must fail");
+    let error = execute_validate(&validate_args(None)).expect_err("missing identity must fail");
     assert!(
         error.contains("workload identity")
             || error.contains("FERRUM_MESH_CA_BACKEND")
@@ -372,8 +371,8 @@ fn missing_spec_for_inferred_file_keeps_native_cp_requirement() {
     install_internal_ca(&guard);
 
     prepare_validate_file_source().expect("no document means no inference");
-    let error = execute_validate(&validate_args(None))
-        .expect_err("default native still needs CP URLs");
+    let error =
+        execute_validate(&validate_args(None)).expect_err("default native still needs CP URLs");
     assert!(
         error.contains("FERRUM_DP_CP_GRPC_URLS"),
         "inference must not fire without a localized document, got: {error}"
@@ -406,8 +405,7 @@ mesh:
         std::env::var("FERRUM_MESH_CONFIG_PROTOCOL").unwrap(),
         "file"
     );
-    let error = execute_validate(&validate_args(None))
-        .expect_err("invalid mesh fields must fail");
+    let error = execute_validate(&validate_args(None)).expect_err("invalid mesh fields must fail");
     assert!(
         error.contains("Mesh spec validation failed") && error.contains("validation failed"),
         "inner field errors must come from the real file parser, got: {error}"
@@ -428,8 +426,8 @@ fn malformed_spec_does_not_infer_file_protocol() {
         std::env::var("FERRUM_MESH_CONFIG_PROTOCOL").is_err(),
         "inference must not select file protocol for malformed YAML"
     );
-    let error = execute_validate(&validate_args(None))
-        .expect_err("default native still needs CP URLs");
+    let error =
+        execute_validate(&validate_args(None)).expect_err("default native still needs CP URLs");
     assert!(
         error.contains("FERRUM_DP_CP_GRPC_URLS"),
         "only the localized shape may skip CP requirements, got: {error}"
