@@ -2234,12 +2234,12 @@ fn rewrite_paths_require_canonical_config_admission() {
 
 #[tokio::test]
 async fn rewrite_composition_refuses_new_dot_segments_before_publication() {
-    // A suffix that opens with a `.` keeps its own segment boundary, so the
+    // A suffix that opens with a complete dot segment keeps its own boundary, so the
     // composition the canonical check sees is the same whether or not the
     // replacement already ends in `/`. Both replacements therefore share one
     // table: `..` / `.` compose a dot segment and are refused before the
-    // override is published, `..hidden` is an ordinary segment and forwards as
-    // one, and `/other` is the control whose prefix simply does not match.
+    // override is published. Other dot-leading text remains a literal suffix,
+    // and `/other` is the control whose prefix simply does not match.
     for replacement in ["/v2", "/v2/"] {
         let plugin = MeshRouteDispatch::new(&json!({"rules": [{
             "match": {"uri": {"prefix": "/api"}},
@@ -2252,7 +2252,22 @@ async fn rewrite_composition_refuses_new_dot_segments_before_publication() {
             ("/api..", None),
             ("/api./users", None),
             ("/api/users", Some("/v2/users")),
-            ("/api..hidden/users", Some("/v2/..hidden/users")),
+            (
+                "/api..hidden/users",
+                Some(if replacement.ends_with('/') {
+                    "/v2/..hidden/users"
+                } else {
+                    "/v2..hidden/users"
+                }),
+            ),
+            (
+                "/api.env",
+                Some(if replacement.ends_with('/') {
+                    "/v2/.env"
+                } else {
+                    "/v2.env"
+                }),
+            ),
             ("/other/users", None),
         ] {
             let mut ctx =
@@ -2443,7 +2458,7 @@ async fn prefix_rewrite_refuses_a_dot_segment_that_opens_the_suffix() {
     // suffix keeps its own segment boundary, the composition stays
     // `/new/../admin`, and it is rejected with 400 before any override is
     // published, exactly as it was before the mid-segment join changed.
-    // `..hidden` is not a dot segment and still forwards, in its own segment,
+    // `..hidden` is not a dot segment and still forwards as a literal suffix,
     // and an ordinary mid-segment tail still substitutes literally.
     for (ignore_case, match_prefix) in [(false, "/prefix/old"), (true, "/Prefix/Old")] {
         let config = json!({"rules": [{
@@ -2456,7 +2471,8 @@ async fn prefix_rewrite_refuses_a_dot_segment_that_opens_the_suffix() {
             ("/prefix/old../admin", None),
             ("/prefix/old..", None),
             ("/prefix/old./users", None),
-            ("/prefix/old..hidden", Some("/new/..hidden")),
+            ("/prefix/old..hidden", Some("/new..hidden")),
+            ("/prefix/old.env", Some("/new.env")),
             ("/prefix/oldtail", Some("/newtail")),
         ] {
             let mut ctx =
@@ -2524,5 +2540,43 @@ async fn redirect_prefix_rewrite_preserves_a_suffix_inside_a_segment() {
             assert_eq!(location, Some("/newtail"));
         }
         other => panic!("expected redirect Reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn redirect_prefix_rewrite_keeps_dot_names_literal_and_refuses_dot_segments() {
+    let config = json!({"rules": [{
+        "match": {"methods": ["GET"]},
+        "redirect": {"uri": "/app", "match_prefix": "/public", "redirect_code": 302}
+    }]});
+    let plugin = MeshRouteDispatch::new(&config).expect("redirect is admitted");
+
+    for (request_path, expected_status, expected_location) in [
+        ("/public.env", 302, Some("/app.env")),
+        ("/public.git/config", 302, Some("/app.git/config")),
+        ("/public../admin", 400, None),
+        ("/public./admin", 400, None),
+        ("/public..", 400, None),
+    ] {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            request_path.to_string(),
+        );
+        match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+            PluginResult::Reject {
+                status_code,
+                headers,
+                ..
+            } => {
+                assert_eq!(status_code, expected_status, "{request_path}");
+                assert_eq!(
+                    headers.get("location").map(String::as_str),
+                    expected_location,
+                    "{request_path}"
+                );
+            }
+            other => panic!("expected Reject for {request_path}, got {other:?}"),
+        }
     }
 }
