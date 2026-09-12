@@ -79,10 +79,9 @@ fn both_timeout_and_cooldown_spellings_are_rejected() {
 
 #[test]
 fn yaml_both_timeout_and_cooldown_spellings_are_rejected() {
-    let err = serde_yaml::from_str::<CircuitBreakerConfig>(
-        "timeout_seconds: 10\ncooldown_seconds: 99\n",
-    )
-    .expect_err("yaml both spellings must be a duplicate field");
+    let err =
+        serde_yaml::from_str::<CircuitBreakerConfig>("timeout_seconds: 10\ncooldown_seconds: 99\n")
+            .expect_err("yaml both spellings must be a duplicate field");
     let message = err.to_string();
     assert!(
         message.contains("duplicate field"),
