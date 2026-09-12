@@ -11,9 +11,9 @@ The `ferrum-edge` binary must be on your shell's `PATH` to be invoked by name. A
 sudo cp target/release/ferrum-edge /usr/local/bin/
 
 # From a pre-built release download (Linux x86_64 example)
-# Pin an explicit tag. GitHub /releases/latest skips prereleases.
+# Pin an immutable semver tag — do not use "latest" (see README).
 set -euo pipefail
-TAG=latest  # or replace with another explicit tag shown on the Releases page
+TAG=v0.9.4  # replace with the desired vX.Y.Z tag from the Releases page
 BASE="https://github.com/ferrum-edge/ferrum-edge/releases/download/${TAG}"
 curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64"
 curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64.sha256"
