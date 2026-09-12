@@ -1875,12 +1875,14 @@ impl AggregateSseStream {
     }
 }
 
-/// Clone-safe, RAII-owned publication staged between final body policy and the
-/// observe-only committed-response hook.
+/// Clone-safe, RAII-owned publication staged between the hook that produced the
+/// client-visible representation and the pipeline's retention boundary — the
+/// pre-commit authorization gate on H1/H2, the completed body write on H3.
 ///
-/// A `RequestContext` clone shares this one claim. Exactly one caller can commit
-/// or abort it; dropping the last handle aborts and returns both the retained
-/// reservation and the request-stream capacity.
+/// Cloning the handle shares one claim; a `RequestContext` clone deliberately
+/// carries none, so only the live request can settle it. Exactly one caller can
+/// commit or abort; dropping the last handle aborts and returns both the
+/// retained reservation and the request-stream capacity.
 #[derive(Clone)]
 pub struct AggregateSsePublication(Arc<PublicationLease>);
 
