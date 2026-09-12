@@ -549,7 +549,8 @@ async fn control_plane_status_reports_no_active_namespace() {
     // Readiness is not asserted here either; see the note above.
     let (_, _, body) = request(reqwest::Method::GET, &base, "/status", None, None).await;
     assert_eq!(
-        body["namespace"]["active"], Value::Null,
+        body["namespace"]["active"],
+        Value::Null,
         "a CP has no data-plane namespace"
     );
     assert_eq!(body["namespace"]["serving_scope"], json!("control-plane"));

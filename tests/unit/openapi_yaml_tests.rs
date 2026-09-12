@@ -17616,7 +17616,11 @@ fn health_namespace_serving_report_is_a_fixed_authenticated_detail_block() {
     );
     assert_eq!(
         schema["properties"]["serving_scope"]["enum"],
-        json!(["single-namespace-data-plane", "control-plane", "no-data-plane"]),
+        json!([
+            "single-namespace-data-plane",
+            "control-plane",
+            "no-data-plane"
+        ]),
         "the serving scope must stay the closed set the runtime emits"
     );
     assert_eq!(
@@ -17627,7 +17631,11 @@ fn health_namespace_serving_report_is_a_fixed_authenticated_detail_block() {
     // The runtime emits these labels from `NamespaceServingScope::as_str`; the
     // handler assigns the block under `namespace` on `HealthResponse`.
     let admin_source = include_str!("../../src/admin/mod.rs");
-    for label in ["single-namespace-data-plane", "control-plane", "no-data-plane"] {
+    for label in [
+        "single-namespace-data-plane",
+        "control-plane",
+        "no-data-plane",
+    ] {
         assert!(
             admin_source.contains(&format!("\"{label}\"")),
             "src/admin/mod.rs must emit the `{label}` serving-scope label"
