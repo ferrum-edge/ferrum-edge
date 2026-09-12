@@ -12128,22 +12128,6 @@ components:
             of failure_status_codes. When true (default), connection errors always
             trip the breaker. When false, only real HTTP response status codes in
             failure_status_codes are counted.
-        half_open_probe_dwell_seconds:
-          type: [integer, "null"]
-          format: uint64
-          minimum: 1
-          maximum: 86400
-          description: >
-            Seconds a half-open probe slot may stay unsettled before the breaker
-            reclaims it, so a probe that is never released degrades to a bounded
-            delay instead of shedding the backend for the process lifetime. Omitted
-            derives max(timeout_seconds * 2, 60); a configured value is clamped up
-            to timeout_seconds and to at least 1. The dwell MUST exceed the longest
-            legitimate backend dispatch a probe can take (backend connect and read
-            timeouts): reclaiming a slot while a real probe is still in flight lets
-            a second probe reach the backend the breaker is protecting. Every
-            reclaim increments ferrum_circuit_breaker_probe_reclaimed_total and logs
-            a warning naming the proxy and target.
 
     # ── Retry ───────────────────────────────────────────────────────
     RetryConfig:
