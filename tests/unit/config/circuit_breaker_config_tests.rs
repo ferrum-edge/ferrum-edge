@@ -103,7 +103,7 @@ fn proxy_circuit_breaker_accepts_cooldown_seconds_alias() {
         },
     }))
     .expect("proxy with cooldown_seconds alias");
-    let breaker = proxy.circuit_breaker.expect("breaker present");
+    let breaker = proxy.circuit_breaker.as_ref().expect("breaker present");
     assert_eq!(breaker.timeout_seconds, 99);
     let serialized = serde_json::to_value(&proxy).expect("serialize proxy");
     let breaker_json = serialized
